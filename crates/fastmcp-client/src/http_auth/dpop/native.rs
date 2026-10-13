@@ -1240,13 +1240,13 @@ mod tls_tests {
 
     #[test]
     fn native_https_typed_calls_correlate_results_and_leave_continuations_to_the_host() {
+        use super::core::DpopCoreError;
+        use crate::http_auth::rpc::{ManagedCoreError, ManagedCoreLimits};
         use fastmcp_protocol::protocol_policy::ProtocolEra;
         use fastmcp_protocol::{
             ClientCapabilities, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta,
             RequestId,
         };
-        use crate::http_auth::rpc::{ManagedCoreError, ManagedCoreLimits};
-        use super::core::DpopCoreError;
 
         RuntimeBuilder::current_thread()
             .with_reactor(create_reactor().unwrap())

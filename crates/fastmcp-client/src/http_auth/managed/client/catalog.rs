@@ -53,7 +53,11 @@ impl CatalogLimits {
         {
             return Err(CatalogError::InvalidLimits);
         }
-        Ok(Self { pages, entries, bytes })
+        Ok(Self {
+            pages,
+            entries,
+            bytes,
+        })
     }
 }
 
@@ -144,7 +148,8 @@ impl ManagedHttpClient {
         cx: &Cx,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalTool>, ManagedHttpClientError> {
-        self.list_all_tools_with_cancellation(cx, &McpRequestCancellation::new(), limits).await
+        self.list_all_tools_with_cancellation(cx, &McpRequestCancellation::new(), limits)
+            .await
     }
 
     /// Like `list_all_tools`, with cancellation isolated from the shared login.
@@ -154,8 +159,11 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalTool>, ManagedHttpClientError> {
-        match self.perform_any(cx, cancellation, Call::Catalog(CatalogKind::Tools, limits))
-            .await?.into_catalog()? {
+        match self
+            .perform_any(cx, cancellation, Call::Catalog(CatalogKind::Tools, limits))
+            .await?
+            .into_catalog()?
+        {
             Collected::Tools(catalog) => Ok(catalog),
             _ => Err(CatalogError::UnexpectedResult.into()),
         }
@@ -167,7 +175,8 @@ impl ManagedHttpClient {
         cx: &Cx,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalResource>, ManagedHttpClientError> {
-        self.list_all_resources_with_cancellation(cx, &McpRequestCancellation::new(), limits).await
+        self.list_all_resources_with_cancellation(cx, &McpRequestCancellation::new(), limits)
+            .await
     }
 
     /// Lists all resources, discarding partial results on caller cancellation.
@@ -177,8 +186,15 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalResource>, ManagedHttpClientError> {
-        match self.perform_any(cx, cancellation, Call::Catalog(CatalogKind::Resources, limits))
-            .await?.into_catalog()? {
+        match self
+            .perform_any(
+                cx,
+                cancellation,
+                Call::Catalog(CatalogKind::Resources, limits),
+            )
+            .await?
+            .into_catalog()?
+        {
             Collected::Resources(catalog) => Ok(catalog),
             _ => Err(CatalogError::UnexpectedResult.into()),
         }
@@ -190,8 +206,12 @@ impl ManagedHttpClient {
         cx: &Cx,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalResourceTemplate>, ManagedHttpClientError> {
-        self.list_all_resource_templates_with_cancellation(cx, &McpRequestCancellation::new(), limits)
-            .await
+        self.list_all_resource_templates_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            limits,
+        )
+        .await
     }
 
     /// Lists all templates with finite, request-local cancellation and limits.
@@ -201,8 +221,15 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalResourceTemplate>, ManagedHttpClientError> {
-        match self.perform_any(cx, cancellation, Call::Catalog(CatalogKind::Templates, limits))
-            .await?.into_catalog()? {
+        match self
+            .perform_any(
+                cx,
+                cancellation,
+                Call::Catalog(CatalogKind::Templates, limits),
+            )
+            .await?
+            .into_catalog()?
+        {
             Collected::Templates(catalog) => Ok(catalog),
             _ => Err(CatalogError::UnexpectedResult.into()),
         }
@@ -214,7 +241,8 @@ impl ManagedHttpClient {
         cx: &Cx,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalPrompt>, ManagedHttpClientError> {
-        self.list_all_prompts_with_cancellation(cx, &McpRequestCancellation::new(), limits).await
+        self.list_all_prompts_with_cancellation(cx, &McpRequestCancellation::new(), limits)
+            .await
     }
 
     /// Lists all prompts without cancelling sibling clients sharing this login.
@@ -224,8 +252,15 @@ impl ManagedHttpClient {
         cancellation: &McpRequestCancellation,
         limits: CatalogLimits,
     ) -> Result<ManagedCatalog<FinalPrompt>, ManagedHttpClientError> {
-        match self.perform_any(cx, cancellation, Call::Catalog(CatalogKind::Prompts, limits))
-            .await?.into_catalog()? {
+        match self
+            .perform_any(
+                cx,
+                cancellation,
+                Call::Catalog(CatalogKind::Prompts, limits),
+            )
+            .await?
+            .into_catalog()?
+        {
             Collected::Prompts(catalog) => Ok(catalog),
             _ => Err(CatalogError::UnexpectedResult.into()),
         }
@@ -257,11 +292,18 @@ impl Meter {
     }
 
     // Called before entries or cursor copies enter the accumulated result.
-    fn admit<T: Serialize>(&mut self, entries: &[T], cursor: Option<&str>) -> Result<(), CatalogError> {
+    fn admit<T: Serialize>(
+        &mut self,
+        entries: &[T],
+        cursor: Option<&str>,
+    ) -> Result<(), CatalogError> {
         if self.pages >= self.limits.pages {
             return Err(CatalogError::PageLimit);
         }
-        let count = self.entries.checked_add(entries.len()).ok_or(CatalogError::EntryLimit)?;
+        let count = self
+            .entries
+            .checked_add(entries.len())
+            .ok_or(CatalogError::EntryLimit)?;
         if count > self.limits.entries {
             return Err(CatalogError::EntryLimit);
         }
@@ -337,25 +379,50 @@ impl Entries {
         }
     }
 
-    fn append(&mut self, page: CoreResult, meter: &mut Meter) -> Result<Option<String>, CatalogError> {
+    fn append(
+        &mut self,
+        page: CoreResult,
+        meter: &mut Meter,
+    ) -> Result<Option<String>, CatalogError> {
         match (self, page) {
-            (Self::Tools(entries), CoreResult::Final(FinalCoreResult::ToolsList { result, .. })) => {
+            (
+                Self::Tools(entries),
+                CoreResult::Final(FinalCoreResult::ToolsList { result, .. }),
+            ) => {
                 meter.admit(&result.payload.tools, result.payload.next_cursor.as_deref())?;
                 entries.extend(result.payload.tools);
                 Ok(result.payload.next_cursor)
             }
-            (Self::Resources(entries), CoreResult::Final(FinalCoreResult::ResourcesList { result, .. })) => {
-                meter.admit(&result.payload.resources, result.payload.next_cursor.as_deref())?;
+            (
+                Self::Resources(entries),
+                CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
+            ) => {
+                meter.admit(
+                    &result.payload.resources,
+                    result.payload.next_cursor.as_deref(),
+                )?;
                 entries.extend(result.payload.resources);
                 Ok(result.payload.next_cursor)
             }
-            (Self::Templates(entries), CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. })) => {
-                meter.admit(&result.payload.resource_templates, result.payload.next_cursor.as_deref())?;
+            (
+                Self::Templates(entries),
+                CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }),
+            ) => {
+                meter.admit(
+                    &result.payload.resource_templates,
+                    result.payload.next_cursor.as_deref(),
+                )?;
                 entries.extend(result.payload.resource_templates);
                 Ok(result.payload.next_cursor)
             }
-            (Self::Prompts(entries), CoreResult::Final(FinalCoreResult::PromptsList { result, .. })) => {
-                meter.admit(&result.payload.prompts, result.payload.next_cursor.as_deref())?;
+            (
+                Self::Prompts(entries),
+                CoreResult::Final(FinalCoreResult::PromptsList { result, .. }),
+            ) => {
+                meter.admit(
+                    &result.payload.prompts,
+                    result.payload.next_cursor.as_deref(),
+                )?;
                 entries.extend(result.payload.prompts);
                 Ok(result.payload.next_cursor)
             }
@@ -384,18 +451,25 @@ pub(super) async fn collect(
     let mut meter = Meter::new(limits);
     let mut cursor: Option<String> = None;
     loop {
-        boundary.check(cx).map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
+        boundary
+            .check(cx)
+            .map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
         let page = match kind {
             CatalogKind::Tools => client.list_tools(cx, cursor.as_deref()).await,
             CatalogKind::Resources => client.list_resources(cx, cursor.as_deref()).await,
             CatalogKind::Templates => client.list_resource_templates(cx, cursor.as_deref()).await,
             CatalogKind::Prompts => client.list_prompts(cx, cursor.as_deref()).await,
-        }.map_err(request_error)?;
-        boundary.check(cx).map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
+        }
+        .map_err(request_error)?;
+        boundary
+            .check(cx)
+            .map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
         cursor = entries.append(page, &mut meter)?;
         // Even cached, immediately ready pages cannot replenish time or publish
         // after local revocation. The outer guard supplies wakeups while pending.
-        boundary.check(cx).map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
+        boundary
+            .check(cx)
+            .map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
         if cursor.is_none() {
             return Ok(entries.finish(meter.pages));
         }
@@ -411,11 +485,18 @@ mod tests {
     fn limits_reject_zero_and_overflow_instead_of_clamping() {
         assert!(CatalogLimits::new(256, 16_384, 32 * 1024 * 1024).is_ok());
         for (pages, entries, bytes) in [
-            (0, 1, 1), (1, 0, 1), (1, 1, 0),
-            (257, 1, 1), (1, 16_385, 1), (1, 1, 32 * 1024 * 1024 + 1),
+            (0, 1, 1),
+            (1, 0, 1),
+            (1, 1, 0),
+            (257, 1, 1),
+            (1, 16_385, 1),
+            (1, 1, 32 * 1024 * 1024 + 1),
             (usize::MAX, usize::MAX, usize::MAX),
         ] {
-            assert_eq!(CatalogLimits::new(pages, entries, bytes), Err(CatalogError::InvalidLimits));
+            assert_eq!(
+                CatalogLimits::new(pages, entries, bytes),
+                Err(CatalogError::InvalidLimits)
+            );
         }
     }
 
@@ -423,7 +504,10 @@ mod tests {
     fn cumulative_entry_limit_accepts_the_boundary_and_refuses_the_next_item() {
         let mut meter = Meter::new(CatalogLimits::new(3, 2, 4096).unwrap());
         meter.admit(&[json!(1)], Some("page-two")).unwrap();
-        assert_eq!(meter.admit(&[json!(2), json!(3)], None), Err(CatalogError::EntryLimit));
+        assert_eq!(
+            meter.admit(&[json!(2), json!(3)], None),
+            Err(CatalogError::EntryLimit)
+        );
         assert_eq!(meter.entries, 1);
         meter.admit(&[json!(2)], None).unwrap();
         assert_eq!(meter.entries, 2);
@@ -436,8 +520,13 @@ mod tests {
         let second = [json!("second")];
         let cursor = Some("private-\"-雪");
         let first_bytes = serde_json::to_vec(&(&first[..], cursor)).unwrap().len();
-        let last_bytes = serde_json::to_vec(&(&second[..], None::<&str>)).unwrap().len();
-        for (budget, accepted) in [(first_bytes + last_bytes, true), (first_bytes + last_bytes - 1, false)] {
+        let last_bytes = serde_json::to_vec(&(&second[..], None::<&str>))
+            .unwrap()
+            .len();
+        for (budget, accepted) in [
+            (first_bytes + last_bytes, true),
+            (first_bytes + last_bytes - 1, false),
+        ] {
             let mut meter = Meter::new(CatalogLimits::new(2, 2, budget).unwrap());
             meter.admit(&first, cursor).unwrap();
             let result = meter.admit(&second, None);
@@ -456,7 +545,10 @@ mod tests {
         for cursor in ["", "opaque-雪%2F", "private-cursor"] {
             let mut meter = Meter::new(CatalogLimits::default());
             meter.admit::<serde_json::Value>(&[], Some(cursor)).unwrap();
-            assert_eq!(meter.admit::<serde_json::Value>(&[], Some(cursor)), Err(CatalogError::CursorCycle));
+            assert_eq!(
+                meter.admit::<serde_json::Value>(&[], Some(cursor)),
+                Err(CatalogError::CursorCycle)
+            );
             assert_eq!(meter.pages, 1);
             meter.admit::<serde_json::Value>(&[], None).unwrap();
             assert_eq!(meter.pages, 2);
@@ -469,7 +561,10 @@ mod tests {
         for cursor in ["a", "b", "c"] {
             meter.admit(&[json!(cursor)], Some(cursor)).unwrap();
         }
-        assert_eq!(meter.admit(&[json!("not published")], Some("a")), Err(CatalogError::CursorCycle));
+        assert_eq!(
+            meter.admit(&[json!("not published")], Some("a")),
+            Err(CatalogError::CursorCycle)
+        );
         assert_eq!(meter.entries, 3);
         assert_eq!(meter.pages, 3);
     }
@@ -478,8 +573,11 @@ mod tests {
     fn empty_pages_consume_page_budget_and_truncation_is_not_success() {
         for terminal in [false, true] {
             let mut meter = Meter::new(CatalogLimits::new(2, 1, 4096).unwrap());
-            meter.admit::<serde_json::Value>(&[], Some("first")).unwrap();
-            let result = meter.admit::<serde_json::Value>(&[], if terminal { None } else { Some("second") });
+            meter
+                .admit::<serde_json::Value>(&[], Some("first"))
+                .unwrap();
+            let result =
+                meter.admit::<serde_json::Value>(&[], if terminal { None } else { Some("second") });
             assert_eq!(result.is_ok(), terminal);
             if !terminal {
                 assert_eq!(result, Err(CatalogError::PageLimit));
@@ -490,10 +588,15 @@ mod tests {
     #[test]
     fn oversized_cursor_is_not_copied_into_the_cycle_index() {
         let mut meter = Meter::new(CatalogLimits::default());
-        assert_eq!(meter.admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES + 1))), Err(CatalogError::CursorLimit));
+        assert_eq!(
+            meter.admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES + 1))),
+            Err(CatalogError::CursorLimit)
+        );
         assert!(meter.seen.is_empty());
         assert_eq!(meter.pages, 0);
-        meter.admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES))).unwrap();
+        meter
+            .admit::<serde_json::Value>(&[], Some(&"x".repeat(MAX_CURSOR_BYTES)))
+            .unwrap();
         assert_eq!(meter.seen.len(), 1);
     }
 
@@ -514,7 +617,10 @@ mod tests {
 
     #[test]
     fn collection_debug_does_not_expose_entries_or_tokens() {
-        let catalog = ManagedCatalog { entries: vec!["private-catalog-entry"], pages: 2 };
+        let catalog = ManagedCatalog {
+            entries: vec!["private-catalog-entry"],
+            pages: 2,
+        };
         assert_eq!(catalog.entries(), &["private-catalog-entry"]);
         assert_eq!(catalog.page_count(), 2);
         assert!(!format!("{catalog:?}").contains("private-catalog-entry"));

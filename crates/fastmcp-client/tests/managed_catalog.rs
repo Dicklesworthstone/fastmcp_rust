@@ -20,7 +20,9 @@ use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, Tl
 use fastmcp_client::http_auth::managed::client::{
     CatalogError, CatalogLimits, ManagedHttpClient, ManagedHttpClientError,
 };
-use fastmcp_client::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
+use fastmcp_client::http_auth::managed::{
+    ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy,
+};
 use fastmcp_client::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 use fastmcp_client::{ClientBuilder, ClientProtocolPlan, ProtocolPolicy};
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
@@ -84,12 +86,15 @@ fn pair<'a, L: Future + 'a, R: Future + 'a>(
 }
 
 fn encode(value: &str) -> String {
-    value.bytes().map(|byte| match byte {
-        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-            char::from(byte).to_string()
-        }
-        byte => format!("%{byte:02X}"),
-    }).collect()
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 fn decode(value: &str) -> String {
     let mut bytes = value.bytes();
@@ -119,10 +124,17 @@ async fn callback(authorization: CanonicalHttpUrl, issuer: String) -> Result<(),
     let fields = form(authorization.query().unwrap());
     assert_eq!(fields["code_challenge_method"], "S256");
     let redirect = url(&fields["redirect_uri"]);
-    let authority = redirect.as_str().strip_prefix("http://").unwrap()
-        .split('/').next().unwrap().to_owned();
+    let authority = redirect
+        .as_str()
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
     let mut stream = TcpStream::connect(authority.clone())
-        .await.map_err(|_| OAuthError::TransportFailed)?;
+        .await
+        .map_err(|_| OAuthError::TransportFailed)?;
     stream.write_all(format!(
         "GET /oauth/callback?code=catalog-code&state={}&iss={} HTTP/1.1\r\nHost: {authority}\r\n\r\n",
         encode(&fields["state"]), encode(&issuer),
@@ -149,7 +161,11 @@ async fn read(stream: &mut Stream) -> (String, BTreeMap<String, String>, Vec<u8>
     let mut headers = BTreeMap::new();
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').unwrap();
-        assert!(headers.insert(name.to_ascii_lowercase(), value.trim().to_owned()).is_none());
+        assert!(
+            headers
+                .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                .is_none()
+        );
     }
     for name in ["cookie", "referer"] {
         assert!(!headers.contains_key(name));
@@ -192,7 +208,10 @@ impl Peer {
             tls: TlsAcceptorBuilder::new(
                 CertificateChain::from_pem(LEAF).unwrap(),
                 PrivateKey::from_pem(KEY).unwrap(),
-            ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
         }
     }
     fn origin(&self) -> String {
@@ -202,10 +221,24 @@ impl Peer {
         url(&format!("{}/mcp", self.origin()))
     }
     fn client(&self, session: ManagedOAuthSession, timeout: Duration) -> ManagedHttpClient {
-        let builder = ClientBuilder::new().protocol_plan(ClientProtocolPlan::http(
-            ProtocolPolicy::ModernOnly, Some(self.resource()), None, None,
-            "catalog-owner".into(), "catalog-trust".into(), "native-http".into(), 0, 0, 0,
-        ).unwrap()).http_resource_root_certificate(self.resource(), root()).unwrap();
+        let builder = ClientBuilder::new()
+            .protocol_plan(
+                ClientProtocolPlan::http(
+                    ProtocolPolicy::ModernOnly,
+                    Some(self.resource()),
+                    None,
+                    None,
+                    "catalog-owner".into(),
+                    "catalog-trust".into(),
+                    "native-http".into(),
+                    0,
+                    0,
+                    0,
+                )
+                .unwrap(),
+            )
+            .http_resource_root_certificate(self.resource(), root())
+            .unwrap();
         ManagedHttpClient::new(session, builder, timeout).unwrap()
     }
     async fn next(&self) -> (Stream, String, BTreeMap<String, String>, Vec<u8>) {
@@ -215,14 +248,26 @@ impl Peer {
         (stream, target, headers, body)
     }
     async fn login(&self, cx: &Cx) -> ManagedOAuthSession {
-        let oauth = OAuthClient::new(OAuthClientConfiguration::from_trusted_endpoints(
-            self.origin(), url(&format!("{}/authorize", self.origin())),
-            url(&format!("{}/token", self.origin())), self.resource(), "native-client",
-            vec!["read".to_owned()],
-        ).unwrap().with_extra_root_certificate(root()).unwrap());
+        let oauth = OAuthClient::new(
+            OAuthClientConfiguration::from_trusted_endpoints(
+                self.origin(),
+                url(&format!("{}/authorize", self.origin())),
+                url(&format!("{}/token", self.origin())),
+                self.resource(),
+                "native-client",
+                vec!["read".to_owned()],
+            )
+            .unwrap()
+            .with_extra_root_certificate(root())
+            .unwrap(),
+        );
         let (session, ()) = pair(
-            ManagedOAuthSession::authorize(cx, oauth, OAuthSessionPolicy::default(),
-                |authorization| callback(authorization, self.origin())),
+            ManagedOAuthSession::authorize(
+                cx,
+                oauth,
+                OAuthSessionPolicy::default(),
+                |authorization| callback(authorization, self.origin()),
+            ),
             async {
                 let (mut stream, target, headers, body) = self.next().await;
                 assert_eq!(target, "/token");
@@ -233,10 +278,16 @@ impl Peer {
                 assert_eq!(fields["code_verifier"].len(), 64);
                 assert_eq!(fields["resource"], self.resource().as_str());
                 assert_eq!(fields["client_id"], "native-client");
-                reply(&mut stream, 200, json!({"access_token":"catalog-access", "token_type":"Bearer",
-                    "expires_in":3600, "refresh_token":"catalog-refresh", "scope":"read"})).await;
+                reply(
+                    &mut stream,
+                    200,
+                    json!({"access_token":"catalog-access", "token_type":"Bearer",
+                    "expires_in":3600, "refresh_token":"catalog-refresh", "scope":"read"}),
+                )
+                .await;
             },
-        ).await;
+        )
+        .await;
         session.unwrap()
     }
     async fn request(&self, method: &str) -> (Stream, Value) {
@@ -245,7 +296,10 @@ impl Peer {
         assert_eq!(headers["authorization"], "Bearer catalog-access");
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["method"], method);
-        assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            FINAL_PROTOCOL_VERSION
+        );
         assert!(body.get("id").is_some());
         (stream, body)
     }
@@ -258,62 +312,141 @@ impl Peer {
             "ttlMs":0, "cacheScope":"private"
         }})).await;
     }
-    async fn page(&self, kind: Kind, cursor: Option<&str>, names: &[&str], next: Option<&str>) -> Value {
+    async fn page(
+        &self,
+        kind: Kind,
+        cursor: Option<&str>,
+        names: &[&str],
+        next: Option<&str>,
+    ) -> Value {
         let (mut stream, body) = self.request(kind.method()).await;
-        assert_eq!(body["params"].get("cursor"), cursor.map(|value| json!(value)).as_ref());
-        reply(&mut stream, 200, json!({"jsonrpc":"2.0", "id":body["id"],
-            "result":kind.page(names, next)})).await;
+        assert_eq!(
+            body["params"].get("cursor"),
+            cursor.map(|value| json!(value)).as_ref()
+        );
+        reply(
+            &mut stream,
+            200,
+            json!({"jsonrpc":"2.0", "id":body["id"],
+            "result":kind.page(names, next)}),
+        )
+        .await;
         body["id"].clone()
     }
     async fn no_more(&self, cx: &Cx) {
-        assert!(asupersync::time::timeout_at(
-            cx.now().saturating_add_nanos(100_000_000), self.listener.accept(),
-        ).await.is_err(), "unexpected refresh, discovery or page replay");
+        assert!(
+            asupersync::time::timeout_at(
+                cx.now().saturating_add_nanos(100_000_000),
+                self.listener.accept(),
+            )
+            .await
+            .is_err(),
+            "unexpected refresh, discovery or page replay"
+        );
     }
 }
 
 #[derive(Clone, Copy)]
-enum Kind { Tools, Resources, Templates, Prompts }
+enum Kind {
+    Tools,
+    Resources,
+    Templates,
+    Prompts,
+}
 impl Kind {
     fn method(self) -> &'static str {
         match self {
-            Self::Tools => "tools/list", Self::Resources => "resources/list",
-            Self::Templates => "resources/templates/list", Self::Prompts => "prompts/list",
+            Self::Tools => "tools/list",
+            Self::Resources => "resources/list",
+            Self::Templates => "resources/templates/list",
+            Self::Prompts => "prompts/list",
         }
     }
     fn page(self, names: &[&str], next: Option<&str>) -> Value {
         let mut value = json!({"resultType":"complete", "ttlMs":0, "cacheScope":"private"});
         let field = match self {
-            Self::Tools => "tools", Self::Resources => "resources",
-            Self::Templates => "resourceTemplates", Self::Prompts => "prompts",
+            Self::Tools => "tools",
+            Self::Resources => "resources",
+            Self::Templates => "resourceTemplates",
+            Self::Prompts => "prompts",
         };
-        value[field] = Value::Array(names.iter().map(|name| match self {
-            Self::Tools => json!({"name":name, "inputSchema":{"type":"object"}}),
-            Self::Resources => json!({"name":name, "uri":format!("note:///{name}")}),
-            Self::Templates => json!({"name":name, "uriTemplate":format!("note:///{name}/{{id}}")}),
-            Self::Prompts => json!({"name":name}),
-        }).collect());
-        if let Some(next) = next { value["nextCursor"] = json!(next); }
+        value[field] = Value::Array(
+            names
+                .iter()
+                .map(|name| match self {
+                    Self::Tools => json!({"name":name, "inputSchema":{"type":"object"}}),
+                    Self::Resources => json!({"name":name, "uri":format!("note:///{name}")}),
+                    Self::Templates => {
+                        json!({"name":name, "uriTemplate":format!("note:///{name}/{{id}}")})
+                    }
+                    Self::Prompts => json!({"name":name}),
+                })
+                .collect(),
+        );
+        if let Some(next) = next {
+            value["nextCursor"] = json!(next);
+        }
         value
     }
-    async fn all(self, client: &mut ManagedHttpClient, cx: &Cx, cancellation: &McpRequestCancellation,
-        limits: CatalogLimits) -> Result<(Vec<String>, usize), ManagedHttpClientError> {
+    async fn all(
+        self,
+        client: &mut ManagedHttpClient,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        limits: CatalogLimits,
+    ) -> Result<(Vec<String>, usize), ManagedHttpClientError> {
         match self {
             Self::Tools => {
-                let result = client.list_all_tools_with_cancellation(cx, cancellation, limits).await?;
-                Ok((result.entries().iter().map(|entry| entry.name.clone()).collect(), result.page_count()))
+                let result = client
+                    .list_all_tools_with_cancellation(cx, cancellation, limits)
+                    .await?;
+                Ok((
+                    result
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect(),
+                    result.page_count(),
+                ))
             }
             Self::Resources => {
-                let result = client.list_all_resources_with_cancellation(cx, cancellation, limits).await?;
-                Ok((result.entries().iter().map(|entry| entry.name.clone()).collect(), result.page_count()))
+                let result = client
+                    .list_all_resources_with_cancellation(cx, cancellation, limits)
+                    .await?;
+                Ok((
+                    result
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect(),
+                    result.page_count(),
+                ))
             }
             Self::Templates => {
-                let result = client.list_all_resource_templates_with_cancellation(cx, cancellation, limits).await?;
-                Ok((result.entries().iter().map(|entry| entry.name.clone()).collect(), result.page_count()))
+                let result = client
+                    .list_all_resource_templates_with_cancellation(cx, cancellation, limits)
+                    .await?;
+                Ok((
+                    result
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect(),
+                    result.page_count(),
+                ))
             }
             Self::Prompts => {
-                let result = client.list_all_prompts_with_cancellation(cx, cancellation, limits).await?;
-                Ok((result.entries().iter().map(|entry| entry.name.clone()).collect(), result.page_count()))
+                let result = client
+                    .list_all_prompts_with_cancellation(cx, cancellation, limits)
+                    .await?;
+                Ok((
+                    result
+                        .entries()
+                        .iter()
+                        .map(|entry| entry.name.clone())
+                        .collect(),
+                    result.page_count(),
+                ))
             }
         }
     }
@@ -328,15 +461,21 @@ fn all_four_catalogs_follow_opaque_cursors_and_preserve_page_order() {
             let session = peer.login(&cx).await;
             let mut client = peer.client(session.clone(), Duration::from_secs(30));
             let cancellation = McpRequestCancellation::new();
-            let (result, ()) = pair(kind.all(&mut client, &cx, &cancellation, CatalogLimits::default()), async {
-                peer.discovery().await;
-                let first = peer.page(kind, None, &["first"], Some("")).await;
-                let second = peer.page(kind, Some(""), &[], Some("opaque-雪%2F")).await;
-                let third = peer.page(kind, Some("opaque-雪%2F"), &["second"], None).await;
-                assert_ne!(first, second);
-                assert_ne!(second, third);
-                assert_ne!(first, third);
-            }).await;
+            let (result, ()) = pair(
+                kind.all(&mut client, &cx, &cancellation, CatalogLimits::default()),
+                async {
+                    peer.discovery().await;
+                    let first = peer.page(kind, None, &["first"], Some("")).await;
+                    let second = peer.page(kind, Some(""), &[], Some("opaque-雪%2F")).await;
+                    let third = peer
+                        .page(kind, Some("opaque-雪%2F"), &["second"], None)
+                        .await;
+                    assert_ne!(first, second);
+                    assert_ne!(second, third);
+                    assert_ne!(first, third);
+                },
+            )
+            .await;
             assert_eq!(result.unwrap(), (vec!["first".into(), "second".into()], 3));
             assert_eq!(client.cached_credential_generation(), Some(1));
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
@@ -348,7 +487,12 @@ fn all_four_catalogs_follow_opaque_cursors_and_preserve_page_order() {
 
 #[test]
 fn cycles_and_limits_never_publish_or_replay_a_partial_catalog() {
-    for failure in [CatalogError::CursorCycle, CatalogError::PageLimit, CatalogError::EntryLimit, CatalogError::ByteLimit] {
+    for failure in [
+        CatalogError::CursorCycle,
+        CatalogError::PageLimit,
+        CatalogError::EntryLimit,
+        CatalogError::ByteLimit,
+    ] {
         for reject in [false, true] {
             run(async {
                 let cx = Cx::current().unwrap();
@@ -356,20 +500,43 @@ fn cycles_and_limits_never_publish_or_replay_a_partial_catalog() {
                 let session = peer.login(&cx).await;
                 let mut client = peer.client(session.clone(), Duration::from_secs(30));
                 let limits = CatalogLimits::new(
-                    if reject && failure == CatalogError::PageLimit { 1 } else { 3 },
-                    if reject && failure == CatalogError::EntryLimit { 1 } else { 2 },
-                    if reject && failure == CatalogError::ByteLimit { 1 } else { 4096 },
-                ).unwrap();
+                    if reject && failure == CatalogError::PageLimit {
+                        1
+                    } else {
+                        3
+                    },
+                    if reject && failure == CatalogError::EntryLimit {
+                        1
+                    } else {
+                        2
+                    },
+                    if reject && failure == CatalogError::ByteLimit {
+                        1
+                    } else {
+                        4096
+                    },
+                )
+                .unwrap();
                 let (result, ()) = pair(client.list_all_tools(&cx, limits), async {
                     peer.discovery().await;
                     peer.page(Kind::Tools, None, &["first"], Some("next")).await;
-                    if !(reject && matches!(failure, CatalogError::PageLimit | CatalogError::ByteLimit)) {
-                        let next = if reject && failure == CatalogError::CursorCycle { Some("next") } else { None };
-                        peer.page(Kind::Tools, Some("next"), &["second"], next).await;
+                    if !(reject
+                        && matches!(failure, CatalogError::PageLimit | CatalogError::ByteLimit))
+                    {
+                        let next = if reject && failure == CatalogError::CursorCycle {
+                            Some("next")
+                        } else {
+                            None
+                        };
+                        peer.page(Kind::Tools, Some("next"), &["second"], next)
+                            .await;
                     }
-                }).await;
+                })
+                .await;
                 if reject {
-                    assert!(matches!(result, Err(ManagedHttpClientError::Catalog(error)) if error == failure));
+                    assert!(
+                        matches!(result, Err(ManagedHttpClientError::Catalog(error)) if error == failure)
+                    );
                     assert_eq!(client.cached_credential_generation(), None);
                 } else {
                     let result = result.unwrap();
@@ -395,22 +562,38 @@ fn stalled_page_observes_cancellation_logout_and_token_revocation() {
             let mut client = peer.client(session.clone(), Duration::from_secs(30));
             let cancellation = McpRequestCancellation::new();
             let (result, ()) = pair(
-                client.list_all_tools_with_cancellation(&cx, &cancellation, CatalogLimits::default()),
+                client.list_all_tools_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    CatalogLimits::default(),
+                ),
                 async {
                     peer.discovery().await;
                     peer.page(Kind::Tools, None, &["first"], Some("next")).await;
                     let (mut stream, request) = peer.request("tools/list").await;
                     assert_eq!(request["params"]["cursor"], "next");
                     match transition {
-                        0 => reply(&mut stream, 200, json!({"jsonrpc":"2.0", "id":request["id"],
-                            "result":Kind::Tools.page(&["second"], None)})).await,
-                        1 => { cancellation.cancel(); }
+                        0 => {
+                            reply(
+                                &mut stream,
+                                200,
+                                json!({"jsonrpc":"2.0", "id":request["id"],
+                            "result":Kind::Tools.page(&["second"], None)}),
+                            )
+                            .await
+                        }
+                        1 => {
+                            cancellation.cancel();
+                        }
                         2 => session.close(),
                         _ => snapshot.credential().revoke(),
                     }
-                    if transition != 0 { closed(&mut stream).await; }
+                    if transition != 0 {
+                        closed(&mut stream).await;
+                    }
                 },
-            ).await;
+            )
+            .await;
             match (transition, result) {
                 (0, Ok(result)) => assert_eq!(result.entries().len(), 2),
                 (1, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled)))
@@ -437,29 +620,38 @@ fn abandoning_a_partial_traversal_releases_the_socket_without_logging_out() {
         let session = peer.login(&cx).await;
         let mut client = peer.client(session.clone(), Duration::from_secs(30));
         let reached = McpRequestCancellation::new();
-        let ((), ()) = pair(async {
-            let mut operation = Box::pin(client.list_all_tools(&cx, CatalogLimits::default()));
-            let mut reached = std::pin::pin!(reached.cancelled());
-            poll_fn(|task| {
-                assert!(operation.as_mut().poll(task).is_pending());
-                reached.as_mut().poll(task)
-            }).await;
-            drop(operation);
-        }, async {
-            peer.discovery().await;
-            peer.page(Kind::Tools, None, &["first"], Some("next")).await;
-            let (mut stream, request) = peer.request("tools/list").await;
-            assert_eq!(request["params"]["cursor"], "next");
-            reached.cancel();
-            closed(&mut stream).await;
-        }).await;
+        let ((), ()) = pair(
+            async {
+                let mut operation = Box::pin(client.list_all_tools(&cx, CatalogLimits::default()));
+                let mut reached = std::pin::pin!(reached.cancelled());
+                poll_fn(|task| {
+                    assert!(operation.as_mut().poll(task).is_pending());
+                    reached.as_mut().poll(task)
+                })
+                .await;
+                drop(operation);
+            },
+            async {
+                peer.discovery().await;
+                peer.page(Kind::Tools, None, &["first"], Some("next")).await;
+                let (mut stream, request) = peer.request("tools/list").await;
+                assert_eq!(request["params"]["cursor"], "next");
+                reached.cancel();
+                closed(&mut stream).await;
+            },
+        )
+        .await;
         assert_eq!(client.cached_credential_generation(), None);
         assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
         peer.no_more(&cx).await;
-        let (result, ()) = pair(client.list_all_tools(&cx, CatalogLimits::default()), async {
-            peer.discovery().await;
-            peer.page(Kind::Tools, None, &["fresh"], None).await;
-        }).await;
+        let (result, ()) = pair(
+            client.list_all_tools(&cx, CatalogLimits::default()),
+            async {
+                peer.discovery().await;
+                peer.page(Kind::Tools, None, &["fresh"], None).await;
+            },
+        )
+        .await;
         assert_eq!(result.unwrap().entries()[0].name, "fresh");
         assert!(cx.checkpoint().is_ok());
     });
@@ -472,14 +664,21 @@ fn quiet_second_page_is_bounded_by_the_managed_operation_deadline() {
         let peer = Peer::new().await;
         let session = peer.login(&cx).await;
         let mut client = peer.client(session.clone(), Duration::from_secs(2));
-        let (result, ()) = pair(client.list_all_tools(&cx, CatalogLimits::default()), async {
-            peer.discovery().await;
-            peer.page(Kind::Tools, None, &["first"], Some("next")).await;
-            let (mut stream, request) = peer.request("tools/list").await;
-            assert_eq!(request["params"]["cursor"], "next");
-            closed(&mut stream).await;
-        }).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))));
+        let (result, ()) = pair(
+            client.list_all_tools(&cx, CatalogLimits::default()),
+            async {
+                peer.discovery().await;
+                peer.page(Kind::Tools, None, &["first"], Some("next")).await;
+                let (mut stream, request) = peer.request("tools/list").await;
+                assert_eq!(request["params"]["cursor"], "next");
+                closed(&mut stream).await;
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))
+        ));
         assert_eq!(client.cached_credential_generation(), None);
         assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
         assert!(cx.checkpoint().is_ok());
@@ -495,27 +694,37 @@ fn a_failed_second_page_is_not_success_or_permission_to_retry() {
             let peer = Peer::new().await;
             let session = peer.login(&cx).await;
             let mut client = peer.client(session.clone(), Duration::from_secs(30));
-            let (result, ()) = pair(client.list_all_tools(&cx, CatalogLimits::default()), async {
-                peer.discovery().await;
-                peer.page(Kind::Tools, None, &["first"], Some("private-next")).await;
-                let (mut stream, request) = peer.request("tools/list").await;
-                assert_eq!(request["params"]["cursor"], "private-next");
-                reply(&mut stream, if http_error { 401 } else { 200 }, json!({
+            let (result, ()) =
+                pair(
+                    client.list_all_tools(&cx, CatalogLimits::default()),
+                    async {
+                        peer.discovery().await;
+                        peer.page(Kind::Tools, None, &["first"], Some("private-next"))
+                            .await;
+                        let (mut stream, request) = peer.request("tools/list").await;
+                        assert_eq!(request["params"]["cursor"], "private-next");
+                        reply(&mut stream, if http_error { 401 } else { 200 }, json!({
                     "jsonrpc":"2.0", "id":request["id"], "error":{
                         "code":-32603, "message":"private-diagnostic", "data":"private-next"
                     }
                 })).await;
-            }).await;
+                    },
+                )
+                .await;
             let error = result.unwrap_err();
             assert!(matches!(error, ManagedHttpClientError::Request { .. }));
             assert!(!format!("{error:?} {error}").contains("private-"));
             assert_eq!(client.cached_credential_generation(), None);
             peer.no_more(&cx).await;
             // An explicit new operation is permitted, but must discover again.
-            let (result, ()) = pair(client.list_all_tools(&cx, CatalogLimits::default()), async {
-                peer.discovery().await;
-                peer.page(Kind::Tools, None, &["fresh"], None).await;
-            }).await;
+            let (result, ()) = pair(
+                client.list_all_tools(&cx, CatalogLimits::default()),
+                async {
+                    peer.discovery().await;
+                    peer.page(Kind::Tools, None, &["fresh"], None).await;
+                },
+            )
+            .await;
             assert_eq!(result.unwrap().entries()[0].name, "fresh");
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
         });
