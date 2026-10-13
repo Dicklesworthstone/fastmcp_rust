@@ -25,6 +25,7 @@ use super::{ManagedOAuthSession, OAuthSessionError, deadline_after};
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
+mod callbacks;
 mod cursors;
 use cursors::{CatalogKind, CursorLedger};
 #[cfg(feature = "tasks")]
@@ -514,8 +515,14 @@ impl ManagedHttpClient {
                                 },
                                 None => None,
                             };
-                            let result = call
-                                .dispatch(cx, cancellation, &mut client, wire_cursor.as_deref())
+                            let callbacks = callbacks::CallbackBoundary::new(
+                                &session,
+                                cancellation,
+                                deadline,
+                                &snapshot,
+                            );
+                            let result = callbacks
+                                .dispatch(cx, call, &mut client, wire_cursor.as_deref())
                                 .await;
                             let mut value = match result {
                                 Ok(value) => value,
