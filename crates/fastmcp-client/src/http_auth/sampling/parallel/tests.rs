@@ -208,8 +208,10 @@ fn host(count: usize, width: Option<usize>) -> Host {
         responses: VecDeque::from([
             response(Value::Array(
                 (0..count)
-                    .map(|index| json!({"type": "tool_use", "id": index.to_string(),
-                        "name": "lookup", "input": {}}))
+                    .map(|index| {
+                        json!({"type": "tool_use", "id": index.to_string(),
+                        "name": "lookup", "input": {}})
+                    })
                     .collect(),
             )),
             response(json!({"type": "text", "text": "done"})),
@@ -257,10 +259,7 @@ fn finish<F: Future>(future: Pin<&mut F>, wakes: &Arc<WakeCount>) -> F::Output {
     }
 }
 
-fn with_context(
-    budget: Budget,
-    test: impl FnOnce(&Cx, &TimerDriverHandle, &Arc<VirtualClock>),
-) {
+fn with_context(budget: Budget, test: impl FnOnce(&Cx, &TimerDriverHandle, &Arc<VirtualClock>)) {
     let clock = Arc::new(VirtualClock::new());
     let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
     let runtime = RuntimeBuilder::current_thread()
@@ -284,7 +283,11 @@ fn bounded_parallel_tools_overlap_and_reassemble_in_model_order() {
         let cancellation = McpRequestCancellation::new();
         let wakes = scheduled();
         let mut run = Box::pin(run_sampling_tool_loop(
-            cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+            cx,
+            &cancellation,
+            request(),
+            SamplingRunLimits::default(),
+            &mut host,
         ));
         assert!(pump(run.as_mut(), &wakes).is_pending());
         assert_eq!(counts.factories.load(Ordering::SeqCst), 2);
@@ -310,10 +313,15 @@ fn bounded_parallel_tools_overlap_and_reassemble_in_model_order() {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for index in 0..5 {
-            assert_eq!(requests[1]["messages"][2]["content"][index],
-                serde_json::to_value(answer(index)).unwrap());
+            assert_eq!(
+                requests[1]["messages"][2]["content"][index],
+                serde_json::to_value(answer(index)).unwrap()
+            );
         }
-        assert_eq!(serde_json::to_value(result.response).unwrap()["content"]["text"], "done");
+        assert_eq!(
+            serde_json::to_value(result.response).unwrap()["content"]["text"],
+            "done"
+        );
         assert_eq!(timer.pending_count(), 0);
     });
 }
@@ -327,7 +335,11 @@ fn no_parallel_executor_preserves_sequential_admission() {
         let cancellation = McpRequestCancellation::new();
         let wakes = scheduled();
         let mut run = Box::pin(run_sampling_tool_loop(
-            cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+            cx,
+            &cancellation,
+            request(),
+            SamplingRunLimits::default(),
+            &mut host,
         ));
         assert!(pump(run.as_mut(), &wakes).is_pending());
         assert_eq!(counts.factories.load(Ordering::SeqCst), 1);
@@ -372,14 +384,24 @@ fn complete_batch_admission_and_consent_precede_executor_selection() {
             let counts = Arc::clone(&host.counts);
             let cancellation = McpRequestCancellation::new();
             let mut run = Box::pin(run_sampling_tool_loop(
-                cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+                cx,
+                &cancellation,
+                request(),
+                SamplingRunLimits::default(),
+                &mut host,
             ));
             let error = finish(run.as_mut(), &scheduled()).err().unwrap();
-            assert_eq!(error, if invalid {
-                SamplingRunError::Protocol(SamplingToolLoopError::UnknownTool)
-            } else {
-                SamplingRunError::Host { stage: SamplingStage::Approval, reason: SamplingHostError::Denied }
-            });
+            assert_eq!(
+                error,
+                if invalid {
+                    SamplingRunError::Protocol(SamplingToolLoopError::UnknownTool)
+                } else {
+                    SamplingRunError::Host {
+                        stage: SamplingStage::Approval,
+                        reason: SamplingHostError::Denied,
+                    }
+                }
+            );
             assert_eq!(
                 counts.approvals.load(Ordering::SeqCst),
                 usize::from(!invalid)
@@ -401,12 +423,20 @@ fn failed_active_tool_drops_siblings_and_never_starts_queued_work() {
             let counts = Arc::clone(&host.counts);
             let cancellation = McpRequestCancellation::new();
             let mut run = Box::pin(run_sampling_tool_loop(
-                cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+                cx,
+                &cancellation,
+                request(),
+                SamplingRunLimits::default(),
+                &mut host,
             ));
             let error = finish(run.as_mut(), &scheduled()).err().unwrap();
-            assert_eq!(error, SamplingRunError::Host {
-                stage: SamplingStage::Tool, reason: SamplingHostError::Failed,
-            });
+            assert_eq!(
+                error,
+                SamplingRunError::Host {
+                    stage: SamplingStage::Tool,
+                    reason: SamplingHostError::Failed,
+                }
+            );
             assert_eq!(counts.factories.load(Ordering::SeqCst), 2);
             assert_eq!(counts.drops.load(Ordering::SeqCst), 2);
             assert_eq!(counts.active.load(Ordering::SeqCst), 0);
@@ -425,11 +455,17 @@ fn malformed_or_over_budget_results_refuse_before_refilling() {
             let (maximum, expected) = match variant {
                 0 => {
                     value["toolUseId"] = json!("foreign");
-                    (4096, SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolResults))
+                    (
+                        4096,
+                        SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolResults),
+                    )
                 }
                 1 => {
                     value["structuredContent"] = json!({"value": "not an integer"});
-                    (4096, SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolOutput))
+                    (
+                        4096,
+                        SamplingRunError::Protocol(SamplingToolLoopError::InvalidToolOutput),
+                    )
                 }
                 _ => (1, SamplingRunError::ToolResultByteLimit),
             };
@@ -438,9 +474,18 @@ fn malformed_or_over_budget_results_refuse_before_refilling() {
             let counts = Arc::clone(&host.counts);
             let cancellation = McpRequestCancellation::new();
             let limits = SamplingRunLimits::new(
-                SamplingToolLoopLimits::default(), Duration::from_secs(1), maximum,
-            ).unwrap();
-            let mut run = Box::pin(run_sampling_tool_loop(cx, &cancellation, request(), limits, &mut host));
+                SamplingToolLoopLimits::default(),
+                Duration::from_secs(1),
+                maximum,
+            )
+            .unwrap();
+            let mut run = Box::pin(run_sampling_tool_loop(
+                cx,
+                &cancellation,
+                request(),
+                limits,
+                &mut host,
+            ));
             assert_eq!(finish(run.as_mut(), &scheduled()).err(), Some(expected));
             assert_eq!(counts.factories.load(Ordering::SeqCst), 2);
             assert_eq!(counts.active.load(Ordering::SeqCst), 0);
@@ -458,7 +503,11 @@ fn cancellation_wakes_all_pending_tools_without_a_child_wakeup() {
             let cancellation = McpRequestCancellation::new();
             let wakes = scheduled();
             let mut run = Box::pin(run_sampling_tool_loop(
-                cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+                cx,
+                &cancellation,
+                request(),
+                SamplingRunLimits::default(),
+                &mut host,
             ));
             assert!(pump(run.as_mut(), &wakes).is_pending());
             assert_eq!(counts.active.load(Ordering::SeqCst), 2);
@@ -500,9 +549,18 @@ fn run_and_caller_deadlines_wake_the_pending_batch() {
             let cancellation = McpRequestCancellation::new();
             let wakes = scheduled();
             let limits = SamplingRunLimits::new(
-                SamplingToolLoopLimits::default(), Duration::from_millis(10), 4096,
-            ).unwrap();
-            let mut run = Box::pin(run_sampling_tool_loop(cx, &cancellation, request(), limits, &mut host));
+                SamplingToolLoopLimits::default(),
+                Duration::from_millis(10),
+                4096,
+            )
+            .unwrap();
+            let mut run = Box::pin(run_sampling_tool_loop(
+                cx,
+                &cancellation,
+                request(),
+                limits,
+                &mut host,
+            ));
             assert!(pump(run.as_mut(), &wakes).is_pending());
             clock.advance(if parent { 5_000_000 } else { 10_000_000 });
             assert!(timer.process_timers() > 0);
@@ -527,7 +585,11 @@ fn dropping_a_polled_batch_retires_tools_timer_and_wakeups() {
         let cancellation = McpRequestCancellation::new();
         let wakes = scheduled();
         let mut run = Box::pin(run_sampling_tool_loop(
-            cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+            cx,
+            &cancellation,
+            request(),
+            SamplingRunLimits::default(),
+            &mut host,
         ));
         assert!(pump(run.as_mut(), &wakes).is_pending());
         drop(run);
@@ -553,12 +615,18 @@ fn mid_poll_cancellation_prevents_later_callback_construction() {
     for ready in [false, true] {
         with_context(Budget::INFINITE, |cx, _, _| {
             let mut host = host(3, Some(3));
-            host.controls[0].cancel_on_poll.store(true, Ordering::SeqCst);
+            host.controls[0]
+                .cancel_on_poll
+                .store(true, Ordering::SeqCst);
             host.controls[0].ready.store(ready, Ordering::SeqCst);
             let counts = Arc::clone(&host.counts);
             let cancellation = McpRequestCancellation::new();
             let mut run = Box::pin(run_sampling_tool_loop(
-                cx, &cancellation, request(), SamplingRunLimits::default(), &mut host,
+                cx,
+                &cancellation,
+                request(),
+                SamplingRunLimits::default(),
+                &mut host,
             ));
             assert_eq!(
                 finish(run.as_mut(), &scheduled()).err(),

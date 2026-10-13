@@ -238,10 +238,7 @@ impl DpopKey {
         if target.as_str().len() > MAX_DPOP_TARGET_BYTES {
             return Err(DpopError::TargetTooLong);
         }
-        if method.is_empty()
-            || method.len() > 64
-            || !method.bytes().all(is_http_token_byte)
-        {
+        if method.is_empty() || method.len() > 64 || !method.bytes().all(is_http_token_byte) {
             return Err(DpopError::InvalidMethod);
         }
         if issued_at > i64::MAX as u64 {
@@ -309,8 +306,20 @@ fn is_http_token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
         || matches!(
             byte,
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-'
-                | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
         )
 }
 
@@ -341,7 +350,13 @@ mod tests {
         let target = url("https://mcp.example/api?tenant=one&cursor=two");
         let nonce = DpopNonce::new("server-nonce").unwrap();
         let proof = key
-            .proof_at("POST", &target, Some("mF_9.B5f-4.1JqM"), Some(&nonce), 1700000000)
+            .proof_at(
+                "POST",
+                &target,
+                Some("mF_9.B5f-4.1JqM"),
+                Some(&nonce),
+                1700000000,
+            )
             .unwrap();
         let (header, claims, signature, input) = decoded(&proof);
         assert_eq!(header["typ"], "dpop+jwt");
@@ -373,13 +388,22 @@ mod tests {
         let key = DpopKey::generate().unwrap();
         let target = url("https://issuer.example/token");
         let first = key.proof_at("POST", &target, None, None, 7).unwrap();
-        let second = key.clone().proof_at("POST", &target, None, None, 7).unwrap();
+        let second = key
+            .clone()
+            .proof_at("POST", &target, None, None, 7)
+            .unwrap();
         let (_, first, _, _) = decoded(&first);
         let (_, second, _, _) = decoded(&second);
         assert!(first.get("ath").is_none());
         assert!(first.get("nonce").is_none());
         assert_ne!(first["jti"], second["jti"]);
-        assert_eq!(URL_SAFE_NO_PAD.decode(first["jti"].as_str().unwrap()).unwrap().len(), 32);
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(first["jti"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            32
+        );
         assert_eq!(key.thumbprint(), key.clone().thumbprint());
     }
 
@@ -387,21 +411,36 @@ mod tests {
     fn dpop_rfc7638_thumbprint_matches_independent_p256_vector() {
         // Test-only scalar 1, encoded by an independent PKCS#8 implementation.
         // Never use this publicly known private key outside this test.
-        let bytes = URL_SAFE_NO_PAD.decode(concat!(
-            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGhRANCAARrF9Hy4SxCR_i85uVjpEDydwN9",
-            "gS3rM6D0oTlF2JjClk_jQuL-Gn-bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1"
-        )).unwrap();
+        let bytes = URL_SAFE_NO_PAD
+            .decode(concat!(
+                "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg",
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGhRANCAARrF9Hy4SxCR_i85uVjpEDydwN9",
+                "gS3rM6D0oTlF2JjClk_jQuL-Gn-bjufrSnwPnhYrzjNXazFezsu2QGg3v1H1"
+            ))
+            .unwrap();
         let key = DpopKey::from_pkcs8(&bytes).unwrap();
-        assert_eq!(key.thumbprint(), "xx0BcA-wMohw8atYDJOe6peGModklG2wRHBlXHMvl0M");
-        assert_eq!(key.public_jwk()["x"], "axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpY");
-        assert_eq!(key.public_jwk()["y"], "T-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU");
+        assert_eq!(
+            key.thumbprint(),
+            "xx0BcA-wMohw8atYDJOe6peGModklG2wRHBlXHMvl0M"
+        );
+        assert_eq!(
+            key.public_jwk()["x"],
+            "axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpY"
+        );
+        assert_eq!(
+            key.public_jwk()["y"],
+            "T-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU"
+        );
     }
 
     #[test]
     fn dpop_rejects_cleartext_targets_including_loopback() {
         let key = DpopKey::generate().unwrap();
-        for target in ["http://mcp.example/api", "http://localhost:8080/api", "http://127.0.0.1/api"] {
+        for target in [
+            "http://mcp.example/api",
+            "http://localhost:8080/api",
+            "http://127.0.0.1/api",
+        ] {
             assert_eq!(
                 key.token_endpoint_proof(&url(target), None).unwrap_err(),
                 DpopError::CleartextTarget
@@ -414,19 +453,38 @@ mod tests {
         let key = DpopKey::generate().unwrap();
         let target = url("https://mcp.example/api");
         for method in ["", "POST GET", "POST\r\nInjected: yes", "méthod"] {
-            assert_eq!(key.proof_at(method, &target, None, None, 7).unwrap_err(), DpopError::InvalidMethod);
+            assert_eq!(
+                key.proof_at(method, &target, None, None, 7).unwrap_err(),
+                DpopError::InvalidMethod
+            );
         }
         for token in ["", "with space", "token\n", "é", "a=b"] {
-            assert_eq!(key.resource_proof("POST", &target, token, None).unwrap_err(), DpopError::InvalidAccessToken);
+            assert_eq!(
+                key.resource_proof("POST", &target, token, None)
+                    .unwrap_err(),
+                DpopError::InvalidAccessToken
+            );
         }
-        assert_eq!(key.proof_at("POST", &target, None, None, u64::MAX).unwrap_err(), DpopError::InvalidTimestamp);
+        assert_eq!(
+            key.proof_at("POST", &target, None, None, u64::MAX)
+                .unwrap_err(),
+            DpopError::InvalidTimestamp
+        );
         let proof = key.proof_at("custom", &target, None, None, 7).unwrap();
         assert_eq!(decoded(&proof).1["htm"], "custom");
     }
 
     #[test]
     fn dpop_nonce_admission_is_bounded_and_does_not_normalize() {
-        for nonce in ["", "has space", "has\"quote", "has\\slash", "bad\r\n", "é", "\u{7f}"] {
+        for nonce in [
+            "",
+            "has space",
+            "has\"quote",
+            "has\\slash",
+            "bad\r\n",
+            "é",
+            "\u{7f}",
+        ] {
             assert_eq!(DpopNonce::new(nonce).unwrap_err(), DpopError::InvalidNonce);
         }
         assert!(DpopNonce::new(&"n".repeat(MAX_DPOP_NONCE_BYTES)).is_ok());
@@ -438,10 +496,18 @@ mod tests {
 
     #[test]
     fn dpop_key_import_is_bounded_and_diagnostics_are_redacted() {
-        assert_eq!(DpopKey::from_pkcs8(&[]).unwrap_err(), DpopError::InvalidPrivateKey);
-        assert_eq!(DpopKey::from_pkcs8(&vec![0; MAX_DPOP_PKCS8_BYTES + 1]).unwrap_err(), DpopError::InvalidPrivateKey);
+        assert_eq!(
+            DpopKey::from_pkcs8(&[]).unwrap_err(),
+            DpopError::InvalidPrivateKey
+        );
+        assert_eq!(
+            DpopKey::from_pkcs8(&vec![0; MAX_DPOP_PKCS8_BYTES + 1]).unwrap_err(),
+            DpopError::InvalidPrivateKey
+        );
         let key = DpopKey::generate().unwrap();
-        let proof = key.token_endpoint_proof(&url("https://issuer.example/token"), None).unwrap();
+        let proof = key
+            .token_endpoint_proof(&url("https://issuer.example/token"), None)
+            .unwrap();
         assert!(!format!("{key:?}").contains(key.public_jwk()["x"].as_str().unwrap()));
         assert!(!format!("{proof:?}").contains(proof.as_str()));
         assert!(format!("{proof:?}").contains("<redacted>"));

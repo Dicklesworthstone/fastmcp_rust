@@ -83,17 +83,18 @@ impl CallbackBoundary {
     fn wrap(&self, mut handlers: ReverseRequestHandlers) -> ReverseRequestHandlers {
         if let Some(handler) = handlers.modern_sampling_create_message.take() {
             let boundary = self.clone();
-            handlers = handlers.with_modern_sampling_create_message(move |cx, cancelled, params| {
-                let boundary = boundary.clone();
-                let handler = handler.clone();
-                Box::pin(async move {
-                    // Invoke even the callback's synchronous constructor only
-                    // inside the guarded future, after the first admission check.
-                    boundary
-                        .run(cx, async move { handler(cx, cancelled, params).await })
-                        .await
-                })
-            });
+            handlers =
+                handlers.with_modern_sampling_create_message(move |cx, cancelled, params| {
+                    let boundary = boundary.clone();
+                    let handler = handler.clone();
+                    Box::pin(async move {
+                        // Invoke even the callback's synchronous constructor only
+                        // inside the guarded future, after the first admission check.
+                        boundary
+                            .run(cx, async move { handler(cx, cancelled, params).await })
+                            .await
+                    })
+                });
         }
         if let Some(handler) = handlers.modern_roots_list.take() {
             let boundary = self.clone();
@@ -143,9 +144,8 @@ impl CallbackBoundary {
                 reviewed,
                 review,
             } => {
-                let checked_review = |binding: &ParameterHeaderBinding| {
-                    self.approve(cx, || review(binding))
-                };
+                let checked_review =
+                    |binding: &ParameterHeaderBinding| self.approve(cx, || review(binding));
                 Call::Reviewed {
                     arguments,
                     reviewed,
@@ -210,30 +210,27 @@ mod tests {
             let closed = boundary.closed.clone();
             let calls = Arc::new(AtomicUsize::new(0));
             let count = calls.clone();
-            let handlers = boundary.wrap(
-                ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+            let handlers = boundary.wrap(ReverseRequestHandlers::new().with_modern_roots_list(
+                move |_, _, _| {
                     count.fetch_add(1, Ordering::SeqCst);
                     // This happens in the callback constructor, before it even
                     // returns its ready future, matching the same-poll gap.
                     if close {
                         closed.cancel();
                     }
-                    Box::pin(async {
-                        Ok(FinalEmbeddedRootsListResult { roots: vec![] })
-                    })
-                }),
-            );
-            let request = || {
-                FinalEmbeddedInputRequest::Roots(serde_json::from_str("{}").unwrap())
-            };
+                    Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
+                },
+            ));
+            let request = || FinalEmbeddedInputRequest::Roots(serde_json::from_str("{}").unwrap());
             let mut answer = Box::pin(handlers.invoke_embedded_input_request_async(
                 &cx,
                 "roots",
                 request(),
                 ReverseRequestCancellation::new(),
             ));
-            let Poll::Ready(result) =
-                answer.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            let Poll::Ready(result) = answer
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
             else {
                 panic!("ready callback must settle in one poll");
             };
@@ -275,7 +272,9 @@ mod tests {
                 Ok(Owned(drops.clone()))
             }));
             assert!(matches!(
-                guarded.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                guarded
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Ready(Err(_))
             ));
             assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -321,8 +320,9 @@ mod tests {
             &cx,
             std::future::ready(Err::<(), _>(McpError::invalid_params("bad answer"))),
         ));
-        let Poll::Ready(Err(error)) =
-            guarded.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        let Poll::Ready(Err(error)) = guarded
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
         else {
             panic!("the original callback error must be returned");
         };
@@ -362,11 +362,9 @@ mod tests {
         let boundary = boundary(&cx);
         let empty = boundary.wrap(ReverseRequestHandlers::new());
         assert!(!empty.has_modern_handlers());
-        let roots = boundary.wrap(
-            ReverseRequestHandlers::new().with_modern_roots_list(|_, _, _| {
-                Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
-            }),
-        );
+        let roots = boundary.wrap(ReverseRequestHandlers::new().with_modern_roots_list(
+            |_, _, _| Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) }),
+        ));
         assert!(roots.modern_roots_list.is_some());
         assert!(roots.modern_sampling_create_message.is_none());
         assert!(roots.modern_elicitation_create.is_none());

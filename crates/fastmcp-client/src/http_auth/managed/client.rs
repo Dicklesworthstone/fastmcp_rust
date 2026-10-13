@@ -127,6 +127,11 @@ enum CallResult {
 }
 
 impl CallResult {
+    // The Result is the refusal of a task result where a core one is required.
+    // Without `tasks`, Core is the only variant and the match cannot fail, so
+    // only that build compiles to an unconditional `Ok`. Same shape as
+    // `select_record` in managed/subscriptions.rs.
+    #[cfg_attr(not(feature = "tasks"), allow(clippy::unnecessary_wraps))]
     fn into_core(self) -> Result<CoreResult, ManagedHttpClientError> {
         match self {
             Self::Core(value) => Ok(*value),
