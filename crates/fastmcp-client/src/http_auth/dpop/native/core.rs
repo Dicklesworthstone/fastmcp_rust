@@ -2,8 +2,10 @@
 //!
 //! The shared MCP decoder, not this transport, owns correlation, lossless
 //! result admission and the complete/input-required distinction. Each call
-//! performs one POST. No discovery, OAuth login, extension negotiation, SSE,
-//! automatic continuation, result cache or retry is installed by this API.
+//! performs one POST. The JSON-only methods remain terminal collectors;
+//! [`stream`] additionally delivers request-scoped SSE notifications. Neither
+//! path installs discovery, OAuth login, extension negotiation, a result cache,
+//! or retries. Explicit multi-round execution lives in [`interaction`].
 
 use std::fmt;
 use std::io::{self, Write};
@@ -22,6 +24,8 @@ use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, Man
 
 /// Explicit host-driven multi-round operations with one credential and deadline.
 pub mod interaction;
+/// Incremental JSON/SSE core responses under the original DPoP credential.
+pub mod stream;
 
 /// Diagnostics retain no peer message, body, nonce or authorization header.
 /// An admitted JSON-RPC error exposes only its numeric code through Protocol.
