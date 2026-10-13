@@ -32,6 +32,8 @@ use fastmcp_protocol::{
     AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, admit_final_schema,
 };
 
+use super::caller::with_caller;
+
 /// Bounded sampling-only resolution of final input-required response maps.
 pub mod inputs;
 /// Opt-in bounded concurrency for independently executable, approved tools.
@@ -262,13 +264,12 @@ pub async fn run_sampling_tool_loop<H: SamplingHost + ?Sized>(
                         })
                 })
                 .await?;
-                let parallel = {
-                    let _caller = Cx::set_current(Some(cx.clone()));
+                let parallel = with_caller(cx, || {
                     check(cx, cancellation, deadline)?;
                     let executor = host.parallel_tools();
                     check(cx, cancellation, deadline)?;
-                    executor
-                };
+                    Ok::<_, SamplingRunError>(executor)
+                })?;
                 let results = if let Some(executor) = parallel {
                     executor
                         .execute(
@@ -384,19 +385,32 @@ fn deadline(
     cancellation: &McpRequestCancellation,
     timeout: Duration,
 ) -> Result<Time, SamplingRunError> {
-    check(cx, cancellation, Time::from_nanos(u64::MAX))?;
-    if cx.timer_driver().is_none() {
+    with_caller(cx, || {
+        check(cx, cancellation, Time::from_nanos(u64::MAX))?;
+        require_timer(cx)?;
+        let nanos =
+            u64::try_from(timeout.as_nanos()).map_err(|_| SamplingRunError::InvalidLimits)?;
+        let end = cx
+            .now()
+            .as_nanos()
+            .checked_add(nanos)
+            .ok_or(SamplingRunError::InvalidLimits)?;
+        let deadline = Time::from_nanos(end);
+        check(cx, cancellation, deadline)?;
+        Ok(deadline)
+    })
+}
+
+// Called inside with_caller, before any timer registration or host effect.
+// Possession of a driver is not permission to use it. Never fall back to a
+// different runtime when the effective caller cannot drive a bounded wait.
+fn require_timer(cx: &Cx) -> Result<(), SamplingRunError> {
+    if cx.timer_driver().is_none()
+        || !Cx::current().is_some_and(|active| active.capabilities().time)
+    {
         return Err(SamplingRunError::RuntimeUnavailable);
     }
-    let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| SamplingRunError::InvalidLimits)?;
-    let end = cx
-        .now()
-        .as_nanos()
-        .checked_add(nanos)
-        .ok_or(SamplingRunError::InvalidLimits)?;
-    let deadline = Time::from_nanos(end);
-    check(cx, cancellation, deadline)?;
-    Ok(deadline)
+    Ok(())
 }
 
 fn check(
@@ -440,19 +454,21 @@ async fn within<T>(
     let mut caller_cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
     poll_fn(|task| {
-        let _caller = Cx::set_current(Some(cx.clone()));
-        check(cx, cancellation, deadline)?;
-        if cancelled.as_mut().poll(task).is_ready()
-            || caller_cancelled.as_mut().poll(task).is_ready()
-        {
-            return Poll::Ready(Err(SamplingRunError::Cancelled));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(SamplingRunError::TimedOut));
-        }
-        let result = future.as_mut().poll(task);
-        check(cx, cancellation, deadline)?;
-        result
+        with_caller(cx, || {
+            check(cx, cancellation, deadline)?;
+            require_timer(cx)?;
+            if cancelled.as_mut().poll(task).is_ready()
+                || caller_cancelled.as_mut().poll(task).is_ready()
+            {
+                return Poll::Ready(Err(SamplingRunError::Cancelled));
+            }
+            if sleep.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(SamplingRunError::TimedOut));
+            }
+            let result = future.as_mut().poll(task);
+            check(cx, cancellation, deadline)?;
+            result
+        })
     })
     .await
 }
@@ -479,3 +495,6 @@ async fn cooperate(
     )
     .await
 }
+
+#[cfg(test)]
+mod authority;

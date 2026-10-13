@@ -26,6 +26,8 @@ use std::time::Instant;
 
 use fastmcp_core::{AccessToken, McpRequestCancellation};
 
+mod caller;
+
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
 /// Explicit DPoP proof, credential, and nonce handling for caller-owned HTTPS I/O.
