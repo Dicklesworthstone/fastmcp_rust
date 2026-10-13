@@ -46,7 +46,7 @@ impl CallbackBoundary {
         }
     }
 
-    fn check(&self, cx: &Cx) -> McpResult<()> {
+    pub(super) fn check(&self, cx: &Cx) -> McpResult<()> {
         if self.closed.is_cancel_requested()
             || self.cancellation.is_cancel_requested()
             || self.revoked.is_cancel_requested()
@@ -151,11 +151,11 @@ impl CallbackBoundary {
                     reviewed,
                     review: &checked_review,
                 }
-                .dispatch(cx, &self.cancellation, client, wire_cursor)
+                .dispatch(cx, &self.cancellation, client, wire_cursor, self)
                 .await
             }
             call => {
-                call.dispatch(cx, &self.cancellation, client, wire_cursor)
+                call.dispatch(cx, &self.cancellation, client, wire_cursor, self)
                     .await
             }
         };

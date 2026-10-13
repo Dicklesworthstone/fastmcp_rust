@@ -26,7 +26,9 @@ use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
 mod callbacks;
+mod catalog;
 mod cursors;
+pub use catalog::{CatalogError, CatalogLimits, ManagedCatalog};
 use cursors::{CatalogKind, CursorLedger};
 #[cfg(feature = "tasks")]
 mod tasks;
@@ -41,6 +43,8 @@ pub enum ManagedHttpClientError {
     Request {
         code: Option<McpErrorCode>,
     },
+    /// A complete catalog exceeded its bounds or failed continuation admission.
+    Catalog(CatalogError),
     /// A cursor cannot cross a reconnect or a credential-generation change.
     CatalogGenerationChanged,
     /// The cursor was not issued by this client's current catalog traversal.
@@ -59,6 +63,10 @@ impl fmt::Debug for ManagedHttpClientError {
             Self::Request { code } => f
                 .debug_struct("ManagedHttpClientError::Request")
                 .field("code", code)
+                .finish(),
+            Self::Catalog(error) => f
+                .debug_tuple("ManagedHttpClientError::Catalog")
+                .field(error)
                 .finish(),
             Self::CatalogGenerationChanged => {
                 f.write_str("ManagedHttpClientError::CatalogGenerationChanged")
@@ -81,6 +89,7 @@ impl fmt::Display for ManagedHttpClientError {
             Self::Session(_) => "managed OAuth operation failed",
             Self::Connection => "authenticated MCP discovery failed",
             Self::Request { .. } => "authenticated MCP request failed; not replayed",
+            Self::Catalog(error) => return fmt::Display::fmt(error, f),
             Self::CatalogGenerationChanged => {
                 "catalog credential generation changed; restart listing without a cursor"
             }
@@ -99,6 +108,12 @@ impl std::error::Error for ManagedHttpClientError {}
 impl From<OAuthSessionError> for ManagedHttpClientError {
     fn from(error: OAuthSessionError) -> Self {
         Self::Session(error)
+    }
+}
+
+impl From<CatalogError> for ManagedHttpClientError {
+    fn from(error: CatalogError) -> Self {
+        Self::Catalog(error)
     }
 }
 
@@ -122,19 +137,17 @@ struct Connection {
 // escape hatch for raw clients, callbacks or credential-bearing stream owners.
 enum CallResult {
     Core(Box<CoreResult>),
+    Catalog(Result<catalog::Collected, ManagedHttpClientError>),
     #[cfg(feature = "tasks")]
     Task(Box<tasks::TaskResult>),
 }
 
 impl CallResult {
-    // The Result is the refusal of a task result where a core one is required.
-    // Without `tasks`, Core is the only variant and the match cannot fail, so
-    // only that build compiles to an unconditional `Ok`. Same shape as
-    // `select_record` in managed/subscriptions.rs.
-    #[cfg_attr(not(feature = "tasks"), allow(clippy::unnecessary_wraps))]
+    // Catalog and task results cannot be returned by a single-core-call API.
     fn into_core(self) -> Result<CoreResult, ManagedHttpClientError> {
         match self {
             Self::Core(value) => Ok(*value),
+            Self::Catalog(_) => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -147,6 +160,12 @@ impl CallResult {
     ) -> Result<(), ManagedHttpClientError> {
         match self {
             Self::Core(value) => cursors.publish(kind, value),
+            Self::Catalog(Ok(_)) => {
+                // A completed traversal has no caller-visible continuation.
+                cursors.take(kind, None)?;
+                Ok(())
+            }
+            Self::Catalog(Err(_)) => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -555,6 +574,9 @@ impl ManagedHttpClient {
                                 .dispatch(cx, call, &mut client, wire_cursor.as_deref())
                                 .await;
                             let mut value = match result {
+                                // A failed traversal never restores its connection
+                                // or releases a successful partial catalog.
+                                Ok(CallResult::Catalog(Err(error))) => return Ok(Err(error)),
                                 Ok(value) => value,
                                 Err(error) => return Ok(Err(request_error(error))),
                             };
@@ -600,6 +622,7 @@ enum Call<'a> {
     Resources(Option<&'a str>),
     Templates(Option<&'a str>),
     Prompts(Option<&'a str>),
+    Catalog(CatalogKind, CatalogLimits),
     Tool {
         name: &'a str,
         arguments: Value,
@@ -626,6 +649,7 @@ impl<'a> Call<'a> {
             Self::Resources(cursor) => Some((CatalogKind::Resources, *cursor)),
             Self::Templates(cursor) => Some((CatalogKind::Templates, *cursor)),
             Self::Prompts(cursor) => Some((CatalogKind::Prompts, *cursor)),
+            Self::Catalog(kind, _) => Some((*kind, None)),
             _ => None,
         }
     }
@@ -636,12 +660,18 @@ impl<'a> Call<'a> {
         cancellation: &McpRequestCancellation,
         client: &mut HttpClient,
         wire_cursor: Option<&str>,
+        boundary: &callbacks::CallbackBoundary,
     ) -> Result<CallResult, HttpClientError> {
         let result = match self {
             Self::Tools(_) => client.list_tools(cx, wire_cursor).await,
             Self::Resources(_) => client.list_resources(cx, wire_cursor).await,
             Self::Templates(_) => client.list_resource_templates(cx, wire_cursor).await,
             Self::Prompts(_) => client.list_prompts(cx, wire_cursor).await,
+            Self::Catalog(kind, limits) => {
+                return Ok(CallResult::Catalog(
+                    Box::pin(catalog::collect(cx, boundary, client, kind, limits)).await,
+                ));
+            }
             Self::Tool { name, arguments } => {
                 client
                     .call_tool_with_cancellation(cx, cancellation, name, arguments)
