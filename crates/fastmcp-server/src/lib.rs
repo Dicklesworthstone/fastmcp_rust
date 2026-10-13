@@ -36351,6 +36351,58 @@ mod lib_unit_tests {
         );
     }
 
+    /// `ping` is spec-required, and the stateless MODERN path had exactly one
+    /// test covering it anywhere in the tree: a case inside
+    /// `builder::tests::proxy_registration_tests` which answers -32601 "Method
+    /// not found" under `--all-features`. That test runs against a
+    /// proxy-registered server and dispatches both eras at once, so it cannot
+    /// separate "the stateless table does not claim ping" from "proxy
+    /// registration displaced it". This isolates that one variable: the same
+    /// request shape, including the modern `_meta`, against a PLAIN server.
+    ///
+    /// The expected result is not invented here. It is the expectation that
+    /// existing test already asserts, and `_meta` carrying the 2026-07-28
+    /// protocol version is what makes this the modern route rather than the
+    /// exact-2024 one, which passes there.
+    ///
+    /// `dispatch_stateless_listen_is_not_method_not_found` above is the
+    /// companion that makes a -32601 here meaningful: it establishes that this
+    /// dispatch names an unclaimed method with MethodNotFound and names a
+    /// claimed-but-unsupported one with a specific diagnostic instead.
+    #[test]
+    fn dispatch_stateless_modern_ping_answers_an_empty_object() {
+        let server = Server::new("stateless-modern-ping", "1.0.0").build();
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 927, InboundRequestTransport::Memory);
+        let mut request = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 927_i64);
+        request
+            .params
+            .as_mut()
+            .expect("the ping request retains its object parameters")
+            .as_object_mut()
+            .expect("the ping parameters remain an object")
+            .insert(
+                "_meta".to_owned(),
+                serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }),
+            );
+        let response = block_on(server.dispatch_stateless(&inbound, &request))
+            .expect("ping with an id must produce a JSON-RPC response");
+        assert_eq!(
+            response.result,
+            Some(serde_json::json!({})),
+            "a stateless modern ping answers an empty object; error was {:?}",
+            response.error
+        );
+        assert!(
+            response.error.is_none(),
+            "a stateless modern ping carries no error: {:?}",
+            response.error
+        );
+    }
+
     #[test]
     fn open_subscription_listen_receives_stateless_catalog_mutation() {
         let server = Server::new("in-process-listen", "1.0.0")
