@@ -430,6 +430,31 @@ impl ManagedHttpClient {
             .await
     }
 
+    /// Completes one prompt or resource-template argument under this login.
+    ///
+    /// Acquisition, discovery and completion share the managed operation's
+    /// deadline and credential lifetime. This returns only a completed result;
+    /// no raw client or response stream can outlive the selected credential.
+    pub async fn complete(
+        &mut self,
+        cx: &Cx,
+        params: crate::CompletionParams,
+    ) -> Result<CoreResult, ManagedHttpClientError> {
+        self.complete_with_cancellation(cx, &McpRequestCancellation::new(), params)
+            .await
+    }
+
+    /// Completes an argument with caller-owned, operation-local cancellation.
+    /// Cancelling or abandoning completion does not close the shared login.
+    pub async fn complete_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: crate::CompletionParams,
+    ) -> Result<CoreResult, ManagedHttpClientError> {
+        self.perform(cx, cancellation, Call::Complete(params)).await
+    }
+
     async fn perform(
         &mut self,
         cx: &Cx,
@@ -580,6 +605,7 @@ enum Call<'a> {
         review: &'a (dyn Fn(&ParameterHeaderBinding) -> bool + Send + Sync),
     },
     Read(&'a str),
+    Complete(crate::CompletionParams),
     Prompt {
         name: &'a str,
         arguments: HashMap<String, String>,
@@ -632,6 +658,7 @@ impl<'a> Call<'a> {
                     .await
             }
             Self::Read(uri) => client.read_resource(cx, uri).await,
+            Self::Complete(params) => client.complete(cx, params).await,
             Self::Prompt { name, arguments } => client.get_prompt(cx, name, arguments).await,
             #[cfg(feature = "tasks")]
             Self::Task(call) => {
@@ -647,3 +674,30 @@ impl<'a> Call<'a> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod completion_api_tests {
+    use super::*;
+    use std::future::Future;
+
+    fn completed_result(_: impl Future<Output = Result<CoreResult, ManagedHttpClientError>>) {}
+
+    // Compile the public call shapes without acquiring a grant or constructing
+    // an unguarded/raw client. No concrete parameter layout is duplicated here.
+    #[test]
+    fn completion_returns_a_typed_managed_result() {
+        let _check = |client: &mut ManagedHttpClient, cx: &Cx, params: crate::CompletionParams| {
+            completed_result(client.complete(cx, params));
+        };
+    }
+
+    #[test]
+    fn completion_accepts_caller_owned_cancellation() {
+        let _check = |client: &mut ManagedHttpClient,
+                      cx: &Cx,
+                      cancellation: &McpRequestCancellation,
+                      params: crate::CompletionParams| {
+            completed_result(client.complete_with_cancellation(cx, cancellation, params));
+        };
+    }
+}
