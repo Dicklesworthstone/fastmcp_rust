@@ -9,6 +9,7 @@ use std::fmt;
 use std::future::poll_fn;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::task::Poll;
 use std::time::Duration;
 
 use asupersync::Cx;
@@ -28,6 +29,12 @@ use crate::http_auth::caller::with_caller;
 use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 use crate::http_executor::{MODERN_MCP_ACCEPT, ModernHttpResponseKind, validate_response_head};
 use crate::sse::{BoundedSseParser, SseLimits, SsePushError};
+
+// Bound ready-body work independently from retained bytes. Neither many empty
+// frames nor one large buffer may monopolize a caller-owned executor. A single
+// admitted JSON frame is still decoded synchronously under the core byte cap.
+const BYTES_PER_TURN: usize = 32 * 1024;
+const FRAMES_PER_TURN: usize = 32;
 
 /// Independent core, parser and no-progress limits for one explicit exchange.
 /// The native DPoP policy still bounds the complete HTTP body, including SSE
@@ -154,6 +161,8 @@ impl DpopHttpClient {
     /// Preparation, headers, body, observer work and EOF share the original
     /// credential/deadline. Cancellation or drop disposes the owned socket;
     /// no automatic remote cancellation POST is sent.
+    /// Ready body processing yields after bounded byte/frame quanta without
+    /// resetting either deadline or moving work to another task or runtime.
     #[allow(clippy::too_many_arguments)]
     pub async fn request_core_with_events<N>(
         &mut self,
@@ -392,7 +401,14 @@ where
     B::Data: Buf,
     N: FnMut(&ServerNotification) -> bool,
 {
+    let mut bytes_left = BYTES_PER_TURN;
+    let mut frames_left = FRAMES_PER_TURN;
     loop {
+        if bytes_left == 0 || frames_left == 0 {
+            cooperate(lifetime, &idle).await?;
+            bytes_left = BYTES_PER_TURN;
+            frames_left = FRAMES_PER_TURN;
+        }
         let frame = within(
             lifetime.cx, lifetime.cancellation, lifetime.session, lifetime.credential,
             idle.bounds(lifetime.bounds),
@@ -404,14 +420,50 @@ where
         let Some(frame) = frame else {
             return with_caller(lifetime.cx, || reader.finish(lifetime, &idle));
         };
+        // Empty data and trailer frames consume scheduling budget too, even
+        // though they cannot consume the raw-body byte budget.
+        frames_left -= 1;
         let Some(mut data) = frame.into_data() else { continue };
         while data.has_remaining() {
+            if bytes_left == 0 {
+                cooperate(lifetime, &idle).await?;
+                bytes_left = BYTES_PER_TURN;
+                frames_left = FRAMES_PER_TURN;
+            }
             let bytes = data.chunk();
-            with_caller(lifetime.cx, || reader.push(bytes, lifetime, &mut idle, observer))?;
-            let consumed = bytes.len();
+            let consumed = bytes.len().min(bytes_left);
+            if consumed == 0 {
+                // A broken Buf must not spin forever without advancing.
+                return Err(DpopHttpError::TransportFailed.into());
+            }
+            with_caller(lifetime.cx, || {
+                reader.push(&bytes[..consumed], lifetime, &mut idle, observer)
+            })?;
             data.advance(consumed);
+            bytes_left -= consumed;
         }
     }
+}
+
+async fn cooperate(lifetime: &Lifetime<'_>, idle: &Idle) -> Result<(), DpopHttpError> {
+    let mut yielded = false;
+    within(
+        lifetime.cx,
+        lifetime.cancellation,
+        lifetime.session,
+        lifetime.credential,
+        idle.bounds(lifetime.bounds),
+        poll_fn(|task| {
+            if yielded {
+                Poll::Ready(Ok(()))
+            } else {
+                yielded = true;
+                task.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }),
+    )
+    .await
 }
 
 #[cfg(test)]

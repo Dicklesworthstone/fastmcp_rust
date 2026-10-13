@@ -386,3 +386,235 @@ fn pending_body_and_pending_eof_are_woken_and_disposed_on_all_terminal_transitio
         }
     }
 }
+
+// These bodies deliberately never return Pending. Scheduling must come from
+// the production reader, not from a socket fixture happening to yield.
+struct ReadyBody {
+    frames: std::collections::VecDeque<Frame<asupersync::bytes::BytesCursor>>,
+    polls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Body for ReadyBody {
+    type Data = asupersync::bytes::BytesCursor;
+    type Error = ();
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let body = self.get_mut();
+        body.polls.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(body.frames.pop_front().map(Ok))
+    }
+}
+
+impl Drop for ReadyBody {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn data_frame(bytes: &[u8]) -> Frame<asupersync::bytes::BytesCursor> {
+    Frame::Data(asupersync::bytes::Bytes::copy_from_slice(bytes).reader())
+}
+
+#[test]
+fn large_ready_buffers_yield_without_changing_notifications_or_exact_results() {
+    fixture(|life, timer, _| {
+        let comment = format!(":{}\n\n", "x".repeat(BYTES_PER_TURN / 2 - 3));
+        let wire = format!("{}{}{}", event(CHANGE), comment.repeat(4), event(COMPLETE));
+        for frame_size in [wire.len(), 4093] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let body = ReadyBody {
+                frames: wire.as_bytes().chunks(frame_size).map(data_frame).collect(),
+                polls: Arc::clone(&polls),
+                drops: Arc::clone(&drops),
+            };
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let seen = std::cell::Cell::new(0);
+            let mut observer = |_: &ServerNotification| { seen.set(seen.get() + 1); true };
+            let mut reading = Box::pin(consume(
+                body, life, Idle::new(life.cx.now(), limits().idle),
+                reader(ModernHttpResponseKind::Sse, limits(), wire.len()), &mut observer,
+            ));
+            let mut result = None;
+            let mut suspensions = 0;
+            for _ in 0..8 {
+                let before = wakes.0.load(Ordering::SeqCst);
+                match reading.as_mut().poll(&mut Context::from_waker(&waker)) {
+                    Poll::Pending => {
+                        suspensions += 1;
+                        assert!(wakes.0.load(Ordering::SeqCst) > before);
+                        assert_eq!(seen.get(), 1, "early notification remains incremental");
+                        assert_eq!(timer.pending_count(), 1);
+                        if frame_size == wire.len() {
+                            assert_eq!(polls.load(Ordering::SeqCst), 1);
+                        }
+                    }
+                    Poll::Ready(outcome) => { result = Some(outcome.unwrap()); break; }
+                }
+            }
+            assert_eq!(suspensions, 2, "one large frame must yield internally too");
+            let encoded = result.expect("finite ready body must complete").encode().unwrap();
+            assert!(encoded.contains("900719925474099312345"));
+            assert!(encoded.contains("1.20e+4"));
+            assert_eq!(seen.get(), 1);
+            drop(reading);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(Arc::strong_count(&wakes), 2);
+        }
+    });
+}
+
+#[test]
+fn empty_ready_data_and_trailer_frames_cannot_evade_the_scheduling_budget() {
+    fixture(|life, timer, _| {
+        for trailers in [false, true] {
+            let mut frames: std::collections::VecDeque<_> = (0..2 * FRAMES_PER_TURN + 1)
+                .map(|_| {
+                    if trailers {
+                        // Synthetic Body stress case, not a claim that multiple
+                        // HTTP/1 trailer sections form a valid wire response.
+                        Frame::Trailers(asupersync::http::body::HeaderMap::new())
+                    } else {
+                        data_frame(b"")
+                    }
+                })
+                .collect();
+            let terminal = event(COMPLETE);
+            frames.push_back(data_frame(terminal.as_bytes()));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let body = ReadyBody { frames, polls: Arc::clone(&polls), drops: Arc::clone(&drops) };
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut observer = |_: &ServerNotification| panic!("terminal-only stream");
+            let mut reading = Box::pin(consume(
+                body, life, Idle::new(life.cx.now(), limits().idle),
+                reader(ModernHttpResponseKind::Sse, limits(), terminal.len()), &mut observer,
+            ));
+            for turn in 1..=2 {
+                let before = wakes.0.load(Ordering::SeqCst);
+                assert!(reading.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                assert_eq!(polls.load(Ordering::SeqCst), turn * FRAMES_PER_TURN);
+                assert!(wakes.0.load(Ordering::SeqCst) > before);
+            }
+            assert!(matches!(
+                reading.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Ok(_))
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 2 * FRAMES_PER_TURN + 3);
+            drop(reading);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+        }
+    });
+}
+
+#[test]
+fn a_cooperative_yield_keeps_cancellation_authority_and_the_original_idle_deadline() {
+    use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+    for action in 0..7 {
+        fixture(|life, timer, clock| {
+            // Exactly one quantum before the first possible observer effect.
+            let prefix = format!(":{}\n", "x".repeat(BYTES_PER_TURN - 2));
+            let wire = format!("{prefix}{}{}", event(CHANGE), event(COMPLETE));
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let body = ReadyBody {
+                frames: std::collections::VecDeque::from([data_frame(wire.as_bytes())]),
+                polls: Arc::clone(&polls),
+                drops: Arc::clone(&drops),
+            };
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut observer = |_: &ServerNotification| panic!("remaining frame must be withheld");
+            let mut reading = Box::pin(consume(
+                body, life, Idle::new(life.cx.now(), limits().idle),
+                reader(ModernHttpResponseKind::Sse, limits(), wire.len()), &mut observer,
+            ));
+            assert!(reading.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            wakes.0.store(0, Ordering::SeqCst);
+            match action {
+                0 => { life.cancellation.cancel(); }
+                1 => life.credential.revoke(),
+                2 => life.session.revoke(),
+                3 => life.cx.set_cancel_requested(true),
+                4 => { clock.advance(10_000_000_000); assert!(timer.process_timers() > 0); }
+                _ => {}
+            }
+            if action < 5 {
+                assert!(wakes.0.load(Ordering::SeqCst) > 0);
+                let outcome = reading.as_mut().poll(&mut Context::from_waker(&waker));
+                if action == 4 {
+                    assert!(matches!(outcome, Poll::Ready(Err(DpopStreamError::Core(
+                        DpopCoreError::Transport(DpopHttpError::TimedOut)
+                    )))));
+                } else {
+                    assert!(matches!(outcome, Poll::Ready(Err(_))));
+                }
+            } else if action == 5 {
+                let _restriction = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                assert!(matches!(
+                    reading.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(DpopStreamError::Core(DpopCoreError::Transport(
+                        DpopHttpError::RuntimeUnavailable
+                    ))))
+                ));
+            }
+            drop(reading);
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(Arc::strong_count(&wakes), 2);
+            wakes.0.store(0, Ordering::SeqCst);
+            life.cancellation.cancel();
+            life.credential.revoke();
+            life.session.revoke();
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        });
+    }
+}
+
+#[test]
+fn a_small_ready_response_finishes_without_an_unnecessary_yield() {
+    fixture(|life, timer, _| {
+        for kind in [ModernHttpResponseKind::Json, ModernHttpResponseKind::Sse] {
+            let wire = if kind == ModernHttpResponseKind::Json {
+                COMPLETE.to_owned()
+            } else {
+                event(COMPLETE)
+            };
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let body = ReadyBody {
+                frames: std::collections::VecDeque::from([data_frame(wire.as_bytes())]),
+                polls: Arc::clone(&polls),
+                drops: Arc::clone(&drops),
+            };
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut observer = |_: &ServerNotification| panic!("terminal-only stream");
+            let mut reading = Box::pin(consume(
+                body, life, Idle::new(life.cx.now(), limits().idle),
+                reader(kind, limits(), wire.len()), &mut observer,
+            ));
+            assert!(matches!(
+                reading.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Ok(_))
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+            drop(reading);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+        }
+    });
+}
