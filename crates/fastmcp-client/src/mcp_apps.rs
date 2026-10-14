@@ -1141,7 +1141,10 @@ impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
 /// MCP server transport; standard-reused methods are delegated to its policy.
 pub struct McpAppsWireHost<T, P> {
     transport: T,
-    _activation_proof: McpAppsActivationProof,
+    // No underscore, unlike `McpAppsHost`'s field of the same type: this one
+    // IS read, by `with_effects` recomposing the Host. bd-qj7m6 ruled that a
+    // used underscore-prefixed binding is renamed rather than allowed.
+    activation_proof: McpAppsActivationProof,
     admission: McpAppsBridgeAdmission,
     next_host_id: McpAppsHostIdAllocator,
     configuration: McpAppsWireHostConfiguration,
@@ -2065,7 +2068,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         let admission = activation_proof.admission();
         Self {
             transport,
-            _activation_proof: activation_proof,
+            activation_proof,
             admission,
             next_host_id: McpAppsHostIdAllocator::default(),
             configuration,
@@ -2097,13 +2100,6 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// When composed repeatedly, ordinary effects use the latest callbacks,
     /// while cancellation retains every prior cleanup and observer in order
     /// before invoking the new observer.
-    // The underscore on `_activation_proof` is load-bearing documentation: the
-    // proof is RETAINED and never inspected, and both constructors spell it
-    // that way. Moving it into the recomposed Host is the one place the field
-    // is read, which is what the lint sees; renaming it to satisfy the lint
-    // would delete the "held, never examined" signal from two struct
-    // definitions and three other sites to resolve a complaint about one.
-    #[allow(clippy::used_underscore_binding)]
     #[must_use]
     pub fn with_effects<E: McpAppsWireHostEffects>(
         self,
@@ -2111,7 +2107,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     ) -> McpAppsWireHost<T, McpAppsWireHostWithEffects<P, E>> {
         McpAppsWireHost {
             transport: self.transport,
-            _activation_proof: self._activation_proof,
+            activation_proof: self.activation_proof,
             admission: self.admission,
             next_host_id: self.next_host_id,
             configuration: self.configuration,
