@@ -191,7 +191,7 @@ impl From<OAuthSessionError> for ManagedTasksError {
     }
 }
 
-/// Incremental tool-call activity or the selected method's terminal result.
+/// Incremental operation activity or the selected method's terminal result.
 /// Update/cancel acknowledge the operation; they do not invent a task snapshot.
 pub enum ManagedTaskEvent {
     Notification(Box<ServerNotification>),
@@ -238,6 +238,9 @@ impl ManagedTasksClient {
     /// Validates before renewal/discovery, then dispatches one Task operation.
     /// The single deadline includes credential acquisition, discovery, response
     /// reads and caller pauses. No HTTP failure causes a retry or a downgrade.
+    /// All operation responses may be JSON or request-scoped SSE. Streamed
+    /// notifications never replace the method-owned terminal result, and a
+    /// terminal remains provisional until clean response-body EOF.
     pub async fn request_with_cancellation(
         &self,
         cx: &Cx,
@@ -428,6 +431,16 @@ enum TaskBody {
     Sse(Box<ManagedOAuthSseStream>),
 }
 
+// Parser syntax has its own bounded allowance; frame_bytes still caps the
+// actual JSON-RPC payload in decode_stream_record/response_source. A valid
+// exact-sized payload must not fail merely because SSE adds `data:` and LF.
+fn task_sse_limits(frame_bytes: usize) -> Result<SseLimits, ManagedTasksError> {
+    let line = frame_bytes.checked_add(16).ok_or(ManagedTasksError::InvalidLimits)?;
+    let event = frame_bytes.checked_add(64).ok_or(ManagedTasksError::InvalidLimits)?;
+    SseLimits::with_data_lines(line, event, 64, 4096)
+        .ok_or(ManagedTasksError::InvalidLimits)
+}
+
 /// One owned response. Pending reads take socket ownership before suspension;
 /// abandonment, error, cancellation or expiry cannot leave a reusable parser.
 pub struct ManagedTaskCall {
@@ -463,11 +476,9 @@ impl ManagedTaskCall {
         let body = match response.metadata().kind() {
             ModernHttpResponseKind::Json => TaskBody::Json(Box::new(response)),
             ModernHttpResponseKind::Sse => {
-                if !matches!(prepared.decoder, TaskDecoder::Tool(_)) {
-                    return Err(ManagedTasksError::InvalidResponse);
-                }
-                let framing = SseLimits::new(limits.frame_bytes, limits.frame_bytes, 64)
-                    .ok_or(ManagedTasksError::InvalidLimits)?;
+                // Representation never selects a different result family:
+                // the prepared decoder still owns get/update/cancel/tool semantics.
+                let framing = task_sse_limits(limits.frame_bytes)?;
                 TaskBody::Sse(Box::new(response.into_sse_stream(framing)?))
             }
             _ => return Err(ManagedTasksError::InvalidResponse),
@@ -828,11 +839,22 @@ fn encode_request(
     method: &str,
     id: &RequestId,
     params: Value,
-    name: Option<String>,
+    mut name: Option<String>,
     maximum: usize,
 ) -> Result<ModernHttpRequest, ManagedTasksError> {
     id.validate()
         .map_err(|_| ManagedTasksError::InvalidRequest)?;
+    if matches!(method, TASK_GET | TASK_UPDATE | TASK_CANCEL) {
+        // Mirror the exact opaque task identity in the actual body, not the
+        // JSON-RPC ID, credential identity or resource URL. Never repair a
+        // conflicting explicit mirror by silently changing the operation.
+        let task_id = params.get("taskId").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).ok_or(ManagedTasksError::InvalidRequest)?;
+        if name.as_deref().is_some_and(|value| value != task_id) {
+            return Err(ManagedTasksError::InvalidRequest);
+        }
+        name = Some(task_id.to_owned());
+    }
     let envelope = serde_json::json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
     let mut writer = BoundedWriter {
         bytes: Vec::new(),
@@ -1748,4 +1770,65 @@ mod tests {
                 assert!(cx.checkpoint().is_ok());
             });
     }
+
+    #[test]
+    fn lifecycle_routing_and_exact_sse_payloads_use_the_same_method_owned_identity() {
+        use crate::sse::BoundedSseParser;
+        for (request, result) in [
+            (ManagedTaskRequest::Get(task_id()),
+                r#"{"resultType":"complete","taskId":"task-one","status":"working","createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z","ttlMs":60000}"#),
+            (ManagedTaskRequest::Cancel(task_id()), r#"{"resultType":"complete"}"#),
+            (ManagedTaskRequest::Update { task: Box::new(input_task()),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+                r#"{"resultType":"complete"}"#),
+        ] {
+            let prepared = prepare("https://mcp.example/mcp", &meta(), &RequestId::Number(2),
+                request, ManagedTasksLimits::default()).unwrap();
+            let body: Value = serde_json::from_slice(prepared.wire.body()).unwrap();
+            let headers = prepared.wire.headers();
+            let mirrors: Vec<_> = headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name")).collect();
+            assert_eq!(mirrors.len(), 1);
+            assert_eq!(body["params"]["taskId"], "task-one");
+            assert_eq!(fastmcp_protocol::http_headers::decode_mcp_header_value(mirrors[0].1.as_bytes()).unwrap(), "task-one");
+            assert_eq!(prepared.wire.target(), "https://mcp.example/mcp");
+            let payload = envelope(result);
+            let framed = format!("data: {}\r\n\r\n", std::str::from_utf8(&payload).unwrap());
+            for split in 0..=framed.len() {
+                let mut parser = BoundedSseParser::new(task_sse_limits(payload.len()).unwrap());
+                let mut frames = Vec::new();
+                let mut accept = |frame: String| { frames.push(frame); Ok::<(), ()>(()) };
+                parser.push_with(&framed.as_bytes()[..split], &mut accept).unwrap();
+                parser.push_with(&framed.as_bytes()[split..], &mut accept).unwrap();
+                assert_eq!(frames.len(), 1);
+                assert_eq!(frames[0].as_bytes(), payload);
+                assert!(decode_stream_record(&prepared.decoder, frames[0].as_bytes(),
+                    &RequestId::Number(2), payload.len(), None, &mut None).is_ok());
+                assert!(decode_stream_record(&prepared.decoder, frames[0].as_bytes(),
+                    &RequestId::Number(3), payload.len(), None, &mut None).is_err());
+                assert!(decode_stream_record(&prepared.decoder, frames[0].as_bytes(),
+                    &RequestId::Number(2), payload.len() - 1, None, &mut None).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_encoder_refuses_a_conflicting_or_missing_task_mirror_source() {
+        for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
+            let params = json!({"taskId":"task-one"});
+            assert!(encode_request("https://mcp.example/mcp", method, &RequestId::Number(2),
+                params.clone(), None, 4096).is_ok());
+            assert!(matches!(encode_request("https://mcp.example/mcp", method, &RequestId::Number(2),
+                params, Some("task-two".to_owned()), 4096), Err(ManagedTasksError::InvalidRequest)));
+            for params in [json!({}), json!({"taskId":null}), json!({"taskId":""})] {
+                assert!(matches!(encode_request("https://mcp.example/mcp", method, &RequestId::Number(2),
+                    params, None, 4096), Err(ManagedTasksError::InvalidRequest)));
+            }
+        }
+        let discover = encode_request("https://mcp.example/mcp", "server/discover",
+            &RequestId::Number(1), json!({"_meta":meta()}), None, 4096).unwrap();
+        assert!(!discover.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+    }
 }
+
+#[cfg(all(test, feature = "native-tls-roots"))]
+mod lifecycle_tests;
