@@ -25,6 +25,7 @@ use crate::http_auth::rpc::interaction::{
 };
 use crate::http_auth::sampling::inputs::mixed::{CoreInputHost, CoreInputLimits};
 use crate::http_auth::sampling::inputs::mixed::session::{CoreInputSession, CoreInputSessionError};
+use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 
 /// One frozen policy for network rounds and typed host-input execution.
 /// The interaction's core byte and notification limits span every round.
@@ -87,6 +88,7 @@ impl DpopStreamHostLimits {
 pub enum DpopStreamHostError {
     Stream(DpopStreamError),
     Host(DpopHostError),
+    Headers(ToolHeaderDispatchError),
 }
 
 impl fmt::Display for DpopStreamHostError {
@@ -94,6 +96,7 @@ impl fmt::Display for DpopStreamHostError {
         match self {
             Self::Stream(error) => fmt::Display::fmt(error, f),
             Self::Host(error) => fmt::Display::fmt(error, f),
+            Self::Headers(error) => fmt::Display::fmt(error, f),
         }
     }
 }
@@ -136,6 +139,12 @@ impl From<CoreInputSessionError> for DpopStreamHostError {
     }
 }
 
+impl From<ToolHeaderDispatchError> for DpopStreamHostError {
+    fn from(error: ToolHeaderDispatchError) -> Self {
+        Self::Headers(error)
+    }
+}
+
 impl DpopHttpClient {
     /// Execute tools/call, resources/read or prompts/get through JSON/SSE
     /// input-required rounds with an explicitly supplied typed input host.
@@ -156,7 +165,8 @@ impl DpopHttpClient {
     /// lifetime and input deadline. Use distinct ID prefixes for concurrent
     /// logical exchanges. Neither correlation IDs nor prefixes are idempotency
     /// keys. Already committed host effects and delivered observations cannot
-    /// be recalled after a later failure.
+    /// be recalled after a later failure. Ordinary calls do not emit parameter
+    /// headers; use the explicit reviewed-header variant to enable disclosure.
     #[allow(clippy::too_many_arguments)]
     pub async fn execute_core_with_streaming_input_host<H, N>(
         &mut self,
@@ -166,6 +176,61 @@ impl DpopHttpClient {
         request: CoreRequest,
         id_prefix: String,
         limits: DpopStreamHostLimits,
+        host: &mut H,
+        observer: N,
+    ) -> Result<DpopHostResult, DpopStreamHostError>
+    where
+        H: CoreInputHost + ?Sized,
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        self.execute_streaming_input_host_configured(
+            cx, cancellation, credential, request, id_prefix, limits, None, host, observer,
+        ).await
+    }
+
+    /// Execute a tool conversation with one immutable, explicitly reviewed
+    /// parameter-header plan. The review remains bound to the complete HTTPS
+    /// resource and exact tool. Every POST projects only the original tool
+    /// arguments from its actual wire body, never host input or requestState.
+    ///
+    /// Header admission runs before proof signing and network I/O on both the
+    /// initial request and every continuation. A binding or projection failure
+    /// stops the whole operation; it never falls back to an unreviewed request.
+    /// This does not authorize invocation, refresh a stale schema, or permit
+    /// replay. The application owns review freshness and non-sensitive exposure
+    /// policy. All ordinary stream, input, cancellation and deadline bounds apply.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_core_with_streaming_input_host_and_headers<H, N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        request: CoreRequest,
+        id_prefix: String,
+        limits: DpopStreamHostLimits,
+        reviewed: &ReviewedToolHeaders,
+        host: &mut H,
+        observer: N,
+    ) -> Result<DpopHostResult, DpopStreamHostError>
+    where
+        H: CoreInputHost + ?Sized,
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        self.execute_streaming_input_host_configured(
+            cx, cancellation, credential, request, id_prefix, limits, Some(reviewed), host, observer,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_streaming_input_host_configured<H, N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        request: CoreRequest,
+        id_prefix: String,
+        limits: DpopStreamHostLimits,
+        reviewed: Option<&ReviewedToolHeaders>,
         host: &mut H,
         mut observer: N,
     ) -> Result<DpopHostResult, DpopStreamHostError>
@@ -190,7 +255,7 @@ impl DpopHttpClient {
             let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
             with_caller(cx, || lifetime.check(&idle))?;
             let (wire, decoder) = conversation.prepare(
-                self.resource().as_str(), self.policy.max_body_bytes,
+                self.resource().as_str(), self.policy.max_body_bytes, reviewed,
             )?;
             let completed = self.execute_prepared_core_stream(
                 cx, cancellation, credential,
@@ -202,7 +267,7 @@ impl DpopHttpClient {
                 Step::Complete(result) => {
                     check_live(cx, cancellation, &self.session, credential, bounds)?;
                     return Ok(DpopHostResult {
-                        result, usage: inputs.usage(), continuations: conversation.continuations,
+                        result: *result, usage: inputs.usage(), continuations: conversation.continuations,
                     });
                 }
                 Step::Input(input) => input,
@@ -212,7 +277,7 @@ impl DpopHttpClient {
             // Only the trusted input engine receives the opaque wire challenge.
             // The application's host sees preflighted descriptors, never state.
             let reply = within(cx, cancellation, &self.session, credential, bounds, async {
-                Ok(inputs.resolve(cx, *input.clone(), next_id, host).await)
+                Ok(inputs.resolve(cx, input.as_ref().clone(), next_id, host).await)
             }).await??;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             conversation.resume(&input, reply)?;
@@ -244,7 +309,7 @@ struct Conversation {
 }
 
 enum Step {
-    Complete(fastmcp_protocol::CoreResult),
+    Complete(Box<fastmcp_protocol::CoreResult>),
     Input(Box<InputRequiredResult>),
 }
 
@@ -266,10 +331,15 @@ impl Conversation {
         &self,
         target: &str,
         transport_limit: usize,
+        reviewed: Option<&ReviewedToolHeaders>,
     ) -> Result<(ModernHttpRequest, CoreDecoder), DpopStreamHostError> {
         let (wire, mut decoder) = prepare(
             target, self.current.clone(), self.request_id.clone(), self.limits.core(), transport_limit,
         )?;
+        let wire = match reviewed {
+            Some(reviewed) => wire.with_reviewed_tool_headers(reviewed)?,
+            None => wire,
+        };
         let bytes = self.usage.0.checked_add(wire.body().len())
             .ok_or(ManagedCoreError::RequestTooLarge)?;
         // Reserve the exact outgoing bytes in the shared decoder before I/O.
@@ -285,7 +355,7 @@ impl Conversation {
         }
         let Some(input) = input_required(&completed.result) else {
             self.usage = completed.usage;
-            return Ok(Step::Complete(completed.result));
+            return Ok(Step::Complete(Box::new(completed.result)));
         };
         if completed.usage.0 >= self.limits.core().total_bytes() {
             return Err(ManagedCoreError::ResponseByteLimit.into());
