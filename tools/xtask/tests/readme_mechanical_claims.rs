@@ -1181,8 +1181,24 @@ fn planted_dpop_consumer_is_detected_and_a_declaration_is_not() {
 // idea.
 // ---------------------------------------------------------------------------
 
-/// Blank out every `#[cfg(...test...)] mod|fn NAME { ... }` block, preserving
-/// byte length so nothing downstream shifts.
+/// Blank out every `#[cfg(...test...)]`-attributed item block, preserving byte
+/// length so nothing downstream shifts.
+///
+/// WHAT IT DOES AND DOES NOT CATCH, measured 2026-10-14 rather than assumed.
+/// It takes the next `{` within 400 bytes that no `;` precedes, so it handles
+/// an attributed `mod`, `fn`, `struct`, `enum`, `impl` or `trait` -- verified
+/// on a synthetic `#[cfg(test)] #[derive(Debug)] pub struct Gone { .. }`,
+/// which is stripped while its neighbours survive. It does NOT remove doc
+/// comments or `impl` bodies that merely NAME a gated type from outside the
+/// gate, so a mention count over the stripped text is an upper bound on
+/// production use rather than an exact one.
+///
+/// That imprecision does not reach the census below: the enforcement count is
+/// IDENTICAL (22 across 17) under this stripper and under a stricter one that
+/// also requires an item keyword, checked over all of
+/// `crates/fastmcp-client/src`. Left as is for that reason -- a "more correct"
+/// stripper whose own correctness is harder to establish would put a pinned
+/// number at risk for no measured gain.
 ///
 /// The predicate is any cfg whose text contains a bare `test` token, not the
 /// literal `#[cfg(test)]` alone. The narrow form missed
