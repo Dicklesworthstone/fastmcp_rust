@@ -107,7 +107,7 @@ fn notifications_are_incremental_and_every_byte_split_preserves_exact_terminal()
             reader.push(&wire.as_bytes()[..split], life, &mut idle, &mut observer).unwrap();
             reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observer).unwrap();
             assert_eq!(calls, 1);
-            let encoded = reader.finish(life, &idle).unwrap().encode().unwrap();
+            let encoded = reader.finish(life, &idle).unwrap().result.encode().unwrap();
             assert!(encoded.contains("900719925474099312345"));
             assert!(encoded.contains("1.20e+4"));
             assert!(encoded.find("\"z\"").unwrap() < encoded.find("\"a\"").unwrap());
@@ -323,7 +323,7 @@ fn json_and_sse_preserve_complete_and_input_required_without_automatic_continuat
                 let wire = if kind == ModernHttpResponseKind::Sse { event(source) } else { source.to_owned() };
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
                 reader.push(wire.as_bytes(), life, &mut idle, &mut |_| panic!("no callback expected")).unwrap();
-                let result = reader.finish(life, &idle).unwrap();
+                let result = reader.finish(life, &idle).unwrap().result;
                 assert_eq!(matches!(result, CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { .. })), input);
             }
         }
@@ -458,7 +458,7 @@ fn large_ready_buffers_yield_without_changing_notifications_or_exact_results() {
                 }
             }
             assert_eq!(suspensions, 2, "one large frame must yield internally too");
-            let encoded = result.expect("finite ready body must complete").encode().unwrap();
+            let encoded = result.expect("finite ready body must complete").result.encode().unwrap();
             assert!(encoded.contains("900719925474099312345"));
             assert!(encoded.contains("1.20e+4"));
             assert_eq!(seen.get(), 1);
@@ -615,6 +615,51 @@ fn a_small_ready_response_finishes_without_an_unnecessary_yield() {
             drop(reading);
             assert_eq!(drops.load(Ordering::SeqCst), 1);
             assert_eq!(timer.pending_count(), 0);
+        }
+    });
+}
+
+#[test]
+fn completed_stream_reports_inherited_and_new_usage_for_json_and_sse() {
+    fixture(|life, _, _| {
+        for kind in [ModernHttpResponseKind::Json, ModernHttpResponseKind::Sse] {
+            let mut decoder = CoreDecoder::for_request(request(), RequestId::Number(7), limits().core).unwrap();
+            decoder.resume_usage(512, 2).unwrap();
+            let mut reader = Reader::new(kind, decoder, limits(), 32768).unwrap();
+            let mut idle = Idle::new(life.cx.now(), limits().idle);
+            let wire = if kind == ModernHttpResponseKind::Sse {
+                format!("{}{}", event(CHANGE), event(COMPLETE))
+            } else { COMPLETE.to_owned() };
+            let mut seen = 0;
+            reader.push(wire.as_bytes(), life, &mut idle, &mut |_| { seen += 1; true }).unwrap();
+            let completed = reader.finish(life, &idle).unwrap();
+            let notes = usize::from(kind == ModernHttpResponseKind::Sse);
+            assert_eq!(seen, notes);
+            assert_eq!(completed.usage, (512 + COMPLETE.len() + notes * CHANGE.len(), 2 + notes));
+            assert!(completed.result.encode().unwrap().contains("1.20e+4"));
+        }
+    });
+}
+
+#[test]
+fn resumed_json_growth_is_refused_at_the_remaining_conversation_budget() {
+    fixture(|life, _, _| {
+        for exact in [false, true] {
+            let core = ManagedCoreLimits::new(8192, 8192, 8192, 0, Duration::from_secs(60)).unwrap();
+            let limits = DpopStreamLimits::new(core, Duration::from_secs(10)).unwrap();
+            let mut decoder = CoreDecoder::for_request(request(), RequestId::Number(7), core).unwrap();
+            let reserved = 8192 - COMPLETE.len() + usize::from(!exact);
+            decoder.resume_usage(reserved, 0).unwrap();
+            let mut reader = Reader::new(ModernHttpResponseKind::Json, decoder, limits, 32768).unwrap();
+            let mut idle = Idle::new(life.cx.now(), limits.idle);
+            let result = reader.push(COMPLETE.as_bytes(), life, &mut idle, &mut |_| panic!("JSON is terminal-only"));
+            if exact {
+                result.unwrap();
+                assert_eq!(reader.finish(life, &idle).unwrap().usage, (8192, 0));
+            } else {
+                assert!(matches!(result, Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit)))));
+                assert_eq!(reader.decoder.usage(), (reserved, 0));
+            }
         }
     });
 }

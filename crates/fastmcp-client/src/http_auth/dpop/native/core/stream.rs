@@ -5,6 +5,9 @@
 //! a second result, later notification or unfinished SSE tail rejects it.
 //! No response owner, proof, raw cursor or credential escapes to the observer.
 
+/// Streaming multi-round operations with an explicitly supplied typed input host.
+pub mod interaction;
+
 use std::fmt;
 use std::future::poll_fn;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -24,7 +27,7 @@ use super::super::{
     DpopCredential, DpopHttpClient, DpopHttpError, DpopSession, WaitBounds, check_live,
     require_runtime, resource_headers, within,
 };
-use super::{DpopCoreError, prepare};
+use super::{DpopCoreError, ModernHttpRequest, prepare};
 use crate::http_auth::caller::with_caller;
 use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 use crate::http_executor::{MODERN_MCP_ACCEPT, ModernHttpResponseKind, validate_response_head};
@@ -145,6 +148,22 @@ impl From<ManagedCoreError> for DpopStreamError {
     }
 }
 
+// An internal continuation can supply the original absolute deadline and a
+// fresh decoder carrying cumulative usage. It cannot select another transport,
+// credential or response parser. This is not a public retry capability.
+struct PreparedStream {
+    wire: ModernHttpRequest,
+    decoder: CoreDecoder,
+    limits: DpopStreamLimits,
+    bounds: WaitBounds,
+    idle: Idle,
+}
+
+struct CompletedStream {
+    result: CoreResult,
+    usage: (usize, usize),
+}
+
 impl DpopHttpClient {
     /// Perform one HTTPS core request and deliver notifications as they arrive.
     /// `observer` returns true to continue or false to stop. It must be brief,
@@ -184,6 +203,28 @@ impl DpopHttpClient {
         let (wire, decoder) = prepare(
             self.resource().as_str(), request, request_id, limits.core, self.policy.max_body_bytes,
         )?;
+        self.execute_prepared_core_stream(
+            cx, cancellation, credential,
+            PreparedStream { wire, decoder, limits, bounds, idle }, &mut observer,
+        ).await.map(|completed| completed.result)
+    }
+
+    // Both one-shot and host-driven calls execute here. A new network round
+    // never creates a new absolute deadline or resets the decoder's quotas.
+    async fn execute_prepared_core_stream<N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        prepared: PreparedStream,
+        observer: &mut N,
+    ) -> Result<CompletedStream, DpopStreamError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        let PreparedStream { wire, decoder, limits, bounds, idle } = prepared;
+        let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+        with_caller(cx, || lifetime.check(&idle))?;
         // Signing and header construction occur only after effective runtime
         // admission, inside the same guard as the first transport poll.
         let response = within(
@@ -223,7 +264,7 @@ impl DpopHttpClient {
             return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
         }
         let state = Reader::new(kind, decoder, limits, self.policy.max_body_bytes)?;
-        consume(response.body, &lifetime, idle, state, &mut observer).await
+        consume(response.body, &lifetime, idle, state, observer).await
     }
 }
 
@@ -298,12 +339,17 @@ impl Reader {
             ModernHttpResponseKind::Sse => WireBody::Sse(BoundedSseParser::new(limits.sse)),
             _ => return Err(ManagedCoreError::InvalidResponse.into()),
         };
+        // A resumed conversation can have less budget left than one frame.
+        // Refuse JSON growth at that remaining budget, not only at EOF.
+        let frame_limit = limits.core.frame_bytes().min(
+            limits.core.total_bytes().saturating_sub(decoder.usage().0),
+        );
         Ok(Self {
             body,
             decoder,
             terminal: None,
             wire_remaining: wire_limit,
-            frame_limit: limits.core.frame_bytes(),
+            frame_limit,
             reset_idle_on_progress: limits.reset_idle_on_progress,
         })
     }
@@ -371,7 +417,7 @@ impl Reader {
         Ok(())
     }
 
-    fn finish(mut self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CoreResult, DpopStreamError> {
+    fn finish(mut self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream, DpopStreamError> {
         lifetime.check(idle)?;
         let result = match self.body {
             WireBody::Json(bytes) => match self.decoder.admit(&bytes, false)? {
@@ -389,13 +435,13 @@ impl Reader {
             }
         };
         lifetime.check(idle)?;
-        Ok(result)
+        Ok(CompletedStream { result, usage: self.decoder.usage() })
     }
 }
 
 async fn consume<B, N>(
     mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader, observer: &mut N,
-) -> Result<CoreResult, DpopStreamError>
+) -> Result<CompletedStream, DpopStreamError>
 where
     B: Body + Unpin,
     B::Data: Buf,
