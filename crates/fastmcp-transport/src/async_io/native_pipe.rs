@@ -81,11 +81,9 @@ impl std::fmt::Debug for PipeIo {
 /// help here either -- it intersects the type-level caps with the cx's own
 /// runtime mask, not with the frame currently in force.
 ///
-/// Checking the active view first makes admission the INTERSECTION of the
-/// explicitly passed authority and any ambient restriction, which fails closed.
-/// Only the I/O dimension is examined: the ambient view is not the caller's
-/// cancellation or deadline domain, so running the full `admit_context` against
-/// it could refuse for reasons that have nothing to do with authority.
+/// This is only the cheap I/O preflight. `stdio::caller_capability_ceiling`
+/// also checks deadline authority and preserves every other denied effect.
+/// The ambient view is never a replacement cancellation or deadline domain.
 pub(super) fn admit_ambient_io_restriction() -> io::Result<()> {
     if let Some(active) = Cx::current() {
         if !active.capabilities().io {
@@ -118,8 +116,9 @@ fn admit_context(cx: &Cx) -> io::Result<()> {
 
 impl PipeIo {
     fn new(cx: &Cx, fd: OwnedFd, writable: bool) -> io::Result<Self> {
-        admit_ambient_io_restriction()?;
+        let ceiling = stdio::caller_capability_ceiling(cx)?;
         let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(ceiling);
         let caller = Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
         admit_context(&caller)?;
         let file = File::from(fd);
@@ -167,10 +166,20 @@ impl PipeIo {
         task: &mut Context<'_>,
         operation: impl FnOnce(&File) -> io::Result<T>,
     ) -> Poll<io::Result<T>> {
-        if let Err(error) = admit_ambient_io_restriction() {
-            return Poll::Ready(Err(error));
-        }
+        // Admission may have happened in a wider scope. Check again before
+        // rearming retained observers or entering a descriptor syscall.
+        let ceiling = match stdio::caller_capability_ceiling(&self.cx) {
+            Ok(ceiling) => ceiling,
+            Err(error) => {
+                // Refusal completes this wait. Retire ALL its registrations,
+                // not merely the next syscall, while retaining byte custody
+                // and the descriptor for a later authorized operation.
+                self.wait = None;
+                return Poll::Ready(Err(error));
+            }
+        };
         let _caller = Cx::set_current(Some(self.cx.clone()));
+        let _restriction = Cx::push_restriction(ceiling);
         let admission = (|| {
             let caller =
                 Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
@@ -256,6 +265,11 @@ impl PipeIo {
 /// Pass this to `AsyncStdioTransport::from_io` or the server's `serve_stdio_io`
 /// entrypoint. A silent peer parks on the caller's reactor without a blocking
 /// pool or helper thread. Cancellation and finite deadlines wake that wait.
+///
+/// The caller/host capability intersection at construction stays with the
+/// endpoint. Each poll may further restrict it but never restore denied effects.
+/// A finite caller deadline requires time authority as well as a timer driver;
+/// a deadline-free endpoint needs no time authority. Close remains unconditional.
 ///
 /// One pending registration is retained in the reader, not in the borrowed
 /// `AsyncReadExt` future. It is replaced by the next operation and retired on
@@ -378,11 +392,17 @@ fn fresh_descriptors() -> io::Result<(OwnedFd, OwnedFd)> {
 /// with the owned-fd constructors after the embedding establishes nonblocking
 /// mode and exclusive byte ownership.
 pub fn native_pipe(cx: &Cx) -> io::Result<(NativePipeReader, NativePipeWriter)> {
-    admit_context(cx)?;
+    // Refuse before creating descriptors, and keep the admitted ceiling in
+    // both endpoints even when their owner later leaves this host scope.
+    let ceiling = stdio::caller_capability_ceiling(cx)?;
+    let _caller = Cx::set_current(Some(cx.clone()));
+    let _restriction = Cx::push_restriction(ceiling);
+    let caller = Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
+    admit_context(&caller)?;
     let (reader, writer) = fresh_descriptors()?;
     Ok((
-        NativePipeReader::from_owned_fd(cx, reader)?,
-        NativePipeWriter::from_owned_fd(cx, writer)?,
+        NativePipeReader::from_owned_fd(&caller, reader)?,
+        NativePipeWriter::from_owned_fd(&caller, writer)?,
     ))
 }
 
@@ -394,6 +414,7 @@ mod tests {
     use std::task::{Wake, Waker};
     use std::time::Duration;
 
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
     use asupersync::runtime::reactor::create_reactor;
     use asupersync::runtime::{IoDriverHandle, Runtime, RuntimeBuilder};
     use asupersync::time::{TimerDriverHandle, VirtualClock};
@@ -868,5 +889,261 @@ mod tests {
         drop((reader, writer, cx, foreign_cx));
         assert!(owner.shutdown_timeout(Duration::from_secs(1)));
         assert!(foreign.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    fn scoped<T>(cx: &Cx, mask: CapMask, operation: impl FnOnce() -> T) -> T {
+        let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(mask);
+        operation()
+    }
+
+    fn effects(cx: &Cx) -> [bool; 5] {
+        let row = cx.capabilities();
+        [row.spawn, row.time, row.entropy, row.io, row.remote]
+    }
+
+    fn masks() -> [(CapMask, [bool; 5]); 7] {
+        [
+            (CapMask::all(), [true; 5]),
+            (CapMask::none(), [false; 5]),
+            (CapSet::<false, true, true, true, true>::MASK, [false, true, true, true, true]),
+            (CapSet::<true, false, true, true, true>::MASK, [true, false, true, true, true]),
+            (CapSet::<true, true, false, true, true>::MASK, [true, true, false, true, true]),
+            (CapSet::<true, true, true, false, true>::MASK, [true, true, true, false, true]),
+            (CapSet::<true, true, true, true, false>::MASK, [true, true, true, true, false]),
+        ]
+    }
+
+    fn with_deadline(test: impl FnOnce(&Cx, &Cx, &Arc<VirtualClock>, &TimerDriverHandle)) {
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .with_timer_driver(timer.clone())
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+        );
+        let live = runtime.request_cx_with_budget(Budget::INFINITE);
+        test(&cx, &live, &clock, &timer);
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(cx.io_driver_handle().unwrap().waker_count(), 0);
+        drop((cx, live));
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn native_constructors_retain_host_effects_and_refuse_unusable_deadline_authority() {
+        let runtime = runtime();
+        for finite in [false, true] {
+            let budget = if finite {
+                Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX))
+            } else {
+                Budget::INFINITE
+            };
+            let cx = runtime.request_cx_with_budget(budget);
+            for (mask, expected) in masks() {
+                for factory in [false, true] {
+                    let result = scoped(&cx, mask, || {
+                        if factory {
+                            native_pipe(&cx)
+                        } else {
+                            let (input, output) = fresh_descriptors()?;
+                            Ok((
+                                NativePipeReader::from_owned_fd(&cx, input)?,
+                                NativePipeWriter::from_owned_fd(&cx, output)?,
+                            ))
+                        }
+                    });
+                    if !expected[3] || (finite && !expected[1]) {
+                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                        continue;
+                    }
+                    let (mut reader, mut writer) = result.unwrap();
+                    assert_eq!(effects(&reader.0.cx), expected);
+                    assert_eq!(effects(&writer.0.cx), expected);
+                    let actual = ready(reader.0.poll_io(
+                        &mut Context::from_waker(Waker::noop()),
+                        |_| Ok(effects(&Cx::current().unwrap())),
+                    ));
+                    assert_eq!(actual, expected);
+                    // Cleanup remains available even outside all effect scopes.
+                    scoped(&cx, CapMask::none(), || close(&mut writer));
+                    scoped(&cx, CapMask::none(), || reader.close()).unwrap();
+                }
+            }
+            assert_eq!(cx.io_driver_handle().unwrap().waker_count(), 0);
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn migrated_pipe_polls_intersect_every_effect_without_permanently_narrowing_the_owner() {
+        let runtime = runtime();
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let host = Cx::for_testing();
+        let baseline = effects(&cx);
+        let (mut reader, writer) = native_pipe(&cx).unwrap();
+        let polls = AtomicUsize::new(0);
+        for (mask, expected) in masks() {
+            let before = polls.load(Ordering::SeqCst);
+            let result: Poll<io::Result<()>> = scoped(&host, mask, || {
+                let result = reader.0.poll_io(&mut Context::from_waker(Waker::noop()), |_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(effects(&Cx::current().unwrap()), expected);
+                    Err(io::Error::from(io::ErrorKind::WouldBlock))
+                });
+                assert_eq!(effects(&Cx::current().unwrap()), expected);
+                result
+            });
+            if expected[3] {
+                assert!(result.is_pending());
+                assert_eq!(polls.load(Ordering::SeqCst), before + 1);
+            } else {
+                assert!(matches!(result, Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied));
+                assert_eq!(polls.load(Ordering::SeqCst), before);
+                assert!(reader.0.wait.is_none());
+            }
+            assert_eq!(effects(&reader.0.cx), baseline);
+        }
+        drop((reader, writer, host, cx));
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn narrowed_receive_retires_observers_preserves_bytes_and_can_resume() {
+        for mask in [
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+        ] {
+            with_deadline(|cx, live, _clock, timer| {
+                let (input, output) = fresh_descriptors().unwrap();
+                let mut reader = NativePipeReader::from_owned_fd(cx, input).unwrap();
+                let mut writer = NativePipeWriter::from_owned_fd(live, output).unwrap();
+                let wakes = Arc::new(Wakes::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                let driver = cx.io_driver_handle().unwrap();
+                let mut bytes = [0; 4];
+                assert!(read(&mut reader, &waker, &mut bytes).is_pending());
+                assert_eq!(driver.waker_count(), 1);
+                assert!(timer.pending_count() > 0);
+                assert!(matches!(
+                    scoped(live, mask, || read(&mut reader, &waker, &mut bytes)),
+                    Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied
+                ));
+                assert_eq!(driver.waker_count(), 0);
+                assert_eq!(timer.pending_count(), 0);
+                assert!(reader.0.wait.is_none() && reader.0.file.is_some());
+                assert_eq!(ready(write(&mut writer, Waker::noop(), b"kept")), 4);
+                // Even ready bytes do not authorize a syscall in the denied scope.
+                assert!(matches!(
+                    scoped(live, mask, || read(&mut reader, &waker, &mut bytes)),
+                    Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied
+                ));
+                assert_eq!(bytes, [0; 4]);
+                assert_eq!(ready(read(&mut reader, &waker, &mut bytes)), 4);
+                assert_eq!(&bytes, b"kept");
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+    }
+
+    #[test]
+    fn narrowed_backpressured_writer_preserves_committed_bytes_and_recovers_capacity() {
+        for mask in [
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+        ] {
+            with_deadline(|cx, live, _clock, timer| {
+                let (input, output) = fresh_descriptors().unwrap();
+                let mut reader = NativePipeReader::from_owned_fd(live, input).unwrap();
+                let mut writer = NativePipeWriter::from_owned_fd(cx, output).unwrap();
+                let driver = cx.io_driver_handle().unwrap();
+                let retained = fill(writer.0.file.as_ref().unwrap());
+                assert!(write(&mut writer, Waker::noop(), b"rejected").is_pending());
+                assert!(timer.pending_count() > 0);
+                assert!(matches!(
+                    scoped(live, mask, || write(&mut writer, Waker::noop(), b"rejected")),
+                    Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied
+                ));
+                assert_eq!(driver.waker_count(), 0);
+                assert_eq!(timer.pending_count(), 0);
+                assert!(writer.0.wait.is_none() && writer.0.file.is_some());
+                let mut block = [0; 8192];
+                let mut drained = 0;
+                while drained < retained {
+                    let count = ready(read(&mut reader, Waker::noop(), &mut block));
+                    assert!(count > 0);
+                    assert!(block[..count].iter().all(|byte| *byte == 7));
+                    drained += count;
+                }
+                assert_eq!(drained, retained);
+                assert_eq!(ready(write(&mut writer, Waker::noop(), b"tail")), 4);
+                scoped(live, CapMask::none(), || close(&mut writer));
+                assert_eq!(ready(read(&mut reader, Waker::noop(), &mut block)), 4);
+                assert_eq!(&block[..4], b"tail");
+                assert_eq!(ready(read(&mut reader, Waker::noop(), &mut block)), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn permission_refusal_unregisters_idle_cancellation_and_deadline_wakers() {
+        for mask in [
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+        ] {
+            with_deadline(|cx, live, clock, timer| {
+                let (mut reader, writer) = native_pipe(cx).unwrap();
+                let wakes = Arc::new(Wakes::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut bytes = [0; 1];
+                assert!(read(&mut reader, &waker, &mut bytes).is_pending());
+                assert!(matches!(
+                    scoped(live, mask, || read(&mut reader, &waker, &mut bytes)),
+                    Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::PermissionDenied
+                ));
+                // The endpoint stays alive. Parent/endpoint Drop cannot hide
+                // a stale timer, reactor slot or cancellation registration.
+                assert!(reader.0.file.is_some());
+                assert_eq!(cx.io_driver_handle().unwrap().waker_count(), 0);
+                assert_eq!(timer.pending_count(), 0);
+                let before = wakes.0.load(Ordering::SeqCst);
+                clock.advance(10_000_000);
+                assert_eq!(timer.process_timers(), 0);
+                cx.set_cancel_requested(true);
+                assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+                scoped(live, CapMask::none(), || reader.close()).unwrap();
+                drop(writer);
+            });
+        }
+    }
+
+    #[test]
+    fn successful_pipe_commit_survives_cancellation_or_deadline_during_the_syscall() {
+        for deadline in [false, true] {
+            with_deadline(|cx, live, clock, _timer| {
+                let (input, output) = fresh_descriptors().unwrap();
+                let mut reader = NativePipeReader::from_owned_fd(live, input).unwrap();
+                let mut writer = NativePipeWriter::from_owned_fd(cx, output).unwrap();
+                let count = ready(writer.0.poll_io(&mut Context::from_waker(Waker::noop()), |file| {
+                    let count = rustix::io::write(file, b"ok").map_err(io::Error::from)?;
+                    if deadline {
+                        clock.advance(10_000_000);
+                    } else {
+                        cx.set_cancel_requested(true);
+                    }
+                    Ok(count)
+                }));
+                assert_eq!(count, 2);
+                assert!(cx.checkpoint().is_err());
+                let mut bytes = [0; 2];
+                assert_eq!(ready(read(&mut reader, Waker::noop(), &mut bytes)), 2);
+                assert_eq!(&bytes, b"ok");
+                scoped(live, CapMask::none(), || close(&mut writer));
+            });
+        }
     }
 }
