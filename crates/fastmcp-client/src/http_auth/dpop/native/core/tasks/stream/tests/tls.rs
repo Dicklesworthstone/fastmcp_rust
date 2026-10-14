@@ -2,6 +2,8 @@
 //! The inline identity is the existing public TEST ONLY fixture. It never
 //! changes process trust and requires no PEM file on remote build workers.
 
+mod driver;
+
 use super::*;
 use std::future::poll_fn;
 use std::collections::BTreeSet;
