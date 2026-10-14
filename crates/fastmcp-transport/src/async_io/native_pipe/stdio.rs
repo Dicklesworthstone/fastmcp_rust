@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use asupersync::Cx;
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
@@ -22,6 +23,39 @@ const POISONED: u8 = 2;
 
 static STDIN_OWNER: LazyLock<Arc<AtomicU8>> = LazyLock::new(|| Arc::new(AtomicU8::new(FREE)));
 static STDOUT_OWNER: LazyLock<Arc<AtomicU8>> = LazyLock::new(|| Arc::new(AtomicU8::new(FREE)));
+
+/// Capture restrictions before republishing the explicit caller. A native
+/// pipe also uses time when it has a finite deadline; possession of a timer
+/// driver does not authorize that effect. Deadline-free pipe I/O needs only
+/// I/O authority. Neither the host's clock nor its cancellation is inherited.
+pub(super) fn caller_capability_ceiling(cx: &Cx) -> io::Result<CapMask> {
+    super::admit_ambient_io_restriction()?;
+    let mut ceiling = CapMask::all();
+    if let Some(active) = Cx::current() {
+        let capabilities = active.capabilities();
+        for (allowed, without_effect) in [
+            (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
+            (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
+            (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
+            (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
+            (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+        ] {
+            if !allowed {
+                ceiling = ceiling.intersect(without_effect);
+            }
+        }
+    }
+    if cx.budget().deadline.is_some()
+        && (!cx.capabilities().time
+            || !ceiling.contains(CapSet::<false, true, false, false, false>::MASK))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "native pipe deadline requires the time capability",
+        ));
+    }
+    Ok(ceiling)
+}
 
 /// This field is dropped AFTER the pipe's I/O registration and owned endpoint.
 /// Its separate descriptor keeps restoration attached to the same open-file
@@ -138,12 +172,13 @@ impl Drop for ProcessStreamLease {
 }
 
 fn claim(cx: &Cx, source: &impl AsFd, writable: bool, state: Arc<AtomicU8>) -> io::Result<PipeIo> {
-    // Before any republish, and before the lease is reserved or a descriptor
-    // flag is touched: an ambient restriction must refuse the claim outright.
-    // See `admit_ambient_io_restriction` for why the republish below would
-    // otherwise widen a narrowed ambient view back out.
-    super::admit_ambient_io_restriction()?;
+    // Snapshot every denied effect before republishing, not just the I/O bit.
+    // Retain that ceiling in the context handed to PipeIo; otherwise a later
+    // poll outside this scope would restore the caller's broader authority.
+    // Refusal precedes ownership reservation, fd duplication and flag changes.
+    let ceiling = caller_capability_ceiling(cx)?;
     let _caller = Cx::set_current(Some(cx.clone()));
+    let _restriction = Cx::push_restriction(ceiling);
     let caller = Cx::current().ok_or_else(|| io::Error::other("caller context unavailable"))?;
     admit_context(&caller)?;
     let mut lease = ProcessStreamLease::reserve(state)?;
@@ -478,6 +513,189 @@ mod tests {
         assert!(claim(&cx, &input, false, Arc::clone(&owner)).is_err());
         // Only the test's external owner may restore its own planted change.
         fcntl_setfl(&input, original).unwrap();
+        drop((reader, input, output, cx));
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    fn scoped<T>(cx: &Cx, mask: CapMask, operation: impl FnOnce() -> T) -> T {
+        let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(mask);
+        operation()
+    }
+
+    fn effects(cx: &Cx) -> [bool; 5] {
+        let row = cx.capabilities();
+        [row.spawn, row.time, row.entropy, row.io, row.remote]
+    }
+
+    fn masks() -> [(CapMask, [bool; 5]); 7] {
+        [
+            (CapMask::all(), [true; 5]),
+            (CapMask::none(), [false; 5]),
+            (CapSet::<false, true, true, true, true>::MASK, [false, true, true, true, true]),
+            (CapSet::<true, false, true, true, true>::MASK, [true, false, true, true, true]),
+            (CapSet::<true, true, false, true, true>::MASK, [true, true, false, true, true]),
+            (CapSet::<true, true, true, false, true>::MASK, [true, true, true, false, true]),
+            (CapSet::<true, true, true, true, false>::MASK, [true, true, true, true, false]),
+        ]
+    }
+
+    #[test]
+    fn process_claim_retains_the_full_caller_host_capability_intersection() {
+        let runtime = runtime();
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let host = Cx::for_testing();
+        let baseline = effects(&cx);
+        for (caller_mask, caller_effects) in masks() {
+            let caller = scoped(&cx, caller_mask, || Cx::current().unwrap());
+            for (host_mask, host_effects) in masks() {
+                for writable in [false, true] {
+                    let (input, output) = io::pipe().unwrap();
+                    let before_input = fcntl_getfl(&input).unwrap();
+                    let before_output = fcntl_getfl(&output).unwrap();
+                    let owner = owner();
+                    let result = scoped(&host, host_mask, || {
+                        let result = if writable {
+                            claim(&caller, &output, true, Arc::clone(&owner))
+                        } else {
+                            claim(&caller, &input, false, Arc::clone(&owner))
+                        };
+                        assert_eq!(effects(&Cx::current().unwrap()), host_effects);
+                        result
+                    });
+                    let expected: [bool; 5] = std::array::from_fn(|index| {
+                        baseline[index] && caller_effects[index] && host_effects[index]
+                    });
+                    if expected[3] {
+                        let mut pipe = result.unwrap();
+                        // Inspect after the host guard has unwound. Admission
+                        // must retain the ceiling, not merely check it once.
+                        assert_eq!(effects(&pipe.cx), expected);
+                        assert_eq!(pipe.cx.budget().deadline, None);
+                        assert!(pipe.cx.checkpoint().is_ok());
+                        pipe.close().unwrap();
+                    } else {
+                        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                    }
+                    assert_eq!(owner.load(Ordering::Acquire), FREE);
+                    assert_eq!(fcntl_getfl(&input).unwrap(), before_input);
+                    assert_eq!(fcntl_getfl(&output).unwrap(), before_output);
+                }
+            }
+        }
+        assert_eq!(effects(&cx), baseline);
+        drop((host, cx));
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    struct CountedFd<'a, T> {
+        source: &'a T,
+        calls: &'a std::sync::atomic::AtomicUsize,
+    }
+
+    impl<T: AsFd> AsFd for CountedFd<'_, T> {
+        fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.source.as_fd()
+        }
+    }
+
+    #[test]
+    fn process_deadline_without_time_authority_refuses_before_descriptor_access() {
+        let runtime = runtime();
+        let cx = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(asupersync::Time::from_nanos(u64::MAX)),
+        );
+        assert!(cx.timer_driver().is_some());
+        let no_time = CapSet::<true, false, true, true, true>::MASK;
+        for held_restriction in [false, true] {
+            for writable in [false, true] {
+                let caller = scoped(&cx, if held_restriction { no_time } else { CapMask::all() }, || {
+                    Cx::current().unwrap()
+                });
+                let host_mask = if held_restriction { CapMask::all() } else { no_time };
+                let (input, output) = io::pipe().unwrap();
+                let input_flags = fcntl_getfl(&input).unwrap();
+                let output_flags = fcntl_getfl(&output).unwrap();
+                let owner = owner();
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let error = scoped(&cx, host_mask, || {
+                    if writable {
+                        claim(&caller, &CountedFd { source: &output, calls: &calls }, true, Arc::clone(&owner))
+                    } else {
+                        claim(&caller, &CountedFd { source: &input, calls: &calls }, false, Arc::clone(&owner))
+                    }
+                }).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(owner.load(Ordering::Acquire), FREE);
+                assert_eq!(fcntl_getfl(&input).unwrap(), input_flags);
+                assert_eq!(fcntl_getfl(&output).unwrap(), output_flags);
+                // Identical descriptors and deadline work with time authority.
+                let mut admitted = if writable {
+                    claim(&cx, &output, true, Arc::clone(&owner)).unwrap()
+                } else {
+                    claim(&cx, &input, false, Arc::clone(&owner)).unwrap()
+                };
+                admitted.close().unwrap();
+                assert_eq!(owner.load(Ordering::Acquire), FREE);
+            }
+        }
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn process_claim_does_not_adopt_an_unrelated_hosts_stopped_lifetime() {
+        let runtime = runtime();
+        let cx = runtime.request_cx_with_budget(
+            Budget::INFINITE.with_deadline(asupersync::Time::from_nanos(u64::MAX)),
+        );
+        let host = Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(asupersync::Time::ZERO));
+        host.set_cancel_requested(true);
+        let mask = CapSet::<false, true, false, true, false>::MASK;
+        let (input, output) = io::pipe().unwrap();
+        let original = fcntl_getfl(&input).unwrap();
+        let owner = owner();
+        let mut reader = NativePipeReader(scoped(&host, mask, || {
+            claim(&cx, &input, false, Arc::clone(&owner))
+        }).unwrap());
+        assert_eq!(effects(&reader.0.cx), [false, true, false, true, false]);
+        assert_eq!(reader.0.cx.budget().deadline, cx.budget().deadline);
+        assert!(reader.0.cx.checkpoint().is_ok());
+        assert_eq!(rustix::io::write(&output, b"live").unwrap(), 4);
+        let mut bytes = [0; 4];
+        assert!(matches!(scoped(&host, mask, || read(&mut reader, &mut bytes)), Poll::Ready(Ok(4))));
+        assert_eq!(&bytes, b"live");
+        reader.close().unwrap();
+        assert_eq!(fcntl_getfl(&input).unwrap(), original);
+        assert_eq!(owner.load(Ordering::Acquire), FREE);
+        assert!(host.checkpoint().is_err());
+        assert!(cx.checkpoint().is_ok());
+        drop((reader, input, output, host, cx));
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn deadline_free_process_pipe_progresses_with_only_io_authority() {
+        let runtime = runtime();
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let (input, output) = io::pipe().unwrap();
+        let original = fcntl_getfl(&input).unwrap();
+        let owner = owner();
+        let only_io = CapSet::<false, false, false, true, false>::MASK;
+        let mut reader = NativePipeReader(scoped(&cx, only_io, || {
+            claim(&cx, &input, false, Arc::clone(&owner))
+        }).unwrap());
+        assert_eq!(effects(&reader.0.cx), [false, false, false, true, false]);
+        let mut bytes = [0; 4];
+        assert!(read(&mut reader, &mut bytes).is_pending());
+        assert_eq!(rustix::io::write(&output, b"data").unwrap(), 4);
+        assert!(matches!(read(&mut reader, &mut bytes), Poll::Ready(Ok(4))));
+        assert_eq!(&bytes, b"data");
+        scoped(&cx, CapMask::none(), || reader.close()).unwrap();
+        assert_eq!(fcntl_getfl(&input).unwrap(), original);
+        assert_eq!(owner.load(Ordering::Acquire), FREE);
         drop((reader, input, output, cx));
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
