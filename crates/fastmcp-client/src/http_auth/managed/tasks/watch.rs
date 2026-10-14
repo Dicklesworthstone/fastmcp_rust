@@ -387,7 +387,7 @@ impl ManagedTaskWatch {
                                 .await?
                         }
                     };
-                    let Some(ManagedTaskEvent::Snapshot(result)) = call.next_event(cx).await?
+                    let Some(ManagedTaskEvent::Snapshot(result)) = call.next_terminal(cx).await?
                     else {
                         return Err(ManagedTaskWatchError::UnexpectedEvent);
                     };

@@ -362,11 +362,12 @@ impl ManagedTasksClient {
                 .await?,
         );
         remote_cancel.pin_credential(Arc::clone(&credential))?;
-        let mut watch = Box::pin(self.session.await_active(
+        let mut watch = Box::pin(self.session.await_credential(
             cx,
             cancellation,
             deadline,
-            Some(credential.expires_at),
+            credential.expires_at,
+            &credential.credential.revoked,
             async {
                 Ok(self
                     .watch_tasks_with_cancellation(
@@ -526,11 +527,14 @@ impl ManagedTaskWatchDriver {
         let client = self.client.clone();
         let cancellation = self.cancellation.clone();
         let deadline = self.deadline;
-        let running = Box::pin(client.session.await_active(
+        // Pin revocation across host input and journal waits too, not merely
+        // socket reads. A revoked token must wake even a silent resolver.
+        let running = Box::pin(client.session.await_credential(
             cx,
             &cancellation,
             deadline,
-            Some(credential.expires_at),
+            credential.expires_at,
+            &credential.credential.revoked,
             async {
                 Ok(self
                     .drive_active(cx, &mut watch, &credential, &mut resolve, &mut observe)
@@ -710,7 +714,7 @@ impl ManagedTaskWatchDriver {
                 )
                 .await?;
             if !matches!(
-                call.next_event(cx).await?,
+                call.next_terminal(cx).await?,
                 Some(ManagedTaskEvent::Updated(_))
             ) {
                 return Err(ManagedTaskWatchError::UnexpectedEvent.into());
@@ -739,7 +743,7 @@ impl ManagedTaskWatchDriver {
                         client.limits.records,
                     )
                     .await?;
-                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_event(cx).await? else {
+                let Some(ManagedTaskEvent::Snapshot(snapshot)) = call.next_terminal(cx).await? else {
                     return Err(ManagedTaskWatchError::UnexpectedEvent);
                 };
                 Ok::<_, ManagedTaskWatchError>(snapshot.task)
@@ -792,7 +796,7 @@ fn check_drive(
     credential: &OAuthCredentialSnapshot,
 ) -> Result<(), ManagedTaskWatchDriveError> {
     client.session.check(cx, cancellation)?;
-    if Instant::now() >= credential.expires_at {
+    if credential.credential().is_revoked() || Instant::now() >= credential.expires_at {
         return Err(OAuthSessionError::LoginRequired.into());
     }
     let deadline = cx
