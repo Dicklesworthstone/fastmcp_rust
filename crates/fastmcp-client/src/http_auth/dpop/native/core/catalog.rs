@@ -105,10 +105,14 @@ impl Traversal {
             return Err(DpopCatalogError::InvalidIdPrefix);
         }
         let method = request.method().to_owned();
-        if !matches!(
-            method.as_str(),
-            "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
-        ) {
+        // Validate the original typed era before rebuilding continuation
+        // requests. Peer-shaped metadata cannot retag a legacy request.
+        if request.era() != ProtocolEra::Modern2026
+            || !matches!(
+                method.as_str(),
+                "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+            )
+        {
             return Err(DpopCatalogError::InvalidRequest);
         }
         let params = request
@@ -268,3 +272,33 @@ impl DpopHttpClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "native-tls-roots"))]
+#[path = "catalog/https_tests.rs"]
+mod https_tests;
+
+#[cfg(all(test, feature = "legacy-2024-11-05"))]
+mod era_tests {
+    use super::*;
+    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+    use serde_json::json;
+
+    #[test]
+    fn modern_looking_metadata_cannot_retag_a_legacy_typed_catalog() {
+        for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+            let params = json!({"_meta": FinalRequestMeta::new(ClientCapabilities::default())});
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                let request = CoreRequest::decode(era, method, Some(&params)).unwrap();
+                assert_eq!(request.era(), era);
+                let result = Traversal::new(
+                    request, "era", ManagedCoreLimits::default(), CatalogLimits::default(), 8 * 1024 * 1024,
+                );
+                if era == ProtocolEra::Modern2026 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(result, Err(DpopCatalogError::InvalidRequest)));
+                }
+            }
+        }
+    }
+}
