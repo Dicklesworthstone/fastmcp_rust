@@ -28,7 +28,7 @@ jobs:
           tar --exclude=.git -czf "$RUNNER_TEMP/source-snapshot.tar.gz" .
 
       - name: Upload exact checkout
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: fastmcp-source-${{ github.sha }}
           path: ${{ runner.temp }}/source-snapshot.tar.gz
