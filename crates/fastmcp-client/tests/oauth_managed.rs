@@ -259,7 +259,15 @@ fn managed_oauth_concurrent_callers_share_one_live_refresh_and_generation() {
             .unwrap();
             expire_first_grant(&cx).await;
             let clone = session.clone();
-            let (one, two) = pair(session.credential(&cx), clone.credential(&cx)).await;
+            // Boxed for the same reason as the outer `Box::pin(pair(..))` in
+            // this file: one `credential` future is under the `large_futures`
+            // threshold and awaited bare 18 times here without complaint, but
+            // composing two of them with `pair` doubles the state machine past
+            // it. The oversize belongs to the test's composition, not to the
+            // product step, so it is boxed here rather than inside
+            // `credential`, which would put an allocation on every caller to
+            // settle a lint no caller triggers.
+            let (one, two) = Box::pin(pair(session.credential(&cx), clone.credential(&cx))).await;
             for snapshot in [
                 one.unwrap(),
                 two.unwrap(),
@@ -377,7 +385,7 @@ fn bounded_refresh_admission_recovers_after_saturation() {
                 ));
                 release_tx.send(&cx, ()).unwrap();
             };
-            let (snapshot, ()) = pair(owner, contender).await;
+            let (snapshot, ()) = Box::pin(pair(owner, contender)).await;
             assert_eq!(snapshot.unwrap().generation(), 2);
             assert_eq!(session.credential(&cx).await.unwrap().generation(), 2);
         };
