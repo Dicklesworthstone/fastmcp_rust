@@ -16,7 +16,25 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
-use fastmcp_protocol::dpop::{DpopError, DpopKey, DpopNonce, MAX_DPOP_TARGET_BYTES};
+/// Re-exported because this module's own public API demands them, and nothing
+/// else makes them nameable from the published root.
+///
+/// [`DpopSession::new`] takes a [`DpopKey`] as its first argument, and
+/// [`DpopClientError::Proof`] carries a [`DpopError`]. Both live in
+/// `fastmcp_protocol::dpop`, which is behind that crate's `jose` feature and
+/// is NOT re-exported by the `fastmcp-rust` facade — the facade forwards
+/// `common_types`, `http_headers`, `methods` and `protocol_policy`, and `jose`
+/// itself only under `builtin-auth-server`. So before this, a facade user
+/// could reach `DpopSession` through `pub use fastmcp_client::http_auth` and
+/// had no way to name the key it requires or the error it returns.
+///
+/// This adds no dependency: `jose` is already enabled for every non-wasm
+/// target by this crate's own `[target.'cfg(not(target_arch = "wasm32"))'
+/// .dependencies]` entry, which is the same predicate that gates `pub mod
+/// dpop` in `http_auth.rs`. `DpopNonce` and `MAX_DPOP_TARGET_BYTES` stay
+/// private because no public signature here names them.
+pub use fastmcp_protocol::dpop::{DpopError, DpopKey};
+use fastmcp_protocol::dpop::{DpopNonce, MAX_DPOP_TARGET_BYTES};
 use fastmcp_protocol::{SecurityDocumentKind, admit_security_document_object};
 
 use super::BoundBearerCredential;

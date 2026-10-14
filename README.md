@@ -954,7 +954,12 @@ If you want DPoP, you drive it; nothing in this SDK will start doing so on your
 behalf.
 
 One session pins one HTTPS token endpoint, one exact HTTPS MCP resource, and
-one ES256 proof key. The flow, in call order:
+one ES256 proof key. The two types a caller must name to open one — `DpopKey`,
+the first argument, and `DpopError`, carried by `DpopClientError::Proof` — are
+re-exported from this same module, so `fastmcp_rust::http_auth::dpop` is
+self-contained. They originate in `fastmcp_protocol::dpop`, which the facade
+does not forward, so without that re-export the API would be reachable without
+being constructible. The flow, in call order:
 
 1. `DpopSession::new` — pin the endpoint, resource and key.
    `DpopSession::authorization_jkt` exposes the key thumbprint for a
