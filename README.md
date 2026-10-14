@@ -214,12 +214,14 @@ different things:
   token-endpoint auth methods, CIMD, pre-registration, offline access and AS
   migration). DPoP
   (RFC 9449) primitives now **exist and compile**, which was not true before
-  2026-10-12, and the surface has grown fast since: measured 2026-10-14 at
-  `a6559ff2`, `fastmcp_client::http_auth::dpop` is **9 files, 6,699 lines, 61
-  public items and 84 in-module tests** — against the 781 lines, 18 public
-  items and 9 tests this row recorded two days earlier, so roughly 8.6× the
-  lines in 48 hours — plus 515 lines and 7 tests in
-  `fastmcp_protocol::dpop` behind the `jose` feature. Treat those counts as a
+  2026-10-12, and the surface is growing faster than this row can be rewritten:
+  measured 2026-10-14 at `acc20148`, `fastmcp_client::http_auth::dpop` is
+  **20 files, 10,541 lines, 83 public items and 132 in-module tests**, plus 515
+  lines and 7 tests in `fastmcp_protocol::dpop` behind the `jose` feature —
+  11,056 lines in all. The trajectory is the point rather than any one reading:
+  781 lines on 2026-10-12, 6,699 at `a6559ff2`, 10,541 at `acc20148` a few
+  hours later. That is **13.5× in two days**, and the caller count was zero at
+  every one of those three readings. Treat the counts as a
   dated reading of a module under active construction, not a durable fact; the
   gate below deliberately does not pin them, because a check that reddens on
   ordinary growth is a check that gets switched off. It is reachable by facade
@@ -230,12 +232,12 @@ different things:
   never been compiled until then. (They had never been formatted either;
   `c65eced1` restored `cargo fmt --check` afterwards.)
   **It still has no consumer, and that is the durable claim here.** The
-  implementation grew ~5,900 lines in two days while the number of callers
+  implementation grew by ~10,300 lines in two days while the number of callers
   stayed at zero. That growth rate, not the absolute size, is what distinguishes
   it from the other unconsumed surfaces this README already records: `http.rs`
-  is 14,734 lines and `websocket.rs` 6,828, both larger than the 7,214 here, but
-  both long-standing rather than six times bigger than they were at the previous
-  reading of this row. Tracked as `bd-iaqgd`;
+  is 14,734 lines and `websocket.rs` 6,828, so the 11,056 here now sits between
+  them — but those two are long-standing, while this one was 781 lines the day
+  before yesterday. Tracked as `bd-iaqgd`;
   `readme_mechanical_claims.rs` gates
   the zero so that wiring DPoP forces this row to be rewritten. Nothing in this
   workspace drives that module. Across every member `src/` file outside the two
