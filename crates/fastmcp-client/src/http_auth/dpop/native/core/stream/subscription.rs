@@ -14,22 +14,26 @@ use fastmcp_protocol::{
 
 use super::{
     DpopCredential, DpopHttpClient, DpopStreamError, DpopStreamLimits, Idle, Lifetime,
-    ManagedCoreError, ManagedCoreEvent, PreparedStream, StreamDecoder, WaitBounds, with_caller,
+    PreparedStream, StreamDecoder, StreamEvent, WaitBounds, with_caller,
 };
 use crate::http_auth::rpc::subscription::{SubscriptionDecoder, prepare_bounded};
 
 impl StreamDecoder for SubscriptionDecoder {
+    type Terminal = CoreResult;
+
     fn admit(
         &mut self,
         frame: &[u8],
         allow_notification: bool,
-    ) -> Result<ManagedCoreEvent, ManagedCoreError> {
+    ) -> Result<StreamEvent<CoreResult>, DpopStreamError> {
         if !allow_notification {
             // A finite JSON response can report a correlated refusal, never
             // establish a subscription or pretend it delivered an SSE ack.
-            return Err(self.json_error(frame));
+            return Err(self.json_error(frame).into());
         }
         SubscriptionDecoder::admit(self, frame)
+            .map(StreamEvent::from)
+            .map_err(DpopStreamError::from)
     }
 
     fn usage(&self) -> (usize, usize) {
@@ -128,7 +132,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::super::{
-        CoreDecoder, DpopCoreError, DpopHttpError, DpopSession, ManagedCoreLimits,
+        CoreDecoder, DpopCoreError, DpopHttpError, DpopSession, ManagedCoreError, ManagedCoreLimits,
         ModernHttpResponseKind, Reader,
     };
 

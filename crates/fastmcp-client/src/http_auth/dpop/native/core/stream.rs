@@ -46,9 +46,9 @@ const FRAMES_PER_TURN: usize = 32;
 /// comments and framing; core payload limits do not replace that wire cap.
 #[derive(Clone, Copy, Debug)]
 pub struct DpopStreamLimits {
-    core: ManagedCoreLimits,
+    pub(super) core: ManagedCoreLimits,
     sse: SseLimits,
-    idle: Duration,
+    pub(super) idle: Duration,
     reset_idle_on_progress: bool,
 }
 
@@ -114,6 +114,8 @@ impl DpopStreamLimits {
 #[derive(Debug)]
 pub enum DpopStreamError {
     Core(DpopCoreError),
+    #[cfg(feature = "tasks")]
+    Task(super::tasks::DpopTasksError),
     InvalidLimits,
     ObserverStopped,
     ObserverPanicked,
@@ -123,6 +125,8 @@ impl fmt::Display for DpopStreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Core(error) => error.fmt(f),
+            #[cfg(feature = "tasks")]
+            Self::Task(error) => error.fmt(f),
             Self::InvalidLimits => f.write_str("invalid DPoP core stream limits"),
             Self::ObserverStopped => f.write_str("DPoP core stream stopped by observer"),
             Self::ObserverPanicked => f.write_str("DPoP core stream observer panicked"),
@@ -150,25 +154,57 @@ impl From<ManagedCoreError> for DpopStreamError {
     }
 }
 
-// Only the private, already-admitted core and subscription decoders implement
-// this seam. Method/filter admission stays with those shared codecs; socket,
-// deadline, cancellation, framing and observer ownership stay with this reader.
-trait StreamDecoder {
+#[cfg(feature = "tasks")]
+impl From<super::tasks::DpopTasksError> for DpopStreamError {
+    fn from(error: super::tasks::DpopTasksError) -> Self {
+        match error {
+            super::tasks::DpopTasksError::Core(error) => Self::Core(error),
+            error => Self::Task(error),
+        }
+    }
+}
+
+// The prepared method owns its terminal vocabulary. Tasks never become a
+// fabricated CoreResult, and a core-only call never acquires Tasks authority.
+pub(super) enum StreamEvent<T> {
+    Notification(Box<ServerNotification>),
+    Result(T),
+}
+
+impl From<ManagedCoreEvent> for StreamEvent<CoreResult> {
+    fn from(event: ManagedCoreEvent) -> Self {
+        match event {
+            ManagedCoreEvent::Notification(notification) => Self::Notification(notification),
+            ManagedCoreEvent::Result(result) => Self::Result(*result),
+        }
+    }
+}
+
+// Only private, already-admitted method decoders implement this seam.
+// Method/filter admission stays with those codecs; socket, deadline,
+// cancellation, framing and observer ownership stay with this reader.
+pub(super) trait StreamDecoder {
+    type Terminal;
+
     fn admit(
         &mut self,
         frame: &[u8],
         allow_notification: bool,
-    ) -> Result<ManagedCoreEvent, ManagedCoreError>;
+    ) -> Result<StreamEvent<Self::Terminal>, DpopStreamError>;
     fn usage(&self) -> (usize, usize);
 }
 
 impl StreamDecoder for CoreDecoder {
+    type Terminal = CoreResult;
+
     fn admit(
         &mut self,
         frame: &[u8],
         allow_notification: bool,
-    ) -> Result<ManagedCoreEvent, ManagedCoreError> {
+    ) -> Result<StreamEvent<CoreResult>, DpopStreamError> {
         CoreDecoder::admit(self, frame, allow_notification)
+            .map(StreamEvent::from)
+            .map_err(DpopStreamError::from)
     }
 
     fn usage(&self) -> (usize, usize) {
@@ -179,17 +215,17 @@ impl StreamDecoder for CoreDecoder {
 // An internal continuation can supply the original absolute deadline and a
 // fresh decoder carrying cumulative usage. It cannot select another transport,
 // credential or response parser. This is not a public retry capability.
-struct PreparedStream<D = CoreDecoder> {
-    wire: ModernHttpRequest,
-    decoder: D,
-    limits: DpopStreamLimits,
-    bounds: WaitBounds,
-    idle: Idle,
+pub(super) struct PreparedStream<D = CoreDecoder> {
+    pub(super) wire: ModernHttpRequest,
+    pub(super) decoder: D,
+    pub(super) limits: DpopStreamLimits,
+    pub(super) bounds: WaitBounds,
+    pub(super) idle: Idle,
 }
 
-struct CompletedStream {
-    result: CoreResult,
-    usage: (usize, usize),
+pub(super) struct CompletedStream<T = CoreResult> {
+    pub(super) result: T,
+    pub(super) usage: (usize, usize),
 }
 
 impl DpopHttpClient {
@@ -237,16 +273,16 @@ impl DpopHttpClient {
         ).await.map(|completed| completed.result)
     }
 
-    // Ordinary, host-driven and subscription calls execute here. A new network
+    // Ordinary, host-driven, subscription and Tasks calls execute here. A new
     // round never creates a new absolute deadline or resets the decoder's quotas.
-    async fn execute_prepared_core_stream<D, N>(
+    pub(super) async fn execute_prepared_core_stream<D, N>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         credential: &DpopCredential,
         prepared: PreparedStream<D>,
         observer: &mut N,
-    ) -> Result<CompletedStream, DpopStreamError>
+    ) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
     where
         D: StreamDecoder,
         N: FnMut(&ServerNotification) -> bool,
@@ -314,20 +350,20 @@ impl Lifetime<'_> {
     }
 }
 
-struct Idle {
+pub(super) struct Idle {
     deadline: Time,
     timeout: Duration,
 }
 
 impl Idle {
-    fn new(now: Time, timeout: Duration) -> Self {
+    pub(super) fn new(now: Time, timeout: Duration) -> Self {
         Self {
             deadline: now.saturating_add_nanos(u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX)),
             timeout,
         }
     }
 
-    fn bounds(&self, absolute: WaitBounds) -> WaitBounds {
+    pub(super) fn bounds(&self, absolute: WaitBounds) -> WaitBounds {
         if self.deadline < absolute.deadline {
             WaitBounds { deadline: self.deadline, terminal: DpopHttpError::TimedOut }
         } else {
@@ -347,10 +383,10 @@ enum WireBody {
     Sse(BoundedSseParser),
 }
 
-struct Reader<D = CoreDecoder> {
+struct Reader<D: StreamDecoder = CoreDecoder> {
     body: WireBody,
     decoder: D,
-    terminal: Option<CoreResult>,
+    terminal: Option<D::Terminal>,
     wire_remaining: usize,
     frame_limit: usize,
     reset_idle_on_progress: bool,
@@ -414,8 +450,8 @@ impl<D: StreamDecoder> Reader<D> {
                     // Decoder work cannot revive a deadline that it exhausted.
                     lifetime.check(idle)?;
                     match event {
-                        ManagedCoreEvent::Result(result) => *terminal = Some(*result),
-                        ManagedCoreEvent::Notification(notification) => {
+                        StreamEvent::Result(result) => *terminal = Some(result),
+                        StreamEvent::Notification(notification) => {
                             if reset_idle_on_progress
                                 && matches!(&*notification, ServerNotification::Progress(_))
                             {
@@ -446,12 +482,12 @@ impl<D: StreamDecoder> Reader<D> {
         Ok(())
     }
 
-    fn finish(mut self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream, DpopStreamError> {
+    fn finish(mut self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream<D::Terminal>, DpopStreamError> {
         lifetime.check(idle)?;
         let result = match self.body {
             WireBody::Json(bytes) => match self.decoder.admit(&bytes, false)? {
-                ManagedCoreEvent::Result(result) => *result,
-                ManagedCoreEvent::Notification(_) => {
+                StreamEvent::Result(result) => result,
+                StreamEvent::Notification(_) => {
                     return Err(ManagedCoreError::UnexpectedNotification.into());
                 }
             },
@@ -470,7 +506,7 @@ impl<D: StreamDecoder> Reader<D> {
 
 async fn consume<B, N, D>(
     mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader<D>, observer: &mut N,
-) -> Result<CompletedStream, DpopStreamError>
+) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
 where
     B: Body + Unpin,
     B::Data: Buf,

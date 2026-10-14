@@ -33,6 +33,9 @@ pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest,
 /// Bounded polling and explicit host input under one original credential.
 pub mod driver;
 
+/// Incremental Task operation replies over the shared DPoP JSON/SSE executor.
+pub mod stream;
+
 /// Bounded Task observation under one original credential and deadline.
 pub mod wait;
 
@@ -266,21 +269,35 @@ impl Admitted {
         if response.status() != 200 {
             return Err(ManagedTasksError::HttpStatus { status: response.status() }.into());
         }
-        if response.body().len() > self.maximum {
+        self.reply.decode(&self.id, response.body(), self.maximum)
+    }
+}
+
+impl Reply {
+    // JSON collectors and SSE operations use the same method-owned terminal
+    // admission. The transport must still establish HTTP success and clean EOF
+    // before publishing this decoded value; a discriminator is not authority.
+    fn decode(
+        &self,
+        id: &RequestId,
+        body: &[u8],
+        maximum: usize,
+    ) -> Result<ManagedTaskEvent, DpopTasksError> {
+        if body.len() > maximum {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
-        let admitted = decode_strict_jsonrpc_response(response.body(), self.maximum)
+        let admitted = decode_strict_jsonrpc_response(body, maximum)
             .map_err(|_| ManagedTasksError::InvalidResponse)?;
         let (response, source) = admitted.into_parts();
-        if !response.id.as_ref().is_some_and(|id| id.correlates_with(&self.id)) {
+        if !response.id.as_ref().is_some_and(|actual| actual.correlates_with(id)) {
             return Err(ManagedTasksError::ResponseIdMismatch.into());
         }
         if let Some(error) = &response.error {
             return Err(ManagedTasksError::Remote { code: error.code.clone() }.into());
         }
         let source = source.ok_or(ManagedTasksError::InvalidResponse)?;
-        let result = match self.reply {
-            Reply::Tool(request) => {
+        let result = match self {
+            Self::Tool(request) => {
                 if response.result.as_ref().and_then(|result| result.get("resultType"))
                     .and_then(Value::as_str) == Some("task")
                 {
@@ -297,18 +314,18 @@ impl Admitted {
                     _ => return Err(ManagedTasksError::InvalidResponse.into()),
                 }
             }
-            Reply::Get(expected) => {
+            Self::Get(expected) => {
                 validate_task_input_shapes(&response)?;
                 let result: GetTaskResult = serde_json::from_str(&source)
                     .map_err(|_| ManagedTasksError::InvalidResponse)?;
-                if result.task.base().task_id != expected {
+                if &result.task.base().task_id != expected {
                     return Err(ManagedTasksError::TaskIdMismatch.into());
                 }
                 ManagedTaskEvent::Snapshot(Box::new(result))
             }
-            Reply::Update => ManagedTaskEvent::Updated(serde_json::from_str(&source)
+            Self::Update => ManagedTaskEvent::Updated(serde_json::from_str(&source)
                 .map_err(|_| ManagedTasksError::InvalidResponse)?),
-            Reply::Cancel => ManagedTaskEvent::Cancelled(serde_json::from_str(&source)
+            Self::Cancel => ManagedTaskEvent::Cancelled(serde_json::from_str(&source)
                 .map_err(|_| ManagedTasksError::InvalidResponse)?),
         };
         Ok(result)

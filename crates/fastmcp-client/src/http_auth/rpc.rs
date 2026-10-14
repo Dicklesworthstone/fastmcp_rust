@@ -27,7 +27,7 @@ use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
-    JsonInteger, JsonRpcMessage, ProgressMarker, RequestId, ServerNotification,
+    JsonInteger, JsonRpcMessage, JsonRpcRequest, ProgressMarker, RequestId, ServerNotification,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 use serde::Deserialize;
@@ -81,6 +81,10 @@ impl ManagedCoreLimits {
     }
     pub(crate) fn total_bytes(self) -> usize {
         self.total_bytes
+    }
+    #[cfg(feature = "tasks")]
+    pub(crate) fn notifications(self) -> usize {
+        self.notifications
     }
     pub(crate) fn timeout(self) -> Duration {
         self.timeout
@@ -606,36 +610,14 @@ impl CoreDecoder {
                 if self.notifications >= self.limits.notifications {
                     return Err(ManagedCoreError::NotificationLimit);
                 }
-                #[derive(Deserialize)]
-                struct RawNotification {
-                    params: Option<Box<serde_json::value::RawValue>>,
-                }
-                let raw: RawNotification =
-                    serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
-                let notification = match raw.params {
-                    Some(params) => {
-                        ServerNotification::decode_with_raw_params(&request, params.get())
-                    }
-                    None => ServerNotification::decode(&request),
-                }
-                .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
-                match &notification {
-                    ServerNotification::Cancelled(_)
-                    | ServerNotification::SubscriptionsAcknowledged(_) => {
-                        return Err(ManagedCoreError::UnexpectedNotification);
-                    }
-                    ServerNotification::Progress(progress) => {
-                        if self.progress_marker.as_ref() != Some(&progress.progress_token)
-                            || self
-                                .last_progress
-                                .as_ref()
-                                .is_some_and(|previous| progress.progress.cmp(previous).is_le())
-                        {
-                            return Err(ManagedCoreError::InvalidProgress);
-                        }
-                        self.last_progress = Some(progress.progress.clone());
-                    }
-                    _ => {}
+                let notification = admit_http_notification(
+                    frame,
+                    &request,
+                    self.progress_marker.as_ref(),
+                    self.last_progress.as_ref(),
+                )?;
+                if let ServerNotification::Progress(progress) = &notification {
+                    self.last_progress = Some(progress.progress.clone());
                 }
                 self.notifications += 1;
                 ManagedCoreEvent::Notification(Box::new(notification))
@@ -644,6 +626,47 @@ impl CoreDecoder {
         self.bytes += frame.len();
         Ok(event)
     }
+}
+
+// Shared by ordinary core and explicitly negotiated Task response streams.
+// Callers first admit the same frame through bounded, duplicate-aware raw
+// JSON-RPC decoding and check their own byte/count budgets. This function does
+// not mutate progress or quotas: only the owning decoder commits those after
+// successful admission. A subscription needs its separate filter/ID decoder.
+pub(crate) fn admit_http_notification(
+    frame: &[u8],
+    request: &JsonRpcRequest,
+    progress_marker: Option<&ProgressMarker>,
+    last_progress: Option<&ExactNonNegativeJsonNumber>,
+) -> Result<ServerNotification, ManagedCoreError> {
+    if request.id.is_some() {
+        return Err(ManagedCoreError::UnexpectedNotification);
+    }
+    #[derive(Deserialize)]
+    struct RawNotification {
+        params: Option<Box<serde_json::value::RawValue>>,
+    }
+    let raw: RawNotification =
+        serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
+    let notification = match raw.params {
+        Some(params) => ServerNotification::decode_with_raw_params(request, params.get()),
+        None => ServerNotification::decode(request),
+    }
+    .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
+    match &notification {
+        ServerNotification::Cancelled(_) | ServerNotification::SubscriptionsAcknowledged(_) => {
+            return Err(ManagedCoreError::UnexpectedNotification);
+        }
+        ServerNotification::Progress(progress) => {
+            if progress_marker != Some(&progress.progress_token)
+                || last_progress.is_some_and(|previous| progress.progress.cmp(previous).is_le())
+            {
+                return Err(ManagedCoreError::InvalidProgress);
+            }
+        }
+        _ => {}
+    }
+    Ok(notification)
 }
 
 struct BoundedWriter {
