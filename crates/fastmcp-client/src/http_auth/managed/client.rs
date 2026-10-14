@@ -505,8 +505,22 @@ impl ManagedHttpClient {
         if self.closed {
             return Err(ManagedHttpClientError::Closed);
         }
-        self.session.check(cx, cancellation)?;
-        let deadline = deadline_after(cx, self.operation_timeout)?;
+        // A refusal before acquisition is still terminal for retained state.
+        // In particular, a pre-cancelled call or a closed shared login must
+        // not leave its discovery, catalog cache or cursor custody reusable.
+        // Invalid cursor preflight below remains non-consuming for an active
+        // owner; lifecycle refusal must be handled before that distinction.
+        let deadline = match self
+            .session
+            .check(cx, cancellation)
+            .and_then(|()| deadline_after(cx, self.operation_timeout))
+        {
+            Ok(deadline) => deadline,
+            Err(error) => {
+                self.connection = None;
+                return Err(error.into());
+            }
+        };
         let catalog = call.catalog();
         let continuation = catalog.is_some_and(|(_, cursor)| cursor.is_some());
         if let Some((kind, Some(cursor))) = catalog {

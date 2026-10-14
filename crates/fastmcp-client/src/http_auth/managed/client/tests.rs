@@ -1076,6 +1076,113 @@ fn reviewed_header_repair_and_mrtr_stay_on_the_original_grant() {
 }
 
 #[test]
+fn pre_cancelled_call_retires_catalog_custody_before_any_network_poll() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut page = catalog("lookup");
+        page["nextCursor"] = json!("retired-wire-cursor");
+        let (listed, ()) = pair(client.list_tools(&cx, None), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/list", "access-one", page).await;
+        })
+        .await;
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = listed.unwrap()
+        else {
+            panic!("expected a catalog page with live continuation custody");
+        };
+        let cursor = result.payload.next_cursor.unwrap();
+        assert_eq!(client.cached_credential_generation(), Some(1));
+
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        let mut call = Box::pin(client.call_tool_with_cancellation(
+            &cx,
+            &cancellation,
+            "lookup",
+            json!({}),
+        ));
+        poll_fn(|task| {
+            assert!(matches!(
+                call.as_mut().poll(task),
+                Poll::Ready(Err(ManagedHttpClientError::Session(
+                    OAuthSessionError::Cancelled
+                )))
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        drop(call);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(matches!(
+            client.list_tools(&cx, Some(&cursor)).await,
+            Err(ManagedHttpClientError::CatalogGenerationChanged)
+        ));
+        peer.no_more(&cx).await;
+
+        // Local cancellation retires only the client's retained connection,
+        // not the login or parent. A fresh explicit call must rediscover and
+        // succeeds with the original credential, without a token refresh.
+        let snapshot = session.credential(&cx).await.unwrap();
+        assert_eq!(snapshot.generation(), 1);
+        assert!(!snapshot.credential().is_revoked());
+        assert!(cx.checkpoint().is_ok());
+        warmup(&cx, &peer, &mut client).await;
+        assert_eq!(client.cached_credential_generation(), Some(1));
+        assert!(matches!(
+            client.list_tools(&cx, Some(&cursor)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)
+        ));
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
+fn shared_login_close_retires_cached_connection_on_the_first_refused_poll() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        warmup(&cx, &peer, &mut client).await;
+        assert_eq!(client.cached_credential_generation(), Some(1));
+        session.close();
+        let mut call = Box::pin(client.list_tools(&cx, None));
+        poll_fn(|task| {
+            assert!(matches!(
+                call.as_mut().poll(task),
+                Poll::Ready(Err(ManagedHttpClientError::Session(
+                    OAuthSessionError::Closed
+                )))
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        drop(call);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(matches!(
+            client.call_tool(&cx, "lookup", json!({})).await,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+        ));
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(cx.checkpoint().is_ok());
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
 fn local_client_close_does_not_revoke_a_sibling_or_the_shared_login() {
     run(async {
         let cx = Cx::current().unwrap();
