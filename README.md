@@ -242,10 +242,16 @@ different things:
   So `readme_mechanical_claims.rs` gates the zero in the opposite sense from
   the one this row first claimed: the check fails if the library ever starts
   driving DPoP itself, which is the promise the module makes and the thing
-  worth protecting. The size and its growth rate are still worth recording --
-  `http.rs` is 14,734 lines and `websocket.rs` 6,828, so the 11,056 here sits
-  between them, but those two are long-standing while this was 781 lines the
-  day before yesterday. Tracked as `bd-iaqgd`.
+  worth protecting. The size and its growth rate are still worth recording:
+  781 lines on 2026-10-12 to 11,056 across two crates two days later.
+  *(An earlier version of this sentence ranked that against "`http.rs` is
+  14,734 lines and `websocket.rs` 6,828". That comparison was wrong and is
+  withdrawn: it set a whole module against a whole module, while the unclaimed
+  surface in those two is one adapter struct and one `cfg(test)` codec
+  respectively. `http.rs` itself is heavily consumed — `HttpResponse`,
+  `HttpStatus`, `HttpRequest` and `HttpMethod` alone account for 680 mentions
+  in `fastmcp-server/src` — so its line count measures something else
+  entirely.)* Tracked as `bd-iaqgd`.
   Across every member `src/` file outside the two
   module trees, the lowercase path spelling `dpop` occurs exactly **twice**, and
   both are the `pub mod dpop;` declarations that put the modules in the build
