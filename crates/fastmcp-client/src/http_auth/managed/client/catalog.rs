@@ -278,10 +278,21 @@ catalog_result!(
 );
 catalog_result!(FinalPrompt, FinalListPromptsResult, prompts);
 
-pub(super) enum Collected {
+/// A complete catalog selected by its original list method.
+///
+/// Publicly exported as `CatalogCollection`. Both managed bearer and explicit
+/// DPoP traversal retain the same typed entries, exact per-page metadata, cache
+/// hints and open result siblings. This is not an atomic snapshot or cache grant.
+/// Debug includes only the catalog kind and counts, never peer-controlled data.
+#[derive(Debug)]
+pub enum Collected {
+    /// A complete tools/list traversal.
     Tools(ManagedCatalog<FinalTool>),
+    /// A complete resources/list traversal.
     Resources(ManagedCatalog<FinalResource>),
+    /// A complete resources/templates/list traversal.
     Templates(ManagedCatalog<FinalResourceTemplate>),
+    /// A complete prompts/list traversal.
     Prompts(ManagedCatalog<FinalPrompt>),
 }
 
@@ -576,6 +587,67 @@ impl Entries {
     }
 }
 
+/// Shared assembly, not transport or credential authority. Every consumer must
+/// decode/correlate a page and enforce its original lifetime before appending.
+/// A failed append retires all partial data; only cursor absence permits finish.
+pub(crate) struct CatalogCollector {
+    entries: Option<Entries>,
+    meter: Meter,
+    complete: bool,
+}
+
+impl CatalogCollector {
+    pub(crate) fn new(method: &str, limits: CatalogLimits) -> Result<Self, CatalogError> {
+        let kind = match method {
+            "tools/list" => CatalogKind::Tools,
+            "resources/list" => CatalogKind::Resources,
+            "resources/templates/list" => CatalogKind::Templates,
+            "prompts/list" => CatalogKind::Prompts,
+            _ => return Err(CatalogError::UnexpectedResult),
+        };
+        Ok(Self::from_kind(kind, limits))
+    }
+
+    fn from_kind(kind: CatalogKind, limits: CatalogLimits) -> Self {
+        Self {
+            entries: Some(Entries::new(kind)),
+            meter: Meter::new(limits),
+            complete: false,
+        }
+    }
+
+    pub(crate) fn append(&mut self, page: CoreResult) -> Result<Option<String>, CatalogError> {
+        if self.complete {
+            self.entries = None;
+            return Err(CatalogError::UnexpectedResult);
+        }
+        let result = self
+            .entries
+            .as_mut()
+            .ok_or(CatalogError::UnexpectedResult)?
+            .append(page, &mut self.meter);
+        match result {
+            Ok(cursor) => {
+                self.complete = cursor.is_none();
+                Ok(cursor)
+            }
+            Err(error) => {
+                self.entries = None;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<Collected, CatalogError> {
+        if !self.complete {
+            return Err(CatalogError::UnexpectedResult);
+        }
+        self.entries
+            .map(Entries::finish)
+            .ok_or(CatalogError::UnexpectedResult)
+    }
+}
+
 pub(super) async fn collect(
     cx: &Cx,
     boundary: &CallbackBoundary,
@@ -583,8 +655,7 @@ pub(super) async fn collect(
     kind: CatalogKind,
     limits: CatalogLimits,
 ) -> Result<Collected, ManagedHttpClientError> {
-    let mut entries = Entries::new(kind);
-    let mut meter = Meter::new(limits);
+    let mut collector = CatalogCollector::from_kind(kind, limits);
     let mut cursor: Option<String> = None;
     loop {
         boundary
@@ -600,14 +671,14 @@ pub(super) async fn collect(
         boundary
             .check(cx)
             .map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
-        cursor = entries.append(page, &mut meter)?;
+        cursor = collector.append(page)?;
         // Even cached, immediately ready pages cannot replenish time or publish
         // after local revocation. The outer guard supplies wakeups while pending.
         boundary
             .check(cx)
             .map_err(|error| request_error(HttpClientError::CoreResult(error)))?;
         if cursor.is_none() {
-            return Ok(entries.finish());
+            return Ok(collector.finish()?);
         }
     }
 }

@@ -29,7 +29,8 @@ mod callbacks;
 mod catalog;
 mod core_listen;
 mod cursors;
-pub use catalog::{CatalogError, CatalogLimits, ManagedCatalog};
+pub use catalog::{CatalogError, CatalogLimits, Collected as CatalogCollection, ManagedCatalog};
+pub(crate) use catalog::CatalogCollector;
 use cursors::{CatalogKind, CursorLedger};
 #[cfg(feature = "tasks")]
 mod tasks;
