@@ -33,6 +33,9 @@ pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest,
 /// Bounded polling and explicit host input under one original credential.
 pub mod driver;
 
+/// Bounded Task observation under one original credential and deadline.
+pub mod wait;
+
 /// One explicit operation with two distinct correlation identities.
 ///
 /// Neither identity is a task ID or an idempotency key. Construct a new value
@@ -360,6 +363,24 @@ impl DpopHttpClient {
         limits: ManagedCoreLimits,
     ) -> Result<ManagedTaskEvent, DpopTasksError> {
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.timeout()), credential)?;
+        self.request_task_with_bounds(cx, cancellation, credential, metadata, operation,
+            limits, bounds).await.map(|(event, _)| event)
+    }
+
+    // Shared by a single explicit operation and the observation-only waiter.
+    // Returning actual response-body usage lets a logical wait charge every
+    // discovery and get without re-encoding snapshots or resetting its budget.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_task_with_bounds(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        operation: DpopTaskOperation,
+        limits: ManagedCoreLimits,
+        bounds: WaitBounds,
+    ) -> Result<(ManagedTaskEvent, usize), DpopTasksError> {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let prepared = Prepared::new(self.resource().as_str(), metadata, operation,
             limits, self.policy.max_body_bytes);
@@ -368,17 +389,20 @@ impl DpopHttpClient {
         let response = self.post_resource_with_bounds(cx, cancellation, credential,
             &prepared.discovery_wire, bounds).await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
+        let discovery_bytes = response.body().len();
         let admitted = prepared.admit(response);
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let admitted = admitted?;
         let response = self.post_resource_with_bounds(cx, cancellation, credential,
             &admitted.wire, bounds).await?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
+        let payload_bytes = discovery_bytes.checked_add(response.body().len())
+            .ok_or(ManagedCoreError::ResponseByteLimit)?;
         let result = admitted.finish(response);
         // Failed decoding and remote errors cannot bypass the final lifetime
         // check any more than successful task results can.
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        result
+        result.map(|event| (event, payload_bytes))
     }
 }
 
