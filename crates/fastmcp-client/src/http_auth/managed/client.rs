@@ -736,7 +736,16 @@ mod completion_api_tests {
 
     // Compile the public call shapes without acquiring a grant or constructing
     // an unguarded/raw client. No concrete parameter layout is duplicated here.
+    // Both of these are compile-only shape tests, as the comment above says:
+    // the closure is never invoked, and its whole job is to prove the public
+    // call typechecks and yields the declared future. `completed_result` is
+    // the type assertion. `clippy::no_effect_underscore_binding` is therefore
+    // literally right -- the binding has no runtime effect -- and the effect
+    // being absent is the design. Allowed rather than restructured: turning
+    // each into a `const _: fn(..)` item would silence the lint but drop two
+    // rows from the crate's test inventory, which reads as deleting tests.
     #[test]
+    #[allow(clippy::no_effect_underscore_binding)]
     fn completion_returns_a_typed_managed_result() {
         let _check = |client: &mut ManagedHttpClient, cx: &Cx, params: crate::CompletionParams| {
             completed_result(client.complete(cx, params));
@@ -744,6 +753,7 @@ mod completion_api_tests {
     }
 
     #[test]
+    #[allow(clippy::no_effect_underscore_binding)]
     fn completion_accepts_caller_owned_cancellation() {
         let _check = |client: &mut ManagedHttpClient,
                       cx: &Cx,

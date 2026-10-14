@@ -571,10 +571,23 @@ fn parallel_inputs_overlap_keep_exact_keys_and_never_replay_an_uncertain_update(
             .await;
             assert_eq!(result.is_ok(), case == 2);
             assert_eq!(calls.load(Ordering::SeqCst), 2);
-            let tokens = tokens.lock().unwrap();
-            assert_eq!(tokens.len(), 2);
-            assert!(tokens.iter().all(|token| token.is_cancel_requested() == (case != 2)));
-            drop(tokens);
+            // Scoped rather than dropped by hand. The explicit `drop` this
+            // replaces was already correct -- it released the guard three
+            // statements before the next await -- but `clippy::await_holding_lock`
+            // reads the binding's lexical scope and flagged it anyway, which
+            // halts the workspace gate at -D warnings. A block makes the
+            // release structural, so the invariant survives a later edit that
+            // moves statements around instead of depending on the `drop` call
+            // staying put.
+            {
+                let tokens = tokens.lock().unwrap();
+                assert_eq!(tokens.len(), 2);
+                assert!(
+                    tokens
+                        .iter()
+                        .all(|token| token.is_cancel_requested() == (case != 2))
+                );
+            }
             assert_eq!(client.cached_credential_generation(), (case == 2).then_some(1));
             assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
             let (next, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {

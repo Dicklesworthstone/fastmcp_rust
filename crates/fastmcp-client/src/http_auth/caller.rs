@@ -167,7 +167,7 @@ mod tests {
         let caller = runtime.request_cx_with_budget(Budget::INFINITE);
         let foreign = Cx::for_testing_with_budget(Budget::ZERO);
         foreign.set_cancel_requested(true);
-        let _ambient = Cx::set_current(Some(foreign.clone()));
+        let ambient_guard = Cx::set_current(Some(foreign.clone()));
         clock.advance(123);
         with_caller(&caller, || {
             let current = Cx::current().unwrap();
@@ -181,7 +181,7 @@ mod tests {
         assert!(Cx::current().unwrap().is_cancel_requested());
         assert!(Cx::current().unwrap().timer_driver().is_none());
         assert_eq!(timer.pending_count(), 0);
-        drop(_ambient);
+        drop(ambient_guard);
         drop(caller);
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }

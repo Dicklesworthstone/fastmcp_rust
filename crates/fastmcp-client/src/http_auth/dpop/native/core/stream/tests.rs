@@ -474,7 +474,7 @@ fn large_ready_buffers_yield_without_changing_notifications_or_exact_results() {
 fn empty_ready_data_and_trailer_frames_cannot_evade_the_scheduling_budget() {
     fixture(|life, timer, _| {
         for trailers in [false, true] {
-            let mut frames: std::collections::VecDeque<_> = (0..2 * FRAMES_PER_TURN + 1)
+            let mut frames: std::collections::VecDeque<_> = (0..=2 * FRAMES_PER_TURN)
                 .map(|_| {
                     if trailers {
                         // Synthetic Body stress case, not a claim that multiple

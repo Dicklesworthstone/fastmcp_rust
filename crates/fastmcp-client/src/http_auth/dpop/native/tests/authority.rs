@@ -190,7 +190,7 @@ fn foreign_ambient_cancellation_and_clock_never_replace_the_native_owner() {
     let cancellation = McpRequestCancellation::new();
     let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
     let ambient = held(&foreign, TIME | IO);
-    let _ambient = Cx::set_current(Some(ambient));
+    let ambient_guard = Cx::set_current(Some(ambient));
     let mut call = Box::pin(within(
         &cx,
         &cancellation,
@@ -213,7 +213,7 @@ fn foreign_ambient_cancellation_and_clock_never_replace_the_native_owner() {
     assert_eq!(Cx::current().unwrap().now(), foreign.now());
     assert!(Cx::current().unwrap().is_cancel_requested());
     drop(call);
-    drop(_ambient);
+    drop(ambient_guard);
     assert_eq!(timer.pending_count(), 0);
     assert_eq!(foreign_timer.pending_count(), 0);
     drop(foreign);
@@ -229,7 +229,7 @@ fn native_unwind_restores_the_surrounding_scope_and_retires_its_timer() {
     let credential = credential(&session);
     let cancellation = McpRequestCancellation::new();
     let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-    let _ambient = Cx::set_current(Some(held(&Cx::for_testing(), TIME | IO)));
+    let ambient_guard = Cx::set_current(Some(held(&Cx::for_testing(), TIME | IO)));
     let depth = Cx::restriction_depth();
     let mut call = Box::pin(within(
         &cx,
@@ -253,7 +253,7 @@ fn native_unwind_restores_the_surrounding_scope_and_retires_its_timer() {
     drop(call);
     assert_eq!(timer.pending_count(), 0);
     assert!(!credential.is_revoked());
-    drop(_ambient);
+    drop(ambient_guard);
     drop(cx);
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
 }
@@ -331,7 +331,7 @@ fn native_outer_wait_preserves_restrictions_inside_the_public_sampling_runner() 
             .await)
         },
     ));
-    let _ambient = Cx::set_current(Some(held(&Cx::for_testing(), TIME | IO)));
+    let ambient_guard = Cx::set_current(Some(held(&Cx::for_testing(), TIME | IO)));
     let Poll::Ready(Ok(Ok(result))) = call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
     else {
         panic!("one ready model round must finish under the intersected ceiling");
@@ -340,7 +340,7 @@ fn native_outer_wait_preserves_restrictions_inside_the_public_sampling_runner() 
     assert_eq!(result.executed_tools, 0);
     assert_eq!(row(&Cx::current().unwrap()), TIME | IO);
     drop(call);
-    drop(_ambient);
+    drop(ambient_guard);
     assert_eq!(timer.pending_count(), 0);
     drop(cx);
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
