@@ -1144,3 +1144,198 @@ fn planted_dpop_consumer_is_detected_and_a_declaration_is_not() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Claim 7: the README's HTTPS hard-gate census matches the tree.
+//
+// This row feeds an open owner decision (the client-mode conformance
+// loopback question), so a wrong number there is worse than a wrong number
+// elsewhere: it prices a decision somebody is being asked to take. The row
+// previously read "32 production HTTPS hard-gates across 19 files" and then
+// named 18 of them. Running the same instrument at the row's own authoring
+// commit and at HEAD returns 22 across 17 BOTH times, so the figure was wrong
+// when written rather than stale, and nothing caught it for a day.
+//
+// WHAT IS COUNTED, and why this is the honest unit. An exemption has to be
+// threaded through each INDEPENDENT refusal, and through the two central
+// helpers in `discovery.rs` once each -- but not through the thirteen call
+// sites that merely invoke those helpers, which inherit the decision. So the
+// enforcement-point count is exactly the number of inline
+// `scheme() != "https"` / `starts_with("https://")` refusals, which includes
+// the two helper bodies and excludes their callers. No classification of
+// imports or call sites is needed, which keeps this check mechanical.
+//
+// NO-CLAIM: this counts refusal SITES in production source. It says nothing
+// about whether each one is reachable, whether the set is complete (a refusal
+// spelled another way would not be seen), or whether the exemption is a good
+// idea.
+// ---------------------------------------------------------------------------
+
+/// Blank out every `#[cfg(...test...)] mod|fn NAME { ... }` block, preserving
+/// byte length so nothing downstream shifts.
+///
+/// The predicate is any cfg whose text contains a bare `test` token, not the
+/// literal `#[cfg(test)]` alone. The narrow form missed
+/// `#[cfg(all(test, feature = "legacy-2024-11-05"))]`, which guards a test
+/// module in `http_executor.rs`, so a census using it called that module
+/// production code.
+fn strip_cfg_test_blocks(text: &str) -> String {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut out = bytes.clone();
+    let mut index = 0usize;
+    while let Some(found) = text[index..].find("#[cfg(") {
+        let start = index + found;
+        let Some(close) = text[start..].find(")]") else {
+            break;
+        };
+        let attribute = &text[start..start + close + 2];
+        index = start + close + 2;
+        if !attribute
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|token| token == "test")
+        {
+            continue;
+        }
+        // Find the item's opening brace, refusing to scan far enough to
+        // swallow an unrelated block if this attribute sits on a `use` or a
+        // field rather than a module or function.
+        let tail = &text[index..];
+        let Some(brace) = tail.find('{') else {
+            continue;
+        };
+        if brace > 400 || tail[..brace].contains(';') {
+            continue;
+        }
+        let open = index + brace;
+        let mut depth = 0i32;
+        let mut cursor = open;
+        for (offset, character) in text[open..].char_indices() {
+            if character == '{' {
+                depth += 1;
+            } else if character == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    cursor = open + offset;
+                    break;
+                }
+            }
+        }
+        let from = text[..start].chars().count();
+        let to = text[..=cursor.min(text.len() - 1)].chars().count();
+        for slot in out.iter_mut().take(to).skip(from) {
+            if *slot != '\n' {
+                *slot = ' ';
+            }
+        }
+        index = cursor + 1;
+    }
+    out.into_iter().collect()
+}
+
+/// Inline HTTPS refusals per repository-relative file under
+/// `crates/fastmcp-client/src`, production code only.
+fn https_enforcement_sites() -> BTreeMap<String, usize> {
+    const PREFIX: &str = "crates/fastmcp-client/src/";
+    let mut per_file = BTreeMap::new();
+    for (path, text) in source_corpus() {
+        if !path.starts_with(PREFIX) {
+            continue;
+        }
+        let production = strip_cfg_test_blocks(text);
+        let count = production.matches("scheme() != \"https\"").count()
+            + production.matches("starts_with(\"https://\")").count();
+        if count > 0 {
+            per_file.insert(path.clone(), count);
+        }
+    }
+    per_file
+}
+
+#[test]
+fn readme_https_gate_census_matches_the_tree() {
+    let per_file = https_enforcement_sites();
+    let sites: usize = per_file.values().sum();
+    let files = per_file.len();
+
+    // Control: a zero would satisfy no README text but would also mean the
+    // corpus lookup or the stripper ate everything, so say so loudly.
+    assert!(
+        sites > 0 && files > 0,
+        "counted {sites} refusals across {files} files; a zero means the \
+         fastmcp-client corpus lookup or the cfg(test) stripper is broken"
+    );
+
+    let readme = read(&repo_root().join("README.md"));
+    let claim = format!("**{sites} production HTTPS enforcement points");
+    let files_claim = format!("across {files} files**");
+    assert!(
+        readme.contains(claim.as_str()) && readme.contains(files_claim.as_str()),
+        "the README's HTTPS census no longer matches the tree: the census \
+         finds {sites} enforcement points across {files} files. This row \
+         prices an open owner decision, so fix the row rather than this \
+         check.\nper file: {per_file:#?}"
+    );
+}
+
+/// Planted negative for the HTTPS census gate.
+///
+/// Uses the drift that really happened -- a row claiming 32 across 19 against
+/// a tree holding 22 across 17 -- and requires the predicate to reject it
+/// while accepting the corrected text. Without this, the green above would be
+/// consistent with a check that accepts any README at all.
+#[test]
+fn planted_https_census_drift_is_detected() {
+    let accepts = |row: &str, sites: usize, files: usize| {
+        row.contains(format!("**{sites} production HTTPS enforcement points").as_str())
+            && row.contains(format!("across {files} files**").as_str())
+    };
+
+    let wrong = "finds **32 production HTTPS hard-gates across 19 files** — \
+                 `validate_https` and `https_url` in `discovery.rs`";
+    let right = "finds **22 production HTTPS enforcement points\n  across 17 files**: 20 \
+                 independent `scheme() != \"https\"`";
+
+    assert!(
+        !accepts(wrong, 22, 17),
+        "the row as it was actually written must be rejected against a 22/17 tree"
+    );
+    assert!(
+        accepts(right, 22, 17),
+        "the corrected row must be accepted against a 22/17 tree"
+    );
+    // And it must discriminate on each number independently, not merely on
+    // the whole string differing.
+    assert!(
+        !accepts(right, 23, 17),
+        "a one-off site count must be rejected"
+    );
+    assert!(
+        !accepts(right, 22, 18),
+        "a one-off file count must be rejected"
+    );
+}
+
+#[test]
+fn planted_cfg_test_stripper_handles_a_compound_predicate() {
+    // The exact shape the narrow `#[cfg(test)]` needle missed.
+    let source = "fn keep() { let a = url.scheme() != \"https\"; }\n\
+                  #[cfg(all(test, feature = \"legacy-2024-11-05\"))]\n\
+                  mod gone {\n    fn inner() { let b = x.scheme() != \"https\"; }\n}\n\
+                  fn also_keep() { let c = y.starts_with(\"https://\"); }\n";
+    let stripped = strip_cfg_test_blocks(source);
+    assert_eq!(
+        stripped.matches("scheme() != \"https\"").count(),
+        1,
+        "the production refusal survives and the cfg(all(test, ..)) one does not: {stripped}"
+    );
+    assert_eq!(
+        stripped.matches("starts_with(\"https://\")").count(),
+        1,
+        "a refusal after the stripped block must survive: {stripped}"
+    );
+    assert_eq!(
+        stripped.len(),
+        source.len(),
+        "the stripper preserves length so line numbers stay true"
+    );
+}

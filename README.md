@@ -136,16 +136,23 @@ different things:
   **more than an adapter profile**, which is worth stating precisely because
   the cheap-sounding estimate is wrong. The HTTPS requirement is not one check
   in the conformance adapter: a census of `crates/fastmcp-client/src`, with
-  `cfg(test)` modules excluded, finds **32 production HTTPS hard-gates across
-  19 files** — `validate_https` and `https_url` in `discovery.rs`, and
-  independent `scheme() != "https"` or `starts_with("https://")` refusals in
-  `challenge.rs`, `step_up.rs`, `private_key_jwt.rs`, `registration.rs`,
-  `metadata_document.rs`, `dpop.rs`, `driver.rs`, `redirect.rs`,
-  `http_client.rs`, `managed/client.rs`, `resume.rs`, `oauth.rs`,
-  `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs` and
-  `parameter_headers.rs` — and **no loopback exemption anywhere**. The one
-  `127.0.0.1` occurrence in the discovery tests is a fixture asserting
-  rejection. Reaching the suite's ephemeral plain-HTTP loopback authorization
+  `cfg(test)` modules excluded, finds **22 production HTTPS enforcement points
+  across 17 files**: 20 independent `scheme() != "https"` or
+  `starts_with("https://")` refusals in `http_auth.rs`, `challenge.rs`,
+  `private_key_jwt.rs`, `metadata_document.rs`, `dpop.rs`, `driver.rs`,
+  `redirect.rs`, `http_client.rs`, `managed/client.rs`, `resume.rs`,
+  `oauth.rs`, `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs`
+  and `parameter_headers.rs`, plus the two central helpers `validate_https`
+  and `https_url` in `discovery.rs`. Thirteen further call sites — in
+  `challenge.rs`, `step_up.rs`, `issuer.rs` and `registration.rs` — inherit
+  those helpers' refusal rather than repeating it, so they are not separate
+  edits.
+  *(This row previously read "32 production HTTPS hard-gates across 19 files"
+  and then named 18. Both figures were wrong when written rather than stale:
+  the same instrument returns 22 across 17 both at the authoring commit
+  `aac6f67c` and at HEAD, so the subject never moved. The corrected figure is
+  smaller, i.e. the earlier row overstated the work.)*
+  Reaching the suite's ephemeral plain-HTTP loopback authorization
   server therefore means threading a loopback exemption through all of them,
   which is a change to the transport security posture of the whole client
   authorization subsystem, plus accepting a *discovered* issuer where
@@ -154,11 +161,34 @@ different things:
   direction that matters: RFC 8252 §7.3 permits loopback `http` for the
   *client's own redirect URI*, which is not what blocks us, while OAuth 2.1
   requires `https` for the authorization server's own endpoints — exactly the
-  URLs these 32 gates refuse. The pinned suite serves its authorization server
+  URLs these 22 enforcement points refuse. The pinned suite serves its
+  authorization server
   over plain `http` as a harness convenience, not because the spec allows it.
   So permitting it would be a real relaxation beyond the spec, not a reviewed
   alignment with it, and it is a library decision rather than adapter plumbing.
   It is not taken here.
+
+  **But a reviewed loopback-HTTP exemption already exists in this library, and
+  the conformance adapter already uses it.** This row previously claimed "no
+  loopback exemption anywhere", which is false.
+  `ReviewedToolHeaders::new_for_loopback_http`
+  (`http_executor/parameter_headers.rs`) is public and documented: it admits
+  canonical IPv4/IPv6 loopback *literals* over plain `http` and deliberately
+  refuses DNS names, `localhost` included, "because a name can be rebound and
+  is therefore not proof of a loopback peer". Its doc states the threat model
+  it accepts — "loopback provides neither peer authentication nor secrecy from
+  other local processes" — and requires per-binding caller review.
+  `examples/conformance_client.rs` branches on the endpoint scheme to call it,
+  and resolves the harness's `http://localhost:<port>` to the loopback literal
+  **in the adapter**, on the stated ground that "resolving the name is the
+  HOST's decision to make, not the library's … the library's literal-only
+  boundary stays intact". So the precedent, the threat model, and the
+  host-versus-library trust split are all settled here already — for parameter
+  headers. What is *not* settled, and is the actual decision, is whether the
+  same split is acceptable for the authorization server's own endpoints, where
+  these 22 points protect credential transport rather than header mirroring.
+  That is a strictly stronger property, so the existing precedent narrows the
+  question rather than answering it.
 
   **A trap for whoever does take it.** Gating the exemption behind a
   conformance-only feature or `cfg` would be the cheap version and is
