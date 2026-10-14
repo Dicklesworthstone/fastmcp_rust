@@ -982,6 +982,16 @@ fn planted_item_declaration_requires_an_identifier_boundary() {
 // and nothing caught it, because the existing checks gate which features are
 // inert and which symbols exist, not the size of a module under construction.
 //
+// WHAT THE ZERO MEANS, corrected 2026-10-14. This check first existed to
+// detect a gap being closed. Reading the module header shows the opposite: it
+// is an EXPLICIT, caller-driven API whose documentation promises it "never
+// promotes a DPoP token into the existing bearer-only OAuth driver" and "does
+// not install automatic OAuth negotiation or HTTP retries". The intended
+// consumer is the application, so zero in-workspace callers is the design.
+// The check is kept and its meaning inverted: it now fails if the library
+// starts driving DPoP itself, which is the promise worth protecting. Either
+// way the README row must be rewritten when it fires.
+//
 // Pinning the size would be the wrong repair. That module is being actively
 // built, so an exact-count gate would redden on every ordinary commit to it,
 // and a gate that reddens on ordinary growth is a gate somebody switches off.
@@ -1049,7 +1059,7 @@ fn dpop_consumer_sites() -> Vec<(String, usize, String)> {
 fn readme_dpop_row_still_has_no_consumer() {
     let readme = read(&repo_root().join("README.md"));
     assert!(
-        readme.contains("It still has no consumer"),
+        readme.contains("It has no in-workspace consumer"),
         "this gate pins a README claim; if the row no longer makes it, retire \
          the gate with the row rather than leaving it asserting nothing"
     );

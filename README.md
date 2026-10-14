@@ -231,16 +231,22 @@ different things:
   `mod dpop` declaration in `http_auth.rs` is that one, so those lines had
   never been compiled until then. (They had never been formatted either;
   `c65eced1` restored `cargo fmt --check` afterwards.)
-  **It still has no consumer, and that is the durable claim here.** The
-  implementation grew by ~10,300 lines in two days while the number of callers
-  stayed at zero. That growth rate, not the absolute size, is what distinguishes
-  it from the other unconsumed surfaces this README already records: `http.rs`
-  is 14,734 lines and `websocket.rs` 6,828, so the 11,056 here now sits between
-  them — but those two are long-standing, while this one was 781 lines the day
-  before yesterday. Tracked as `bd-iaqgd`;
-  `readme_mechanical_claims.rs` gates
-  the zero so that wiring DPoP forces this row to be rewritten. Nothing in this
-  workspace drives that module. Across every member `src/` file outside the two
+  **It has no in-workspace consumer, and that is its design rather than a
+  gap** — a correction to what this row said earlier today. The module
+  documentation states that it "never promotes a DPoP token into the existing
+  bearer-only OAuth driver" and "does not install automatic OAuth negotiation
+  or HTTP retries", so the intended consumer is the *application*, not this
+  SDK. See **Sender-constrained credentials: DPoP** under Authenticated HTTP
+  clients for the caller-facing flow; the real gap was that nothing pointed a
+  reader at it, which is now fixed.
+  So `readme_mechanical_claims.rs` gates the zero in the opposite sense from
+  the one this row first claimed: the check fails if the library ever starts
+  driving DPoP itself, which is the promise the module makes and the thing
+  worth protecting. The size and its growth rate are still worth recording --
+  `http.rs` is 14,734 lines and `websocket.rs` 6,828, so the 11,056 here sits
+  between them, but those two are long-standing while this was 781 lines the
+  day before yesterday. Tracked as `bd-iaqgd`.
+  Across every member `src/` file outside the two
   module trees, the lowercase path spelling `dpop` occurs exactly **twice**, and
   both are the `pub mod dpop;` declarations that put the modules in the build
   (`http_auth.rs:35`, `fastmcp-protocol/src/lib.rs:44`); it occurs **zero**
@@ -929,6 +935,52 @@ HTTPS uses the transport's bundled WebPKI roots by default. Enable
 store. That profile also honors the native certificate provider's
 `SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
 and do not disable certificate or hostname verification.
+
+### Sender-constrained credentials: DPoP (RFC 9449), caller-driven
+
+`fastmcp_rust::http_auth::dpop` is a **public, explicit, caller-driven** API for
+DPoP. It is deliberately *not* wired into the bearer OAuth driver: its module
+documentation states that it "never promotes a DPoP token into the existing
+bearer-only OAuth driver" and "does not install automatic OAuth negotiation or
+HTTP retries". So the application owns the authenticated HTTPS I/O, the
+response-size limits, cancellation of in-flight I/O, and every retry decision.
+If you want DPoP, you drive it; nothing in this SDK will start doing so on your
+behalf.
+
+One session pins one HTTPS token endpoint, one exact HTTPS MCP resource, and
+one ES256 proof key. The flow, in call order:
+
+1. `DpopSession::new` — pin the endpoint, resource and key.
+   `DpopSession::authorization_jkt` exposes the key thumbprint for a
+   confirmation claim.
+2. `DpopSession::token_request_headers` — build the headers for your token
+   request, then perform that request yourself.
+3. `DpopSession::admit_token_response` — strict, bounded, duplicate-free
+   admission of the response. It yields a `DpopCredential`, and refuses a
+   bearer downgrade or a mismatched proof key rather than accepting one.
+4. `DpopSession::resource_request_headers` — build the headers for the MCP
+   request, again performed by you.
+5. On a nonce challenge, feed the nonce back with
+   `DpopSession::observe_token_nonce` or
+   `DpopSession::observe_resource_nonce` and generate *new* headers for a
+   retry you deliberately admit. Never replay a proof, and never
+   automatically replay a possibly-executed MCP call.
+
+`DpopRequestHeaders::apply_to` and `DpopRequestHeaders::into_headers` move the
+prepared fields onto your request. `DpopCredential::expires_at`,
+`DpopCredential::revoke` and `DpopCredential::is_revoked` cover lifetime and
+revocation; `DpopSession::revoke` irreversibly retires the session and every
+credential it issued. AS and RS nonce state are kept separate. Errors are the
+redacted `DpopClientError` variants — no peer text, URL, proof, token or
+response body is retained.
+
+The full contract, including what each refusal means, is the module
+documentation on `fastmcp_client::http_auth::dpop`; read it before driving the
+flow, because several of the rules above are the caller's to honour rather than
+the library's to enforce. `fastmcp_protocol::dpop` holds the ES256 proof and
+RFC 7638 thumbprint primitives behind the `jose` feature. A bounded native
+HTTPS resource POST is available under the module's `native` submodule for
+callers who would rather not own that I/O.
 
 ---
 
