@@ -44622,8 +44622,11 @@ mod lib_unit_tests {
                 let mut stream = std::net::TcpStream::connect(address).map_err(|error| {
                     format!("post-admission capability connect failed: {error}")
                 })?;
+                // Bound named once so the message below cannot drift from the
+                // value actually installed on the socket.
+                let acknowledgement_read_bound = Duration::from_secs(2);
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .set_read_timeout(Some(acknowledgement_read_bound))
                     .map_err(|error| {
                         format!("post-admission capability timeout setup failed: {error}")
                     })?;
@@ -44643,7 +44646,33 @@ mod lib_unit_tests {
                 {
                     let mut chunk = [0_u8; 2048];
                     let count = std::io::Read::read(&mut stream, &mut chunk).map_err(|error| {
-                        format!("post-admission capability acknowledgement read failed: {error}")
+                        // An expired SO_RCVTIMEO on a blocking socket surfaces
+                        // as WouldBlock (EAGAIN, "Resource temporarily
+                        // unavailable") or TimedOut depending on the platform,
+                        // which reads like an I/O fault rather than the missed
+                        // bound it actually is. Naming the bound and the bytes
+                        // already received separates "the peer sent nothing"
+                        // from "the peer sent a partial response" from a real
+                        // transport error, which the bare OS string cannot.
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) {
+                            format!(
+                                "post-admission capability acknowledgement did not arrive within \
+                                 {acknowledgement_read_bound:?}; {} byte(s) received so far, as \
+                                 text {:?}. This is the read bound elapsing, not a transport \
+                                 fault: the underlying error is {error:?}",
+                                received.len(),
+                                String::from_utf8_lossy(&received[..received.len().min(512)])
+                            )
+                        } else {
+                            format!(
+                                "post-admission capability acknowledgement read failed after {} \
+                                 byte(s): {error}",
+                                received.len()
+                            )
+                        }
                     })?;
                     if count == 0 {
                         return Err(
