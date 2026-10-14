@@ -76,6 +76,25 @@ impl CallbackBoundary {
         .await
     }
 
+    // Constructing a callback future is itself host code. A single guarded
+    // `async { construct().await }` still polls that future in the same poll
+    // even when its constructor has just cancelled or revoked authority.
+    // Check between these two host effects, and drop refused work unpolled.
+    // Effects already performed inside the constructor cannot be undone.
+    async fn construct_and_run<T, F>(
+        &self,
+        cx: &Cx,
+        construct: impl FnOnce() -> F,
+    ) -> McpResult<T>
+    where
+        F: Future<Output = McpResult<T>>,
+    {
+        self.check(cx)?;
+        let future = construct();
+        self.check(cx)?;
+        self.run(cx, future).await
+    }
+
     pub(crate) fn approve(&self, cx: &Cx, review: impl FnOnce() -> bool) -> bool {
         self.check(cx).is_ok() && review() && self.check(cx).is_ok()
     }
@@ -88,10 +107,10 @@ impl CallbackBoundary {
                     let boundary = boundary.clone();
                     let handler = handler.clone();
                     Box::pin(async move {
-                        // Invoke even the callback's synchronous constructor only
-                        // inside the guarded future, after the first admission check.
+                        // Defer construction until admission, then recheck before
+                        // the first poll of returned host work.
                         boundary
-                            .run(cx, async move { handler(cx, cancelled, params).await })
+                            .construct_and_run(cx, move || handler(cx, cancelled, params))
                             .await
                     })
                 });
@@ -103,7 +122,7 @@ impl CallbackBoundary {
                 let handler = handler.clone();
                 Box::pin(async move {
                     boundary
-                        .run(cx, async move { handler(cx, cancelled, params).await })
+                        .construct_and_run(cx, move || handler(cx, cancelled, params))
                         .await
                 })
             });
@@ -115,7 +134,7 @@ impl CallbackBoundary {
                 let handler = handler.clone();
                 Box::pin(async move {
                     boundary
-                        .run(cx, async move { handler(cx, cancelled, params).await })
+                        .construct_and_run(cx, move || handler(cx, cancelled, params))
                         .await
                 })
             });
@@ -391,5 +410,306 @@ mod tests {
         assert!(roots.modern_elicitation_create.is_none());
         assert!(roots.roots_list.is_none());
         assert!(roots.sampling_create_message.is_none());
+    }
+}
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    use crate::{
+        ElicitResult, FinalCreateMessageResult, FinalEmbeddedRootsListResult,
+        ReverseRequestCancellation,
+    };
+    use fastmcp_core::McpErrorCode;
+    use fastmcp_protocol::FinalEmbeddedInputRequest;
+    use serde_json::json;
+
+    #[derive(Clone, Copy)]
+    enum Transition {
+        Live,
+        Session,
+        Request,
+        Credential,
+        Caller,
+    }
+
+    impl Transition {
+        fn apply(self, boundary: &CallbackBoundary, cx: &Cx) {
+            match self {
+                Self::Live => {}
+                Self::Session => {
+                    boundary.closed.cancel();
+                }
+                Self::Request => {
+                    boundary.cancellation.cancel();
+                }
+                Self::Credential => {
+                    boundary.revoked.cancel();
+                }
+                Self::Caller => {
+                    cx.set_cancel_requested(true);
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Counts {
+        constructed: AtomicUsize,
+        polled: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    struct Owned(Arc<Counts>);
+    impl Owned {
+        fn polled(&self) {
+            self.0.polled.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn boundary(cx: &Cx) -> CallbackBoundary {
+        CallbackBoundary {
+            closed: McpRequestCancellation::new(),
+            cancellation: McpRequestCancellation::new(),
+            revoked: McpRequestCancellation::new(),
+            deadline: cx.now().saturating_add_nanos(60_000_000_000),
+            expires_at: Instant::now() + Duration::from_secs(60),
+        }
+    }
+
+    // Construction is observable separately from the future's first host effect.
+    // The live control returns its own typed error; a lifetime refusal must not
+    // poll that error-producing body either, nor retain its captured resources.
+    fn construct_error<T: Send + 'static>(
+        boundary: &CallbackBoundary,
+        cx: &Cx,
+        transition: Transition,
+        counts: Arc<Counts>,
+    ) -> Pin<Box<dyn Future<Output = McpResult<T>> + Send>> {
+        counts.constructed.fetch_add(1, Ordering::SeqCst);
+        transition.apply(boundary, cx);
+        let owned = Owned(Arc::clone(&counts));
+        Box::pin(async move {
+            let _owned = owned;
+            counts.polled.fetch_add(1, Ordering::SeqCst);
+            Err(McpError::invalid_params("live callback refusal"))
+        })
+    }
+
+    fn handlers(
+        boundary: &CallbackBoundary,
+        transition: Transition,
+        counts: &Arc<Counts>,
+    ) -> ReverseRequestHandlers {
+        let roots_boundary = boundary.clone();
+        let roots_counts = Arc::clone(counts);
+        let sampling_boundary = boundary.clone();
+        let sampling_counts = Arc::clone(counts);
+        let elicitation_boundary = boundary.clone();
+        let elicitation_counts = Arc::clone(counts);
+        boundary.wrap(
+            ReverseRequestHandlers::new()
+                .with_modern_roots_list(move |cx, _, _| {
+                    construct_error::<FinalEmbeddedRootsListResult>(
+                        &roots_boundary,
+                        cx,
+                        transition,
+                        Arc::clone(&roots_counts),
+                    )
+                })
+                .with_modern_sampling_create_message(move |cx, _, _| {
+                    construct_error::<FinalCreateMessageResult>(
+                        &sampling_boundary,
+                        cx,
+                        transition,
+                        Arc::clone(&sampling_counts),
+                    )
+                })
+                .with_modern_elicitation_create(move |cx, _, _| {
+                    construct_error::<ElicitResult>(
+                        &elicitation_boundary,
+                        cx,
+                        transition,
+                        Arc::clone(&elicitation_counts),
+                    )
+                }),
+        )
+    }
+
+    #[test]
+    fn every_wrapped_constructor_rechecks_authority_before_polling_its_future() {
+        let descriptors = [
+            json!({"method":"roots/list"}),
+            json!({"method":"sampling/createMessage","params":{
+                "messages":[{"role":"user","content":{"type":"text","text":"hello"}}],
+                "maxTokens":16
+            }}),
+            json!({"method":"elicitation/create","params":{
+                "mode":"form","message":"approve",
+                "requestedSchema":{"type":"object","properties":{}}
+            }}),
+        ];
+        for descriptor in descriptors {
+            for transition in [
+                Transition::Live,
+                Transition::Session,
+                Transition::Request,
+                Transition::Credential,
+                Transition::Caller,
+            ] {
+                let cx = Cx::for_testing();
+                let boundary = boundary(&cx);
+                let counts = Arc::new(Counts::default());
+                let handlers = handlers(&boundary, transition, &counts);
+                let request: FinalEmbeddedInputRequest =
+                    serde_json::from_value(descriptor.clone()).unwrap();
+                let local = ReverseRequestCancellation::new();
+                let mut call = Box::pin(handlers.invoke_embedded_input_request_async(
+                    &cx,
+                    "selected",
+                    request,
+                    local,
+                ));
+                let Poll::Ready(Err(error)) =
+                    call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("ready or refused callback must settle on its first poll");
+                };
+                let live = matches!(transition, Transition::Live);
+                assert_eq!(
+                    error.code,
+                    if live {
+                        McpErrorCode::InvalidParams
+                    } else {
+                        McpErrorCode::RequestCancelled
+                    }
+                );
+                assert_eq!(counts.constructed.load(Ordering::SeqCst), 1);
+                assert_eq!(counts.polled.load(Ordering::SeqCst), usize::from(live));
+                assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
+                // No guard owns cancellation of the caller or sibling domains.
+                assert_eq!(
+                    boundary.closed.is_cancel_requested(),
+                    matches!(transition, Transition::Session)
+                );
+                assert_eq!(
+                    boundary.cancellation.is_cancel_requested(),
+                    matches!(transition, Transition::Request)
+                );
+                assert_eq!(
+                    boundary.revoked.is_cancel_requested(),
+                    matches!(transition, Transition::Credential)
+                );
+                assert_eq!(
+                    cx.checkpoint().is_ok(),
+                    !matches!(transition, Transition::Caller)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn already_invalid_lifetimes_never_construct_host_work() {
+        for refusal in 0..6 {
+            let cx = Cx::for_testing();
+            let mut boundary = boundary(&cx);
+            match refusal {
+                0 => Transition::Session.apply(&boundary, &cx),
+                1 => Transition::Request.apply(&boundary, &cx),
+                2 => Transition::Credential.apply(&boundary, &cx),
+                3 => Transition::Caller.apply(&boundary, &cx),
+                4 => boundary.expires_at = Instant::now(),
+                _ => boundary.deadline = cx.now(),
+            }
+            let calls = AtomicUsize::new(0);
+            let mut guarded = Box::pin(boundary.construct_and_run(&cx, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(()))
+            }));
+            let Poll::Ready(Err(error)) =
+                guarded.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("invalid authority must fail without invoking its constructor");
+            };
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn constructed_pending_work_is_dropped_without_a_post_cancellation_poll() {
+        for transition in [
+            Transition::Session,
+            Transition::Request,
+            Transition::Credential,
+            Transition::Caller,
+        ] {
+            let cx = Cx::for_testing();
+            let boundary = boundary(&cx);
+            let counts = Arc::new(Counts::default());
+            let mut guarded = Box::pin(boundary.construct_and_run(&cx, || {
+                counts.constructed.fetch_add(1, Ordering::SeqCst);
+                let owned = Owned(Arc::clone(&counts));
+                poll_fn(move |_| {
+                    owned.polled();
+                    Poll::<McpResult<()>>::Pending
+                })
+            }));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(guarded.as_mut().poll(&mut task).is_pending());
+            assert_eq!(counts.constructed.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.polled.load(Ordering::SeqCst), 1);
+            transition.apply(&boundary, &cx);
+            let Poll::Ready(Err(error)) = guarded.as_mut().poll(&mut task) else {
+                panic!("retired callback must not poll pending host work again");
+            };
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(counts.polled.load(Ordering::SeqCst), 1);
+            assert_eq!(counts.dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn abandoning_a_constructor_owner_neither_starts_nor_orphans_host_work() {
+        for started in [false, true] {
+            let cx = Cx::for_testing();
+            let boundary = boundary(&cx);
+            let counts = Arc::new(Counts::default());
+            let mut guarded = Box::pin(boundary.construct_and_run(&cx, || {
+                counts.constructed.fetch_add(1, Ordering::SeqCst);
+                let owned = Owned(Arc::clone(&counts));
+                poll_fn(move |_| {
+                    owned.polled();
+                    Poll::<McpResult<()>>::Pending
+                })
+            }));
+            if started {
+                assert!(
+                    guarded
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            }
+            drop(guarded);
+            assert_eq!(counts.constructed.load(Ordering::SeqCst), usize::from(started));
+            assert_eq!(counts.polled.load(Ordering::SeqCst), usize::from(started));
+            assert_eq!(counts.dropped.load(Ordering::SeqCst), usize::from(started));
+            assert!(!boundary.closed.is_cancel_requested());
+            assert!(!boundary.cancellation.is_cancel_requested());
+            assert!(!boundary.revoked.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        }
     }
 }
