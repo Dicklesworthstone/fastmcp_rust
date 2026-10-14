@@ -78,9 +78,12 @@ impl From<McpHeaderError> for ToolHeaderDispatchError {
 /// [`Self::new_for_loopback_http`] for a numeric loopback HTTP endpoint.
 /// No arbitrary header map can be installed. The complete source is admitted
 /// before the first review callback. Rejecting any binding rejects the plan,
-/// including previously approved siblings. Unannotated arguments remain body
-/// data. This value is deliberately neither Clone nor serializable; an owner
-/// may explicitly share it through an Arc without sharing invocation data.
+/// including previously approved siblings. A `writeOnly` or password-formatted
+/// field, or a field inside such an object, cannot be approved for disclosure.
+/// These checks precede every callback, even when the secret is a later binding.
+/// Unannotated arguments remain body data. This value is deliberately neither
+/// Clone nor serializable; an owner may explicitly share it through an Arc
+/// without sharing invocation data.
 pub struct ReviewedToolHeaders {
     resource: CanonicalHttpUrl,
     tool_name: String,
@@ -157,6 +160,9 @@ impl ReviewedToolHeaders {
             return Err(McpHeaderError::InvalidSchema.into());
         }
         let schema = AdmittedToolHeaderSchema::admit(schema)?;
+        if header_plan_discloses_secret(&schema) {
+            return Err(ToolHeaderDispatchError::DisclosureDenied);
+        }
         for binding in schema.header_plan().bindings() {
             if !review(binding) {
                 return Err(ToolHeaderDispatchError::DisclosureDenied);
@@ -196,6 +202,40 @@ impl ReviewedToolHeaders {
         }
         project_exact_tool_call(request, &self.tool_name, &self.schema)
     }
+}
+
+// Compilation bounds both the number of bindings and the depth of their exact
+// property paths. Inspect those schema locations only: examples/defaults and
+// unrelated secret properties are instance data, not disclosure policy for a
+// selected field. A child cannot erase a containing object's secret annotation.
+fn header_plan_discloses_secret(schema: &AdmittedToolHeaderSchema) -> bool {
+    schema.header_plan().bindings().iter().any(|binding| {
+        if binding.marks_secret_field() {
+            return true;
+        }
+        let mut node = schema.schema();
+        for key in binding.property_path() {
+            if node.get("writeOnly") == Some(&Value::Bool(true))
+                || node
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .is_some_and(|format| format.eq_ignore_ascii_case("password"))
+            {
+                return true;
+            }
+            let Some(child) = node
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|properties| properties.get(key))
+            else {
+                // An admitted binding must resolve through exact properties.
+                // Do not turn an unexpected compiler/path mismatch into consent.
+                return true;
+            };
+            node = child;
+        }
+        false
+    })
 }
 
 /// Projects `schema`'s mirrors from the exact outgoing `tools/call` body of
@@ -356,6 +396,130 @@ impl ModernHttpRequest {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod secret_exposure_tests {
+    use super::*;
+    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+    use serde_json::json;
+
+    fn review(
+        schema: Value,
+        loopback: bool,
+        calls: &mut usize,
+    ) -> Result<ReviewedToolHeaders, ToolHeaderDispatchError> {
+        let approve = |_| {
+            *calls += 1;
+            true
+        };
+        if loopback {
+            ReviewedToolHeaders::new_for_loopback_http(
+                CanonicalHttpUrl::parse("http://127.0.0.1:8123/mcp").unwrap(),
+                "lookup",
+                schema,
+                approve,
+            )
+        } else {
+            ReviewedToolHeaders::new(
+                CanonicalHttpUrl::parse("https://tools.example/mcp").unwrap(),
+                "lookup",
+                schema,
+                approve,
+            )
+        }
+    }
+
+    #[test]
+    fn secret_primitive_headers_are_denied_before_any_review() {
+        for property in [
+            json!({"type":"string", "writeOnly":true, "x-mcp-header":"Secret"}),
+            json!({"type":"integer", "writeOnly":true, "x-mcp-header":"Secret"}),
+            json!({"type":"boolean", "writeOnly":true, "x-mcp-header":"Secret"}),
+            json!({"type":"string", "format":"password", "x-mcp-header":"Secret"}),
+            json!({"type":"string", "format":"PaSsWoRd", "x-mcp-header":"Secret"}),
+        ] {
+            // The public binding sorts first: the entire secret check must run
+            // before an approving callback can observe even this safe sibling.
+            let schema = json!({"type":"object", "properties":{
+                "a_public":{"type":"string", "x-mcp-header":"Public"},
+                "z_secret":property
+            }});
+            for loopback in [false, true] {
+                let mut calls = 0;
+                let error = review(schema.clone(), loopback, &mut calls).unwrap_err();
+                assert_eq!(error, ToolHeaderDispatchError::DisclosureDenied);
+                assert_eq!(calls, 0);
+                assert!(!format!("{error:?} {error}").contains("z_secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn containing_secret_objects_cannot_be_overridden_by_a_public_leaf() {
+        let leaf = json!({
+            "type":"string", "writeOnly":false, "x-mcp-header":"Region"
+        });
+        for schema in [
+            json!({"type":"object", "writeOnly":true, "properties":{"region":leaf}}),
+            json!({"type":"object", "properties":{
+                "credentials":{"type":"object", "writeOnly":true, "properties":{"region":leaf}}
+            }}),
+            json!({"type":"object", "properties":{
+                "credentials":{"type":"object", "format":"password", "properties":{"region":leaf}}
+            }}),
+            json!({"type":"object", "properties":{
+                "a/b~c":{"type":"object", "writeOnly":true, "properties":{"0":leaf}}
+            }}),
+        ] {
+            for loopback in [false, true] {
+                let mut calls = 0;
+                assert_eq!(
+                    review(schema.clone(), loopback, &mut calls).unwrap_err(),
+                    ToolHeaderDispatchError::DisclosureDenied
+                );
+                assert_eq!(calls, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_secrets_stay_in_the_body_without_blocking_public_headers() {
+        let schema = json!({"type":"object", "properties":{
+            "region":{"type":"string", "writeOnly":false, "x-mcp-header":"Region",
+                "examples":["password"], "default":"writeOnly"},
+            "private":{"type":"string", "writeOnly":true, "format":"password"}
+        }});
+        for loopback in [false, true] {
+            let mut calls = 0;
+            let plan = review(schema.clone(), loopback, &mut calls).unwrap();
+            assert_eq!(calls, 1);
+            let body = serde_json::to_vec(&json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{
+                    "name":"lookup", "arguments":{"region":"eu", "private":"body-only-secret"},
+                    "_meta":FinalRequestMeta::new(ClientCapabilities::default())
+                }
+            }))
+            .unwrap();
+            let original = ModernHttpRequest::new(
+                plan.resource().as_str(),
+                body,
+                FINAL_PROTOCOL_VERSION,
+                "tools/call",
+                Some("lookup".to_owned()),
+            )
+            .unwrap();
+            let projected = original.clone().with_reviewed_tool_headers(&plan).unwrap();
+            assert_eq!(projected.body(), original.body());
+            let fields: Vec<_> = projected
+                .headers()
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+                .collect();
+            assert_eq!(fields, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
+            assert!(!projected.headers().iter().any(|(_, value)| value.contains("body-only-secret")));
+        }
+    }
+}
 
 #[cfg(test)]
 mod loopback_tests {
