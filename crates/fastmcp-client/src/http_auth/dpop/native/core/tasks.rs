@@ -6,6 +6,7 @@
 //! Tasks discovery admission; it does not install a second Tasks wire schema.
 
 use std::fmt;
+use std::sync::Arc;
 
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
@@ -28,6 +29,7 @@ use super::{
     WaitBounds, check_live, decode_response,
 };
 use crate::http_auth::managed::tasks::validate_task_input_shapes;
+use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError};
 
 /// Bounded polling and explicit host input under one original credential.
@@ -45,10 +47,13 @@ pub mod wait;
 /// for each explicit call; this owner is deliberately not Clone. Construction
 /// performs no network or cryptographic work. Input-ledger and byte-bound
 /// validation occur before discovery when the operation is polled.
+/// Tool calls may explicitly retain a resource-bound disclosure review through
+/// [`Self::with_reviewed_tool_headers`]; ordinary operations stay header-free.
 pub struct DpopTaskOperation {
     discovery_id: RequestId,
     operation_id: RequestId,
     request: ManagedTaskRequest,
+    reviewed_headers: Option<Arc<ReviewedToolHeaders>>,
 }
 
 impl DpopTaskOperation {
@@ -62,7 +67,35 @@ impl DpopTaskOperation {
         if discovery_id.correlates_with(&operation_id) {
             return Err(ManagedTasksError::InvalidRequest);
         }
-        Ok(Self { discovery_id, operation_id, request })
+        Ok(Self { discovery_id, operation_id, request, reviewed_headers: None })
+    }
+
+    /// Selects one already-reviewed tool-argument disclosure plan.
+    ///
+    /// Only a tool call with this exact name can retain the review; get, update
+    /// and cancel never acquire tool parameter headers. The review cannot be
+    /// replaced. Its exact resource and projection types are checked against
+    /// the final encoded operation before discovery, proof signing or I/O.
+    ///
+    /// Both JSON and streaming Task APIs consume this same preparation. Only
+    /// the tool POST receives mirrors; discovery and body-only secrets remain
+    /// untouched. Failure rejects the operation, without unreviewed fallback,
+    /// schema repair, automatic retry or permission inferred from Tasks support.
+    /// Sharing the immutable review does not share invocation arguments.
+    pub fn with_reviewed_tool_headers(
+        mut self,
+        reviewed: Arc<ReviewedToolHeaders>,
+    ) -> Result<Self, ToolHeaderDispatchError> {
+        if self.reviewed_headers.is_some() {
+            return Err(ToolHeaderDispatchError::AlreadyProjected);
+        }
+        if !matches!(&self.request, ManagedTaskRequest::CallTool { name, .. }
+            if name == reviewed.tool_name())
+        {
+            return Err(ToolHeaderDispatchError::OperationMismatch);
+        }
+        self.reviewed_headers = Some(reviewed);
+        Ok(self)
     }
 }
 
@@ -72,6 +105,7 @@ impl DpopTaskOperation {
 pub enum DpopTasksError {
     Core(DpopCoreError),
     Task(ManagedTasksError),
+    Header(ToolHeaderDispatchError),
 }
 
 impl fmt::Display for DpopTasksError {
@@ -79,6 +113,7 @@ impl fmt::Display for DpopTasksError {
         match self {
             Self::Core(error) => error.fmt(f),
             Self::Task(error) => error.fmt(f),
+            Self::Header(error) => error.fmt(f),
         }
     }
 }
@@ -94,6 +129,9 @@ impl From<ManagedCoreError> for DpopTasksError {
 }
 impl From<ManagedTasksError> for DpopTasksError {
     fn from(error: ManagedTasksError) -> Self { Self::Task(error) }
+}
+impl From<ToolHeaderDispatchError> for DpopTasksError {
+    fn from(error: ToolHeaderDispatchError) -> Self { Self::Header(error) }
 }
 
 // Method-owned reply state. No response discriminator alone can choose a
@@ -232,6 +270,12 @@ impl Prepared {
             }
         };
         let operation_wire = wire(target, method, &id, params, name, maximum)?;
+        // Use the shared exact-body projection after metadata and byte admission,
+        // but before either POST. Discovery never inherits argument disclosures.
+        let operation_wire = match operation.reviewed_headers {
+            Some(reviewed) => operation_wire.with_reviewed_tool_headers(&reviewed)?,
+            None => operation_wire,
+        };
         Ok(Self { discovery_wire, discovery_decoder, operation_wire,
             operation_id: id, reply, limits })
     }
@@ -499,6 +543,139 @@ mod routing_tests {
             for params in [json!({}), json!({"taskId":null}), json!({"taskId":2}), json!({"taskId":""})] {
                 assert!(wire("https://mcp.example/mcp", method, &RequestId::Number(2),
                     params, None, 8192).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+    use fastmcp_core::CanonicalHttpUrl;
+    use fastmcp_protocol::ClientCapabilities;
+    use fastmcp_protocol::http_headers::{McpHeaderError, decode_mcp_header_value};
+
+    const TARGET: &str = "https://mcp.example/mcp?tenant=one";
+
+    fn review(target: &str, tool: &str) -> Arc<ReviewedToolHeaders> {
+        Arc::new(ReviewedToolHeaders::new(
+            CanonicalHttpUrl::parse(target).unwrap(),
+            tool,
+            json!({"type":"object","properties":{
+                "region":{"type":"string","x-mcp-header":"Region"},
+                "private":{"type":"string","writeOnly":true}
+            }}),
+            |_| true,
+        ).unwrap())
+    }
+
+    fn call(arguments: Value) -> DpopTaskOperation {
+        DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2),
+            ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: Some(arguments) })
+            .unwrap()
+    }
+
+    fn prepare_call(operation: DpopTaskOperation, maximum: usize) -> Result<Prepared, DpopTasksError> {
+        Prepared::new(TARGET, FinalRequestMeta::new(ClientCapabilities::default()),
+            operation, ManagedCoreLimits::default(), maximum)
+    }
+
+    fn fields(wire: &ModernHttpRequest) -> Vec<(String, String)> {
+        wire.headers().into_iter()
+            .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+            .collect()
+    }
+
+    #[test]
+    fn reviewed_task_projection_preserves_both_bodies_and_keeps_discovery_private() {
+        let reviewed = review(TARGET, "echo");
+        for region in ["eu", " 雪 ", "=?base64?YWJj?="] {
+            let arguments = json!({"region":region,"private":"body-only-canary"});
+            let plain = prepare_call(call(arguments.clone()), 8192).unwrap();
+            let selected = call(arguments.clone()).with_reviewed_tool_headers(Arc::clone(&reviewed))
+                .unwrap();
+            let selected = prepare_call(selected, 8192).unwrap();
+            assert_eq!(selected.operation_wire.body(), plain.operation_wire.body());
+            assert_eq!(selected.discovery_wire.body(), plain.discovery_wire.body());
+            assert_eq!(selected.operation_wire.target(), TARGET);
+            assert!(fields(&plain.operation_wire).is_empty());
+            assert!(fields(&selected.discovery_wire).is_empty());
+            let projected = fields(&selected.operation_wire);
+            assert_eq!(projected.len(), 1);
+            assert_eq!(projected[0].0, "Mcp-Param-Region");
+            assert_eq!(decode_mcp_header_value(projected[0].1.as_bytes()).unwrap(), region);
+            let body: Value = serde_json::from_slice(selected.operation_wire.body()).unwrap();
+            assert_eq!(body["params"]["arguments"], arguments);
+            assert_eq!(body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+                json!({TASKS_EXTENSION:{}}));
+            assert!(!selected.operation_wire.headers().iter().any(|(name, value)|
+                name.eq_ignore_ascii_case("authorization") || name.eq_ignore_ascii_case("dpop")
+                    || value.contains("body-only-canary")));
+        }
+    }
+
+    #[test]
+    fn tool_reviews_cannot_cross_operations_or_replace_an_existing_selection() {
+        let reviewed = review(TARGET, "echo");
+        let task: Task = serde_json::from_value(json!({
+            "taskId":"task-one","status":"input_required",
+            "createdAt":"2026-09-16T00:00:00Z","lastUpdatedAt":"2026-09-16T00:00:00Z",
+            "ttlMs":60000,"inputRequests":{"roots":{"method":"roots/list"}}
+        })).unwrap();
+        for request in [
+            ManagedTaskRequest::Get(TaskId::parse("task-one").unwrap()),
+            ManagedTaskRequest::Cancel(TaskId::parse("task-one").unwrap()),
+            ManagedTaskRequest::Update { task: Box::new(task),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+        ] {
+            let operation = DpopTaskOperation::new(RequestId::Number(1), RequestId::Number(2), request)
+                .unwrap();
+            assert!(matches!(operation.with_reviewed_tool_headers(Arc::clone(&reviewed)),
+                Err(ToolHeaderDispatchError::OperationMismatch)));
+        }
+        assert!(matches!(call(json!({})).with_reviewed_tool_headers(review(TARGET, "other")),
+            Err(ToolHeaderDispatchError::OperationMismatch)));
+        let operation = call(json!({})).with_reviewed_tool_headers(Arc::clone(&reviewed)).unwrap();
+        assert!(matches!(operation.with_reviewed_tool_headers(reviewed),
+            Err(ToolHeaderDispatchError::AlreadyProjected)));
+    }
+
+    #[test]
+    fn reviewed_task_preflight_refuses_foreign_resources_and_never_drops_a_bad_plan() {
+        for target in ["https://other.example/mcp", "https://mcp.example/other?tenant=one",
+            "https://mcp.example/mcp?tenant=two"]
+        {
+            let operation = call(json!({"region":"eu"}))
+                .with_reviewed_tool_headers(review(target, "echo")).unwrap();
+            assert!(matches!(prepare_call(operation, 8192),
+                Err(DpopTasksError::Header(ToolHeaderDispatchError::TargetMismatch))));
+        }
+        let arguments = json!({"region":7,"private":"body-only-canary"});
+        assert!(prepare_call(call(arguments.clone()), 8192).is_ok());
+        let operation = call(arguments).with_reviewed_tool_headers(review(TARGET, "echo")).unwrap();
+        let error = prepare_call(operation, 8192).err().unwrap();
+        assert!(matches!(&error, DpopTasksError::Header(ToolHeaderDispatchError::Projection(
+            McpHeaderError::InvalidParameter))));
+        assert!(!format!("{error:?} {error}").contains("body-only-canary"));
+    }
+
+    #[test]
+    fn header_selection_does_not_relax_the_original_request_byte_limits() {
+        let arguments = json!({"region":"eu","private":"body-only-canary"});
+        let plain = prepare_call(call(arguments.clone()), 8192).unwrap();
+        let needed = plain.discovery_wire.body().len().max(plain.operation_wire.body().len());
+        for selected in [false, true] {
+            for exact in [false, true] {
+                let mut operation = call(arguments.clone());
+                if selected {
+                    operation = operation.with_reviewed_tool_headers(review(TARGET, "echo")).unwrap();
+                }
+                let result = prepare_call(operation, needed - usize::from(!exact));
+                if exact {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(matches!(result, Err(DpopTasksError::Task(ManagedTasksError::RequestTooLarge))));
+                }
             }
         }
     }

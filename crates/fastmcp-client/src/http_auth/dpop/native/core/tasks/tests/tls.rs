@@ -375,3 +375,170 @@ fn discovery_time_is_not_refunded_when_the_task_post_starts() {
     });
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
 }
+
+#[test]
+fn reviewed_task_tool_headers_survive_discovery_and_all_json_sse_result_kinds() {
+    use std::sync::Arc;
+    use crate::http_auth::dpop::native::core::stream::{DpopStreamError, DpopStreamLimits};
+    use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
+    use fastmcp_protocol::http_headers::{AdmittedToolHeaderSchema, McpHeaderError, decode_mcp_header_value};
+
+    // JSON collector, streaming API with JSON, and genuinely incremental SSE.
+    // Each must preserve complete/input-required/task as distinct outcomes.
+    for mode in 0..3 {
+        for kind in 0..3 {
+            run(async move {
+                let cx = Cx::current().unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target = format!("https://{}/mcp?tenant=one", listener.local_addr().unwrap());
+                let (mut client, credential, acceptor) = configured(&target);
+                let schema = json!({"type":"object","properties":{
+                    "region":{"type":"string","x-mcp-header":"Region"},
+                    "private":{"type":"string","writeOnly":true}
+                }});
+                let review = |resource: &str| Arc::new(ReviewedToolHeaders::new(
+                    CanonicalHttpUrl::parse(resource).unwrap(), "echo", schema.clone(), |_| true,
+                ).unwrap());
+                let reviewed = review(&target);
+                let arguments = json!({"region":" 雪 ","private":"body-only-canary"});
+                let mut meta = serde_json::to_value(metadata()).unwrap();
+                meta["progressToken"] = json!("reviewed-work");
+                let meta: FinalRequestMeta = serde_json::from_value(meta).unwrap();
+                let limits = DpopStreamLimits::new(ManagedCoreLimits::default(), Duration::from_secs(30)).unwrap();
+                let cancellation = McpRequestCancellation::new();
+
+                // Differ only in the forbidden dimension. Neither bad plan may
+                // open even the discovery socket, spend a proof or invoke an observer.
+                for (selected, args, foreign) in [
+                    (review("https://other.example/mcp"), arguments.clone(), true),
+                    (Arc::clone(&reviewed), json!({"region":7,"private":"body-only-canary"}), false),
+                ] {
+                    let selected = operation(ManagedTaskRequest::CallTool {
+                        name: "echo".to_owned(), arguments: Some(args),
+                    }).with_reviewed_tool_headers(selected).unwrap();
+                    let mut failed = Box::pin(async {
+                        if mode == 0 {
+                            client.request_task(&cx, &credential, meta.clone(), selected, ManagedCoreLimits::default())
+                                .await.map_err(DpopStreamError::from)
+                        } else {
+                            client.request_task_with_events(&cx, &cancellation, &credential, meta.clone(),
+                                selected, limits, |_| panic!("invalid projection cannot emit events")).await
+                        }
+                    });
+                    let error = poll_fn(|task| {
+                        let Poll::Ready(result) = failed.as_mut().poll(task) else {
+                            panic!("header refusal must precede every network wait");
+                        };
+                        Poll::Ready(result.err().unwrap())
+                    }).await;
+                    drop(failed);
+                    if foreign {
+                        assert!(matches!(error, DpopStreamError::Task(DpopTasksError::Header(
+                            ToolHeaderDispatchError::TargetMismatch))));
+                    } else {
+                        assert!(matches!(error, DpopStreamError::Task(DpopTasksError::Header(
+                            ToolHeaderDispatchError::Projection(McpHeaderError::InvalidParameter)))));
+                    }
+                    assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+                    assert!(!client.revocation_handle().is_revoked());
+                }
+
+                let selected = operation(ManagedTaskRequest::CallTool {
+                    name: "echo".to_owned(), arguments: Some(arguments.clone()),
+                }).with_reviewed_tool_headers(Arc::clone(&reviewed)).unwrap();
+                let observed = McpRequestCancellation::new();
+                let mut observer_calls = 0;
+                let application = async {
+                    if mode == 0 {
+                        client.request_task(&cx, &credential, meta.clone(), selected, ManagedCoreLimits::default())
+                            .await.map_err(DpopStreamError::from)
+                    } else {
+                        client.request_task_with_events(&cx, &cancellation, &credential, meta.clone(),
+                            selected, limits, |notification| {
+                                assert!(matches!(notification, fastmcp_protocol::ServerNotification::Progress(_)));
+                                observer_calls += 1;
+                                observed.cancel();
+                                true
+                            }).await
+                    }
+                };
+                let peer = async {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = acceptor.accept(socket).await.unwrap();
+                    let (head, body) = read_request(&mut socket).await;
+                    assert_eq!(body["method"], "server/discover");
+                    assert_eq!(body["id"], 1);
+                    assert!(body["params"].get("arguments").is_none());
+                    assert!(!head.to_ascii_lowercase().contains("mcp-param-"));
+                    assert!(!head.contains("body-only-canary"));
+                    assert_eq!(header(&head, "authorization"), "DPoP tasks-token");
+                    let first = claims(header(&head, "dpop"));
+                    assert!(first.get("nonce").is_none());
+                    send(&mut socket, discovery()).await;
+
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let mut socket = acceptor.accept(socket).await.unwrap();
+                    let (head, body) = read_request(&mut socket).await;
+                    assert!(head.starts_with("POST /mcp?tenant=one HTTP/1.1\r\n"));
+                    assert_eq!(body["id"], 2);
+                    assert_eq!(body["method"], "tools/call");
+                    assert_eq!(body["params"]["arguments"], arguments);
+                    assert_eq!(body["params"]["_meta"]["progressToken"], "reviewed-work");
+                    assert_eq!(body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"],
+                        json!({TASKS_EXTENSION:{}}));
+                    assert_eq!(header(&head, "authorization"), "DPoP tasks-token");
+                    assert_eq!(header(&head, "mcp-name"), "echo");
+                    assert_eq!(decode_mcp_header_value(header(&head, "mcp-param-region").as_bytes()).unwrap(), " 雪 ");
+                    assert!(!head.contains("body-only-canary"));
+                    assert_eq!(header(&head, "accept"), if mode == 0 { "application/json" }
+                        else { crate::http_executor::MODERN_MCP_ACCEPT });
+                    let second = claims(header(&head, "dpop"));
+                    assert_ne!(first["jti"], second["jti"]);
+                    assert_eq!(first["ath"], second["ath"]);
+                    assert_eq!(second["nonce"], "resource-next");
+                    assert_eq!(second["htu"], target.split('?').next().unwrap());
+                    assert_eq!(second["htm"], "POST");
+                    let fields: Vec<_> = head.lines().filter_map(|line| line.split_once(':'))
+                        .map(|(name, value)| (name.to_owned(), value.trim().to_owned())).collect();
+                    let admitted = AdmittedToolHeaderSchema::admit(schema.clone()).unwrap();
+                    admitted.header_plan().validate(body["params"].get("arguments"), &fields).unwrap();
+                    let missing: Vec<_> = fields.into_iter()
+                        .filter(|(name, _)| !name.eq_ignore_ascii_case("mcp-param-region")).collect();
+                    assert!(admitted.header_plan().validate(body["params"].get("arguments"), &missing).is_err());
+                    let result = match kind {
+                        0 => r#"{"resultType":"complete","content":[{"type":"text","text":"done"}]}"#.to_owned(),
+                        1 => task_result("task"),
+                        _ => r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"opaque-state"}"#.to_owned(),
+                    };
+                    if mode != 2 {
+                        send(&mut socket, terminal(&result)).await;
+                    } else {
+                        let progress = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":\"reviewed-work\",\"progress\":1}}\r\n\r\n";
+                        let terminal = String::from_utf8(envelope(&RequestId::Number(2), &result)).unwrap();
+                        let terminal = format!("data: {terminal}\r\n\r\n");
+                        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{progress}",
+                            progress.len() + terminal.len()).as_bytes()).await.unwrap();
+                        socket.flush().await.unwrap();
+                        // The terminal does not exist on the wire until the
+                        // public observer has received the progress event.
+                        observed.cancelled().await;
+                        socket.write_all(terminal.as_bytes()).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                    }
+                };
+                let (result, ()) = Box::pin(pair(application, peer)).await;
+                let ManagedTaskEvent::ToolResult(result) = result.unwrap() else {
+                    panic!("reviewed operation must retain the tool result family");
+                };
+                assert!(matches!((kind, *result),
+                    (0, FinalCoreResult::ToolsCall { .. })
+                        | (1, FinalCoreResult::ToolsCallTask { .. })
+                        | (2, FinalCoreResult::ToolsCallInputRequired { .. })));
+                assert_eq!(observer_calls, usize::from(mode == 2));
+                assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+                assert!(!client.revocation_handle().is_revoked());
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+    }
+}
