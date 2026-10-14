@@ -6,6 +6,8 @@
 //! [`stream`] additionally delivers request-scoped SSE notifications. Neither
 //! path installs discovery, OAuth login, extension negotiation, a result cache,
 //! or retries. Explicit multi-round execution lives in [`interaction`].
+//! The separately selected `tasks` module adds authenticated Tasks discovery
+//! and operations without changing the core-only request contract.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -28,6 +30,9 @@ pub mod catalog;
 pub mod interaction;
 /// Incremental JSON/SSE core responses under the original DPoP credential.
 pub mod stream;
+/// Explicit official Tasks discovery and operations over the same DPoP transport.
+#[cfg(feature = "tasks")]
+pub mod tasks;
 
 /// Diagnostics retain no peer message, body, nonce or authorization header.
 /// An admitted JSON-RPC error exposes only its numeric code through Protocol.
