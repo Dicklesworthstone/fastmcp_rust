@@ -17,6 +17,8 @@
 //! - With the `proxy` feature, `ClientCredentialsProvider`: the same exact
 //!   tool, resource, prompt, template and completion handlers using an explicitly
 //!   provisioned machine identity instead of an interactive OAuth login.
+//! - With `jwt-resource-auth`, `JwtResourceVerifier`: local RS256 access-token
+//!   authentication through the existing `TokenAuthProvider` server hook.
 //!
 //! # Example
 //!
@@ -41,6 +43,12 @@ mod filesystem;
 #[cfg(feature = "apps")]
 mod mcp_apps;
 mod schema_tool;
+
+/// Explicitly provisioned JWT resource-server authentication; no key discovery.
+#[cfg(feature = "jwt-resource-auth")]
+pub mod jwt_resource;
+#[cfg(feature = "jwt-resource-auth")]
+pub use jwt_resource::{JwtResourceAuthError, JwtResourcePolicy, JwtResourceVerifier};
 
 /// Authenticated, request-owned modern core forwarding using a managed login.
 #[cfg(feature = "proxy")]
