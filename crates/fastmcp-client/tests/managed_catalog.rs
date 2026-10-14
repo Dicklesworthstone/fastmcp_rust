@@ -637,7 +637,7 @@ fn stalled_page_observes_cancellation_logout_and_token_revocation() {
                                 json!({"jsonrpc":"2.0", "id":request["id"],
                             "result":Kind::Tools.page(&["second"], None)}),
                             )
-                            .await
+                            .await;
                         }
                         1 => {
                             cancellation.cancel();
