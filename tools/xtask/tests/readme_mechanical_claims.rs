@@ -137,7 +137,6 @@ fn feature_mentions(krate: &str, feature: &str) -> usize {
 /// eight crates that declare any rather than by reading the row.
 const README_INERT: &[(&str, &str)] = &[
     ("fastmcp-server", "enterprise-auth"),
-    ("fastmcp-server", "jwt-resource-auth"),
     ("fastmcp-server", "websocket-experimental"),
     ("fastmcp-console", "enterprise-auth"),
     ("fastmcp-console", "oauth-client-credentials"),
@@ -155,6 +154,7 @@ const README_INERT: &[(&str, &str)] = &[
 const README_NOT_INERT: &[(&str, &str)] = &[
     ("fastmcp-server", "oauth-client-credentials"),
     ("fastmcp-server", "websocket"),
+    ("fastmcp-server", "jwt-resource-auth"),
 ];
 
 #[test]
