@@ -29,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly-2026-08-25
           components: rustfmt, clippy
@@ -124,7 +124,7 @@ jobs:
           persist-credentials: false
 
       # FND-01: pin the exact dated nightly from rust-toolchain.toml (not floating "nightly").
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
           toolchain: nightly-2026-08-25
           targets: ${{ matrix.target }}
