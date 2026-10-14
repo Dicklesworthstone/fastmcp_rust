@@ -184,16 +184,33 @@ different things:
   token-endpoint auth methods, CIMD, pre-registration, offline access and AS
   migration). DPoP
   (RFC 9449) primitives now **exist and compile**, which was not true before
-  2026-10-12: `fastmcp_client::http_auth::dpop` is 781 lines with 18 public
-  items and 9 in-module tests, and it is reachable by facade users through
-  `pub use fastmcp_client::http_auth`. It had been **unwired rather than
-  absent** — the file was created by `2612a7d4`, the `pub mod dpop;` that puts
-  it in the build was added only by `ac00c6ad`, and the only `mod dpop`
-  declaration in `http_auth.rs` is that one, so those lines had never been
-  compiled until then. (They had never been formatted either; `c65eced1`
-  restored `cargo fmt --check` afterwards.)
-  **It has no consumer, though.** Nothing in this workspace drives that module:
-  a search for `dpop::` outside the module itself returns nothing, the
+  2026-10-12, and the surface has grown fast since: measured 2026-10-14 at
+  `a6559ff2`, `fastmcp_client::http_auth::dpop` is **9 files, 6,699 lines, 61
+  public items and 84 in-module tests** — against the 781 lines, 18 public
+  items and 9 tests this row recorded two days earlier, so roughly 8.6× the
+  lines in 48 hours — plus 515 lines and 7 tests in
+  `fastmcp_protocol::dpop` behind the `jose` feature. Treat those counts as a
+  dated reading of a module under active construction, not a durable fact; the
+  gate below deliberately does not pin them, because a check that reddens on
+  ordinary growth is a check that gets switched off. It is reachable by facade
+  users through `pub use fastmcp_client::http_auth`. It had been **unwired
+  rather than absent** — the file was created by `2612a7d4`, the `pub mod
+  dpop;` that puts it in the build was added only by `ac00c6ad`, and the only
+  `mod dpop` declaration in `http_auth.rs` is that one, so those lines had
+  never been compiled until then. (They had never been formatted either;
+  `c65eced1` restored `cargo fmt --check` afterwards.)
+  **It still has no consumer, and that is the durable claim here.** The
+  implementation grew ~5,900 lines in two days while the number of callers
+  stayed at zero, which makes this the largest finished-but-unconnected surface
+  in the workspace (tracked as `bd-iaqgd`); `readme_mechanical_claims.rs` gates
+  the zero so that wiring DPoP forces this row to be rewritten. Nothing in this
+  workspace drives that module. Across every member `src/` file outside the two
+  module trees, the lowercase path spelling `dpop` occurs exactly **twice**, and
+  both are the `pub mod dpop;` declarations that put the modules in the build
+  (`http_auth.rs:35`, `fastmcp-protocol/src/lib.rs:44`); it occurs **zero**
+  times in every `crates/**` file outside `src/`, so not even a test target
+  drives it. Case is the discriminator — Rust spells the path `dpop` while prose
+  and wire values spell it `DPoP`. Beyond those two declarations, the
   automatic path still states "No automatic login/retry, DPoP, DCR, DNS
   pinning, or OIDC identity authentication is installed"
   (`http_auth/discovery/challenge.rs`), and the client-credentials path still

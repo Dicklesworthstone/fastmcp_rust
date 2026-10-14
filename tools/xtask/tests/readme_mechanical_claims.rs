@@ -972,3 +972,175 @@ fn planted_item_declaration_requires_an_identifier_boundary() {
         "a re-export is not a declaration"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Claim 6: the README's "DPoP has no consumer" row stays true.
+//
+// WHY THIS ROW AND NOT ITS NUMBERS. The row quoted "781 lines with 18 public
+// items and 9 in-module tests" on 2026-10-12. Two days later the module was 9
+// files, 6,699 lines, 61 public items and 84 tests — roughly 8.6x the lines —
+// and nothing caught it, because the existing checks gate which features are
+// inert and which symbols exist, not the size of a module under construction.
+//
+// Pinning the size would be the wrong repair. That module is being actively
+// built, so an exact-count gate would redden on every ordinary commit to it,
+// and a gate that reddens on ordinary growth is a gate somebody switches off.
+// What the row actually ASSERTS, and what a reader acts on, is the structural
+// claim: this implementation has no caller. That is stable until someone wires
+// it, and when they do the row must be rewritten — so the zero is exactly the
+// right thing to gate, and this check is designed to fail at that moment.
+//
+// NO-CLAIM: a passing result means no workspace member source names the module
+// outside its own tree. It says nothing about whether the DPoP code is correct,
+// whether it would work if wired, or whether wiring it would satisfy RFC 9449.
+// ---------------------------------------------------------------------------
+
+/// The two module trees that ARE the DPoP implementation. Mentions inside them
+/// are the module talking about itself, not a consumer.
+const DPOP_MODULE_PREFIXES: &[&str] = &[
+    "crates/fastmcp-client/src/http_auth/dpop",
+    "crates/fastmcp-protocol/src/dpop.rs",
+];
+
+/// The `pub mod dpop;` lines that put the two modules in the build. A module
+/// declaration is not a consumer: it is what makes the code compile at all,
+/// and the README row says so in the sentence about `ac00c6ad`.
+const DPOP_DECLARATIONS: &[(&str, &str)] = &[
+    ("crates/fastmcp-client/src/http_auth.rs", "pub mod dpop;"),
+    ("crates/fastmcp-protocol/src/lib.rs", "pub mod dpop;"),
+];
+
+/// Does this line reference the DPoP module from outside it?
+///
+/// The needle is the LOWERCASE `dpop`, case-sensitively, because that is the
+/// module path. Rust spells the path `dpop` while every piece of prose and
+/// every wire value spells it `DPoP`, so case alone separates a code reference
+/// from a doc comment or a string literal — including
+/// `("token_type", json!("DPoP"))` in `client_credentials.rs`, which is a test
+/// fixture REJECTING a sender-constrained token and must not read as a caller.
+/// A case-insensitive needle matched five files; this one matches two, and both
+/// are the declarations above.
+fn is_dpop_consumer_line(line: &str) -> bool {
+    line.contains("dpop")
+        && !DPOP_DECLARATIONS
+            .iter()
+            .any(|(_, decl)| line.trim() == *decl)
+}
+
+/// `(path, line number, text)` for every DPoP reference outside the module.
+fn dpop_consumer_sites() -> Vec<(String, usize, String)> {
+    source_corpus()
+        .iter()
+        .filter(|(path, _)| {
+            !DPOP_MODULE_PREFIXES
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+        })
+        .flat_map(|(path, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| is_dpop_consumer_line(line))
+                .map(move |(index, line)| (path.clone(), index + 1, line.trim().to_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn readme_dpop_row_still_has_no_consumer() {
+    let readme = read(&repo_root().join("README.md"));
+    assert!(
+        readme.contains("It still has no consumer"),
+        "this gate pins a README claim; if the row no longer makes it, retire \
+         the gate with the row rather than leaving it asserting nothing"
+    );
+
+    // Control: the corpus must actually contain the module, or the zero below
+    // would be the sound of a broken lookup rather than an absent consumer.
+    //
+    // This counts FILES and requires only a nonzero mention count, rather than
+    // a mention threshold. A threshold would be the very failure this gate's
+    // header warns about: the module is 6,699 lines but only 59 of its lines
+    // carry the lowercase path spelling, because internally it says `DPoP` in
+    // prose and uses bare type names, so any figure near 59 would redden on
+    // ordinary refactoring.
+    let (files, mentions) = source_corpus()
+        .iter()
+        .filter(|(path, _)| {
+            DPOP_MODULE_PREFIXES
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+        })
+        .fold((0usize, 0usize), |(files, mentions), (_, text)| {
+            (files + 1, mentions + text.matches("dpop").count())
+        });
+    assert!(
+        files >= 2 && mentions > 0,
+        "the corpus holds {files} DPoP module file(s) with {mentions} \
+         lowercase `dpop` mention(s); both modules must be present and \
+         self-referencing, or the zero below is a broken lookup"
+    );
+
+    // Control: both declarations must still be present and still be the thing
+    // the exemption describes. If one is renamed the exemption would start
+    // hiding a real reference of the same shape.
+    for (path, declaration) in DPOP_DECLARATIONS {
+        let (_, text) = source_corpus()
+            .iter()
+            .find(|(candidate, _)| candidate == path)
+            .unwrap_or_else(|| panic!("{path} must be in the member source corpus"));
+        assert!(
+            text.lines().any(|line| line.trim() == *declaration),
+            "{path} no longer carries `{declaration}`, so the declaration \
+             exemption no longer describes what it exempts"
+        );
+    }
+
+    let consumers = dpop_consumer_sites();
+    assert!(
+        consumers.is_empty(),
+        "the README says the DPoP module still has no consumer, but {} \
+         reference(s) now exist outside it. If DPoP has been wired, that is \
+         good news and this row must be rewritten to describe it:\n{}",
+        consumers.len(),
+        consumers
+            .iter()
+            .map(|(path, line, text)| format!("  {path}:{line}  {text}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Planted negative for the DPoP consumer gate.
+///
+/// Feeds the predicate the four shapes that must NOT count — both module
+/// declarations, a doc comment, and the `"DPoP"` string literal from the
+/// client-credentials rejection test — beside the two shapes that must, a
+/// `use` import and a call. Without this the empty result above would be
+/// consistent with a predicate that matches nothing at all.
+#[test]
+fn planted_dpop_consumer_is_detected_and_a_declaration_is_not() {
+    for benign in [
+        "pub mod dpop;",
+        "    pub mod dpop;",
+        "/// Explicit DPoP proof, credential, and nonce handling.",
+        "//! pinning, or OIDC identity authentication is installed",
+        "            (\"token_type\", json!(\"DPoP\")),",
+    ] {
+        assert!(
+            !is_dpop_consumer_line(benign),
+            "must not count as a consumer: {benign:?}"
+        );
+    }
+
+    for wiring in [
+        "use crate::http_auth::dpop::DpopSession;",
+        "        let proof = dpop::sign(&credential, &request)?;",
+        "use crate::http_auth::dpop;",
+        "pub use crate::http_auth::dpop::DpopCredential;",
+    ] {
+        assert!(
+            is_dpop_consumer_line(wiring),
+            "must count as a consumer: {wiring:?}"
+        );
+    }
+}
