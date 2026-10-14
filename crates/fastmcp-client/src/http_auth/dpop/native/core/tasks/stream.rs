@@ -5,6 +5,9 @@
 //! chooses its method authority. The same Reply decoder serves both transports;
 //! the common DPoP reader owns TLS, nonce/proof handling, observers and EOF.
 
+/// Task-capable tool conversations with explicit typed host input.
+pub mod interaction;
+
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
