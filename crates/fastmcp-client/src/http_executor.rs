@@ -11467,6 +11467,22 @@ fn validate_final_method(method: &str, has_request_id: bool) -> Result<(), Moder
     // `{"result":{}}`, so none of them can see the disagreement, and removing
     // the bypass is a cross-crate contract change rather than a local repair.
     // Tracked as bd-ep6pp for a ruling on which half moves.
+    //
+    // THIS BYPASS IS ALSO LOAD-BEARING FOR A SHIPPED PATH, which the test
+    // inventory above understates. `owned_core_metadata_bytes` builds a PING
+    // request purely to measure `request.body.len()` -- `ping` is a
+    // method-name LENGTH PROXY there, never sent -- and reaches this function
+    // through `build_post_discovery_request` ->
+    // `build_modern_request_with_extensions`. That call returns `Ok` only
+    // because of the special case below, so deleting the bypass WITHOUT also
+    // changing that sizing method makes the facade's `execute_core` and
+    // `execute_core_with_timeout_policy` fail with
+    // `invalid_params("HTTP owned execution metadata could not be encoded")`.
+    // Any admitted method serves as the proxy: `ping` is 4 bytes against a
+    // longest declared method const of 36, and that function's own 64-byte
+    // allowance covers either. Not changed here, because substituting it moves
+    // a measured byte boundary and belongs in the same unit of work as the
+    // ruling.
     if method == PING {
         return if has_request_id {
             Ok(())
