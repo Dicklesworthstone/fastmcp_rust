@@ -9,6 +9,7 @@
 
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
@@ -34,6 +35,7 @@ use super::{
     ManagedOAuthResponse, ManagedOAuthSession, ManagedOAuthSseStream, OAuthCredentialSnapshot,
     OAuthSessionError, deadline_after,
 };
+use crate::http_executor::parameter_headers::{ReviewedToolHeaders, ToolHeaderDispatchError};
 use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
 use crate::sse::SseLimits;
 
@@ -149,6 +151,8 @@ pub enum ManagedTasksError {
     MissingTerminal,
     RecordLimit,
     Closed,
+    /// The explicit tool-header plan could not be bound or projected locally.
+    ParameterHeaders(ToolHeaderDispatchError),
     HttpStatus { status: u16 },
     Remote { code: JsonInteger },
     Session(OAuthSessionError),
@@ -162,6 +166,7 @@ impl fmt::Display for ManagedTasksError {
             }
             Self::Remote { code } => write!(f, "managed Task request failed with JSON-RPC {code}"),
             Self::Session(error) => fmt::Display::fmt(error, f),
+            Self::ParameterHeaders(error) => fmt::Display::fmt(error, f),
             other => f.write_str(match other {
                 Self::InvalidLimits => "invalid managed Tasks limits",
                 Self::InvalidRequest => "invalid managed Task request",
@@ -178,7 +183,10 @@ impl fmt::Display for ManagedTasksError {
                 Self::MissingTerminal => "Task stream ended without its terminal result",
                 Self::RecordLimit => "managed Task response record limit exceeded",
                 Self::Closed => "managed Task call is closed",
-                Self::HttpStatus { .. } | Self::Remote { .. } | Self::Session(_) => unreachable!(),
+                Self::HttpStatus { .. }
+                | Self::Remote { .. }
+                | Self::Session(_)
+                | Self::ParameterHeaders(_) => unreachable!(),
             }),
         }
     }
@@ -209,6 +217,7 @@ pub struct ManagedTasksClient {
     session: ManagedOAuthSession,
     metadata: Value,
     limits: ManagedTasksLimits,
+    reviewed_tool_headers: Option<Arc<ReviewedToolHeaders>>,
 }
 
 impl ManagedTasksClient {
@@ -222,7 +231,37 @@ impl ManagedTasksClient {
             session,
             metadata,
             limits,
+            reviewed_tool_headers: None,
         })
+    }
+
+    /// Selects an explicitly reviewed header plan for this resource's tool.
+    ///
+    /// Initial calls and every resumed tool round project from their exact
+    /// final JSON-RPC body before credential acquisition or discovery. A call
+    /// to a different tool is refused, never silently sent without the review.
+    /// Discovery and Task get/update/cancel remain free of tool-argument headers.
+    /// Clones share the immutable review, not invocation values or credentials.
+    ///
+    /// A review cannot be replaced on this client. Construct another client
+    /// for a changed schema or disclosure policy; the host owns review freshness.
+    /// No callback, network request or credential acquisition occurs here.
+    pub fn with_reviewed_tool_headers(
+        mut self,
+        reviewed: Arc<ReviewedToolHeaders>,
+    ) -> Result<Self, ManagedTasksError> {
+        if self.reviewed_tool_headers.is_some() {
+            return Err(ManagedTasksError::ParameterHeaders(
+                ToolHeaderDispatchError::AlreadyProjected,
+            ));
+        }
+        if reviewed.resource() != self.session.resource() {
+            return Err(ManagedTasksError::ParameterHeaders(
+                ToolHeaderDispatchError::TargetMismatch,
+            ));
+        }
+        self.reviewed_tool_headers = Some(reviewed);
+        Ok(self)
     }
 
     pub async fn request(
@@ -283,8 +322,19 @@ impl ManagedTasksClient {
     fn prepare_round(
         &self,
         ids: ManagedTaskRequestIds,
-        prepared: PreparedTask,
+        mut prepared: PreparedTask,
     ) -> Result<PreparedTaskRound, ManagedTasksError> {
+        // This is the common boundary AFTER initial/continuation serialization.
+        // Installing fields earlier would lose them when a resumed body is
+        // rebuilt, or risk copying fields from a different invocation.
+        if matches!(&prepared.decoder, TaskDecoder::Tool(_))
+            && let Some(reviewed) = self.reviewed_tool_headers.as_deref()
+        {
+            prepared.wire = prepared
+                .wire
+                .with_reviewed_tool_headers(reviewed)
+                .map_err(ManagedTasksError::ParameterHeaders)?;
+        }
         let discovery = discovery_request(&self.metadata)?;
         let params = discovery
             .encode_params()
@@ -1850,6 +1900,170 @@ mod tests {
         let discover = encode_request("https://mcp.example/mcp", "server/discover",
             &RequestId::Number(1), json!({"_meta":meta()}), None, 4096).unwrap();
         assert!(!discover.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+    }
+
+    fn header_client() -> ManagedTasksClient {
+        ManagedTasksClient::new(
+            finite_task_call().session,
+            FinalRequestMeta::new(ClientCapabilities::default()),
+            ManagedTasksLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn reviewed_headers(resource: &str) -> Arc<ReviewedToolHeaders> {
+        Arc::new(
+            ReviewedToolHeaders::new(
+                fastmcp_core::CanonicalHttpUrl::parse(resource).unwrap(),
+                "echo",
+                json!({"type":"object","properties":{
+                    "region":{"type":"string","x-mcp-header":"Region"},
+                    "count":{"type":"number","x-mcp-header":"Count"},
+                    "enabled":{"type":"boolean","x-mcp-header":"Enabled"},
+                    "secret":{"type":"string","writeOnly":true}
+                }}),
+                |_| true,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn header_ids() -> ManagedTaskRequestIds {
+        ManagedTaskRequestIds::new(RequestId::Number(1), RequestId::Number(2)).unwrap()
+    }
+
+    fn header_fields(wire: &ModernHttpRequest) -> std::collections::BTreeMap<String, String> {
+        wire.headers()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+            .map(|(name, value)| {
+                let value = fastmcp_protocol::http_headers::decode_mcp_header_value(value.as_bytes())
+                    .unwrap();
+                (name, value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reviewed_task_rounds_project_the_final_body_without_disclosing_state_or_secrets() {
+        let plain = header_client();
+        let client = plain.clone().with_reviewed_tool_headers(
+            reviewed_headers("https://mcp.example/mcp"),
+        ).unwrap();
+        for continuation in [false, true] {
+            let arguments = json!({"region":"north/λ%","count":42,"enabled":false,
+                "secret":"body-only-canary"});
+            let mut prepared = prepare(
+                client.session.resource().as_str(), &client.metadata, &RequestId::Number(2),
+                ManagedTaskRequest::CallTool { name: "echo".to_owned(), arguments: Some(arguments) },
+                client.limits,
+            ).unwrap();
+            if continuation {
+                let TaskDecoder::Tool(core) = &prepared.decoder else { panic!("tool decoder") };
+                let mut params = core.encode_params().unwrap().unwrap();
+                params["requestState"] = json!("sealed-state-canary");
+                params["inputResponses"] = json!({"roots":{"roots":[]}});
+                prepared.decoder = TaskDecoder::Tool(Box::new(
+                    CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap(),
+                ));
+                prepared.wire = encode_request(client.session.resource().as_str(), "tools/call",
+                    &RequestId::Number(2), params, Some("echo".to_owned()), client.limits.request_bytes)
+                    .unwrap();
+            }
+            let original = prepared.wire.body().to_vec();
+            let round = client.clone().prepare_round(header_ids(), prepared).unwrap();
+            assert_eq!(round.prepared.wire.body(), original);
+            assert_eq!(header_fields(&round.prepared.wire), std::collections::BTreeMap::from([
+                ("Mcp-Param-Region".to_owned(), "north/λ%".to_owned()),
+                ("Mcp-Param-Count".to_owned(), "42".to_owned()),
+                ("Mcp-Param-Enabled".to_owned(), "false".to_owned()),
+            ]));
+            assert!(header_fields(&round.discover_wire).is_empty());
+            for wire in [&round.prepared.wire, &round.discover_wire] {
+                assert!(!wire.headers().iter().any(|(_, value)|
+                    value.contains("body-only-canary") || value.contains("sealed-state-canary")));
+            }
+            let discover: Value = serde_json::from_slice(round.discover_wire.body()).unwrap();
+            assert!(discover["params"].get("requestState").is_none());
+            assert!(discover["params"].get("inputResponses").is_none());
+        }
+        let prepared = prepare(plain.session.resource().as_str(), &plain.metadata,
+            &RequestId::Number(2), ManagedTaskRequest::CallTool {
+                name: "echo".to_owned(), arguments: Some(json!({"region":"eu"})),
+            }, plain.limits).unwrap();
+        assert!(header_fields(&plain.prepare_round(header_ids(), prepared).unwrap().prepared.wire).is_empty());
+    }
+
+    #[test]
+    fn reviewed_task_clients_keep_lifecycle_operations_unprojected_and_bound() {
+        let client = header_client().with_reviewed_tool_headers(
+            reviewed_headers("https://mcp.example/mcp"),
+        ).unwrap();
+        for request in [
+            ManagedTaskRequest::Get(task_id()),
+            ManagedTaskRequest::Cancel(task_id()),
+            ManagedTaskRequest::Update { task: Box::new(input_task()),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+        ] {
+            let prepared = prepare(client.session.resource().as_str(), &client.metadata,
+                &RequestId::Number(2), request, client.limits).unwrap();
+            let original = prepared.wire.body().to_vec();
+            let round = client.prepare_round(header_ids(), prepared).unwrap();
+            assert_eq!(round.prepared.wire.body(), original);
+            assert!(header_fields(&round.prepared.wire).is_empty());
+            assert!(header_fields(&round.discover_wire).is_empty());
+            assert!(round.prepared.wire.headers().iter().any(|(name, value)|
+                name.eq_ignore_ascii_case("mcp-name") && value == "task-one"));
+        }
+        assert!(matches!(header_client().with_reviewed_tool_headers(
+            reviewed_headers("https://mcp.example/other")),
+            Err(ManagedTasksError::ParameterHeaders(ToolHeaderDispatchError::TargetMismatch))));
+        assert!(matches!(client.clone().with_reviewed_tool_headers(
+            reviewed_headers("https://mcp.example/mcp")),
+            Err(ManagedTasksError::ParameterHeaders(ToolHeaderDispatchError::AlreadyProjected))));
+    }
+
+    #[test]
+    fn reviewed_task_projection_refuses_bad_operations_before_credential_acquisition() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap()).build().unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = header_client().with_reviewed_tool_headers(
+                    reviewed_headers("https://mcp.example/mcp"),
+                ).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                for (name, arguments) in [
+                    ("other", json!({"region":"eu"})),
+                    ("echo", json!({"count":"not-a-number-canary"})),
+                    ("echo", json!({"enabled":{"not":"a boolean"}})),
+                ] {
+                    let mut request = Box::pin(client.request_with_cancellation(
+                        &cx, &cancellation, header_ids(), ManagedTaskRequest::CallTool {
+                            name: name.to_owned(), arguments: Some(arguments),
+                        },
+                    ));
+                    poll_fn(|task| match request.as_mut().poll(task) {
+                        Poll::Ready(Err(ManagedTasksError::ParameterHeaders(error))) => {
+                            assert!(!format!("{error:?} {error}").contains("canary"));
+                            Poll::Ready(())
+                        }
+                        _ => panic!("projection must fail before requesting the absent credential"),
+                    }).await;
+                }
+                assert!(!cancellation.is_cancel_requested());
+                assert!(!client.session.inner.closed.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+                let prepared = prepare(client.session.resource().as_str(), &client.metadata,
+                    &RequestId::Number(2), ManagedTaskRequest::CallTool {
+                        name: "echo".to_owned(), arguments: Some(json!({"count":7})),
+                    }, client.limits).unwrap();
+                let valid = client.prepare_round(header_ids(), prepared).unwrap();
+                assert_eq!(header_fields(&valid.prepared.wire).get("Mcp-Param-Count").map(String::as_str), Some("7"));
+            });
     }
 }
 
