@@ -184,7 +184,7 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         self.execute_streaming_input_host_configured(
-            cx, cancellation, credential, request, id_prefix, limits, None, host, observer,
+            cx, cancellation, credential, request, id_prefix, &limits, None, host, observer,
         ).await
     }
 
@@ -217,7 +217,7 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         self.execute_streaming_input_host_configured(
-            cx, cancellation, credential, request, id_prefix, limits, Some(reviewed), host, observer,
+            cx, cancellation, credential, request, id_prefix, &limits, Some(reviewed), host, observer,
         ).await
     }
 
@@ -229,7 +229,11 @@ impl DpopHttpClient {
         credential: &DpopCredential,
         request: CoreRequest,
         id_prefix: String,
-        limits: DpopStreamHostLimits,
+        // By reference: the struct is 280 bytes, past the
+        // `large_types_passed_by_value` threshold, and this function only
+        // reads its fields. It is `Copy`, so every `limits.field` use below
+        // works unchanged through the reference.
+        limits: &DpopStreamHostLimits,
         reviewed: Option<&ReviewedToolHeaders>,
         host: &mut H,
         mut observer: N,
