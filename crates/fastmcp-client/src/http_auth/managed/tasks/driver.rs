@@ -268,7 +268,7 @@ impl ManagedTasksClient {
                             )
                             .await?;
                         let Some(ManagedTaskEvent::Snapshot(snapshot)) =
-                            call.next_event(cx).await?
+                            call.next_terminal(cx).await?
                         else {
                             return Err(ManagedTaskDriverError::UnexpectedResponse);
                         };
@@ -339,7 +339,7 @@ impl ManagedTasksClient {
                             .request_with_cancellation(cx, cancellation, ids, update)
                             .await?;
                         if !matches!(
-                            call.next_event(cx).await?,
+                            call.next_terminal(cx).await?,
                             Some(ManagedTaskEvent::Updated(_))
                         ) {
                             return Err(ManagedTaskDriverError::UnexpectedResponse);

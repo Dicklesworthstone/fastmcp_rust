@@ -511,6 +511,29 @@ impl ManagedTaskCall {
         self.body = None;
     }
 
+    // Lifecycle consumers need the method-owned result, not the first SSE
+    // record. Progress/logging/catalog notifications are valid intermediate
+    // records even on get/update/cancel. They do not acknowledge a mutation or
+    // replace the authoritative snapshot used for reconciliation.
+    //
+    // Drain through next_event, never through the raw stream: correlation,
+    // monotonic progress, record limits, original credential/deadline and clean
+    // terminal EOF remain enforced there. No limit is reset between records.
+    // These internal callers observe snapshots/ACKs only; public callers that
+    // need incremental notifications retain the unchanged next_event API.
+    // Abandonment during any read still takes/drops body custody in next_event.
+    async fn next_terminal(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ManagedTaskEvent>, ManagedTasksError> {
+        loop {
+            match self.next_event(cx).await? {
+                Some(ManagedTaskEvent::Notification(_)) => {}
+                terminal => return Ok(terminal),
+            }
+        }
+    }
+
     /// Results are delivered once. EOF without a result is an error. Session
     /// renewal never lengthens the credential lifetime of this response.
     /// SSE terminals remain provisional until clean body EOF. Trailing records
