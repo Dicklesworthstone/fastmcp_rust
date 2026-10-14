@@ -34,12 +34,12 @@ use super::{
 /// credential renewal, discovery, network reads, host input and poll delays.
 #[derive(Clone, Copy, Debug)]
 pub struct ManagedTaskDriverPolicy {
-    minimum_poll_interval: Duration,
-    timeout: Duration,
-    maximum_polls: usize,
-    maximum_updates: usize,
-    maximum_input_keys: usize,
-    maximum_state_bytes: usize,
+    pub(crate) minimum_poll_interval: Duration,
+    pub(crate) timeout: Duration,
+    pub(crate) maximum_polls: usize,
+    pub(crate) maximum_updates: usize,
+    pub(crate) maximum_input_keys: usize,
+    pub(crate) maximum_state_bytes: usize,
 }
 
 impl Default for ManagedTaskDriverPolicy {
@@ -395,7 +395,7 @@ fn update_for_validation(
     }
 }
 
-fn next_poll_time(
+pub(crate) fn next_poll_time(
     now: Time,
     task: &Task,
     minimum: Duration,
@@ -414,14 +414,14 @@ fn next_poll_time(
 }
 
 #[derive(Default)]
-struct DriverState {
+pub(crate) struct DriverState {
     ids: HashSet<CorrelationKey>,
     answered: BTreeMap<String, Sha256Digest>,
     retained_bytes: usize,
 }
 
 impl DriverState {
-    fn reserve_ids(
+    pub(crate) fn reserve_ids(
         &mut self,
         ids: &ManagedTaskRequestIds,
         maximum: usize,
@@ -456,7 +456,7 @@ impl DriverState {
         Ok(())
     }
 
-    fn unanswered(
+    pub(crate) fn unanswered(
         &self,
         requests: &TaskInputRequests,
         policy: ManagedTaskDriverPolicy,
@@ -495,7 +495,7 @@ impl DriverState {
         Ok((pending, fingerprints))
     }
 
-    fn answer_bytes(
+    pub(crate) fn answer_bytes(
         &self,
         keys: &[String],
         fingerprints: &BTreeMap<String, Sha256Digest>,
@@ -517,7 +517,7 @@ impl DriverState {
         Ok(bytes)
     }
 
-    fn record_answers(
+    pub(crate) fn record_answers(
         &mut self,
         keys: &[String],
         fingerprints: &BTreeMap<String, Sha256Digest>,
@@ -532,7 +532,7 @@ impl DriverState {
     }
 }
 
-fn validate_answers(
+pub(crate) fn validate_answers(
     requests: &TaskInputRequests,
     responses: &TaskInputResponses,
 ) -> Result<(), ManagedTaskDriverError> {
@@ -544,7 +544,7 @@ fn validate_answers(
         .map_err(|_| ManagedTaskDriverError::InvalidInputResponse)
 }
 
-fn admit_capabilities(
+pub(crate) fn admit_capabilities(
     metadata: &serde_json::Value,
     requests: &TaskInputRequests,
 ) -> Result<TaskInputRequests, ManagedTaskDriverError> {

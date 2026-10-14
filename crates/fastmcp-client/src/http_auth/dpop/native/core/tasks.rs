@@ -30,6 +30,9 @@ use super::{
 use crate::http_auth::managed::tasks::validate_task_input_shapes;
 pub use crate::http_auth::managed::tasks::{ManagedTaskEvent, ManagedTaskRequest, ManagedTasksError};
 
+/// Bounded polling and explicit host input under one original credential.
+pub mod driver;
+
 /// One explicit operation with two distinct correlation identities.
 ///
 /// Neither identity is a task ID or an idempotency key. Construct a new value
