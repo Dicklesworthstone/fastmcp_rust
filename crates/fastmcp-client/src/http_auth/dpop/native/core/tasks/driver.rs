@@ -390,6 +390,12 @@ impl DpopHttpClient {
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
         N: FnMut(&ServerNotification) -> bool,
     {
+        // Cancellation needs no runtime, timer, credential admission or host
+        // effect. Both JSON and SSE enter here before WaitBounds checks the
+        // runtime, so a cancelled driver cannot be misreported as unavailable.
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(DpopHttpError::Cancelled.into());
+        }
         let timeout = policy.timeout.min(limits.timeout()).min(self.policy.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
@@ -540,3 +546,115 @@ impl DpopHttpClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cancellation_preflight_tests {
+    use super::*;
+    use crate::http_auth::dpop::DpopSession;
+    use crate::http_auth::dpop::native::DpopHttpPolicy;
+    use fastmcp_core::CanonicalHttpUrl;
+    use fastmcp_protocol::ClientCapabilities;
+    use fastmcp_protocol::dpop::DpopKey;
+    use std::future::Ready;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Waker};
+    use std::time::{Duration, Instant};
+
+    fn client() -> (DpopHttpClient, DpopCredential) {
+        let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
+        let resource = CanonicalHttpUrl::parse("https://mcp.example/mcp").unwrap();
+        let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource)
+            .unwrap();
+        let credential = session.admit_token_response(
+            &issuer, 200,
+            br#"{"access_token":"preflight-token","token_type":"DPoP","expires_in":60}"#,
+            Instant::now(), Duration::from_secs(60),
+        ).unwrap();
+        (DpopHttpClient::new(session, DpopHttpPolicy::default()).unwrap(), credential)
+    }
+
+    fn no_input(_: TaskInputRequests) -> Ready<Result<ManagedTaskInputAction, ManagedTaskDriverError>> {
+        panic!("preflight refusal must not invoke an input resolver")
+    }
+
+    fn first_poll(
+        client: &mut DpopHttpClient,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        streamed: bool,
+        prefix: &str,
+    ) -> DpopHttpError {
+        let metadata = FinalRequestMeta::new(ClientCapabilities::default());
+        let task_id = TaskId::parse("task-one").unwrap();
+        let policy = ManagedTaskDriverPolicy::default();
+        let mut drive: Pin<Box<dyn Future<Output = Result<ManagedTaskRunOutcome, DpopTaskDriverError>> + '_>> =
+            if streamed {
+                Box::pin(client.drive_task_with_events(
+                    cx, cancellation, credential, metadata, task_id, prefix, policy,
+                    DpopStreamLimits::default(), no_input,
+                    |_| panic!("preflight refusal must not invoke a snapshot observer"),
+                    |_| panic!("preflight refusal must not invoke a notification observer"),
+                ))
+            } else {
+                Box::pin(client.drive_task_with_cancellation(
+                    cx, cancellation, credential, metadata, task_id, prefix, policy,
+                    ManagedCoreLimits::default(), no_input,
+                    |_| panic!("preflight refusal must not invoke a snapshot observer"),
+                ))
+            };
+        match drive.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(Err(DpopTaskDriverError::Task(DpopTasksError::Core(
+                super::super::DpopCoreError::Transport(error),
+            )))) => error,
+            _ => panic!("the first poll must return the exact local transport disposition"),
+        }
+    }
+
+    #[test]
+    fn both_reply_modes_refuse_precancelled_work_without_requiring_a_runtime() {
+        for streamed in [false, true] {
+            for cancel_cx in [false, true] {
+                for prefix in ["valid", ""] {
+                    let cx = Cx::for_testing();
+                    assert!(cx.timer_driver().is_none());
+                    let cancellation = McpRequestCancellation::new();
+                    if cancel_cx { cx.set_cancel_requested(true); } else { cancellation.cancel(); }
+                    let (mut client, credential) = client();
+                    assert_eq!(
+                        first_poll(&mut client, &cx, &cancellation, &credential, streamed, prefix),
+                        DpopHttpError::Cancelled,
+                    );
+                    assert_eq!(cx.checkpoint().is_err(), cancel_cx);
+                    assert!(!client.revocation_handle().is_revoked());
+
+                    // A cancelled call neither revokes its credential nor grants
+                    // missing runtime authority to a subsequent explicit call.
+                    let fresh_cx = Cx::for_testing();
+                    assert_eq!(
+                        first_poll(&mut client, &fresh_cx, &McpRequestCancellation::new(),
+                            &credential, streamed, "fresh"),
+                        DpopHttpError::RuntimeUnavailable,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_drivers_preserve_cancellation_precedence_over_credential_refusal() {
+        for streamed in [false, true] {
+            let cx = Cx::for_testing();
+            let cancellation = McpRequestCancellation::new();
+            cancellation.cancel();
+            let (mut client, credential) = client();
+            credential.revoke();
+            assert_eq!(
+                first_poll(&mut client, &cx, &cancellation, &credential, streamed, "valid"),
+                DpopHttpError::Cancelled,
+            );
+            assert!(cx.checkpoint().is_ok());
+            assert!(!client.revocation_handle().is_revoked());
+        }
+    }
+}
