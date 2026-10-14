@@ -2,6 +2,8 @@
 //! The PEM material is the repository's existing, public TEST ONLY identity;
 //! it is inline so remote compilation never depends on excluded PEM files.
 
+mod wait;
+
 use super::*;
 use std::pin::{Pin, pin};
 use std::future::poll_fn;
