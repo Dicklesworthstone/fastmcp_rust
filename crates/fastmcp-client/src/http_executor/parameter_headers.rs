@@ -258,6 +258,12 @@ fn project_exact_tool_call(
     if request.body().len() > MAX_TOOL_HEADER_REQUEST_BYTES {
         return Err(ToolHeaderDispatchError::RequestTooLarge);
     }
+    // Gateway plans come directly from an upstream catalog rather than from a
+    // host review. Enforce the same non-overridable policy at their common
+    // dispatch boundary, before producing even one field from the body.
+    if header_plan_discloses_secret(schema) {
+        return Err(ToolHeaderDispatchError::DisclosureDenied);
+    }
     let message = decode_strict_jsonrpc_message(request.body(), MAX_TOOL_HEADER_REQUEST_BYTES)
         .map_err(|_| ToolHeaderDispatchError::InvalidRequest)?;
     let JsonRpcMessage::Request(envelope) = message else {
@@ -301,9 +307,10 @@ fn project_exact_tool_call(
 /// `tools/list` input schemas (PXY-04).
 ///
 /// A `tools/call` for a planned tool gets its mirrors projected from the exact
-/// outgoing body, exactly as [`ReviewedToolHeaders`] does, but with no HTTPS or
-/// review gate: the gateway mirrors arguments it already sends in that body to
-/// the same upstream, so the fields disclose nothing the body does not. The
+/// outgoing body, exactly as [`ReviewedToolHeaders`] does, without requiring a
+/// caller review callback. This does not grant permission to expose secrets in
+/// headers: a plan selecting a `writeOnly` or password-marked field, including
+/// one inside a secret object, fails request preparation as a whole. The
 /// downstream's own fields are never involved. Debug reports a count only.
 #[derive(Default)]
 pub struct GatewayToolHeaders {
@@ -315,6 +322,8 @@ impl GatewayToolHeaders {
     /// catalog of `(name, inputSchema)` pairs, so a tool that left the catalog
     /// leaves no plan behind. A schema with no admissible annotation recognizes
     /// nothing, as on the server, so its tool gets no plan rather than a guess.
+    /// Secret-selecting plans remain identifiable and are refused at dispatch;
+    /// they must not silently become an unplanned call with missing mirrors.
     pub fn replace<'a>(&self, catalog: impl IntoIterator<Item = (&'a str, &'a Value)>) {
         let plans = catalog
             .into_iter()
@@ -408,7 +417,7 @@ mod secret_exposure_tests {
         loopback: bool,
         calls: &mut usize,
     ) -> Result<ReviewedToolHeaders, ToolHeaderDispatchError> {
-        let approve = |_| {
+        let approve = |_: &ParameterHeaderBinding| {
             *calls += 1;
             true
         };
@@ -516,8 +525,149 @@ mod secret_exposure_tests {
                 .filter(|(name, _)| name.starts_with("Mcp-Param-"))
                 .collect();
             assert_eq!(fields, vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]);
-            assert!(!projected.headers().iter().any(|(_, value)| value.contains("body-only-secret")));
+            assert!(
+                !projected
+                    .headers()
+                    .iter()
+                    .any(|(_, value)| value.contains("body-only-secret"))
+            );
         }
+    }
+
+    fn gateway_request(name: &str, arguments: Option<Value>) -> ModernHttpRequest {
+        let mut params = json!({
+            "name":name, "_meta":FinalRequestMeta::new(ClientCapabilities::default())
+        });
+        if let Some(arguments) = arguments {
+            params["arguments"] = arguments;
+        }
+        let body = serde_json::to_vec(&json!({
+            "jsonrpc":"2.0", "id":17, "method":"tools/call", "params":params
+        }))
+        .unwrap();
+        ModernHttpRequest::new(
+            "https://tools.example/mcp",
+            body,
+            FINAL_PROTOCOL_VERSION,
+            "tools/call",
+            Some(name.to_owned()),
+        )
+        .unwrap()
+    }
+
+    fn parameter_fields(request: &ModernHttpRequest) -> Vec<(String, String)> {
+        request
+            .headers()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("Mcp-Param-"))
+            .collect()
+    }
+
+    #[test]
+    fn gateway_refuses_secret_plans_for_absent_null_and_populated_input() {
+        for schema in [
+            json!({"type":"object", "properties":{
+                "a_public":{"type":"string", "x-mcp-header":"Public"},
+                "region":{"type":"string", "writeOnly":true, "x-mcp-header":"Secret"}
+            }}),
+            json!({"type":"object", "properties":{
+                "region":{"type":"string", "format":"password", "x-mcp-header":"Secret"}
+            }}),
+            json!({"type":"object", "writeOnly":true, "properties":{
+                "region":{"type":"string", "x-mcp-header":"Secret"}
+            }}),
+            json!({"type":"object", "properties":{
+                "credentials":{"type":"object", "writeOnly":true, "properties":{
+                    "region":{"type":"string", "x-mcp-header":"Secret"}
+                }}
+            }}),
+        ] {
+            let gateway = GatewayToolHeaders::default();
+            gateway.replace([("lookup", &schema)]);
+            for arguments in [
+                None,
+                Some(json!({})),
+                Some(json!({"region":null, "credentials":null})),
+                Some(json!({
+                    "a_public":"eu", "region":"secret-canary",
+                    "credentials":{"region":"secret-canary"}
+                })),
+            ] {
+                let original = gateway_request("lookup", arguments);
+                let before = original.body().to_vec();
+                let error = original
+                    .clone()
+                    .with_gateway_tool_headers(&gateway)
+                    .unwrap_err();
+                assert_eq!(error, ToolHeaderDispatchError::DisclosureDenied);
+                assert_eq!(original.body(), before);
+                assert!(parameter_fields(&original).is_empty());
+                let diagnostics = format!("{gateway:?} {error:?} {error}");
+                assert!(!diagnostics.contains("secret-canary"));
+                assert!(!diagnostics.contains("credentials"));
+                assert!(!diagnostics.contains("Mcp-Param-Secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_catalog_replacement_rechecks_secrets_without_poisoning_siblings() {
+        let safe = json!({"type":"object", "properties":{
+            "region":{"type":"string", "x-mcp-header":"Region"}
+        }});
+        let mut secret = safe.clone();
+        secret["properties"]["region"]["writeOnly"] = json!(true);
+        let gateway = GatewayToolHeaders::default();
+        let call = |name| gateway_request(name, Some(json!({"region":"eu"})));
+        gateway.replace([("lookup", &safe)]);
+        assert_eq!(
+            parameter_fields(&call("lookup").with_gateway_tool_headers(&gateway).unwrap()),
+            vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+        );
+
+        gateway.replace([("lookup", &secret), ("other", &safe)]);
+        assert_eq!(
+            call("lookup").with_gateway_tool_headers(&gateway).unwrap_err(),
+            ToolHeaderDispatchError::DisclosureDenied
+        );
+        assert_eq!(
+            parameter_fields(&call("other").with_gateway_tool_headers(&gateway).unwrap()),
+            vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+        );
+
+        gateway.replace([("lookup", &safe)]);
+        assert!(call("lookup").with_gateway_tool_headers(&gateway).is_ok());
+        gateway.replace([("other", &safe)]);
+        let original = call("lookup");
+        let unplanned = original.clone().with_gateway_tool_headers(&gateway).unwrap();
+        assert_eq!(unplanned.body(), original.body());
+        assert!(parameter_fields(&unplanned).is_empty());
+    }
+
+    #[test]
+    fn gateway_preserves_unannotated_secrets_as_body_only_data() {
+        let schema = json!({"type":"object", "properties":{
+            "region":{"type":"string", "x-mcp-header":"Region"},
+            "private":{"type":"string", "writeOnly":true, "format":"password"}
+        }});
+        let gateway = GatewayToolHeaders::default();
+        gateway.replace([("lookup", &schema)]);
+        let original = gateway_request(
+            "lookup",
+            Some(json!({"region":"eu", "private":"body-only-secret"})),
+        );
+        let projected = original.clone().with_gateway_tool_headers(&gateway).unwrap();
+        assert_eq!(projected.body(), original.body());
+        assert_eq!(
+            parameter_fields(&projected),
+            vec![("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+        );
+        assert!(
+            !projected
+                .headers()
+                .iter()
+                .any(|(_, value)| value.contains("body-only-secret"))
+        );
     }
 }
 
