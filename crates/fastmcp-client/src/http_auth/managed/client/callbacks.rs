@@ -22,7 +22,7 @@ use super::{Call, CallResult};
 use crate::{HttpClient, HttpClientError, ReverseRequestHandlers};
 
 #[derive(Clone)]
-pub(super) struct CallbackBoundary {
+pub(crate) struct CallbackBoundary {
     closed: McpRequestCancellation,
     cancellation: McpRequestCancellation,
     revoked: McpRequestCancellation,
@@ -31,7 +31,7 @@ pub(super) struct CallbackBoundary {
 }
 
 impl CallbackBoundary {
-    pub(super) fn new(
+    pub(crate) fn new(
         session: &ManagedOAuthSession,
         cancellation: &McpRequestCancellation,
         deadline: Time,
@@ -76,7 +76,7 @@ impl CallbackBoundary {
         .await
     }
 
-    fn approve(&self, cx: &Cx, review: impl FnOnce() -> bool) -> bool {
+    pub(crate) fn approve(&self, cx: &Cx, review: impl FnOnce() -> bool) -> bool {
         self.check(cx).is_ok() && review() && self.check(cx).is_ok()
     }
 
@@ -123,13 +123,14 @@ impl CallbackBoundary {
         handlers
     }
 
-    pub(super) async fn dispatch(
+    // Both managed HTTP entrypoints use these same operation-local wrappers.
+    // The caller owns the complete client during dispatch: abandonment drops
+    // that client, while completed dispatch restores the original handlers.
+    pub(crate) fn install(
         &self,
         cx: &Cx,
-        call: Call<'_>,
         client: &mut HttpClient,
-        wire_cursor: Option<&str>,
-    ) -> Result<CallResult, HttpClientError> {
+    ) -> Result<Option<ReverseRequestHandlers>, HttpClientError> {
         self.check(cx).map_err(HttpClientError::CoreResult)?;
         let original = client.connection.modern_reverse_request_handlers().cloned();
         if let Some(handlers) = &original {
@@ -138,6 +139,32 @@ impl CallbackBoundary {
                 .set_modern_reverse_request_handlers(self.wrap(handlers.clone()))
                 .map_err(HttpClientError::CoreResult)?;
         }
+        Ok(original)
+    }
+
+    pub(crate) fn restore(
+        &self,
+        cx: &Cx,
+        client: &mut HttpClient,
+        original: Option<ReverseRequestHandlers>,
+    ) -> Result<(), HttpClientError> {
+        if let Some(handlers) = original {
+            client
+                .connection
+                .set_modern_reverse_request_handlers(handlers)
+                .map_err(HttpClientError::CoreResult)?;
+        }
+        self.check(cx).map_err(HttpClientError::CoreResult)
+    }
+
+    pub(super) async fn dispatch(
+        &self,
+        cx: &Cx,
+        call: Call<'_>,
+        client: &mut HttpClient,
+        wire_cursor: Option<&str>,
+    ) -> Result<CallResult, HttpClientError> {
+        let original = self.install(cx, client)?;
         let result = match call {
             Call::Reviewed {
                 arguments,
@@ -162,13 +189,7 @@ impl CallbackBoundary {
         // A reusable connection must not retain a prior operation's cancellation
         // or deadline, nor accumulate wrapper layers. On abandonment the whole
         // owned client is dropped by perform_any instead of returning to cache.
-        if let Some(handlers) = original {
-            client
-                .connection
-                .set_modern_reverse_request_handlers(handlers)
-                .map_err(HttpClientError::CoreResult)?;
-        }
-        self.check(cx).map_err(HttpClientError::CoreResult)?;
+        self.restore(cx, client, original)?;
         result
     }
 }

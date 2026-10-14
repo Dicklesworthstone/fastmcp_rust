@@ -20,6 +20,7 @@ use fastmcp_protocol::CoreResult;
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use serde_json::Value;
 
+use super::managed::client::callbacks::CallbackBoundary;
 use super::managed::{ManagedOAuthSession, OAuthCredentialSnapshot, OAuthSessionError};
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
@@ -237,16 +238,28 @@ impl ManagedHttpClient {
         operation: ManagedHttpOperation<'_>,
     ) -> Result<CoreResult, ManagedHttpClientError> {
         let mut lease = self.acquire(cx, cancellation).await?;
+        let deadline = cx
+            .budget()
+            .deadline
+            .map_or(lease.deadline, |parent| parent.min(lease.deadline));
+        let boundary = CallbackBoundary::new(&self.session, cancellation, deadline, &lease.snapshot);
         let result = guarded(
             cx,
             cancellation,
             lease.deadline,
             Some(lease.snapshot.credential()),
             async {
-                operation
-                    .dispatch(&mut lease.ready.client, cx)
-                    .await
-                    .map_err(ManagedHttpClientError::Http)
+                let original = boundary
+                    .install(cx, &mut lease.ready.client)
+                    .map_err(ManagedHttpClientError::Http)?;
+                let result = operation.dispatch(&mut lease.ready.client, cx).await;
+                // Never cache callback wrappers carrying an earlier operation's
+                // cancellation domain or deadline. The outer guard preserves
+                // precise lifetime errors, and drops the client on any failure.
+                boundary
+                    .restore(cx, &mut lease.ready.client, original)
+                    .map_err(ManagedHttpClientError::Http)?;
+                result.map_err(ManagedHttpClientError::Http)
             },
         )
         .await?;
@@ -269,13 +282,26 @@ impl ManagedHttpClient {
             return Err(ManagedHttpClientError::InvalidPolicy);
         }
         let mut lease = self.acquire(cx, cancellation).await?;
+        let deadline = cx
+            .budget()
+            .deadline
+            .map_or(lease.deadline, |parent| parent.min(lease.deadline));
+        let boundary = CallbackBoundary::new(&self.session, cancellation, deadline, &lease.snapshot);
         let result = guarded(
             cx,
             cancellation,
             lease.deadline,
             Some(lease.snapshot.credential()),
             async {
-                lease
+                let original = boundary
+                    .install(cx, &mut lease.ready.client)
+                    .map_err(ManagedHttpClientError::Http)?;
+                // A repair can review several bindings within one ready poll.
+                // A revoking review must not authorize a later review or POST.
+                // Keep the public callback's existing non-Send signature.
+                let checked_review =
+                    |binding: &ParameterHeaderBinding| boundary.approve(cx, || review(binding));
+                let result = lease
                     .ready
                     .client
                     .call_tool_with_reviewed_headers_and_cancellation(
@@ -283,10 +309,13 @@ impl ManagedHttpClient {
                         cancellation,
                         arguments,
                         reviewed,
-                        review,
+                        &checked_review,
                     )
-                    .await
-                    .map_err(ManagedHttpClientError::Http)
+                    .await;
+                boundary
+                    .restore(cx, &mut lease.ready.client, original)
+                    .map_err(ManagedHttpClientError::Http)?;
+                result.map_err(ManagedHttpClientError::Http)
             },
         )
         .await?;

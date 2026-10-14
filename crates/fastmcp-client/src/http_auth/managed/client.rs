@@ -25,7 +25,7 @@ use super::{ManagedOAuthSession, OAuthSessionError, deadline_after};
 use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
-mod callbacks;
+pub(crate) mod callbacks;
 mod catalog;
 mod core_listen;
 mod cursors;
