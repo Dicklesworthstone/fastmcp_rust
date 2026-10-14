@@ -395,6 +395,22 @@ pub(crate) struct CoreDecoder {
     notifications: usize,
 }
 
+// Mandatory core routing mirrors come from the exact encoded parameters, not
+// from credentials, request state or the HTTP target. Resource reads mirror
+// `uri`, while tool calls and prompt gets mirror `name`. Both authenticated
+// core composers use this selection; ModernHttpRequest owns safe wire encoding.
+pub(crate) fn core_routing_name(method: &str, params: &serde_json::Value) -> Option<String> {
+    let field = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        _ => return None,
+    };
+    params
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 fn prepare(
     target: &str,
     request: CoreRequest,
@@ -437,14 +453,7 @@ fn prepare(
     {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
-    let name = if matches!(request.method(), "tools/call" | "prompts/get") {
-        params
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    } else {
-        None
-    };
+    let name = core_routing_name(request.method(), &params);
     let envelope = serde_json::json!({
         "jsonrpc": "2.0", "id": request_id, "method": request.method(), "params": params,
     });
@@ -799,6 +808,63 @@ mod tests {
             ),
             Err(ManagedCoreError::RequestTooLarge)
         ));
+    }
+
+    #[test]
+    fn authenticated_core_routing_matches_the_servers_mandatory_mirror_contract() {
+        use fastmcp_protocol::{
+            FinalHttpRequestMetadata, RequestVersionMetadata, admit_final_http_request,
+        };
+        fn header<'a>(fields: &'a [(String, String)], wanted: &str) -> Option<&'a str> {
+            fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+                .map(|(_, value)| value.as_str())
+        }
+        for (method, parameters, key) in [
+            ("tools/call", json!({"name":"echo"}), "name"),
+            ("prompts/get", json!({"name":"greeting"}), "name"),
+            ("resources/read", json!({"uri":"file:///sample"}), "uri"),
+            ("resources/read", json!({"uri":"https://resources.example/a%2Fb?q=one#part"}), "uri"),
+        ] {
+            let core = request(method, parameters);
+            let original = core.encode_params().unwrap().unwrap();
+            let (wire, _) = prepare(
+                "https://mcp.example/mcp", core, RequestId::Number(7), ManagedCoreLimits::default(),
+            ).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
+            let headers = wire.headers();
+            assert_eq!(body["params"], original);
+            assert_eq!(wire.target(), "https://mcp.example/mcp");
+            assert_eq!(headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name")).count(), 1);
+            let name = header(&headers, "mcp-name").unwrap();
+            assert_eq!(
+                fastmcp_protocol::http_headers::decode_mcp_header_value(name.as_bytes()).unwrap(),
+                body["params"][key].as_str().unwrap(),
+            );
+            // This is the protocol admission function the shipped server uses,
+            // fed with actual prepared headers and body rather than a mock rule.
+            let admitted = |header_name: Option<&str>| {
+                admit_final_http_request(FinalHttpRequestMetadata {
+                    version: RequestVersionMetadata {
+                        header_version: header(&headers, "mcp-protocol-version"),
+                        body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
+                    },
+                    header_method: header(&headers, "mcp-method"),
+                    body_method: body["method"].as_str(),
+                    header_name,
+                    body_name: body["params"][key].as_str(),
+                }).is_ok()
+            };
+            assert!(admitted(Some(name)), "the prepared {method} is admitted");
+            assert!(!admitted(None), "removing only {method}'s mirror must fail");
+            assert!(!admitted(Some("different")), "changing only the mirror must fail");
+        }
+        for method in ["server/discover", "tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+            let (wire, _) = prepare(
+                "https://mcp.example/mcp", request(method, json!({})),
+                RequestId::Number(7), ManagedCoreLimits::default(),
+            ).unwrap();
+            assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+        }
     }
 
     #[test]

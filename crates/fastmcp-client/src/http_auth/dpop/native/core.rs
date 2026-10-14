@@ -22,7 +22,9 @@ use super::{
     DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse, ModernHttpRequest, WaitBounds,
     check_live,
 };
-use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
+use crate::http_auth::rpc::{
+    CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits, core_routing_name,
+};
 
 /// Complete catalog traversal under one original credential and deadline.
 pub mod catalog;
@@ -143,14 +145,7 @@ fn prepare(
     // validation. Do not fork that table into a DPoP-specific implementation.
     let decoder = CoreDecoder::for_request(request, request_id.clone(), limits)?;
     admit_core_metadata(&params)?;
-    let name = if matches!(method.as_str(), "tools/call" | "prompts/get") {
-        params
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    } else {
-        None
-    };
+    let name = core_routing_name(&method, &params);
     let envelope = serde_json::json!({
         "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
     });
@@ -286,6 +281,34 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name == "Authorization" || name == "DPoP")
         );
+    }
+
+    #[test]
+    fn resource_reads_mirror_the_exact_uri_without_changing_the_authenticated_target() {
+        for uri in [
+            "file:///sample",
+            "https://resources.example/a%2Fb?q=one#section",
+            "https://resources.example/a%2fb?q=two#section",
+        ] {
+            let (wire, _) = prepared("resources/read", json!({"uri":uri}));
+            let body: Value = serde_json::from_slice(wire.body()).unwrap();
+            let headers = wire.headers();
+            let mirrors: Vec<_> = headers.iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name"))
+                .collect();
+            assert_eq!(mirrors.len(), 1);
+            assert_eq!(
+                fastmcp_protocol::http_headers::decode_mcp_header_value(mirrors[0].1.as_bytes()).unwrap(),
+                uri,
+            );
+            assert_eq!(body["params"]["uri"], uri);
+            assert_eq!(wire.target(), "https://mcp.example/mcp");
+            assert!(!headers.iter().any(|(name, _)| name == "Authorization" || name == "DPoP"));
+        }
+        for method in ["resources/list", "resources/templates/list", "tools/list", "prompts/list"] {
+            let (wire, _) = prepared(method, json!({}));
+            assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+        }
     }
 
     #[test]
