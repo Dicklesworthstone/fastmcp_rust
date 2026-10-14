@@ -22,6 +22,8 @@ use super::{
 };
 use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
 
+/// Complete catalog traversal under one original credential and deadline.
+pub mod catalog;
 /// Explicit host-driven multi-round operations with one credential and deadline.
 pub mod interaction;
 /// Incremental JSON/SSE core responses under the original DPoP credential.
