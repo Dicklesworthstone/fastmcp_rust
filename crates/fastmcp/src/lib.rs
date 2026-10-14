@@ -536,9 +536,10 @@ pub use fastmcp_protocol::{
     McpAppsInitializeParams, McpAppsInitializeResult, McpAppsListParams,
     McpAppsLogMessageNotification, McpAppsMessageParams, McpAppsMessageRole, McpAppsOpenLinkParams,
     McpAppsOperationResult, McpAppsPingParams, McpAppsProgressNotification,
-    McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsSandboxSignal,
-    McpAppsToolCallParams, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
-    McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
+    McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsRoutedMethod,
+    McpAppsSandboxSignal, McpAppsToolCallParams, McpAppsUpdateModelContextParams,
+    McpAppsViewCapabilities, McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse,
+    McpAppsViewToHost,
 };
 
 /// Bounded public-JWKS and external-signer primitives for the opt-in OIDC
