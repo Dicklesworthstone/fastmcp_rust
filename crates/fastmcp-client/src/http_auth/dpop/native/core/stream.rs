@@ -7,6 +7,8 @@
 
 /// Streaming multi-round operations with an explicitly supplied typed input host.
 pub mod interaction;
+/// Acknowledged and filter-bound core subscriptions over explicit DPoP HTTPS.
+pub mod subscription;
 
 use std::fmt;
 use std::future::poll_fn;
@@ -148,12 +150,38 @@ impl From<ManagedCoreError> for DpopStreamError {
     }
 }
 
+// Only the private, already-admitted core and subscription decoders implement
+// this seam. Method/filter admission stays with those shared codecs; socket,
+// deadline, cancellation, framing and observer ownership stay with this reader.
+trait StreamDecoder {
+    fn admit(
+        &mut self,
+        frame: &[u8],
+        allow_notification: bool,
+    ) -> Result<ManagedCoreEvent, ManagedCoreError>;
+    fn usage(&self) -> (usize, usize);
+}
+
+impl StreamDecoder for CoreDecoder {
+    fn admit(
+        &mut self,
+        frame: &[u8],
+        allow_notification: bool,
+    ) -> Result<ManagedCoreEvent, ManagedCoreError> {
+        CoreDecoder::admit(self, frame, allow_notification)
+    }
+
+    fn usage(&self) -> (usize, usize) {
+        CoreDecoder::usage(self)
+    }
+}
+
 // An internal continuation can supply the original absolute deadline and a
 // fresh decoder carrying cumulative usage. It cannot select another transport,
 // credential or response parser. This is not a public retry capability.
-struct PreparedStream {
+struct PreparedStream<D = CoreDecoder> {
     wire: ModernHttpRequest,
-    decoder: CoreDecoder,
+    decoder: D,
     limits: DpopStreamLimits,
     bounds: WaitBounds,
     idle: Idle,
@@ -209,17 +237,18 @@ impl DpopHttpClient {
         ).await.map(|completed| completed.result)
     }
 
-    // Both one-shot and host-driven calls execute here. A new network round
-    // never creates a new absolute deadline or resets the decoder's quotas.
-    async fn execute_prepared_core_stream<N>(
+    // Ordinary, host-driven and subscription calls execute here. A new network
+    // round never creates a new absolute deadline or resets the decoder's quotas.
+    async fn execute_prepared_core_stream<D, N>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         credential: &DpopCredential,
-        prepared: PreparedStream,
+        prepared: PreparedStream<D>,
         observer: &mut N,
     ) -> Result<CompletedStream, DpopStreamError>
     where
+        D: StreamDecoder,
         N: FnMut(&ServerNotification) -> bool,
     {
         let PreparedStream { wire, decoder, limits, bounds, idle } = prepared;
@@ -318,19 +347,19 @@ enum WireBody {
     Sse(BoundedSseParser),
 }
 
-struct Reader {
+struct Reader<D = CoreDecoder> {
     body: WireBody,
-    decoder: CoreDecoder,
+    decoder: D,
     terminal: Option<CoreResult>,
     wire_remaining: usize,
     frame_limit: usize,
     reset_idle_on_progress: bool,
 }
 
-impl Reader {
+impl<D: StreamDecoder> Reader<D> {
     fn new(
         kind: ModernHttpResponseKind,
-        decoder: CoreDecoder,
+        decoder: D,
         limits: DpopStreamLimits,
         wire_limit: usize,
     ) -> Result<Self, DpopStreamError> {
@@ -439,13 +468,14 @@ impl Reader {
     }
 }
 
-async fn consume<B, N>(
-    mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader, observer: &mut N,
+async fn consume<B, N, D>(
+    mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader<D>, observer: &mut N,
 ) -> Result<CompletedStream, DpopStreamError>
 where
     B: Body + Unpin,
     B::Data: Buf,
     N: FnMut(&ServerNotification) -> bool,
+    D: StreamDecoder,
 {
     let mut bytes_left = BYTES_PER_TURN;
     let mut frames_left = FRAMES_PER_TURN;
