@@ -157,12 +157,12 @@ fn tool_results_do_not_force_task_creation_and_mutation_acks_do_not_invent_snaps
     ] {
         let result = prepared(tool()).admit(discovery()).unwrap().finish(terminal(&source)).unwrap();
         let ManagedTaskEvent::ToolResult(result) = result else { panic!("expected typed tool result"); };
-        assert!(match (kind, *result) {
+        assert!(matches!(
+            (kind, *result),
             (0, FinalCoreResult::ToolsCall { .. })
-            | (1, FinalCoreResult::ToolsCallTask { .. })
-            | (2, FinalCoreResult::ToolsCallInputRequired { .. }) => true,
-            _ => false,
-        });
+                | (1, FinalCoreResult::ToolsCallTask { .. })
+                | (2, FinalCoreResult::ToolsCallInputRequired { .. })
+        ));
     }
     assert!(matches!(prepared(update()).admit(discovery()).unwrap()
         .finish(terminal(r#"{"resultType":"complete"}"#)), Ok(ManagedTaskEvent::Updated(_))));
