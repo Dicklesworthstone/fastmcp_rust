@@ -204,38 +204,16 @@ impl ReviewedToolHeaders {
     }
 }
 
-// Compilation bounds both the number of bindings and the depth of their exact
-// property paths. Inspect those schema locations only: examples/defaults and
-// unrelated secret properties are instance data, not disclosure policy for a
-// selected field. A child cannot erase a containing object's secret annotation.
+// The shared compiler resolves effective confidentiality once, including every
+// containing object. Server registration, explicit client reviews and automatic
+// gateway projection must consume that same decision rather than reinterpreting
+// schema traversal or policy independently at each call site.
 fn header_plan_discloses_secret(schema: &AdmittedToolHeaderSchema) -> bool {
-    schema.header_plan().bindings().iter().any(|binding| {
-        if binding.marks_secret_field() {
-            return true;
-        }
-        let mut node = schema.schema();
-        for key in binding.property_path() {
-            if node.get("writeOnly") == Some(&Value::Bool(true))
-                || node
-                    .get("format")
-                    .and_then(Value::as_str)
-                    .is_some_and(|format| format.eq_ignore_ascii_case("password"))
-            {
-                return true;
-            }
-            let Some(child) = node
-                .get("properties")
-                .and_then(Value::as_object)
-                .and_then(|properties| properties.get(key))
-            else {
-                // An admitted binding must resolve through exact properties.
-                // Do not turn an unexpected compiler/path mismatch into consent.
-                return true;
-            };
-            node = child;
-        }
-        false
-    })
+    schema
+        .header_plan()
+        .bindings()
+        .iter()
+        .any(ParameterHeaderBinding::marks_secret_field)
 }
 
 /// Projects `schema`'s mirrors from the exact outgoing `tools/call` body of
