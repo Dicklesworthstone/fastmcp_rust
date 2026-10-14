@@ -1,5 +1,7 @@
 //! Driver state and real Task-codec regression tests. Network cases are separate.
 
+mod stream;
+
 use super::*;
 use std::collections::HashSet;
 use std::task::{Context, Poll, Waker};

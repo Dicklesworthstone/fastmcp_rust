@@ -11,7 +11,7 @@ use asupersync::Cx;
 use asupersync::time::Sleep;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::tasks_extension::{Task, TaskId, TaskInputRequests};
-use fastmcp_protocol::{FinalRequestMeta, RequestId};
+use fastmcp_protocol::{FinalRequestMeta, RequestId, ServerNotification};
 
 use super::{
     Admitted, DpopCredential, DpopHttpClient, DpopHttpError, DpopHttpResponse,
@@ -20,6 +20,8 @@ use super::{
     check_live,
 };
 use super::super::super::within;
+use super::super::stream::{DpopStreamError, DpopStreamLimits, Idle, PreparedStream};
+use super::stream::{TaskStreamDecoder, progress_marker};
 use crate::http_auth::caller::with_caller;
 use crate::http_auth::managed::tasks::ManagedTaskRequestIds;
 use crate::http_auth::managed::tasks::driver::{
@@ -37,6 +39,8 @@ pub enum DpopTaskDriverError {
     IdentityExhausted,
     Driver(ManagedTaskDriverError),
     Task(DpopTasksError),
+    /// A streaming-specific limit or notification observer stopped the run.
+    Stream(DpopStreamError),
 }
 
 impl fmt::Display for DpopTaskDriverError {
@@ -46,6 +50,7 @@ impl fmt::Display for DpopTaskDriverError {
             Self::IdentityExhausted => f.write_str("DPoP Task driver identities exhausted"),
             Self::Driver(error) => error.fmt(f),
             Self::Task(error) => error.fmt(f),
+            Self::Stream(error) => error.fmt(f),
         }
     }
 }
@@ -67,6 +72,23 @@ impl From<DpopHttpError> for DpopTaskDriverError {
     fn from(error: DpopHttpError) -> Self { Self::Task(error.into()) }
 }
 
+impl From<DpopStreamError> for DpopTaskDriverError {
+    fn from(error: DpopStreamError) -> Self {
+        match error {
+            // Keep transport/protocol diagnostics consistent across modes.
+            DpopStreamError::Core(error) => Self::Task(error.into()),
+            DpopStreamError::Task(error) => Self::Task(error),
+            error => Self::Stream(error),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReplyMode {
+    Json,
+    Stream(DpopStreamLimits),
+}
+
 // Only the driver owns this state. An ACK advances the shared input ledger;
 // allocating an ID or sending an update never means that an answer was accepted.
 struct Run {
@@ -77,6 +99,7 @@ struct Run {
     polls: usize,
     updates: usize,
     remaining_bytes: usize,
+    notifications: usize,
 }
 
 impl Run {
@@ -99,6 +122,7 @@ impl Run {
             polls: 0,
             updates: 0,
             remaining_bytes: limits.total_bytes(),
+            notifications: 0,
         })
     }
 
@@ -165,6 +189,33 @@ impl Run {
         }
         admitted.maximum = admitted.maximum.min(self.remaining_bytes);
         Ok(admitted)
+    }
+
+    // Stream decoders inherit ALL prior payloads, including the discovery
+    // already charged by admit. A fresh parser is not a fresh run budget.
+    fn stream_usage(&self, limits: ManagedCoreLimits) -> Result<(usize, usize), DpopTaskDriverError> {
+        let bytes = limits.total_bytes().checked_sub(self.remaining_bytes)
+            .ok_or(ManagedCoreError::ResponseByteLimit)?;
+        Ok((bytes, self.notifications))
+    }
+
+    fn complete_stream(
+        &mut self,
+        usage: (usize, usize),
+        limits: ManagedCoreLimits,
+    ) -> Result<(), DpopTaskDriverError> {
+        let (before, notifications) = self.stream_usage(limits)?;
+        if usage.0 < before || usage.0 > limits.total_bytes() {
+            return Err(ManagedCoreError::ResponseByteLimit.into());
+        }
+        if usage.1 < notifications || usage.1 > limits.notifications() {
+            return Err(ManagedCoreError::NotificationLimit.into());
+        }
+        // This is cumulative usage, not a delta: discovery must not be charged
+        // twice. Commit both counters only after every quota check succeeds.
+        self.remaining_bytes = limits.total_bytes() - usage.0;
+        self.notifications = usage.1;
+        Ok(())
     }
 
     fn finish(
@@ -251,13 +302,93 @@ impl DpopHttpClient {
         id_prefix: &str,
         policy: ManagedTaskDriverPolicy,
         limits: ManagedCoreLimits,
-        mut resolve: R,
-        mut observe: O,
+        resolve: R,
+        observe: O,
     ) -> Result<ManagedTaskRunOutcome, DpopTaskDriverError>
     where
         R: FnMut(TaskInputRequests) -> F,
         F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        self.drive_task_inner(
+            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
+            limits, ReplyMode::Json, resolve, observe, |_| true,
+        ).await
+    }
+
+    /// Follow one existing Task with incremental operation notifications and
+    /// JSON-or-SSE get/update replies. The ordinary drive_task methods remain
+    /// JSON-only; streaming is selected explicitly through this entry point.
+    ///
+    /// Poll timing, capability-gated host input, identity reservation and the
+    /// acknowledged-input ledger are the SAME driver as the JSON path. Every
+    /// round performs fresh JSON discovery under the SAME original credential.
+    /// No task creation, remote cancellation, retry, refresh or worker is added.
+    ///
+    /// Core payload bytes include all discoveries and every notification/result
+    /// across the entire run. The notification count is also run-wide: neither
+    /// polling nor an update resets either quota. Parser and native raw-body
+    /// limits apply per response. Each network pair starts a new idle timer;
+    /// valid progress may reset only that timer. The absolute driver/core/native/
+    /// caller/token deadline is fixed before preparation and also covers sleeps,
+    /// host callbacks and their pending futures. No later round extends it.
+    ///
+    /// notify sees validated notifications immediately and returns true to
+    /// continue, or false to stop. It must be nonblocking and apply the host's
+    /// disclosure policy. observe sees only fully admitted Task snapshots. A
+    /// provisional update ACK never advances the input ledger: clean HTTP EOF
+    /// is required first. Invalid tails, observer refusal/panic, cancellation,
+    /// revocation and abandonment stop the run without replay or remote cancel.
+    /// Previously delivered notifications and committed effects cannot be undone.
+    /// Use request_task_with_events when driving a single operation manually.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn drive_task_with_events<R, F, O, N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task_id: TaskId,
+        id_prefix: &str,
+        policy: ManagedTaskDriverPolicy,
+        limits: DpopStreamLimits,
+        resolve: R,
+        observe: O,
+        notify: N,
+    ) -> Result<ManagedTaskRunOutcome, DpopTaskDriverError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        self.drive_task_inner(
+            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
+            limits.core, ReplyMode::Stream(limits), resolve, observe, notify,
+        ).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_task_inner<R, F, O, N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task_id: TaskId,
+        id_prefix: &str,
+        policy: ManagedTaskDriverPolicy,
+        limits: ManagedCoreLimits,
+        mode: ReplyMode,
+        mut resolve: R,
+        mut observe: O,
+        mut notify: N,
+    ) -> Result<ManagedTaskRunOutcome, DpopTaskDriverError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+        N: FnMut(&ServerNotification) -> bool,
     {
         let timeout = policy.timeout.min(limits.timeout()).min(self.policy.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
@@ -283,8 +414,8 @@ impl DpopHttpClient {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let prepared = run.prepare(self.resource().as_str(), metadata.clone(),
                 ManagedTaskRequest::Get(task_id.clone()), limits, self.policy.max_body_bytes)?;
-            let event = self.drive_task_pair(cx, cancellation, credential, bounds,
-                &mut run, prepared).await?;
+            let event = self.drive_task_selected_pair(cx, cancellation, credential, bounds,
+                &mut run, prepared, mode, &mut notify).await?;
             let ManagedTaskEvent::Snapshot(snapshot) = event else {
                 return Err(ManagedTaskDriverError::UnexpectedResponse.into());
             };
@@ -325,14 +456,61 @@ impl DpopHttpClient {
             // Include the update's new ID reservation before checking whether
             // its ACK can fit. Do not post an answer that cannot be remembered.
             run.state.answer_bytes(&answered, &fingerprints, policy.maximum_state_bytes)?;
-            let event = self.drive_task_pair(cx, cancellation, credential, bounds,
-                &mut run, prepared).await?;
+            let event = self.drive_task_selected_pair(cx, cancellation, credential, bounds,
+                &mut run, prepared, mode, &mut notify).await?;
             if !matches!(event, ManagedTaskEvent::Updated(_)) {
                 return Err(ManagedTaskDriverError::UnexpectedResponse.into());
             }
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             run.state.record_answers(&answered, &fingerprints, policy.maximum_state_bytes)?;
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_task_selected_pair<N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        bounds: WaitBounds,
+        run: &mut Run,
+        prepared: Prepared,
+        mode: ReplyMode,
+        notify: &mut N,
+    ) -> Result<ManagedTaskEvent, DpopTaskDriverError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        let ReplyMode::Stream(limits) = mode else {
+            return self.drive_task_pair(cx, cancellation, credential, bounds, run, prepared).await;
+        };
+        let idle = Idle::new(cx.now(), limits.idle);
+        let pair_bounds = idle.bounds(bounds);
+        check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
+        // Validate the actual operation's progress identity BEFORE discovery or
+        // signing. It is independent of generated correlation IDs and carries
+        // no authority to acknowledge host input.
+        let progress = progress_marker(&prepared.operation_wire, limits.core.request_bytes())?;
+        check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
+        let response = self.post_resource_with_bounds(cx, cancellation, credential,
+            &prepared.discovery_wire, pair_bounds).await?;
+        check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
+        let admitted = run.admit(prepared, response)?;
+        check_live(cx, cancellation, &self.session, credential, pair_bounds)?;
+        let (wire, decoder) = TaskStreamDecoder::with_usage(
+            admitted, limits.core, run.stream_usage(limits.core)?, progress,
+        )?;
+        // The shared native reader alone decides EOF, proof/nonce handling,
+        // observer context, framing and cooperative ready-body yielding. The
+        // same absolute bounds enter every round; no public request wrapper
+        // may manufacture a new timeout or discard cumulative accounting here.
+        let completed = self.execute_prepared_core_stream(
+            cx, cancellation, credential,
+            PreparedStream { wire, decoder, limits, bounds, idle }, notify,
+        ).await?;
+        check_live(cx, cancellation, &self.session, credential, bounds)?;
+        run.complete_stream(completed.usage, limits.core)?;
+        Ok(completed.result)
     }
 
     async fn drive_task_pair(

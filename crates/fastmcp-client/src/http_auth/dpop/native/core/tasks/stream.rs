@@ -23,7 +23,7 @@ use super::super::stream::{
 };
 use crate::http_auth::rpc::admit_http_notification;
 
-struct TaskStreamDecoder {
+pub(super) struct TaskStreamDecoder {
     id: RequestId,
     reply: Reply,
     limits: ManagedCoreLimits,
@@ -42,7 +42,23 @@ impl TaskStreamDecoder {
         discovery_bytes: usize,
         progress: Option<ProgressMarker>,
     ) -> Result<(ModernHttpRequest, Self), DpopStreamError> {
-        let remaining = limits.total_bytes().checked_sub(discovery_bytes)
+        Self::with_usage(admitted, limits, (discovery_bytes, 0), progress)
+    }
+
+    // Private continuation seam: only the lifecycle owner may seed cumulative
+    // payload/notification usage. Per-request correlation and progress history
+    // start afresh, but quotas never do. A terminal is still permitted when the
+    // notification count is exactly exhausted and payload capacity remains.
+    pub(super) fn with_usage(
+        admitted: Admitted,
+        limits: ManagedCoreLimits,
+        usage: (usize, usize),
+        progress: Option<ProgressMarker>,
+    ) -> Result<(ModernHttpRequest, Self), DpopStreamError> {
+        if usage.1 > limits.notifications() {
+            return Err(ManagedCoreError::NotificationLimit.into());
+        }
+        let remaining = limits.total_bytes().checked_sub(usage.0)
             .filter(|remaining| *remaining > 0)
             .ok_or(ManagedCoreError::ResponseByteLimit)?;
         let Admitted { wire, id, reply, maximum } = admitted;
@@ -51,8 +67,8 @@ impl TaskStreamDecoder {
             reply,
             limits,
             maximum_frame: maximum.min(limits.frame_bytes()).min(remaining),
-            bytes: discovery_bytes,
-            notifications: 0,
+            bytes: usage.0,
+            notifications: usage.1,
             progress,
             last_progress: None,
             terminal: false,
@@ -119,7 +135,7 @@ impl StreamDecoder for TaskStreamDecoder {
 // Capture progress identity from the already-admitted, actual operation body,
 // never from the discovery ID or an unrelated synthetic core request. This
 // bounded preflight runs before discovery/proof signing and retains no inputs.
-fn progress_marker(
+pub(super) fn progress_marker(
     wire: &ModernHttpRequest,
     maximum: usize,
 ) -> Result<Option<ProgressMarker>, DpopStreamError> {
