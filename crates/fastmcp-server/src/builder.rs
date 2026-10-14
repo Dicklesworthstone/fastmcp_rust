@@ -7432,7 +7432,7 @@ mod tests {
         }
 
         #[test]
-        fn public_legacy_and_stateless_ping_answer_empty_object_without_entering_the_final_request_union()
+        fn public_legacy_ping_is_served_while_the_removed_modern_ping_is_refused_outside_the_final_request_union()
          {
             let server = ServerBuilder::new("srv", "1.0").build();
             let mut legacy_session =
@@ -7501,15 +7501,32 @@ mod tests {
                 714,
                 crate::InboundRequestTransport::Memory,
             );
-            let answered = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &final_ping))
-                .expect("stateless modern ping is a connection health-check");
+            // This half used to assert that the modern-marked ping ALSO
+            // answers an empty object, which contradicted the two assertions
+            // at the end of this same test: `ping` must stay outside
+            // `FINAL_2026_07_28_METHODS`, and `CoreRequest::decode` must
+            // refuse it for `Modern2026` as an unsupported method. The frozen
+            // plan settles it in the same direction -- its protocol
+            // comparison table reads `| Ping | Removed | Present |
+            // Legacy-only |` and the text twice calls core ping "the removed
+            // MCP core method" -- so the removal is the contract and the
+            // empty-object expectation was the stale side. The row is
+            // inverted rather than dropped, which keeps this test's real
+            // subject intact: the two eras disagree about one method while
+            // sharing a server, and the legacy half above still proves the
+            // served direction.
+            let refused = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &final_ping))
+                .expect("a ping carrying an id must produce a JSON-RPC response");
+            let refusal = refused
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("the modern era removed ping: {refused:?}"));
             assert_eq!(
-                answered.result,
-                Some(serde_json::json!({})),
-                "the stateless modern ping answers an empty object; error was {:?}",
-                answered.error
+                refusal.code,
+                fastmcp_protocol::JsonInteger::from(-32601),
+                "a modern ping is an unknown method, not a health-check: {refusal:?}"
             );
-            assert!(answered.error.is_none());
+            assert!(refused.result.is_none());
             assert_eq!(
                 legacy_session.state().len(),
                 state_before,

@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::sync::Arc;
@@ -1585,8 +1586,10 @@ impl WireServerCatalogs {
             let token = identifier
                 .as_bytes()
                 .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+                .fold(String::new(), |mut out, byte| {
+                    let _ = write!(out, "{byte:02x}");
+                    out
+                });
             if self.cursors.contains_key(&token)
                 || retained_bytes
                     .saturating_add(token.len())
@@ -2094,6 +2097,13 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// When composed repeatedly, ordinary effects use the latest callbacks,
     /// while cancellation retains every prior cleanup and observer in order
     /// before invoking the new observer.
+    // The underscore on `_activation_proof` is load-bearing documentation: the
+    // proof is RETAINED and never inspected, and both constructors spell it
+    // that way. Moving it into the recomposed Host is the one place the field
+    // is read, which is what the lint sees; renaming it to satisfy the lint
+    // would delete the "held, never examined" signal from two struct
+    // definitions and three other sites to resolve a complaint about one.
+    #[allow(clippy::used_underscore_binding)]
     #[must_use]
     pub fn with_effects<E: McpAppsWireHostEffects>(
         self,

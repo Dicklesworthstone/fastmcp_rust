@@ -11447,8 +11447,26 @@ fn with_optional_parameter_headers(
 }
 
 fn validate_final_method(method: &str, has_request_id: bool) -> Result<(), ModernHttpClientError> {
-    // Connection health-check. Not a member of the official 2026 client-request
-    // union; the server still answers `{}` on the stateless HTTP surface.
+    // Not a member of the official 2026 client-request union. The second half
+    // of this comment used to read "the server still answers `{}` on the
+    // stateless HTTP surface", and that is not what this project's server
+    // does: a modern-marked ping is refused -32601, measured on both stateless
+    // dispatch chains and under both modern policies, because
+    // `fastmcp-server`'s `is_removed_legacy_method` lists `ping` beside
+    // `logging/setLevel` and no ping arm exists anywhere in the server's HTTP
+    // admission, router, or legacy modules. The frozen plan agrees: its
+    // protocol comparison table reads `| Ping | Removed | Present |
+    // Legacy-only |`, and it twice calls core ping "the removed MCP core
+    // method". So this bypass admits a request the peer half of this very
+    // repository rejects, and `logging/setLevel` -- removed by the same
+    // revision, refused three lines below -- shows the shape the rule would
+    // otherwise take here.
+    //
+    // The behaviour is deliberately LEFT AS IS: every modern-path ping test in
+    // this file answers from a hand-written TCP fixture hardcoded to reply
+    // `{"result":{}}`, so none of them can see the disagreement, and removing
+    // the bypass is a cross-crate contract change rather than a local repair.
+    // Tracked as bd-ep6pp for a ruling on which half moves.
     if method == PING {
         return if has_request_id {
             Ok(())
@@ -19764,7 +19782,7 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
     #[test]
     fn public_http_ping_is_admitted_without_entering_the_final_request_union() {
         super::validate_final_method(fastmcp_protocol::methods::PING, true)
-            .expect("ping is a connection health-check");
+            .expect("this client admits a modern ping; see the bd-ep6pp note on the bypass");
         super::validate_final_method(fastmcp_protocol::methods::PING, false)
             .expect_err("ping still requires a request id");
         let refused = super::validate_final_method("logging/setLevel", true)

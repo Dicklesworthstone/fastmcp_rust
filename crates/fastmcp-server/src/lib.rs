@@ -36408,143 +36408,204 @@ mod lib_unit_tests {
         );
     }
 
-    /// `ping` is spec-required, and the stateless MODERN path had exactly one
-    /// test covering it anywhere in the tree: a case inside
-    /// `builder::tests::proxy_registration_tests` which answers -32601 "Method
-    /// not found" under `--all-features`. That test runs against a
-    /// proxy-registered server and dispatches both eras at once, so it cannot
-    /// separate "the stateless table does not claim ping" from "proxy
-    /// registration displaced it". This isolates that one variable: the same
-    /// request shape, including the modern `_meta`, against a PLAIN server.
+    /// `ping` is a MCP 2024-11-05 method that MCP 2026-07-28 REMOVED, so a
+    /// modern request naming it is an unknown method and -32601 is the
+    /// specified answer. That rule is stated independently in five places:
+    /// the frozen plan's protocol comparison table (`| Ping | Removed |
+    /// Present | Legacy-only |`), the plan's twice-written "the removed MCP
+    /// core method", `FINAL_2026_07_28_METHODS` (eighteen entries, no
+    /// `ping`), `CoreRequest::decode(ProtocolEra::Modern2026, "ping", ..)`
+    /// which is required to return `UnsupportedMethod`, and
+    /// `is_removed_legacy_method` in this crate.
     ///
-    /// The expected result is not invented here. It is the expectation that
-    /// existing test already asserts, and `_meta` carrying the 2026-07-28
-    /// protocol version is what makes this the modern route rather than the
-    /// exact-2024 one, which passes there.
+    /// This assertion is the INVERSE of the one it replaces. The earlier
+    /// version asserted a modern ping answers an empty object, and I filed
+    /// the resulting -32601 as a p1 server defect before reading any of those
+    /// five sources; the measurement was right and the expectation was stale.
+    /// It is inverted rather than removed because the stateless chains had no
+    /// direct coverage of the removal rule at all, so the corrected test is
+    /// the regression guard the original coverage audit was actually looking
+    /// for: it fails if anyone routes `ping` back into the modern era.
     ///
-    /// `dispatch_stateless_listen_is_not_method_not_found` above is the
-    /// companion that makes a -32601 here meaningful: it establishes that this
-    /// dispatch names an unclaimed method with MethodNotFound and names a
-    /// claimed-but-unsupported one with a specific diagnostic instead.
+    /// The second half is the near-identical negative control (RH-5). It
+    /// changes only the one forbidden dimension -- whether the method
+    /// survived into 2026-07-28 -- by sending `server/discover`, the first
+    /// entry in `FINAL_2026_07_28_METHODS`, with the identical modern `_meta`
+    /// to the identical server. Without it, a server that answered -32601 to
+    /// everything would satisfy the positive.
+    ///
+    /// `server/discover` is chosen over a registration-dependent method such
+    /// as `tools/list` because it is already known to be claimed on a plain
+    /// server two ways: `modern_request_version_refusal`'s own planted
+    /// negative answers it -32602 for missing metadata rather than -32601,
+    /// which is only reachable for a CLAIMED method, and an instrumented
+    /// websocket capture on this crate recorded a complete 344-byte
+    /// `server/discover` result frame from a server with no registrations.
+    /// `dispatch_stateless_listen_is_not_method_not_found` above is the second
+    /// control, establishing that this dispatch does distinguish an unclaimed
+    /// method from a claimed-but-unsupported one.
     #[test]
-    fn dispatch_stateless_modern_ping_answers_an_empty_object() {
+    fn dispatch_stateless_refuses_the_removed_modern_ping() {
         let server = Server::new("stateless-modern-ping", "1.0.0").build();
+        let modern_meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let mark_modern = |request: &mut JsonRpcRequest| {
+            request
+                .params
+                .as_mut()
+                .expect("the request retains its object parameters")
+                .as_object_mut()
+                .expect("the request parameters remain an object")
+                .insert("_meta".to_owned(), modern_meta.clone());
+        };
+
         let inbound =
             InboundRequestContext::new(Cx::for_testing(), 927, InboundRequestTransport::Memory);
-        let mut request = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 927_i64);
-        request
-            .params
-            .as_mut()
-            .expect("the ping request retains its object parameters")
-            .as_object_mut()
-            .expect("the ping parameters remain an object")
-            .insert(
-                "_meta".to_owned(),
-                serde_json::json!({
-                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                }),
-            );
-        let response = block_on(server.dispatch_stateless(&inbound, &request))
+        let mut ping = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 927_i64);
+        mark_modern(&mut ping);
+        let refused = block_on(server.dispatch_stateless(&inbound, &ping))
             .expect("ping with an id must produce a JSON-RPC response");
+        let error = refused
+            .error
+            .as_ref()
+            .unwrap_or_else(|| panic!("a modern ping is a removed method: {refused:?}"));
         assert_eq!(
-            response.result,
-            Some(serde_json::json!({})),
-            "a stateless modern ping answers an empty object; error was {:?}",
-            response.error
+            error.code,
+            i32::from(McpErrorCode::MethodNotFound).into(),
+            "MCP 2026-07-28 removed ping, so the modern era answers -32601: {error:?}"
         );
         assert!(
-            response.error.is_none(),
-            "a stateless modern ping carries no error: {:?}",
-            response.error
+            refused.result.is_none(),
+            "a refused ping carries no result: {:?}",
+            refused.result
         );
+
+        let surviving_inbound =
+            InboundRequestContext::new(Cx::for_testing(), 929, InboundRequestTransport::Memory);
+        let mut surviving =
+            JsonRpcRequest::new("server/discover", Some(serde_json::json!({})), 929_i64);
+        mark_modern(&mut surviving);
+        let answered = block_on(server.dispatch_stateless(&surviving_inbound, &surviving))
+            .expect("server/discover with an id must produce a JSON-RPC response");
+        if let Some(error) = answered.error.as_ref() {
+            assert_ne!(
+                error.code,
+                i32::from(McpErrorCode::MethodNotFound).into(),
+                "server/discover survived into 2026-07-28, so the -32601 above is about ping's \
+                 removal and not a server that refuses every method: {error:?}"
+            );
+        }
     }
 
-    /// The severity companion to
-    /// `dispatch_stateless_modern_ping_answers_an_empty_object`, and the one
-    /// that reaches the chain a real transport uses.
+    /// The same removal rule as
+    /// `dispatch_stateless_refuses_the_removed_modern_ping`, on the chain a
+    /// real transport uses.
     ///
-    /// Its companion dispatches through `dispatch_stateless`, which for those
+    /// That companion dispatches through `dispatch_stateless`, which for those
     /// arguments resolves to `dispatch_stateless_with_cancellation`. The
     /// production stdio loop does NOT use that function: `async_stdio` contains
     /// no ping handling of its own and routes every inbound request through
     /// `dispatch_with_protocol_policy_owned` under `ProtocolPolicy::ModernOnly`,
     /// which descends the separate `dispatch_stateless_owned_*` chain. So the
-    /// companion alone cannot say whether a shipped transport is affected, and
-    /// a test that merely swapped in the non-owned policy wrapper would have
-    /// been close to tautological against it. This one takes the owned path,
-    /// shaped exactly like the stdio call site, and keeps `Auto` beside
-    /// `ModernOnly` because `Auto` is the default policy.
+    /// companion alone cannot say what a shipped transport does, and a test
+    /// that merely swapped in the non-owned policy wrapper would have been
+    /// close to tautological against it, because that wrapper delegates to the
+    /// very same call. This one takes the owned path, shaped exactly like the
+    /// stdio call site, and keeps `Auto` beside `ModernOnly` because `Auto` is
+    /// the default policy.
+    ///
+    /// `LegacyOnly` is deliberately absent. The served half of the rule -- a
+    /// 2024-11-05 ping answering an empty object -- is already proven on the
+    /// path that owns it, by the legacy arm of
+    /// `builder::tests::proxy_registration_tests::public_legacy_and_stateless_ping_answer_empty_object_without_entering_the_final_request_union`,
+    /// which dispatches through a negotiated 2024-11-05 `Session`. Asserting
+    /// it here would mean pairing `LegacyOnly` with a `ModernConnection`
+    /// inbound context and a session-less request, which is not a shape any
+    /// transport produces, so the result would say nothing about the shipped
+    /// legacy path.
     ///
     /// Written self-contained rather than sharing a request-building helper
     /// with its companion on purpose: if one fixture fed both, a fault in the
     /// fixture would fail both halves together and destroy exactly the
     /// independence that makes the pair worth having.
     #[test]
-    fn modern_ping_through_the_owned_production_dispatch_answers_an_empty_object() {
+    fn the_owned_production_dispatch_refuses_the_removed_ping_under_every_modern_policy() {
         // Every policy is evaluated before anything is asserted. An assertion
-        // inside the loop ends the test on the first refusal and silently
+        // inside the loop ends the test on the first disagreement and silently
         // leaves the remaining policies unmeasured, which is how the first
         // version of this test reported one policy while its name promised
         // two -- and the unmeasured one, ModernOnly, is precisely what the
         // stdio loop dispatches under.
-        let mut observed: Vec<(ProtocolPolicy, bool, String)> = Vec::new();
+        //
+        // `tools/list` rides along as the near-identical negative control
+        // (RH-5): same chain, same policy, same server, same modern `_meta`,
+        // differing only in whether the method survived into 2026-07-28. A
+        // server that answered -32601 to everything would satisfy the ping
+        // half alone.
+        let mut observed: Vec<(ProtocolPolicy, &str, bool, String)> = Vec::new();
         for policy in [ProtocolPolicy::Auto, ProtocolPolicy::ModernOnly] {
-            let server = Arc::new(Server::new("policy-modern-ping", "1.0.0").build());
-            let connection = ModernConnection::new();
-            let inbound = InboundRequestContext::with_modern_connection(
-                Cx::for_testing(),
-                928,
-                InboundRequestTransport::Memory,
-                &connection,
-            );
-            let notifications: NotificationSender = Arc::new(|_| {});
-            let mut request = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 928_i64);
-            request
-                .params
-                .as_mut()
-                .expect("the ping request retains its object parameters")
-                .as_object_mut()
-                .expect("the ping parameters remain an object")
-                .insert(
-                    "_meta".to_owned(),
-                    serde_json::json!({
-                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                    }),
+            for (method, id) in [("ping", 928_i64), ("tools/list", 930_i64)] {
+                let server = Arc::new(Server::new("policy-modern-ping", "1.0.0").build());
+                let connection = ModernConnection::new();
+                let inbound = InboundRequestContext::with_modern_connection(
+                    Cx::for_testing(),
+                    u64::try_from(id).expect("the literal request ids are positive"),
+                    InboundRequestTransport::Memory,
+                    &connection,
                 );
-            let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
-                policy,
-                &inbound,
-                request,
-                None,
-                None,
-                None,
-                None,
-                fastmcp_core::McpRequestCancellation::new(),
-                None,
-                Arc::clone(&notifications),
-            ))
-            .unwrap_or_else(|| {
-                panic!("ping with an id must produce a JSON-RPC response under {policy:?}")
-            });
-            let answered_empty_object =
-                response.result == Some(serde_json::json!({})) && response.error.is_none();
-            observed.push((
-                policy,
-                answered_empty_object,
-                format!("result={:?} error={:?}", response.result, response.error),
-            ));
+                let notifications: NotificationSender = Arc::new(|_| {});
+                let mut request = JsonRpcRequest::new(method, Some(serde_json::json!({})), id);
+                request
+                    .params
+                    .as_mut()
+                    .expect("the request retains its object parameters")
+                    .as_object_mut()
+                    .expect("the request parameters remain an object")
+                    .insert(
+                        "_meta".to_owned(),
+                        serde_json::json!({
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }),
+                    );
+                let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                    policy,
+                    &inbound,
+                    request,
+                    None,
+                    None,
+                    None,
+                    None,
+                    fastmcp_core::McpRequestCancellation::new(),
+                    None,
+                    Arc::clone(&notifications),
+                ))
+                .unwrap_or_else(|| {
+                    panic!("{method} with an id must produce a JSON-RPC response under {policy:?}")
+                });
+                let method_not_found = response.error.as_ref().is_some_and(|error| {
+                    error.code == i32::from(McpErrorCode::MethodNotFound).into()
+                });
+                observed.push((
+                    policy,
+                    method,
+                    method_not_found,
+                    format!("result={:?} error={:?}", response.result, response.error),
+                ));
+            }
         }
-        let refused: Vec<&(ProtocolPolicy, bool, String)> = observed
+        let disagreed: Vec<&(ProtocolPolicy, &str, bool, String)> = observed
             .iter()
-            .filter(|(_, answered, _)| !answered)
+            .filter(|(_, method, method_not_found, _)| (*method == "ping") != *method_not_found)
             .collect();
         assert!(
-            refused.is_empty(),
-            "every shipped policy must answer a modern ping with an empty object and no error; \
-             {} of {} refused: {refused:#?}",
-            refused.len(),
+            disagreed.is_empty(),
+            "MCP 2026-07-28 removed ping and kept tools/list, so every modern policy must answer \
+             -32601 to the first and something other than -32601 to the second; {} of {} rows \
+             disagreed: {disagreed:#?}",
+            disagreed.len(),
             observed.len()
         );
     }
