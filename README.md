@@ -201,8 +201,12 @@ different things:
   `c65eced1` restored `cargo fmt --check` afterwards.)
   **It still has no consumer, and that is the durable claim here.** The
   implementation grew ~5,900 lines in two days while the number of callers
-  stayed at zero, which makes this the largest finished-but-unconnected surface
-  in the workspace (tracked as `bd-iaqgd`); `readme_mechanical_claims.rs` gates
+  stayed at zero. That growth rate, not the absolute size, is what distinguishes
+  it from the other unconsumed surfaces this README already records: `http.rs`
+  is 14,734 lines and `websocket.rs` 6,828, both larger than the 7,214 here, but
+  both long-standing rather than six times bigger than they were at the previous
+  reading of this row. Tracked as `bd-iaqgd`;
+  `readme_mechanical_claims.rs` gates
   the zero so that wiring DPoP forces this row to be rewritten. Nothing in this
   workspace drives that module. Across every member `src/` file outside the two
   module trees, the lowercase path spelling `dpop` occurs exactly **twice**, and
