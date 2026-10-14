@@ -60,7 +60,23 @@ fn reservation_error(error: mpsc::CheckedSendError<()>) -> TransportError {
     match error {
         mpsc::CheckedSendError::Channel(error) => send_error(error),
         // Refusing an obligation must not silently fall back to an untracked
-        // send. Do not expose runtime internals through a transport error.
+        // send. The refusal's own Display is appended rather than the error
+        // object: `ObligationAdmissionError`'s messages are fixed category
+        // strings -- "obligation region is closed", "obligation holder does
+        // not match the context", "obligation limit {limit} reached with
+        // {live} live obligations" -- so they name WHICH of the six admission
+        // outcomes occurred without exposing runtime internals or the
+        // retained value. Collapsing all six into one sentence left a refusal
+        // here undiagnosable at the transport boundary, which is what the
+        // original wording did.
+        mpsc::CheckedSendError::Admission { error, .. } => {
+            TransportError::Io(std::io::Error::other(format!(
+                "memory transport send obligation admission refused: {error}"
+            )))
+        }
+        // `CheckedSendError` is `#[non_exhaustive]`, so a future variant must
+        // still map somewhere. Keeping the original sentence verbatim here
+        // means an unrecognised refusal stays greppable under the old text.
         _ => TransportError::Io(std::io::Error::other(
             "memory transport send obligation admission refused",
         )),
