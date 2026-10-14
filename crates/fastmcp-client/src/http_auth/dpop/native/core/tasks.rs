@@ -124,9 +124,20 @@ fn wire(
     method: &str,
     id: &RequestId,
     params: Value,
-    name: Option<String>,
+    mut name: Option<String>,
     maximum: usize,
 ) -> Result<ModernHttpRequest, DpopTasksError> {
+    // Task IDs are opaque routing data, not request IDs or network targets.
+    // Derive the mandatory mirror from the same typed params we serialize;
+    // a caller-supplied mirror cannot disagree with the actual operation.
+    if matches!(method, TASK_GET | TASK_UPDATE | TASK_CANCEL) {
+        let task_id = params.get("taskId").and_then(Value::as_str)
+            .filter(|value| !value.is_empty()).ok_or(ManagedTasksError::InvalidRequest)?;
+        if name.as_deref().is_some_and(|value| value != task_id) {
+            return Err(ManagedTasksError::InvalidRequest.into());
+        }
+        name = Some(task_id.to_owned());
+    }
     let mut writer = BoundedWriter { bytes: Vec::new(), maximum };
     serde_json::to_writer(&mut writer, &json!({
         "jsonrpc":"2.0", "id":id, "method":method, "params":params,
@@ -373,3 +384,81 @@ impl DpopHttpClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use fastmcp_protocol::{ClientCapabilities, FinalHttpRequestMetadata, RequestVersionMetadata,
+        admit_final_http_request};
+
+    fn header<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn every_task_operation_satisfies_the_actual_server_routing_contract() {
+        let target = "https://mcp.example/mcp?tenant=one";
+        let task_id = TaskId::parse("opaque-task-one").unwrap();
+        let task: Task = serde_json::from_value(json!({
+            "taskId":"opaque-task-one", "status":"input_required",
+            "createdAt":"2026-09-16T00:00:00Z", "lastUpdatedAt":"2026-09-16T00:00:00Z",
+            "ttlMs":60000, "inputRequests":{"roots":{"method":"roots/list"}}
+        })).unwrap();
+        for request in [
+            ManagedTaskRequest::Get(task_id.clone()),
+            ManagedTaskRequest::Cancel(task_id),
+            ManagedTaskRequest::Update { task: Box::new(task),
+                input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() },
+        ] {
+            let prepared = Prepared::new(target, FinalRequestMeta::new(ClientCapabilities::default()),
+                DpopTaskOperation::new(RequestId::Number(11), RequestId::Number(12), request).unwrap(),
+                ManagedCoreLimits::default(), 8192).unwrap();
+            let fields = prepared.operation_wire.headers();
+            let body: Value = serde_json::from_slice(prepared.operation_wire.body()).unwrap();
+            let mirror = header(&fields, "mcp-name").unwrap();
+            assert_eq!(fields.iter().filter(|(key, _)| key.eq_ignore_ascii_case("mcp-name")).count(), 1);
+            assert_eq!(body["params"]["taskId"], "opaque-task-one");
+            assert_eq!(body["id"], 12);
+            assert_eq!(prepared.operation_wire.target(), target);
+            assert_eq!(fastmcp_protocol::http_headers::decode_mcp_header_value(mirror.as_bytes()).unwrap(),
+                "opaque-task-one");
+            let admit = |name: Option<&str>| admit_final_http_request(FinalHttpRequestMetadata {
+                version: RequestVersionMetadata {
+                    header_version: header(&fields, "mcp-protocol-version"),
+                    body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
+                },
+                header_method: header(&fields, "mcp-method"), body_method: body["method"].as_str(),
+                header_name: name, body_name: body["params"]["taskId"].as_str(),
+            }).is_ok();
+            assert!(admit(Some(mirror)));
+            assert!(!admit(None));
+            assert!(!admit(Some("another-task")));
+            assert!(header(&prepared.discovery_wire.headers(), "mcp-name").is_none());
+            assert!(header(&fields, "authorization").is_none());
+            assert!(header(&fields, "dpop").is_none());
+        }
+    }
+
+    #[test]
+    fn task_mirrors_cannot_be_substituted_and_encoding_is_lossless() {
+        for method in [TASK_GET, TASK_UPDATE, TASK_CANCEL] {
+            for id in ["opaque%2Fone", "=?base64?YWJj?=", "task 雪"] {
+                let params = json!({"taskId":id});
+                let request = wire("https://mcp.example/mcp", method, &RequestId::Number(2),
+                    params.clone(), None, 8192).unwrap();
+                let fields = request.headers();
+                assert_eq!(fastmcp_protocol::http_headers::decode_mcp_header_value(
+                    header(&fields, "mcp-name").unwrap().as_bytes()).unwrap(), id);
+                let body: Value = serde_json::from_slice(request.body()).unwrap();
+                assert_eq!(body["params"], params);
+                assert!(wire("https://mcp.example/mcp", method, &RequestId::Number(2),
+                    params, Some("different".to_owned()), 8192).is_err());
+            }
+            for params in [json!({}), json!({"taskId":null}), json!({"taskId":2}), json!({"taskId":""})] {
+                assert!(wire("https://mcp.example/mcp", method, &RequestId::Number(2),
+                    params, None, 8192).is_err());
+            }
+        }
+    }
+}
