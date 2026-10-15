@@ -4,6 +4,9 @@
 //! remains open during resolution and update; a successful update is followed
 //! by an immediate get, without waiting for a possibly coalesced status event.
 
+/// Create one tool invocation and continue on the same bounded subscription run.
+pub mod start;
+
 use std::collections::BTreeMap;
 use std::future::{Future, Ready, poll_fn};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -279,7 +282,7 @@ impl DpopHttpClient {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         self.watch_task_using(
             cx, cancellation, credential, metadata, task, id_prefix,
-            policy.watch, limits, bounds, Some(input),
+            policy.watch, limits, bounds, (0, 0), Some(input),
         ).await
     }
 }

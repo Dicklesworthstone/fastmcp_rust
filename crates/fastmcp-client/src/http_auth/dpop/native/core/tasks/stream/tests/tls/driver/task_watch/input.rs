@@ -1,5 +1,7 @@
 //! Subscription input driving through the existing authenticated loopback TLS peer.
 
+mod start;
+
 use super::*;
 use std::future::Future;
 use crate::http_auth::dpop::native::core::stream::task_subscription::watch::input::{

@@ -306,7 +306,7 @@ impl DpopHttpClient {
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
         self.watch_task_using(
             cx, cancellation, credential, metadata, task, id_prefix,
-            policy, limits, bounds, None::<NoInput>,
+            policy, limits, bounds, (0, 0), None::<NoInput>,
         ).await
     }
 
@@ -318,7 +318,7 @@ impl DpopHttpClient {
         &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
         credential: &DpopCredential, metadata: FinalRequestMeta, task: TaskId,
         id_prefix: &str, policy: DpopTaskWatchPolicy, limits: DpopStreamLimits,
-        bounds: WaitBounds, mut input: Option<InputDriver<R, O>>,
+        bounds: WaitBounds, prior_usage: (usize, usize), mut input: Option<InputDriver<R, O>>,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -327,6 +327,9 @@ impl DpopHttpClient {
     {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut state = WatchState::new(id_prefix, policy, limits)?;
+        // Only the private creating-call adapter supplies nonzero usage. A
+        // creation-to-watch handoff cannot replenish either response quota.
+        state.charge(prior_usage)?;
         if let Some(result) = self.watch_snapshot(
             cx, cancellation, credential, &metadata, &task, &mut state, bounds, &mut input, true,
         ).await? {
