@@ -2,6 +2,8 @@
 //!
 //! These cases exercise public methods, not a substitute Task loop or parser.
 
+mod start;
+
 use super::*;
 use crate::http_auth::dpop::native::core::tasks::driver::ManagedTaskDriverError;
 use fastmcp_protocol::tasks_extension::TaskInputRequests;

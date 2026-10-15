@@ -1,8 +1,12 @@
 //! Bounded polling and explicit host input for DPoP-protected Tasks.
 //!
 //! This composes the existing negotiated Task POSTs and the shared Task input
-//! ledger. It does not create Tasks, refresh credentials, retry failed POSTs,
-//! or continue running after its caller-owned future is dropped.
+//! ledger. The existing-Task entrypoints do not create Tasks; `start` adds an
+//! explicit creating call under the same lifecycle. Neither refreshes credentials,
+//! retries failed POSTs, or runs after its caller-owned future is dropped.
+
+/// Start one tool call and drive its Task without resetting execution bounds.
+pub mod start;
 
 use std::fmt;
 use std::future::Future;
@@ -423,9 +427,9 @@ impl DpopHttpClient {
         policy: ManagedTaskDriverPolicy,
         limits: ManagedCoreLimits,
         mode: ReplyMode,
-        mut resolve: R,
-        mut observe: O,
-        mut notify: N,
+        resolve: R,
+        observe: O,
+        notify: N,
     ) -> Result<ManagedTaskRunOutcome, DpopTaskDriverError>
     where
         R: FnMut(TaskInputRequests) -> F,
@@ -442,33 +446,70 @@ impl DpopHttpClient {
         let timeout = policy.timeout.min(limits.timeout()).min(self.policy.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let mut run = Run::new(id_prefix, policy, limits)?;
+        let run = Run::new(id_prefix, policy, limits)?;
+        self.drive_task_run(
+            cx, cancellation, credential, metadata, task_id, run, bounds,
+            limits, mode, None, resolve, observe, notify,
+        ).await
+    }
+
+    // Both existing-Task and creating-tool entrypoints use this lifecycle.
+    // A creation snapshot is already admitted and charged; consuming it must
+    // not issue a redundant get, reset quotas, or lose the original deadline.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive_task_run<R, F, O, N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task_id: TaskId,
+        mut run: Run,
+        bounds: WaitBounds,
+        limits: ManagedCoreLimits,
+        mode: ReplyMode,
+        mut initial: Option<Task>,
+        mut resolve: R,
+        mut observe: O,
+        mut notify: N,
+    ) -> Result<ManagedTaskRunOutcome, DpopTaskDriverError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        let policy = run.policy;
         let input_metadata = serde_json::to_value(&metadata)
             .map_err(|_| ManagedTasksError::InvalidRequest)?;
         let mut due = cx.now();
         loop {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
-            if run.polls >= policy.maximum_polls {
-                return Err(ManagedTaskDriverError::PollLimit.into());
-            }
-            if run.remaining_bytes == 0 {
-                return Err(ManagedCoreError::ResponseByteLimit.into());
-            }
-            if cx.now() < due {
-                within(cx, cancellation, &self.session, credential, bounds, async {
-                    Sleep::new(due).await;
-                    Ok(())
-                }).await?;
-            }
-            check_live(cx, cancellation, &self.session, credential, bounds)?;
-            let prepared = run.prepare(self.resource().as_str(), metadata.clone(),
-                ManagedTaskRequest::Get(task_id.clone()), limits, self.policy.max_body_bytes)?;
-            let event = self.drive_task_selected_pair(cx, cancellation, credential, bounds,
-                &mut run, prepared, mode, &mut notify).await?;
-            let ManagedTaskEvent::Snapshot(snapshot) = event else {
-                return Err(ManagedTaskDriverError::UnexpectedResponse.into());
+            let task = if let Some(task) = initial.take() {
+                task
+            } else {
+                if run.polls >= policy.maximum_polls {
+                    return Err(ManagedTaskDriverError::PollLimit.into());
+                }
+                if run.remaining_bytes == 0 {
+                    return Err(ManagedCoreError::ResponseByteLimit.into());
+                }
+                if cx.now() < due {
+                    within(cx, cancellation, &self.session, credential, bounds, async {
+                        Sleep::new(due).await;
+                        Ok(())
+                    }).await?;
+                }
+                check_live(cx, cancellation, &self.session, credential, bounds)?;
+                let prepared = run.prepare(self.resource().as_str(), metadata.clone(),
+                    ManagedTaskRequest::Get(task_id.clone()), limits, self.policy.max_body_bytes)?;
+                let event = self.drive_task_selected_pair(cx, cancellation, credential, bounds,
+                    &mut run, prepared, mode, &mut notify).await?;
+                let ManagedTaskEvent::Snapshot(snapshot) = event else {
+                    return Err(ManagedTaskDriverError::UnexpectedResponse.into());
+                };
+                snapshot.task
             };
-            let task = snapshot.task;
             let received = cx.now();
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let observed = with_caller(cx, || observe(&task));
