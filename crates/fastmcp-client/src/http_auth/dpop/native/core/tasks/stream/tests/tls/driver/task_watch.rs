@@ -292,10 +292,17 @@ fn quiet_watch_cancellation_and_idle_timeout_close_only_owned_requests() {
             let selected = if idle_timeout {
                 DpopStreamLimits::new(watch_limits(4).core, Duration::from_secs(1)).unwrap()
             } else { watch_limits(4) };
-            let application = client.watch_task_with_cancellation(
-                &cx, &cancellation, &credential, driver_metadata(), TaskId::parse("task-one").unwrap(),
-                "quiet", watch_policy(4), selected,
-            );
+            let application = async {
+                let watch = client.watch_task_with_cancellation(
+                    &cx, &cancellation, &credential, driver_metadata(), TaskId::parse("task-one").unwrap(),
+                    "quiet", watch_policy(4), selected,
+                );
+                if idle_timeout {
+                    // The much later absolute deadline cannot satisfy the idle test.
+                    asupersync::time::timeout_at(cx.now().saturating_add_nanos(3_000_000_000), watch)
+                        .await.expect("the one-second listen idle deadline must win")
+                } else { watch.await }
+            };
             let server = async {
                 peer.watch_snapshot_reply("quiet", 0, "working").await;
                 let mut listen = peer.watch_listen("quiet").await;
@@ -334,5 +341,110 @@ fn already_finished_or_input_required_tasks_need_no_subscription() {
             } else { assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::InputRequired(_))); }
             peer.no_extra(1);
         });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReconciliationPhase { Discovery, GetHead, GetBody }
+
+#[derive(Clone, Copy)]
+enum WatchRetirement { Cancel, Credential, Session, Abandon, Idle }
+
+#[test]
+fn watch_retirement_releases_the_listen_and_stalled_reconciliation_together() {
+    for phase in [ReconciliationPhase::Discovery, ReconciliationPhase::GetHead,
+        ReconciliationPhase::GetBody]
+    {
+        for retirement in [WatchRetirement::Cancel, WatchRetirement::Credential,
+            WatchRetirement::Session, WatchRetirement::Abandon, WatchRetirement::Idle]
+        {
+            run(async {
+                let cx = Cx::current().unwrap();
+                let (mut peer, mut client, credential) = Peer::new().await;
+                let cancellation = McpRequestCancellation::new();
+                let reached = McpRequestCancellation::new();
+                let session = client.revocation_handle();
+                let idle = matches!(retirement, WatchRetirement::Idle);
+                let selected = if idle {
+                    DpopStreamLimits::new(watch_limits(4).core, Duration::from_secs(1)).unwrap()
+                } else { watch_limits(4) };
+                let application = async {
+                    let mut watch = Box::pin(client.watch_task_with_cancellation(
+                        &cx, &cancellation, &credential, driver_metadata(),
+                        TaskId::parse("task-one").unwrap(), "retire", watch_policy(4), selected,
+                    ));
+                    if matches!(retirement, WatchRetirement::Abandon) {
+                        let mut ready = std::pin::pin!(reached.cancelled());
+                        poll_fn(|context| {
+                            assert!(watch.as_mut().poll(context).is_pending(),
+                                "no complete authoritative snapshot is available");
+                            ready.as_mut().poll(context)
+                        }).await;
+                        drop(watch);
+                    } else {
+                        let result = if idle {
+                            asupersync::time::timeout_at(
+                                cx.now().saturating_add_nanos(3_000_000_000), watch,
+                            ).await.expect("listen idle also bounds a silent reconciliation")
+                        } else { watch.await };
+                        let error = result.err().expect("unfinished reconciliation cannot succeed");
+                        match retirement {
+                            WatchRetirement::Cancel => assert!(matches!(error,
+                                DpopTaskWatchError::Stream(DpopStreamError::Core(
+                                    DpopCoreError::Transport(DpopHttpError::Cancelled))))),
+                            WatchRetirement::Credential | WatchRetirement::Session => assert!(matches!(error,
+                                DpopTaskWatchError::Stream(DpopStreamError::Core(
+                                    DpopCoreError::Transport(DpopHttpError::Authorization(_)))))),
+                            WatchRetirement::Idle => assert!(matches!(error,
+                                DpopTaskWatchError::Stream(DpopStreamError::Core(
+                                    DpopCoreError::Transport(DpopHttpError::TimedOut))))),
+                            WatchRetirement::Abandon => unreachable!(),
+                        }
+                    }
+                };
+                let server = async {
+                    peer.watch_snapshot_reply("retire", 0, "working").await;
+                    let mut listen = peer.watch_listen("retire").await;
+                    listen.write_all(HEAD).await.unwrap();
+                    event(&mut listen, &watch_ack("retire", true)).await;
+                    let mut stalled = match phase {
+                        ReconciliationPhase::Discovery => {
+                            peer.receive_named("retire.1.discover", "server/discover").await.0
+                        }
+                        ReconciliationPhase::GetHead | ReconciliationPhase::GetBody => {
+                            peer.wait_round("retire", 1).await
+                        }
+                    };
+                    if matches!(phase, ReconciliationPhase::GetBody) {
+                        // Supply a valid incremental reply but never its terminal
+                        // or HTTP EOF. The listen remains open at the same time.
+                        stalled.write_all(HEAD).await.unwrap();
+                        event(&mut stalled, &progress(json!("work"), "1")).await;
+                    }
+                    reached.cancel();
+                    match retirement {
+                        WatchRetirement::Cancel => { cancellation.cancel(); }
+                        WatchRetirement::Credential => { credential.revoke(); }
+                        WatchRetirement::Session => { session.revoke(); }
+                        WatchRetirement::Abandon | WatchRetirement::Idle => {}
+                    }
+                    // Peer I/O uses its still-live ambient Cx, so an error here
+                    // is socket retirement, not cancellation of the test server.
+                    pair(assert_watch_closed(&mut listen), assert_watch_closed(&mut stalled)).await;
+                };
+                pair(application, server).await;
+                let requests = if matches!(phase, ReconciliationPhase::Discovery) { 5 } else { 6 };
+                assert_eq!(peer.proofs.len(), requests);
+                assert!(peer.listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending(),
+                    "retirement must not reconnect, retry, get or cancel remotely");
+                assert!(cx.checkpoint().is_ok());
+                assert_eq!(client.revocation_handle().is_revoked(),
+                    matches!(retirement, WatchRetirement::Session));
+                if matches!(retirement, WatchRetirement::Cancel | WatchRetirement::Abandon | WatchRetirement::Idle) {
+                    followup(&mut peer, &mut client, &credential).await;
+                    assert_eq!(peer.proofs.len(), requests + 2);
+                }
+            });
+        }
     }
 }
