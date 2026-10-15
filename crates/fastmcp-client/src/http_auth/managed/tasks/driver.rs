@@ -253,8 +253,11 @@ impl ManagedTasksClient {
     /// not a second parser or a notification history buffer. Per-response
     /// byte/record limits remain in force, and the policy bounds the total
     /// number of get/update pairs. No callback resets either limit or the
-    /// original driver deadline. Notifications retain the original response
-    /// credential's expiry and revocation even if another caller renews login.
+    /// original driver deadline. Notifications, snapshot observers, and input
+    /// resolvers retain the original response credential's expiry and revocation
+    /// even if another caller renews login. Resolver construction and its future
+    /// are guarded separately: revocation during construction cannot start the
+    /// returned future. Pending host work is woken when that credential is revoked.
     ///
     /// Failure, callback refusal, cancellation or abandonment stops this run
     /// without replay, reconnect, automatic remote cancellation, or a worker.
@@ -323,13 +326,17 @@ impl ManagedTasksClient {
                         else {
                             return Err(ManagedTaskDriverError::UnexpectedResponse);
                         };
+                        let callback_lifetime = DriverCallbackLifetime::new(&call, deadline);
                         drop(call);
                         let task = snapshot.task;
                         // Keep the peer's relative polling hint anchored to receipt,
                         // not to the later completion of a potentially slow resolver.
                         due = next_poll_time(cx.now(), &task, policy.minimum_poll_interval)?;
                         self.check_driver(cx, cancellation, deadline)?;
-                        observe(&task)?;
+                        callback_lifetime.run(cx, || {
+                            std::future::ready(observe(&task))
+                        })
+                        .await?;
                         self.check_driver(cx, cancellation, deadline)?;
                         if matches!(
                             task,
@@ -354,9 +361,10 @@ impl ManagedTasksClient {
                         }
                         let callback_inputs = admit_capabilities(&self.metadata, &pending)?;
                         self.check_driver(cx, cancellation, deadline)?;
-                        let resolution = resolve(callback_inputs);
-                        self.check_driver(cx, cancellation, deadline)?;
-                        let action = resolution.await?;
+                        let action = callback_lifetime.run(cx, || {
+                            resolve(callback_inputs)
+                        })
+                        .await?;
                         self.check_driver(cx, cancellation, deadline)?;
                         let ManagedTaskInputAction::Respond(responses) = action else {
                             return Ok(ManagedTaskRunOutcome::InputRequired(Box::new(task)));
@@ -378,7 +386,10 @@ impl ManagedTasksClient {
                             self.limits,
                         )?;
                         self.check_driver(cx, cancellation, deadline)?;
-                        let ids = next_ids()?;
+                        let ids = callback_lifetime.run(cx, || {
+                            std::future::ready(next_ids())
+                        })
+                        .await?;
                         self.check_driver(cx, cancellation, deadline)?;
                         state.reserve_ids(&ids, policy.maximum_state_bytes)?;
                         // Include the newly reserved IDs before verifying that an
@@ -386,6 +397,9 @@ impl ManagedTasksClient {
                         state.answer_bytes(&answered, &fingerprints, policy.maximum_state_bytes)?;
                         updates += 1;
                         self.check_driver(cx, cancellation, deadline)?;
+                        // Host work retained only the completed response's
+                        // lifetime, never its body or bearer text. The unchanged
+                        // managed acquisition policy owns this explicit update.
                         let mut call = self
                             .request_with_cancellation(cx, cancellation, ids, update)
                             .await?;
@@ -434,7 +448,9 @@ impl ManagedTasksClient {
             self.check_driver(cx, cancellation, deadline)?;
             match event {
                 Some(ManagedTaskEvent::Notification(notification)) => {
-                    deliver_driver_notification(cx, call, deadline, &notification, notify).await?;
+                    DriverCallbackLifetime::new(call, deadline)
+                        .notify(cx, &notification, notify)
+                        .await?;
                 }
                 terminal => return Ok(terminal),
             }
@@ -461,35 +477,82 @@ impl ManagedTasksClient {
     }
 }
 
-// Guard EACH callback, not just the enclosing async driver: several buffered
-// records may be ready in one poll. Check the dispatch credential before and
-// after user code, including when the callback refuses or revokes itself.
-async fn deliver_driver_notification<N>(
-    cx: &Cx,
-    call: &ManagedTaskCall,
+// Guard construction separately from polling the returned host future. Wrapping
+// `construct().await` as one future would allow a constructor that revokes its
+// credential to start host work before the outer guard observes revocation.
+// Both guards retain the same response authority; neither acquires credentials,
+// changes a deadline, or transfers host work to a detached task.
+// Do not borrow a response/parser across host awaits. An owned response needs
+// Send, not Sync; sharing &ManagedTaskCall here would strengthen the public
+// driver's future bounds. This snapshot retains only the existing guard's
+// session/stop signals and original clocks, never a bearer or socket.
+struct DriverCallbackLifetime {
+    session: super::ManagedOAuthSession,
+    cancellation: McpRequestCancellation,
+    revocation: McpRequestCancellation,
+    expires_at: std::time::Instant,
     deadline: Time,
-    notification: &ServerNotification,
-    notify: &mut N,
-) -> Result<(), ManagedTaskDriverError>
-where
-    N: FnMut(&ServerNotification) -> bool,
-{
-    let accepted = call
-        .session
-        .await_credential(
-            cx,
-            &call.cancellation,
-            deadline.min(call.deadline),
-            call.expires_at,
-            &call.revocation,
-            async { Ok(notify(notification)) },
-        )
+}
+
+impl DriverCallbackLifetime {
+    fn new(call: &ManagedTaskCall, deadline: Time) -> Self {
+        Self {
+            session: call.session.clone(),
+            cancellation: call.cancellation.clone(),
+            revocation: call.revocation.clone(),
+            expires_at: call.expires_at,
+            deadline: deadline.min(call.deadline),
+        }
+    }
+
+    async fn run<T, C, F>(&self, cx: &Cx, construct: C) -> Result<T, ManagedTaskDriverError>
+    where
+        C: FnOnce() -> F,
+        F: Future<Output = Result<T, ManagedTaskDriverError>>,
+    {
+        let future = self.session
+            .await_credential(
+                cx,
+                &self.cancellation,
+                self.deadline,
+                self.expires_at,
+                &self.revocation,
+                async { Ok(construct()) },
+            )
+            .await
+            .map_err(ManagedTasksError::from)?;
+        self.session
+            .await_credential(
+                cx,
+                &self.cancellation,
+                self.deadline,
+                self.expires_at,
+                &self.revocation,
+                async { Ok(future.await) },
+            )
+            .await
+            .map_err(ManagedTasksError::from)?
+    }
+
+    // Several buffered notifications may be ready in one poll. Use the SAME
+    // guard as observers and resolvers, including for a refusing callback.
+    async fn notify<N>(
+        &self,
+        cx: &Cx,
+        notification: &ServerNotification,
+        notify: &mut N,
+    ) -> Result<(), ManagedTaskDriverError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        self.run(cx, || {
+            std::future::ready(if notify(notification) {
+                Ok(())
+            } else {
+                Err(ManagedTaskDriverError::AbortedByHost)
+            })
+        })
         .await
-        .map_err(ManagedTasksError::from)?;
-    if accepted {
-        Ok(())
-    } else {
-        Err(ManagedTaskDriverError::AbortedByHost)
     }
 }
 
@@ -520,8 +583,7 @@ pub(crate) fn next_poll_time(
         .map(|hint| hint.try_as_millis())
         .transpose()
         .map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?
-        .map(Duration::from_millis)
-        .unwrap_or(minimum);
+    let peer = peer.map(Duration::from_millis).unwrap_or(minimum);
     let nanos = u64::try_from(peer.max(minimum).as_nanos()).unwrap_or(u64::MAX);
     Ok(now.saturating_add_nanos(nanos))
 }
@@ -1054,8 +1116,8 @@ mod tests {
                         let cancelled = call.cancellation.clone();
                         let revoked = call.revocation.clone();
                         let session = call.session.clone();
-                        let result = deliver_driver_notification(
-                            &cx, &call, Time::from_nanos(u64::MAX), &note,
+                        let result = DriverCallbackLifetime::new(&call, Time::from_nanos(u64::MAX)).notify(
+                            &cx, &note,
                             &mut |_| {
                                 calls += 1;
                                 if !preflight {
@@ -1085,8 +1147,8 @@ mod tests {
                         }
                         assert_eq!(calls, usize::from(!preflight || action == 5));
                         if action <= 2 {
-                            let again = deliver_driver_notification(
-                                &cx, &call, Time::from_nanos(u64::MAX), &note,
+                            let again = DriverCallbackLifetime::new(&call, Time::from_nanos(u64::MAX)).notify(
+                                &cx, &note,
                                 &mut |_| { panic!("a second buffered notification escaped refusal") },
                             ).await;
                             assert!(again.is_err());
@@ -1096,12 +1158,213 @@ mod tests {
                 }
                 let call = notification_call();
                 let mut calls = 0;
-                deliver_driver_notification(&cx, &call, Time::from_nanos(u64::MAX), &note,
+                DriverCallbackLifetime::new(&call, Time::from_nanos(u64::MAX)).notify(&cx, &note,
                     &mut |_| { calls += 1; true }).await.unwrap();
                 assert_eq!(calls, 1);
                 assert!(!call.cancellation.is_cancel_requested());
                 assert!(!call.session.inner.closed.is_cancel_requested());
             });
+    }
+
+    // Count construction, polling and destruction independently: a rejected
+    // result alone cannot show that a revoked callback did not start host work.
+    struct TrackedHostFuture {
+        polls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        drops: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        pending: bool,
+    }
+
+    impl Future for TrackedHostFuture {
+        type Output = Result<(), ManagedTaskDriverError>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.pending {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    impl Drop for TrackedHostFuture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn host_constructor_stops_before_polling_but_live_resolution_completes() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                for stop in 0..4 {
+                    let call = notification_call();
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let mut constructors = 0;
+                    let result = DriverCallbackLifetime::new(&call, call.deadline).run(&cx, || {
+                        constructors += 1;
+                        match stop {
+                            0 => { call.cancellation.cancel(); }
+                            1 => call.session.close(),
+                            2 => { call.revocation.cancel(); }
+                            _ => {}
+                        }
+                        TrackedHostFuture {
+                            polls: Arc::clone(&polls), drops: Arc::clone(&drops), pending: false,
+                        }
+                    }).await;
+                    match stop {
+                        0 => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                            ManagedTasksError::Session(OAuthSessionError::Cancelled))))),
+                        1 => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                            ManagedTasksError::Session(OAuthSessionError::Closed))))),
+                        2 => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                            ManagedTasksError::Session(OAuthSessionError::LoginRequired))))),
+                        _ => assert!(result.is_ok()),
+                    }
+                    assert_eq!(constructors, 1);
+                    assert_eq!(polls.load(Ordering::SeqCst), usize::from(stop == 3));
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    if stop < 3 {
+                        let refused = DriverCallbackLifetime::new(&call, call.deadline).run(&cx, || {
+                            constructors += 1;
+                            std::future::ready(Ok(()))
+                        }).await;
+                        assert!(refused.is_err());
+                        assert_eq!(constructors, 1);
+                    }
+                    assert!(cx.checkpoint().is_ok());
+                }
+            });
+    }
+
+    #[test]
+    fn pending_host_resolution_wakes_on_authority_loss_and_releases_owned_work() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+            fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                for stop in 0..4 {
+                    let call = notification_call();
+                    let polls = Arc::new(AtomicUsize::new(0));
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+                    let waker = Waker::from(Arc::clone(&wakes));
+                    let mut task = Context::from_waker(&waker);
+                    let lifetime = DriverCallbackLifetime::new(&call, call.deadline);
+                    let mut resolution = Box::pin(lifetime.run(&cx, || {
+                        TrackedHostFuture {
+                            polls: Arc::clone(&polls), drops: Arc::clone(&drops), pending: true,
+                        }
+                    }));
+                    assert!(resolution.as_mut().poll(&mut task).is_pending());
+                    assert_eq!(polls.load(Ordering::SeqCst), 1);
+                    assert_eq!(drops.load(Ordering::SeqCst), 0);
+                    let before = wakes.0.load(Ordering::SeqCst);
+                    match stop {
+                        0 => { call.cancellation.cancel(); }
+                        1 => call.session.close(),
+                        2 => { call.revocation.cancel(); }
+                        _ => {}
+                    }
+                    if stop < 3 {
+                        assert!(wakes.0.load(Ordering::SeqCst) > before,
+                            "a silent resolver must be woken without advancing time");
+                        let result = resolution.as_mut().poll(&mut task);
+                        match stop {
+                            0 => assert!(matches!(result, Poll::Ready(Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::Cancelled)))))),
+                            1 => assert!(matches!(result, Poll::Ready(Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::Closed)))))),
+                            _ => assert!(matches!(result, Poll::Ready(Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::LoginRequired)))))),
+                        }
+                    }
+                    drop(resolution);
+                    assert_eq!(polls.load(Ordering::SeqCst), 1,
+                        "lost authority must not poll pending host work again");
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    let before = wakes.0.load(Ordering::SeqCst);
+                    call.cancellation.cancel();
+                    call.revocation.cancel();
+                    call.session.close();
+                    assert_eq!(wakes.0.load(Ordering::SeqCst), before,
+                        "completed/abandoned host work must release its stop registrations");
+                    assert!(cx.checkpoint().is_ok());
+                }
+            });
+    }
+
+    #[test]
+    fn ready_host_results_are_dropped_when_their_poll_revokes_authority() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        use std::task::Poll;
+
+        struct Answer(Arc<AtomicUsize>);
+        impl Drop for Answer {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                for revoke in [false, true] {
+                    let call = notification_call();
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let polls = std::cell::Cell::new(0);
+                    let count = &polls;
+                    let revocation = call.revocation.clone();
+                    let answer_drops = Arc::clone(&drops);
+                    let result = DriverCallbackLifetime::new(&call, call.deadline).run(&cx, move || {
+                        std::future::poll_fn(move |_| {
+                            count.set(count.get() + 1);
+                            if revoke { revocation.cancel(); }
+                            Poll::Ready(Ok(Answer(Arc::clone(&answer_drops))))
+                        })
+                    }).await;
+                    assert_eq!(polls.get(), 1);
+                    if revoke {
+                        assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                            ManagedTasksError::Session(OAuthSessionError::LoginRequired)))));
+                        assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    } else {
+                        assert!(result.is_ok());
+                        assert_eq!(drops.load(Ordering::SeqCst), 0);
+                        drop(result);
+                        assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    }
+                    assert!(cx.checkpoint().is_ok());
+                    assert!(!call.session.inner.closed.is_cancel_requested());
+                }
+            });
+    }
+
+    #[test]
+    fn callback_lifetime_preserves_send_for_send_host_futures() {
+        fn assert_send<F: Future + Send>(_: F) {}
+
+        let cx = Cx::for_testing();
+        let call = notification_call();
+        let lifetime = DriverCallbackLifetime::new(&call, call.deadline);
+        // The future owns no shared reference to the response or parser.
+        // This is a compile-time contract, not a runtime execution claim.
+        assert_send(lifetime.run(&cx, || std::future::ready(Ok(()))));
     }
 
     #[test]
