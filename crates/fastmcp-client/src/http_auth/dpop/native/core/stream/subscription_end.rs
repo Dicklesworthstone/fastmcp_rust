@@ -5,8 +5,6 @@
 //! signal into another application outcome. This is not ordinary RPC replay
 //! tolerance: nonterminal traffic, foreign IDs and malformed envelopes fail.
 
-#![cfg(feature = "tasks")]
-
 use fastmcp_protocol::{
     FINAL_SUBSCRIPTION_ID_META_KEY, JsonRpcMessage, RequestId, ServerNotification,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,

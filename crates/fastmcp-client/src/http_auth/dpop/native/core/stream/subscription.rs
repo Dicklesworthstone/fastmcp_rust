@@ -6,6 +6,9 @@
 //! transport owner remains the ordinary DPoP reader, including its bounded
 //! ready-work turns, original credential, cancellation and clean-EOF rule.
 
+mod termination;
+use termination::TerminalDecoder;
+
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
@@ -56,7 +59,12 @@ impl DpopHttpClient {
     /// It must be brief and nonblocking. Already-observed notifications cannot
     /// be recalled after a later failure. The returned result is the shared
     /// typed subscription completion, published only after clean HTTP body EOF.
-    /// EOF without completion, foreign IDs, unselected events and incomplete
+    /// Peer cancellation after ACK instead returns SubscriptionCancelled after
+    /// clean EOF; it never cancels the caller or fabricates successful completion.
+    /// The first terminal wins, tolerating one complementary correlated signal
+    /// without publishing it. Both signals spend payload bytes but not event
+    /// slots. Same-signal duplicates and nonterminal/foreign traffic still fail.
+    /// EOF without a terminal, foreign IDs, unselected events and incomplete
     /// SSE tails are errors. A finite JSON refusal exposes only its error code.
     ///
     /// This is a bounded listen, not an indefinitely renewed connection. The
@@ -93,10 +101,11 @@ impl DpopHttpClient {
         let (wire, decoder) = prepare_bounded(
             self.resource().as_str(),
             params,
-            request_id,
+            request_id.clone(),
             limits.core,
             self.policy.max_body_bytes,
         )?;
+        let decoder = TerminalDecoder::new(decoder, request_id, limits.core);
         self.execute_prepared_core_stream(
             cx,
             cancellation,
@@ -110,8 +119,8 @@ impl DpopHttpClient {
             },
             &mut observer,
         )
-        .await
-        .map(|completed| completed.result)
+        .await?
+        .result
     }
 }
 
@@ -135,6 +144,8 @@ mod tests {
         CoreDecoder, DpopCoreError, DpopHttpError, DpopSession, ManagedCoreError, ManagedCoreLimits,
         ModernHttpResponseKind, Reader,
     };
+
+    mod termination;
 
     #[cfg(feature = "native-tls-roots")]
     mod tls;
@@ -196,12 +207,12 @@ mod tests {
         kind: ModernHttpResponseKind,
         requested: Value,
         limits: DpopStreamLimits,
-    ) -> Reader<SubscriptionDecoder> {
+    ) -> Reader<TerminalDecoder> {
         let (_, decoder) = prepare_bounded(
             TARGET, params(requested), RequestId::Number(7), limits.core, 8192,
         )
         .unwrap();
-        Reader::new(kind, decoder, limits, 32768).unwrap()
+        Reader::new(kind, TerminalDecoder::new(decoder, RequestId::Number(7), limits.core), limits, 32768).unwrap()
     }
 
     fn fixture(f: impl FnOnce(&Lifetime<'_>, &Arc<VirtualClock>)) {
@@ -330,7 +341,7 @@ mod tests {
                 reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe).unwrap();
                 assert_eq!(observations, [true, false, false]);
                 assert_eq!(reader.decoder.usage(), (acknowledgement.len() + changed.len() + resource.len() + COMPLETE.len(), 3));
-                let result = reader.finish(life, &idle).unwrap().result;
+                let result = reader.finish(life, &idle).unwrap().result.unwrap();
                 assert!(matches!(&result, CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })));
                 let encoded = result.encode().unwrap();
                 assert!(encoded.contains("900719925474099312345"));
