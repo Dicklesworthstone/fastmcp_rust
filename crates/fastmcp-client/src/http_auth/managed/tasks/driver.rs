@@ -583,7 +583,8 @@ pub(crate) fn next_poll_time(
         .map(|hint| hint.try_as_millis())
         .transpose()
         .map_err(|_| ManagedTaskDriverError::UnexpectedResponse)?
-    let peer = peer.map(Duration::from_millis).unwrap_or(minimum);
+        .map(Duration::from_millis)
+        .unwrap_or(minimum);
     let nanos = u64::try_from(peer.max(minimum).as_nanos()).unwrap_or(u64::MAX);
     Ok(now.saturating_add_nanos(nanos))
 }
