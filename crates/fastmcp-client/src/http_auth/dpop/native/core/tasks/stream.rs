@@ -22,7 +22,8 @@ use super::{
     ModernHttpRequest, Prepared, Reply, WaitBounds, check_live,
 };
 use super::super::stream::{
-    DpopStreamError, DpopStreamLimits, Idle, PreparedStream, StreamDecoder, StreamEvent,
+    CompletedStream, DpopStreamError, DpopStreamLimits, Idle, PreparedStream, StreamDecoder,
+    StreamEvent,
 };
 use crate::http_auth::rpc::admit_http_notification;
 
@@ -201,6 +202,30 @@ impl DpopHttpClient {
         N: FnMut(&ServerNotification) -> bool,
     {
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        self.request_task_stream_with_bounds(
+            cx, cancellation, credential, metadata, operation, limits, bounds, &mut observer,
+        ).await.map(|completed| completed.result)
+    }
+
+    // Polling and input-driving consumers retain their ORIGINAL bounds and
+    // charge the actual discovery/operation payload and notification usage.
+    // This is the same negotiated execution as the public streaming API, not
+    // a second parser, a refreshed deadline or permission to replay a mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn request_task_stream_with_bounds<N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        operation: DpopTaskOperation,
+        limits: DpopStreamLimits,
+        bounds: WaitBounds,
+        observer: &mut N,
+    ) -> Result<CompletedStream<ManagedTaskEvent>, DpopStreamError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
         let idle = Idle::new(cx.now(), limits.idle);
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         let prepared = Prepared::new(
@@ -222,8 +247,8 @@ impl DpopHttpClient {
         )?;
         self.execute_prepared_core_stream(
             cx, cancellation, credential,
-            PreparedStream { wire, decoder, limits, bounds, idle }, &mut observer,
-        ).await.map(|completed| completed.result)
+            PreparedStream { wire, decoder, limits, bounds, idle }, observer,
+        ).await
     }
 }
 
@@ -269,7 +294,9 @@ mod tests {
             0 => ManagedTaskRequest::CallTool {
                 name: "echo".to_owned(), arguments: Some(json!({"private":"body-only","x":17})),
             },
-            1 => ManagedTaskRequest::Get(id),
+            1 => {
+                ManagedTaskRequest::Get(id)
+            }
             2 => {
                 let task: Task = serde_json::from_value(json!({
                     "taskId":"task-one", "status":"input_required",
