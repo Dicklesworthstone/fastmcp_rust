@@ -258,7 +258,15 @@ impl DpopHttpClient {
     /// replies are refused. Only a decoded update ACK advances answer custody.
     /// Zero allowed updates returns input-required without invoking a resolver.
     ///
-    /// JSON-only, caller-driven execution: no refresh, retry, subscription,
+    /// Get/update replies may be JSON or finite request-scoped SSE. Valid
+    /// notifications are admitted and discarded incrementally; they still
+    /// consume the run-wide byte and notification budgets. Snapshots and
+    /// update acknowledgements remain provisional until clean HTTP EOF.
+    /// Use [`Self::drive_task_with_events`] to observe notifications or set
+    /// parser/idle bounds, and [`Self::drive_task_json_with_cancellation`]
+    /// to retain the original JSON-only Accept and error contract.
+    ///
+    /// Caller-driven execution: no refresh, retry, subscription,
     /// worker or persistent resume state. A failed or uncertain update stops
     /// the run without replay. Callbacks must cooperate; synchronous work and
     /// committed remote effects cannot be preempted or undone. Starting a new
@@ -310,6 +318,41 @@ impl DpopHttpClient {
         F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
     {
+        // Reuse the explicit stream path's decoder, quotas and cancellation
+        // guard rather than maintaining a second default execution path.
+        self.drive_task_with_events(
+            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
+            DpopStreamLimits::new(limits, limits.timeout())?, resolve, observe,
+            |_| true,
+        ).await
+    }
+
+    /// Explicit JSON-only compatibility mode for an existing Task lifecycle.
+    ///
+    /// Sends `Accept: application/json` for discovery and get/update, retaining
+    /// the original JSON-only response admission and typed HTTP errors. Prefer
+    /// [`Self::drive_task_with_cancellation`] for peers which may stream replies.
+    /// All modes share the same polling, host-input ledger, original credential,
+    /// cancellation, absolute deadline and no-replay/no-remote-cancel rules.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn drive_task_json_with_cancellation<R, F, O>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task_id: TaskId,
+        id_prefix: &str,
+        policy: ManagedTaskDriverPolicy,
+        limits: ManagedCoreLimits,
+        resolve: R,
+        observe: O,
+    ) -> Result<ManagedTaskRunOutcome, DpopTaskDriverError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
         self.drive_task_inner(
             cx, cancellation, credential, metadata, task_id, id_prefix, policy,
             limits, ReplyMode::Json, resolve, observe, |_| true,
@@ -317,8 +360,8 @@ impl DpopHttpClient {
     }
 
     /// Follow one existing Task with incremental operation notifications and
-    /// JSON-or-SSE get/update replies. The ordinary drive_task methods remain
-    /// JSON-only; streaming is selected explicitly through this entry point.
+    /// JSON-or-SSE get/update replies. [`Self::drive_task`] uses this same entry
+    /// point with notifications discarded and default parser bounds.
     ///
     /// Poll timing, capability-gated host input, identity reservation and the
     /// acknowledged-input ledger are the SAME driver as the JSON path. Every

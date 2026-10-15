@@ -1,6 +1,8 @@
 //! Public streamed lifecycle runs on the parent's real, resource-bound TLS peer.
 //! No new transport, root certificate, token exchange or scheduler is substituted.
 
+mod default_replies;
+
 use super::*;
 use asupersync::net::TcpStream;
 use asupersync::tls::TlsStream;
