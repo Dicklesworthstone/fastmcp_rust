@@ -1,5 +1,7 @@
 //! Public event-driven watches through the existing real TLS and DPoP fixture.
 
+mod subscription_end;
+
 use super::*;
 use crate::http_auth::dpop::native::core::stream::task_subscription::watch::{
     DpopTaskWatchError, DpopTaskWatchPolicy,
