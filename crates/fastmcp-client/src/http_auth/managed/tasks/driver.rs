@@ -19,15 +19,15 @@ use fastmcp_core::{McpRequestCancellation, Sha256Digest, sha256_bounded};
 use fastmcp_protocol::tasks_extension::{
     Task, TaskId, TaskInputLedger, TaskInputRequests, TaskInputResponses,
 };
-use fastmcp_protocol::{CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY};
+use fastmcp_protocol::{CorrelationKey, FINAL_CLIENT_CAPABILITIES_META_KEY, ServerNotification};
 
 use crate::http_auth::rpc::interaction::{
     ManagedInteractionError, admit_embedded_input, normalize_embedded_input_context,
 };
 
 use super::{
-    BoundedWriter, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds, ManagedTasksClient,
-    ManagedTasksError, OAuthSessionError, deadline_after, prepare,
+    BoundedWriter, ManagedTaskCall, ManagedTaskEvent, ManagedTaskRequest, ManagedTaskRequestIds,
+    ManagedTasksClient, ManagedTasksError, OAuthSessionError, deadline_after, prepare,
 };
 
 /// One finite budget for the entire poll/resolve/update lifecycle, including
@@ -222,15 +222,63 @@ impl ManagedTasksClient {
         cancellation: &McpRequestCancellation,
         task_id: TaskId,
         policy: ManagedTaskDriverPolicy,
-        mut next_ids: I,
-        mut resolve: R,
-        mut observe: O,
+        next_ids: I,
+        resolve: R,
+        observe: O,
     ) -> Result<ManagedTaskRunOutcome, ManagedTaskDriverError>
     where
         I: FnMut() -> Result<ManagedTaskRequestIds, ManagedTaskDriverError>,
         R: FnMut(TaskInputRequests) -> F,
         F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        self.drive_task_with_events(
+            cx, cancellation, task_id, policy, next_ids, resolve, observe, |_| true,
+        )
+        .await
+    }
+
+    /// Follows one existing Task while delivering admitted get/update
+    /// notifications before the method's terminal response has arrived.
+    ///
+    /// `notify` returns true to continue or false to stop locally. It must be
+    /// brief, nonblocking, and apply the host's disclosure policy to peer data.
+    /// Notifications are not snapshots or update acknowledgements: `observe`
+    /// and the input ledger advance only after the existing decoder has checked
+    /// the correlated method result and clean response EOF. Already delivered
+    /// notifications and committed remote updates cannot be recalled.
+    ///
+    /// This is the same polling/input state machine as [`Self::drive_task`].
+    /// JSON replies still work; SSE uses the existing managed response owner,
+    /// not a second parser or a notification history buffer. Per-response
+    /// byte/record limits remain in force, and the policy bounds the total
+    /// number of get/update pairs. No callback resets either limit or the
+    /// original driver deadline. Notifications retain the original response
+    /// credential's expiry and revocation even if another caller renews login.
+    ///
+    /// Failure, callback refusal, cancellation or abandonment stops this run
+    /// without replay, reconnect, automatic remote cancellation, or a worker.
+    /// Normal managed credential acquisition between explicit Task operations
+    /// remains unchanged. An input-required snapshot is not permission to
+    /// invoke unadvertised capabilities or repeat an acknowledged answer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn drive_task_with_events<I, R, F, O, N>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: TaskId,
+        policy: ManagedTaskDriverPolicy,
+        mut next_ids: I,
+        mut resolve: R,
+        mut observe: O,
+        mut notify: N,
+    ) -> Result<ManagedTaskRunOutcome, ManagedTaskDriverError>
+    where
+        I: FnMut() -> Result<ManagedTaskRequestIds, ManagedTaskDriverError>,
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+        N: FnMut(&ServerNotification) -> bool,
     {
         self.session
             .check(cx, cancellation)
@@ -268,7 +316,10 @@ impl ManagedTasksClient {
                             )
                             .await?;
                         let Some(ManagedTaskEvent::Snapshot(snapshot)) =
-                            call.next_terminal(cx).await?
+                            self.next_driver_terminal(
+                                cx, cancellation, deadline, &mut call, &mut notify,
+                            )
+                            .await?
                         else {
                             return Err(ManagedTaskDriverError::UnexpectedResponse);
                         };
@@ -339,7 +390,10 @@ impl ManagedTasksClient {
                             .request_with_cancellation(cx, cancellation, ids, update)
                             .await?;
                         if !matches!(
-                            call.next_terminal(cx).await?,
+                            self.next_driver_terminal(
+                                cx, cancellation, deadline, &mut call, &mut notify,
+                            )
+                            .await?,
                             Some(ManagedTaskEvent::Updated(_))
                         ) {
                             return Err(ManagedTaskDriverError::UnexpectedResponse);
@@ -360,6 +414,33 @@ impl ManagedTasksClient {
             .map_err(ManagedTasksError::from)?
     }
 
+    // Both get and update consume this same decoder-owned event stream. A
+    // notification cannot accidentally satisfy the mutation ACK branch, and
+    // no rejected/abandoned read can leave a reusable body in the driver.
+    async fn next_driver_terminal<N>(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: Time,
+        call: &mut ManagedTaskCall,
+        notify: &mut N,
+    ) -> Result<Option<ManagedTaskEvent>, ManagedTaskDriverError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        loop {
+            self.check_driver(cx, cancellation, deadline)?;
+            let event = call.next_event(cx).await?;
+            self.check_driver(cx, cancellation, deadline)?;
+            match event {
+                Some(ManagedTaskEvent::Notification(notification)) => {
+                    deliver_driver_notification(cx, call, deadline, &notification, notify).await?;
+                }
+                terminal => return Ok(terminal),
+            }
+        }
+    }
+
     fn check_driver(
         &self,
         cx: &Cx,
@@ -377,6 +458,38 @@ impl ManagedTasksClient {
             return Err(ManagedTasksError::from(OAuthSessionError::TimedOut).into());
         }
         Ok(())
+    }
+}
+
+// Guard EACH callback, not just the enclosing async driver: several buffered
+// records may be ready in one poll. Check the dispatch credential before and
+// after user code, including when the callback refuses or revokes itself.
+async fn deliver_driver_notification<N>(
+    cx: &Cx,
+    call: &ManagedTaskCall,
+    deadline: Time,
+    notification: &ServerNotification,
+    notify: &mut N,
+) -> Result<(), ManagedTaskDriverError>
+where
+    N: FnMut(&ServerNotification) -> bool,
+{
+    let accepted = call
+        .session
+        .await_credential(
+            cx,
+            &call.cancellation,
+            deadline.min(call.deadline),
+            call.expires_at,
+            &call.revocation,
+            async { Ok(notify(notification)) },
+        )
+        .await
+        .map_err(ManagedTasksError::from)?;
+    if accepted {
+        Ok(())
+    } else {
+        Err(ManagedTaskDriverError::AbortedByHost)
     }
 }
 
@@ -872,5 +985,157 @@ mod tests {
             Err(ManagedTaskDriverError::StateByteLimit)
         ));
         assert!(state.answered.is_empty());
+    }
+
+    // A real session lifetime with no grant/network. The callback guard must
+    // use the response's original credential signal, not acquire a new token.
+    fn notification_call() -> ManagedTaskCall {
+        use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy, SessionInner};
+        use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+        use fastmcp_core::CanonicalHttpUrl;
+        use std::sync::{Arc, atomic::{AtomicBool, AtomicUsize}};
+        use std::time::Instant;
+
+        let url = |text| CanonicalHttpUrl::parse(text).unwrap();
+        let resource = url("https://mcp.example/mcp");
+        let config = OAuthClientConfiguration::from_trusted_endpoints(
+            "https://issuer.example", url("https://issuer.example/authorize"),
+            url("https://issuer.example/token"), resource.clone(), "native-client", vec![],
+        ).unwrap();
+        let session = ManagedOAuthSession {
+            inner: Arc::new(SessionInner {
+                client: OAuthClient::new(config), resource,
+                policy: OAuthSessionPolicy::default(),
+                state: Arc::new(asupersync::sync::Mutex::new(None)),
+                closed: McpRequestCancellation::new(), logout_handoff: AtomicBool::new(false),
+                pending: AtomicUsize::new(0),
+            }),
+        };
+        ManagedTaskCall {
+            body: None,
+            decoder: super::super::TaskDecoder::Get(TaskId::parse("task-one").unwrap()),
+            session,
+            cancellation: McpRequestCancellation::new(), request_id: RequestId::Number(2),
+            progress: None, last_progress: None, deadline: Time::from_nanos(u64::MAX),
+            expires_at: Instant::now() + Duration::from_secs(60), generation: 1,
+            revocation: McpRequestCancellation::new(), limits: super::super::ManagedTasksLimits::default(),
+            records: 0, finished: false,
+        }
+    }
+
+    fn notification() -> ServerNotification {
+        let wire = fastmcp_protocol::JsonRpcRequest::notification(
+            "notifications/tools/list_changed", None,
+        );
+        ServerNotification::decode(&wire).unwrap()
+    }
+
+    #[test]
+    fn driver_notification_lifetime_checks_precede_and_follow_every_callback() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::time::Instant;
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let note = notification();
+                for preflight in [false, true] {
+                    for action in 0..6 {
+                        let mut call = notification_call();
+                        let stop = |call: &mut ManagedTaskCall| match action {
+                            0 => { call.cancellation.cancel(); }
+                            1 => call.session.close(),
+                            2 => { call.revocation.cancel(); }
+                            3 => call.expires_at = Instant::now(),
+                            4 => call.deadline = Time::ZERO,
+                            _ => {}
+                        };
+                        if preflight { stop(&mut call); }
+                        let mut calls = 0;
+                        let cancelled = call.cancellation.clone();
+                        let revoked = call.revocation.clone();
+                        let session = call.session.clone();
+                        let result = deliver_driver_notification(
+                            &cx, &call, Time::from_nanos(u64::MAX), &note,
+                            &mut |_| {
+                                calls += 1;
+                                if !preflight {
+                                    match action {
+                                        0 => { cancelled.cancel(); }
+                                        1 => session.close(),
+                                        2 => { revoked.cancel(); }
+                                        _ => {}
+                                    }
+                                }
+                                // Refusal cannot mask cancellation/revocation.
+                                false
+                            },
+                        ).await;
+                        match action {
+                            0 => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::Cancelled))))),
+                            1 => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::Closed))))),
+                            2 => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::LoginRequired))))),
+                            3 if preflight => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::LoginRequired))))),
+                            4 if preflight => assert!(matches!(result, Err(ManagedTaskDriverError::Task(
+                                ManagedTasksError::Session(OAuthSessionError::TimedOut))))),
+                            _ => assert!(matches!(result, Err(ManagedTaskDriverError::AbortedByHost))),
+                        }
+                        assert_eq!(calls, usize::from(!preflight || action == 5));
+                        if action <= 2 {
+                            let again = deliver_driver_notification(
+                                &cx, &call, Time::from_nanos(u64::MAX), &note,
+                                &mut |_| { panic!("a second buffered notification escaped refusal") },
+                            ).await;
+                            assert!(again.is_err());
+                        }
+                        assert!(cx.checkpoint().is_ok());
+                    }
+                }
+                let call = notification_call();
+                let mut calls = 0;
+                deliver_driver_notification(&cx, &call, Time::from_nanos(u64::MAX), &note,
+                    &mut |_| { calls += 1; true }).await.unwrap();
+                assert_eq!(calls, 1);
+                assert!(!call.cancellation.is_cancel_requested());
+                assert!(!call.session.inner.closed.is_cancel_requested());
+            });
+    }
+
+    #[test]
+    fn precancelled_event_driver_cannot_allocate_ids_or_start_host_work() {
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+        use std::task::{Context, Poll, Waker};
+
+        RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
+            .build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let client = ManagedTasksClient::new(notification_call().session,
+                    FinalRequestMeta::new(ClientCapabilities::default()),
+                    super::super::ManagedTasksLimits::default()).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                cancellation.cancel();
+                let mut waiting = Box::pin(client.drive_task_with_events(
+                    &cx, &cancellation, TaskId::parse("task-one").unwrap(),
+                    ManagedTaskDriverPolicy::default(),
+                    || panic!("cancelled driver asked for identities"),
+                    |_| {
+                        panic!("cancelled driver resolved input");
+                        #[allow(unreachable_code)]
+                        std::future::ready(Ok(ManagedTaskInputAction::ReturnToCaller))
+                    },
+                    |_| panic!("cancelled driver observed a snapshot"),
+                    |_| panic!("cancelled driver observed a notification"),
+                ));
+                assert!(matches!(waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(ManagedTaskDriverError::Task(
+                        ManagedTasksError::Session(OAuthSessionError::Cancelled))))));
+                drop(waiting);
+                assert!(cx.checkpoint().is_ok());
+                assert!(!client.session.inner.closed.is_cancel_requested());
+            });
     }
 }
