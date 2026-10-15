@@ -3,6 +3,9 @@
 //! Every poll is a freshly negotiated discovery/get pair. No creating call,
 //! input answer or remote cancellation is ever replayed by this owner.
 
+#[cfg(test)]
+mod cancellation_preflight;
+
 use std::fmt;
 use std::time::Duration;
 
@@ -367,6 +370,12 @@ impl DpopHttpClient {
     where
         N: FnMut(&ServerNotification) -> bool,
     {
+        // A cancelled waiter owns no timer, credential admission or peer
+        // work. Preserve this disposition even without a runtime, just as
+        // the Task driver does; check_live still guards every later phase.
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(DpopHttpError::Cancelled.into());
+        }
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut state = PollState::new(id_prefix, policy, limits.core)?;
