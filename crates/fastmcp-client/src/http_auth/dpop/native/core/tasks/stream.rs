@@ -207,12 +207,11 @@ impl DpopHttpClient {
         ).await.map(|completed| completed.result)
     }
 
-    // Polling and input-driving consumers retain their ORIGINAL bounds and
-    // charge the actual discovery/operation payload and notification usage.
-    // This is the same negotiated execution as the public streaming API, not
-    // a second parser, a refreshed deadline or permission to replay a mutation.
+    // Polling, input-driving and subscription-watch consumers retain their
+    // ORIGINAL bounds and charge actual payload/notification usage. Visibility
+    // stops at the private core integration; no public retry capability is added.
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn request_task_stream_with_bounds<N>(
+    pub(in super::super) async fn request_task_stream_with_bounds<N>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,

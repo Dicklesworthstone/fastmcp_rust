@@ -2,6 +2,7 @@
 //! No new transport, root certificate, token exchange or scheduler is substituted.
 
 mod default_replies;
+mod task_watch;
 
 use super::*;
 use asupersync::net::TcpStream;

@@ -4,6 +4,9 @@
 //! budget. The protocol's core/Tasks codecs own the wire vocabulary; this
 //! adapter owns only explicit negotiation, exact-ID selection and accounting.
 
+/// Event-driven observation with authoritative post-acknowledgement snapshots.
+pub mod watch;
+
 use asupersync::Cx;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
