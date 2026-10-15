@@ -30,6 +30,7 @@ use super::{
     Idle, Lifetime, ManagedCoreError, ManagedCoreLimits, ModernHttpRequest,
     PreparedStream, StreamDecoder, StreamEvent, StreamNotification, WaitBounds, with_caller,
 };
+use super::subscription_end::{SubscriptionEnd, admit_cancelled};
 use super::super::{BoundedWriter, DpopHttpResponse, decode_response};
 use super::super::tasks::{DpopTasksError, ManagedTasksError};
 use crate::http_auth::rpc::subscription::json_subscription_error;
@@ -155,6 +156,7 @@ impl Prepared {
                 bytes: 0,
                 notifications: 0,
                 terminal: false,
+                end: SubscriptionEnd::default(),
             },
         })
     }
@@ -189,6 +191,12 @@ impl DpopHttpClient {
     /// A Task's terminal status is an observation, not the listen's completion.
     /// The returned core subscriptions/listen result requires clean HTTP EOF.
     ///
+    /// Peer cancellation after acknowledgement also requires clean EOF and
+    /// returns `DpopStreamError::SubscriptionCancelled`, not a fabricated result
+    /// or a cancelled Task. The first terminal wins: one matching cancellation
+    /// after completion, or one correlated response after cancellation, is
+    /// consumed without another outcome. Other post-terminal records still fail.
+    ///
     /// No task polling, updates, cancellation POSTs, reconnect, login, refresh,
     /// redirect or bearer fallback occurs. A finite JSON body can report a
     /// correlated refusal, never establish a subscription. Premature EOF,
@@ -197,11 +205,11 @@ impl DpopHttpClient {
     ///
     /// Discovery and listen share the original native/core/caller/token bounds
     /// and aggregate JSON payload budget. The acknowledgement counts against
-    /// the notification allowance; completion does not. Native raw-body limits
-    /// apply independently to each POST, including all SSE syntax. Neither
-    /// statuses nor keepalives reset idle time. The observer must be brief and
-    /// nonblocking; true continues and false yields ObserverStopped, not success.
-    /// Its prior side effects cannot be recalled after a later failure.
+    /// the notification allowance; teardown signals do not, but their bytes do.
+    /// Native raw-body limits apply independently to each POST, including all
+    /// SSE syntax. Neither statuses nor keepalives reset idle time. The observer
+    /// must be brief and nonblocking; true continues and false yields
+    /// ObserverStopped, not success. Prior side effects cannot be recalled.
     ///
     /// Cancellation, revocation, observer refusal/panic and abandoning the
     /// future release this owned exchange without cancelling the remote Tasks
@@ -242,9 +250,14 @@ impl DpopHttpClient {
         self.execute_prepared_core_stream(
             cx, cancellation, credential,
             PreparedStream { wire, decoder, limits, bounds, idle }, &mut observer,
-        ).await.map(|completed| completed.result)
+        ).await?.result
     }
 }
+
+// An admitted remote cancellation is a provisional terminal, not a parsing
+// error. The reader must still validate the complete HTTP/SSE response before
+// publishing it. Outer errors retain transport, protocol and quota failures.
+type TaskSubscriptionResult = Result<CoreResult, DpopStreamError>;
 
 struct TaskSubscriptionDecoder {
     request: CoreRequest,
@@ -255,6 +268,7 @@ struct TaskSubscriptionDecoder {
     bytes: usize,
     notifications: usize,
     terminal: bool,
+    end: SubscriptionEnd,
 }
 
 fn accepted_ids(filter: &SubscriptionFilter, requested: &[TaskId])
@@ -279,13 +293,13 @@ fn accepted_ids(filter: &SubscriptionFilter, requested: &[TaskId])
 }
 
 impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
-    type Terminal = CoreResult;
+    type Terminal = TaskSubscriptionResult;
 
     fn admit(
         &mut self,
         frame: &[u8],
         allow_notification: bool,
-    ) -> Result<StreamEvent<CoreResult, DpopTaskSubscriptionEvent>, DpopStreamError> {
+    ) -> Result<StreamEvent<TaskSubscriptionResult, DpopTaskSubscriptionEvent>, DpopStreamError> {
         if self.terminal {
             return Err(ManagedCoreError::InvalidResponse.into());
         }
@@ -320,11 +334,21 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
                 if !matches!(&result, CoreResult::Final(FinalCoreResult::SubscriptionsListen { .. })) {
                     return Err(ManagedCoreError::InvalidResult.into());
                 }
-                StreamEvent::Result(result)
+                StreamEvent::Result(Ok(result))
             }
             JsonRpcMessage::Request(request) => {
                 if request.id.is_some() {
                     return Err(ManagedCoreError::UnexpectedNotification.into());
+                }
+                if request.method == "notifications/cancelled" {
+                    if self.accepted.is_none() {
+                        return Err(ManagedCoreError::UnexpectedNotification.into());
+                    }
+                    admit_cancelled(frame, &self.id, maximum)?;
+                    self.end.cancel();
+                    self.terminal = true;
+                    self.bytes += frame.len();
+                    return Ok(StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled)));
                 }
                 if self.notifications >= self.limits.notifications() {
                     return Err(ManagedCoreError::NotificationLimit.into());
@@ -372,10 +396,28 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
         if let Some(accepted) = accepted { self.accepted = Some(accepted); }
         match &event {
             StreamEvent::Notification(_) => self.notifications += 1,
-            StreamEvent::Result(_) => self.terminal = true,
+            StreamEvent::Result(_) => {
+                self.terminal = true;
+                self.end.complete();
+            }
         }
         self.bytes += frame.len();
         Ok(event)
+    }
+
+    fn admit_terminal_tail(&mut self, frame: &[u8]) -> Result<(), DpopStreamError> {
+        if !self.terminal {
+            return Err(ManagedCoreError::InvalidResponse.into());
+        }
+        let maximum = self.limits.frame_bytes().min(
+            self.limits.total_bytes().saturating_sub(self.bytes),
+        );
+        if frame.len() > maximum {
+            return Err(ManagedCoreError::ResponseByteLimit.into());
+        }
+        self.end.admit_tail(frame, &self.id, maximum)?;
+        self.bytes += frame.len();
+        Ok(())
     }
 
     fn usage(&self) -> (usize, usize) { (self.bytes, self.notifications) }

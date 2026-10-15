@@ -230,10 +230,12 @@ impl DpopHttpClient {
     /// The returned complete GetTaskResult is preserved, including metadata.
     /// Input-required is an explicit host handoff; failed/cancelled remote Tasks
     /// are terminal snapshots, not successful executions. A clean subscription
-    /// terminal requires a final get; a still-Working Task is an error. Missing
-    /// acknowledgement, early EOF, invalid frames and exhausted bounds fail.
-    /// A non-Working authoritative get stops the local listen without claiming
-    /// that the subscription itself completed or validating an unread tail.
+    /// terminal, whether completion or peer cancellation, requires a final get;
+    /// a still-Working Task is an error. Subscription cancellation never means
+    /// Task cancellation. Missing acknowledgement, early EOF, invalid frames
+    /// and exhausted bounds fail without a final get. A non-Working
+    /// authoritative get stops the local listen without claiming that the
+    /// subscription itself completed or validating an unread tail.
     ///
     /// All discovery, get and listen payloads/notifications share the original
     /// limits. ACK counts as a notification. Native raw-body caps apply per
@@ -336,9 +338,13 @@ impl DpopHttpClient {
                     .transpose().map_err(|_| DpopHttpError::TransportFailed)
             }).await?;
             let Some(frame) = frame else {
-                // Only clean, admitted subscription completion gets a final
-                // reconciliation. Missing/invalid EOF cannot manufacture one.
+                // Only a clean admitted terminal permits final reconciliation.
+                // Peer cancellation ends this listen, not its selected Task.
                 let completed = with_caller(cx, || reader.finish(&lifetime, &idle))?;
+                match completed.result {
+                    Ok(_) | Err(DpopStreamError::SubscriptionCancelled) => {}
+                    Err(error) => return Err(error.into()),
+                }
                 state.usage = completed.usage;
                 return self.watch_snapshot(
                     cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),

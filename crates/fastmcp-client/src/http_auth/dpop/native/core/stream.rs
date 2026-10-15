@@ -3,12 +3,14 @@
 //! Uses the native HTTP body and the shared SSE/core codecs, not a second
 //! event-stream dialect. A final result is retained until clean HTTP EOF;
 //! a second result, later notification or unfinished SSE tail rejects it.
+//! Subscription decoders alone may admit the complementary teardown signal.
 //! No response owner, proof, raw cursor or credential escapes to the observer.
 
 /// Streaming multi-round operations with an explicitly supplied typed input host.
 pub mod interaction;
 /// Acknowledged and filter-bound core subscriptions over explicit DPoP HTTPS.
 pub mod subscription;
+mod subscription_end;
 /// Authenticated Tasks discovery and exact-ID status subscriptions.
 #[cfg(feature = "tasks")]
 pub mod task_subscription;
@@ -123,6 +125,10 @@ pub enum DpopStreamError {
     InvalidLimits,
     ObserverStopped,
     ObserverPanicked,
+    /// The peer ended this subscription with notifications/cancelled. This
+    /// is published only after clean EOF, not as a fabricated complete result.
+    /// It does not mean a watched Task or the caller's context was cancelled.
+    SubscriptionCancelled,
 }
 
 impl fmt::Display for DpopStreamError {
@@ -134,6 +140,7 @@ impl fmt::Display for DpopStreamError {
             Self::InvalidLimits => f.write_str("invalid DPoP core stream limits"),
             Self::ObserverStopped => f.write_str("DPoP core stream stopped by observer"),
             Self::ObserverPanicked => f.write_str("DPoP core stream observer panicked"),
+            Self::SubscriptionCancelled => f.write_str("DPoP subscription ended by peer cancellation"),
         }
     }
 }
@@ -209,6 +216,15 @@ pub(super) trait StreamDecoder<E: StreamNotification = ServerNotification> {
         frame: &[u8],
         allow_notification: bool,
     ) -> Result<StreamEvent<Self::Terminal, E>, DpopStreamError>;
+
+    // Ordinary RPCs reject every post-terminal record. Only subscription
+    // codecs may opt in to bounded admission of their complementary teardown
+    // signal, with exact correlation and cumulative accounting. No callback
+    // or replacement terminal can escape this seam.
+    fn admit_terminal_tail(&mut self, _frame: &[u8]) -> Result<(), DpopStreamError> {
+        Err(ManagedCoreError::InvalidResponse.into())
+    }
+
     fn usage(&self) -> (usize, usize);
 }
 
@@ -473,7 +489,11 @@ where
                 parser.push_with(bytes, |frame| {
                     lifetime.check(idle)?;
                     if terminal.is_some() {
-                        return Err(ManagedCoreError::InvalidResponse.into());
+                        decoder.admit_terminal_tail(frame.as_bytes())?;
+                        // A tolerated peer teardown cannot bypass the same
+                        // lifetime guard used for every other admitted frame.
+                        lifetime.check(idle)?;
+                        return Ok(());
                     }
                     let event = decoder.admit(frame.as_bytes(), true)?;
                     // Decoder work cannot revive a deadline that it exhausted.

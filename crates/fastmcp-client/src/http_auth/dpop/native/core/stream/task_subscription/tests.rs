@@ -9,6 +9,8 @@ use fastmcp_protocol::ClientCapabilities;
 use fastmcp_protocol::dpop::DpopKey;
 use super::super::{DpopCoreError, DpopSession, ModernHttpResponseKind, Reader};
 
+mod termination;
+
 const TARGET: &str = "https://mcp.example/mcp?tenant=one";
 const COMPLETE: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2},"x-exact":{"z":900719925474099312345,"a":1.20e+4,"text":"雪"}}}"#;
 
@@ -190,7 +192,7 @@ fn only_acknowledged_exact_ids_reach_the_typed_status_observer() {
     let StreamEvent::Result(result) = decoder.admit(COMPLETE.as_bytes(), true).unwrap() else {
         panic!("expected the listen's separate completion");
     };
-    let encoded = result.encode().unwrap();
+    let encoded = result.unwrap().encode().unwrap();
     assert!(encoded.contains("900719925474099312345"));
     assert!(encoded.contains("1.20e+4"));
     let before = snapshot(&decoder);
