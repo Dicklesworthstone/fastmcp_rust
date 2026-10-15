@@ -6,17 +6,20 @@
 
 /// Bounded, observation-only checkpoints for explicit host-owned restart.
 pub mod checkpoint;
+/// Event-driven input resolution using the shared acknowledged-input ledger.
+pub mod input;
 
 use std::fmt;
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::pin::Pin;
 
 use asupersync::bytes::Buf;
 use asupersync::http::body::Body;
 use asupersync::http::h1::Method;
-use fastmcp_protocol::tasks_extension::{GetTaskResult, Task};
+use fastmcp_protocol::tasks_extension::{GetTaskResult, Task, TaskInputRequests};
 
 use super::*;
+use input::{InputDecision, InputDriver, ManagedTaskDriverError, ManagedTaskInputAction, NoInput};
 use super::super::{
     BYTES_PER_TURN, FRAMES_PER_TURN, Reader, cooperate,
 };
@@ -63,6 +66,8 @@ pub enum DpopTaskWatchError {
     SubscriptionEndedWhileWorking,
     UnexpectedResponse,
     Stream(DpopStreamError),
+    /// Capability, host-input, or acknowledged-ledger refusal.
+    Driver(ManagedTaskDriverError),
 }
 
 impl fmt::Display for DpopTaskWatchError {
@@ -75,6 +80,7 @@ impl fmt::Display for DpopTaskWatchError {
             Self::SubscriptionEndedWhileWorking => "DPoP Task subscription ended while work remains",
             Self::UnexpectedResponse => "DPoP Task watch requires a get snapshot",
             Self::Stream(error) => return error.fmt(f),
+            Self::Driver(error) => return error.fmt(f),
         })
     }
 }
@@ -198,23 +204,55 @@ fn outcome(snapshot: GetTaskResult) -> Option<DpopTaskWaitOutcome> {
 
 impl DpopHttpClient {
     #[allow(clippy::too_many_arguments)]
-    async fn watch_snapshot(
+    async fn watch_snapshot<R, F, O>(
         &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
         credential: &DpopCredential, metadata: &FinalRequestMeta, task: &TaskId,
         state: &mut WatchState, bounds: WaitBounds,
-    ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError> {
-        check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let (operation, limits) = state.snapshot_request(task)?;
-        let completed = self.request_task_stream_with_bounds(
-            cx, cancellation, credential, metadata.clone(), operation, limits, bounds, &mut |_| true,
-        ).await?;
-        check_live(cx, cancellation, &self.session, credential, bounds)?;
-        state.charge(completed.usage)?;
-        let ManagedTaskEvent::Snapshot(snapshot) = completed.result else {
-            return Err(DpopTaskWatchError::UnexpectedResponse);
-        };
-        check_live(cx, cancellation, &self.session, credential, bounds)?;
-        Ok(outcome(*snapshot))
+        input: &mut Option<InputDriver<R, O>>, may_update: bool,
+    ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        loop {
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            let (operation, limits) = state.snapshot_request(task)?;
+            let completed = self.request_task_stream_with_bounds(
+                cx, cancellation, credential, metadata.clone(), operation, limits, bounds, &mut |_| true,
+            ).await?;
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            state.charge(completed.usage)?;
+            let ManagedTaskEvent::Snapshot(snapshot) = completed.result else {
+                return Err(DpopTaskWatchError::UnexpectedResponse);
+            };
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            let Some(input) = input.as_mut() else { return Ok(outcome(*snapshot)); };
+            let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+            let decision = input.on_snapshot(&life, state, &snapshot.task, may_update).await?;
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            match decision {
+                InputDecision::Return => return Ok(outcome(*snapshot)),
+                InputDecision::Wait => return Ok(None),
+                InputDecision::Update(responses) => {
+                    let (operation, limits) = input.update_request(state, snapshot.task, responses)?;
+                    let completed = self.request_task_stream_with_bounds(
+                        cx, cancellation, credential, metadata.clone(), operation, limits,
+                        bounds, &mut |_| true,
+                    ).await?;
+                    check_live(cx, cancellation, &self.session, credential, bounds)?;
+                    state.charge(completed.usage)?;
+                    if !matches!(completed.result, ManagedTaskEvent::Updated(_)) {
+                        return Err(DpopTaskWatchError::UnexpectedResponse);
+                    }
+                    // The decoder has admitted both the ACK and clean EOF. No
+                    // failed/provisional update can advance custody or be replayed.
+                    input.acknowledged()?;
+                    // Reconcile now even if the server coalesced its status
+                    // notification. The original limits and deadline stay fixed.
+                }
+            }
+        }
     }
 
     /// Observe an existing Task without periodic polling or implicit mutation.
@@ -266,10 +304,31 @@ impl DpopHttpClient {
             return Err(DpopHttpError::Cancelled.into());
         }
         let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
+        self.watch_task_using(
+            cx, cancellation, credential, metadata, task, id_prefix,
+            policy, limits, bounds, None::<NoInput>,
+        ).await
+    }
+
+    // Observation and input driving share the same live response owner. Only
+    // the explicit input entrypoint installs callbacks; checkpoints remain
+    // observation-only and never retain input answers or an update capability.
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_task_using<R, F, O>(
+        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
+        credential: &DpopCredential, metadata: FinalRequestMeta, task: TaskId,
+        id_prefix: &str, policy: DpopTaskWatchPolicy, limits: DpopStreamLimits,
+        bounds: WaitBounds, mut input: Option<InputDriver<R, O>>,
+    ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
         check_live(cx, cancellation, &self.session, credential, bounds)?;
         let mut state = WatchState::new(id_prefix, policy, limits)?;
         if let Some(result) = self.watch_snapshot(
-            cx, cancellation, credential, &metadata, &task, &mut state, bounds,
+            cx, cancellation, credential, &metadata, &task, &mut state, bounds, &mut input, true,
         ).await? {
             return Ok(result);
         }
@@ -348,6 +407,7 @@ impl DpopHttpClient {
                 state.usage = completed.usage;
                 return self.watch_snapshot(
                     cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),
+                    &mut input, false,
                 ).await?.ok_or(DpopTaskWatchError::SubscriptionEndedWhileWorking);
             };
             frames_left -= 1;
@@ -379,6 +439,7 @@ impl DpopHttpClient {
                     // transport borrow; the same client can drive the get.
                     if let Some(result) = self.watch_snapshot(
                         cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),
+                        &mut input, true,
                     ).await? {
                         return Ok(result);
                     }

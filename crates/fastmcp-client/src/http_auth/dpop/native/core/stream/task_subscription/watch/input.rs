@@ -1,0 +1,288 @@
+//! Capability-gated host input on the existing event-driven DPoP Task watch.
+//!
+//! Only authoritative get snapshots can request host work. The subscription
+//! remains open during resolution and update; a successful update is followed
+//! by an immediate get, without waiting for a possibly coalesced status event.
+
+use std::collections::BTreeMap;
+use std::future::{Future, Ready, poll_fn};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::task::Poll;
+use std::time::Duration;
+
+use fastmcp_core::Sha256Digest;
+use fastmcp_protocol::tasks_extension::{TaskInputRequests, TaskInputResponses};
+use serde_json::Value;
+
+use super::*;
+use crate::http_auth::managed::tasks::driver::{
+    DriverState, ManagedTaskDriverPolicy, admit_capabilities, validate_answers,
+};
+pub use crate::http_auth::managed::tasks::driver::{
+    ManagedTaskDriverError, ManagedTaskInputAction,
+};
+
+/// Finite limits for snapshots, host input, and the entire subscription drive.
+/// Input fingerprints, not answers or a replayable continuation, are retained.
+#[derive(Clone, Copy, Debug)]
+pub struct DpopTaskWatchDriverPolicy {
+    watch: DpopTaskWatchPolicy,
+    input: ManagedTaskDriverPolicy,
+}
+
+impl Default for DpopTaskWatchDriverPolicy {
+    fn default() -> Self {
+        Self {
+            watch: DpopTaskWatchPolicy::default(),
+            input: ManagedTaskDriverPolicy::default(),
+        }
+    }
+}
+
+impl DpopTaskWatchDriverPolicy {
+    /// Allows 1..=1024 gets, 0..=128 updates, 0..=4096 input keys,
+    /// 1..=4 MiB of retained input-key/fingerprint bytes and a nonzero timeout
+    /// of at most 24 hours. Zero updates makes input-required a host handoff.
+    /// No polling interval exists: gets follow acknowledgement, status hints,
+    /// accepted updates, or clean subscription completion, never a timer.
+    pub fn new(
+        maximum_snapshots: usize,
+        maximum_updates: usize,
+        maximum_input_keys: usize,
+        maximum_state_bytes: usize,
+        timeout: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        let watch = DpopTaskWatchPolicy::new(maximum_snapshots)?;
+        // Reuse the shared input-ledger policy admission. Its interval and
+        // polling counter are unused; WatchState owns snapshot scheduling.
+        let input = ManagedTaskDriverPolicy::new(
+            Duration::from_secs(1), timeout, maximum_snapshots, maximum_updates,
+            maximum_input_keys, maximum_state_bytes,
+        ).map_err(|_| DpopTaskWatchError::InvalidPolicy)?;
+        Ok(Self { watch, input })
+    }
+}
+
+impl From<ManagedTaskDriverError> for DpopTaskWatchError {
+    fn from(error: ManagedTaskDriverError) -> Self { Self::Driver(error) }
+}
+
+// Concrete generic callbacks keep Send conditional on the host's own types,
+// instead of introducing a boxed/dynamic future or requiring a Send-only host.
+pub(super) type NoInput = InputDriver<
+    fn(TaskInputRequests) -> Ready<Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+    fn(&Task) -> Result<(), ManagedTaskDriverError>,
+>;
+
+pub(super) enum InputDecision {
+    Return,
+    Wait,
+    Update(TaskInputResponses),
+}
+
+struct PendingAnswers {
+    keys: Vec<String>,
+    fingerprints: BTreeMap<String, Sha256Digest>,
+}
+
+pub(super) struct InputDriver<R, O> {
+    policy: ManagedTaskDriverPolicy,
+    ledger: DriverState,
+    updates: usize,
+    pending: Option<PendingAnswers>,
+    metadata: Value,
+    resolve: R,
+    observe: O,
+}
+
+fn check(life: &Lifetime<'_>) -> Result<(), DpopTaskWatchError> {
+    check_live(life.cx, life.cancellation, life.session, life.credential, life.bounds)?;
+    Ok(())
+}
+
+// Catch host panics without retaining their payload. Check lifetime after the
+// callback even when it refuses or panics; cancellation/revocation still wins.
+fn callback<T>(life: &Lifetime<'_>, call: impl FnOnce() -> T)
+    -> Result<T, DpopTaskWatchError>
+{
+    check(life)?;
+    let result = with_caller(life.cx, || catch_unwind(AssertUnwindSafe(call)));
+    check(life)?;
+    result.map_err(|_| DpopStreamError::ObserverPanicked.into())
+}
+
+impl<R, O> InputDriver<R, O> {
+    fn new(
+        policy: ManagedTaskDriverPolicy, metadata: &FinalRequestMeta, resolve: R, observe: O,
+    ) -> Result<Self, DpopTaskWatchError> {
+        Ok(Self {
+            policy, ledger: DriverState::default(), updates: 0, pending: None,
+            metadata: serde_json::to_value(metadata).map_err(|_| ManagedCoreError::InvalidRequest)?,
+            resolve, observe,
+        })
+    }
+
+    fn stage(
+        &mut self, requests: &TaskInputRequests,
+        fingerprints: BTreeMap<String, Sha256Digest>, responses: &TaskInputResponses,
+    ) -> Result<(), DpopTaskWatchError> {
+        if self.pending.is_some() {
+            return Err(ManagedTaskDriverError::UnexpectedResponse.into());
+        }
+        validate_answers(requests, responses)?;
+        let keys: Vec<_> = responses.keys().cloned().collect();
+        // Never send answers which cannot be remembered after acknowledgement.
+        self.ledger.answer_bytes(&keys, &fingerprints, self.policy.maximum_state_bytes)?;
+        self.pending = Some(PendingAnswers { keys, fingerprints });
+        Ok(())
+    }
+
+    pub(super) fn update_request(
+        &mut self, watch: &WatchState, task: Task, responses: TaskInputResponses,
+    ) -> Result<(DpopTaskOperation, DpopStreamLimits), DpopTaskWatchError> {
+        if self.pending.is_none() {
+            return Err(ManagedTaskDriverError::UnexpectedResponse.into());
+        }
+        if self.updates >= self.policy.maximum_updates {
+            return Err(ManagedTaskDriverError::UpdateLimit.into());
+        }
+        watch.require_snapshot()?;
+        let limits = watch.remaining_limits()?;
+        // The fixed "input" segment is disjoint from numbered gets and listen.
+        // Bounded monotonic counters therefore need no retained ID history.
+        let operation = DpopTaskOperation::new(
+            RequestId::String(format!("{}.input.{}.discover", watch.prefix, self.updates)),
+            RequestId::String(format!("{}.input.{}.update", watch.prefix, self.updates)),
+            ManagedTaskRequest::Update { task: Box::new(task), input_responses: responses },
+        )?;
+        self.updates += 1;
+        Ok((operation, limits))
+    }
+
+    pub(super) fn acknowledged(&mut self) -> Result<(), DpopTaskWatchError> {
+        let pending = self.pending.as_ref().ok_or(ManagedTaskDriverError::UnexpectedResponse)?;
+        self.ledger.record_answers(
+            &pending.keys, &pending.fingerprints, self.policy.maximum_state_bytes,
+        )?;
+        self.pending = None;
+        Ok(())
+    }
+
+    pub(super) async fn on_snapshot<F>(
+        &mut self, life: &Lifetime<'_>, watch: &WatchState, task: &Task, may_update: bool,
+    ) -> Result<InputDecision, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        callback(life, || (self.observe)(task))??;
+        let Task::InputRequired { input_requests, .. } = task else {
+            return Ok(if matches!(task, Task::Working(_)) {
+                InputDecision::Wait
+            } else { InputDecision::Return });
+        };
+        // A finished listen cannot grant a new mutation or resolver invocation.
+        // Preserve the complete final snapshot for explicit host handling.
+        if !may_update || self.policy.maximum_updates == 0 {
+            return Ok(InputDecision::Return);
+        }
+        let (pending, fingerprints) = self.ledger.unanswered(input_requests, self.policy)?;
+        if pending.is_empty() { return Ok(InputDecision::Wait); }
+        if self.updates >= self.policy.maximum_updates {
+            return Err(ManagedTaskDriverError::UpdateLimit.into());
+        }
+        watch.require_snapshot()?;
+        watch.remaining_limits()?;
+        let inputs = admit_capabilities(&self.metadata, &pending)?;
+        // A constructor may revoke authority. Guard construction separately so
+        // its returned future is never polled after that revocation.
+        let resolution = callback(life, || (self.resolve)(inputs))?;
+        let mut resolution = std::pin::pin!(resolution);
+        let action = within(
+            life.cx, life.cancellation, life.session, life.credential, life.bounds, async {
+                Ok(poll_fn(|context| {
+                    match catch_unwind(AssertUnwindSafe(|| resolution.as_mut().poll(context))) {
+                        Ok(Poll::Pending) => Poll::Pending,
+                        Ok(Poll::Ready(result)) => Poll::Ready(result.map_err(DpopTaskWatchError::from)),
+                        Err(_) => Poll::Ready(Err(DpopStreamError::ObserverPanicked.into())),
+                    }
+                }).await)
+            },
+        ).await??;
+        check(life)?;
+        match action {
+            ManagedTaskInputAction::ReturnToCaller => Ok(InputDecision::Return),
+            ManagedTaskInputAction::Respond(responses) => {
+                self.stage(&pending, fingerprints, &responses)?;
+                check(life)?;
+                Ok(InputDecision::Update(responses))
+            }
+        }
+    }
+}
+
+impl DpopHttpClient {
+    /// Drive an existing Task using subscriptions and explicit, typed host input.
+    ///
+    /// Uses the SAME get/acknowledge/reconcile watch as observation-only waiting.
+    /// Observers see authoritative get snapshots, never status hints. Only new,
+    /// capability-admitted input keys reach the resolver; sampling context is
+    /// normalized by the shared Task driver. Empty, foreign, already-answered,
+    /// or type-mismatched answers fail before discovery or update dispatch.
+    ///
+    /// Successful updates require a method-owned ACK and clean JSON/SSE EOF
+    /// before the shared input ledger advances. Every accepted update causes
+    /// an immediate fresh get: no event is needed to finish the input round.
+    /// Unchanged acknowledged inputs do not repeat host work or an update;
+    /// reusing an acknowledged key for a changed descriptor fails closed.
+    /// Partial answers are supported. A failed/uncertain update ends the run
+    /// without replay, reconciliation, automatic reconnect, or remote cancel.
+    ///
+    /// Input can be serviced before subscribing. Once the listen opens, it
+    /// stays owned during resolver and update waits. Its original idle deadline
+    /// bounds those waits too; status hints, updates and host callbacks never
+    /// extend it. All discovery/get/update/listen payloads and notifications
+    /// share ONE byte/count budget, original credential, and absolute deadline.
+    /// Get/update progress is admitted and charged, not delivered as a snapshot.
+    /// A quiet listen sends no periodic gets. After clean listen completion,
+    /// the final get is observation-only: input-required returns to the host.
+    ///
+    /// ReturnToCaller and a zero-update policy return the full input snapshot,
+    /// including metadata. Failed/cancelled Tasks retain their terminal variants.
+    /// Host errors, panics, cancellation, revocation and dropping the future stop
+    /// local work and release both owned exchanges, not the shared login. The
+    /// host's panic hook and effects already performed cannot be undone.
+    ///
+    /// Use a fresh bounded id_prefix for every run. The input ledger lives only
+    /// in this future; restarting is explicit host authority, NOT an exactly-once
+    /// promise or a checkpoint containing reusable input-answer authority.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn drive_task_with_subscription<R, F, O>(
+        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
+        credential: &DpopCredential, metadata: FinalRequestMeta, task: TaskId,
+        id_prefix: &str, policy: DpopTaskWatchDriverPolicy, limits: DpopStreamLimits,
+        resolve: R, observe: O,
+    ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(DpopHttpError::Cancelled.into());
+        }
+        let timeout = self.policy.timeout.min(limits.core.timeout()).min(policy.input.timeout);
+        let bounds = WaitBounds::new(cx, timeout, credential)?;
+        check_live(cx, cancellation, &self.session, credential, bounds)?;
+        let input = InputDriver::new(policy.input, &metadata, resolve, observe)?;
+        check_live(cx, cancellation, &self.session, credential, bounds)?;
+        self.watch_task_using(
+            cx, cancellation, credential, metadata, task, id_prefix,
+            policy.watch, limits, bounds, Some(input),
+        ).await
+    }
+}
+
+#[cfg(test)]
+mod tests;
