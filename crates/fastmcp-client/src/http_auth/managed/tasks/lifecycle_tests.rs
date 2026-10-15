@@ -735,3 +735,5 @@ fn native_oauth_reviewed_task_calls_keep_headers_through_public_continuation_and
         }
     }
 }
+
+mod driver_events;
