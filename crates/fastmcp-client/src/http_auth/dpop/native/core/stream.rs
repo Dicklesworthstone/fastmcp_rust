@@ -9,9 +9,13 @@
 pub mod interaction;
 /// Acknowledged and filter-bound core subscriptions over explicit DPoP HTTPS.
 pub mod subscription;
+/// Authenticated Tasks discovery and exact-ID status subscriptions.
+#[cfg(feature = "tasks")]
+pub mod task_subscription;
 
 use std::fmt;
 use std::future::poll_fn;
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::task::Poll;
@@ -164,11 +168,25 @@ impl From<super::tasks::DpopTasksError> for DpopStreamError {
     }
 }
 
-// The prepared method owns its terminal vocabulary. Tasks never become a
-// fabricated CoreResult, and a core-only call never acquires Tasks authority.
-pub(super) enum StreamEvent<T> {
-    Notification(Box<ServerNotification>),
+// The prepared method owns both vocabularies. Extension notifications never
+// become fabricated core notifications or grant authority to a core-only call.
+pub(super) enum StreamEvent<T, E = ServerNotification> {
+    Notification(Box<E>),
     Result(T),
+}
+
+// Only a decoder-admitted core progress event may extend the idle budget.
+// Task statuses and subscription acknowledgements are not request progress.
+pub(super) trait StreamNotification {
+    fn is_progress(&self) -> bool {
+        false
+    }
+}
+
+impl StreamNotification for ServerNotification {
+    fn is_progress(&self) -> bool {
+        matches!(self, Self::Progress(_))
+    }
 }
 
 impl From<ManagedCoreEvent> for StreamEvent<CoreResult> {
@@ -183,14 +201,14 @@ impl From<ManagedCoreEvent> for StreamEvent<CoreResult> {
 // Only private, already-admitted method decoders implement this seam.
 // Method/filter admission stays with those codecs; socket, deadline,
 // cancellation, framing and observer ownership stay with this reader.
-pub(super) trait StreamDecoder {
+pub(super) trait StreamDecoder<E: StreamNotification = ServerNotification> {
     type Terminal;
 
     fn admit(
         &mut self,
         frame: &[u8],
         allow_notification: bool,
-    ) -> Result<StreamEvent<Self::Terminal>, DpopStreamError>;
+    ) -> Result<StreamEvent<Self::Terminal, E>, DpopStreamError>;
     fn usage(&self) -> (usize, usize);
 }
 
@@ -275,7 +293,7 @@ impl DpopHttpClient {
 
     // Ordinary, host-driven, subscription and Tasks calls execute here. A new
     // round never creates a new absolute deadline or resets the decoder's quotas.
-    pub(super) async fn execute_prepared_core_stream<D, N>(
+    pub(super) async fn execute_prepared_core_stream<D, E, N>(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
@@ -284,8 +302,9 @@ impl DpopHttpClient {
         observer: &mut N,
     ) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
     where
-        D: StreamDecoder,
-        N: FnMut(&ServerNotification) -> bool,
+        D: StreamDecoder<E>,
+        E: StreamNotification,
+        N: FnMut(&E) -> bool,
     {
         let PreparedStream { wire, decoder, limits, bounds, idle } = prepared;
         let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
@@ -328,7 +347,7 @@ impl DpopHttpClient {
         if response.head.status != 200 {
             return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
         }
-        let state = Reader::new(kind, decoder, limits, self.policy.max_body_bytes)?;
+        let state = Reader::<D, E>::new(kind, decoder, limits, self.policy.max_body_bytes)?;
         consume(response.body, &lifetime, idle, state, observer).await
     }
 }
@@ -383,16 +402,25 @@ enum WireBody {
     Sse(BoundedSseParser),
 }
 
-struct Reader<D: StreamDecoder = CoreDecoder> {
+struct Reader<D = CoreDecoder, E = ServerNotification>
+where
+    D: StreamDecoder<E>,
+    E: StreamNotification,
+{
     body: WireBody,
     decoder: D,
     terminal: Option<D::Terminal>,
     wire_remaining: usize,
     frame_limit: usize,
     reset_idle_on_progress: bool,
+    notification: PhantomData<fn(&E)>,
 }
 
-impl<D: StreamDecoder> Reader<D> {
+impl<D, E> Reader<D, E>
+where
+    D: StreamDecoder<E>,
+    E: StreamNotification,
+{
     fn new(
         kind: ModernHttpResponseKind,
         decoder: D,
@@ -416,10 +444,11 @@ impl<D: StreamDecoder> Reader<D> {
             wire_remaining: wire_limit,
             frame_limit,
             reset_idle_on_progress: limits.reset_idle_on_progress,
+            notification: PhantomData,
         })
     }
 
-    fn push<N: FnMut(&ServerNotification) -> bool>(
+    fn push<N: FnMut(&E) -> bool>(
         &mut self, bytes: &[u8], lifetime: &Lifetime<'_>, idle: &mut Idle, observer: &mut N,
     ) -> Result<(), DpopStreamError> {
         lifetime.check(idle)?;
@@ -452,9 +481,7 @@ impl<D: StreamDecoder> Reader<D> {
                     match event {
                         StreamEvent::Result(result) => *terminal = Some(result),
                         StreamEvent::Notification(notification) => {
-                            if reset_idle_on_progress
-                                && matches!(&*notification, ServerNotification::Progress(_))
-                            {
+                            if reset_idle_on_progress && notification.is_progress() {
                                 idle.progress(lifetime.cx.now());
                             }
                             let observed = catch_unwind(AssertUnwindSafe(|| observer(&notification)));
@@ -504,14 +531,15 @@ impl<D: StreamDecoder> Reader<D> {
     }
 }
 
-async fn consume<B, N, D>(
-    mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader<D>, observer: &mut N,
+async fn consume<B, N, D, E>(
+    mut body: B, lifetime: &Lifetime<'_>, mut idle: Idle, mut reader: Reader<D, E>, observer: &mut N,
 ) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
 where
     B: Body + Unpin,
     B::Data: Buf,
-    N: FnMut(&ServerNotification) -> bool,
-    D: StreamDecoder,
+    N: FnMut(&E) -> bool,
+    D: StreamDecoder<E>,
+    E: StreamNotification,
 {
     let mut bytes_left = BYTES_PER_TURN;
     let mut frames_left = FRAMES_PER_TURN;
