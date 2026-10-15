@@ -4,6 +4,9 @@
 //! notifications are only hints: neither their order nor their embedded Task
 //! can roll back a newer snapshot or manufacture a successful Task outcome.
 
+/// Bounded, observation-only checkpoints for explicit host-owned restart.
+pub mod checkpoint;
+
 use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
