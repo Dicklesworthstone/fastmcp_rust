@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use asupersync::Time;
 use asupersync::time::Sleep;
+use fastmcp_protocol::ServerNotification;
 
 use super::{
     Cx, DpopCredential, DpopHttpClient, DpopHttpError, DpopTaskOperation, DpopTasksError,
@@ -229,9 +230,8 @@ fn next_poll_time(
         .as_ref()
         .map(|hint| hint.try_as_millis())
         .transpose()
-        .map_err(|_| DpopTaskWaitError::InvalidPollInterval)?
-        .map(Duration::from_millis)
-        .unwrap_or(minimum);
+        .map_err(|_| DpopTaskWaitError::InvalidPollInterval)?;
+    let peer = peer.map(Duration::from_millis).unwrap_or(minimum);
     let nanos = u64::try_from(peer.max(minimum).as_nanos()).unwrap_or(u64::MAX);
     Ok(now.saturating_add_nanos(nanos))
 }
@@ -327,16 +327,57 @@ impl DpopHttpClient {
         policy: DpopTaskWaitPolicy,
         limits: ManagedCoreLimits,
     ) -> Result<DpopTaskWaitOutcome, DpopTaskWaitError> {
-        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.timeout()), credential)?;
+        self.wait_task_with_events(
+            cx, cancellation, credential, metadata, task_id, id_prefix, policy,
+            DpopStreamLimits::new(limits, limits.timeout())?, |_| true,
+        ).await
+    }
+
+    /// Observe one existing Task while delivering validated notifications as
+    /// they arrive. This is the same observation-only state machine as
+    /// [`Self::wait_task`], with explicit parser and per-pair idle limits.
+    /// Only discovery and get are sent: an input-required snapshot returns to
+    /// the host without resolving input, updating or cancelling the Task.
+    ///
+    /// `notify` returns true to continue or false to stop. It receives progress,
+    /// logging and other admitted request-scoped notifications, not a fabricated
+    /// snapshot. It must be brief, nonblocking and apply local disclosure policy.
+    /// Observer refusal/panic, cancellation, revocation or drop closes the owned
+    /// response. Already-delivered events and remote effects cannot be recalled.
+    /// No notification queue, worker, implicit reconnect or refresh is created.
+    ///
+    /// Byte and notification budgets span the entire wait. Each pair uses the
+    /// configured SSE/idle policy, but never resets the ORIGINAL absolute or
+    /// credential deadline. A snapshot remains provisional until clean HTTP EOF;
+    /// an incomplete response cannot schedule the next poll or return success.
+    /// The shared stream reader checks lifetime before and after every observer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wait_task_with_events<N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        task_id: TaskId,
+        id_prefix: &str,
+        policy: DpopTaskWaitPolicy,
+        limits: DpopStreamLimits,
+        mut notify: N,
+    ) -> Result<DpopTaskWaitOutcome, DpopTaskWaitError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
+        let bounds = WaitBounds::new(cx, self.policy.timeout.min(limits.core.timeout()), credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        let mut state = PollState::new(id_prefix, policy, limits)?;
+        let mut state = PollState::new(id_prefix, policy, limits.core)?;
         let mut due = cx.now();
         loop {
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             state.check_available()?;
             pause(cx, cancellation, &self.session, credential, bounds, due).await?;
-            let (operation, round_limits) = state.begin(&task_id)?;
-            let stream_limits = DpopStreamLimits::new(round_limits, round_limits.timeout())?;
+            let (operation, round_core) = state.begin(&task_id)?;
+            let mut round_limits = limits;
+            round_limits.core = round_core;
             let completed = self
                 .request_task_stream_with_bounds(
                     cx,
@@ -344,9 +385,9 @@ impl DpopHttpClient {
                     credential,
                     metadata.clone(),
                     operation,
-                    stream_limits,
+                    round_limits,
                     bounds,
-                    &mut |_| true,
+                    &mut notify,
                 )
                 .await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;

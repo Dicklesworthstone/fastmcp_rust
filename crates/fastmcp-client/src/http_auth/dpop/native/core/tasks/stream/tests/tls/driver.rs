@@ -8,6 +8,9 @@ use crate::http_auth::dpop::native::core::tasks::driver::{
     DpopTaskDriverError, ManagedTaskDriverPolicy,
     ManagedTaskInputAction, ManagedTaskRunOutcome,
 };
+use crate::http_auth::dpop::native::core::tasks::wait::{
+    DpopTaskWaitError, DpopTaskWaitOutcome, DpopTaskWaitPolicy,
+};
 
 fn driver_metadata() -> FinalRequestMeta {
     let mut meta = metadata();
@@ -54,13 +57,17 @@ impl Peer {
     }
 
     async fn receive(&mut self, prefix: &str, round: usize, method: &str) -> (TlsStream<TcpStream>, Value) {
+        let suffix = if method == "server/discover" { "discover" } else { "task" };
+        self.receive_named(&format!("{prefix}.{round}.{suffix}"), method).await
+    }
+
+    async fn receive_named(&mut self, request_id: &str, method: &str) -> (TlsStream<TcpStream>, Value) {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut socket = self.acceptor.accept(socket).await.unwrap();
         let (head, body) = read(&mut socket).await;
         let discovery = method == "server/discover";
-        let suffix = if discovery { "discover" } else { "task" };
         assert!(head.starts_with("POST /mcp?tenant=one HTTP/1.1\r\n"));
-        assert_eq!(body["id"], format!("{prefix}.{round}.{suffix}"));
+        assert_eq!(body["id"], request_id);
         assert_eq!(body["method"], method, "no replay, remote cancellation or hidden request");
         assert_eq!(header(&head, "authorization"), "DPoP stream-task-token");
         assert_eq!(header(&head, "mcp-method"), method);
@@ -98,6 +105,16 @@ impl Peer {
         let (mut socket, _) = self.receive(prefix, round, "server/discover").await;
         json_reply(&mut socket, &driver_response(prefix, round, true, &discovery_result())).await;
         self.receive(prefix, round, method).await
+    }
+
+    async fn wait_round(&mut self, prefix: &str, round: usize) -> TlsStream<TcpStream> {
+        let (mut discovery, _) = self.receive_named(
+            &format!("{prefix}.{round}.discover"), "server/discover",
+        ).await;
+        json_reply(&mut discovery, &wait_response(prefix, round, true, &discovery_result())).await;
+        let (socket, body) = self.receive_named(&format!("{prefix}.{round}.get"), "tasks/get").await;
+        assert!(body["params"].get("inputResponses").is_none());
+        socket
     }
 
     fn no_extra(&self, pairs: usize) {
@@ -391,5 +408,290 @@ fn streamed_driver_keeps_the_original_deadline_while_honoring_a_long_poll_hint()
         assert_eq!(snapshots, 1, "the first stream must complete before the bounded poll wait");
         peer.no_extra(1);
         assert!(cx.checkpoint().is_ok());
+    });
+}
+
+fn wait_policy(polls: usize) -> DpopTaskWaitPolicy {
+    DpopTaskWaitPolicy::new(polls, Duration::from_millis(1)).unwrap()
+}
+
+fn wait_response(prefix: &str, round: usize, discovery: bool, result: &Value) -> Vec<u8> {
+    let suffix = if discovery { "discover" } else { "get" };
+    serde_json::to_vec(&json!({
+        "jsonrpc":"2.0", "id":format!("{prefix}.{round}.{suffix}"), "result":result,
+    })).unwrap()
+}
+
+async fn wait_follow_up(peer: &mut Peer, client: &mut DpopHttpClient, cx: &Cx, credential: &DpopCredential) {
+    let application = client.wait_task(
+        cx, credential, metadata(), TaskId::parse("task-one").unwrap(),
+        "after", wait_policy(1), limits(0).core,
+    );
+    let server = async {
+        let mut socket = peer.wait_round("after", 0).await;
+        json_reply(&mut socket, &wait_response("after", 0, false, &task_result("cancelled"))).await;
+    };
+    let (result, ()) = pair(application, server).await;
+    assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::Terminal(snapshot)
+        if matches!(snapshot.task, Task::Cancelled(_))));
+    assert!(cx.checkpoint().is_ok());
+    assert!(!client.revocation_handle().is_revoked());
+}
+
+#[test]
+fn public_waiter_preserves_json_sse_progress_and_input_handoff_without_mutation() {
+    for explicit_events in [false, true] {
+        for json_rounds in [[false, false], [true, true], [false, true]] {
+            for final_status in ["cancelled", "input_required"] {
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let (mut peer, mut client, credential) = Peer::new().await;
+                    let cancellation = McpRequestCancellation::new();
+                    let observed = McpRequestCancellation::new();
+                    let mut notifications = 0;
+                    let application = async {
+                        if explicit_events {
+                            client.wait_task_with_events(
+                                &cx, &cancellation, &credential, metadata(), TaskId::parse("task-one").unwrap(),
+                                "observe", wait_policy(2), limits(2),
+                                |notification| {
+                                    assert!(matches!(notification, ServerNotification::Progress(_)));
+                                    notifications += 1;
+                                    observed.cancel();
+                                    true
+                                },
+                            ).await
+                        } else {
+                            client.wait_task_with_cancellation(
+                                &cx, &cancellation, &credential, metadata(), TaskId::parse("task-one").unwrap(),
+                                "observe", wait_policy(2), limits(2).core,
+                            ).await
+                        }
+                    };
+                    let server = async {
+                        for (round, status) in [(0, "working"), (1, final_status)] {
+                            let mut socket = peer.wait_round("observe", round).await;
+                            let bytes = wait_response("observe", round, false, &task_result(status));
+                            if json_rounds[round] { json_reply(&mut socket, &bytes).await; }
+                            else {
+                                streamed_reply(&mut socket, &bytes,
+                                    if explicit_events && round == 0 { Some(&observed) } else { None }, false).await;
+                            }
+                        }
+                    };
+                    let (result, ()) = pair(application, server).await;
+                    match (final_status, result.unwrap()) {
+                        ("cancelled", DpopTaskWaitOutcome::Terminal(snapshot)) => {
+                            assert!(matches!(snapshot.task, Task::Cancelled(_)));
+                        }
+                        ("input_required", DpopTaskWaitOutcome::InputRequired(snapshot)) => {
+                            assert!(matches!(snapshot.task, Task::InputRequired { .. }));
+                        }
+                        _ => panic!("waiter must preserve the selected Task outcome"),
+                    }
+                    let expected = if explicit_events { json_rounds.iter().filter(|json| !**json).count() } else { 0 };
+                    assert_eq!(notifications, expected);
+                    peer.no_extra(2);
+                    wait_follow_up(&mut peer, &mut client, &cx, &credential).await;
+                    peer.no_extra(3);
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn public_waiter_charges_notifications_and_bytes_across_actual_https_polls() {
+    for budget in [Budget::Exact, Budget::ByteShort, Budget::NotificationShort] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let (mut peer, mut client, credential) = Peer::new().await;
+            let cancellation = McpRequestCancellation::new();
+            let mut total = 0;
+            let mut maximum = 0;
+            for (round, status) in [(0, "working"), (1, "cancelled")] {
+                for bytes in [
+                    wait_response("quota", round, true, &discovery_result()),
+                    progress(json!("work"), "1"),
+                    wait_response("quota", round, false, &task_result(status)),
+                ] {
+                    total += bytes.len();
+                    maximum = maximum.max(bytes.len());
+                }
+            }
+            let core = ManagedCoreLimits::new(8192, maximum,
+                total - usize::from(matches!(budget, Budget::ByteShort)),
+                if matches!(budget, Budget::NotificationShort) { 1 } else { 2 },
+                Duration::from_secs(10)).unwrap();
+            let mut notifications = 0;
+            let application = client.wait_task_with_events(
+                &cx, &cancellation, &credential, metadata(), TaskId::parse("task-one").unwrap(),
+                "quota", wait_policy(2), DpopStreamLimits::new(core, Duration::from_secs(5)).unwrap(),
+                |_| { notifications += 1; true },
+            );
+            let server = async {
+                for (round, status) in [(0, "working"), (1, "cancelled")] {
+                    let mut socket = peer.wait_round("quota", round).await;
+                    streamed_reply(&mut socket, &wait_response("quota", round, false, &task_result(status)), None, false).await;
+                }
+            };
+            let (result, ()) = pair(application, server).await;
+            match budget {
+                Budget::Exact => {
+                    assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::Terminal(_)));
+                    assert_eq!(notifications, 2);
+                }
+                Budget::ByteShort => {
+                    assert!(matches!(result, Err(DpopTaskWaitError::Task(DpopTasksError::Core(
+                        DpopCoreError::Protocol(ManagedCoreError::ResponseByteLimit))))));
+                    assert_eq!(notifications, 2);
+                }
+                Budget::NotificationShort => {
+                    assert!(matches!(result, Err(DpopTaskWaitError::Task(DpopTasksError::Core(
+                        DpopCoreError::Protocol(ManagedCoreError::NotificationLimit))))));
+                    assert_eq!(notifications, 1);
+                }
+            }
+            peer.no_extra(2);
+            wait_follow_up(&mut peer, &mut client, &cx, &credential).await;
+            peer.no_extra(3);
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WaitFailure {
+    DuplicateTerminal, IncompleteTail, MissingTerminal, ForeignId, WrongTask,
+    Decline, Cancel, Revoke, Abandon, Idle,
+}
+
+#[test]
+fn public_waiter_withholds_provisional_snapshots_and_retires_failed_streams() {
+    for failure in [WaitFailure::DuplicateTerminal, WaitFailure::IncompleteTail,
+        WaitFailure::MissingTerminal, WaitFailure::ForeignId, WaitFailure::WrongTask,
+        WaitFailure::Decline, WaitFailure::Cancel, WaitFailure::Revoke,
+        WaitFailure::Abandon, WaitFailure::Idle]
+    {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let (mut peer, mut client, credential) = Peer::new().await;
+            let cancellation = McpRequestCancellation::new();
+            let observed = McpRequestCancellation::new();
+            let selected = DpopStreamLimits::new(limits(4).core,
+                if matches!(failure, WaitFailure::Idle) { Duration::from_secs(1) } else { Duration::from_secs(5) }).unwrap();
+            let mut notifications = 0;
+            let application = async {
+                let mut waiting = Box::pin(client.wait_task_with_events(
+                    &cx, &cancellation, &credential, metadata(), TaskId::parse("task-one").unwrap(),
+                    "refused", wait_policy(2), selected,
+                    |_| {
+                        notifications += 1;
+                        observed.cancel();
+                        if matches!(failure, WaitFailure::Cancel) { cancellation.cancel(); }
+                        if matches!(failure, WaitFailure::Revoke) { credential.revoke(); }
+                        !matches!(failure, WaitFailure::Decline)
+                    },
+                ));
+                if matches!(failure, WaitFailure::Abandon) {
+                    poll_fn(|task| {
+                        assert!(waiting.as_mut().poll(task).is_pending());
+                        if observed.is_cancel_requested() { Poll::Ready(()) } else { Poll::Pending }
+                    }).await;
+                    drop(waiting);
+                } else {
+                    let result = if matches!(failure, WaitFailure::Idle) {
+                        asupersync::time::timeout_at(cx.now().saturating_add_nanos(3_000_000_000), waiting)
+                            .await.expect("one-second idle cap must beat the absolute wait deadline")
+                    } else { waiting.await };
+                    let error = result.err().expect("refused stream cannot publish its provisional snapshot");
+                    match failure {
+                        WaitFailure::Decline => assert!(matches!(error,
+                            DpopTaskWaitError::Stream(DpopStreamError::ObserverStopped))),
+                        WaitFailure::Cancel => assert!(matches!(error, DpopTaskWaitError::Task(DpopTasksError::Core(
+                            DpopCoreError::Transport(DpopHttpError::Cancelled))))),
+                        WaitFailure::Revoke => assert!(matches!(error, DpopTaskWaitError::Task(DpopTasksError::Core(
+                            DpopCoreError::Transport(DpopHttpError::Authorization(_)))))),
+                        WaitFailure::Idle => assert!(matches!(error, DpopTaskWaitError::Task(DpopTasksError::Core(
+                            DpopCoreError::Transport(DpopHttpError::TimedOut))))),
+                        WaitFailure::ForeignId => assert!(matches!(error, DpopTaskWaitError::Task(DpopTasksError::Task(
+                            ManagedTasksError::ResponseIdMismatch)))),
+                        WaitFailure::WrongTask => assert!(matches!(error, DpopTaskWaitError::Task(DpopTasksError::Task(
+                            ManagedTasksError::TaskIdMismatch)))),
+                        WaitFailure::DuplicateTerminal | WaitFailure::IncompleteTail | WaitFailure::MissingTerminal => {}
+                        WaitFailure::Abandon => unreachable!(),
+                    }
+                }
+            };
+            let server = async {
+                let mut socket = peer.wait_round("refused", 0).await;
+                socket.write_all(HEAD).await.unwrap();
+                event(&mut socket, &progress(json!("work"), "1")).await;
+                observed.cancelled().await;
+                if matches!(failure, WaitFailure::Decline | WaitFailure::Cancel | WaitFailure::Revoke
+                    | WaitFailure::Abandon | WaitFailure::Idle)
+                {
+                    let mut byte = [0];
+                    assert!(!matches!(socket.read(&mut byte).await, Ok(n) if n > 0),
+                        "the waiter must drop the silent response without a peer terminal");
+                    return;
+                }
+                let mut result = task_result("cancelled");
+                if matches!(failure, WaitFailure::WrongTask) { result["taskId"] = json!("task-two"); }
+                let mut envelope: Value = serde_json::from_slice(&wait_response("refused", 0, false, &result)).unwrap();
+                if matches!(failure, WaitFailure::ForeignId) { envelope["id"] = json!("foreign"); }
+                let terminal = serde_json::to_vec(&envelope).unwrap();
+                let mut tail = Vec::new();
+                if !matches!(failure, WaitFailure::MissingTerminal) {
+                    tail.extend_from_slice(&event_chunk(&terminal));
+                }
+                if matches!(failure, WaitFailure::DuplicateTerminal) {
+                    tail.extend_from_slice(&event_chunk(&terminal));
+                }
+                if matches!(failure, WaitFailure::IncompleteTail) {
+                    tail.extend_from_slice(&chunk(b"data: unfinished"));
+                }
+                tail.extend_from_slice(b"0\r\n\r\n");
+                socket.write_all(&tail).await.unwrap();
+                let _ = socket.shutdown().await;
+            };
+            pair(application, server).await;
+            assert_eq!(notifications, 1);
+            peer.no_extra(1);
+            assert!(cx.checkpoint().is_ok());
+            assert!(!client.revocation_handle().is_revoked());
+            if !matches!(failure, WaitFailure::Revoke) {
+                wait_follow_up(&mut peer, &mut client, &cx, &credential).await;
+                peer.no_extra(2);
+            }
+        });
+    }
+}
+
+#[test]
+fn public_waiter_retains_its_original_deadline_after_a_streamed_working_snapshot() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let (mut peer, mut client, credential) = Peer::new().await;
+        let cancellation = McpRequestCancellation::new();
+        let core = ManagedCoreLimits::new(8192, 8192, 32768, 4, Duration::from_secs(2)).unwrap();
+        let mut notifications = 0;
+        let application = client.wait_task_with_events(
+            &cx, &cancellation, &credential, metadata(), TaskId::parse("task-one").unwrap(),
+            "deadline", wait_policy(2), DpopStreamLimits::new(core, Duration::from_secs(2)).unwrap(),
+            |_| { notifications += 1; true },
+        );
+        let server = async {
+            let mut socket = peer.wait_round("deadline", 0).await;
+            let mut task = task_result("working");
+            task["pollIntervalMs"] = json!(60000);
+            streamed_reply(&mut socket, &wait_response("deadline", 0, false, &task), None, false).await;
+        };
+        let (result, ()) = pair(application, server).await;
+        assert!(matches!(result, Err(DpopTaskWaitError::Task(DpopTasksError::Core(
+            DpopCoreError::Transport(DpopHttpError::TimedOut))))));
+        assert_eq!(notifications, 1);
+        peer.no_extra(1);
+        wait_follow_up(&mut peer, &mut client, &cx, &credential).await;
+        peer.no_extra(2);
     });
 }
