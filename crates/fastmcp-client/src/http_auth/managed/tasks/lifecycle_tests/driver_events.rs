@@ -19,6 +19,10 @@ enum Failure {
     Missing,
     BadProgress,
     RecordLimit,
+    SnapshotRevoke,
+    ResolverCancelConstructor,
+    ResolverRevokeConstructor,
+    ResolverRevokePending,
 }
 
 fn snapshot(status: &str) -> Value {
@@ -55,7 +59,9 @@ async fn exercise(streams: [bool; 4], events: bool, failure: Option<(usize, Fail
     ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap();
     let observed: [_; 4] = std::array::from_fn(|_| McpRequestCancellation::new());
     let rounds = failure.map_or(4, |(round, _)| round + 1);
-    let follow_up = !matches!(failure, Some((_, Failure::Revoke | Failure::Close)));
+    let follow_up = !matches!(failure, Some((_, Failure::Revoke | Failure::Close
+        | Failure::SnapshotRevoke | Failure::ResolverRevokeConstructor
+        | Failure::ResolverRevokePending)));
 
     let application = async {
         let callback_issuer = issuer.clone();
@@ -93,6 +99,9 @@ async fn exercise(streams: [bool; 4], events: bool, failure: Option<(usize, Fail
         ).unwrap();
         let id_pairs = std::cell::Cell::new(0_i64);
         let (mut resolutions, mut snapshots, mut notifications) = (0, 0, 0);
+        let resolver_polls = std::cell::Cell::new(0);
+        let host_polls = &resolver_polls;
+        let host_bearer = original.credential();
         let next_ids = || {
             let ids = sequential_ids(1 + 2 * id_pairs.get());
             id_pairs.set(id_pairs.get() + 1);
@@ -101,11 +110,32 @@ async fn exercise(streams: [bool; 4], events: bool, failure: Option<(usize, Fail
         let resolve = |requests: fastmcp_protocol::tasks_extension::TaskInputRequests| {
             resolutions += 1;
             assert_eq!(requests.keys().map(String::as_str).collect::<Vec<_>>(), ["roots"]);
-            std::future::ready(Ok(ManagedTaskInputAction::Respond(
-                serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
-            )))
+            let selected = failure_at(failure, 0);
+            match selected {
+                Some(Failure::ResolverCancelConstructor) => { cancellation.cancel(); }
+                Some(Failure::ResolverRevokeConstructor) => { host_bearer.revoke(); }
+                _ => {}
+            }
+            async move {
+                host_polls.set(host_polls.get() + 1);
+                if matches!(selected, Some(Failure::ResolverRevokePending)) {
+                    host_bearer.revoke();
+                    // No result and no self-wake: the response credential's
+                    // guard must stop this pending host work on the same poll.
+                    std::future::pending::<()>().await;
+                }
+                Ok(ManagedTaskInputAction::Respond(
+                    serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
+                ))
+            }
         };
-        let observe = |_: &Task| { snapshots += 1; Ok(()) };
+        let observe = |_: &Task| {
+            snapshots += 1;
+            if matches!(failure_at(failure, 0), Some(Failure::SnapshotRevoke)) {
+                original.credential().revoke();
+            }
+            Ok(())
+        };
         let result = if events {
             let mut drive = Box::pin(client.drive_task_with_events(
                 &cx, &cancellation, TaskId::parse("task-one").unwrap(), policy,
@@ -149,22 +179,35 @@ async fn exercise(streams: [bool; 4], events: bool, failure: Option<(usize, Fail
                 // The unchanged input snapshot after the ACK is observed but
                 // neither resolved nor submitted a second time.
                 assert_eq!((id_pairs.get(), resolutions, snapshots), (4, 1, 3));
+                assert_eq!(resolver_polls.get(), 1);
                 assert_eq!(notifications, if events { streams.iter().filter(|s| **s).count() } else { 0 });
             }
             Some((round, failure)) => {
                 assert_eq!(id_pairs.get(), (round + 1) as i64);
-                assert_eq!(resolutions, round);
-                assert_eq!(snapshots, round);
-                assert_eq!(notifications, round + if matches!(failure, Failure::RecordLimit) { 2 } else { 1 });
+                if matches!(failure, Failure::SnapshotRevoke | Failure::ResolverCancelConstructor
+                    | Failure::ResolverRevokeConstructor | Failure::ResolverRevokePending)
+                {
+                    assert_eq!(round, 0);
+                    assert_eq!(snapshots, 1);
+                    assert_eq!(resolutions, usize::from(!matches!(failure, Failure::SnapshotRevoke)));
+                    assert_eq!(resolver_polls.get(), usize::from(matches!(failure, Failure::ResolverRevokePending)),
+                        "constructor-time refusal must drop the returned host future without polling it");
+                    assert_eq!(notifications, usize::from(events && streams[0]));
+                } else {
+                    assert_eq!(resolutions, round);
+                    assert_eq!(snapshots, round);
+                    assert_eq!(notifications, round + if matches!(failure, Failure::RecordLimit) { 2 } else { 1 });
+                }
                 if matches!(failure, Failure::Abandon) {
                     assert!(result.is_none());
                 } else {
                     let error = result.unwrap().err().expect("failed stream must not publish a snapshot/ACK");
                     match failure {
                         Failure::Decline => assert!(matches!(error, ManagedTaskDriverError::AbortedByHost)),
-                        Failure::Cancel => assert!(matches!(error, ManagedTaskDriverError::Task(
+                        Failure::Cancel | Failure::ResolverCancelConstructor => assert!(matches!(error, ManagedTaskDriverError::Task(
                             ManagedTasksError::Session(OAuthSessionError::Cancelled)))),
-                        Failure::Revoke => assert!(matches!(error, ManagedTaskDriverError::Task(
+                        Failure::Revoke | Failure::SnapshotRevoke | Failure::ResolverRevokeConstructor
+                        | Failure::ResolverRevokePending => assert!(matches!(error, ManagedTaskDriverError::Task(
                             ManagedTasksError::Session(OAuthSessionError::LoginRequired)))),
                         Failure::Close => assert!(matches!(error, ManagedTaskDriverError::Task(
                             ManagedTasksError::Session(OAuthSessionError::Closed)))),
@@ -313,6 +356,19 @@ fn managed_driver_retires_streams_without_publishing_failed_gets_or_update_acks(
             Failure::Abandon, Failure::Trailing, Failure::Missing, Failure::BadProgress, Failure::RecordLimit]
         {
             run(exercise([true; 4], true, Some((round, failure))));
+        }
+    }
+}
+
+#[test]
+fn managed_driver_guards_snapshot_and_resolver_authority_on_both_entrypoints() {
+    for events in [false, true] {
+        for sse in [false, true] {
+            for failure in [Failure::SnapshotRevoke, Failure::ResolverCancelConstructor,
+                Failure::ResolverRevokeConstructor, Failure::ResolverRevokePending]
+            {
+                run(exercise([sse; 4], events, Some((0, failure))));
+            }
         }
     }
 }
