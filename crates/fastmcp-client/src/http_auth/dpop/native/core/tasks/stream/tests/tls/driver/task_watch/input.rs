@@ -1,6 +1,7 @@
 //! Subscription input driving through the existing authenticated loopback TLS peer.
 
 mod start;
+mod hosted;
 
 use super::*;
 use std::future::Future;
