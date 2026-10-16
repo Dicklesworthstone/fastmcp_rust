@@ -7,6 +7,8 @@
 
 /// Persistence callbacks retaining Task creation and watch write custody.
 pub mod persistence;
+/// Complete asynchronous staging for freshly authorized restart recovery.
+pub mod restart;
 
 use std::fmt;
 use std::fs::File;
@@ -311,6 +313,7 @@ impl<P: TaskResumeProtector + 'static> AsyncTaskResumeStore<P> {
 #[cfg(test)]
 mod tests {
     mod persistence;
+    mod restart;
 
     use super::*;
     use std::collections::BTreeMap;
