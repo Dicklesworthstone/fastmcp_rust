@@ -164,3 +164,92 @@ fn public_watch_honors_precancellation_before_runtime_or_prefix_admission() {
         }
     }
 }
+
+#[test]
+fn reconnect_policy_bounds_and_delay_are_explicit() {
+    for count in [0, 65, usize::MAX] {
+        assert!(DpopTaskReconnectPolicy::new(count, Duration::from_millis(1)).is_err());
+    }
+    for delay in [Duration::ZERO, Duration::from_nanos(999_999), Duration::from_secs(61)] {
+        assert!(DpopTaskReconnectPolicy::new(1, delay).is_err());
+    }
+    for count in [1, 64] {
+        for delay in [Duration::from_millis(1), Duration::from_secs(60)] {
+            assert!(DpopTaskReconnectPolicy::new(count, delay).is_ok());
+        }
+    }
+    let now = Cx::for_testing().now();
+    let mut ordinary = state(2);
+    assert!(ordinary.begin_reconnect(now).unwrap().is_none());
+    assert_eq!(ordinary.reconnects, 0);
+    let policy = DpopTaskWatchPolicy::new(8).unwrap()
+        .with_reconnects(2, Duration::from_millis(17)).unwrap();
+    let mut reconnecting = WatchState::new("watch", policy, limits(4)).unwrap();
+    reconnecting.charge((91, 1)).unwrap();
+    for ordinal in 1..=2 {
+        let before = (reconnecting.snapshots, reconnecting.usage);
+        assert_eq!(reconnecting.begin_reconnect(now).unwrap(), Some(now.saturating_add_nanos(17_000_000)));
+        assert_eq!((reconnecting.snapshots, reconnecting.usage), before);
+        let selected = reconnecting.selection(FinalRequestMeta::new(ClientCapabilities::default()), &task()).unwrap();
+        assert_eq!(selected.subscription_id, RequestId::String(format!("watch.listen.{ordinal}")));
+        assert_eq!(selected.discovery_id, RequestId::String(format!("watch.listen.{ordinal}.discover")));
+        assert_eq!(selected.task_ids, vec![task()]);
+    }
+    assert!(matches!(reconnecting.begin_reconnect(now), Err(DpopTaskWatchError::ReconnectLimit)));
+    assert_eq!(reconnecting.reconnects, 2);
+    reconnecting.policy = policy.with_polling_fallback(1, Duration::from_millis(1)).unwrap();
+    assert!(reconnecting.begin_reconnect(now).unwrap().is_none());
+    assert_eq!(reconnecting.reconnects, 2);
+    assert_eq!(reconnecting.usage, (91, 1));
+}
+
+#[test]
+fn reconnect_cannot_replenish_or_partially_advance_exhausted_admission() {
+    for dimension in 0..3 {
+        let policy = DpopTaskWatchPolicy::new(2).unwrap()
+            .with_reconnects(1, Duration::from_millis(1)).unwrap();
+        let mut watch = WatchState::new("watch", policy, limits(2)).unwrap();
+        match dimension {
+            0 => { for _ in 0..2 { watch.snapshot_request(&task()).unwrap(); } }
+            1 => watch.charge((32768, 0)).unwrap(),
+            _ => watch.charge((17, 2)).unwrap(),
+        }
+        let before = (watch.reconnects, watch.snapshots, watch.usage);
+        assert!(watch.begin_reconnect(Cx::for_testing().now()).is_err());
+        assert_eq!((watch.reconnects, watch.snapshots, watch.usage), before);
+        let selected = watch.selection(FinalRequestMeta::new(ClientCapabilities::default()), &task()).unwrap();
+        assert_eq!(selected.subscription_id, RequestId::String("watch.listen".to_owned()));
+    }
+}
+
+#[test]
+fn successor_requires_its_own_acknowledgement_and_preserves_cumulative_usage() {
+    let policy = DpopTaskWatchPolicy::new(8).unwrap()
+        .with_reconnects(2, Duration::from_millis(1)).unwrap();
+    let mut watch = WatchState::new("watch", policy, limits(3)).unwrap();
+    // Simulate admitted earlier discovery, get and acknowledgement charges.
+    watch.charge((500, 1)).unwrap();
+    watch.snapshot_request(&task()).unwrap();
+    watch.begin_reconnect(Cx::for_testing().now()).unwrap().unwrap();
+    let mut successor = decoder(&watch);
+    assert!(WatchState::require_acknowledged(&successor, &task()).is_err());
+    assert!(successor.admit(&ack(&["task-one"]), true).is_err(),
+        "an old listen's ACK cannot authorize the successor");
+    assert!(WatchState::require_acknowledged(&successor, &task()).is_err());
+    let mut successor = decoder(&watch);
+    watch.charge(successor.usage()).unwrap();
+    successor.limits = watch.limits.core;
+    successor.bytes = watch.usage.0;
+    successor.notifications = watch.usage.1;
+    let fresh = serde_json::to_vec(&json!({"jsonrpc":"2.0",
+        "method":"notifications/subscriptions/acknowledged",
+        "params":{"notifications":{"taskIds":["task-one"]},
+            "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"watch.listen.1"}}})).unwrap();
+    let before = watch.usage;
+    assert!(matches!(successor.admit(&fresh, true).unwrap(), StreamEvent::Notification(_)));
+    WatchState::require_acknowledged(&successor, &task()).unwrap();
+    watch.usage = successor.usage();
+    assert_eq!(watch.usage, (before.0 + fresh.len(), before.1 + 1));
+    assert_eq!(watch.remaining_limits().unwrap().core.notifications(), 1);
+    assert_eq!(watch.snapshots, 1, "fresh ACK cannot reset the snapshot counter");
+}

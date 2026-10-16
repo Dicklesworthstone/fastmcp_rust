@@ -61,32 +61,61 @@ impl DpopTaskPollingFallback {
     }
 }
 
+/// Bounded resubscription after an acknowledged listen ends cleanly.
+/// This is NOT retry authority for transport failures, rejected credentials,
+/// malformed framing or a failed Task update. Every successor is a new read-only
+/// subscription, with fresh discovery, identity and acknowledgement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpopTaskReconnectPolicy {
+    maximum_reconnects: usize,
+    minimum_delay: Duration,
+}
+
+impl DpopTaskReconnectPolicy {
+    /// Bound additional listens to 1..=64 and delay each by 1ms..=60s.
+    /// The floor prevents a peer repeatedly completing listens from causing a
+    /// busy loop. The original operation deadline may end the delay sooner.
+    pub fn new(
+        maximum_reconnects: usize,
+        minimum_delay: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        if !(1..=64).contains(&maximum_reconnects)
+            || !(Duration::from_millis(1)..=Duration::from_secs(60)).contains(&minimum_delay)
+        {
+            return Err(DpopTaskWatchError::InvalidPolicy);
+        }
+        Ok(Self { maximum_reconnects, minimum_delay })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpopTaskWatchPolicy {
     maximum_snapshots: usize,
     fallback: Option<DpopTaskPollingFallback>,
+    reconnect: Option<DpopTaskReconnectPolicy>,
 }
 
 impl Default for DpopTaskWatchPolicy {
     fn default() -> Self {
-        Self { maximum_snapshots: 64, fallback: None }
+        Self { maximum_snapshots: 64, fallback: None, reconnect: None }
     }
 }
 
 impl DpopTaskWatchPolicy {
     /// Admit 1..=1024 snapshots, including the initial and final reconciliation.
     /// A single snapshot is useful for a Task which is already non-Working.
-    /// Polling fallback is disabled unless explicitly selected.
+    /// Polling fallback and reconnection are disabled unless explicitly selected.
     pub fn new(maximum_snapshots: usize) -> Result<Self, DpopTaskWatchError> {
         if !(1..=1024).contains(&maximum_snapshots) {
             return Err(DpopTaskWatchError::InvalidPolicy);
         }
-        Ok(Self { maximum_snapshots, fallback: None })
+        Ok(Self { maximum_snapshots, fallback: None, reconnect: None })
     }
 
     /// Opt into bounded observation-only polling if an acknowledged subscription
     /// ends cleanly while the authoritative Task remains Working. This never
-    /// restores Task-input update authority after teardown.
+    /// restores Task-input update authority after teardown. When reconnection is
+    /// also selected, polling begins only after its additional listens are used.
     pub fn with_polling_fallback(
         mut self,
         maximum_polls: usize,
@@ -95,6 +124,22 @@ impl DpopTaskWatchPolicy {
         self.fallback = Some(DpopTaskPollingFallback::new(
             maximum_polls, minimum_poll_interval,
         )?);
+        Ok(self)
+    }
+
+    /// Continue event-driven observation across clean peer rollovers instead
+    /// of immediately polling or returning SubscriptionEndedWhileWorking.
+    /// A final authenticated get precedes every reconnect. Each successor
+    /// must freshly acknowledge this Task and is reconciled again after ACK.
+    /// All listens/gets share the original snapshot, byte, notification and
+    /// absolute time limits. Fresh input-required state is returned to the host;
+    /// reconnection cannot restore an ended listen's input-update authority.
+    pub fn with_reconnects(
+        mut self,
+        maximum_reconnects: usize,
+        minimum_delay: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        self.reconnect = Some(DpopTaskReconnectPolicy::new(maximum_reconnects, minimum_delay)?);
         Ok(self)
     }
 }
@@ -107,6 +152,7 @@ pub enum DpopTaskWatchError {
     SnapshotLimit,
     TaskNotAcknowledged,
     SubscriptionEndedWhileWorking,
+    ReconnectLimit,
     FallbackLimit,
     InvalidPollInterval,
     UnexpectedResponse,
@@ -123,6 +169,7 @@ impl fmt::Display for DpopTaskWatchError {
             Self::SnapshotLimit => "DPoP Task watch snapshot limit reached",
             Self::TaskNotAcknowledged => "DPoP Task watch selection was not acknowledged",
             Self::SubscriptionEndedWhileWorking => "DPoP Task subscription ended while work remains",
+            Self::ReconnectLimit => "DPoP Task subscription reconnect limit reached",
             Self::FallbackLimit => "DPoP Task polling fallback limit reached",
             Self::InvalidPollInterval => "DPoP Task polling interval cannot be represented",
             Self::UnexpectedResponse => "DPoP Task watch requires a get snapshot",
@@ -156,6 +203,7 @@ struct WatchState {
     prefix: String,
     policy: DpopTaskWatchPolicy,
     snapshots: usize,
+    reconnects: usize,
     fallback_polls: usize,
     fallback_due: Option<Time>,
     usage: (usize, usize),
@@ -175,6 +223,7 @@ impl WatchState {
             prefix: prefix.to_owned(),
             policy,
             snapshots: 0,
+            reconnects: 0,
             fallback_polls: 0,
             fallback_due: None,
             usage: (0, 0),
@@ -261,12 +310,40 @@ impl WatchState {
         Ok(Some(due))
     }
 
+    // Called only after validated terminal framing AND the final get says
+    // Working. Errors, provisional results and incomplete EOF never reach it.
+    fn begin_reconnect(&mut self, now: Time) -> Result<Option<Time>, DpopTaskWatchError> {
+        let Some(policy) = self.policy.reconnect else { return Ok(None); };
+        if self.reconnects >= policy.maximum_reconnects {
+            return if self.policy.fallback.is_some() {
+                Ok(None)
+            } else {
+                Err(DpopTaskWatchError::ReconnectLimit)
+            };
+        }
+        self.require_snapshot()?;
+        if self.remaining_limits()?.core.notifications() == 0 {
+            return Err(ManagedCoreError::NotificationLimit.into());
+        }
+        // All fallible quota checks precede identity advancement. No existing
+        // response, snapshot or input allowance is replenished here.
+        self.reconnects += 1;
+        let delay = u64::try_from(policy.minimum_delay.as_nanos())
+            .map_err(|_| DpopTaskWatchError::InvalidPolicy)?;
+        Ok(Some(now.saturating_add_nanos(delay)))
+    }
+
     fn selection(&self, metadata: FinalRequestMeta, task: &TaskId)
         -> Result<DpopTaskSubscription, DpopTaskWatchError>
     {
+        let id = if self.reconnects == 0 {
+            format!("{}.listen", self.prefix)
+        } else {
+            format!("{}.listen.{}", self.prefix, self.reconnects)
+        };
         Ok(DpopTaskSubscription::new(
-            RequestId::String(format!("{}.listen.discover", self.prefix)),
-            RequestId::String(format!("{}.listen", self.prefix)),
+            RequestId::String(format!("{id}.discover")),
+            RequestId::String(id),
             metadata, vec![task.clone()],
         )?)
     }
@@ -387,32 +464,38 @@ impl DpopHttpClient {
     /// The returned complete GetTaskResult is preserved, including metadata.
     /// Input-required is an explicit host handoff; failed/cancelled remote Tasks
     /// are terminal snapshots, not successful executions. A clean subscription
-    /// terminal, whether completion or peer cancellation, requires a final get;
-    /// a still-Working Task is an error unless an explicit bounded polling
-    /// fallback was configured. Fallback waits for the greater of its local
-    /// floor and the latest admitted pollIntervalMs, and remains observation-only:
+    /// terminal, whether completion or peer cancellation, requires a final get.
+    /// If still Working, an explicitly configured reconnect opens a fresh listen
+    /// after a bounded delay. It must acknowledge this Task again, then another
+    /// get closes the rollover race. When reconnects are exhausted, an explicit
+    /// polling fallback is used; otherwise the corresponding limit is returned.
+    /// With neither option the original SubscriptionEndedWhileWorking remains.
+    /// Fallback waits for the greater of its local floor and the latest admitted
+    /// pollIntervalMs. Reconnection and fallback remain observation-only:
     /// input-required is returned rather than updated. Subscription cancellation
-    /// never means Task cancellation. Missing acknowledgement, early EOF, invalid frames
-    /// and exhausted bounds fail without a final get. A non-Working
-    /// authoritative get stops the local listen without claiming that the
-    /// subscription itself completed or validating an unread tail.
+    /// never means Task cancellation. Missing acknowledgement, early EOF, invalid
+    /// frames, transport failures and exhausted bounds are not retryable here.
+    /// A non-Working authoritative get stops the local listen without claiming
+    /// the subscription itself completed or validating an unread tail.
     ///
     /// All discovery, get and listen payloads/notifications share the original
     /// limits. ACK counts as a notification. Native raw-body caps apply per
     /// response. The same credential and absolute native/core/caller/token
-    /// deadline cover the complete watch. Subscription idle time also bounds
-    /// reconciliation; statuses, comments and gets never reset it. Get responses
-    /// may be finite JSON or SSE and require clean EOF before publication.
+    /// deadline cover the complete watch, including reconnect delays. Each new
+    /// physical listen gets its own idle window, but statuses, comments and gets
+    /// never reset that window. Get responses may be finite JSON or SSE and
+    /// require clean EOF before publication.
     ///
     /// One live listen and at most one snapshot request are driven together.
     /// The native streaming response owns its socket independently of the
     /// client's bounded discovery pool, so reconciliation reuses this client's
-    /// exact transport, trust policy and original DPoP session. No second client,
-    /// runtime, detached task, token renewal, tool call, update, remote cancel,
-    /// retry, redirect, proxy, cookie state or bearer downgrade is introduced.
-    /// Dropping/cancelling this future retires the listen and any in-flight
-    /// request without revoking the shared login or discarding reusable idle
-    /// discovery connections. Already committed remote effects cannot be recalled.
+    /// exact transport, trust policy and original DPoP session. Every successor
+    /// receives a new request identity and fresh proof; no second client, runtime,
+    /// detached task, token renewal, tool call, update, remote cancel, redirect,
+    /// proxy, cookie state or bearer downgrade is introduced. Dropping/cancelling
+    /// this future retires its listen and any in-flight request without revoking
+    /// the shared login or discarding reusable idle discovery connections.
+    /// Already committed remote effects cannot be recalled.
     ///
     /// Use a fresh 1..=128 ASCII alphanumeric/underscore/dot/dash id_prefix for
     /// each explicit run. Generated IDs are not idempotency or restart tokens.
@@ -457,125 +540,141 @@ impl DpopHttpClient {
         ).await? {
             return Ok(result);
         }
-        // Refuse impossible reconciliation before opening a live connection.
-        state.require_snapshot()?;
-        let remaining = state.remaining_limits()?;
-        if remaining.core.notifications() == 0 {
-            return Err(ManagedCoreError::NotificationLimit.into());
-        }
-        let idle = Idle::new(cx.now(), limits.idle);
-        let selection = state.selection(metadata.clone(), &task)?;
-        let prepared = with_caller(cx, || Prepared::new(
-            self.resource().as_str(), selection,
-            remaining.core, self.policy.max_body_bytes,
-        ))?;
-        let response = self.post_resource_with_bounds(
-            cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
-        ).await?;
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-        let (wire, mut decoder) = with_caller(cx, || prepared.admit(response))?;
-        state.charge(decoder.usage())?;
-        // From this point the decoder holds cumulative watch-wide usage. Later
-        // gets update these counters rather than obtaining a new listen budget.
-        decoder.limits = limits.core;
-        decoder.bytes = state.usage.0;
-        decoder.notifications = state.usage.1;
+        'subscriptions: loop {
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            // Refuse impossible reconciliation before opening a live connection.
+            state.require_snapshot()?;
+            let remaining = state.remaining_limits()?;
+            if remaining.core.notifications() == 0 {
+                return Err(ManagedCoreError::NotificationLimit.into());
+            }
+            // A successor can observe but cannot revive the former listen's
+            // resolver/update authority, even if the caller installed a driver.
+            let may_update = state.reconnects == 0;
+            let idle = Idle::new(cx.now(), limits.idle);
+            let selection = state.selection(metadata.clone(), &task)?;
+            let prepared = with_caller(cx, || Prepared::new(
+                self.resource().as_str(), selection,
+                remaining.core, self.policy.max_body_bytes,
+            ))?;
+            let response = self.post_resource_with_bounds(
+                cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
+            ).await?;
+            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            let (wire, mut decoder) = with_caller(cx, || prepared.admit(response))?;
+            state.charge(decoder.usage())?;
+            // From this point the decoder holds cumulative watch-wide usage.
+            // Fresh discovery/listens never allocate a fresh aggregate budget.
+            decoder.limits = limits.core;
+            decoder.bytes = state.usage.0;
+            decoder.notifications = state.usage.1;
 
-        let response = within(cx, cancellation, &self.session, credential, idle.bounds(bounds), async {
-            let mut headers = resource_headers(&self.session, credential, &wire, &self.policy)?;
-            for (name, value) in &mut headers {
-                if name.eq_ignore_ascii_case("Accept") { *value = MODERN_MCP_ACCEPT.to_owned(); }
-            }
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-            self.transport.request_streaming(
-                cx, Method::Post, self.session.resource.as_str(), headers, wire.body().to_vec(),
-            ).await.map_err(|_| DpopHttpError::TransportFailed)
-        }).await?;
-        let kind = with_caller(cx, || -> Result<_, DpopTaskWatchError> {
-            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-            Ok(validate_response_head(response.head.status, &response.head.headers)
-                .map_err(|_| DpopHttpError::InvalidResponseHeaders)?.kind())
-        })?;
-        let source = self.session.resource.clone();
-        self.session.observe_resource_nonce(&source, &response.head.headers)
-            .map_err(DpopHttpError::from)?;
-        check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
-        if response.head.status != 200 {
-            return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
-        }
-        let mut body = response.body;
-        let mut reader = Reader::<_, DpopTaskSubscriptionEvent>::new(
-            kind, decoder, limits, self.policy.max_body_bytes,
-        )?;
-        let mut idle = idle;
-        let mut bytes_left = BYTES_PER_TURN;
-        let mut frames_left = FRAMES_PER_TURN;
-        loop {
-            let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
-            if bytes_left == 0 || frames_left == 0 {
-                cooperate(&lifetime, &idle).await?;
-                bytes_left = BYTES_PER_TURN;
-                frames_left = FRAMES_PER_TURN;
-            }
-            let frame = within(cx, cancellation, &self.session, credential, idle.bounds(bounds), async {
-                poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await
-                    .transpose().map_err(|_| DpopHttpError::TransportFailed)
+            let response = within(cx, cancellation, &self.session, credential, idle.bounds(bounds), async {
+                let mut headers = resource_headers(&self.session, credential, &wire, &self.policy)?;
+                for (name, value) in &mut headers {
+                    if name.eq_ignore_ascii_case("Accept") { *value = MODERN_MCP_ACCEPT.to_owned(); }
+                }
+                check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+                self.transport.request_streaming(
+                    cx, Method::Post, self.session.resource.as_str(), headers, wire.body().to_vec(),
+                ).await.map_err(|_| DpopHttpError::TransportFailed)
             }).await?;
-            let Some(frame) = frame else {
-                // Only a clean admitted terminal permits final reconciliation.
-                // Peer cancellation ends this listen, not its selected Task.
-                let completed = with_caller(cx, || reader.finish(&lifetime, &idle))?;
-                match completed.result {
-                    Ok(_) | Err(DpopStreamError::SubscriptionCancelled) => {}
-                    Err(error) => return Err(error.into()),
-                }
-                state.usage = completed.usage;
-                if let Some(result) = self.watch_snapshot(
-                    cx, cancellation, credential, &metadata, &task, &mut state, bounds,
-                    &mut input, false,
-                ).await? {
-                    return Ok(result);
-                }
-                return self.poll_after_subscription(
-                    cx, cancellation, credential, &metadata, &task, &mut state, bounds,
-                    &mut input,
-                ).await;
-            };
-            frames_left -= 1;
-            let Some(mut data) = frame.into_data() else { continue };
-            while data.has_remaining() {
+            let kind = with_caller(cx, || -> Result<_, DpopTaskWatchError> {
+                check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+                Ok(validate_response_head(response.head.status, &response.head.headers)
+                    .map_err(|_| DpopHttpError::InvalidResponseHeaders)?.kind())
+            })?;
+            let source = self.session.resource.clone();
+            self.session.observe_resource_nonce(&source, &response.head.headers)
+                .map_err(DpopHttpError::from)?;
+            check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
+            if response.head.status != 200 {
+                return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
+            }
+            let mut body = response.body;
+            let mut reader = Reader::<_, DpopTaskSubscriptionEvent>::new(
+                kind, decoder, limits, self.policy.max_body_bytes,
+            )?;
+            let mut idle = idle;
+            let mut bytes_left = BYTES_PER_TURN;
+            let mut frames_left = FRAMES_PER_TURN;
+            loop {
                 let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
-                if bytes_left == 0 {
+                if bytes_left == 0 || frames_left == 0 {
                     cooperate(&lifetime, &idle).await?;
                     bytes_left = BYTES_PER_TURN;
                     frames_left = FRAMES_PER_TURN;
                 }
-                let bytes = data.chunk();
-                let consumed = bytes.len().min(bytes_left);
-                if consumed == 0 { return Err(DpopHttpError::TransportFailed.into()); }
-                let mut reconcile = false;
-                with_caller(cx, || reader.push(
-                    &bytes[..consumed], &lifetime, &mut idle,
-                    &mut |_| { reconcile = true; true },
-                ))?;
-                data.advance(consumed);
-                bytes_left -= consumed;
-                if reconcile {
-                    WatchState::require_acknowledged(&reader.decoder, &task)?;
-                }
-                if reconcile && reader.terminal.is_none() {
-                    state.usage = reader.decoder.usage();
-                    // No immutable session borrow crosses this mutable get.
-                    // The listen owns its response body, not a pool slot or a
-                    // transport borrow; the same client can drive the get.
+                let frame = within(cx, cancellation, &self.session, credential, idle.bounds(bounds), async {
+                    poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await
+                        .transpose().map_err(|_| DpopHttpError::TransportFailed)
+                }).await?;
+                let Some(frame) = frame else {
+                    // Only a clean admitted terminal permits final reconciliation
+                    // or a successor. Peer cancellation ends the listen, not Task.
+                    let completed = with_caller(cx, || reader.finish(&lifetime, &idle))?;
+                    match completed.result {
+                        Ok(_) | Err(DpopStreamError::SubscriptionCancelled) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    // Retire the old physical response before any successor I/O.
+                    drop(body);
+                    state.usage = completed.usage;
                     if let Some(result) = self.watch_snapshot(
-                        cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),
-                        &mut input, true,
+                        cx, cancellation, credential, &metadata, &task, &mut state, bounds,
+                        &mut input, false,
                     ).await? {
                         return Ok(result);
                     }
-                    reader.decoder.bytes = state.usage.0;
-                    reader.decoder.notifications = state.usage.1;
+                    if let Some(due) = state.begin_reconnect(cx.now())? {
+                        within(cx, cancellation, &self.session, credential, bounds, async {
+                            if cx.now() < due { Sleep::new(due).await; }
+                            Ok(())
+                        }).await?;
+                        check_live(cx, cancellation, &self.session, credential, bounds)?;
+                        continue 'subscriptions;
+                    }
+                    return self.poll_after_subscription(
+                        cx, cancellation, credential, &metadata, &task, &mut state, bounds,
+                        &mut input,
+                    ).await;
+                };
+                frames_left -= 1;
+                let Some(mut data) = frame.into_data() else { continue };
+                while data.has_remaining() {
+                    let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+                    if bytes_left == 0 {
+                        cooperate(&lifetime, &idle).await?;
+                        bytes_left = BYTES_PER_TURN;
+                        frames_left = FRAMES_PER_TURN;
+                    }
+                    let bytes = data.chunk();
+                    let consumed = bytes.len().min(bytes_left);
+                    if consumed == 0 { return Err(DpopHttpError::TransportFailed.into()); }
+                    let mut reconcile = false;
+                    with_caller(cx, || reader.push(
+                        &bytes[..consumed], &lifetime, &mut idle,
+                        &mut |_| { reconcile = true; true },
+                    ))?;
+                    data.advance(consumed);
+                    bytes_left -= consumed;
+                    if reconcile {
+                        WatchState::require_acknowledged(&reader.decoder, &task)?;
+                    }
+                    if reconcile && reader.terminal.is_none() {
+                        state.usage = reader.decoder.usage();
+                        // No immutable session borrow crosses this mutable get.
+                        // The listen owns its response body, not a pool slot or a
+                        // transport borrow; the same client can drive the get.
+                        if let Some(result) = self.watch_snapshot(
+                            cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),
+                            &mut input, may_update,
+                        ).await? {
+                            return Ok(result);
+                        }
+                        reader.decoder.bytes = state.usage.0;
+                        reader.decoder.notifications = state.usage.1;
+                    }
                 }
             }
         }
