@@ -5,6 +5,9 @@
 //! returned task after an interrupted wait to recover the SAME owner and
 //! disposition; cancellation is not a rollback receipt.
 
+/// Persistence callbacks retaining Task creation and watch write custody.
+pub mod persistence;
+
 use std::fmt;
 use std::fs::File;
 
@@ -66,7 +69,7 @@ impl<P, I> std::error::Error for TaskResumeSubmissionFailure<P, I> {}
 
 /// The same exclusive owner and the transaction's exact storage outcome.
 /// Even a protection or uncertain-commit error returns the owner, preserving
-/// quarantine. Neither a record nor its possibly sensitive controls is Debug.
+/// quarantine. This completion implements neither Debug, Clone nor serialization.
 pub struct TaskResumeCompletion<P, T> {
     owner: AsyncTaskResumeStore<P>,
     outcome: Result<T, TaskResumeStoreError>,
@@ -307,6 +310,8 @@ impl<P: TaskResumeProtector + 'static> AsyncTaskResumeStore<P> {
 
 #[cfg(test)]
 mod tests {
+    mod persistence;
+
     use super::*;
     use std::collections::BTreeMap;
     use std::fs;
