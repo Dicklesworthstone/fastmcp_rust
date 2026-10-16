@@ -61,6 +61,14 @@ impl DpopTaskWatchDriverPolicy {
         };
         check(format!("{prefix}.listen.discover"))?;
         check(format!("{prefix}.listen"))?;
+        // A creating call may not borrow an identity that will be used only
+        // after a later clean rollover. Reserve the whole configured namespace
+        // before creation, not when the already-created Task reconnects.
+        let reconnects = self.watch.reconnect.map_or(0, |policy| policy.maximum_reconnects);
+        for index in 1..=reconnects {
+            check(format!("{prefix}.listen.{index}.discover"))?;
+            check(format!("{prefix}.listen.{index}"))?;
+        }
         for index in 0..self.watch.maximum_snapshots {
             check(format!("{prefix}.{index}.discover"))?;
             check(format!("{prefix}.{index}.get"))?;
@@ -94,8 +102,24 @@ impl DpopTaskWatchDriverPolicy {
         Ok(Self { watch, input })
     }
 
+    /// Continue observation across bounded clean subscription rollovers.
+    /// After the first listen ends, successors can observe but cannot invoke
+    /// the input resolver or send updates. Fresh input-required state returns
+    /// to the host for explicit disposition; old answers are never replayed.
+    /// Creating-call adapters reserve every successor request ID in advance.
+    /// The same operation deadline, credential and aggregate quotas remain.
+    pub fn with_reconnects(
+        mut self,
+        maximum_reconnects: usize,
+        minimum_delay: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        self.watch = self.watch.with_reconnects(maximum_reconnects, minimum_delay)?;
+        Ok(self)
+    }
+
     /// Opt into observation-only polling after a clean subscription ending.
     /// Task-input mutation authority is not restored once the listen is gone.
+    /// When reconnection is selected, polling follows its exhausted allowance.
     pub fn with_polling_fallback(
         mut self,
         maximum_polls: usize,
@@ -320,7 +344,9 @@ impl DpopHttpClient {
     /// share ONE byte/count budget, original credential, and absolute deadline.
     /// Get/update progress is admitted and charged, not delivered as a snapshot.
     /// A quiet listen sends no periodic gets. After clean listen completion,
-    /// the final get is observation-only: input-required returns to the host.
+    /// the final get and any explicitly configured successors are observation-only:
+    /// input-required returns to the host, even if the input ledger has capacity.
+    /// Reconnection never carries the former listen's mutation authority forward.
     ///
     /// ReturnToCaller and a zero-update policy return the full input snapshot,
     /// including metadata. Failed/cancelled Tasks retain their terminal variants.
@@ -360,3 +386,52 @@ impl DpopHttpClient {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "native-tls-roots"))]
+mod reconnect_tls;
+
+#[cfg(test)]
+mod reconnect_admission_tests {
+    use super::*;
+
+    #[test]
+    fn creating_ids_are_checked_against_every_configured_successor_before_creation() {
+        let ordinary = DpopTaskWatchDriverPolicy::new(8, 2, 16, 4096, Duration::from_secs(60)).unwrap();
+        let reconnecting = ordinary.with_reconnects(64, Duration::from_millis(1)).unwrap();
+        let unrelated = RequestId::String("creating-call".to_owned());
+        for index in [1, 2, 63, 64] {
+            for suffix in ["", ".discover"] {
+                let reserved = RequestId::String(format!("watch.listen.{index}{suffix}"));
+                assert!(ordinary.admit_creation_ids("watch", [&unrelated, &reserved]).is_ok());
+                for ids in [[&reserved, &unrelated], [&unrelated, &reserved]] {
+                    assert!(matches!(reconnecting.admit_creation_ids("watch", ids),
+                        Err(DpopTaskWatchError::Driver(ManagedTaskDriverError::RepeatedRequestId))));
+                }
+                assert!(reconnecting.admit_creation_ids("other", [&unrelated, &reserved]).is_ok());
+            }
+        }
+        let outside = RequestId::String("watch.listen.65".to_owned());
+        assert!(reconnecting.admit_creation_ids("watch", [&unrelated, &outside]).is_ok());
+        for reserved in ["watch.listen", "watch.listen.discover", "watch.0.get", "watch.input.0.update"] {
+            let reserved = RequestId::String(reserved.to_owned());
+            assert!(reconnecting.admit_creation_ids("watch", [&unrelated, &reserved]).is_err());
+        }
+    }
+
+    #[test]
+    fn reconnect_configuration_preserves_driver_limits_and_composes_with_polling() {
+        let original = DpopTaskWatchDriverPolicy::new(9, 3, 16, 4096, Duration::from_secs(27)).unwrap();
+        let selected = original.with_reconnects(2, Duration::from_millis(7)).unwrap()
+            .with_polling_fallback(4, Duration::from_millis(11)).unwrap();
+        assert_eq!(selected.watch.maximum_snapshots, original.watch.maximum_snapshots);
+        assert_eq!(selected.input.maximum_updates, original.input.maximum_updates);
+        assert_eq!(selected.input.maximum_input_keys, original.input.maximum_input_keys);
+        assert_eq!(selected.input.maximum_state_bytes, original.input.maximum_state_bytes);
+        assert_eq!(selected.timeout(), original.timeout());
+        assert_eq!(selected.watch.reconnect.unwrap().maximum_reconnects, 2);
+        assert_eq!(selected.watch.fallback.unwrap().maximum_polls, 4);
+        assert!(original.watch.reconnect.is_none());
+        assert!(original.with_reconnects(0, Duration::from_millis(1)).is_err());
+        assert!(original.with_reconnects(1, Duration::ZERO).is_err());
+    }
+}
