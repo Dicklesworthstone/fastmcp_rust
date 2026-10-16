@@ -136,10 +136,11 @@ different things:
   **more than an adapter profile**, which is worth stating precisely because
   the cheap-sounding estimate is wrong. The HTTPS requirement is not one check
   in the conformance adapter: a census of `crates/fastmcp-client/src`, with
-  `cfg(test)` modules excluded, finds **22 production HTTPS enforcement points
-  across 17 files**: 20 independent `scheme() != "https"` or
+  `cfg(test)` modules excluded, finds **23 production HTTPS enforcement points
+  across 18 files**: 21 independent `scheme() != "https"` or
   `starts_with("https://")` refusals in `http_auth.rs`, `challenge.rs`,
-  `private_key_jwt.rs`, `metadata_document.rs`, `dpop.rs`, `driver.rs`,
+  `private_key_jwt.rs`, `metadata_document.rs`, `dpop.rs`,
+  `dpop/native/core/stream/task_subscription/watch/checkpoint.rs`, `driver.rs`,
   `redirect.rs`, `http_client.rs`, `managed/client.rs`, `resume.rs`,
   `oauth.rs`, `revocation.rs`, `recovery.rs`, `repair.rs`, `http_executor.rs`
   and `parameter_headers.rs`, plus the two central helpers `validate_https`
@@ -161,7 +162,7 @@ different things:
   direction that matters: RFC 8252 §7.3 permits loopback `http` for the
   *client's own redirect URI*, which is not what blocks us, while OAuth 2.1
   requires `https` for the authorization server's own endpoints — exactly the
-  URLs these 22 enforcement points refuse. The pinned suite serves its
+  URLs these 23 enforcement points refuse. The pinned suite serves its
   authorization server
   over plain `http` as a harness convenience, not because the spec allows it.
   So permitting it would be a real relaxation beyond the spec, not a reviewed
@@ -186,7 +187,7 @@ different things:
   host-versus-library trust split are all settled here already — for parameter
   headers. What is *not* settled, and is the actual decision, is whether the
   same split is acceptable for the authorization server's own endpoints, where
-  these 22 points protect credential transport rather than header mirroring.
+  these 23 points protect credential transport rather than header mirroring.
   That is a strictly stronger property, so the existing precedent narrows the
   question rather than answering it.
 
@@ -215,13 +216,15 @@ different things:
   migration). DPoP
   (RFC 9449) primitives now **exist and compile**, which was not true before
   2026-10-12, and the surface is growing faster than this row can be rewritten:
-  measured 2026-10-14 at `acc20148`, `fastmcp_client::http_auth::dpop` is
-  **20 files, 10,541 lines, 83 public items and 132 in-module tests**, plus 515
+  measured 2026-10-16 at `7bd44cd0`, `fastmcp_client::http_auth::dpop` is
+  **57 files, 24,095 lines, 151 public items and 311 in-module tests**, plus 515
   lines and 7 tests in `fastmcp_protocol::dpop` behind the `jose` feature —
-  11,056 lines in all. The trajectory is the point rather than any one reading:
-  781 lines on 2026-10-12, 6,699 at `a6559ff2`, 10,541 at `acc20148` a few
-  hours later. That is **13.5× in two days**, and the caller count was zero at
-  every one of those three readings. Treat the counts as a
+  24,610 lines in all. The trajectory is the point rather than any one reading:
+  781 lines on 2026-10-12, 6,699 at `a6559ff2`, 10,541 at `acc20148`, and
+  24,095 at `7bd44cd0` two days after that — **30.8× in four days**, with the
+  in-workspace caller count zero at every reading. That is the module keeping
+  its own promise, not a widening gap: it is caller-driven by design, so the
+  consumer is the application. Treat the counts as a
   dated reading of a module under active construction, not a durable fact; the
   gate below deliberately does not pin them, because a check that reddens on
   ordinary growth is a check that gets switched off. It is reachable by facade
@@ -243,7 +246,7 @@ different things:
   the one this row first claimed: the check fails if the library ever starts
   driving DPoP itself, which is the promise the module makes and the thing
   worth protecting. The size and its growth rate are still worth recording:
-  781 lines on 2026-10-12 to 11,056 across two crates two days later.
+  781 lines on 2026-10-12 to 24,610 across two crates four days later.
   *(An earlier version of this sentence ranked that against "`http.rs` is
   14,734 lines and `websocket.rs` 6,828". That comparison was wrong and is
   withdrawn: it set a whole module against a whole module, while the unclaimed
