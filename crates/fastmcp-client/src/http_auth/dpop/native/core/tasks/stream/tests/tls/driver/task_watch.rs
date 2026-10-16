@@ -1,5 +1,6 @@
 //! Public event-driven watches through the existing real TLS and DPoP fixture.
 
+mod fallback;
 mod input;
 mod subscription_end;
 

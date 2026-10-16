@@ -12,10 +12,13 @@ pub mod input;
 use std::fmt;
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::time::Duration;
 
+use asupersync::Time;
 use asupersync::bytes::Buf;
 use asupersync::http::body::Body;
 use asupersync::http::h1::Method;
+use asupersync::time::Sleep;
 use fastmcp_protocol::tasks_extension::{GetTaskResult, Task, TaskInputRequests};
 
 use super::*;
@@ -35,24 +38,64 @@ use crate::http_executor::{MODERN_MCP_ACCEPT, validate_response_head};
 /// Limits the initial snapshot and all event-triggered reconciliations.
 /// No interval is needed: a quiet acknowledged subscription is never polled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DpopTaskPollingFallback {
+    maximum_polls: usize,
+    minimum_poll_interval: Duration,
+}
+
+impl DpopTaskPollingFallback {
+    /// Admit 1..=1024 additional gets after a clean subscription ending.
+    /// The local interval is nonzero and at most one minute; a longer peer
+    /// pollIntervalMs always wins.
+    pub fn new(
+        maximum_polls: usize,
+        minimum_poll_interval: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        if !(1..=1024).contains(&maximum_polls)
+            || minimum_poll_interval.is_zero()
+            || minimum_poll_interval > Duration::from_mins(1)
+        {
+            return Err(DpopTaskWatchError::InvalidPolicy);
+        }
+        Ok(Self { maximum_polls, minimum_poll_interval })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DpopTaskWatchPolicy {
     maximum_snapshots: usize,
+    fallback: Option<DpopTaskPollingFallback>,
 }
 
 impl Default for DpopTaskWatchPolicy {
     fn default() -> Self {
-        Self { maximum_snapshots: 64 }
+        Self { maximum_snapshots: 64, fallback: None }
     }
 }
 
 impl DpopTaskWatchPolicy {
     /// Admit 1..=1024 snapshots, including the initial and final reconciliation.
     /// A single snapshot is useful for a Task which is already non-Working.
+    /// Polling fallback is disabled unless explicitly selected.
     pub fn new(maximum_snapshots: usize) -> Result<Self, DpopTaskWatchError> {
         if !(1..=1024).contains(&maximum_snapshots) {
             return Err(DpopTaskWatchError::InvalidPolicy);
         }
-        Ok(Self { maximum_snapshots })
+        Ok(Self { maximum_snapshots, fallback: None })
+    }
+
+    /// Opt into bounded observation-only polling if an acknowledged subscription
+    /// ends cleanly while the authoritative Task remains Working. This never
+    /// restores Task-input update authority after teardown.
+    pub fn with_polling_fallback(
+        mut self,
+        maximum_polls: usize,
+        minimum_poll_interval: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        self.fallback = Some(DpopTaskPollingFallback::new(
+            maximum_polls, minimum_poll_interval,
+        )?);
+        Ok(self)
     }
 }
 
@@ -64,6 +107,8 @@ pub enum DpopTaskWatchError {
     SnapshotLimit,
     TaskNotAcknowledged,
     SubscriptionEndedWhileWorking,
+    FallbackLimit,
+    InvalidPollInterval,
     UnexpectedResponse,
     Stream(DpopStreamError),
     /// Capability, host-input, or acknowledged-ledger refusal.
@@ -78,6 +123,8 @@ impl fmt::Display for DpopTaskWatchError {
             Self::SnapshotLimit => "DPoP Task watch snapshot limit reached",
             Self::TaskNotAcknowledged => "DPoP Task watch selection was not acknowledged",
             Self::SubscriptionEndedWhileWorking => "DPoP Task subscription ended while work remains",
+            Self::FallbackLimit => "DPoP Task polling fallback limit reached",
+            Self::InvalidPollInterval => "DPoP Task polling interval cannot be represented",
             Self::UnexpectedResponse => "DPoP Task watch requires a get snapshot",
             Self::Stream(error) => return error.fmt(f),
             Self::Driver(error) => return error.fmt(f),
@@ -109,6 +156,8 @@ struct WatchState {
     prefix: String,
     policy: DpopTaskWatchPolicy,
     snapshots: usize,
+    fallback_polls: usize,
+    fallback_due: Option<Time>,
     usage: (usize, usize),
     limits: DpopStreamLimits,
 }
@@ -122,7 +171,15 @@ impl WatchState {
         {
             return Err(DpopTaskWatchError::InvalidIdPrefix);
         }
-        Ok(Self { prefix: prefix.to_owned(), policy, snapshots: 0, usage: (0, 0), limits })
+        Ok(Self {
+            prefix: prefix.to_owned(),
+            policy,
+            snapshots: 0,
+            fallback_polls: 0,
+            fallback_due: None,
+            usage: (0, 0),
+            limits,
+        })
     }
 
     fn require_snapshot(&self) -> Result<(), DpopTaskWatchError> {
@@ -170,6 +227,38 @@ impl WatchState {
         )?;
         self.snapshots += 1;
         Ok((operation, limits))
+    }
+
+    fn note_snapshot(&mut self, now: Time, task: &Task) -> Result<(), DpopTaskWatchError> {
+        let Some(fallback) = self.policy.fallback else {
+            self.fallback_due = None;
+            return Ok(());
+        };
+        if !matches!(task, Task::Working(_)) {
+            self.fallback_due = None;
+            return Ok(());
+        }
+        let peer = task.base().poll_interval_ms.as_ref()
+            .map(|hint| hint.try_as_millis())
+            .transpose()
+            .map_err(|_| DpopTaskWatchError::InvalidPollInterval)?
+            .map(Duration::from_millis)
+            .unwrap_or(fallback.minimum_poll_interval);
+        let nanos = u64::try_from(peer.max(fallback.minimum_poll_interval).as_nanos())
+            .unwrap_or(u64::MAX);
+        self.fallback_due = Some(now.saturating_add_nanos(nanos));
+        Ok(())
+    }
+
+    fn begin_fallback_poll(&mut self) -> Result<Option<Time>, DpopTaskWatchError> {
+        let Some(fallback) = self.policy.fallback else { return Ok(None); };
+        if self.fallback_polls >= fallback.maximum_polls {
+            return Err(DpopTaskWatchError::FallbackLimit);
+        }
+        self.require_snapshot()?;
+        let due = self.fallback_due.ok_or(DpopTaskWatchError::UnexpectedResponse)?;
+        self.fallback_polls += 1;
+        Ok(Some(due))
     }
 
     fn selection(&self, metadata: FinalRequestMeta, task: &TaskId)
@@ -227,6 +316,7 @@ impl DpopHttpClient {
                 return Err(DpopTaskWatchError::UnexpectedResponse);
             };
             check_live(cx, cancellation, &self.session, credential, bounds)?;
+            state.note_snapshot(cx.now(), &snapshot.task)?;
             let Some(input) = input.as_mut() else { return Ok(outcome(*snapshot)); };
             let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
             let decision = input.on_snapshot(&life, state, &snapshot.task, may_update).await?;
@@ -255,6 +345,35 @@ impl DpopHttpClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_after_subscription<R, F, O>(
+        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
+        credential: &DpopCredential, metadata: &FinalRequestMeta, task: &TaskId,
+        state: &mut WatchState, bounds: WaitBounds,
+        input: &mut Option<InputDriver<R, O>>,
+    ) -> Result<DpopTaskWaitOutcome, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        loop {
+            let Some(due) = state.begin_fallback_poll()? else {
+                return Err(DpopTaskWatchError::SubscriptionEndedWhileWorking);
+            };
+            within(cx, cancellation, &self.session, credential, bounds, async {
+                if cx.now() < due { Sleep::new(due).await; }
+                Ok(())
+            }).await?;
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            if let Some(result) = self.watch_snapshot(
+                cx, cancellation, credential, metadata, task, state, bounds, input, false,
+            ).await? {
+                return Ok(result);
+            }
+        }
+    }
+
     /// Observe an existing Task without periodic polling or implicit mutation.
     ///
     /// The first authenticated get is immediate. If Working, one Tasks listen
@@ -263,14 +382,17 @@ impl DpopHttpClient {
     /// the get/subscribe race even when completion emits no event to this listen.
     /// Later admitted status events trigger fresh gets; their embedded snapshots
     /// are not used to overwrite newer state. Coalesced events may share a get.
-    /// A quiet subscription causes no periodic gets or reconnects.
+    /// A quiet live subscription causes no periodic gets or reconnects.
     ///
     /// The returned complete GetTaskResult is preserved, including metadata.
     /// Input-required is an explicit host handoff; failed/cancelled remote Tasks
     /// are terminal snapshots, not successful executions. A clean subscription
     /// terminal, whether completion or peer cancellation, requires a final get;
-    /// a still-Working Task is an error. Subscription cancellation never means
-    /// Task cancellation. Missing acknowledgement, early EOF, invalid frames
+    /// a still-Working Task is an error unless an explicit bounded polling
+    /// fallback was configured. Fallback waits for the greater of its local
+    /// floor and the latest admitted pollIntervalMs, and remains observation-only:
+    /// input-required is returned rather than updated. Subscription cancellation
+    /// never means Task cancellation. Missing acknowledgement, early EOF, invalid frames
     /// and exhausted bounds fail without a final get. A non-Working
     /// authoritative get stops the local listen without claiming that the
     /// subscription itself completed or validating an unread tail.
@@ -287,7 +409,7 @@ impl DpopHttpClient {
     /// client's bounded discovery pool, so reconciliation reuses this client's
     /// exact transport, trust policy and original DPoP session. No second client,
     /// runtime, detached task, token renewal, tool call, update, remote cancel,
-    /// retry, redirect, proxy, cookie state or bearer fallback is introduced.
+    /// retry, redirect, proxy, cookie state or bearer downgrade is introduced.
     /// Dropping/cancelling this future retires the listen and any in-flight
     /// request without revoking the shared login or discarding reusable idle
     /// discovery connections. Already committed remote effects cannot be recalled.
@@ -408,10 +530,16 @@ impl DpopHttpClient {
                     Err(error) => return Err(error.into()),
                 }
                 state.usage = completed.usage;
-                return self.watch_snapshot(
-                    cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),
+                if let Some(result) = self.watch_snapshot(
+                    cx, cancellation, credential, &metadata, &task, &mut state, bounds,
                     &mut input, false,
-                ).await?.ok_or(DpopTaskWatchError::SubscriptionEndedWhileWorking);
+                ).await? {
+                    return Ok(result);
+                }
+                return self.poll_after_subscription(
+                    cx, cancellation, credential, &metadata, &task, &mut state, bounds,
+                    &mut input,
+                ).await;
             };
             frames_left -= 1;
             let Some(mut data) = frame.into_data() else { continue };

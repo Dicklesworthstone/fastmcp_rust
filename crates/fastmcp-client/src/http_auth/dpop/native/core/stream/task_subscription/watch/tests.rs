@@ -1,3 +1,5 @@
+mod fallback;
+
 use super::*;
 use std::future::Future;
 use std::task::{Context, Poll, Waker};

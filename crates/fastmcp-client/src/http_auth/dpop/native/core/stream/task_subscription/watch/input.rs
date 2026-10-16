@@ -93,6 +93,19 @@ impl DpopTaskWatchDriverPolicy {
         ).map_err(|_| DpopTaskWatchError::InvalidPolicy)?;
         Ok(Self { watch, input })
     }
+
+    /// Opt into observation-only polling after a clean subscription ending.
+    /// Task-input mutation authority is not restored once the listen is gone.
+    pub fn with_polling_fallback(
+        mut self,
+        maximum_polls: usize,
+        minimum_poll_interval: Duration,
+    ) -> Result<Self, DpopTaskWatchError> {
+        self.watch = self.watch.with_polling_fallback(
+            maximum_polls, minimum_poll_interval,
+        )?;
+        Ok(self)
+    }
 }
 
 impl From<ManagedTaskDriverError> for DpopTaskWatchError {
