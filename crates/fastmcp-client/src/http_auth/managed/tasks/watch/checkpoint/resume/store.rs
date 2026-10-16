@@ -13,6 +13,9 @@
 //! lock. Valid old checkpoints are NOT independent anti-rollback evidence:
 //! restart must always reauthorize and read current remote Task state.
 
+/// Owned asynchronous access through the caller's bounded credential-I/O lane.
+pub mod asynchronous;
+
 use std::collections::BTreeMap;
 use std::fmt;
 
