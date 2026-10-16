@@ -4,6 +4,9 @@
 //! admission. A later checkpoint write therefore cannot invalidate a cursor
 //! halfway through staging or make a partial selection appear complete.
 
+/// Fresh reconciliation with explicit, persistence-gated result disposition.
+pub mod workflow;
+
 use std::fmt;
 
 use asupersync::Cx;
