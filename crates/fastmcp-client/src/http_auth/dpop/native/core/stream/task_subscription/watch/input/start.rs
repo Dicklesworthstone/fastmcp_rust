@@ -50,6 +50,41 @@ fn creation_operation(
     )?)
 }
 
+
+fn admit_creation_operation(
+    prefix: &str,
+    operation: &DpopTaskOperation,
+    policy: DpopTaskWatchDriverPolicy,
+) -> Result<(), DpopTaskWatchError> {
+    if !matches!(&operation.request, ManagedTaskRequest::CallTool { .. }) {
+        return Err(DpopTaskWatchError::UnexpectedResponse);
+    }
+    let collides = |candidate: &RequestId| {
+        operation.discovery_id.correlates_with(candidate)
+            || operation.operation_id.correlates_with(candidate)
+    };
+    for index in 0..policy.watch.maximum_snapshots {
+        for suffix in ["discover", "get"] {
+            if collides(&RequestId::String(format!("{prefix}.{index}.{suffix}"))) {
+                return Err(ManagedTaskDriverError::RepeatedRequestId.into());
+            }
+        }
+    }
+    for index in 0..policy.input.maximum_updates {
+        for suffix in ["discover", "update"] {
+            if collides(&RequestId::String(format!("{prefix}.input.{index}.{suffix}"))) {
+                return Err(ManagedTaskDriverError::RepeatedRequestId.into());
+            }
+        }
+    }
+    for suffix in ["listen.discover", "listen"] {
+        if collides(&RequestId::String(format!("{prefix}.{suffix}"))) {
+            return Err(ManagedTaskDriverError::RepeatedRequestId.into());
+        }
+    }
+    Ok(())
+}
+
 impl DpopHttpClient {
     /// Create once, then drive a returned Task without periodic polling.
     ///
@@ -102,16 +137,54 @@ impl DpopHttpClient {
         F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
         O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
     {
+        let operation = creation_operation(id_prefix, request)?;
+        self.start_and_drive_task_operation_with_subscription(
+            cx, cancellation, credential, metadata, operation, id_prefix,
+            policy, limits, resolve, observe,
+        ).await
+    }
+
+    /// Create once from an already-reviewed DPoP Task operation, then continue
+    /// through the subscription/input lifecycle without losing its tool headers.
+    ///
+    /// The operation must be CallTool. Its exact discovery/tool IDs and optional
+    /// ReviewedToolHeaders are retained. Before signing or I/O, both IDs are
+    /// checked against every generated get, input-update, and listen identity
+    /// permitted by the selected policy; a collision fails closed.
+    ///
+    /// All creation EOF, observer, quota, deadline, no-replay, recovery and
+    /// teardown rules are identical to start_and_drive_task_with_subscription.
+    /// Reviewed headers apply only to the creating tool POST. They never appear
+    /// on Tasks discovery, get, update or subscription requests.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_and_drive_task_operation_with_subscription<R, F, O>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        operation: DpopTaskOperation,
+        id_prefix: &str,
+        policy: DpopTaskWatchDriverPolicy,
+        limits: DpopStreamLimits,
+        resolve: R,
+        observe: O,
+    ) -> Result<DpopTaskSubscriptionExecutionOutcome, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(DpopHttpError::Cancelled.into());
         }
         let timeout = self.policy.timeout.min(limits.core.timeout()).min(policy.input.timeout);
         let bounds = WaitBounds::new(cx, timeout, credential)?;
         check_live(cx, cancellation, &self.session, credential, bounds)?;
-        // Prefix and callback metadata admission precede creation. The later
-        // private watch constructor reuses these limits, not a new deadline.
+        // Prefix, future-ID namespace and callback metadata admission all
+        // precede creation. No collision may surface after remote work exists.
         WatchState::new(id_prefix, policy.watch, limits)?;
-        let operation = creation_operation(id_prefix, request)?;
+        admit_creation_operation(id_prefix, &operation, policy)?;
         let mut input = InputDriver::new(policy.input, &metadata, resolve, observe)?;
         let completed = self.request_task_stream_with_bounds(
             cx, cancellation, credential, metadata.clone(), operation, limits,
@@ -134,8 +207,6 @@ impl DpopHttpClient {
             return Ok(DpopTaskSubscriptionExecutionOutcome::Initial(initial));
         }
         let task_id = task.base().task_id.clone();
-        // Never call the public watcher/driver here: it would reset response
-        // quotas and create a new absolute deadline after remote work began.
         let outcome = self.watch_task_using(
             cx, cancellation, credential, metadata, task_id, id_prefix,
             policy.watch, limits, bounds, completed.usage, Some(input),
@@ -157,6 +228,36 @@ mod tests {
         assert!(creation_operation("run", ManagedTaskRequest::CallTool {
             name: "work".to_owned(), arguments: None,
         }).is_ok());
+    }
+
+    #[test]
+    fn arbitrary_creation_ids_are_checked_against_the_entire_future_namespace() {
+        let policy = DpopTaskWatchDriverPolicy::new(
+            3, 2, 4, 8192, std::time::Duration::from_secs(10),
+        ).unwrap();
+        let call = || ManagedTaskRequest::CallTool {
+            name: "work".to_owned(), arguments: None,
+        };
+        for id in [
+            "run.0.discover", "run.2.get", "run.input.0.discover",
+            "run.input.1.update", "run.listen.discover", "run.listen",
+        ] {
+            let operation = DpopTaskOperation::new(
+                RequestId::String(id.to_owned()),
+                RequestId::String("initial-call".to_owned()),
+                call(),
+            ).unwrap();
+            assert!(matches!(
+                admit_creation_operation("run", &operation, policy),
+                Err(DpopTaskWatchError::Driver(ManagedTaskDriverError::RepeatedRequestId))
+            ));
+        }
+        let operation = DpopTaskOperation::new(
+            RequestId::String("run.3.get".to_owned()),
+            RequestId::String("run.input.2.update".to_owned()),
+            call(),
+        ).unwrap();
+        assert!(admit_creation_operation("run", &operation, policy).is_ok());
     }
 
     #[test]
