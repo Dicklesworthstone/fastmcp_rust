@@ -43,6 +43,35 @@ impl Default for DpopTaskWatchDriverPolicy {
 }
 
 impl DpopTaskWatchDriverPolicy {
+    pub(in crate::http_auth::dpop::native::core) fn timeout(self) -> Duration {
+        self.input.timeout
+    }
+
+    // Preflight arbitrary creating IDs against the COMPLETE bounded future
+    // namespace, before a tool can create remote work. Conversation successor
+    // IDs use colons and are disjoint from these dot-separated watch IDs.
+    pub(in crate::http_auth::dpop::native::core) fn admit_creation_ids(
+        self, prefix: &str, ids: [&RequestId; 2],
+    ) -> Result<(), DpopTaskWatchError> {
+        let check = |candidate: String| {
+            let candidate = RequestId::String(candidate);
+            if ids.iter().any(|id| id.correlates_with(&candidate)) {
+                Err(DpopTaskWatchError::from(ManagedTaskDriverError::RepeatedRequestId))
+            } else { Ok(()) }
+        };
+        check(format!("{prefix}.listen.discover"))?;
+        check(format!("{prefix}.listen"))?;
+        for index in 0..self.watch.maximum_snapshots {
+            check(format!("{prefix}.{index}.discover"))?;
+            check(format!("{prefix}.{index}.get"))?;
+        }
+        for index in 0..self.input.maximum_updates {
+            check(format!("{prefix}.input.{index}.discover"))?;
+            check(format!("{prefix}.input.{index}.update"))?;
+        }
+        Ok(())
+    }
+
     /// Allows 1..=1024 gets, 0..=128 updates, 0..=4096 input keys,
     /// 1..=4 MiB of retained input-key/fingerprint bytes and a nonzero timeout
     /// of at most 24 hours. Zero updates makes input-required a host handoff.
@@ -226,6 +255,35 @@ impl<R, O> InputDriver<R, O> {
 }
 
 impl DpopHttpClient {
+    // Only an admitted creating conversation can call this handoff. Publish
+    // its Task ID before any successor POST, then preserve the exact original
+    // bounds and charges; this method is not a public restart capability.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::http_auth::dpop::native::core) async fn drive_created_task_with_subscription<R, F, O>(
+        &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
+        credential: &DpopCredential, metadata: FinalRequestMeta, task: Task,
+        id_prefix: &str, policy: DpopTaskWatchDriverPolicy, limits: DpopStreamLimits,
+        bounds: WaitBounds, initial_usage: (usize, usize), resolve: R, observe: O,
+    ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+    {
+        check_live(cx, cancellation, &self.session, credential, bounds)?;
+        let mut input = InputDriver::new(policy.input, &metadata, resolve, observe)?;
+        let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+        callback(&life, || (input.observe)(&task))??;
+        if matches!(&task, Task::Completed { .. } | Task::Failed { .. } | Task::Cancelled(_)) {
+            return Ok(None);
+        }
+        let task_id = task.base().task_id.clone();
+        self.watch_task_using(
+            cx, cancellation, credential, metadata, task_id, id_prefix,
+            policy.watch, limits, bounds, initial_usage, Some(input),
+        ).await.map(Some)
+    }
+
     /// Drive an existing Task using subscriptions and explicit, typed host input.
     ///
     /// Uses the SAME get/acknowledge/reconcile watch as observation-only waiting.

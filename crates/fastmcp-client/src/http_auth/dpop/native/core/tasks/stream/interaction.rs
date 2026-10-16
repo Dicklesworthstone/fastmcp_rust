@@ -4,6 +4,9 @@
 //! common stream reader and the shared typed input session. A Task ends this
 //! conversation; it is not implicitly polled, updated or cancelled.
 
+/// Join protocol-authorized tool continuations to subscribed Task execution.
+pub mod execution;
+
 use std::fmt;
 use std::sync::Arc;
 
@@ -79,6 +82,14 @@ pub struct DpopTaskHostResult {
     pub result: Box<FinalCoreResult>,
     pub usage: CoreInputUsage,
     pub continuations: usize,
+}
+
+// Private handoff, never a public retry token. The executor carries its exact
+// cumulative charges and already-intersected host deadline into Task ownership.
+struct CompletedTaskConversation {
+    result: DpopTaskHostResult,
+    usage: (usize, usize),
+    bounds: WaitBounds,
 }
 
 /// No diagnostic retains peer state, arguments, answers, tokens or host text.
@@ -161,15 +172,41 @@ impl DpopHttpClient {
         id_prefix: &str,
         limits: &DpopTaskHostLimits,
         host: &mut H,
-        mut observer: N,
+        observer: N,
     ) -> Result<DpopTaskHostResult, DpopTaskHostError>
     where
         H: CoreInputHost + ?Sized,
         N: FnMut(&ServerNotification) -> bool,
     {
-        let mut bounds = WaitBounds::new(
+        let bounds = WaitBounds::new(
             cx, self.policy.timeout.min(limits.stream.core.timeout()), credential,
         )?;
+        self.execute_task_conversation_with_bounds(
+            cx, cancellation, credential, metadata, operation, id_prefix,
+            limits, bounds, host, observer,
+        ).await.map(|completed| completed.result)
+    }
+
+    // Both entrypoints use the same conversation, input session, decoders and
+    // observer guards. Only the caller chooses whether a Task is then driven.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_task_conversation_with_bounds<H, N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        operation: DpopTaskOperation,
+        id_prefix: &str,
+        limits: &DpopTaskHostLimits,
+        mut bounds: WaitBounds,
+        host: &mut H,
+        mut observer: N,
+    ) -> Result<CompletedTaskConversation, DpopTaskHostError>
+    where
+        H: CoreInputHost + ?Sized,
+        N: FnMut(&ServerNotification) -> bool,
+    {
         let mut idle = Idle::new(cx.now(), limits.stream.idle);
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         validate_prefix(id_prefix)?;
@@ -215,8 +252,12 @@ impl DpopHttpClient {
             )).await?;
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             let input = match conversation.accept(completed.result, completed.usage)? {
-                Step::Complete(result) => return Ok(DpopTaskHostResult {
-                    result, usage: inputs.usage(), continuations: conversation.continuations,
+                Step::Complete(result) => return Ok(CompletedTaskConversation {
+                    result: DpopTaskHostResult {
+                        result, usage: inputs.usage(), continuations: conversation.continuations,
+                    },
+                    usage: conversation.usage,
+                    bounds,
                 }),
                 Step::Input(input) => input,
             };
@@ -273,7 +314,7 @@ impl Conversation {
         limits: ManagedInteractionLimits,
     ) -> Result<Self, DpopTaskHostError> {
         let Reply::Tool(original) = &prepared.reply else {
-            return Err(ManagedInteractionError::InvalidInitialRequest.into());
+            return Err(ManagedCoreError::InvalidResult.into());
         };
         validate_initial(original)?;
         Ok(Self {
