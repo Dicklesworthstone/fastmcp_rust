@@ -13,6 +13,7 @@ use std::task::Poll;
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
+use asupersync::cx::cap;
 use asupersync::time::Sleep;
 use fastmcp_core::McpRequestCancellation;
 
@@ -21,12 +22,20 @@ use super::{ManagedCoreError, ManagedToolError, ToolContract, check_tool_call};
 // T deliberately includes the inner Result. Interaction-local answer refusals
 // must retain their original type and challenge; invalidation is terminal and
 // must not enter that correctable-input branch or restore the owned operation.
-pub(super) async fn await_validity<T>(
-    cx: &Cx,
+// Generic over the caller's capability set rather than demanding the full one.
+// The body needs TIME for the caller deadline and nothing else, so a caller
+// holding a narrower authority can still fence its own work here. The
+// capability flows to the callback through `set_current_restricted` below, so
+// widening it is a compile error rather than a review item.
+pub(super) async fn await_validity<Caps, T>(
+    cx: &Cx<Caps>,
     cancellation: &McpRequestCancellation,
     contract: &ToolContract,
     future: impl Future<Output = T>,
-) -> Result<T, ManagedToolError> {
+) -> Result<T, ManagedToolError>
+where
+    Caps: cap::HasTime + cap::CapSetRuntimeMask,
+{
     let mut invalidated = std::pin::pin!(contract.invalidation.cancelled());
     let mut cancelled = std::pin::pin!(cancellation.cancelled());
     // The pinned asupersync 0.5 API has no public Cx::cancelled observer.
@@ -44,7 +53,12 @@ pub(super) async fn await_validity<T>(
     poll_fn(|task| {
         // Native timers and callbacks must use the supplied caller's authority,
         // not another task's ambient context. This guard ends before Pending.
-        let _caller = Cx::set_current(Some(cx.clone()));
+        // `set_current_restricted`, not `set_current`: the latter publishes only
+        // the caller's runtime mask and silently discards its type-level
+        // capability set, so a narrowed caller's callback would observe the
+        // wider ambient authority through `Cx::current()`. Intersecting both
+        // layers is what makes the caller's bound actually bind.
+        let _caller = cx.clone().set_current_restricted();
         check_tool_call(cx, cancellation, contract)?;
         if deadline.is_some_and(|deadline| cx.now() >= deadline) {
             return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
@@ -348,15 +362,27 @@ mod context_cancellation_tests {
     fn pending_callbacks_restore_the_ambient_context_without_widening_authority() {
         let ambient = Cx::for_testing();
         let _ambient = Cx::set_current(Some(ambient.clone()));
-        let cx = Cx::detached_cancel_context();
+        // The caller holds TIME and nothing else. TIME is not an accommodation:
+        // `await_validity` enforces the caller's own deadline and so genuinely
+        // needs a clock, which is why a fully stripped `detached_cancel_context`
+        // cannot be the subject here. Keeping one capability makes this a test
+        // of SELECTIVE propagation -- four dimensions must not appear, the one
+        // the caller actually holds must -- which is strictly more than a
+        // blanket-stripping assertion would prove.
+        let cx = Cx::for_testing().restrict::<cap::CapSet<false, true, false, false, false>>();
         let observed = std::cell::RefCell::new(None);
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let inner = poll_fn(|_| {
+            // `ambient` above is fully capable, so every `false` here is a
+            // capability the callback could only have obtained by escaping the
+            // caller's bound through the thread-local lookup.
             let current = Cx::current().unwrap();
             assert!(!current.capabilities().io);
             assert!(!current.capabilities().spawn);
-            assert!(!current.capabilities().time);
+            assert!(!current.capabilities().entropy);
+            assert!(!current.capabilities().remote);
+            assert!(current.capabilities().time);
             *observed.borrow_mut() = Some(current);
             Poll::<()>::Pending
         });

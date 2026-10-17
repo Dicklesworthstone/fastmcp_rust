@@ -25,7 +25,7 @@ use fastmcp_protocol::{
 };
 use fastmcp_server::{FinalToolOutcome, Server, ToolExecutionMode, ToolHandler};
 use fastmcp_transport::ReceivedTransportFrame;
-use fastmcp_transport::async_io::{NativePipeReader, NativePipeWriter, create_native_pipe};
+use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pipe};
 
 #[derive(Default)]
 struct Probe {
@@ -102,9 +102,10 @@ impl ToolHandler for PipeTool {
                 "isError": false,
             }))
             .expect("the runtime-selected text is a final tool payload");
+            // `ResultMeta` has no `Default`; `empty()` is its constructor.
             Outcome::Ok(FinalToolOutcome::Complete(CompleteResult::new(
                 payload,
-                ResultMeta::default(),
+                ResultMeta::empty(),
             )))
         })
     }
