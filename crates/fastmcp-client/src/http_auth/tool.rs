@@ -452,8 +452,11 @@ impl ManagedToolCall {
 
 // Recheck the retained request-local domain around synchronous schema work,
 // not just the caller Cx. The transport still owns its original time budgets.
-fn check_tool_call(
-    cx: &Cx,
+// Generic over the caller's capability set: this only checkpoints, which every
+// capability row permits, so demanding the full set would needlessly exclude a
+// narrowed caller that `await_validity` now accepts.
+fn check_tool_call<Caps>(
+    cx: &Cx<Caps>,
     cancellation: &McpRequestCancellation,
     contract: &ToolContract,
 ) -> Result<(), ManagedToolError> {
