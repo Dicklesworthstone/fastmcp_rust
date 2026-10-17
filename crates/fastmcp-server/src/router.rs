@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "tasks")]
 use crate::FinalTaskRuntime;
@@ -2347,7 +2347,7 @@ impl Router {
         cursor: &str,
         binding: &EnvelopeBinding,
         catalog_length: usize,
-    ) -> McpResult<usize> {
+    ) -> McpResult<(usize, Instant)> {
         if cursor.len() > MAX_CURSOR_BYTES {
             return Err(invalid_modern_catalog_cursor());
         }
@@ -2375,7 +2375,7 @@ impl Router {
         if offset == 0 || offset >= catalog_length {
             return Err(invalid_modern_catalog_cursor());
         }
-        Ok(offset)
+        Ok((offset, opened.expires_at()))
     }
 
     fn encode_modern_catalog_cursor(
@@ -2383,6 +2383,7 @@ impl Router {
         request_ctx: &McpContext,
         binding: &EnvelopeBinding,
         offset: usize,
+        expires_at: Instant,
     ) -> McpResult<String> {
         let offset = u64::try_from(offset).map_err(|_| invalid_modern_catalog_cursor())?;
         let mut owner = self
@@ -2408,12 +2409,7 @@ impl Router {
         let envelope = owner
             .as_mut()
             .ok_or_else(invalid_modern_catalog_cursor)?
-            .seal(
-                request_ctx.cx(),
-                binding,
-                &offset.to_be_bytes(),
-                MODERN_CATALOG_CURSOR_LIFETIME,
-            )
+            .seal_until(request_ctx.cx(), binding, &offset.to_be_bytes(), expires_at)
             .map_err(catalog_cursor_issuance_error)?;
         let cursor = format!(
             "{MODERN_CATALOG_CURSOR_PREFIX}{}",
@@ -2432,35 +2428,45 @@ impl Router {
         cursor: Option<&str>,
         catalog: FinalCatalogKind,
         query: &FinalCatalogQuery,
-    ) -> McpResult<(Vec<T>, Option<String>)> {
+    ) -> McpResult<(Vec<T>, Option<String>, Option<Instant>)> {
         let Some(page_size) = self.list_page_size else {
             return if cursor.is_none() {
-                Ok((items, None))
+                Ok((items, None, None))
             } else {
                 Err(invalid_modern_catalog_cursor())
             };
         };
+        let initial_expiry = Instant::now()
+            .checked_add(MODERN_CATALOG_CURSOR_LIFETIME)
+            .ok_or_else(|| McpError::internal_error("catalog cursor lifetime is out of range"))?;
         if cursor.is_none() && items.len() <= page_size {
-            return Ok((items, None));
+            return Ok((items, None, Some(initial_expiry)));
         }
         let binding = self.final_catalog_binding(request_ctx, catalog, query)?;
-        let offset = cursor
+        let (offset, expires_at) = cursor
             .map(|cursor| {
                 self.decode_modern_catalog_cursor(request_ctx, cursor, &binding, items.len())
             })
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or((0, initial_expiry));
         let end = offset
             .checked_add(page_size)
             .ok_or_else(invalid_modern_catalog_cursor)?
             .min(items.len());
+        // Re-sealing a later page uses the authenticated original deadline.
+        // Following or replaying a cursor can never start a fresh lifetime.
         let next_cursor = (end < items.len())
-            .then(|| self.encode_modern_catalog_cursor(request_ctx, &binding, end))
+            .then(|| self.encode_modern_catalog_cursor(request_ctx, &binding, end, expires_at))
             .transpose()?;
-        Ok((items[offset..end].to_vec(), next_cursor))
+        Ok((items[offset..end].to_vec(), next_cursor, Some(expires_at)))
     }
 
-    fn final_catalog_cache_hints(&self, catalog: FinalCatalogKind) -> FinalCacheHintPolicy {
+    fn final_catalog_cache_hints(
+        &self,
+        catalog: FinalCatalogKind,
+        cursor_expires_at: Option<Instant>,
+        now: Instant,
+    ) -> FinalCacheHintPolicy {
         let mut hints = self.final_cache_hints.clone();
         #[cfg(feature = "proxy")]
         {
@@ -2476,7 +2482,7 @@ impl Router {
                 // adjusted lifetime with the current application policy.
                 let local_ttl = hints.list_ttl_ms.try_as_millis().unwrap_or(0);
                 hints.list_ttl_ms = CacheTtl::milliseconds(
-                    local_ttl.min(upstream.remaining_ttl_ms(std::time::Instant::now())),
+                    local_ttl.min(upstream.remaining_ttl_ms(now)),
                 );
                 if upstream.cache_scope == CacheScope::Private {
                     hints.scope = CacheScope::Private;
@@ -2486,12 +2492,18 @@ impl Router {
         #[cfg(not(feature = "proxy"))]
         let _ = catalog;
         if self.list_page_size.is_some() {
-            // A cached copy cannot renew an expiring cursor's lifetime. Until
-            // every cache propagates exact age/remaining validity, return the
-            // same no-cache policy on all pages of a paginated catalog.
-            hints.list_ttl_ms = CacheTtl::milliseconds(0);
-            // The cursor itself is caller-bound even when its catalog rows
-            // are public. Its response cannot acquire shared-cache scope.
+            // The cursor chain retains its first authenticated deadline. Floor
+            // its remaining validity to whole milliseconds, intersecting both
+            // application policy and any upstream snapshot lifetime. A cached
+            // page never authorizes renewing the cursor or its server expiry.
+            let remaining_ms = cursor_expires_at
+                .map(|deadline| deadline.saturating_duration_since(now).as_millis())
+                .and_then(|milliseconds| u64::try_from(milliseconds).ok())
+                .unwrap_or(0);
+            let local_ttl = hints.list_ttl_ms.try_as_millis().unwrap_or(0);
+            hints.list_ttl_ms = CacheTtl::milliseconds(local_ttl.min(remaining_ms));
+            // Keep every page private, including the cursorless final page:
+            // its request may itself contain a caller-bound cursor.
             hints.scope = CacheScope::Private;
         }
         hints
@@ -5304,7 +5316,7 @@ impl Router {
         })
         .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
 
-        let (tools, next_cursor) = self.page_modern_catalog(
+        let (tools, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             tools,
             params.cursor.as_deref(),
@@ -5315,7 +5327,11 @@ impl Router {
         self.project_final_tools_list(
             request_ctx,
             result,
-            self.final_catalog_cache_hints(FinalCatalogKind::Tools),
+            self.final_catalog_cache_hints(
+                FinalCatalogKind::Tools,
+                cursor_expires_at,
+                Instant::now(),
+            ),
         )
     }
 
@@ -5379,14 +5395,18 @@ impl Router {
                 Ok(entry.definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resources, next_cursor) = self.page_modern_catalog(
+        let (resources, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             resources,
             params.cursor.as_deref(),
             FinalCatalogKind::Resources,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Resources);
+        let hints = self.final_catalog_cache_hints(
+            FinalCatalogKind::Resources,
+            cursor_expires_at,
+            Instant::now(),
+        );
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
@@ -5423,14 +5443,18 @@ impl Router {
                 Ok(definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resource_templates, next_cursor) = self.page_modern_catalog(
+        let (resource_templates, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             resource_templates,
             params.cursor.as_deref(),
             FinalCatalogKind::ResourceTemplates,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints(FinalCatalogKind::ResourceTemplates);
+        let hints = self.final_catalog_cache_hints(
+            FinalCatalogKind::ResourceTemplates,
+            cursor_expires_at,
+            Instant::now(),
+        );
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
             next_cursor,
@@ -5462,14 +5486,18 @@ impl Router {
             })
             .map(|(_, entry)| entry.definition.clone())
             .collect();
-        let (prompts, next_cursor) = self.page_modern_catalog(
+        let (prompts, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             prompts,
             params.cursor.as_deref(),
             FinalCatalogKind::Prompts,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Prompts);
+        let hints = self.final_catalog_cache_hints(
+            FinalCatalogKind::Prompts,
+            cursor_expires_at,
+            Instant::now(),
+        );
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
@@ -16043,7 +16071,8 @@ mod router_tests {
         assert_eq!(
             router
                 .decode_modern_catalog_cursor(&request_ctx, cursor, &binding, 2)
-                .expect("cursor is router-generated for this exact final catalog revision"),
+                .expect("cursor is router-generated for this exact final catalog revision")
+                .0,
             1,
             "the cursor advances across admitted entries"
         );
@@ -16080,9 +16109,166 @@ mod router_tests {
     }
 
     #[test]
+    fn modern_catalog_cache_retains_one_deadline_across_the_complete_cursor_chain() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        for name in ["expiry-a", "expiry-b", "expiry-c"] {
+            router.add_tool(NamedTool::new(name)).unwrap();
+        }
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let query = FinalCatalogQuery::from_tag_filters(None, None);
+        let binding = router
+            .final_catalog_binding(&ctx, FinalCatalogKind::Tools, &query)
+            .unwrap();
+        let first = block_on(
+            router.dispatch_stateless(&ctx, &final_tools_list_request(None, None, None, 1_i64)),
+        )
+        .unwrap();
+        let first_cursor = first["nextCursor"].as_str().unwrap();
+        let (first_offset, original_expiry) = router
+            .decode_modern_catalog_cursor(&ctx, first_cursor, &binding, 3)
+            .unwrap();
+        assert_eq!(first_offset, 1);
+        let first_ttl = first["ttlMs"].as_u64().unwrap();
+        assert!((1..=300_000).contains(&first_ttl));
+        assert_eq!(first["cacheScope"], "private");
+
+        let second = block_on(router.dispatch_stateless(
+            &ctx,
+            &final_tools_list_request(Some(first_cursor), None, None, 2_i64),
+        ))
+        .unwrap();
+        let second_cursor = second["nextCursor"].as_str().unwrap();
+        let (second_offset, continued_expiry) = router
+            .decode_modern_catalog_cursor(&ctx, second_cursor, &binding, 3)
+            .unwrap();
+        assert_eq!(second_offset, 2);
+        assert_eq!(
+            continued_expiry, original_expiry,
+            "a fresh continuation envelope must retain the first cursor's exact expiry"
+        );
+        assert_ne!(first_cursor, second_cursor);
+        let second_ttl = second["ttlMs"].as_u64().unwrap();
+        assert!((1..=first_ttl).contains(&second_ttl));
+        assert_eq!(second["cacheScope"], "private");
+
+        let last = block_on(router.dispatch_stateless(
+            &ctx,
+            &final_tools_list_request(Some(second_cursor), None, None, 3_i64),
+        ))
+        .unwrap();
+        assert_eq!(last["tools"][0]["name"], "expiry-c");
+        assert!(last.get("nextCursor").is_none());
+        assert!((1..=second_ttl).contains(&last["ttlMs"].as_u64().unwrap()));
+        assert_eq!(last["cacheScope"], "private");
+
+        // Only monotonic time changes for the exact authenticated deadline.
+        // TTL projection reaches zero at expiry and never rounds a fraction
+        // of a millisecond upward.
+        for (before_expiry, expected_ms) in [
+            (Duration::from_millis(1_501), 1_501),
+            (Duration::from_micros(1_999), 1),
+            (Duration::from_micros(999), 0),
+            (Duration::ZERO, 0),
+        ] {
+            let hints = router.final_catalog_cache_hints(
+                FinalCatalogKind::Tools,
+                Some(original_expiry),
+                original_expiry - before_expiry,
+            );
+            assert_eq!(hints.list_ttl_ms, CacheTtl::milliseconds(expected_ms));
+            assert_eq!(hints.scope, CacheScope::Private);
+        }
+        let expired = router.final_catalog_cache_hints(
+            FinalCatalogKind::Tools,
+            Some(original_expiry),
+            original_expiry + Duration::from_millis(1),
+        );
+        assert_eq!(expired.list_ttl_ms, CacheTtl::milliseconds(0));
+    }
+
+    #[test]
+    fn modern_catalog_cache_intersects_policy_and_keeps_all_paginated_pages_private() {
+        let mut router = Router::new();
+        let now = Instant::now();
+        let expiry = now + Duration::from_secs(30);
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(700),
+            CacheTtl::milliseconds(900),
+            CacheScope::Public,
+        );
+        let unpaginated = router.final_catalog_cache_hints(FinalCatalogKind::Tools, None, now);
+        assert_eq!(unpaginated.list_ttl_ms, CacheTtl::milliseconds(700));
+        assert_eq!(unpaginated.scope, CacheScope::Public);
+
+        router.set_list_page_size(Some(1));
+        for kind in [
+            FinalCatalogKind::Tools,
+            FinalCatalogKind::Resources,
+            FinalCatalogKind::ResourceTemplates,
+            FinalCatalogKind::Prompts,
+        ] {
+            let hints = router.final_catalog_cache_hints(kind, Some(expiry), now);
+            assert_eq!(hints.list_ttl_ms, CacheTtl::milliseconds(700));
+            assert_eq!(hints.scope, CacheScope::Private);
+            let absent = router.final_catalog_cache_hints(kind, None, now);
+            assert_eq!(absent.list_ttl_ms, CacheTtl::milliseconds(0));
+            assert_eq!(absent.scope, CacheScope::Private);
+        }
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(0),
+            CacheTtl::milliseconds(900),
+            CacheScope::Public,
+        );
+        let disabled = router.final_catalog_cache_hints(FinalCatalogKind::Tools, Some(expiry), now);
+        assert_eq!(disabled.list_ttl_ms, CacheTtl::milliseconds(0));
+        assert_eq!(disabled.scope, CacheScope::Private);
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn modern_catalog_cache_cannot_renew_an_upstream_snapshot() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(60_000),
+            CacheTtl::milliseconds(60_000),
+            CacheScope::Public,
+        );
+        let upstream =
+            ProxyCatalogCacheHint::new(CacheTtl::milliseconds(2_500), CacheScope::Public);
+        router.proxy_catalog_cache_hints[0] = Some(upstream);
+        let now = Instant::now();
+        let expiry = now + MODERN_CATALOG_CURSOR_LIFETIME;
+        let upstream_remaining = router.proxy_catalog_cache_hints[0]
+            .as_ref()
+            .unwrap()
+            .remaining_ttl_ms(now);
+        let fresh = router.final_catalog_cache_hints(FinalCatalogKind::Tools, Some(expiry), now);
+        assert_eq!(
+            fresh.list_ttl_ms,
+            CacheTtl::milliseconds(upstream_remaining)
+        );
+        assert!(upstream_remaining > 0);
+        assert_eq!(fresh.scope, CacheScope::Private);
+        let stale = router.final_catalog_cache_hints(
+            FinalCatalogKind::Tools,
+            Some(expiry),
+            now + Duration::from_secs(3),
+        );
+        assert_eq!(stale.list_ttl_ms, CacheTtl::milliseconds(0));
+        assert_eq!(stale.scope, CacheScope::Private);
+    }
+
+    #[test]
     fn modern_catalog_cursors_authenticate_every_byte_and_preserve_valid_replays() {
         let mut router = Router::new();
         router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(60_000),
+            CacheTtl::milliseconds(60_000),
+            CacheScope::Private,
+        );
         router.add_tool(NamedTool::new("cursor-a")).unwrap();
         router.add_tool(NamedTool::new("cursor-b")).unwrap();
         let cx = Cx::for_testing();
@@ -16091,7 +16277,8 @@ mod router_tests {
         let first = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
         let cursor = first["nextCursor"].as_str().unwrap();
         assert!(cursor.len() <= MAX_CURSOR_BYTES);
-        assert_eq!(first["ttlMs"], 0);
+        assert_eq!(first["ttlMs"], 60_000);
+        assert_eq!(first["cacheScope"], "private");
         let wire = URL_SAFE_NO_PAD
             .decode(cursor.strip_prefix(MODERN_CATALOG_CURSOR_PREFIX).unwrap())
             .unwrap();
@@ -16100,7 +16287,8 @@ mod router_tests {
         let expected = block_on(router.dispatch_stateless(&ctx, &retry)).unwrap();
         assert_eq!(expected["tools"][0]["name"], "cursor-b");
         assert!(expected.get("nextCursor").is_none());
-        assert_eq!(expected["ttlMs"], 0);
+        assert_eq!(expected["ttlMs"], 60_000);
+        assert_eq!(expected["cacheScope"], "private");
         for byte in 0..wire.len() {
             let mut changed = wire.clone();
             changed[byte] ^= 1;
@@ -16149,6 +16337,11 @@ mod router_tests {
     fn modern_catalog_cursor_binds_verified_owner_grants_and_claims() {
         let mut router = Router::new();
         router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(60_000),
+            CacheTtl::milliseconds(60_000),
+            CacheScope::Private,
+        );
         router.add_tool(NamedTool::new("owned-a")).unwrap();
         router.add_tool(NamedTool::new("owned-b")).unwrap();
         let cx = Cx::for_testing();
@@ -16204,6 +16397,11 @@ mod router_tests {
         fn catalog() -> Router {
             let mut router = Router::new();
             router.set_list_page_size(Some(1));
+            router.set_final_cache_hint_policy(
+                CacheTtl::milliseconds(60_000),
+                CacheTtl::milliseconds(60_000),
+                CacheScope::Private,
+            );
             router.add_tool(NamedTool::new("instance-a")).unwrap();
             router.add_tool(NamedTool::new("instance-b")).unwrap();
             router.add_resource(NamedResource::new("file:///instance-a"));
@@ -16293,7 +16491,9 @@ mod router_tests {
             let first = block_on(router.dispatch_stateless(&explicit_anonymous, &first_request))
                 .expect("all four modern catalogs page through the explicit anonymous provider");
             assert_eq!(first[field].as_array().map(Vec::len), Some(1));
-            assert_eq!(first["ttlMs"], 0);
+            let first_ttl = first["ttlMs"].as_u64().unwrap();
+            assert!((1..=300_000).contains(&first_ttl));
+            assert_eq!(first["cacheScope"], "private");
             let mut retry =
                 final_tools_list_request(first["nextCursor"].as_str(), None, None, 41_i64);
             retry.method = method.to_owned();
@@ -16302,7 +16502,8 @@ mod router_tests {
             );
             assert_eq!(second[field][0][identity], expected);
             assert!(second.get("nextCursor").is_none());
-            assert_eq!(second["ttlMs"], 0);
+            assert!((1..=first_ttl).contains(&second["ttlMs"].as_u64().unwrap()));
+            assert_eq!(second["cacheScope"], "private");
             let mut changed_query = retry;
             changed_query.params.as_mut().unwrap()["includeTags"] =
                 serde_json::json!(["different"]);
@@ -16357,7 +16558,8 @@ mod router_tests {
             router.dispatch_stateless(&origin, &final_tools_list_request(None, None, None, 50_i64)),
         )
         .expect("subject-only static-token configuration retains working modern pagination");
-        assert_eq!(first["ttlMs"], 0);
+        let first_ttl = first["ttlMs"].as_u64().unwrap();
+        assert!((1..=300_000).contains(&first_ttl));
         assert_eq!(first["cacheScope"], "private");
         let retry = final_tools_list_request(first["nextCursor"].as_str(), None, None, 51_i64);
         let fresh_auth = authenticate("Bearer catalog-token-one", 51);
@@ -16365,7 +16567,7 @@ mod router_tests {
             .expect("reverification of the same token preserves its cursor binding");
         assert_eq!(expected["tools"][0]["name"], "token-tool-b");
         assert!(expected.get("nextCursor").is_none());
-        assert_eq!(expected["ttlMs"], 0);
+        assert!((1..=first_ttl).contains(&expected["ttlMs"].as_u64().unwrap()));
         assert_eq!(expected["cacheScope"], "private");
 
         let other_auth = authenticate("Bearer catalog-token-two", 52);
@@ -16374,10 +16576,13 @@ mod router_tests {
         );
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        let replay = block_on(router.dispatch_stateless(&fresh_auth, &retry)).unwrap();
+        assert!(replay["ttlMs"].as_u64().unwrap() <= expected["ttlMs"].as_u64().unwrap());
+        let mut aged_expected = expected;
+        aged_expected["ttlMs"] = replay["ttlMs"].clone();
         assert_eq!(
-            block_on(router.dispatch_stateless(&fresh_auth, &retry)).unwrap(),
-            expected,
-            "the rejected credential leaves the verified owner's cursor usable"
+            replay, aged_expected,
+            "the rejected credential preserves every page field while its original TTL ages"
         );
     }
 

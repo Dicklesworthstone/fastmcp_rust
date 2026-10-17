@@ -2042,8 +2042,13 @@ impl HttpServerFixture {
         Self::spawn_with_policy_and_middleware(protocol_policy, None)
     }
 
-    fn spawn_modern_with_page_size(page_size: usize) -> Self {
-        spawn_modern_facade_http_server(false, Some(page_size), false)
+    fn spawn_modern_with_page_size(page_size: usize, requests: Arc<AtomicUsize>) -> Self {
+        spawn_modern_facade_http_server_with_middleware(
+            false,
+            Some(page_size),
+            false,
+            Some(Arc::new(McpConfigHttpRequestCounter { requests })),
+        )
     }
 
     fn spawn_with_policy_and_middleware(
@@ -2253,6 +2258,20 @@ fn spawn_modern_facade_http_server(
     page_size: Option<usize>,
     with_resource: bool,
 ) -> HttpServerFixture {
+    spawn_modern_facade_http_server_with_middleware(
+        with_native_bearer_auth,
+        page_size,
+        with_resource,
+        None,
+    )
+}
+
+fn spawn_modern_facade_http_server_with_middleware(
+    with_native_bearer_auth: bool,
+    page_size: Option<usize>,
+    with_resource: bool,
+    middleware: Option<Arc<dyn Middleware>>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let tool_calls = Arc::clone(&handler_calls);
     let resource_calls = Arc::clone(&handler_calls);
@@ -2301,7 +2320,7 @@ fn spawn_modern_facade_http_server(
                 let _ = resource_calls;
                 builder
             };
-            let server = builder
+            let builder = builder
                 .prompt(CountingPublicHttpInstruction {
                     counters: prompt_calls,
                 })
@@ -2310,8 +2329,11 @@ fn spawn_modern_facade_http_server(
                     CountingPublicHttpCompletion {
                         counters: completion_calls,
                     },
-                )
-                .build();
+                );
+            let server = match middleware {
+                Some(middleware) => builder.middleware(middleware).build(),
+                None => builder.build(),
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -8417,6 +8439,11 @@ fn e2e_modern_facade_final_cache_enabled_hits_near_negative() {
 
 #[test]
 fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_closed() {
+    use fastmcp_rust::{
+        CachePartitionKey, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
+        FinalCacheResultSet, FinalResultCache,
+    };
+
     fn tools_page(result: CoreResult) -> fastmcp_rust::FinalListToolsResult {
         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
             panic!("tools/list must retain its exact final result vocabulary");
@@ -8428,34 +8455,27 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         serde_json::to_value(page).expect("a typed final tools page retains an exact JSON identity")
     }
 
-    /// The same identity with `nextCursor` removed.
-    ///
-    /// A live server mints a fresh cursor on every request, so two separate
-    /// live responses to the identical request are equal in every field EXCEPT
-    /// that one. Comparing the full identity across a wire replay would
-    /// therefore always fail; comparing it was only ever sound while the replay
-    /// was served from the local cache, which the paginated no-cache contract
-    /// has withdrawn. Dropping the one varying field keeps the real property,
-    /// that the page CONTENT is unchanged, and the cursor is asserted
-    /// separately for presence.
-    fn typed_page_identity_without_cursor(
-        page: &fastmcp_rust::FinalListToolsResult,
-    ) -> serde_json::Value {
-        let mut identity = typed_page_identity(page);
-        let removed = identity
-            .as_object_mut()
-            .expect("a typed final tools page serializes as a JSON object")
-            .remove("nextCursor");
-        assert!(
-            removed.is_some(),
-            "this helper exists to drop nextCursor; a page without one means \
-             the field was renamed and every comparison below silently widened"
-        );
-        identity
+    fn cache_key(partition: &str) -> FinalCacheKey {
+        FinalCacheKey::new(
+            "live-catalog-endpoint",
+            modern::PROTOCOL_VERSION,
+            "{}",
+            "{}",
+            "tools/list",
+            r#"{"includeTags":["cursor"]}"#,
+            None,
+            1,
+            1,
+            1,
+            1,
+            CachePartitionKey::new(partition),
+            FinalCacheResultSet::Tools,
+        )
     }
 
     let cx = Cx::for_request();
-    let server = HttpServerFixture::spawn_modern_with_page_size(1);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = HttpServerFixture::spawn_modern_with_page_size(1, Arc::clone(&requests));
 
     let admitted_client = runtime_block_on_bounded(
         &cx,
@@ -8490,113 +8510,50 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     )
     .expect("the public HTTP client completes live modern discovery");
 
-    let first = tools_page(
-        runtime_block_on_bounded(
-            &cx,
-            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
-        )
-        .expect("the filtered first public tools page is admitted"),
-    );
+    let before_first = requests.load(Ordering::SeqCst);
+    let fetched = runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+    )
+    .expect("the filtered first public tools page is admitted");
+    let first = tools_page(fetched.clone());
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 1);
     assert_eq!(
         first.tools.len(),
         1,
         "page size creates a real continuation"
     );
-    // A PAGINATED catalog is deliberately no-cache, and this is the only place
-    // that contract is exercised end to end. `final_catalog_cache_hints`
-    // (fastmcp-server/src/router.rs:2487) zeroes list ttlMs and forces Private
-    // scope on every page whenever `list_page_size.is_some()`, because a cached
-    // copy cannot decrement an expiring cursor's remaining validity and the
-    // cursor is caller-bound even when its rows are public. That landed in
-    // 756719c3 inside the cursor-authentication fix; the fixture here is
-    // `spawn_modern_with_page_size(1)`, so the branch always fires. ttlMs 0 is
-    // the fail-CLOSED value this test's name promises.
-    //
-    // RH-5: the opposite contract is proven against a NON-paginated shipped
-    // server by `evaluate_modern_facade_final_cache_controls` (:8309, driven by
-    // the pair at :8411/:8415), which reaches fills == 1 and hits == 1 with a
-    // wire-request counter showing zero I/O on the replay. Those two tests
-    // differ in exactly one dimension, whether the server paginates, so neither
-    // one alone can be mistaken for "caching works" or "caching is broken".
-    // fills == 1 there is itself only reachable with a nonzero server hint,
-    // because fastmcp-client/src/cache.rs:475 refuses admission outright when
-    // ttl_ms == 0.
-    //
-    // These expectations CHANGE when bd-rzm5d lands age/remaining-validity
-    // propagation and retires the stopgap. Treat this test as that bead's
-    // canary; do not relax it to accommodate a partial implementation.
-    assert_eq!(
-        first.ttl_ms,
-        CacheTtl::milliseconds(0),
-        "a paginated first page must advertise the fail-closed zero final ttlMs"
+    let first_ttl = first.ttl_ms.try_as_millis().unwrap();
+    assert!(
+        (1..=300_000).contains(&first_ttl),
+        "pagination advertises a positive TTL bounded by its sealed five-minute lifetime"
     );
-    assert_eq!(
-        first.cache_scope,
-        CacheScope::Private,
-        "the typed first page retains its exact final cacheScope"
-    );
+    assert_eq!(first.cache_scope, CacheScope::Private);
     let first_identity = typed_page_identity(&first);
     let cursor = first
         .next_cursor
         .clone()
         .expect("the first filtered page carries an opaque cursor");
-    // Never admitted, so never a hit. `misses` is the counter-observable that
-    // separates "the server declared ttlMs 0" from "the cache was never
-    // consulted at all": the lookup ran and declined.
-    assert_eq!(
-        client.final_result_cache_stats().fills,
-        0,
-        "a zero-ttl paginated page must not be admitted to the final cache"
-    );
+    assert_eq!(client.final_result_cache_stats().fills, 1);
     assert_eq!(client.final_result_cache_stats().hits, 0);
-    assert_eq!(
-        client.final_result_cache_stats().misses,
-        1,
-        "the first paginated page must be looked up and missed, not skipped"
-    );
+    assert_eq!(client.final_result_cache_stats().misses, 1);
 
     let replay = tools_page(
         runtime_block_on_bounded(
             &cx,
             client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
         )
-        .expect("the identical public list request goes back to the live server"),
-    );
-    // The replay's CONTENT is unchanged, which is what proves it reached the
-    // wire and succeeded rather than erroring. Its cursor is necessarily a new
-    // one, because the server mints a cursor per request, so this compares
-    // every field except that one and then requires the cursor to be present.
-    //
-    // Deliberately NOT asserting that the two cursors differ. They did differ
-    // in the run that caught this, but the varying component is opaque and its
-    // resolution is not specified here, so an inequality assertion could pass
-    // for a reason this test does not control. The affirmative wire evidence is
-    // the `misses` counter below: a miss means the cache was consulted and
-    // declined, so the response came from the server.
-    assert_eq!(
-        typed_page_identity_without_cursor(&replay),
-        typed_page_identity_without_cursor(&first),
-        "the uncached replay retains the typed first-page content"
-    );
-    assert!(
-        replay.next_cursor.is_some(),
-        "a freshly served paginated first page still carries a continuation"
+        .expect("an identical public list request reuses the cached page"),
     );
     assert_eq!(
-        client.final_result_cache_stats().fills,
-        0,
-        "replaying a zero-ttl paginated page must not admit it either"
+        typed_page_identity(&replay),
+        first_identity,
+        "a cache hit retains the exact page, TTL and opaque cursor bytes"
     );
-    assert_eq!(
-        client.final_result_cache_stats().hits,
-        0,
-        "an identical paginated request can never be a cache hit"
-    );
-    assert_eq!(
-        client.final_result_cache_stats().misses,
-        2,
-        "every identical paginated replay is a fresh miss, so each one is live"
-    );
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 1);
+    assert_eq!(client.final_result_cache_stats().fills, 1);
+    assert_eq!(client.final_result_cache_stats().hits, 1);
+    assert_eq!(client.final_result_cache_stats().misses, 1);
 
     let second = tools_page(
         runtime_block_on_bounded(
@@ -8609,127 +8566,152 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("the exact cursor/query continuation reaches the second live page"),
     );
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 2);
     assert_eq!(second.tools.len(), 1);
-    assert_eq!(
-        second.tools[0].name, PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME,
-        "the sole valid continuation retains the exact cursor-secondary tool identity"
-    );
+    assert_eq!(second.tools[0].name, PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME);
     assert!(second.next_cursor.is_none());
-    // The LAST page carries no cursor at all, so it has no lifetime to renew,
-    // and it is still zeroed: the rule keys off whether the SERVER paginates,
-    // not whether this RESPONSE carries a cursor. That is deliberately pinned
-    // here rather than left implicit, because it is the single observable that
-    // distinguishes the shipped rule from the narrower cursor-presence rule
-    // recorded as disposition (b) on bd-hq26f. If anyone narrows the rule, this
-    // assertion is the one that must fail first and name the change.
-    assert_eq!(
-        second.ttl_ms,
-        CacheTtl::milliseconds(0),
-        "a cursorless final page of a paginated catalog is still fail-closed"
-    );
-    assert_eq!(
-        second.cache_scope,
-        CacheScope::Private,
-        "the typed continuation page retains its exact final cacheScope"
-    );
-    assert_ne!(
-        typed_page_identity(&second),
-        first_identity,
-        "the continuation must retain a complete typed page identity distinct from page one"
-    );
+    assert!((1..=first_ttl).contains(&second.ttl_ms.try_as_millis().unwrap()));
+    assert_eq!(second.cache_scope, CacheScope::Private);
+    let second_identity = typed_page_identity(&second);
+    assert_ne!(second_identity, first_identity);
 
-    // RH-5: only the query changes. The retained cursor must not cross into a
-    // different filtered catalog, and the prior cached first page stays live.
-    let query_rejection = runtime_block_on_bounded(
-        &cx,
-        client.request_final_core(
+    let second_replay = tools_page(
+        runtime_block_on_bounded(
             &cx,
+            client.request_final_core(
+                &cx,
+                "tools/list",
+                json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
+            ),
+        )
+        .expect("a continuation page has its own reusable cache identity"),
+    );
+    assert_eq!(typed_page_identity(&second_replay), second_identity);
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 2);
+    assert_eq!(client.final_result_cache_stats().fills, 2);
+    assert_eq!(client.final_result_cache_stats().hits, 2);
+    assert_eq!(client.final_result_cache_stats().misses, 2);
+
+    // Each negative changes exactly one request identity dimension.
+    for (method, params) in [
+        (
             "tools/list",
             json!({ "cursor": cursor.clone(), "includeTags": ["other"] }),
         ),
-    )
-    .expect_err("changing only includeTags rejects the cursor before page projection");
-    assert!(matches!(
-        query_rejection,
-        fastmcp_rust::HttpClientError::CoreResult(error)
-            if error.code == McpErrorCode::InvalidParams
-    ));
-
-    // RH-5: only the catalog method changes. A tools cursor cannot select a
-    // resources page, and this rejection must leave the tools request
-    // serviceable (no cached page exists to flush under this contract).
-    let kind_rejection = runtime_block_on_bounded(
-        &cx,
-        client.request_final_core(
-            &cx,
+        (
             "resources/list",
             json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
         ),
-    )
-    .expect_err("changing only the catalog kind rejects the tools cursor");
-    assert!(matches!(
-        kind_rejection,
-        fastmcp_rust::HttpClientError::CoreResult(error)
-            if error.code == McpErrorCode::InvalidParams
-    ));
-
-    // RH-5: only wire presence changes from an absent cursor to the explicitly
-    // present empty cursor. An empty cursor is a distinct request identity and
-    // is rejected, not silently treated as the absent-cursor request.
-    let empty_cursor_rejection = runtime_block_on_bounded(
-        &cx,
-        client.request_final_core(
-            &cx,
+        (
             "tools/list",
             json!({ "cursor": "", "includeTags": ["cursor"] }),
         ),
-    )
-    .expect_err("an explicit empty cursor is not the absent-cursor cache identity");
-    assert!(matches!(
-        empty_cursor_rejection,
-        fastmcp_rust::HttpClientError::CoreResult(error)
-            if error.code == McpErrorCode::InvalidParams
-    ));
+    ] {
+        let error = runtime_block_on_bounded(&cx, client.request_final_core(&cx, method, params))
+            .expect_err("query, catalog and explicit-empty cursor identities cannot reuse a page");
+        assert!(matches!(
+            error,
+            fastmcp_rust::HttpClientError::CoreResult(error)
+                if error.code == McpErrorCode::InvalidParams
+        ));
+    }
 
     let before_unchanged_retry = client.final_result_cache_stats();
+    let before_unchanged_requests = requests.load(Ordering::SeqCst);
     let unchanged_retry = tools_page(
         runtime_block_on_bounded(
             &cx,
             client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
         )
-        .expect("cursor rejections leave the unchanged original request serviceable"),
+        .expect("rejected cursor variations preserve the original cached page"),
     );
-    // The property here is unchanged state after three rejections, and it does
-    // not depend on caching: the unchanged original request must still return
-    // the same page content. Under the fail-closed paginated contract it
-    // resolves live rather than from an entry, so this compares content
-    // without the per-request cursor, exactly as the replay above does, and
-    // the counters below are stated RELATIVE to the pre-retry snapshot. The
-    // relative form avoids predicting whether a rejected request performs a
-    // lookup before failing, which is not this test's subject.
-    assert_eq!(
-        typed_page_identity_without_cursor(&unchanged_retry),
-        typed_page_identity_without_cursor(&first),
-        "cursor rejections leave the typed first-page content unchanged"
-    );
-    assert!(
-        unchanged_retry.next_cursor.is_some(),
-        "the post-rejection page still carries a continuation"
-    );
+    assert_eq!(typed_page_identity(&unchanged_retry), first_identity);
+    assert_eq!(requests.load(Ordering::SeqCst), before_unchanged_requests);
     assert_eq!(
         client.final_result_cache_stats().fills,
-        before_unchanged_retry.fills,
-        "rejected cursor variations cannot admit a page the policy refused"
+        before_unchanged_retry.fills
     );
     assert_eq!(
         client.final_result_cache_stats().hits,
-        before_unchanged_retry.hits,
-        "no request in this test may ever resolve from the final cache"
+        before_unchanged_retry.hits + 1
     );
     assert_eq!(
         client.final_result_cache_stats().misses,
-        before_unchanged_retry.misses + 1,
-        "the unchanged original request is served live, exactly once more"
+        before_unchanged_retry.misses
+    );
+
+    // Clearing a real populated client cache forces one new wire request and
+    // a newly sealed first cursor while preserving the catalog's content.
+    client.clear_final_result_cache();
+    let refreshed = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("explicit cache invalidation fetches a fresh paginated catalog"),
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        before_unchanged_requests + 1
+    );
+    assert_eq!(
+        serde_json::to_value(&refreshed.tools).unwrap(),
+        serde_json::to_value(&first.tools).unwrap()
+    );
+    assert_eq!(refreshed.cache_scope, CacheScope::Private);
+    assert!((1..=300_000).contains(&refreshed.ttl_ms.try_as_millis().unwrap()));
+    assert_ne!(refreshed.next_cursor.as_deref(), Some(cursor.as_str()));
+    assert_eq!(
+        client.final_result_cache_stats().fills,
+        before_unchanged_retry.fills + 1
+    );
+
+    // Use this actual server-produced page with the public monotonic cache
+    // API. Only time differs across the positive and exact-expiry negative;
+    // a preceding hit must not extend the original receipt-based TTL.
+    let receipt = Instant::now();
+    let expiry = receipt + Duration::from_millis(first_ttl);
+    let key = cache_key("owner-a");
+    let mut expiry_cache = FinalResultCache::new(4);
+    let generation = expiry_cache.begin_fetch(key.result_set());
+    assert_eq!(
+        expiry_cache.insert_if_current_at(key.clone(), generation, fetched.clone(), receipt),
+        FinalCacheInsert::Stored
+    );
+    assert!(matches!(
+        expiry_cache.lookup_at(&cache_key("owner-b"), receipt),
+        FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+    ));
+    let FinalCacheLookup::Fresh(before_expiry) =
+        expiry_cache.lookup_at(&key, expiry - Duration::from_nanos(1))
+    else {
+        panic!("the exact caller's stored page must remain fresh before expiry");
+    };
+    assert_eq!(
+        typed_page_identity(&tools_page(before_expiry)),
+        first_identity
+    );
+    assert!(matches!(
+        expiry_cache.lookup_at(&key, expiry),
+        FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+    ));
+    assert_eq!(expiry_cache.stats().stale, 1);
+
+    let mut invalidation_cache = FinalResultCache::new(4);
+    let generation = invalidation_cache.begin_fetch(key.result_set());
+    assert_eq!(
+        invalidation_cache.insert_if_current_at(key.clone(), generation, fetched.clone(), receipt),
+        FinalCacheInsert::Stored
+    );
+    invalidation_cache.invalidate_result_set(&FinalCacheResultSet::Tools);
+    assert!(matches!(
+        invalidation_cache.lookup_at(&key, receipt),
+        FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+    ));
+    assert_eq!(
+        invalidation_cache.insert_if_current_at(key, generation, fetched, receipt),
+        FinalCacheInsert::InvalidatedDuringFetch,
+        "an old fetch cannot resurrect an invalidated cursor page"
     );
 
     drop(client);
