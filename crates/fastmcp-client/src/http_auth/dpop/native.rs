@@ -482,10 +482,25 @@ fn check_live(
     credential: &DpopCredential,
     bounds: WaitBounds,
 ) -> Result<(), DpopHttpError> {
+    check_live_owner(cx, cancellation, &session.cancellation, credential, bounds)
+}
+
+// The revoke-only owner signal lets an already-admitted response remain live
+// while the single mutable session owner processes another response nonce.
+// It cannot sign a proof, admit a credential, select an endpoint, or renew time.
+fn check_live_owner(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    owner: &McpRequestCancellation,
+    credential: &DpopCredential,
+    bounds: WaitBounds,
+) -> Result<(), DpopHttpError> {
     if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
         return Err(DpopHttpError::Cancelled);
     }
-    session.require_active()?;
+    if owner.is_cancel_requested() {
+        return Err(DpopClientError::SessionRevoked.into());
+    }
     require_credential(credential)?;
     if cx.now() >= bounds.deadline {
         return Err(bounds.terminal);
@@ -501,7 +516,20 @@ async fn within<T>(
     bounds: WaitBounds,
     future: impl Future<Output = Result<T, DpopHttpError>>,
 ) -> Result<T, DpopHttpError> {
-    check_live(cx, cancellation, session, credential, bounds)?;
+    within_owner(cx, cancellation, &session.cancellation, credential, bounds, future).await
+}
+
+// Same cancellation domains, effect ceiling, timer and error ordering as
+// `within`; only the mutable nonce owner is no longer borrowed by the waiter.
+async fn within_owner<T>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    owner: &McpRequestCancellation,
+    credential: &DpopCredential,
+    bounds: WaitBounds,
+    future: impl Future<Output = Result<T, DpopHttpError>>,
+) -> Result<T, DpopHttpError> {
+    check_live_owner(cx, cancellation, owner, credential, bounds)?;
     // Public Sleep resolves its driver when polled. The non-widening caller
     // scope below covers every timer, cancellation and application poll, and
     // is restored before suspension. Nested host runners inherit the ceiling.
@@ -509,7 +537,7 @@ async fn within<T>(
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut caller = pin!(receiver.recv(cx));
     let mut operation_cancelled = pin!(cancellation.cancelled());
-    let mut owner_cancelled = pin!(session.cancellation.cancelled());
+    let mut owner_cancelled = pin!(owner.cancelled());
     let mut token_cancelled = pin!(credential.bound.revoked.cancelled());
     let mut credential_owner_cancelled = pin!(async {
         match &credential.bound.owner_cancellation {
@@ -520,7 +548,7 @@ async fn within<T>(
     let mut future = pin!(future);
     poll_fn(|task| {
         with_caller(cx, || {
-            check_live(cx, cancellation, session, credential, bounds)?;
+            check_live_owner(cx, cancellation, owner, credential, bounds)?;
             require_runtime(cx)?;
             if caller.as_mut().poll(task).is_ready()
                 || operation_cancelled.as_mut().poll(task).is_ready()
@@ -539,7 +567,7 @@ async fn within<T>(
                 return Poll::Ready(Err(bounds.terminal));
             }
             let result = future.as_mut().poll(task);
-            check_live(cx, cancellation, session, credential, bounds)?;
+            check_live_owner(cx, cancellation, owner, credential, bounds)?;
             result
         })
     })

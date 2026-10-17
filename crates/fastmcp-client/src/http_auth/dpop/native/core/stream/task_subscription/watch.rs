@@ -8,10 +8,10 @@
 pub mod checkpoint;
 /// Event-driven input resolution using the shared acknowledged-input ledger.
 pub mod input;
+mod live;
 
 use std::fmt;
-use std::future::{Future, poll_fn};
-use std::pin::Pin;
+use std::future::Future;
 use std::time::Duration;
 
 use asupersync::Time;
@@ -23,9 +23,9 @@ use fastmcp_protocol::tasks_extension::{GetTaskResult, Task, TaskInputRequests};
 
 use super::*;
 use input::{InputDecision, InputDriver, ManagedTaskDriverError, ManagedTaskInputAction, NoInput};
-use super::super::{
-    BYTES_PER_TURN, FRAMES_PER_TURN, Reader, cooperate,
-};
+use super::super::Reader;
+use crate::http_auth::dpop::native::core::stream::budget::SharedStreamBudget;
+use live::{Follow, LiveListen, LiveStep, ReadOwner};
 use crate::http_auth::dpop::native::{
     DpopHttpError, check_live, resource_headers, within,
 };
@@ -152,6 +152,9 @@ pub enum DpopTaskWatchError {
     SnapshotLimit,
     TaskNotAcknowledged,
     SubscriptionEndedWhileWorking,
+    /// The listen ended while an input update was pending. Its remote outcome
+    /// is uncertain; this run must not retry, reconnect or replay the answers.
+    SubscriptionEndedDuringUpdate,
     ReconnectLimit,
     FallbackLimit,
     InvalidPollInterval,
@@ -169,6 +172,7 @@ impl fmt::Display for DpopTaskWatchError {
             Self::SnapshotLimit => "DPoP Task watch snapshot limit reached",
             Self::TaskNotAcknowledged => "DPoP Task watch selection was not acknowledged",
             Self::SubscriptionEndedWhileWorking => "DPoP Task subscription ended while work remains",
+            Self::SubscriptionEndedDuringUpdate => "DPoP Task subscription ended during an input update",
             Self::ReconnectLimit => "DPoP Task subscription reconnect limit reached",
             Self::FallbackLimit => "DPoP Task polling fallback limit reached",
             Self::InvalidPollInterval => "DPoP Task polling interval cannot be represented",
@@ -422,6 +426,91 @@ impl DpopHttpClient {
         }
     }
 
+    // Unlike pre-listen/fallback snapshots, live reconciliation keeps reading
+    // the acknowledged listen through discovery, get, host input and update.
+    // Only a successful, clean update can advance the input ledger. A listen
+    // teardown aborts observation/resolution but makes an in-flight mutation
+    // uncertain: it may not silently enter the read-only reconnect path.
+    #[allow(clippy::too_many_arguments)]
+    async fn watch_live_snapshot<R, F, O, B>(
+        &mut self, metadata: &FinalRequestMeta, task: &TaskId,
+        state: &mut WatchState, input: &mut Option<InputDriver<R, O>>, may_update: bool,
+        live: &mut LiveListen<B>, owner: &ReadOwner<'_>,
+    ) -> Result<Option<DpopTaskWaitOutcome>, DpopTaskWatchError>
+    where
+        R: FnMut(TaskInputRequests) -> F,
+        F: Future<Output = Result<ManagedTaskInputAction, ManagedTaskDriverError>>,
+        O: FnMut(&Task) -> Result<(), ManagedTaskDriverError>,
+        B: Body + Unpin,
+        B::Data: Buf,
+    {
+        let cx = owner.cx;
+        let cancellation = owner.cancellation;
+        let credential = owner.credential;
+        let bounds = live.bounds(owner.bounds);
+        loop {
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            state.usage = live.budget.usage()?;
+            let (operation, limits) = state.snapshot_request(task)?;
+            live.clear_hint();
+            let budget = live.budget.clone();
+            let completed = live.follow(owner, async {
+                Ok(self.request_task_stream_with_budget(
+                    cx, cancellation, credential, metadata.clone(), operation, limits,
+                    bounds, &mut |_| true, Some(budget),
+                ).await?)
+            }).await?;
+            state.usage = live.budget.usage()?;
+            let Follow::Completed(completed) = completed else { return Ok(None); };
+            let ManagedTaskEvent::Snapshot(snapshot) = completed.result else {
+                return Err(DpopTaskWatchError::UnexpectedResponse);
+            };
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            state.note_snapshot(cx.now(), &snapshot.task)?;
+            // A hint admitted during this get may represent a later transition.
+            // Coalesce it into one successor get, never into a fabricated Task.
+            if live.has_hint() && matches!(&snapshot.task, Task::Working(_) | Task::InputRequired { .. }) {
+                continue;
+            }
+            let Some(input) = input.as_mut() else { return Ok(outcome(*snapshot)); };
+            let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
+            let decision = live.follow(owner,
+                input.on_snapshot(&life, state, &snapshot.task, may_update),
+            ).await?;
+            state.usage = live.budget.usage()?;
+            let Follow::Completed(decision) = decision else { return Ok(None); };
+            check_live(cx, cancellation, &self.session, credential, bounds)?;
+            match decision {
+                InputDecision::Return => return Ok(outcome(*snapshot)),
+                InputDecision::Wait => {
+                    if live.has_hint() { continue; }
+                    return Ok(None);
+                }
+                InputDecision::Update(responses) => {
+                    let (operation, limits) = input.update_request(state, snapshot.task, responses)?;
+                    let budget = live.budget.clone();
+                    let completed = live.follow(owner, async {
+                        Ok(self.request_task_stream_with_budget(
+                            cx, cancellation, credential, metadata.clone(), operation, limits,
+                            bounds, &mut |_| true, Some(budget),
+                        ).await?)
+                    }).await?;
+                    state.usage = live.budget.usage()?;
+                    let Follow::Completed(completed) = completed else {
+                        return Err(DpopTaskWatchError::SubscriptionEndedDuringUpdate);
+                    };
+                    check_live(cx, cancellation, &self.session, credential, bounds)?;
+                    if !matches!(completed.result, ManagedTaskEvent::Updated(_)) {
+                        return Err(DpopTaskWatchError::UnexpectedResponse);
+                    }
+                    input.acknowledged()?;
+                    // Immediate fresh reconciliation remains mandatory even if
+                    // no status notification accompanied this accepted update.
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn poll_after_subscription<R, F, O>(
         &mut self, cx: &Cx, cancellation: &McpRequestCancellation,
@@ -486,7 +575,14 @@ impl DpopHttpClient {
     /// never reset that window. Get responses may be finite JSON or SSE and
     /// require clean EOF before publication.
     ///
-    /// One live listen and at most one snapshot request are driven together.
+    /// One live listen and at most one companion request are polled together.
+    /// The listen is drained during discovery, get, host-input and update waits;
+    /// ready work yields after bounded byte/frame quanta. Concurrent frames use
+    /// one admission ledger, not independent copies of the remaining quota.
+    /// Teardown stops pending input resolution before a successor update. An
+    /// update interrupted by teardown fails with an uncertain remote outcome
+    /// and cannot trigger reconnection or answer replay. Hints received during
+    /// a get coalesce into fresh reconciliation rather than overwriting a Task.
     /// The native streaming response owns its socket independently of the
     /// client's bounded discovery pool, so reconciliation reuses this client's
     /// exact transport, trust policy and original DPoP session. Every successor
@@ -591,92 +687,42 @@ impl DpopHttpClient {
             if response.head.status != 200 {
                 return Err(ManagedCoreError::HttpStatus { status: response.head.status }.into());
             }
-            let mut body = response.body;
-            let mut reader = Reader::<_, DpopTaskSubscriptionEvent>::new(
-                kind, decoder, limits, self.policy.max_body_bytes,
-            )?;
-            let mut idle = idle;
-            let mut bytes_left = BYTES_PER_TURN;
-            let mut frames_left = FRAMES_PER_TURN;
+            let budget = SharedStreamBudget::new(limits.core, state.usage)?;
+            let mut live = LiveListen::new(response.body, kind, decoder, idle, task.clone(),
+                limits, self.policy.max_body_bytes, budget)?;
+            let owner = ReadOwner::new(cx, cancellation, &self.session, credential, bounds);
             loop {
-                let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
-                if bytes_left == 0 || frames_left == 0 {
-                    cooperate(&lifetime, &idle).await?;
-                    bytes_left = BYTES_PER_TURN;
-                    frames_left = FRAMES_PER_TURN;
-                }
-                let frame = within(cx, cancellation, &self.session, credential, idle.bounds(bounds), async {
-                    poll_fn(|context| Pin::new(&mut body).poll_frame(context)).await
-                        .transpose().map_err(|_| DpopHttpError::TransportFailed)
-                }).await?;
-                let Some(frame) = frame else {
-                    // Only a clean admitted terminal permits final reconciliation
-                    // or a successor. Peer cancellation ends the listen, not Task.
-                    let completed = with_caller(cx, || reader.finish(&lifetime, &idle))?;
-                    match completed.result {
-                        Ok(_) | Err(DpopStreamError::SubscriptionCancelled) => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    // Retire the old physical response before any successor I/O.
-                    drop(body);
-                    state.usage = completed.usage;
-                    if let Some(result) = self.watch_snapshot(
-                        cx, cancellation, credential, &metadata, &task, &mut state, bounds,
-                        &mut input, false,
-                    ).await? {
-                        return Ok(result);
-                    }
-                    if let Some(due) = state.begin_reconnect(cx.now())? {
-                        within(cx, cancellation, &self.session, credential, bounds, async {
-                            if cx.now() < due { Sleep::new(due).await; }
-                            Ok(())
-                        }).await?;
-                        check_live(cx, cancellation, &self.session, credential, bounds)?;
-                        continue 'subscriptions;
-                    }
-                    return self.poll_after_subscription(
-                        cx, cancellation, credential, &metadata, &task, &mut state, bounds,
-                        &mut input,
-                    ).await;
-                };
-                frames_left -= 1;
-                let Some(mut data) = frame.into_data() else { continue };
-                while data.has_remaining() {
-                    let lifetime = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
-                    if bytes_left == 0 {
-                        cooperate(&lifetime, &idle).await?;
-                        bytes_left = BYTES_PER_TURN;
-                        frames_left = FRAMES_PER_TURN;
-                    }
-                    let bytes = data.chunk();
-                    let consumed = bytes.len().min(bytes_left);
-                    if consumed == 0 { return Err(DpopHttpError::TransportFailed.into()); }
-                    let mut reconcile = false;
-                    with_caller(cx, || reader.push(
-                        &bytes[..consumed], &lifetime, &mut idle,
-                        &mut |_| { reconcile = true; true },
-                    ))?;
-                    data.advance(consumed);
-                    bytes_left -= consumed;
-                    if reconcile {
-                        WatchState::require_acknowledged(&reader.decoder, &task)?;
-                    }
-                    if reconcile && reader.terminal.is_none() {
-                        state.usage = reader.decoder.usage();
-                        // No immutable session borrow crosses this mutable get.
-                        // The listen owns its response body, not a pool slot or a
-                        // transport borrow; the same client can drive the get.
-                        if let Some(result) = self.watch_snapshot(
-                            cx, cancellation, credential, &metadata, &task, &mut state, idle.bounds(bounds),
-                            &mut input, may_update,
+                match live.next(&owner).await? {
+                    LiveStep::Hint => {
+                        if let Some(result) = self.watch_live_snapshot(
+                            &metadata, &task, &mut state, &mut input, may_update, &mut live, &owner,
                         ).await? {
                             return Ok(result);
                         }
-                        reader.decoder.bytes = state.usage.0;
-                        reader.decoder.notifications = state.usage.1;
                     }
+                    LiveStep::Closed => break,
                 }
             }
+            state.usage = live.budget.usage()?;
+            drop(live);
+            if let Some(result) = self.watch_snapshot(
+                cx, cancellation, credential, &metadata, &task, &mut state, bounds,
+                &mut input, false,
+            ).await? {
+                return Ok(result);
+            }
+            if let Some(due) = state.begin_reconnect(cx.now())? {
+                within(cx, cancellation, &self.session, credential, bounds, async {
+                    if cx.now() < due { Sleep::new(due).await; }
+                    Ok(())
+                }).await?;
+                check_live(cx, cancellation, &self.session, credential, bounds)?;
+                continue 'subscriptions;
+            }
+            return self.poll_after_subscription(
+                cx, cancellation, credential, &metadata, &task, &mut state, bounds,
+                &mut input,
+            ).await;
         }
     }
 }
