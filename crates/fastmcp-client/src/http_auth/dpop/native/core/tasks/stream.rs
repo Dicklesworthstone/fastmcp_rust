@@ -25,6 +25,7 @@ use super::super::stream::{
     CompletedStream, DpopStreamError, DpopStreamLimits, Idle, PreparedStream, StreamDecoder,
     StreamEvent,
 };
+use super::super::stream::budget::{Budgeted, SharedStreamBudget};
 use crate::http_auth::rpc::admit_http_notification;
 
 pub(super) struct TaskStreamDecoder {
@@ -225,6 +226,29 @@ impl DpopHttpClient {
     where
         N: FnMut(&ServerNotification) -> bool,
     {
+        self.request_task_stream_with_budget(
+            cx, cancellation, credential, metadata, operation, limits, bounds, observer, None,
+        ).await
+    }
+
+    // Only a live watch supplies the aggregate ledger. Its discovery and
+    // method frames are charged before publication, alongside listen frames.
+    #[allow(clippy::too_many_arguments)]
+    pub(in super::super) async fn request_task_stream_with_budget<N>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        credential: &DpopCredential,
+        metadata: FinalRequestMeta,
+        operation: DpopTaskOperation,
+        limits: DpopStreamLimits,
+        bounds: WaitBounds,
+        observer: &mut N,
+        budget: Option<SharedStreamBudget>,
+    ) -> Result<CompletedStream<ManagedTaskEvent>, DpopStreamError>
+    where
+        N: FnMut(&ServerNotification) -> bool,
+    {
         let idle = Idle::new(cx.now(), limits.idle);
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         let prepared = Prepared::new(
@@ -244,6 +268,10 @@ impl DpopHttpClient {
         let (wire, decoder) = TaskStreamDecoder::from_admitted(
             admitted?, limits.core, discovery_bytes, progress,
         )?;
+        if let Some(budget) = &budget {
+            budget.charge((discovery_bytes, 0))?;
+        }
+        let decoder = Budgeted::new(decoder, budget);
         self.execute_prepared_core_stream(
             cx, cancellation, credential,
             PreparedStream { wire, decoder, limits, bounds, idle }, observer,

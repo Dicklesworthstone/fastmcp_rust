@@ -14,6 +14,8 @@ mod subscription_end;
 /// Authenticated Tasks discovery and exact-ID status subscriptions.
 #[cfg(feature = "tasks")]
 pub mod task_subscription;
+#[cfg(feature = "tasks")]
+pub(super) mod budget;
 
 use std::fmt;
 use std::future::poll_fn;
@@ -467,7 +469,20 @@ where
     fn push<N: FnMut(&E) -> bool>(
         &mut self, bytes: &[u8], lifetime: &Lifetime<'_>, idle: &mut Idle, observer: &mut N,
     ) -> Result<(), DpopStreamError> {
-        lifetime.check(idle)?;
+        self.push_with_check(bytes, lifetime.cx, idle, observer, |idle| lifetime.check(idle))
+    }
+
+    // Private receive-side seam. The watch supplies the same caller, token,
+    // owner revocation and deadline checks without borrowing the mutable nonce
+    // owner. Grammar, byte limits, terminal custody and observers stay here.
+    fn push_with_check<N, C>(
+        &mut self, bytes: &[u8], cx: &Cx, idle: &mut Idle, observer: &mut N, mut check: C,
+    ) -> Result<(), DpopStreamError>
+    where
+        N: FnMut(&E) -> bool,
+        C: FnMut(&Idle) -> Result<(), DpopHttpError>,
+    {
+        check(idle)?;
         // Admit the same byte prefix regardless of HTTP frame boundaries. A
         // large native frame must not suppress notifications that a fragmented
         // delivery would have emitted before the raw-body cap was reached.
@@ -487,27 +502,27 @@ where
                 let decoder = &mut self.decoder;
                 let terminal = &mut self.terminal;
                 parser.push_with(bytes, |frame| {
-                    lifetime.check(idle)?;
+                    check(idle)?;
                     if terminal.is_some() {
                         decoder.admit_terminal_tail(frame.as_bytes())?;
                         // A tolerated peer teardown cannot bypass the same
                         // lifetime guard used for every other admitted frame.
-                        lifetime.check(idle)?;
+                        check(idle)?;
                         return Ok(());
                     }
                     let event = decoder.admit(frame.as_bytes(), true)?;
                     // Decoder work cannot revive a deadline that it exhausted.
-                    lifetime.check(idle)?;
+                    check(idle)?;
                     match event {
                         StreamEvent::Result(result) => *terminal = Some(result),
                         StreamEvent::Notification(notification) => {
                             if reset_idle_on_progress && notification.is_progress() {
-                                idle.progress(lifetime.cx.now());
+                                idle.progress(cx.now());
                             }
                             let observed = catch_unwind(AssertUnwindSafe(|| observer(&notification)));
                             // Same-poll cancellation/revocation wins over a ready
                             // observer, its decline, or its captured panic.
-                            lifetime.check(idle)?;
+                            check(idle)?;
                             match observed {
                                 Ok(true) => {}
                                 Ok(false) => return Err(DpopStreamError::ObserverStopped),
@@ -522,15 +537,24 @@ where
                 })?;
             }
         }
-        lifetime.check(idle)?;
+        check(idle)?;
         if exceeded {
             return Err(DpopHttpError::BodyTooLarge.into());
         }
         Ok(())
     }
 
-    fn finish(mut self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream<D::Terminal>, DpopStreamError> {
-        lifetime.check(idle)?;
+    fn finish(self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream<D::Terminal>, DpopStreamError> {
+        self.finish_with_check(idle, |idle| lifetime.check(idle))
+    }
+
+    fn finish_with_check<C>(
+        mut self, idle: &Idle, mut check: C,
+    ) -> Result<CompletedStream<D::Terminal>, DpopStreamError>
+    where
+        C: FnMut(&Idle) -> Result<(), DpopHttpError>,
+    {
+        check(idle)?;
         let result = match self.body {
             WireBody::Json(bytes) => match self.decoder.admit(&bytes, false)? {
                 StreamEvent::Result(result) => result,
@@ -546,7 +570,7 @@ where
                 self.terminal.ok_or(ManagedCoreError::MissingTerminal)?
             }
         };
-        lifetime.check(idle)?;
+        check(idle)?;
         Ok(CompletedStream { result, usage: self.decoder.usage() })
     }
 }
