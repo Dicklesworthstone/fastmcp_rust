@@ -7,6 +7,9 @@
 //! against that client; it is never followed to construct a new connection.
 //! Current authorization and the remote Task's existence remain server-owned.
 
+/// Bounded, authenticated startup reconciliation of independently saved Tasks.
+pub mod reconcile;
+
 use std::fmt;
 
 use asupersync::Cx;
@@ -67,6 +70,7 @@ pub enum DpopTaskCheckpointError {
     UnsupportedProtocol,
     InvalidResource,
     ResourceMismatch,
+    InvalidSelection,
     Watch(DpopTaskWatchError),
 }
 
@@ -79,6 +83,7 @@ impl fmt::Display for DpopTaskCheckpointError {
             Self::UnsupportedProtocol => "unsupported DPoP Task checkpoint protocol era",
             Self::InvalidResource => "invalid DPoP Task checkpoint resource",
             Self::ResourceMismatch => "DPoP Task checkpoint does not match the configured resource",
+            Self::InvalidSelection => "invalid DPoP Task checkpoint reconciliation selection",
             Self::Watch(_) => "DPoP Task checkpoint observation failed",
         })
     }
@@ -279,7 +284,7 @@ mod tests {
         serde_json::from_slice(&checkpoint().encode().unwrap()).unwrap()
     }
 
-    fn client() -> (DpopHttpClient, DpopCredential) {
+    pub(super) fn client() -> (DpopHttpClient, DpopCredential) {
         let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
         let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), resource()).unwrap();
         let credential = session.admit_token_response(

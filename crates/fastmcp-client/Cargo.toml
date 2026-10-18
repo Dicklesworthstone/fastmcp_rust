@@ -149,5 +149,12 @@ name = "task_resume_store"
 path = "tests/task_resume_store.rs"
 required-features = ["tasks"]
 
+[[test]]
+# Eight public HTTPS recovery tests. Require both features when naming the
+# target; an empty cfg-filtered binary is not a successful recovery test run.
+name = "dpop_task_recovery"
+path = "tests/dpop_task_recovery.rs"
+required-features = ["tasks", "native-tls-roots"]
+
 [lints]
 workspace = true
