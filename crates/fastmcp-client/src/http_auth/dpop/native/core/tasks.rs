@@ -49,10 +49,17 @@ pub mod wait;
 /// validation occur before discovery when the operation is polled.
 /// Tool calls may explicitly retain a resource-bound disclosure review through
 /// [`Self::with_reviewed_tool_headers`]; ordinary operations stay header-free.
+/// The three correlation/request members are `pub(crate)` rather than private
+/// because readers exist on BOTH sides of this module's subtree. Descendants of
+/// `core::tasks` (`tasks/wait.rs`, `tasks/driver/start.rs`) may read private
+/// fields of their ancestor, but `core::stream::task_subscription::watch::input`
+/// is a sibling branch and cannot, so a private field here fails to compile for
+/// it with E0616. `reviewed_headers` stays private because only this module
+/// reads it; widening it would grant crate-wide reach nothing asks for.
 pub struct DpopTaskOperation {
-    discovery_id: RequestId,
-    operation_id: RequestId,
-    request: ManagedTaskRequest,
+    pub(crate) discovery_id: RequestId,
+    pub(crate) operation_id: RequestId,
+    pub(crate) request: ManagedTaskRequest,
     reviewed_headers: Option<Arc<ReviewedToolHeaders>>,
 }
 
