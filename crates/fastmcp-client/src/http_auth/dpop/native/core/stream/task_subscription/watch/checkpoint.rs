@@ -9,6 +9,8 @@
 
 /// Bounded, authenticated startup reconciliation of independently saved Tasks.
 pub mod reconcile;
+/// Owner-bound, retention-limited recovery from protected Task resume records.
+pub mod resume;
 
 use std::fmt;
 
