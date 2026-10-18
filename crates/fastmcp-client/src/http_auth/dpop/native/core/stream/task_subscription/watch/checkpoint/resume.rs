@@ -6,6 +6,9 @@
 //! record cannot select a login, transport root, endpoint or DPoP signing key.
 //! Neither the stored status nor a Task ID is proof of remote authorization.
 
+#[cfg(all(test, feature = "native-tls-roots"))]
+mod tls;
+
 use std::fmt;
 
 use asupersync::Cx;
@@ -215,7 +218,7 @@ mod tests {
     use fastmcp_protocol::ClientCapabilities;
     use serde_json::json;
 
-    fn binding(subject: &str, resource: &str) -> TaskResumeBinding {
+    pub(super) fn binding(subject: &str, resource: &str) -> TaskResumeBinding {
         let owner = DurableOwnerKey::derive(&PartitionDescriptor::from_verified_facts(
             "fixture", 1, "https://issuer.example", resource, "tenant", subject,
             "client", 1, 1, &[b"bound-resource".as_slice()],
@@ -226,7 +229,7 @@ mod tests {
         ).unwrap()
     }
 
-    fn snapshot(status: &str, second: u8) -> Box<GetTaskResult> {
+    pub(super) fn snapshot(status: &str, second: u8) -> Box<GetTaskResult> {
         let mut value = json!({"resultType":"complete", "taskId":"task-secret", "status":status,
             "createdAt":"2020-01-01T00:00:00Z",
             "lastUpdatedAt":format!("2020-01-01T00:00:0{second}Z"),
@@ -238,7 +241,7 @@ mod tests {
         Box::new(serde_json::from_value(value).unwrap())
     }
 
-    fn record(cx: &Cx, binding: &TaskResumeBinding) -> TaskResumeRecord {
+    pub(super) fn record(cx: &Cx, binding: &TaskResumeBinding) -> TaskResumeRecord {
         TaskResumeRecord::capture(cx, binding, &snapshot("working", 1).task, Duration::from_secs(3600)).unwrap()
     }
 
