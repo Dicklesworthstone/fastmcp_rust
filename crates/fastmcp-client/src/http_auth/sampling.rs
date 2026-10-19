@@ -25,14 +25,27 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::common_types::SamplingContentBlock;
-use fastmcp_protocol::sampling::{
-    SamplingToolLoop, SamplingToolLoopError, SamplingToolLoopLimits, SamplingToolLoopStep,
-};
+use fastmcp_protocol::sampling::{SamplingToolLoop, SamplingToolLoopError, SamplingToolLoopStep};
 use fastmcp_protocol::{
     AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, admit_final_schema,
 };
 
 use super::caller::with_caller;
+
+/// Re-exported because `SamplingRunLimits::new` below takes one BY VALUE, so a
+/// consumer depending only on the `fastmcp-rust` facade must be able to write
+/// the name. Without this the constructor is reachable but uncallable with a
+/// non-default conversation bound: the facade forwards `http_auth`
+/// (`crates/fastmcp/src/lib.rs:936`) and `sampling` is `pub mod`, yet
+/// `fastmcp_protocol::sampling` is NOT among the facade's forwarded modules and
+/// the type appears nowhere in the facade's explicit re-export lists, so the
+/// caller's only alternative was a direct dependency on `fastmcp-protocol`.
+///
+/// It lives here rather than in the parent `http_auth` root because the
+/// signature demanding it is here; the parent closed the identical defect class
+/// for `OAuthCredentialStore::open` with
+/// `pub use fastmcp_core::partition::PartitionAuthorization`.
+pub use fastmcp_protocol::sampling::SamplingToolLoopLimits;
 
 /// Bounded sampling-only resolution of final input-required response maps.
 pub mod inputs;

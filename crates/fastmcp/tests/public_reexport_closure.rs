@@ -39,7 +39,10 @@
 
 // Every path below goes through `fastmcp_rust`. None of them names
 // `fastmcp_core` or `fastmcp_protocol`, which is the entire point.
+use std::time::Duration;
+
 use fastmcp_rust::http_auth::dpop::{DpopClientError, DpopError, DpopKey, DpopSession};
+use fastmcp_rust::http_auth::sampling::{SamplingRunLimits, SamplingToolLoopLimits};
 use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
 
 /// `DpopKey::generate` returns `Result<DpopKey, DpopError>`, so a consumer that
@@ -79,6 +82,41 @@ fn names_routed_method(
     method: fastmcp_rust::McpAppsRoutedMethod,
 ) -> fastmcp_rust::McpAppsRoutedMethod {
     method
+}
+
+/// `SamplingRunLimits::new` takes a `SamplingToolLoopLimits` BY VALUE, so any
+/// consumer wanting a conversation bound other than the default must write that
+/// name. The facade forwards `http_auth` and `sampling` is `pub mod` there, but
+/// `fastmcp_protocol::sampling` is NOT a forwarded module and the type is in no
+/// explicit facade list, so before the re-export this function could not be
+/// written against `fastmcp_rust` alone. That unwritability is the planted
+/// negative for this closure claim, in the same form as the three above.
+fn builds_sampling_run_limits() -> Result<SamplingRunLimits, ()> {
+    let conversation = SamplingToolLoopLimits::new(1, 8, 4096).map_err(|_| ())?;
+    SamplingRunLimits::new(conversation, Duration::from_secs(1), 4096).map_err(|_| ())
+}
+
+#[test]
+fn facade_names_the_sampling_limits_its_run_constructor_demands() {
+    // Positive observable: a NON-DEFAULT conversation bound is accepted, which
+    // cannot be expressed without naming `SamplingToolLoopLimits`. Reaching
+    // `SamplingRunLimits::default()` would prove nothing, because the default
+    // never forces the inner type into caller code.
+    assert!(
+        builds_sampling_run_limits().is_ok(),
+        "a non-default sampling conversation bound is constructible via the facade"
+    );
+
+    // Negative control differing only in the forbidden dimension: the same
+    // constructor, same conversation bound, refuses a zero timeout. Without
+    // this, a `new` returning Ok unconditionally would satisfy the positive
+    // above (RH-5).
+    let conversation =
+        SamplingToolLoopLimits::new(1, 8, 4096).expect("the loop bounds are within the ceilings");
+    assert!(
+        SamplingRunLimits::new(conversation, Duration::ZERO, 4096).is_err(),
+        "a zero timeout must be refused, so the positive is not vacuous"
+    );
 }
 
 #[test]
