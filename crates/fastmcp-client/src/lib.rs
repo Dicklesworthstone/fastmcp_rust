@@ -13735,9 +13735,10 @@ impl HttpClient {
     /// Calls one tool with reviewed `Mcp-Param-*` mirrors (HTTP-05).
     ///
     /// `reviewed` is the host's current plan for `name`, bound to this
-    /// client's HTTPS endpoint. If the server refuses this exact request
-    /// before dispatch (HTTP 400, -32020, same id, canonical message), the plan
-    /// is presumed stale: the cached `tools/list` is dropped, a fresh listing
+    /// client's approved HTTPS or numeric-loopback HTTP endpoint. If the server
+    /// refuses this exact request before dispatch (HTTP 400, -32020, same id,
+    /// canonical message), the plan is presumed stale: the cached `tools/list`
+    /// is dropped, a fresh listing
     /// supplies the tool's schema, `review` re-approves every projected
     /// binding, and the call is retried exactly once with a new request id.
     ///
@@ -13745,6 +13746,9 @@ impl HttpClient {
     /// after the send committed, and not any response the handler may have
     /// produced. If `review` refuses a binding of the refreshed schema, no
     /// retry is sent. An `input_required` result is returned, not followed.
+    /// Every refreshed catalog page comes from the peer, including when its
+    /// cursor repeats a previously cacheable page. Page/item/byte bounds apply,
+    /// and one absolute timeout covers the initial call, refresh and retry.
     pub async fn call_tool_with_parameter_headers(
         &mut self,
         cx: &Cx,
@@ -13753,76 +13757,117 @@ impl HttpClient {
         reviewed: &http_executor::parameter_headers::ReviewedToolHeaders,
         review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
     ) -> Result<CoreResult, HttpClientError> {
-        let parameters = serde_json::json!({ "name": name, "arguments": arguments });
-        match self
-            .request_final_core_with_optional_cancellation(
+        cx.checkpoint()
+            .map_err(|_| HttpClientError::CoreResult(McpError::request_cancelled()))?;
+        let now = cx.now();
+        let timeout = self.request_timeout_policy.absolute_timeout();
+        let remaining = cx.budget().deadline.map_or(timeout, |deadline| {
+            timeout.min(Duration::from_nanos(deadline.duration_since(now)))
+        });
+        let deadline =
+            now.saturating_add_nanos(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX));
+        match asupersync::time::timeout_at(deadline, async {
+            let parameters = serde_json::json!({ "name": name, "arguments": arguments });
+            match self
+                .request_final_core_with_optional_cancellation(
+                    cx,
+                    None,
+                    "tools/call",
+                    parameters.clone(),
+                    Some(reviewed),
+                )
+                .await
+            {
+                Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::ParameterHeaderMismatch { .. },
+                )) => {}
+                outcome => return outcome,
+            }
+            let refreshed = self
+                .refreshed_parameter_headers(cx, reviewed, review)
+                .await?;
+            self.request_final_core_with_optional_cancellation(
                 cx,
                 None,
                 "tools/call",
-                parameters.clone(),
-                Some(reviewed),
+                parameters,
+                Some(&refreshed),
             )
             .await
-        {
-            Err(HttpClientError::Connection(
-                ClientHttpConnectionError::ParameterHeaderMismatch { .. },
-            )) => {}
-            outcome => return outcome,
-        }
-        let refreshed = self
-            .refreshed_parameter_headers(cx, name, reviewed.resource().clone(), review)
-            .await?;
-        self.request_final_core_with_optional_cancellation(
-            cx,
-            None,
-            "tools/call",
-            parameters,
-            Some(&refreshed),
-        )
+        })
         .await
+        {
+            Ok(result) => result,
+            Err(_) if cx.checkpoint().is_err() => Err(McpError::request_cancelled().into()),
+            Err(_) => Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                "Parameter-header tool call absolute timeout exceeded",
+                serde_json::json!({"timeoutSource":"absolute"}),
+            )
+            .into()),
+        }
     }
 
-    /// Re-reviews `name` from a fresh, uncached `tools/list`.
+    /// Re-reviews the approved tool from a fresh, uncached `tools/list`.
     async fn refreshed_parameter_headers(
         &mut self,
         cx: &Cx,
-        name: &str,
-        resource: CanonicalHttpUrl,
+        reviewed: &http_executor::parameter_headers::ReviewedToolHeaders,
         review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
     ) -> Result<http_executor::parameter_headers::ReviewedToolHeaders, HttpClientError> {
         const MAX_REFRESH_PAGES: usize = 64;
         self.final_result_cache
             .invalidate_result_set(&FinalCacheResultSet::Tools);
+        let mut budget = PaginationBudget::for_request(self.request_timeout_policy);
+        budget.limits.pages = MAX_REFRESH_PAGES;
         let mut cursor: Option<String> = None;
-        for _ in 0..MAX_REFRESH_PAGES {
-            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) =
-                self.list_tools(cx, cursor.as_deref()).await?
-            else {
+        loop {
+            budget.begin_page()?;
+            let parameters = match cursor.take() {
+                Some(cursor) => serde_json::json!({"cursor":cursor}),
+                None => serde_json::json!({}),
+            };
+            let (result, _) = self
+                .request_final_core_with_cache_policy(
+                    cx,
+                    None,
+                    "tools/list",
+                    parameters,
+                    None,
+                    false,
+                )
+                .await?;
+            let (items, next_cursor) = http_catalog_page("tools/list", &result)?;
+            budget.account_core_page(&result, items)?;
+            cursor = budget.admit_next_cursor(next_cursor)?;
+            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
                 return Err(HttpClientError::CoreResult(McpError::invalid_request(
                     "Parameter-header refresh requires a final tools/list result",
                 )));
             };
             let payload = result.payload;
-            if let Some(tool) = payload.tools.into_iter().find(|tool| tool.name == name) {
-                return http_executor::parameter_headers::ReviewedToolHeaders::new(
-                    resource,
-                    name,
-                    tool.input_schema,
-                    review,
-                )
-                .map_err(|error| {
-                    HttpClientError::Connection(ClientHttpConnectionError::Modern(
-                        ModernHttpClientError::ParameterHeaders(error),
-                    ))
-                });
+            if let Some(tool) = payload
+                .tools
+                .into_iter()
+                .find(|tool| tool.name == reviewed.tool_name())
+            {
+                return reviewed
+                    .re_review(tool.input_schema, review)
+                    .map_err(|error| {
+                        HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                            ModernHttpClientError::ParameterHeaders(error),
+                        ))
+                    });
             }
-            match payload.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
+            if cursor.is_none() {
+                break;
             }
         }
         Err(HttpClientError::CoreResult(McpError::invalid_params(
-            format!("Tool '{name}' is not listed after refreshing tools/list"),
+            format!(
+                "Tool '{}' is not listed after refreshing tools/list",
+                reviewed.tool_name()
+            ),
         )))
     }
 
@@ -20493,6 +20538,43 @@ impl Client {
             server_info,
             discovery: result,
         })
+    }
+
+    /// Fetches one catalog page directly from the selected peer.
+    ///
+    /// Accepts only `tools/list`, `resources/list`, `resources/templates/list`,
+    /// and `prompts/list`. This integration hook preserves an opaque cursor
+    /// exactly, including an empty string, and neither reads nor populates the
+    /// complete-result cache. A caller materializing a catalog can therefore
+    /// follow repeated cursors without replaying an earlier cached page.
+    ///
+    /// The connection retains its ordinary request deadline, cancellation,
+    /// notification routing and selected-era response validation. Callers own
+    /// the bounds spanning multiple pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported method, failed initialization or
+    /// request, or a response contradicting the selected-era result contract.
+    pub fn list_catalog_page_uncached(
+        &mut self,
+        method: &str,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult> {
+        if !matches!(
+            method,
+            "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+        ) {
+            return Err(McpError::invalid_params(
+                "Uncached catalog requests require a list method",
+            ));
+        }
+        self.ensure_initialized()?;
+        let parameters = cursor.map_or_else(
+            || serde_json::json!({}),
+            |cursor| serde_json::json!({ "cursor": cursor }),
+        );
+        self.send_typed_core_request(method, parameters)
     }
 
     /// Lists one page of tools and returns its negotiated core result.
@@ -32598,6 +32680,232 @@ mod tests {
             result["nextCursor"] = serde_json::json!(cursor);
         }
         result
+    }
+
+    #[cfg(unix)]
+    fn write_http_parameter_header_test_refusal(
+        stream: &mut TcpStream,
+        request: &serde_json::Value,
+    ) {
+        let body = serde_json::json!({
+            "jsonrpc":"2.0", "id":request["id"],
+            "error":{
+                "code":fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE,
+                "message":fastmcp_protocol::HEADER_MISMATCH_MESSAGE
+            }
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn http_parameter_header_test_review(
+        client: &HttpClient,
+    ) -> http_executor::parameter_headers::ReviewedToolHeaders {
+        http_executor::parameter_headers::ReviewedToolHeaders::new_for_loopback_http(
+            CanonicalHttpUrl::parse(client.protocol_plan().modern_post_target().unwrap()).unwrap(),
+            "lookup",
+            serde_json::json!({"type":"object","properties":{
+                "region":{"type":"string","x-mcp-header":"OldRegion"}
+            }}),
+            |_| true,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_parameter_header_repair_follows_repeated_cacheable_cursors() {
+        for allow_review in [true, false] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let reviewed = http_parameter_header_test_review(&client);
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for index in 0..4 + usize::from(allow_review) {
+                    let mut stream = accept_http_catalog_test_request(&listener);
+                    let request = read_http_cache_test_request(&mut stream);
+                    if index == 0 {
+                        assert_eq!(request["method"], "tools/call");
+                        write_http_parameter_header_test_refusal(&mut stream, &request);
+                    } else {
+                        let result = if index < 4 {
+                            assert_eq!(request["method"], "tools/list");
+                            assert_eq!(
+                                request["params"]
+                                    .get("cursor")
+                                    .and_then(serde_json::Value::as_str),
+                                if index == 1 { None } else { Some("") }
+                            );
+                            let mut result = http_catalog_test_result(
+                                "tools/list",
+                                "lookup",
+                                (index < 3).then_some(""),
+                                60_000,
+                                "private",
+                            );
+                            if index < 3 {
+                                result["tools"] = serde_json::json!([]);
+                            } else {
+                                result["tools"][0]["inputSchema"] = serde_json::json!({
+                                    "type":"object","properties":{
+                                        "region":{"type":"string","x-mcp-header":"NewRegion"}
+                                    }
+                                });
+                            }
+                            result
+                        } else {
+                            assert_eq!(request["method"], "tools/call");
+                            assert_eq!(request["params"]["name"], "lookup");
+                            assert_eq!(
+                                request["params"]["arguments"],
+                                serde_json::json!({"region":"east"})
+                            );
+                            serde_json::json!({
+                                "resultType":"complete", "content":[{"type":"text","text":"done"}],
+                                "isError":false
+                            })
+                        };
+                        let response = serde_json::json!({
+                            "jsonrpc":"2.0", "id":request["id"], "result":result
+                        });
+                        write_http_cache_test_response(
+                            &mut stream,
+                            "application/json",
+                            response.to_string().as_bytes(),
+                        );
+                    }
+                    requests.push(request);
+                }
+                (requests, listener)
+            });
+            let reviews = std::sync::atomic::AtomicUsize::new(0);
+            let outcome = http_test_runtime_block_on(client.call_tool_with_parameter_headers(
+                &Cx::for_request(),
+                "lookup",
+                serde_json::json!({"region":"east"}),
+                &reviewed,
+                &|binding| {
+                    assert_eq!(binding.header_name(), "Mcp-Param-NewRegion");
+                    reviews.fetch_add(1, Ordering::Relaxed);
+                    allow_review
+                },
+            ));
+            if allow_review {
+                assert!(matches!(
+                    outcome,
+                    Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+                ));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Err(HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::ParameterHeaders(
+                            http_executor::parameter_headers::ToolHeaderDispatchError::DisclosureDenied
+                        )
+                    )))
+                ));
+            }
+            assert_eq!(reviews.load(Ordering::Relaxed), 1);
+            assert_eq!(reviewed.bindings()[0].header_name(), "Mcp-Param-OldRegion");
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            let (requests, listener) = server.join().unwrap();
+            assert_eq!(requests.len(), 4 + usize::from(allow_review));
+            for pair in requests.windows(2) {
+                assert_ne!(pair[0]["id"], pair[1]["id"]);
+            }
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_parameter_header_repair_keeps_the_original_deadline_through_retry() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let reviewed = http_parameter_header_test_review(&client);
+        client.request_timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_millis(1_500))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut initial = accept_http_catalog_test_request(&listener);
+            let first = read_http_cache_test_request(&mut initial);
+            assert_eq!(first["method"], "tools/call");
+            std::thread::sleep(Duration::from_millis(500));
+            write_http_parameter_header_test_refusal(&mut initial, &first);
+
+            let mut catalog = accept_http_catalog_test_request(&listener);
+            let listed = read_http_cache_test_request(&mut catalog);
+            assert_eq!(listed["method"], "tools/list");
+            std::thread::sleep(Duration::from_millis(500));
+            let response = serde_json::json!({
+                "jsonrpc":"2.0", "id":listed["id"],
+                "result":http_catalog_test_result("tools/list", "lookup", None, 60_000, "private")
+            });
+            write_http_cache_test_response(
+                &mut catalog,
+                "application/json",
+                response.to_string().as_bytes(),
+            );
+
+            let mut pending = accept_http_catalog_test_request(&listener);
+            let retried = read_http_cache_test_request(&mut pending);
+            assert_eq!(retried["method"], "tools/call");
+            assert_eq!(retried["params"]["arguments"], first["params"]["arguments"]);
+            assert_ne!(retried["id"], first["id"]);
+            let waiting = Instant::now();
+            let mut probe = [0_u8; 1];
+            assert_eq!(
+                pending.read(&mut probe).unwrap(),
+                0,
+                "timeout releases the retried POST"
+            );
+            assert!(
+                waiting.elapsed() < Duration::from_millis(1_200),
+                "the retry cannot acquire a fresh 1.5-second timeout"
+            );
+
+            let mut healthy = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut healthy);
+            assert_eq!(request["params"]["name"], "healthy");
+            let response = serde_json::json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "result":{"resultType":"complete","content":[],"isError":false}
+            });
+            write_http_cache_test_response(
+                &mut healthy,
+                "application/json",
+                response.to_string().as_bytes(),
+            );
+        });
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let outcome = runtime.block_on(client.call_tool_with_parameter_headers(
+            &cx,
+            "lookup",
+            serde_json::json!({"region":"east"}),
+            &reviewed,
+            &|_| true,
+        ));
+        assert!(matches!(
+            outcome,
+            Err(HttpClientError::CoreResult(error))
+                if error.message == "Parameter-header tool call absolute timeout exceeded"
+                    && error.data.as_ref().is_some_and(|data| data["timeoutSource"] == "absolute")
+        ));
+        assert!(cx.checkpoint().is_ok());
+        assert!(matches!(
+            runtime.block_on(client.call_tool(&cx, "healthy", serde_json::json!({}))),
+            Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+        ));
+        server.join().unwrap();
     }
 
     #[cfg(unix)]
