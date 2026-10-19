@@ -507,6 +507,24 @@ pub use fastmcp_core::{crypto, uri};
 // Re-export logging module
 pub use fastmcp_core::logging;
 
+// `partition` and `runtime` are forwarded because this facade ALREADY forwards
+// `fastmcp_client::http_auth`, and public signatures inside that tree demand
+// types declared in these two modules:
+//   `http_auth::oauth::persistence::OAuthRefreshStore::open` takes
+//     `&CredentialStoreKey` (and `CredentialStoreKey::derive` in turn needs
+//     `PartitionDescriptor` and returns `SealedAdmissionKeyError`),
+//   `http_auth::managed::tasks::watch::checkpoint::resume` takes
+//     `&DurableOwnerKey`, and
+//   `http_auth::secure_file::slot::coordinator::asynchronous::CredentialIoLane::new`
+//     takes `&ProcessGenerationGuard`.
+// Every one of those is obtainable ONLY through an associated function
+// (`derive`, `install`), never returned by a reachable method, so a caller has
+// to be able to WRITE the name. Without this a consumer could reach those
+// constructors through the facade but not call them without adding a direct
+// dependency on `fastmcp-core` — the same defect `PartitionAuthorization`
+// already had, fixed one parameter at a time until this closed the family.
+pub use fastmcp_core::{partition, runtime};
+
 // Re-export protocol types shared by both eras. Exact legacy initialization
 // types live in `legacy_2024`; modern discovery types live in `modern`.
 pub use fastmcp_protocol::{

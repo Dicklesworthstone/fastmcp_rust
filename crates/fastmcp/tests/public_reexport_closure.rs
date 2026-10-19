@@ -44,6 +44,8 @@ use std::time::Duration;
 use fastmcp_rust::http_auth::dpop::{DpopClientError, DpopError, DpopKey, DpopSession};
 use fastmcp_rust::http_auth::sampling::{SamplingRunLimits, SamplingToolLoopLimits};
 use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
+use fastmcp_rust::partition::{CredentialStoreKey, DurableOwnerKey, PartitionDescriptor};
+use fastmcp_rust::runtime::ProcessGenerationGuard;
 
 /// `DpopKey::generate` returns `Result<DpopKey, DpopError>`, so a consumer that
 /// wraps key generation must be able to name BOTH types. Declared as a real
@@ -117,6 +119,86 @@ fn facade_names_the_sampling_limits_its_run_constructor_demands() {
         SamplingRunLimits::new(conversation, Duration::ZERO, 4096).is_err(),
         "a zero timeout must be refused, so the positive is not vacuous"
     );
+}
+
+/// Builds the descriptor both partition keys derive from. Worth noting that
+/// `from_verified_facts` takes only primitives, so a consumer needs no further
+/// types to reach this point — the descriptor is the whole prerequisite.
+fn verified_descriptor() -> Result<PartitionDescriptor, ()> {
+    PartitionDescriptor::from_verified_facts(
+        "test-provider",
+        1,
+        "https://issuer.example.test",
+        "https://example.test/mcp",
+        "tenant-a",
+        "subject-a",
+        "client-a",
+        1,
+        1,
+        &[b"https://example.test/mcp"],
+    )
+    .map_err(|_| ())
+}
+
+#[test]
+fn facade_names_the_partition_types_its_credential_store_api_demands() {
+    // `http_auth::oauth::persistence::OAuthRefreshStore::open` is reachable
+    // through the forwarded `http_auth` tree and its THIRD parameter is a
+    // `&CredentialStoreKey`, obtainable only via the associated `derive`. So
+    // the constructor was reachable while being uncallable: naming the key and
+    // its descriptor required a direct dependency on `fastmcp-core`. An earlier
+    // fix re-exported only `PartitionAuthorization`, the FOURTH parameter,
+    // which left the call still unwritable.
+    let descriptor = verified_descriptor().expect("a descriptor builds from verified facts");
+
+    // Positive observable 1: a real credential-store key derives. The opaque
+    // key macro emits `as_bytes` as its only accessor, so the 32-byte digest is
+    // the observable rather than mere absence of a panic.
+    let key = CredentialStoreKey::derive(
+        &descriptor,
+        "store-main",
+        "credential-class-refresh",
+        "token-instance-1",
+    )
+    .expect("a credential store partition derives");
+    assert_eq!(key.as_bytes().len(), 32);
+
+    // Positive observable 2: the durable owner key, demanded by
+    // `http_auth::managed::tasks::watch::checkpoint::resume`, derives from the
+    // same descriptor and is distinct from the credential key — two different
+    // partition domains must not collide into one digest.
+    let owner = DurableOwnerKey::derive(&descriptor, 7).expect("a durable owner derives");
+    assert_ne!(
+        owner.as_bytes(),
+        key.as_bytes(),
+        "distinct partition domains must derive distinct digests"
+    );
+
+    // Negative control differing only in the forbidden dimension: same
+    // descriptor, same other arguments, but an EMPTY store domain is refused by
+    // `require_admission_field`. Without this, a `derive` that accepted
+    // anything would satisfy both positives above (RH-5).
+    assert!(
+        CredentialStoreKey::derive(&descriptor, "", "credential-class-refresh", "token-instance-1")
+            .is_err(),
+        "an empty admission field must be refused, so the positives are not vacuous"
+    );
+
+    // `ProcessGenerationGuard` is demanded by `CredentialIoLane::new` in the
+    // same forwarded tree. Named at signature level ONLY: `install()` plants a
+    // process-global `&'static`, which a test must not inflict on its siblings.
+    // Taking the address of a declared fn rather than coercing a closure,
+    // matching `borrows_authorization` below — a closure would have to be
+    // generic over the lifetime to coerce to this fn pointer type.
+    let names_guard: fn(&ProcessGenerationGuard) -> &ProcessGenerationGuard = borrows_guard;
+    let _ = names_guard;
+}
+
+/// Signature-level companion to the test above: proves the name resolves
+/// without installing the process-global that `ProcessGenerationGuard::install`
+/// would plant.
+fn borrows_guard(guard: &ProcessGenerationGuard) -> &ProcessGenerationGuard {
+    guard
 }
 
 #[test]
