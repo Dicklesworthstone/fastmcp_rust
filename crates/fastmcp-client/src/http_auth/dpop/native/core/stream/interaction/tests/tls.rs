@@ -12,7 +12,6 @@ use asupersync::net::TcpListener;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptorBuilder};
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fastmcp_core::CanonicalHttpUrl;
 use fastmcp_protocol::common_types::SamplingContentBlock;
 use fastmcp_protocol::dpop::DpopKey;
@@ -205,10 +204,39 @@ fn check_request(head: &str, body: &Value, original: &Value, round: usize) -> Va
     let proof = field(head, "dpop");
     let parts: Vec<_> = proof.split('.').collect();
     assert_eq!(parts.len(), 3);
-    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+    let claims: Value = serde_json::from_slice(&base64url_payload(parts[1])).unwrap();
     assert_eq!(claims["htm"], "POST");
     assert!(claims["jti"].as_str().is_some_and(|id| !id.is_empty()));
     claims
+}
+
+// Decode a captured proof segment for wire-binding assertions, not signature or
+// issuer conformance. `base64` is declared nowhere in this crate's manifest, so
+// importing it never compiled; this mirrors the sibling DPoP fixtures
+// (`core/tasks/tests/tls.rs`, `core/tasks/stream/tests/tls.rs`), which decode
+// locally for the same reason: no production dependency is needed by tests.
+fn base64url_payload(segment: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let (mut acc, mut bits) = (0_u32, 0_u32);
+    for byte in segment.bytes() {
+        let digit = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => panic!("invalid base64url proof"),
+        };
+        acc = (acc << 6) | u32::from(digit);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    assert_eq!(acc, 0, "a base64url segment leaves no trailing bits set");
+    bytes
 }
 
 async fn chunk<IO: AsyncWrite + Unpin>(io: &mut IO, event: &[u8]) {
