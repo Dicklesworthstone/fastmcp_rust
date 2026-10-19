@@ -2737,8 +2737,8 @@ fn handler_prompt_to_legacy(message: PromptMessage) -> McpResult<LegacyPromptMes
 ///
 /// Proxy registration creates a fixed downstream snapshot, so every page must
 /// be collected before any entry is registered. The bound keeps an upstream
-/// cursor cycle or an unbounded catalog from turning that one-time operation
-/// into unbounded work.
+/// peer that never omits `nextCursor` from turning that one-time operation
+/// into unbounded work. Cursor contents do not determine whether a page exists.
 const MAX_MODERN_PROXY_CATALOG_PAGES: usize = 64;
 
 /// Maximum entries retained while materializing one proxy catalog family.
@@ -2875,12 +2875,14 @@ impl std::io::Write for ProxyCatalogByteCounter {
     }
 }
 
-/// Collects one paginated modern catalog without accepting a cursor cycle.
+/// Collects one paginated modern catalog within the independent local bounds.
 ///
 /// The caller owns selected-era decoding; this helper owns only the invariant
 /// shared by tools, resources, templates, and prompts. Returning an error
 /// drops the locally accumulated entries, so the caller cannot construct a
-/// partial proxy catalog after an invalid cursor sequence.
+/// partial proxy catalog after a failed page or an exhausted local bound.
+/// Every present cursor, including an empty or repeated value, is forwarded
+/// unchanged; only absence of `nextCursor` terminates a successful listing.
 fn collect_modern_proxy_catalog_pages<T: Serialize>(
     method: &str,
     mut fetch_page: impl FnMut(
@@ -2903,7 +2905,6 @@ fn collect_proxy_catalog_pages<T: Serialize>(
     let mut entries = Vec::new();
     let mut cache_hints = Vec::new();
     let mut cursor = None;
-    let mut observed_cursors = HashSet::new();
     let mut admission = ProxyCatalogAdmission::default();
 
     for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
@@ -2918,16 +2919,6 @@ fn collect_proxy_catalog_pages<T: Serialize>(
                 cache_hints,
             });
         };
-        if cursor.as_deref() == Some(next_cursor.as_str()) {
-            return Err(McpError::invalid_request(format!(
-                "Proxy {era} {method} catalog returned a non-advancing cursor"
-            )));
-        }
-        if !observed_cursors.insert(next_cursor.clone()) {
-            return Err(McpError::invalid_request(format!(
-                "Proxy {era} {method} catalog returned a repeated cursor"
-            )));
-        }
         cursor = Some(next_cursor);
     }
 
@@ -3182,7 +3173,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::TOOLS_LIST,
-                    |cursor| match Client::list_tools_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("tools/list", cursor)? {
                         CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
                             let payload = result.payload;
                             Ok((
@@ -3249,7 +3240,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::RESOURCES_LIST,
-                    |cursor| match Client::list_resources_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("resources/list", cursor)? {
                         CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
                             let payload = result.payload;
                             Ok((
@@ -3316,7 +3307,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
-                    |cursor| match Client::list_resource_templates_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("resources/templates/list", cursor)? {
                     CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                         result, ..
                     }) => {
@@ -3383,7 +3374,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::PROMPTS_LIST,
-                    |cursor| match Client::list_prompts_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("prompts/list", cursor)? {
                         CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
                             let payload = result.payload;
                             Ok((
@@ -6240,7 +6231,6 @@ impl ProxyHttpClient {
     ) -> McpResult<Vec<T>> {
         let mut entries = Vec::new();
         let mut cursor = None;
-        let mut observed_cursors = HashSet::new();
         let mut admission = ProxyCatalogAdmission::default();
 
         for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
@@ -6256,16 +6246,6 @@ impl ProxyHttpClient {
             let Some(next_cursor) = next_cursor else {
                 return Ok(entries);
             };
-            if cursor.as_deref() == Some(next_cursor.as_str()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy legacy {method} catalog returned a non-advancing cursor"
-                )));
-            }
-            if !observed_cursors.insert(next_cursor.clone()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy legacy {method} catalog returned a repeated cursor"
-                )));
-            }
             cursor = Some(next_cursor);
         }
 
@@ -9512,7 +9492,6 @@ impl ProxyClient {
     ) -> McpResult<ProxyFinalCatalog<T>> {
         let mut catalog = ProxyFinalCatalog::new(Vec::new());
         let mut cursor = None;
-        let mut observed_cursors = HashSet::new();
         let mut admission = ProxyCatalogAdmission::default();
         let era = if self.upstream_binding.map(|binding| binding.era())
             == Some(ProtocolEra::Legacy2024)
@@ -9554,16 +9533,6 @@ impl ProxyClient {
             let Some(next_cursor) = next_cursor else {
                 return Ok(catalog);
             };
-            if cursor.as_deref() == Some(next_cursor.as_str()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy {era} {method} catalog returned a non-advancing cursor"
-                )));
-            }
-            if !observed_cursors.insert(next_cursor.clone()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy {era} {method} catalog returned a repeated cursor"
-                )));
-            }
             cursor = Some(next_cursor);
         }
         Err(McpError::invalid_request(format!(
@@ -17041,16 +17010,18 @@ IFS= read -r end
                         &serde_json::to_vec(&response).unwrap(),
                     );
                 }
-                let methods: &[&str] = if interrupt == 4 {
-                    &["tools/list", "tools/list"]
+                let methods = if interrupt == 4 {
+                    vec!["tools/list"; 64]
                 } else {
-                    &[
-                        "tools/list",
+                    [
                         "tools/list",
                         "resources/list",
                         "resources/templates/list",
                         "prompts/list",
                     ]
+                    .into_iter()
+                    .flat_map(|method| std::iter::repeat_n(method, 4))
+                    .collect()
                 };
                 for (index, method) in methods.iter().enumerate() {
                     let mut post = accept();
@@ -17066,20 +17037,39 @@ IFS= read -r end
                             break;
                         }
                     }
+                    let page = index % 4;
                     let mut result = match *method {
-                        "tools/list" => {
-                            serde_json::json!({"tools":[{"name":format!("registry-{}-{index}", address.port()), "inputSchema":{"type":"object"}}]})
+                        "tools/list" if page == 0 || page == 3 => {
+                            let entry = usize::from(page == 3);
+                            serde_json::json!({"tools":[{"name":format!("registry-{}-{entry}", address.port()), "inputSchema":{"type":"object"}}]})
                         }
+                        "tools/list" => serde_json::json!({"tools":[]}),
                         "resources/list" => serde_json::json!({"resources":[]}),
                         "resources/templates/list" => serde_json::json!({"resourceTemplates":[]}),
                         "prompts/list" => serde_json::json!({"prompts":[]}),
                         _ => unreachable!(),
                     };
-                    if index == 0 || (index == 1 && interrupt == 4) {
+                    if interrupt == 4 {
                         result["nextCursor"] = serde_json::json!("page-two");
-                    }
-                    if index == 1 {
-                        assert_eq!(message["params"]["cursor"], "page-two");
+                        assert_eq!(
+                            message["params"].get("cursor"),
+                            (index > 0).then(|| serde_json::json!("page-two")).as_ref()
+                        );
+                    } else {
+                        if page < 3 {
+                            result["nextCursor"] =
+                                serde_json::json!(if page < 2 { "" } else { " \tresume\n " });
+                        }
+                        assert_eq!(
+                            message["params"].get("cursor"),
+                            match page {
+                                0 => None,
+                                1 | 2 => Some(serde_json::json!("")),
+                                _ => Some(serde_json::json!(" \tresume\n ")),
+                            }
+                            .as_ref(),
+                            "each async catalog forwards the exact preceding opaque cursor"
+                        );
                     }
                     if !legacy {
                         result["resultType"] = serde_json::json!("complete");
@@ -17326,7 +17316,7 @@ IFS= read -r end
                         if interrupt == 4 {
                             let error = catalog.unwrap_err();
                             assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                            assert!(error.message.contains("non-advancing cursor"));
+                            assert!(error.message.contains("64-page limit"));
                         } else {
                             let catalog = catalog.unwrap();
                             let names: Vec<_> = match &catalog.tools {
@@ -17334,7 +17324,7 @@ IFS= read -r end
                                     tools.iter().map(|tool| tool.name.clone()).collect()
                                 }
                                 ProxyToolCatalog::Final(tools) => {
-                                    assert_eq!(tools.cache_hints.len(), 2);
+                                    assert_eq!(tools.cache_hints.len(), 4);
                                     assert_eq!(
                                         serde_json::to_value(&tools.cache_hints[1].ttl_ms).unwrap(),
                                         18
@@ -17549,7 +17539,7 @@ IFS= read -r end
         use std::future::Future;
         use std::task::Poll;
 
-        // 0: complete, 1: cursor cycle, 2: cancellation, 3: deadline, 4: drop.
+        // 0: complete, 1: page exhaustion, 2: cancellation, 3: deadline, 4: drop.
         let legacy = policy == ProtocolPolicy::LegacyOnly;
         let clock = Arc::new(asupersync::time::VirtualClock::new());
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -17584,7 +17574,8 @@ IFS= read -r end
         );
         let mut pages = Vec::new();
         if interrupt == 1 {
-            pages.extend([(0, true), (1, true)]);
+            pages.push((0, true));
+            pages.extend(std::iter::repeat_n((1, true), 63));
         } else if interrupt >= 2 {
             pages.push((0, true));
         }
@@ -17713,7 +17704,7 @@ IFS= read -r end
                     let catalog = if interrupt == 1 {
                         let error = observed.unwrap_err();
                         assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                        assert!(error.message.contains("non-advancing cursor"));
+                        assert!(error.message.contains("64-page limit"));
                         proxy.catalog_typed_with_cx(&cx).await.unwrap()
                     } else {
                         observed.unwrap()
@@ -23552,7 +23543,57 @@ IFS= read -r end
     }
 
     #[test]
-    fn proxy_catalog_rejects_one_non_advancing_modern_cursor_without_replacing_catalog() {
+    fn proxy_catalog_accepts_empty_repeated_and_cyclic_opaque_cursors() {
+        for era in ["modern", "legacy"] {
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                let cursors = [
+                    Some(""),
+                    Some(" \tresume\n "),
+                    Some(" \tresume\n "),
+                    Some(""),
+                    None,
+                ];
+                let mut page_requests = 0_usize;
+                let catalog = super::collect_proxy_catalog_pages(era, method, |cursor| {
+                    let page = page_requests;
+                    assert_eq!(cursor, page.checked_sub(1).and_then(|index| cursors[index]));
+                    page_requests += 1;
+                    // Zero entries do not terminate a catalog when a cursor is
+                    // present, nor does returning a previously seen token.
+                    let entries = if matches!(page, 1 | 2) {
+                        Vec::new()
+                    } else {
+                        vec![page]
+                    };
+                    Ok((
+                        entries,
+                        cursors[page].map(str::to_owned),
+                        (era == "modern").then(|| {
+                            ProxyCatalogCacheHint::new(
+                                CacheTtl::milliseconds(page as u64),
+                                CacheScope::Private,
+                            )
+                        }),
+                    ))
+                })
+                .expect("every present opaque cursor must be followed unchanged");
+                assert_eq!(page_requests, cursors.len());
+                assert_eq!(catalog.entries, [0, 3, 4]);
+                assert_eq!(
+                    catalog.cache_hints.len(),
+                    if era == "modern" { 5 } else { 0 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_page_limit_bounds_repeated_cursors_without_replacing_catalog() {
         let retained_catalog = ProxyCatalog {
             tool_catalog_era: Some(ProtocolEra::Modern2026),
             final_tools: vec![final_catalog_tool()],
@@ -23578,8 +23619,8 @@ IFS= read -r end
                         page_hint(),
                     )),
                     Some("tools-page-2") => {
-                        // The one forbidden difference from the terminal
-                        // positive page is retaining this same cursor.
+                        // A repeated token is valid until the independent
+                        // page bound is reached without a terminal page.
                         Ok((
                             vec![second_page.clone()],
                             Some("tools-page-2".to_owned()),
@@ -23598,14 +23639,12 @@ IFS= read -r end
             final_tool_cache_hints: final_tools.cache_hints,
             ..ProxyCatalog::default()
         });
-        let error = replacement.expect_err(
-            "only changing the terminal nextCursor to the current cursor must fail closed",
-        );
+        let error = replacement.expect_err("an unterminated listing must hit its page bound");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(error.message.contains("non-advancing cursor"));
+        assert!(error.message.contains("64-page limit"));
         assert_eq!(
-            page_requests, 2,
-            "the repeated cursor is rejected before a third catalog request"
+            page_requests, 64,
+            "the page bound prevents the 65th request independently of cursor contents"
         );
 
         assert_eq!(
@@ -24808,7 +24847,7 @@ exec sleep 2
     #[cfg(feature = "legacy-2024-11-05")]
     #[derive(Clone, Copy)]
     enum LegacyCatalogPageFailure {
-        RepeatedCursor,
+        PageLimit,
         UpstreamError,
     }
 
@@ -24835,41 +24874,53 @@ exec sleep 2
                 "resources/templates/list",
                 "prompts/list",
             ] {
-                for page in 1..=2 {
+                let page_count = if method == "resources/list"
+                    && matches!(attempt, Some(LegacyCatalogPageFailure::PageLimit))
+                {
+                    64
+                } else {
+                    4
+                };
+                for page in 1..=page_count {
+                    let entry_page = if page == 1 { 1 } else { 2 };
                     let mut result = match method {
                         "tools/list" => serde_json::json!({"tools":[{
-                            "name": format!("tool-{page}"),
-                            "description": format!("Tool from page {page}"),
+                            "name": format!("tool-{entry_page}"),
+                            "description": format!("Tool from page {entry_page}"),
                             "inputSchema": {"type":"object","properties":{"city":{"type":"string"}}}
                         }]}),
                         "resources/list" => serde_json::json!({"resources":[{
-                            "uri": format!("https://example.test/resource/{page}"),
-                            "name": format!("resource-{page}"),
-                            "description": format!("Resource from page {page}"),
+                            "uri": format!("https://example.test/resource/{entry_page}"),
+                            "name": format!("resource-{entry_page}"),
+                            "description": format!("Resource from page {entry_page}"),
                             "mimeType":"text/plain"
                         }]}),
                         "resources/templates/list" => serde_json::json!({"resourceTemplates":[{
-                            "uriTemplate": format!("https://example.test/template/{page}/{{id}}"),
-                            "name": format!("template-{page}"),
+                            "uriTemplate": format!("https://example.test/template/{entry_page}/{{id}}"),
+                            "name": format!("template-{entry_page}"),
                             "mimeType":"text/plain"
                         }]}),
                         "prompts/list" => serde_json::json!({"prompts":[{
-                            "name": format!("prompt-{page}"),
-                            "description": format!("Prompt from page {page}"),
+                            "name": format!("prompt-{entry_page}"),
+                            "description": format!("Prompt from page {entry_page}"),
                             "arguments":[{"name":"city","description":"City name","required":true}]
                         }]}),
                         _ => unreachable!(),
                     };
-                    // Reuse the same opaque token across families. Each list
-                    // operation must retain its own cursor history.
-                    if page == 1 {
-                        result["nextCursor"] = serde_json::json!("catalog-page-two");
+                    // Two empty pages reuse the empty cursor before the final
+                    // populated page. Only an absent nextCursor ends a list.
+                    if page > 1 && page < page_count {
+                        let entries = result.as_object_mut().unwrap().values_mut().next().unwrap();
+                        *entries = serde_json::json!([]);
                     }
-                    let failing_page = attempt.is_some() && method == "resources/list" && page == 2;
-                    if failing_page
-                        && matches!(attempt, Some(LegacyCatalogPageFailure::RepeatedCursor))
+                    let failing_page =
+                        attempt.is_some() && method == "resources/list" && page == page_count;
+                    if page < page_count
+                        || (failing_page
+                            && matches!(attempt, Some(LegacyCatalogPageFailure::PageLimit)))
                     {
-                        result["nextCursor"] = serde_json::json!("catalog-page-two");
+                        result["nextCursor"] =
+                            serde_json::json!(if page <= 2 { "" } else { "catalog-page-two" });
                     }
                     let response = if failing_page
                         && matches!(attempt, Some(LegacyCatalogPageFailure::UpstreamError))
@@ -24882,12 +24933,16 @@ exec sleep 2
                     };
                     replies.push(LegacyCatalogPageReply {
                         method,
-                        cursor: (page == 2).then_some("catalog-page-two"),
+                        cursor: match page {
+                            1 => None,
+                            2 | 3 => Some(""),
+                            _ => Some("catalog-page-two"),
+                        },
                         response,
                     });
                     if failing_page {
                         // The next attempt must restart tools/list without a
-                        // cursor, never request page three or later families.
+                        // cursor, never exceed the page bound or list later families.
                         break 'catalog;
                     }
                 }
@@ -24973,9 +25028,9 @@ exec sleep 2
                 .catalog()
                 .expect_err("a failed page cannot become a shorter catalog");
             match failure {
-                LegacyCatalogPageFailure::RepeatedCursor => {
+                LegacyCatalogPageFailure::PageLimit => {
                     assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                    assert!(error.message.contains("non-advancing cursor"));
+                    assert!(error.message.contains("64-page limit"));
                 }
                 LegacyCatalogPageFailure::UpstreamError => {
                     assert_eq!(error.code, McpErrorCode::InvalidParams);
@@ -25013,15 +25068,15 @@ trap 'exit 99' HUP INT TERM
 expect_request() {{
     IFS= read -r request || exit 90
     case "$request" in *"\"method\":\"$1\""*) ;; *) exit 91 ;; esac
-    if [ -n "$2" ]; then
+    if [ "$3" = present ]; then
         case "$request" in *"\"cursor\":\"$2\""*) ;; *) exit 92 ;; esac
     else
         case "$request" in *'"cursor":'*) exit 93 ;; esac
     fi
 }}
-expect_request initialize ''
+expect_request initialize '' absent
 printf '%s\n' '{initialize}'
-expect_request notifications/initialized ''
+expect_request notifications/initialized '' absent
 "#
         );
         for (index, reply) in legacy_catalog_page_replies(failure).into_iter().enumerate() {
@@ -25034,9 +25089,14 @@ expect_request notifications/initialized ''
                 "shell fixture response must be quote-safe"
             );
             script.push_str(&format!(
-                "expect_request '{}' '{}'\nprintf '%s\\n' '{response}'\n",
+                "expect_request '{}' '{}' '{}'\nprintf '%s\\n' '{response}'\n",
                 reply.method,
                 reply.cursor.unwrap_or_default(),
+                if reply.cursor.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                },
             ));
         }
         script.push_str("while IFS= read -r remaining; do :; done\n");
@@ -25063,7 +25123,7 @@ expect_request notifications/initialized ''
     #[test]
     fn proxy_legacy_stdio_catalog_pagination_planted_negative() {
         for failure in [
-            LegacyCatalogPageFailure::RepeatedCursor,
+            LegacyCatalogPageFailure::PageLimit,
             LegacyCatalogPageFailure::UpstreamError,
         ] {
             proxy_legacy_stdio_catalog_pagination_probe(Some(failure));
@@ -25166,7 +25226,14 @@ expect_request notifications/initialized ''
             ClientCapabilities::default(),
         ));
         assert_legacy_catalog_pagination(&proxy, failure);
-        assert_eq!(peer.join().unwrap(), if failure.is_some() { 20 } else { 8 });
+        assert_eq!(
+            peer.join().unwrap(),
+            match failure {
+                None => 16,
+                Some(LegacyCatalogPageFailure::UpstreamError) => 40,
+                Some(LegacyCatalogPageFailure::PageLimit) => 100,
+            }
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
@@ -25179,7 +25246,7 @@ expect_request notifications/initialized ''
     #[test]
     fn proxy_legacy_http_catalog_pagination_planted_negative() {
         for failure in [
-            LegacyCatalogPageFailure::RepeatedCursor,
+            LegacyCatalogPageFailure::PageLimit,
             LegacyCatalogPageFailure::UpstreamError,
         ] {
             proxy_legacy_http_catalog_pagination_probe(Some(failure));
@@ -25229,11 +25296,37 @@ expect_request notifications/initialized ''
                 br#"{"jsonrpc":"2.0","id":9,"result":{"resultType":"complete","prompts":[{"name":"prompt-two"}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
                 br#"{"jsonrpc":"2.0","id":10,"result":{"resultType":"complete","content":[{"type":"text","text":"forwarded"}]}}"#.as_slice(),
             ];
-            let mut normal_requests = Vec::new();
+            let mut opaque_cursor_responses = Vec::new();
             for response in responses {
+                let mut response: serde_json::Value = serde_json::from_slice(response).unwrap();
+                if response["result"].get("nextCursor").is_some() {
+                    let entries = ["tools", "resources", "resourceTemplates", "prompts"]
+                        .into_iter()
+                        .find(|field| response["result"].get(*field).is_some())
+                        .unwrap();
+                    response["result"]["nextCursor"] = serde_json::json!("");
+                    let mut empty = response.clone();
+                    empty["result"][entries] = serde_json::json!([]);
+                    opaque_cursor_responses.push(response);
+                    opaque_cursor_responses.push(empty.clone());
+                    empty["result"]["nextCursor"] = serde_json::json!(" \tresume\n ");
+                    opaque_cursor_responses.push(empty);
+                } else {
+                    opaque_cursor_responses.push(response);
+                }
+            }
+            let mut normal_requests = Vec::new();
+            for mut response in opaque_cursor_responses {
                 let (mut normal, _) = listener.accept().expect("accept modern proxy request");
                 let request = read_http_request(&mut normal);
-                write_http_response(&mut normal, 200, "application/json", response);
+                let message: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                response["id"] = message["id"].clone();
+                write_http_response(
+                    &mut normal,
+                    200,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
                 normal_requests.push(request);
             }
             (probe_request, normal_requests)
@@ -25346,17 +25439,16 @@ expect_request notifications/initialized ''
                 ["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
             "proxy-http-test-client"
         );
-        let expected_methods = [
-            "tools/list",
+        let expected_methods: Vec<_> = [
             "tools/list",
             "resources/list",
-            "resources/list",
-            "resources/templates/list",
             "resources/templates/list",
             "prompts/list",
-            "prompts/list",
-            "tools/call",
-        ];
+        ]
+        .into_iter()
+        .flat_map(|method| std::iter::repeat_n(method, 4))
+        .chain(std::iter::once("tools/call"))
+        .collect();
         assert_eq!(normal.len(), expected_methods.len());
         for (request, method) in normal.iter().zip(expected_methods) {
             assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
@@ -25372,27 +25464,22 @@ expect_request notifications/initialized ''
                 serde_json::json!({})
             );
         }
-        for (request, cursor) in normal.iter().zip([
-            None,
-            Some("tools-page-2"),
-            None,
-            Some("resources-page-2"),
-            None,
-            Some("templates-page-2"),
-            None,
-            Some("prompts-page-2"),
-            None,
-        ]) {
+        for (index, request) in normal.iter().enumerate() {
+            let cursor = match index % 4 {
+                0 => None,
+                1 | 2 => Some(""),
+                _ => Some(" \tresume\n "),
+            };
             let parameters = serde_json::from_slice::<serde_json::Value>(&request.body)
                 .expect("modern paged catalog request JSON")["params"]
                 .clone();
             assert_eq!(
                 parameters.get("cursor").and_then(serde_json::Value::as_str),
                 cursor,
-                "only second modern catalog pages carry their predecessor cursor"
+                "empty, repeated and whitespace-bearing cursors are forwarded verbatim"
             );
         }
-        let call = serde_json::from_slice::<serde_json::Value>(&normal[8].body)
+        let call = serde_json::from_slice::<serde_json::Value>(&normal[16].body)
             .expect("modern handler request JSON");
         assert_eq!(call["method"], "tools/call");
         assert_eq!(call["params"]["name"], "echo");
@@ -27351,6 +27438,187 @@ exec sleep 2
         assert!(catalog.resource_templates.is_empty());
         assert!(catalog.prompts.is_empty());
         client.close().expect("close proxy catalog client");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_catalog_repeated_cursors_bypass_positive_ttl_cache() {
+        let methods = [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ];
+        let page = |method: &str, member: &str, name: Option<&str>, next: Option<&str>| {
+            let mut result = serde_json::json!({
+                "resultType": "complete", "ttlMs": 60000, "cacheScope": "private"
+            });
+            result[member] = name.map_or_else(
+                || serde_json::json!([]),
+                |name| {
+                    let entry = match method {
+                        "tools/list" => serde_json::json!({"name":name,"inputSchema":{"type":"object"}}),
+                        "resources/list" => serde_json::json!({"name":name,"uri":format!("file:///cache/{name}")}),
+                        "resources/templates/list" => serde_json::json!({"name":name,"uriTemplate":format!("file:///cache/{name}/{{id}}")}),
+                        "prompts/list" => serde_json::json!({"name":name}),
+                        _ => unreachable!(),
+                    };
+                    serde_json::json!([entry])
+                },
+            );
+            if let Some(next) = next {
+                result["nextCursor"] = serde_json::json!(next);
+            }
+            result
+        };
+        let cached_page = |client: &mut Client, method| match method {
+            "tools/list" => client.list_tools_typed(Some("")),
+            "resources/list" => client.list_resources_typed(Some("")),
+            "resources/templates/list" => client.list_resource_templates_typed(Some("")),
+            "prompts/list" => client.list_prompts_typed(Some("")),
+            _ => unreachable!(),
+        };
+        for cache_enabled in [true, false] {
+            let discovery = scripted_response_line(
+                1,
+                serde_json::json!({
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{"tools":{},"resources":{},"prompts":{}},
+                    "ttlMs":0,"cacheScope":"private"
+                }),
+            );
+            let mut script = format!(
+                r#"
+peer_pid=$$
+(sleep 12; kill -TERM "$peer_pid" 2>/dev/null) >/dev/null 2>&1 &
+watchdog_pid=$!
+trap 'kill "$watchdog_pid" 2>/dev/null || true' EXIT
+trap 'exit 99' HUP INT TERM
+expect_request() {{
+    IFS= read -r request || exit 90
+    case "$request" in *"\"method\":\"$1\""*) ;; *) exit 91 ;; esac
+    if [ "$2" = present ]; then
+        case "$request" in *'"cursor":""'*) ;; *) exit 92 ;; esac
+    else
+        case "$request" in *'"cursor":'*) exit 93 ;; esac
+    fi
+}}
+expect_request server/discover absent
+printf '%s\n' '{discovery}'
+"#
+            );
+            let mut id = 2;
+            // Warm each ordinary page cache with a nonterminal response whose
+            // cursor and content must never substitute for a new proxy page.
+            for (method, member) in methods {
+                let response =
+                    scripted_response_line(id, page(method, member, Some("cached"), Some("")));
+                script.push_str(&format!(
+                    "expect_request '{method}' present\nprintf '%s\\n' '{response}'\n"
+                ));
+                id += 1;
+            }
+            for (method, member) in methods {
+                for (index, name) in [Some("first"), None, Some("last")].into_iter().enumerate() {
+                    let response = scripted_response_line(
+                        id,
+                        page(method, member, name, (index < 2).then_some("")),
+                    );
+                    let presence = if index == 0 { "absent" } else { "present" };
+                    script.push_str(&format!(
+                        "expect_request '{method}' {presence}\nprintf '%s\\n' '{response}'\n"
+                    ));
+                    id += 1;
+                }
+            }
+            let response = scripted_response_line(id, page("tools/list", "tools", None, Some("")));
+            script.push_str(&format!(
+                "expect_request tools/list absent\nprintf '%s\\n' '{response}'\n"
+            ));
+            let response = serde_json::json!({
+                "jsonrpc":"2.0", "id":id + 1,
+                "error":{"code":-32603,"message":"upstream catalog failure"}
+            });
+            script.push_str(&format!(
+                "expect_request tools/list present\nprintf '%s\\n' '{response}'\nwhile IFS= read -r remaining; do :; done\n"
+            ));
+
+            let cx = Cx::for_testing();
+            let mut client = block_on(
+                fastmcp_client::ClientBuilder::new()
+                    .auto_initialize(true)
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .request_timeout_policy(scripted_peer_timeout_policy())
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+            )
+            .expect("spawn positive-TTL repeated-cursor peer");
+            for (method, _) in methods {
+                cached_page(&mut client, method).unwrap();
+                cached_page(&mut client, method).unwrap();
+            }
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 4);
+            client.set_final_result_cache_enabled(cache_enabled);
+            let before = client.peek_next_request_id();
+            let catalog = ProxyCatalog::from_client(&mut client)
+                .expect("every present opaque cursor obtains another live peer page");
+            assert_eq!(client.peek_next_request_id() - before, 12);
+            assert_eq!(client.final_result_cache_enabled(), cache_enabled);
+            let tools: Vec<_> = catalog
+                .final_tools
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let resources: Vec<_> = catalog
+                .final_resources
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let templates: Vec<_> = catalog
+                .final_resource_templates
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let prompts: Vec<_> = catalog
+                .final_prompts
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            for names in [tools, resources, templates, prompts] {
+                assert_eq!(names, ["first", "last"]);
+            }
+            for hints in [
+                &catalog.final_tool_cache_hints,
+                &catalog.final_resource_cache_hints,
+                &catalog.final_resource_template_cache_hints,
+                &catalog.final_prompt_cache_hints,
+            ] {
+                assert_eq!(hints.len(), 3);
+                assert!(hints.iter().all(|hint| hint.ttl_ms.as_str() == "60000"));
+            }
+
+            let error = ProxyBackend::list_tool_catalog(&mut client)
+                .expect_err("a failed continuation cannot publish a partial catalog");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(client.final_result_cache_enabled(), cache_enabled);
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 4);
+            client.set_final_result_cache_enabled(true);
+            for (method, _) in methods {
+                cached_page(&mut client, method).expect("unrelated retained page cache survives");
+            }
+            assert_eq!(client.final_result_cache_stats().hits, 8);
+            let before = client.peek_next_request_id();
+            assert_eq!(
+                client
+                    .list_catalog_page_uncached("tools/call", None)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
+            assert_eq!(client.peek_next_request_id(), before);
+            client.close().expect("close repeated-cursor proxy peer");
+        }
     }
 
     #[cfg(unix)]
