@@ -517,7 +517,12 @@ fn native_oauth_reviewed_task_calls_keep_headers_through_public_continuation_and
                                         async move {
                                             let (address, path) = redirect.strip_prefix("http://").unwrap()
                                                 .split_once('/').unwrap();
-                                            let mut callback = asupersync::net::TcpStream::connect(address).await
+                                            // Owned: TcpStream::connect is `A: ToSocketAddrs +
+                                            // Send + 'static`, so a borrow of `redirect` cannot
+                                            // satisfy it (E0597). Mirrors the working sibling
+                                            // fixture in managed/client/tests.rs.
+                                            let (address, path) = (address.to_owned(), path.to_owned());
+                                            let mut callback = asupersync::net::TcpStream::connect(address.clone()).await
                                                 .map_err(|_| OAuthError::BrowserLaunchFailed)?;
                                             let request = format!(
                                                 "GET /{path}?code=fixture-code&state={}&iss={} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n",

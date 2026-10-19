@@ -74,7 +74,11 @@ async fn exercise(streams: [bool; 4], events: bool, failure: Option<(usize, Fail
                 let state = fields["state"].clone();
                 async move {
                     let (address, path) = redirect.strip_prefix("http://").unwrap().split_once('/').unwrap();
-                    let mut callback = asupersync::net::TcpStream::connect(address).await
+                    // Owned: TcpStream::connect is `A: ToSocketAddrs + Send + 'static`, so a
+                    // borrow of `redirect` cannot satisfy it (E0597). Mirrors the working
+                    // sibling fixture in managed/client/tests.rs.
+                    let (address, path) = (address.to_owned(), path.to_owned());
+                    let mut callback = asupersync::net::TcpStream::connect(address.clone()).await
                         .map_err(|_| OAuthError::BrowserLaunchFailed)?;
                     callback.write_all(format!(
                         "GET /{path}?code=fixture-code&state={}&iss={} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n",
