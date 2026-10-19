@@ -14,7 +14,6 @@
 /// Subscription-driven, bounded reconciliation of complete machine catalogs.
 pub mod watch;
 
-use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -191,6 +190,9 @@ impl ClientCredentialsCatalogClient {
     /// supplies a fresh discovery/operation pair for each page. No ID from either
     /// role can be reused during this collection, including numeric aliases.
     /// `observe` runs without a mutex held and must not block the async runtime.
+    /// Every present cursor, including an empty or repeated value, is passed
+    /// back unchanged. Only cursor absence completes the collection; count,
+    /// byte and deadline limits bound peers that keep returning continuations.
     pub async fn collect<I, O>(
         &self,
         cx: &Cx,
@@ -540,7 +542,6 @@ fn page_facts(
 #[derive(Default)]
 struct Traversal {
     ids: Vec<RequestId>,
-    cursors: HashSet<String>,
     state_bytes: usize,
     items: usize,
     bytes: usize,
@@ -562,7 +563,6 @@ impl Traversal {
                 return Err(ManagedCatalogError::StateLimit);
             }
             state.state_bytes = charge;
-            state.cursors.insert(cursor.to_owned());
         }
         Ok(state)
     }
@@ -613,23 +613,17 @@ impl Traversal {
             return Err(ManagedCatalogError::ItemLimit);
         }
         let charge = match page.cursor {
-            Some(cursor) => {
-                if self.cursors.contains(cursor) {
-                    return Err(ManagedCatalogError::RepeatedCursor);
-                }
-                cursor
-                    .len()
-                    .checked_add(1)
-                    .ok_or(ManagedCatalogError::StateLimit)?
-            }
+            Some(cursor) => cursor
+                .len()
+                .checked_add(1)
+                .ok_or(ManagedCatalogError::StateLimit)?,
             None => 0,
         };
         if charge > limits.maximum_state_bytes.saturating_sub(self.state_bytes) {
             return Err(ManagedCatalogError::StateLimit);
         }
-        if let Some(cursor) = page.cursor {
-            self.cursors.insert(cursor.to_owned());
-        }
+        // Every retained page owns its cursor, even if the peer repeats the
+        // exact same bytes. Charge each occurrence without interpreting it.
         self.state_bytes += charge;
         self.items += page.count;
         self.scope = Some(page.scope);
@@ -678,84 +672,214 @@ mod tests {
             ("resources/templates/list", "resourceTemplates"),
             ("prompts/list", "prompts"),
         ] {
-            let request = request(method);
+            let mut request = request(method);
             let kind = CatalogKind::of(&request).unwrap();
-            let first = result(&request, field, Some(""));
-            let last = result(&request, field, None);
             let mut traversal = Traversal::default();
-            assert_eq!(
-                traversal
+            let mut pages = Vec::new();
+            for cursor in [
+                Some(""),
+                Some(""),
+                Some(" opaque-雪/% "),
+                Some(" opaque-雪/% "),
+                None,
+            ] {
+                let page = result(&request, field, cursor);
+                let next = traversal
                     .admit_page(
-                        page_facts(kind, &first).unwrap(),
-                        ClientCredentialsCatalogLimits::default()
+                        page_facts(kind, &page).unwrap(),
+                        ClientCredentialsCatalogLimits::default(),
                     )
-                    .unwrap(),
-                Some(String::new())
-            );
-            assert_eq!(
-                traversal
-                    .admit_page(
-                        page_facts(kind, &last).unwrap(),
-                        ClientCredentialsCatalogLimits::default()
-                    )
-                    .unwrap(),
-                None
-            );
+                    .unwrap();
+                assert_eq!(next.as_deref(), cursor);
+                pages.push(page);
+                if let Some(cursor) = next {
+                    list_params_mut(&mut request).unwrap().cursor = Some(cursor);
+                }
+            }
             let collected = CollectedMachineCatalog {
                 kind,
-                pages: vec![first, last],
+                pages,
                 item_count: 0,
                 credential_generation: 4,
             };
             assert_eq!(collected.method(), method);
-            assert_eq!(collected.pages().len(), 2);
+            assert_eq!(collected.pages().len(), 5);
             assert_eq!(collected.credential_generation(), 4);
-            let encoded = collected.pages()[0].encode().unwrap();
-            assert!(encoded.contains("1.20e+4") && encoded.contains("900719925474099312345"));
-            assert_eq!(collected.into_pages().len(), 2);
+            for page in collected.pages() {
+                let encoded = page.encode().unwrap();
+                assert!(encoded.contains("1.20e+4") && encoded.contains("900719925474099312345"));
+            }
+            assert_eq!(collected.into_pages().len(), 5);
         }
     }
 
     #[test]
     fn machine_pagination_changes_only_the_exact_cursor() {
-        let mut request = request("tools/list");
-        let before = request.encode_params().unwrap().unwrap();
-        list_params_mut(&mut request).unwrap().cursor = Some("  opaque+/%\0  ".to_owned());
-        let mut after = request.encode_params().unwrap().unwrap();
-        assert_eq!(after["cursor"], "  opaque+/%\0  ");
-        after.as_object_mut().unwrap().remove("cursor");
-        assert_eq!(before, after);
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
+            let mut request = request(method);
+            let before = request.encode_params().unwrap().unwrap();
+            for cursor in ["", "", "  opaque+/%\0  ", "  opaque+/%\0  "] {
+                list_params_mut(&mut request).unwrap().cursor = Some(cursor.to_owned());
+                let mut after = request.encode_params().unwrap().unwrap();
+                assert_eq!(after["cursor"], cursor);
+                after.as_object_mut().unwrap().remove("cursor");
+                assert_eq!(before, after);
+            }
+        }
     }
 
     #[test]
-    fn machine_cursor_cycles_and_empty_initial_cursors_are_rejected_unchanged() {
+    fn machine_empty_and_repeated_cursors_continue_until_absence() {
         let limits = ClientCredentialsCatalogLimits::default();
-        let mut state = Traversal::new(Some(""), limits).unwrap();
-        assert_eq!(state.state_bytes, 1);
-        assert_eq!(
+        for initial in [None, Some(""), Some("next")] {
+            let mut state = Traversal::new(initial, limits).unwrap();
+            let mut expected_bytes = initial.map_or(0, |cursor| cursor.len() + 1);
+            let mut expected_items = 0;
+            for (count, cursor) in [
+                (0, Some("")),
+                (2, Some("next")),
+                (0, Some("next")),
+                (1, Some("")),
+                (0, Some(" \t雪/%\0 ")),
+                (0, Some(" \t雪/%\0 ")),
+                (1, None),
+            ] {
+                let next = state
+                    .admit_page(page(count, cursor, CacheScope::Private), limits)
+                    .unwrap();
+                assert_eq!(next.as_deref(), cursor);
+                expected_bytes += cursor.map_or(0, |cursor| cursor.len() + 1);
+                expected_items += count;
+                assert_eq!(state.state_bytes, expected_bytes);
+                assert_eq!(state.items, expected_items);
+            }
+            assert_eq!(state.items, 4);
+        }
+    }
+
+    #[test]
+    fn machine_repeated_cursors_exhaust_state_budget_without_admitting_a_page() {
+        for cursor in ["", "repeat", " \t雪/%\0 "] {
+            let cursor_charge = cursor.len() + 1;
+            let limits = ClientCredentialsCatalogLimits::new(
+                ManagedCoreLimits::default(),
+                16,
+                0,
+                2 + 4 * cursor_charge,
+            )
+            .unwrap();
+            let mut state = Traversal::new(Some(cursor), limits).unwrap();
             state
-                .admit_page(page(2, Some("next"), CacheScope::Private), limits)
-                .unwrap(),
-            Some("next".to_owned())
-        );
-        let before = (state.state_bytes, state.items, state.cursors.clone());
-        for cursor in ["", "next"] {
+                .reserve_ids(
+                    &RequestId::Number(1),
+                    &RequestId::Number(2),
+                    limits.maximum_state_bytes,
+                )
+                .unwrap();
+            for _ in 0..3 {
+                assert_eq!(
+                    state
+                        .admit_page(page(0, Some(cursor), CacheScope::Private), limits)
+                        .unwrap()
+                        .as_deref(),
+                    Some(cursor)
+                );
+            }
+            let before = (
+                state.state_bytes,
+                state.items,
+                state.scope,
+                state.ids.clone(),
+            );
+            assert_eq!(state.state_bytes, limits.maximum_state_bytes);
             assert!(matches!(
-                state.admit_page(page(1, Some(cursor), CacheScope::Private), limits),
-                Err(ManagedCatalogError::RepeatedCursor)
+                state.admit_page(page(0, Some(cursor), CacheScope::Private), limits),
+                Err(ManagedCatalogError::StateLimit)
             ));
             assert_eq!(
-                (state.state_bytes, state.items, state.cursors.clone()),
+                (
+                    state.state_bytes,
+                    state.items,
+                    state.scope,
+                    state.ids.clone()
+                ),
                 before
             );
+            // The identical zero-item page with no continuation can complete
+            // at the bound; a repeated present token can never imply success.
+            assert_eq!(
+                state
+                    .admit_page(page(0, None, CacheScope::Private), limits)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(state.state_bytes, limits.maximum_state_bytes);
         }
-        assert_eq!(
-            state
-                .admit_page(page(1, None, CacheScope::Private), limits)
-                .unwrap(),
-            None
-        );
-        assert_eq!(state.items, 3);
+    }
+
+    #[test]
+    fn machine_repeated_cursor_pages_share_the_payload_byte_limit() {
+        use crate::http_auth::rpc::CoreDecoder;
+
+        let request = request("tools/list");
+        for cursor in ["", "repeat"] {
+            let cursor_json = serde_json::to_string(cursor).unwrap();
+            let frame = |id| {
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","tools":[],"nextCursor":{cursor_json},"ttlMs":0,"cacheScope":"private"}}}}"#
+                )
+            };
+            let page_bytes = frame(1).len();
+            for short_by_one in [false, true] {
+                let core = ManagedCoreLimits::new(
+                    4096,
+                    page_bytes,
+                    3 * page_bytes - usize::from(short_by_one),
+                    0,
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+                let limits = ClientCredentialsCatalogLimits::new(core, 16, 0, 4096).unwrap();
+                let mut state = Traversal::new(Some(cursor), limits).unwrap();
+                for id in 1..=3 {
+                    let mut decoder =
+                        CoreDecoder::for_request(request.clone(), RequestId::Number(id), core)
+                            .unwrap();
+                    decoder
+                        .resume_usage(state.bytes, state.notifications)
+                        .unwrap();
+                    let before = (state.bytes, state.notifications, state.state_bytes);
+                    let event = decoder.admit(frame(id).as_bytes(), false);
+                    if short_by_one && id == 3 {
+                        assert!(matches!(event, Err(ManagedCoreError::ResponseByteLimit)));
+                        assert_eq!(decoder.usage(), (state.bytes, state.notifications));
+                        assert_eq!(
+                            (state.bytes, state.notifications, state.state_bytes),
+                            before
+                        );
+                        continue;
+                    }
+                    let ManagedCoreEvent::Result(result) = event.unwrap() else {
+                        panic!("catalog page must decode as a result");
+                    };
+                    (state.bytes, state.notifications) = decoder.usage();
+                    assert_eq!(
+                        state
+                            .admit_page(page_facts(CatalogKind::Tools, &result).unwrap(), limits)
+                            .unwrap()
+                            .as_deref(),
+                        Some(cursor)
+                    );
+                }
+                assert_eq!(state.bytes, page_bytes * if short_by_one { 2 } else { 3 });
+                assert_eq!(state.items, 0);
+            }
+        }
     }
 
     #[test]
@@ -811,8 +935,8 @@ mod tests {
             .admit_page(page(1, Some("a"), CacheScope::Private), limits)
             .unwrap();
         for (facts, reason) in [
-            (page(2, None, CacheScope::Private), "items"),
-            (page(1, None, CacheScope::Public), "scope"),
+            (page(2, Some("a"), CacheScope::Private), "items"),
+            (page(1, Some("a"), CacheScope::Public), "scope"),
             (page(1, Some("xx"), CacheScope::Private), "bytes"),
         ] {
             let error = state.admit_page(facts, limits).unwrap_err();
@@ -823,11 +947,11 @@ mod tests {
             }
             assert_eq!(state.items, 1);
             assert_eq!(state.state_bytes, 2);
-            assert_eq!(state.cursors.len(), 1);
+            assert!(state.ids.is_empty());
             assert_eq!(state.scope, Some(CacheScope::Private));
         }
         state
-            .admit_page(page(1, Some("b"), CacheScope::Private), limits)
+            .admit_page(page(1, Some("a"), CacheScope::Private), limits)
             .unwrap();
         assert_eq!((state.items, state.state_bytes), (2, 4));
     }
