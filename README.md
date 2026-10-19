@@ -1323,6 +1323,32 @@ fn commit_revision(
 | **OAuth/OIDC Promotion** | Public source APIs exist, but production security and profile conformance remain unverified; they are quarantined from production-support claims |
 | **Early Development** | API may change before 1.0 |
 
+### MCP Apps host sampling
+
+With the `apps` feature, a negotiated `McpAppsWireHost` accepts the View's
+standard `sampling/createMessage` request when its committed `ui/initialize`
+response advertises `hostCapabilities.sampling`. Supply the model operation
+through `McpAppsWireHostEffects::sampling_create_message` and attach the effects
+with `host.with_effects(effects)`. The public facade exports
+`McpAppsSamplingCapability`, `McpAppsSamplingParams`, and `McpAppsSamplingResult`
+at the root and under `modern`.
+
+The callback owns approval for each invocation, model selection, any requested
+context inclusion, and consent to disclose the result to that View. Its default
+refuses the request. Advertising `sampling: {}` permits plain sampling;
+`sampling: { tools: {} }` additionally permits the `tools` and `toolChoice`
+parameters. Tool descriptions grant no permission to execute those tools.
+The request runs under the caller's context with a bounded deadline; matching
+View cancellation drops its pending work and suppresses its response.
+
+Sampling uses the isolated Apps JSON-RPC channel and never forwards a standalone
+sampling request to the MCP server. Plain requests return one text, image, or
+audio block; requests carrying `tools` may return extended sampling content.
+Results are validated against the original request before disclosure, preserve
+the View's request ID, and carry no modern MCP `resultType`. This is a
+browser-neutral Host capability: the embedder still supplies its model provider
+and rendering environment.
+
 ---
 
 ## FAQ

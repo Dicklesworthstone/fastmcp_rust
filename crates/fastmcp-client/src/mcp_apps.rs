@@ -30,8 +30,9 @@ use fastmcp_protocol::{
     McpAppsJsonRpcRequestId, McpAppsOperationResult, McpAppsPinnedHostCapabilities,
     McpAppsPinnedHostContext, McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
     McpAppsProgressControlParams, McpAppsResourceTeardownParams, McpAppsRoutedMethod,
-    McpAppsUpdateModelContextParams, McpAppsViewLifecycle, McpAppsViewNotification,
-    McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
+    McpAppsSamplingParams, McpAppsSamplingResult, McpAppsUpdateModelContextParams,
+    McpAppsViewLifecycle, McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse,
+    McpAppsViewToHost,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -838,6 +839,29 @@ pub trait McpAppsWireHostPolicy {
         Err(wire_policy_denied())
     }
 
+    /// Reviews and performs one View-requested model sampling operation.
+    ///
+    /// The bridge requires an advertised sampling capability and validates the
+    /// bounded request before calling this hook. The Host must apply its own
+    /// View/origin policy and obtain any required user consent for this exact
+    /// prompt, context inclusion, model choice and response disclosure. Tool
+    /// descriptions and requested context are untrusted input, not permission
+    /// to execute tools or disclose another conversation.
+    ///
+    /// Run model work under the supplied context and cancellation token. The
+    /// bridge bounds the operation and drops its future on matching View
+    /// cancellation; implementations must not detach work. Returning a model
+    /// result authorizes its disclosure only to this View. The default refuses
+    /// sampling, and no sampling request is forwarded to the MCP server.
+    async fn sampling_create_message(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: &McpAppsSamplingParams,
+    ) -> Result<McpAppsSamplingResult, McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
     /// Reviews and atomically accepts one replacement of this View's model
     /// context. An empty request explicitly clears the previous context.
     /// The whole payload's negotiated modalities have been checked before
@@ -970,6 +994,19 @@ pub trait McpAppsWireHostEffects {
         Err(wire_policy_denied())
     }
 
+    /// Reviews and performs one admitted model sampling request for this View.
+    /// The same consent, context-isolation, disclosure and cancellation rules
+    /// as [`McpAppsWireHostPolicy::sampling_create_message`] apply. Advertising
+    /// sampling does not grant consent; the default refuses every invocation.
+    async fn sampling_create_message(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: &McpAppsSamplingParams,
+    ) -> Result<McpAppsSamplingResult, McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
     /// Atomically accepts one complete model-context replacement, including
     /// an empty replacement that clears the previous context.
     async fn update_model_context(
@@ -1069,6 +1106,17 @@ impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
         params: &fastmcp_protocol::McpAppsToolCallParams,
     ) -> Result<(), McpAppsHostError> {
         self.effects.approve_view_tool_call(cx, tool, params).await
+    }
+
+    async fn sampling_create_message(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: &McpAppsSamplingParams,
+    ) -> Result<McpAppsSamplingResult, McpAppsHostError> {
+        self.effects
+            .sampling_create_message(cx, cancellation, params)
+            .await
     }
 
     async fn update_model_context(
@@ -1285,7 +1333,7 @@ impl Drop for WireHostSendGuard<'_> {
 struct StagedViewTools {
     tools: BTreeMap<String, Arc<McpAppsViewTool>>,
     next_cursor: String,
-    seen_cursors: BTreeSet<String>,
+    pages: usize,
     deadline: WireHostDeadline,
 }
 
@@ -1326,9 +1374,7 @@ fn view_catalog_bytes(tools: &BTreeMap<String, Arc<McpAppsViewTool>>) -> usize {
 }
 
 fn staged_view_tool_bytes(stage: &StagedViewTools) -> usize {
-    view_catalog_bytes(&stage.tools)
-        + stage.next_cursor.len()
-        + stage.seen_cursors.iter().map(String::len).sum::<usize>()
+    view_catalog_bytes(&stage.tools) + stage.next_cursor.len()
 }
 
 fn decode_view_tool_page(result: &Value) -> Result<McpAppsViewToolsPage, McpAppsHostError> {
@@ -1342,9 +1388,7 @@ fn decode_view_tool_page(result: &Value) -> Result<McpAppsViewToolsPage, McpApps
     }
     let next_cursor = match object.get("nextCursor") {
         None => None,
-        Some(Value::String(cursor)) if !cursor.is_empty() && cursor.len() <= 4 * 1024 => {
-            Some(cursor.clone())
-        }
+        Some(Value::String(cursor)) if cursor.len() <= 4 * 1024 => Some(cursor.clone()),
         _ => return Err(invalid_view_result()),
     };
     let raw_tools = object
@@ -2088,8 +2132,8 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// Attaches embedder effects while retaining this Host's MCP forwarding.
     ///
     /// Use after [`crate::Client::mcp_apps_wire_host`] or
-    /// [`crate::HttpClient::mcp_apps_wire_host`] to supply consent, model
-    /// context and renderer hooks without reimplementing core requests. The
+    /// [`crate::HttpClient::mcp_apps_wire_host`] to supply consent, sampling,
+    /// model context and renderer hooks without reimplementing core requests. The
     /// original initialization policy, fresh core IDs, cancellation cleanup
     /// and selected-era result validation remain in force.
     ///
@@ -2565,6 +2609,19 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                 .and_then(|()| match &entry.state {
                     WireHostRequestState::List => {
                         let page = decode_view_tool_page(value)?;
+                        let pages = self
+                            .staged_view_tools
+                            .as_ref()
+                            .map_or(Some(1), |stage| stage.pages.checked_add(1))
+                            .filter(|pages| *pages <= MAX_APPS_CATALOG_PAGES)
+                            .ok_or_else(invalid_view_result)?;
+                        // Cursor values are opaque. Count admitted pages rather
+                        // than interpreting repeated or empty tokens as cycles.
+                        // A final page may use the entire bound, but a continued
+                        // page cannot authorize a request beyond that bound.
+                        if pages == MAX_APPS_CATALOG_PAGES && page.next_cursor.is_some() {
+                            return Err(invalid_view_result());
+                        }
                         let mut tools = self
                             .staged_view_tools
                             .as_ref()
@@ -2580,16 +2637,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                         if tools.len() > MAX_MCP_APPS_VIEW_TOOLS {
                             return Err(invalid_view_result());
                         }
-                        let mut seen_cursors = self
-                            .staged_view_tools
-                            .as_ref()
-                            .map_or_else(BTreeSet::new, |stage| stage.seen_cursors.clone());
                         if let Some(cursor) = &page.next_cursor {
-                            if !seen_cursors.insert(cursor.clone())
-                                || seen_cursors.len() > MAX_MCP_APPS_BRIDGE_IN_FLIGHT
-                            {
-                                return Err(invalid_view_result());
-                            }
                             let mut cursor_deadline = self
                                 .staged_view_tools
                                 .as_ref()
@@ -2598,7 +2646,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                             prepared_stage = Some(StagedViewTools {
                                 tools,
                                 next_cursor: cursor.clone(),
-                                seen_cursors,
+                                pages,
                                 deadline: cursor_deadline,
                             });
                         } else {
@@ -2623,22 +2671,20 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     WireHostRequestState::Complete(_) => Err(invalid_view_result()),
                 }),
         };
-        let staged_bytes = |stage: &StagedViewTools| {
-            view_catalog_bytes(&stage.tools)
-                + stage.next_cursor.len()
-                + stage.seen_cursors.iter().map(String::len).sum::<usize>()
-        };
         let (mut outcome, mut bytes) =
             parsed.unwrap_or((McpAppsHostRequestOutcome::InvalidResponse, 0));
         let mut retained = self.retained_tool_bytes().saturating_sub(old_bytes) + bytes;
         if was_list {
-            retained =
-                retained.saturating_sub(self.staged_view_tools.as_ref().map_or(0, staged_bytes));
+            retained = retained.saturating_sub(
+                self.staged_view_tools
+                    .as_ref()
+                    .map_or(0, staged_view_tool_bytes),
+            );
             if let Some(tools) = &prepared_catalog {
                 retained = retained.saturating_sub(view_catalog_bytes(&self.view_tools))
                     + view_catalog_bytes(tools);
             }
-            retained += prepared_stage.as_ref().map_or(0, staged_bytes);
+            retained += prepared_stage.as_ref().map_or(0, staged_view_tool_bytes);
         }
         if retained > MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES {
             outcome = McpAppsHostRequestOutcome::InvalidResponse;
@@ -2929,7 +2975,10 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             };
             McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
                 .map_err(McpAppsHostError::Bridge)?;
-            if catalog.is_some() {
+            if catalog.is_some() || method == McpAppsRoutedMethod::SamplingCreateMessage {
+                // A typed sampling result can satisfy each content-block bound
+                // while exceeding the complete frame budget. Reject it through
+                // the sanitized terminal-error path before touching the carrier.
                 McpAppsJsonRpcEnvelope::Response {
                     id: id.clone(),
                     result: result.clone(),
@@ -3039,6 +3088,32 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     .map_err(|error| McpAppsHostError::Transport(error.to_string()))
             }
             McpAppsRoutedMethod::Ping => Ok(json!({})),
+            McpAppsRoutedMethod::SamplingCreateMessage => {
+                let params: McpAppsSamplingParams = decode_params(params)?;
+                let capability = state
+                    .capabilities
+                    .as_ref()
+                    .and_then(|capabilities| capabilities.sampling.as_ref())
+                    .ok_or_else(wire_policy_denied)?;
+                if (params.tools.is_some() || params.tool_choice.is_some())
+                    && capability.tools.is_none()
+                {
+                    return Err(wire_policy_denied());
+                }
+                wire_policy_checkpoint(cx, cancellation)?;
+                let deadline = WireHostDeadline::new(cx);
+                let sampled = await_wire_operation(
+                    cx,
+                    &deadline,
+                    policy.sampling_create_message(cx, cancellation, &params),
+                )
+                .await?;
+                wire_policy_checkpoint(cx, cancellation)?;
+                let result = encode_wire_host_request_params(sampled)?;
+                McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &result)
+                    .map_err(McpAppsHostError::Bridge)?;
+                Ok(result)
+            }
             McpAppsRoutedMethod::UpdateModelContext => {
                 let raw =
                     params.ok_or(McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))?;
@@ -6003,6 +6078,220 @@ exec sleep 10
     }
 
     #[test]
+    fn closed_wire_view_tools_empty_repeated_and_cyclic_cursors_preserve_atomic_catalog() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            let cursors = [
+                Some(""),
+                Some(" \tresume\n "),
+                Some(" \tresume\n "),
+                Some(""),
+                None,
+            ];
+            let mut previous = None;
+            for (page, next_cursor) in cursors.into_iter().enumerate() {
+                let id = host
+                    .send_host_request(
+                        &cx,
+                        McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams {
+                            cursor: previous.map(str::to_owned),
+                        }),
+                        None,
+                    )
+                    .await
+                    .expect("the currently issued cursor is valid even when empty or repeated");
+                let request: Value =
+                    serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                assert_eq!(
+                    request["params"].get("cursor"),
+                    previous.map(Value::from).as_ref(),
+                    "the Host forwards the exact issued token"
+                );
+                let mut result = json!({"tools": match page {
+                    0 => vec![view_tool_descriptor("first")],
+                    4 => vec![view_tool_descriptor("last")],
+                    _ => Vec::new(),
+                }});
+                if let Some(cursor) = next_cursor {
+                    result["nextCursor"] = Value::from(cursor);
+                }
+                let outcome = tool_wire_reply(&mut host, &mut view, &cx, &id, result).await;
+                let McpAppsHostRequestOutcome::ToolsList(result) = outcome else {
+                    panic!("valid opaque pagination must return a tools page");
+                };
+                assert_eq!(result.next_cursor.as_deref(), next_cursor);
+                assert!(host.host_requests.is_empty());
+                if next_cursor.is_some() {
+                    assert_eq!(host.staged_view_tools.as_ref().unwrap().pages, page + 1);
+                    assert_eq!(
+                        host.view_tools()
+                            .map(|tool| tool.descriptor().name.as_str())
+                            .collect::<Vec<_>>(),
+                        ["view_counter"],
+                        "no partial page replaces the current callable catalog"
+                    );
+                    assert!(
+                        host.send_host_request(
+                            &cx,
+                            McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams {
+                                cursor: Some("unissued-token".to_owned()),
+                            }),
+                            None,
+                        )
+                        .await
+                        .is_err(),
+                        "accepting repeated tokens does not authorize unissued tokens"
+                    );
+                    assert_eq!(host.staged_view_tools.as_ref().unwrap().pages, page + 1);
+                }
+                previous = next_cursor;
+            }
+            assert!(host.staged_view_tools.is_none());
+            assert_eq!(
+                host.view_tools()
+                    .map(|tool| tool.descriptor().name.as_str())
+                    .collect::<Vec<_>>(),
+                ["first", "last"]
+            );
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_tools_repeated_cursor_page_limit_accepts_terminal_boundary() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            for terminal_at_limit in [true, false] {
+                let (mut host, mut view) = tool_wire_host(&cx, true).await;
+                install_view_tool_catalog(&mut host, &mut view, &cx).await;
+                let mut received = 0;
+                for page in 0..64 {
+                    let id = host
+                        .send_host_request(
+                            &cx,
+                            McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams {
+                                cursor: (page > 0).then(String::new),
+                            }),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    let request: Value =
+                        serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    received += 1;
+                    assert_eq!(
+                        request["params"].get("cursor"),
+                        (page > 0).then(|| json!("")).as_ref()
+                    );
+                    let mut result = json!({"tools": if page == 0 {
+                        vec![view_tool_descriptor("replacement")]
+                    } else {
+                        Vec::new()
+                    }});
+                    if page < 63 || !terminal_at_limit {
+                        result["nextCursor"] = json!("");
+                    }
+                    let outcome = tool_wire_reply(&mut host, &mut view, &cx, &id, result).await;
+                    if page == 63 && !terminal_at_limit {
+                        assert!(matches!(
+                            outcome,
+                            McpAppsHostRequestOutcome::InvalidResponse
+                        ));
+                    } else {
+                        assert!(matches!(outcome, McpAppsHostRequestOutcome::ToolsList(_)));
+                    }
+                    assert!(host.host_requests.is_empty());
+                    if page < 63 {
+                        assert_eq!(host.staged_view_tools.as_ref().unwrap().pages, page + 1);
+                        assert_eq!(
+                            host.view_tools()
+                                .map(|tool| tool.descriptor().name.as_str())
+                                .collect::<Vec<_>>(),
+                            ["view_counter"]
+                        );
+                    }
+                }
+                assert_eq!(
+                    received, 64,
+                    "the bound counts pages independently of token values"
+                );
+                assert!(host.staged_view_tools.is_none());
+                assert_eq!(
+                    host.view_tools()
+                        .map(|tool| tool.descriptor().name.as_str())
+                        .collect::<Vec<_>>(),
+                    [if terminal_at_limit {
+                        "replacement"
+                    } else {
+                        "view_counter"
+                    }],
+                    "only an absent terminal cursor permits atomic catalog replacement"
+                );
+                assert!(
+                    host.send_host_request(
+                        &cx,
+                        McpAppsHostRequest::ToolsList(fastmcp_protocol::McpAppsListParams {
+                            cursor: Some(String::new()),
+                        }),
+                        None,
+                    )
+                    .await
+                    .is_err(),
+                    "neither a completed chain nor an exhausted chain admits a 65th page"
+                );
+                assert!(host.host_requests.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_tools_cursor_type_and_size_refusals_preserve_catalog() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (mut host, mut view) = tool_wire_host(&cx, true).await;
+            install_view_tool_catalog(&mut host, &mut view, &cx).await;
+            for cursor in [
+                Value::Null,
+                json!(false),
+                json!(1),
+                json!("x".repeat(4 * 1024 + 1)),
+            ] {
+                let id = host
+                    .send_host_request(
+                        &cx,
+                        McpAppsHostRequest::ToolsList(
+                            fastmcp_protocol::McpAppsListParams::default(),
+                        ),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let _ = view.receive_from_host(&cx).await.unwrap();
+                assert!(matches!(
+                    tool_wire_reply(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        &id,
+                        json!({"tools":[view_tool_descriptor("replacement")],"nextCursor":cursor}),
+                    )
+                    .await,
+                    McpAppsHostRequestOutcome::InvalidResponse
+                ));
+                assert!(host.host_requests.is_empty());
+                assert!(host.staged_view_tools.is_none());
+                assert_eq!(
+                    host.view_tools()
+                        .map(|tool| tool.descriptor().name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["view_counter"]
+                );
+            }
+        });
+    }
+
+    #[test]
     fn closed_wire_view_tools_reject_javascript_value_changes_before_approval() {
         block_on(async {
             let cx = Cx::for_testing();
@@ -6926,6 +7215,474 @@ exec sleep 10
             serde_json::from_str(&view.receive_from_host(cx).await.unwrap()).unwrap();
         assert_eq!(response["id"], id);
         response
+    }
+
+    struct SamplingEffects {
+        allow: bool,
+        yield_once: bool,
+        response: Value,
+        events: Arc<Mutex<Vec<Value>>>,
+        cancellation: Arc<Mutex<Option<McpRequestCancellation>>>,
+    }
+
+    impl McpAppsWireHostEffects for SamplingEffects {
+        async fn sampling_create_message(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: &McpAppsSamplingParams,
+        ) -> Result<McpAppsSamplingResult, McpAppsHostError> {
+            self.events.lock().unwrap().push(json!({"request": params}));
+            *self.cancellation.lock().unwrap() = Some(cancellation.clone());
+            if !self.allow {
+                return Err(wire_policy_denied());
+            }
+            if self.yield_once {
+                let mut yielded = false;
+                poll_fn(|task| {
+                    if yielded {
+                        Poll::Ready(())
+                    } else {
+                        yielded = true;
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+            }
+            wire_policy_checkpoint(cx, cancellation)?;
+            self.events.lock().unwrap().push(json!({"completed": true}));
+            serde_json::from_value(self.response.clone())
+                .map_err(|_| McpAppsHostError::Bridge(McpAppsBridgeError::InvalidParams))
+        }
+    }
+
+    fn sampling_effects() -> SamplingEffects {
+        SamplingEffects {
+            allow: true,
+            yield_once: false,
+            response: json!({
+                "role": "assistant", "model": "host-selected-model",
+                "content": {"type": "text", "text": "A host-reviewed answer"},
+                "stopReason": "endTurn"
+            }),
+            events: Arc::new(Mutex::new(Vec::new())),
+            cancellation: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn sampling_params(tools: bool) -> Value {
+        let mut params = json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": "Summarize this selection"}}],
+            "maxTokens": 256,
+            "systemPrompt": "Keep the response brief",
+            "includeContext": "none",
+            "modelPreferences": {"hints": [{"name": "preferred-model"}]}
+        });
+        if tools {
+            params["tools"] = json!([{"name": "calculate", "inputSchema": {"type": "object"}}]);
+            params["toolChoice"] = json!({"mode": "auto"});
+        }
+        params
+    }
+
+    #[test]
+    fn closed_wire_sampling_effects_consent_controls_disclosure_without_mcp_forwarding() {
+        block_on(async {
+            for allow in [true, false] {
+                let cx = Cx::for_testing();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut configuration = wire_configuration();
+                configuration.host_capabilities.sampling = Some(Default::default());
+                let mut effects = sampling_effects();
+                effects.allow = allow;
+                let events = Arc::clone(&effects.events);
+                let expected = effects.response.clone();
+                let policy = state_recording_policy();
+                let forwarded = Arc::clone(&policy.entries);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    configuration,
+                    policy,
+                    activation_proof(),
+                )
+                .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let params = sampling_params(false);
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "sample",
+                    "sampling/createMessage",
+                    params.clone(),
+                )
+                .await;
+                assert_eq!(response.get("result").is_some(), allow, "{response}");
+                assert_eq!(response.get("error").is_some(), !allow);
+                if allow {
+                    assert_eq!(response["result"], expected);
+                    assert!(response["result"].get("resultType").is_none());
+                }
+                let observed = events.lock().unwrap();
+                assert_eq!(observed[0], json!({"request": params}));
+                assert_eq!(observed.len(), if allow { 2 } else { 1 });
+                assert_eq!(forwarded.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_sampling_requires_committed_capability_and_separate_tool_consent() {
+        block_on(async {
+            for (capabilities, tools, permitted) in [
+                (json!({}), false, false),
+                (json!({"sampling": {}}), false, true),
+                (json!({"sampling": {}}), true, false),
+                (json!({"sampling": {"tools": {}}}), true, true),
+            ] {
+                let cx = Cx::for_testing();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut configuration = wire_configuration();
+                configuration.host_capabilities.sampling =
+                    Some(serde_json::from_value(json!({"tools": {}})).unwrap());
+                let mut policy = state_recording_policy();
+                // The actual initialize reply, not the preconfigured upper
+                // bound, owns permission for subsequent View requests.
+                policy.advertised = Some(serde_json::from_value(capabilities).unwrap());
+                let effects = sampling_effects();
+                let events = Arc::clone(&effects.events);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    configuration,
+                    policy,
+                    activation_proof(),
+                )
+                .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "capability",
+                    "sampling/createMessage",
+                    sampling_params(tools),
+                )
+                .await;
+                assert_eq!(response.get("result").is_some(), permitted, "{response}");
+                assert_eq!(events.lock().unwrap().len(), if permitted { 2 } else { 0 });
+            }
+
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut configuration = wire_configuration();
+            configuration.host_capabilities.sampling = Some(Default::default());
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                configuration,
+                state_recording_policy(),
+                activation_proof(),
+            )
+            .with_effects(());
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let response = stateful_wire_request(
+                &mut host,
+                &mut view,
+                &cx,
+                "default-denies",
+                "sampling/createMessage",
+                sampling_params(false),
+            )
+            .await;
+            assert!(
+                response.get("error").is_some(),
+                "advertisement alone grants no consent"
+            );
+        });
+    }
+
+    #[test]
+    fn closed_wire_sampling_tool_choice_without_tools_requires_tool_capability() {
+        block_on(async {
+            for tools_permitted in [false, true] {
+                let cx = Cx::for_testing();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut configuration = wire_configuration();
+                configuration.host_capabilities.sampling =
+                    Some(serde_json::from_value(json!({"tools": {}})).unwrap());
+                let mut policy = state_recording_policy();
+                policy.advertised = Some(
+                    serde_json::from_value(if tools_permitted {
+                        json!({"sampling": {"tools": {}}})
+                    } else {
+                        json!({"sampling": {}})
+                    })
+                    .unwrap(),
+                );
+                let forwarded = Arc::clone(&policy.entries);
+                let effects = sampling_effects();
+                let events = Arc::clone(&effects.events);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    configuration,
+                    policy,
+                    activation_proof(),
+                )
+                .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let mut params = sampling_params(false);
+                params["toolChoice"] = json!({"mode": "auto"});
+                assert!(params.get("tools").is_none());
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "choice-only",
+                    "sampling/createMessage",
+                    params.clone(),
+                )
+                .await;
+                assert_eq!(
+                    response.get("result").is_some(),
+                    tools_permitted,
+                    "{response}"
+                );
+                assert_eq!(response.get("error").is_some(), !tools_permitted);
+                let observed = events.lock().unwrap();
+                if tools_permitted {
+                    assert_eq!(
+                        observed.as_slice(),
+                        &[json!({"request": params}), json!({"completed": true})]
+                    );
+                } else {
+                    assert!(
+                        observed.is_empty(),
+                        "toolChoice needs tool consent before entering the callback"
+                    );
+                }
+                assert_eq!(forwarded.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_sampling_result_shape_is_bound_to_original_tool_request() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut configuration = wire_configuration();
+            configuration.host_capabilities.sampling =
+                Some(serde_json::from_value(json!({"tools": {}})).unwrap());
+            let mut effects = sampling_effects();
+            effects.response["content"] = json!([
+                {"type": "tool_use", "id": "calculation", "name": "calculate", "input": {}}
+            ]);
+            effects.response["stopReason"] = json!("toolUse");
+            let expected = effects.response.clone();
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                configuration,
+                state_recording_policy(),
+                activation_proof(),
+            )
+            .with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            for tools in [false, true] {
+                // Reuse the same ID to prove a rejected response retires its
+                // correlation, while never leaking tool content to a plain request.
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "shape",
+                    "sampling/createMessage",
+                    sampling_params(tools),
+                )
+                .await;
+                assert_eq!(response.get("result").is_some(), tools, "{response}");
+                if tools {
+                    assert_eq!(response["result"], expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_sampling_oversized_typed_result_is_sanitized_and_releases_correlation() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut configuration = wire_configuration();
+            configuration.host_capabilities.sampling =
+                Some(serde_json::from_value(json!({"tools": {}})).unwrap());
+            let mut effects = sampling_effects();
+            let private_marker = "private-sampled-content-marker:";
+            let text = format!(
+                "{private_marker}{}",
+                "x".repeat(fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES - private_marker.len())
+            );
+            let block_count = fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES
+                / fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES
+                + 1;
+            effects.response["content"] =
+                json!(vec![json!({"type": "text", "text": text}); block_count]);
+            let sampled: McpAppsSamplingResult =
+                serde_json::from_value(effects.response.clone()).unwrap();
+            let sampled = serde_json::to_value(sampled).unwrap();
+            let params = sampling_params(true);
+            let typed_params: McpAppsSamplingParams =
+                serde_json::from_value(params.clone()).unwrap();
+            // Every individual block is valid; only the combined wire frame
+            // exceeds the limit. This reaches the actual response preflight.
+            McpAppsJsonRpcEnvelope::validate_sampling_response_for(&typed_params, &sampled)
+                .unwrap();
+            assert!(matches!(
+                McpAppsJsonRpcEnvelope::Response {
+                    id: McpAppsJsonRpcRequestId::string("sample-too-large".into()).unwrap(),
+                    result: sampled,
+                }
+                .encode(McpAppsBridgeDirection::HostToView),
+                Err(McpAppsBridgeError::MessageTooLarge)
+            ));
+            let events = Arc::clone(&effects.events);
+            let policy = state_recording_policy();
+            let forwarded = Arc::clone(&policy.entries);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                configuration,
+                policy,
+                activation_proof(),
+            )
+            .with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let response = stateful_wire_request(
+                &mut host,
+                &mut view,
+                &cx,
+                "sample-too-large",
+                "sampling/createMessage",
+                params.clone(),
+            )
+            .await;
+            assert_eq!(
+                response,
+                json!({
+                    "jsonrpc": "2.0", "id": "sample-too-large",
+                    "error": {"code": -32_000, "message": "MCP Apps request rejected"}
+                })
+            );
+            assert!(!response.to_string().contains(private_marker));
+            assert_eq!(
+                events.lock().unwrap().len(),
+                2,
+                "the typed callback completed before its response was refused"
+            );
+
+            let expected = sampling_effects().response;
+            host.policy.effects.response = expected.clone();
+            // Reusing the rejected request's ID proves its correlation was
+            // released and a healthy sampling operation can still complete.
+            let response = stateful_wire_request(
+                &mut host,
+                &mut view,
+                &cx,
+                "sample-too-large",
+                "sampling/createMessage",
+                params,
+            )
+            .await;
+            assert_eq!(response["result"], expected);
+            assert_eq!(events.lock().unwrap().len(), 4);
+            assert_eq!(forwarded.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+        });
+    }
+
+    #[test]
+    fn closed_wire_sampling_cancellation_suppresses_only_the_matching_response() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for matching in [true, false] {
+                let cx = Cx::current().unwrap();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut configuration = wire_configuration();
+                configuration.host_capabilities.sampling = Some(Default::default());
+                let mut effects = sampling_effects();
+                effects.yield_once = true;
+                let events = Arc::clone(&effects.events);
+                let cancellation = Arc::clone(&effects.cancellation);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    configuration,
+                    state_recording_policy(),
+                    activation_proof(),
+                )
+                .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                view.send_to_host(
+                    &cx,
+                    json!({
+                        "jsonrpc": "2.0", "id": "sample", "method": "sampling/createMessage",
+                        "params": sampling_params(false)
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+                view.send_to_host(
+                    &cx,
+                    json!({
+                        "jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": if matching { "sample" } else { "unrelated" }}
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+                let outcome = host.process_next(&cx).await;
+                if matching {
+                    outcome.unwrap();
+                    assert_eq!(events.lock().unwrap().len(), 1);
+                    assert!(
+                        cancellation
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .is_cancel_requested()
+                    );
+                } else {
+                    assert!(matches!(
+                        outcome,
+                        Err(McpAppsHostError::Bridge(
+                            McpAppsBridgeError::UnknownCorrelation
+                        ))
+                    ));
+                    assert_eq!(events.lock().unwrap().len(), 2);
+                    assert!(
+                        !cancellation
+                            .lock()
+                            .unwrap()
+                            .as_ref()
+                            .unwrap()
+                            .is_cancel_requested()
+                    );
+                    let response: Value =
+                        serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    assert_eq!(response["id"], "sample");
+                    assert!(response.get("result").is_some());
+                }
+                let response =
+                    stateful_wire_request(&mut host, &mut view, &cx, "alive", "ping", json!({}))
+                        .await;
+                assert_eq!(response["result"], json!({}));
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            }
+        });
     }
 
     #[test]

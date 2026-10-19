@@ -75,7 +75,9 @@ fn borrows_authorization(authorization: &PartitionAuthorization) -> &PartitionAu
 /// the same gate. Without the feature this item is compiled out and proves
 /// nothing, which is why the `#[test]` below does not depend on it.
 #[cfg(feature = "apps")]
-fn names_routed_method(method: fastmcp_rust::McpAppsRoutedMethod) -> fastmcp_rust::McpAppsRoutedMethod {
+fn names_routed_method(
+    method: fastmcp_rust::McpAppsRoutedMethod,
+) -> fastmcp_rust::McpAppsRoutedMethod {
     method
 }
 
@@ -120,4 +122,64 @@ fn facade_root_names_every_type_its_dpop_api_demands() {
             names_routed_method;
         let _ = routed;
     }
+}
+
+#[cfg(feature = "apps")]
+#[test]
+fn facade_sampling_effect_is_implementable_and_consent_is_explicit() {
+    use fastmcp_rust::{
+        Cx, McpAppsHostError, McpAppsSamplingParams, McpAppsSamplingResult, McpAppsWireHostEffects,
+        McpRequestCancellation,
+    };
+
+    struct ApprovedSampling;
+
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "The consumer fixture returns immediately through the async effects contract."
+    )]
+    impl McpAppsWireHostEffects for ApprovedSampling {
+        async fn sampling_create_message(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: &McpAppsSamplingParams,
+        ) -> Result<McpAppsSamplingResult, McpAppsHostError> {
+            assert!(cx.checkpoint().is_ok());
+            assert!(!cancellation.is_cancel_requested());
+            assert_eq!(params.messages.len(), 1);
+            Ok(serde_json::from_value(serde_json::json!({
+                "role": "assistant", "model": "consumer-owned-model",
+                "content": {"type": "text", "text": "Approved response"}
+            }))
+            .unwrap())
+        }
+    }
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        let cancellation = McpRequestCancellation::new();
+        // Both public import paths must describe the callback's exact payload.
+        let params: fastmcp_rust::modern::McpAppsSamplingParams =
+            serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "Summarize"}}],
+                "maxTokens": 128
+            }))
+            .unwrap();
+        let capability: fastmcp_rust::modern::McpAppsSamplingCapability = Default::default();
+        assert!(capability.tools.is_none());
+        let result: fastmcp_rust::modern::McpAppsSamplingResult = ApprovedSampling
+            .sampling_create_message(&cx, &cancellation, &params)
+            .await
+            .unwrap();
+        assert_eq!(result.model, "consumer-owned-model");
+        assert!(
+            ().sampling_create_message(&cx, &cancellation, &params)
+                .await
+                .is_err()
+        );
+    });
 }

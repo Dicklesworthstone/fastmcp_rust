@@ -594,6 +594,41 @@ pub struct McpAppsServerResourcesCapability {
     pub list_changed: bool,
 }
 
+/// Pinned Host sampling capability. It authorizes no model invocation by
+/// itself: an embedder must still approve each View request independently.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAppsSamplingCapability {
+    /// The Host supports the sampling `tools` and `toolChoice` parameters.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_sampling_capability"
+    )]
+    pub tools: Option<McpAppsCapabilityMarker>,
+}
+
+fn deserialize_present_sampling_capability<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+/// Stock sampling parameters carried from an Apps View to its Host.
+///
+/// The sampling payload matches the embedded sampling vocabulary. The Apps
+/// JSON-RPC wrapper owns its optional progress token separately; this payload
+/// carries neither modern MCP request metadata nor a protocol-era selector.
+pub type McpAppsSamplingParams = crate::messages::FinalEmbeddedCreateMessageParams;
+
+/// Stock sampling result returned by the Host to one correlated Apps request.
+/// It carries no modern `resultType` envelope or model connection authority.
+pub type McpAppsSamplingResult = crate::messages::FinalCreateMessageResult;
+
 /// Pinned sandbox declaration. It is data only and never grants authority.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -626,6 +661,12 @@ pub struct McpAppsPinnedHostCapabilities {
     pub update_model_context: Option<McpAppsContentBlockModalities>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<McpAppsContentBlockModalities>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_sampling_capability"
+    )]
+    pub sampling: Option<McpAppsSamplingCapability>,
 }
 
 /// Source-parity Host context. Unknown source-forward fields are retained as
@@ -871,7 +912,7 @@ pub enum McpAppsRoutedMethod {
     ResourceTemplatesList,
     ResourcesRead,
     PromptsList,
-    SamplingCreateMessageRejected,
+    SamplingCreateMessage,
     Ping,
     Initialized,
     SizeChanged,
@@ -1108,9 +1149,7 @@ impl McpAppsJsonRpcEnvelope {
             | McpAppsRoutedMethod::ResourceTemplatesList
             | McpAppsRoutedMethod::ResourcesRead
             | McpAppsRoutedMethod::PromptsList => require_bounded(Some(result)),
-            McpAppsRoutedMethod::SamplingCreateMessageRejected => {
-                Err(McpAppsBridgeError::InvalidParams)
-            }
+            McpAppsRoutedMethod::SamplingCreateMessage => validate_sampling_result(result),
             McpAppsRoutedMethod::Initialized
             | McpAppsRoutedMethod::SizeChanged
             | McpAppsRoutedMethod::RequestTeardown
@@ -1127,6 +1166,32 @@ impl McpAppsJsonRpcEnvelope {
             | McpAppsRoutedMethod::Progress
             | McpAppsRoutedMethod::Cancelled => Err(McpAppsBridgeError::InvalidParams),
         }
+    }
+
+    /// Applies the pinned request-dependent sampling response shape before
+    /// the Host commits a reply. A request without `tools` uses the stock
+    /// single text/image/audio response; only a request with `tools` enables
+    /// array content and tool-use blocks. This does not execute View tools.
+    pub fn validate_sampling_response_for(
+        params: &McpAppsSamplingParams,
+        result: &Value,
+    ) -> Result<(), McpAppsBridgeError> {
+        validate_sampling_result(result)?;
+        let response: McpAppsSamplingResult = serde_json::from_value(result.clone())
+            .map_err(|_| McpAppsBridgeError::InvalidParams)?;
+        if params.tools.is_none()
+            && !matches!(
+                response.content,
+                crate::types::FinalSamplingMessageContent::Block(
+                    crate::common_types::SamplingContentBlock::Text { .. }
+                        | crate::common_types::SamplingContentBlock::Image { .. }
+                        | crate::common_types::SamplingContentBlock::Audio { .. }
+                )
+            )
+        {
+            return Err(McpAppsBridgeError::InvalidParams);
+        }
+        Ok(())
     }
 }
 
@@ -1364,7 +1429,9 @@ impl McpAppsBridgeAdmission {
         method: McpAppsRoutedMethod,
         progress_token: Option<McpAppsJsonRpcRequestId>,
     ) -> Result<(), McpAppsBridgeError> {
-        if method == McpAppsRoutedMethod::SamplingCreateMessageRejected {
+        if method == McpAppsRoutedMethod::SamplingCreateMessage
+            && direction != McpAppsBridgeDirection::ViewToHost
+        {
             return Err(McpAppsBridgeError::InvalidMethodDirection);
         }
         match method {
@@ -1738,9 +1805,7 @@ fn route_method(
             McpAppsRoutedMethod::ResourceTemplatesList
         }
         (ViewToHost, false, "prompts/list") => McpAppsRoutedMethod::PromptsList,
-        (ViewToHost, false, "sampling/createMessage") => {
-            McpAppsRoutedMethod::SamplingCreateMessageRejected
-        }
+        (ViewToHost, false, "sampling/createMessage") => McpAppsRoutedMethod::SamplingCreateMessage,
         (ViewToHost, false, "ping") => McpAppsRoutedMethod::Ping,
         (HostToView, false, "ui/resource-teardown") => McpAppsRoutedMethod::ResourceTeardown,
         (HostToView, false, "tools/list") => McpAppsRoutedMethod::ToolsList,
@@ -1797,7 +1862,7 @@ fn method_name(method: McpAppsRoutedMethod) -> &'static str {
         McpAppsRoutedMethod::ResourceTemplatesList => "resources/templates/list",
         McpAppsRoutedMethod::ResourcesRead => "resources/read",
         McpAppsRoutedMethod::PromptsList => "prompts/list",
-        McpAppsRoutedMethod::SamplingCreateMessageRejected => "sampling/createMessage",
+        McpAppsRoutedMethod::SamplingCreateMessage => "sampling/createMessage",
         McpAppsRoutedMethod::Ping => "ping",
         McpAppsRoutedMethod::Initialized => "ui/notifications/initialized",
         McpAppsRoutedMethod::SizeChanged => "ui/notifications/size-changed",
@@ -1859,8 +1924,63 @@ fn validate_routed_payload(
         McpAppsRoutedMethod::ToolResult => require_bounded(params),
         McpAppsRoutedMethod::ToolCancelled => validate_tool_cancelled(params),
         McpAppsRoutedMethod::HostContextChanged => validate_host_context(params),
-        McpAppsRoutedMethod::SamplingCreateMessageRejected => require_bounded(params),
+        McpAppsRoutedMethod::SamplingCreateMessage => validate_sampling_params(params),
     }
+}
+
+fn validate_sampling_params(params: Option<&Value>) -> Result<(), McpAppsBridgeError> {
+    let value = params.ok_or(McpAppsBridgeError::InvalidParams)?;
+    reject_explicit_null_members(
+        value,
+        &[
+            "systemPrompt",
+            "temperature",
+            "stopSequences",
+            "modelPreferences",
+            "includeContext",
+            "metadata",
+            "tools",
+            "toolChoice",
+        ],
+    )?;
+    validate_typed::<McpAppsSamplingParams>(params)?;
+    if let Some(choice) = value.get("toolChoice") {
+        reject_explicit_null_members(choice, &["mode"])?;
+    }
+    let Some(preferences) = value.get("modelPreferences") else {
+        return Ok(());
+    };
+    let zero = crate::common_types::ExactNonNegativeJsonNumber::parse("0")
+        .map_err(|_| McpAppsBridgeError::InvalidParams)?;
+    let one = crate::common_types::ExactNonNegativeJsonNumber::parse("1")
+        .map_err(|_| McpAppsBridgeError::InvalidParams)?;
+    for member in ["costPriority", "speedPriority", "intelligencePriority"] {
+        let Some(priority) = preferences.get(member) else {
+            continue;
+        };
+        let Value::Number(priority) = priority else {
+            return Err(McpAppsBridgeError::InvalidParams);
+        };
+        // Apply the schema range to the exact decimal spelling before the
+        // advisory f64 preference is exposed to the Host. Values immediately
+        // outside [0, 1] must not round into an accepted endpoint.
+        let priority = crate::common_types::ExactNonNegativeJsonNumber::parse(priority.as_str())
+            .map_err(|_| McpAppsBridgeError::InvalidParams)?;
+        if priority < zero || priority > one {
+            return Err(McpAppsBridgeError::InvalidParams);
+        }
+    }
+    if let Some(hints) = preferences.get("hints").and_then(Value::as_array) {
+        for hint in hints {
+            reject_explicit_null_members(hint, &["name"])?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_sampling_result(result: &Value) -> Result<(), McpAppsBridgeError> {
+    reject_explicit_null_members(result, &["stopReason", "_meta"])?;
+    validate_typed::<McpAppsSamplingResult>(Some(result))
 }
 
 fn validate_initialize(params: Option<&Value>) -> Result<(), McpAppsBridgeError> {
@@ -2770,6 +2890,261 @@ mod tests {
         .expect("forward-open host context decodes");
         assert_eq!(context.time_zone.as_deref(), Some("America/New_York"));
         assert_eq!(context.unknown["futureHostField"]["retained"], true);
+    }
+
+    #[test]
+    fn apps_sampling_capability_preserves_exact_absent_empty_and_tools_states() {
+        for (wire, enabled, tools) in [
+            (json!({}), false, false),
+            (json!({"sampling": {}}), true, false),
+            (json!({"sampling": {"tools": {}}}), true, true),
+        ] {
+            let capabilities: McpAppsPinnedHostCapabilities =
+                serde_json::from_value(wire.clone()).expect("pinned sampling capability decodes");
+            assert_eq!(capabilities.sampling.is_some(), enabled);
+            assert_eq!(
+                capabilities
+                    .sampling
+                    .as_ref()
+                    .is_some_and(|sampling| sampling.tools.is_some()),
+                tools
+            );
+            assert_eq!(serde_json::to_value(capabilities).unwrap(), wire);
+        }
+        for wire in [
+            json!({"sampling": null}),
+            json!({"sampling": {"tools": null}}),
+            json!({"sampling": {"tools": true}}),
+            json!({"sampling": {"tools": {"enabled": true}}}),
+            json!({"sampling": {"context": {}}}),
+        ] {
+            assert!(
+                serde_json::from_value::<McpAppsPinnedHostCapabilities>(wire).is_err(),
+                "only the pinned object-marker tools capability grants its exact leaf"
+            );
+        }
+    }
+
+    #[test]
+    fn apps_sampling_wire_request_retains_stock_payload_and_progress_correlation() {
+        let wire = json!({
+            "jsonrpc": "2.0",
+            "id": "view-sample",
+            "method": "sampling/createMessage",
+            "params": {
+                "messages": [{"role": "user", "content": {"type": "text", "text": "Summarize"}}],
+                "maxTokens": 128,
+                "systemPrompt": "Answer concisely",
+                "temperature": 0.5,
+                "stopSequences": ["END"],
+                "modelPreferences": {"hints": [{"name": "host-selected"}]},
+                "metadata": {"localPurpose": "summary"},
+                "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+                "toolChoice": {"mode": "auto"},
+                "_meta": {"progressToken": "sample-progress"}
+            }
+        });
+        let envelope =
+            McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, &wire.to_string())
+                .expect("the official Apps sampling request has a positive wire route");
+        let McpAppsJsonRpcEnvelope::Request {
+            method,
+            params: Some(params),
+            progress_token,
+            ..
+        } = &envelope
+        else {
+            panic!("sampling remains one correlated View request");
+        };
+        assert_eq!(*method, McpAppsRoutedMethod::SamplingCreateMessage);
+        assert_eq!(
+            progress_token,
+            &Some(McpAppsJsonRpcRequestId::string("sample-progress".into()).unwrap())
+        );
+        assert!(params.get("_meta").is_none());
+        let sampled: McpAppsSamplingParams = serde_json::from_value(params.clone()).unwrap();
+        assert_eq!(sampled.messages.len(), 1);
+        assert_eq!(sampled.tools.as_ref().unwrap()[0].name, "weather");
+        assert_eq!(
+            serde_json::from_str::<Value>(
+                &envelope.encode(McpAppsBridgeDirection::ViewToHost).unwrap()
+            )
+            .unwrap(),
+            wire
+        );
+        assert_eq!(
+            McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::HostToView, &wire.to_string()),
+            Err(McpAppsBridgeError::InvalidMethodDirection),
+            "changing only direction cannot create an independent MCP reverse request"
+        );
+    }
+
+    #[test]
+    fn apps_sampling_wire_rejects_malformed_or_modern_authority_before_admission() {
+        let valid_params = json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": "Summarize"}}],
+            "maxTokens": 128
+        });
+        validate_sampling_params(Some(&valid_params)).expect("stock sampling payload is admitted");
+        for (member, value) in [
+            ("maxTokens", json!("128")),
+            ("maxTokens", json!(1.5)),
+            ("tools", Value::Null),
+            ("tools", json!([{"name": "weather", "inputSchema": false}])),
+            ("toolChoice", json!({"mode": "arbitrary"})),
+            ("toolChoice", json!({"mode": null})),
+            ("includeContext", json!("other")),
+            ("modelPreferences", json!({"costPriority": null})),
+            ("modelPreferences", json!({"hints": [{"name": null}]})),
+            ("requestState", json!("unrelated-core-continuation")),
+            ("resultType", json!("input_required")),
+        ] {
+            let mut invalid = valid_params.clone();
+            invalid[member] = value;
+            assert_eq!(
+                validate_sampling_params(Some(&invalid)),
+                Err(McpAppsBridgeError::InvalidParams),
+                "one malformed sampling member must reject before host dispatch"
+            );
+        }
+        let mut authority = valid_params;
+        authority["_meta"] = json!({"io.modelcontextprotocol/protocolVersion": "2026-07-28"});
+        let wire = json!({
+            "jsonrpc": "2.0", "id": "sample", "method": "sampling/createMessage",
+            "params": authority
+        });
+        assert_eq!(
+            McpAppsJsonRpcEnvelope::decode(McpAppsBridgeDirection::ViewToHost, &wire.to_string()),
+            Err(McpAppsBridgeError::InvalidParams),
+            "a View cannot smuggle independent core request authority through Apps sampling"
+        );
+    }
+
+    #[test]
+    fn apps_sampling_preferences_enforce_exact_unit_interval_before_float_narrowing() {
+        for (lexeme, permitted) in [
+            ("0", true),
+            ("-0.0", true),
+            ("1.000", true),
+            ("0.9999999999999999999999999", true),
+            ("1.0000000000000000000000001", false),
+            ("-1e-1000", false),
+            ("2", false),
+        ] {
+            let priority: Value = serde_json::from_str(lexeme).unwrap();
+            for member in ["costPriority", "speedPriority", "intelligencePriority"] {
+                let mut request = json!({
+                    "messages": [{"role": "user", "content": {"type": "text", "text": "Hello"}}],
+                    "maxTokens": 128,
+                    "modelPreferences": {}
+                });
+                request["modelPreferences"][member] = priority.clone();
+                assert_eq!(
+                    validate_sampling_params(Some(&request)).is_ok(),
+                    permitted,
+                    "exact {member} value {lexeme} keeps its original range decision"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn apps_sampling_response_shape_depends_on_the_exact_request_tools_member() {
+        let mut params: McpAppsSamplingParams = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": {"type": "text", "text": "Weather?"}}],
+            "maxTokens": 128
+        }))
+        .unwrap();
+        let text = json!({
+            "content": {"type": "text", "text": "Sunny"},
+            "role": "assistant", "model": "host-model", "stopReason": "endTurn"
+        });
+        McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &text)
+            .expect("ordinary sampling returns a bounded single text block");
+        let mut open_reason = text.clone();
+        open_reason["stopReason"] = json!("toolUse");
+        McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &open_reason)
+            .expect("an open provider stop reason cannot override the actual content shape");
+        let tool_use = json!({
+            "content": [{"type": "tool_use", "id": "weather-1", "name": "weather", "input": {}}],
+            "role": "assistant", "model": "host-model", "stopReason": "toolUse"
+        });
+        assert_eq!(
+            McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &tool_use),
+            Err(McpAppsBridgeError::InvalidParams)
+        );
+        params.tools = Some(vec![
+            serde_json::from_value(json!({"name": "weather", "inputSchema": {"type": "object"}}))
+                .unwrap(),
+        ]);
+        McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &tool_use)
+            .expect("changing only the request tools member admits the extended response");
+        McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &text)
+            .expect("the model may still finish with ordinary text when tools are offered");
+        let mut wrong_envelope = text.clone();
+        wrong_envelope["resultType"] = json!("complete");
+        assert_eq!(
+            McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &wrong_envelope),
+            Err(McpAppsBridgeError::InvalidParams)
+        );
+        let mut oversized = text;
+        oversized["content"]["text"] = json!("x".repeat(MAX_MCP_APPS_BRIDGE_TEXT_BYTES + 1));
+        assert_eq!(
+            McpAppsJsonRpcEnvelope::validate_sampling_response_for(&params, &oversized),
+            Err(McpAppsBridgeError::InvalidParams)
+        );
+    }
+
+    #[test]
+    fn apps_sampling_lifecycle_duplicate_and_response_replay_are_fenced() {
+        let wire = json!({
+            "jsonrpc": "2.0", "id": "sample", "method": "sampling/createMessage",
+            "params": {
+                "messages": [{"role": "user", "content": {"type": "text", "text": "Hello"}}],
+                "maxTokens": 128
+            }
+        })
+        .to_string();
+        let receipt = apps_activation_receipt(crate::extensions::MCP_APPS_HTML_MIME_TYPE).unwrap();
+        let mut inactive = McpAppsBridgeAdmission::new(receipt);
+        assert_eq!(
+            inactive.decode_and_admit(McpAppsBridgeDirection::ViewToHost, &wire),
+            Err(McpAppsBridgeError::InvalidLifecycle)
+        );
+        let mut admission = active_admission();
+        admission
+            .decode_and_admit(McpAppsBridgeDirection::ViewToHost, &wire)
+            .expect("initialized View admits a fresh sampling request");
+        assert_eq!(
+            admission.decode_and_admit(McpAppsBridgeDirection::ViewToHost, &wire),
+            Err(McpAppsBridgeError::DuplicateLiveRequest)
+        );
+        let id = McpAppsJsonRpcRequestId::string("sample".into()).unwrap();
+        let result = json!({
+            "content": {"type": "text", "text": "Hello"},
+            "role": "assistant", "model": "host-model"
+        });
+        let mut malformed = result.clone();
+        malformed["content"] = json!({"type": "resource_link", "uri": "file:///private"});
+        assert_eq!(
+            admission.complete_response(McpAppsBridgeDirection::ViewToHost, &id, &malformed),
+            Err(McpAppsBridgeError::InvalidParams)
+        );
+        assert_eq!(
+            admission
+                .complete_response(McpAppsBridgeDirection::ViewToHost, &id, &result)
+                .expect("rejected response leaves its exact request live"),
+            McpAppsRoutedMethod::SamplingCreateMessage
+        );
+        assert_eq!(
+            admission.complete_response(McpAppsBridgeDirection::ViewToHost, &id, &result),
+            Err(McpAppsBridgeError::UnknownCorrelation)
+        );
+        admission.begin_teardown().unwrap();
+        assert_eq!(
+            admission.decode_and_admit(McpAppsBridgeDirection::ViewToHost, &wire),
+            Err(McpAppsBridgeError::InvalidLifecycle)
+        );
     }
 
     #[test]

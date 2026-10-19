@@ -537,9 +537,9 @@ pub use fastmcp_protocol::{
     McpAppsLogMessageNotification, McpAppsMessageParams, McpAppsMessageRole, McpAppsOpenLinkParams,
     McpAppsOperationResult, McpAppsPingParams, McpAppsProgressNotification,
     McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsRoutedMethod,
-    McpAppsSandboxSignal, McpAppsToolCallParams, McpAppsUpdateModelContextParams,
-    McpAppsViewCapabilities, McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse,
-    McpAppsViewToHost,
+    McpAppsSamplingCapability, McpAppsSamplingParams, McpAppsSamplingResult, McpAppsSandboxSignal,
+    McpAppsToolCallParams, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
+    McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
 };
 
 /// Bounded public-JWKS and external-signer primitives for the opt-in OIDC
@@ -2950,8 +2950,9 @@ pub mod modern {
         McpAppsMetadataError, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
         McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
         McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
-        McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult,
-        McpAppsToolVisibility, McpAppsViewLifecycle, project_final_core_tools_call_result,
+        McpAppsResultProjectionError, McpAppsSamplingCapability, McpAppsSamplingParams,
+        McpAppsSamplingResult, McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility,
+        McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_server::providers::McpAppsUiResource;
