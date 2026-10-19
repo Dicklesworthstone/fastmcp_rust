@@ -49,7 +49,7 @@ rustix = { version = "=1.1.5", default-features = false }
 # Serialization (only these)
 serde = { version = "=1.0.229", features = ["derive"] }
 # FND-01 ROOT-SERDE-JSON: exact version + arbitrary_precision for protocol numbers
-serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
+serde_json = { version = "=1.0.154", features = ["arbitrary_precision"] }
 serde_yaml = { version = "=0.9.34" }
 
 # Logging (facade only, zero-cost when disabled)
@@ -81,7 +81,7 @@ url = { version = "=2.5.8", default-features = false, features = ["std"] }
 getrandom = { version = "=0.4.3", default-features = false }
 sha2 = { version = "=0.11.1", default-features = false }
 hmac = { version = "=0.13.0", default-features = false }
-zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+zeroize = { version = "=1.9.1", default-features = false, features = ["alloc", "derive"] }
 # FND-08 ephemeral protection, using the frozen FND-01 envelope candidate.
 # Entropy stays in fastmcp-core; no cipher RNG or reduced-round features.
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
