@@ -22,8 +22,9 @@
 //!    consumer. Seventeen in-workspace `#[prompt]` tests and twelve trybuild
 //!    cases stayed green through all of it.
 //! 2. The builder path the README leads with, registering all three handlers.
-//! 3. The runtime a consumer needs, reached through the facade rather than
-//!    through a second dependency.
+//! 3. The documented stdio entry point, reached with a caller-supplied `Cx`,
+//!    which is the contract: the `Cx` flows down from the consumer's runtime
+//!    and this framework never creates one.
 //! 4. The two `FinalTaskStore` RETURN positions whose claim wrappers the facade
 //!    did not name, so no external store could be written. Return positions are
 //!    the stricter case: naming a type is enough to accept one as a parameter
@@ -32,7 +33,9 @@
 //!
 //! NO-CLAIM. This is a verification surface and earns no capability credit. It
 //! gates one property -- that `fastmcp-rust` alone suffices for the APIs it
-//! publishes -- under ONE feature configuration, the dependency's defaults
+//! publishes, with the runtime the README instructs a consumer to add treated
+//! as consumer-owned rather than as a gap, for the reason recorded at
+//! `serve_documented` -- under ONE feature configuration, the dependency's defaults
 //! (`legacy-2024-11-05` and `tasks`). It says nothing about the `apps`,
 //! `proxy`, `websocket-experimental`, `builtin-auth-server` or
 //! `--no-default-features` facade profiles, whose closure is unmeasured by any
@@ -90,16 +93,30 @@ pub fn build_server() -> fastmcp_rust::auto::Server {
 }
 
 // ---------------------------------------------------------------------------
-// 3. The runtime, reached through the facade.
+// 3. The documented stdio entry point.
 // ---------------------------------------------------------------------------
 
-/// The README tells a consumer to add `asupersync = "=0.5.0"` to its own
-/// manifest and `use asupersync::runtime::RuntimeBuilder`. That resolves
-/// through the consumer's dependency, so it is not a facade property and
-/// cannot be probed from here. This alias checks the other route -- the one a
-/// consumer with a single dependency must use -- and it is a real route
-/// because `Cx` flows down from the consumer's runtime by design.
-pub type ProbeRuntimeBuilder = fastmcp_rust::asupersync::runtime::RuntimeBuilder;
+/// THERE IS NO FACADE ROUTE TO THE RUNTIME, AND THAT IS DELIBERATE. My first
+/// draft of this file aliased `fastmcp_rust::asupersync::runtime::RuntimeBuilder`
+/// on the theory that a single-dependency consumer needs one. It does not
+/// resolve: `pub use asupersync;` at crates/fastmcp/src/lib.rs:242 is
+/// `#[cfg(feature = "testing-lab")]`, and its own comment says production
+/// callers "receive `Cx` directly from this facade and do not need a
+/// test-internals runtime dependency". The README agrees from the other side,
+/// instructing `asupersync = "=0.5.0"` in the consumer's own manifest. So the
+/// runtime is a CONSUMER-OWNED dependency by design, resolved through the
+/// consumer's own extern prelude, and therefore not a facade closure property
+/// and not probeable from here. Recorded rather than deleted because the
+/// absence looks exactly like the gaps this crate hunts, and the next reader
+/// should not have to re-derive that it is not one.
+///
+/// What IS a facade property is that a consumer can name `Cx` and hand one
+/// down, which is the documented contract. This function does that and nothing
+/// else; `run_stdio_with_cx` returns `!`, which coerces here exactly as it
+/// does in the README's own `main`.
+pub async fn serve_documented(cx: &Cx) {
+    build_server().run_stdio_with_cx(cx).await
+}
 
 // ---------------------------------------------------------------------------
 // 4. The `FinalTaskStore` return positions.
