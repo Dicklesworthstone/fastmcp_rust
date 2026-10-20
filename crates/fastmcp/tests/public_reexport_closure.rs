@@ -518,3 +518,125 @@ fn facade_private_surface_names_every_promote_helper_the_handler_macros_emit() {
          through __private::server and must promote an empty list"
     );
 }
+
+/// Traits the facade re-exports BY ITEM, which the module-walking sweep could
+/// not see at all: it enumerated types inside FORWARDED modules, and
+/// `fastmcp_server`'s `handler`, `proxy` and `tasks` are not forwarded — they
+/// are not even public modules in their own crate. Auditing all 44
+/// facade-exported traits' method signatures surfaced three types a consumer
+/// implementing a published trait must write and could not.
+///
+/// THE DISCRIMINATOR THAT SEPARATES A GAP FROM A SEALED TYPE, and it is not
+/// position alone. All five candidates sat in RETURN position on a defaulted
+/// method. For a return, naming is insufficient: the implementor must be able
+/// to CONSTRUCT the value. So constructibility decides it.
+///
+///   gap, constructible          FinalTaskAcceptedInputClaim   pub fn new
+///                              FinalTaskInitialWorkClaim     pub fn new
+///                              ProxyLegacyPeerNotifications  all fields pub
+///   sealed, NOT constructible  UpstreamFinalToolSchemaRegistration
+///                                (single private field `_proxy_registration: ()`)
+///                              PreparedIncrementalHttpListen
+///                                (private fields, no constructor; its own doc
+///                                 says stdio backends return `None`)
+///
+/// The two sealed types are deliberately still unexported. Re-exporting their
+/// names would let a consumer write the override signature and never satisfy
+/// it, which is worse than the honest `None` the default already returns. A
+/// reachability exemption is therefore a property of a position AND a
+/// direction, not of a type.
+///
+/// NO-CLAIM. The bindings below prove that each name resolves and that each
+/// constructor is callable at the published path. They do not execute a store
+/// or a backend, and they say nothing about the semantics of a custom
+/// implementation.
+#[cfg(feature = "tasks")]
+#[test]
+fn facade_names_the_task_claims_a_custom_store_must_return() {
+    use fastmcp_rust::{
+        FinalTaskAcceptedInputClaim, FinalTaskId, FinalTaskInitialWorkClaim,
+        FinalTaskInputResponses, FinalTaskSnapshot, FinalTaskWorkDescriptor, McpResult,
+    };
+
+    // The exact return positions on `FinalTaskStore` that could not be written
+    // before these re-exports: `mod tasks;` is private in fastmcp-server, so
+    // neither name resolved for any external implementor, facade or not.
+    fn input_handoff_override_shape(
+        _expected: &FinalTaskSnapshot,
+        _owner_id: &str,
+    ) -> McpResult<Option<FinalTaskAcceptedInputClaim>> {
+        Ok(None)
+    }
+    fn initial_work_handoff_override_shape(
+        _expected: &FinalTaskSnapshot,
+        _owner_id: &str,
+    ) -> McpResult<Option<FinalTaskInitialWorkClaim>> {
+        Ok(None)
+    }
+
+    // Naming is not enough in a return position, so bind both constructors at
+    // their published paths. The coercion fixes `impl Into<String>` to
+    // `String`, which is what makes these fn-pointer bindings type-check.
+    let _accepted: fn(
+        FinalTaskId,
+        u64,
+        String,
+        FinalTaskWorkDescriptor,
+        FinalTaskInputResponses,
+    ) -> FinalTaskAcceptedInputClaim = FinalTaskAcceptedInputClaim::new;
+    let _initial: fn(
+        FinalTaskId,
+        u64,
+        String,
+        FinalTaskWorkDescriptor,
+    ) -> FinalTaskInitialWorkClaim = FinalTaskInitialWorkClaim::new;
+
+    // The four bindings above cannot be CALLED from outside the crate, and that
+    // is correct rather than a shortcoming: `FinalTaskSnapshot` derives only
+    // Clone and Debug and exposes no constructor, because a store RECEIVES a
+    // snapshot instead of minting one. So the `expected` parameter is sealed
+    // while the returns are not, which is exactly why the returns needed
+    // exporting and the parameter did not.
+    let _shapes: (
+        fn(&FinalTaskSnapshot, &str) -> McpResult<Option<FinalTaskAcceptedInputClaim>>,
+        fn(&FinalTaskSnapshot, &str) -> McpResult<Option<FinalTaskInitialWorkClaim>>,
+    ) = (input_handoff_override_shape, initial_work_handoff_override_shape);
+
+    // What CAN execute here is the published constructor of the descriptor both
+    // claims carry, so this leg is on the same path rather than filler.
+    // POSITIVE: a non-null descriptor is accepted.
+    let descriptor = FinalTaskWorkDescriptor::new(serde_json::json!({"op": "reindex"}))
+        .expect("a non-null work descriptor must be accepted through the facade");
+    assert!(!descriptor.as_value().is_null());
+
+    // NEGATIVE (RH-5): the same call differing only in the one forbidden
+    // dimension the constructor documents, so the positive is not vacuous.
+    assert!(
+        FinalTaskWorkDescriptor::new(serde_json::Value::Null).is_err(),
+        "a null work descriptor must be refused"
+    );
+}
+
+/// Companion to the above for the proxy profile: `ProxyBackend` is a published
+/// trait an external backend implements, and this is the return type of its
+/// defaulted `take_legacy_peer_notifications`. It was reachable at the
+/// fastmcp-server crate root and missing only from the facade, so unlike the
+/// task claims this one was a facade-only gap.
+#[cfg(feature = "proxy")]
+#[test]
+fn facade_names_and_builds_the_proxy_legacy_notifications_a_backend_returns() {
+    use fastmcp_rust::{LoggingLevel, ProgressParams, ProxyLegacyPeerNotifications};
+
+    // Built rather than merely named, because a return position demands it.
+    // Every field type has to be reachable too, which is the half a name-only
+    // check would have missed.
+    let notifications = ProxyLegacyPeerNotifications {
+        updated_uris: vec!["https://example.test/resource".to_owned()],
+        log_messages: vec![(LoggingLevel::Warning, serde_json::json!({"msg": "drained"}))],
+        progress: Vec::<ProgressParams>::new(),
+    };
+
+    assert_eq!(notifications.updated_uris.len(), 1);
+    assert_eq!(notifications.log_messages.len(), 1);
+    assert!(notifications.progress.is_empty());
+}
