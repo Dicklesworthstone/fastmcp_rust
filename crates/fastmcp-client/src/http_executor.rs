@@ -39,7 +39,7 @@ use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, Final2026Peer, NOTIFICATIONS_PROGRESS, PING,
+    Final2026Direction, Final2026EnvelopeKind, Final2026Peer, NOTIFICATIONS_PROGRESS,
     PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
@@ -19770,11 +19770,28 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
     }
 
     #[test]
-    fn public_http_ping_is_admitted_without_entering_the_final_request_union() {
-        super::validate_final_method(fastmcp_protocol::methods::PING, true)
-            .expect("this client admits a modern ping; see the bd-ep6pp note on the bypass");
-        super::validate_final_method(fastmcp_protocol::methods::PING, false)
-            .expect_err("ping still requires a request id");
+    fn public_http_ping_is_refused_like_every_method_outside_the_final_request_union() {
+        // `ping` was REMOVED by MCP 2026-07-28, so the modern path refuses it
+        // through the ordinary union check whether or not a request id is
+        // present: the union lookup fails before `has_request_id` is consulted.
+        for has_request_id in [true, false] {
+            let refused =
+                super::validate_final_method(fastmcp_protocol::methods::PING, has_request_id)
+                    .expect_err("ping was removed by 2026-07-28; the modern path must refuse it");
+            assert!(
+                matches!(
+                    &refused,
+                    super::ModernHttpClientError::UnsupportedFinalMethod { method }
+                        if method.as_str() == fastmcp_protocol::methods::PING
+                ),
+                "expected UnsupportedFinalMethod for ping with has_request_id={has_request_id}, got {refused:?}"
+            );
+        }
+        // Near-identical control (RH-5): `logging/setLevel` differs from the
+        // rows above only in being a different method the same revision
+        // removed, so it must be refused the same way. If this row passes while
+        // the ping rows fail, ping is being special-cased again rather than the
+        // union check being broken.
         let refused = super::validate_final_method("logging/setLevel", true)
             .expect_err("the removed final setLevel RPC stays refused");
         assert!(matches!(
