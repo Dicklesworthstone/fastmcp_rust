@@ -873,12 +873,25 @@ pub use fastmcp_server::{
 /// `ProxyLegacyPeerNotifications` is listed because `ProxyBackend` above is a
 /// trait an external backend implements, and this is the return type of its
 /// defaulted `take_legacy_peer_notifications`. Its three fields are public and
-/// their types (`LoggingLevel`, `ProgressParams`, `serde_json::Value`) are
-/// already reachable, so a backend can now both name and build one. The two
-/// other types in `ProxyBackend`'s signatures stay unexported on purpose:
+/// their types are `LoggingLevel` (already at this root), `serde_json::Value`
+/// and `ProgressParams`, so a backend can now both name and build one.
+///
+/// `ProgressParams` is re-exported here rather than left alone because it was
+/// reachable ONLY through `legacy_2024`, which is gated on
+/// `feature = "legacy-2024-11-05"`. A consumer enabling `proxy` alone could
+/// therefore name `ProxyLegacyPeerNotifications` and never construct it: a gap
+/// that CROSSES profiles, where the API of one feature demands a type only a
+/// different feature publishes. A static name check cannot see this and did
+/// not; `cargo check` on the consumer-position test did, with
+/// `error[E0432]: unresolved import fastmcp_rust::ProgressParams`. Gating it on
+/// `proxy` keeps it available exactly where the API that demands it is.
+///
+/// The two other types in `ProxyBackend`'s signatures stay unexported on purpose:
 /// `PreparedIncrementalHttpListen` has no public constructor and its own doc
 /// says stdio backends return `None`, so it is a sealed witness rather than a
 /// closure gap.
+#[cfg(feature = "proxy")]
+pub use fastmcp_protocol::ProgressParams;
 #[cfg(feature = "proxy")]
 pub use fastmcp_server::{
     FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
