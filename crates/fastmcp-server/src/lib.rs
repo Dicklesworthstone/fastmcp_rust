@@ -164,13 +164,28 @@ use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SubscriptionAdmission,
     SubscriptionAdmissionError, SubscriptionRemoval, SubscriptionRemovalError,
 };
+// The two `...Claim` types are here because `FinalTaskStore` is a public trait
+// an external store implements, and they are the RETURN types of two of its
+// defaulted methods:
+//   take_input_handoff_for_owner_if_current       -> Option<FinalTaskAcceptedInputClaim>
+//   take_initial_work_handoff_for_owner_if_current -> Option<FinalTaskInitialWorkClaim>
+// `mod tasks;` is private, so a type absent from this list is unnameable
+// outside this crate and the override cannot be written at all. Their plain
+// counterparts `FinalTaskAcceptedInput` and `FinalTaskInitialWork` were already
+// listed; the `Claim` wrappers that carry task_id/generation/owner_id alongside
+// them were not, which is the one-item-at-a-time shape this kind of list rots
+// in. Both expose `pub fn new`, so external construction is intended -- unlike
+// `UpstreamFinalToolSchemaRegistration` and `PreparedIncrementalHttpListen`,
+// which have no public constructor and are deliberately sealed, and so are
+// correctly absent.
 #[cfg(feature = "tasks")]
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
+    FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
+    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
     InMemoryFinalTaskStore, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES,
     MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
 };

@@ -860,20 +860,31 @@ pub use fastmcp_server::{
 #[cfg(feature = "tasks")]
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
+    FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
+    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
     InMemoryFinalTaskStore,
 };
 
 /// Proxy APIs are available only with the proxy profile.
+///
+/// `ProxyLegacyPeerNotifications` is listed because `ProxyBackend` above is a
+/// trait an external backend implements, and this is the return type of its
+/// defaulted `take_legacy_peer_notifications`. Its three fields are public and
+/// their types (`LoggingLevel`, `ProgressParams`, `serde_json::Value`) are
+/// already reachable, so a backend can now both name and build one. The two
+/// other types in `ProxyBackend`'s signatures stay unexported on purpose:
+/// `PreparedIncrementalHttpListen` has no public constructor and its own doc
+/// says stdio backends return `None`, so it is a sealed witness rather than a
+/// closure gap.
 #[cfg(feature = "proxy")]
 pub use fastmcp_server::{
     FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
-    ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+    ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications, ProxyPromptCatalog,
+    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+    ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
 
 /// Final Tasks proxy-listener APIs require both extensions.
