@@ -182,9 +182,20 @@ pub mod __private {
     /// surfaces.
     pub mod server {
         pub use fastmcp_server::bidirectional;
+        // All three `promote_legacy_*` helpers belong here because all three
+        // handler macros expand to one. Only the tool helper was listed, and
+        // the omission could not surface inside this workspace: Cargo gives an
+        // integration target the package's own `[dependencies]`, and
+        // `fastmcp-server` is one, so a facade test resolves the missing names
+        // through the dependency and compiles. A consumer whose only
+        // dependency is `fastmcp-rust` has no `fastmcp_server` in its extern
+        // prelude, so `#[prompt]` and `#[resource]` failed to expand for the
+        // one audience this module exists to serve. Same structural blind spot
+        // that `tests/public_reexport_closure.rs` was written for.
         pub use fastmcp_server::{
             BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
             PromptHandler, ResourceHandler, ToolErrorKind, ToolExecutionMode, ToolHandler,
+            promote_legacy_prompt_messages, promote_legacy_resource_contents,
             promote_legacy_tool_content,
         };
     }

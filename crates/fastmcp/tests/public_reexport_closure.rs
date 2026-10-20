@@ -455,3 +455,66 @@ fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
     assert_eq!(stored.message, "method not found");
     assert!(stored.data.is_none());
 }
+
+/// The handler macros' PRIVATE support surface, which is a closure gap with a
+/// blast radius the public one does not have: every `#[prompt]` and
+/// `#[resource]` user is affected, not just a caller who writes a type name.
+///
+/// HOW THE MACROS RESOLVE PATHS. `handler_crate_paths`
+/// (crates/fastmcp-macros/src/lib.rs:119) tries `crate_name("fastmcp-rust")`
+/// first, and on success emits `use <facade>::__private::server as
+/// fastmcp_server;` into the expansion. Every generated path is then relative
+/// to that alias, so `__private::server` must name everything the macros emit.
+///
+/// WHAT WAS BROKEN. `__private::server` listed `promote_legacy_tool_content`
+/// and neither of its two siblings, while the prompt and resource expansions
+/// wrote `::fastmcp_server::promote_legacy_prompt_messages` and
+/// `::fastmcp_server::promote_legacy_resource_contents` — with a LEADING `::`,
+/// which names an extern crate and deliberately bypasses the alias. Within the
+/// very same `quote!` block, `fastmcp_server::BoxFuture` and
+/// `fastmcp_server::FinalMethodOutcome` are alias-relative, so the two `::`
+/// paths were inconsistent with their own neighbours rather than intentional.
+/// For a consumer whose only dependency is `fastmcp-rust` there is no
+/// `fastmcp_server` in the extern prelude, so by the documented population
+/// those expansions could not resolve: async `#[prompt]` handlers implementing
+/// only `get_async`, and async `#[resource]` handlers implementing only
+/// `read_async`.
+///
+/// WHY NOTHING IN THIS REPOSITORY CAUGHT IT, which is the part worth keeping.
+/// Cargo gives an integration target its package's own `[dependencies]`, and
+/// `fastmcp-server` is one of the facade's (crates/fastmcp/Cargo.toml:5). So
+/// inside this workspace `::fastmcp_server` resolves through that dependency
+/// and every macro test compiles — including the 17 `#[prompt]` and 2
+/// `#[resource]` uses in `tests/macro_expansion.rs`. The defect is invisible to
+/// every target this repository can build, which is the same structural blind
+/// spot this file's header describes for the public surface. The instrument
+/// that would actually catch it is an out-of-workspace consumer depending on
+/// `fastmcp-rust` alone, and the repository has none.
+///
+/// NO-CLAIM, stated because the limit is real. This test proves the re-export
+/// half: all three helper paths now resolve through `__private::server` and
+/// each one runs. It CANNOT prove the macro half — that dropping the leading
+/// `::` makes the expansion resolve for an external consumer — because this
+/// target sees `fastmcp-server` either way. That half rests on a language rule
+/// plus the in-block consistency noted above, and a bead records the missing
+/// out-of-workspace harness as the proper proof.
+#[test]
+fn facade_private_surface_names_every_promote_helper_the_handler_macros_emit() {
+    use fastmcp_rust::__private::server::{
+        promote_legacy_prompt_messages, promote_legacy_resource_contents,
+        promote_legacy_tool_content,
+    };
+
+    // Each path is the assertion; the empty input exercises the one branch all
+    // three share without constructing protocol payloads. `tool` is the
+    // CONTROL: it was already re-exported, so if it ever fails the cause is the
+    // helpers themselves rather than this file's re-export claim.
+    let prompt = promote_legacy_prompt_messages(Vec::new());
+    let resource = promote_legacy_resource_contents(Vec::new());
+    let tool = promote_legacy_tool_content(Vec::new());
+    assert!(
+        prompt.is_ok() && resource.is_ok() && tool.is_ok(),
+        "every promote_legacy_* helper the handler macros emit must be reachable \
+         through __private::server and must promote an empty list"
+    );
+}

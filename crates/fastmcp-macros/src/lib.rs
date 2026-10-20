@@ -2159,7 +2159,7 @@ fn generate_prompt_execution_methods(
                     Box::pin(async move {
                         match self.get_async_in_request(ctx, request_cx, arguments).await {
                             fastmcp_core::Outcome::Ok(messages) => {
-                                match ::fastmcp_server::promote_legacy_prompt_messages(messages) {
+                                match fastmcp_server::promote_legacy_prompt_messages(messages) {
                                     Ok(complete) => fastmcp_core::Outcome::Ok(
                                         fastmcp_server::FinalMethodOutcome::Complete(complete),
                                     ),
@@ -2591,7 +2591,7 @@ fn generate_resource_execution_methods(
                         .await
                     {
                         fastmcp_core::Outcome::Ok(contents) => {
-                            match ::fastmcp_server::promote_legacy_resource_contents(contents) {
+                            match fastmcp_server::promote_legacy_resource_contents(contents) {
                                 Ok(complete) => fastmcp_core::Outcome::Ok(
                                     fastmcp_server::FinalMethodOutcome::Complete(complete),
                                 ),
