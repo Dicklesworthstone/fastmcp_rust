@@ -35,5 +35,12 @@ description = "Compile-time proof that the published facade is sufficient for th
 [workspace]
 resolver = "3"
 
+[features]
+# OFF by default, and the default build must stay green. Checking with this
+# feature on MUST FAIL: that failure is the only evidence this crate can detect
+# a closure defect at all, and an instrument that has never failed is not known
+# to work. src/lib.rs says what each negative proves.
+planted-negative = []
+
 [dependencies]
 fastmcp-rust = { path = "../crates/fastmcp" }

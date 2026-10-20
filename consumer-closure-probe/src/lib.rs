@@ -19,8 +19,17 @@
 //!    listed only the tool helper. So an async `#[prompt]` returning
 //!    `Vec<PromptMessage>` and an async `#[resource]` returning `String` --
 //!    precisely the two shapes below -- could not expand for a facade-only
-//!    consumer. Seventeen in-workspace `#[prompt]` tests and twelve trybuild
-//!    cases stayed green through all of it.
+//!    consumer. Measured across `crates/fastmcp` at HEAD by pairing each
+//!    attribute with the next `fn` line: 57 `#[prompt]` uses of which 7 are
+//!    async, and 82 `#[resource]` uses of which 13 are async, plus 9 trybuild
+//!    failure cases and one pass case. The 20 ASYNC uses are the affected
+//!    population and all of them compiled green throughout -- and 20 is an
+//!    upper bound, since the broken arm additionally requires no MRTR resume
+//!    parameter and a non-`Final` return. Two of those async prompts and five
+//!    of those async resources are in `examples/echo_server.rs`, the binary
+//!    the README tells users to run, so the unexpandable arm was in shipped
+//!    example code and compiled anyway for exactly the reason this crate
+//!    exists.
 //! 2. The builder path the README leads with, registering all three handlers.
 //! 3. The documented stdio entry point, reached with a caller-supplied `Cx`,
 //!    which is the contract: the `Cx` flows down from the consumer's runtime
@@ -30,6 +39,16 @@
 //!    the stricter case: naming a type is enough to accept one as a parameter
 //!    and never enough to produce one, so both constructors are bound here
 //!    rather than merely imported.
+//! 5. The closure surface `crates/fastmcp/tests/public_reexport_closure.rs`
+//!    states in its own header that it cannot prove, because Cargo gives it
+//!    the facade's dependencies. Its import list, mirrored where it is
+//!    falsifiable.
+//! 6. A planted negative behind an off-by-default feature, so this crate is
+//!    known to be able to go red. Two halves that are not interchangeable: the
+//!    extern-prelude half (a leading `::`, the defect verbatim) and the
+//!    list-membership half (a name the facade deliberately withholds). Only
+//!    the second would turn red if a future edit dropped a name from
+//!    `__private::server`.
 //!
 //! NO-CLAIM. This is a verification surface and earns no capability credit. It
 //! gates one property -- that `fastmcp-rust` alone suffices for the APIs it
@@ -149,7 +168,122 @@ pub fn task_store_return_positions() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. The guard that keeps this instrument from being retired by accident.
+// 5. The closure surface the in-package test states it cannot prove.
+// ---------------------------------------------------------------------------
+//
+// `crates/fastmcp/tests/public_reexport_closure.rs` names these paths and says
+// so in its own header: "Integration targets can also see the crate's regular
+// dependencies, so this does not prove that `fastmcp_core` and
+// `fastmcp_protocol` are unreachable by some other route." Here they are where
+// that is falsifiable. Only the NAMES and SIGNATURE SHAPES are mirrored; that
+// file's eighteen test bodies already execute in the workspace, and copying
+// them would make this crate a second integration suite.
+
+use fastmcp_rust::http_auth::dpop::{DpopClientError, DpopError, DpopKey, DpopSession};
+use fastmcp_rust::http_auth::sampling::{SamplingRunLimits, SamplingToolLoopLimits};
+use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
+use fastmcp_rust::partition::{CredentialStoreKey, DurableOwnerKey, PartitionDescriptor};
+use fastmcp_rust::runtime::ProcessGenerationGuard;
+
+/// A name that cannot be reached through the facade makes this fail to
+/// resolve, which is the entire assertion. Parameters are underscore-prefixed
+/// because nothing here is meant to run.
+pub fn facade_closure_signatures(
+    _url: &CanonicalHttpUrl,
+    _authorization: &PartitionAuthorization,
+    _descriptor: &PartitionDescriptor,
+    _store: &CredentialStoreKey,
+    _owner: &DurableOwnerKey,
+    _guard: &ProcessGenerationGuard,
+    _session: &DpopSession,
+    _loop_limits: &SamplingToolLoopLimits,
+    _run_limits: &SamplingRunLimits,
+) {
+}
+
+/// The positions where naming is not enough. `CredentialStoreKey` is
+/// obtainable ONLY through `derive` and is never returned by a reachable
+/// method -- which is the reason `partition` and `runtime` are forwarded at
+/// all, stated at `crates/fastmcp/src/lib.rs:531-536` -- so a consumer must be
+/// able to WRITE the parameter types. Binding the constructors as fn pointers
+/// fixes those types; a bare `use` would pass even if they were unusable.
+pub fn constructors_are_callable() {
+    let _derive: fn(
+        &PartitionDescriptor,
+        &str,
+        &str,
+        &str,
+    ) -> Result<CredentialStoreKey, fastmcp_rust::SealedAdmissionKeyError> =
+        CredentialStoreKey::derive;
+    let _generate: fn() -> Result<DpopKey, DpopError> = DpopKey::generate;
+}
+
+/// Reading a proof failure forces the inner error type to be nameable, which a
+/// `let` binding cannot infer away.
+pub fn proof_failure_is_nameable(error: &DpopClientError) -> Option<&DpopError> {
+    match error {
+        DpopClientError::Proof(inner) => Some(inner),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. The planted negative: proof that this crate can go red.
+// ---------------------------------------------------------------------------
+//
+// NOT WHAT bd-jwvfb'S ITEM 4 LITERALLY ASKS FOR, and the difference is
+// recorded rather than glossed. That item (which I wrote) says to delete
+// `promote_legacy_prompt_messages` from the facade's `__private::server` list
+// and show this crate fail. Executing it means transiently breaking
+// `crates/fastmcp/src/lib.rs` in a shared worktree where another lane can and
+// does commit whatever it finds -- so the test for the defect could reintroduce
+// the defect for every consumer. Both negatives below therefore live in THIS
+// crate, behind an off-by-default feature, so the broken state is a separate
+// reproducible run rather than a window of broken shared state.
+//
+// They are not the same experiment as the literal version, and they are not
+// interchangeable with each other.
+
+/// POSITIVE. All three helpers resolve through the path the handler macros
+/// actually address. `Vec::new()` infers its element type from each parameter,
+/// so no return type is named -- deliberately, since naming them would test
+/// the protocol re-exports instead of the one thing under test.
+pub fn promote_helpers_resolve_through_the_facade() {
+    let _ = fastmcp_rust::__private::server::promote_legacy_tool_content(Vec::new());
+    let _ = fastmcp_rust::__private::server::promote_legacy_resource_contents(Vec::new());
+    let _ = fastmcp_rust::__private::server::promote_legacy_prompt_messages(Vec::new());
+}
+
+/// NEGATIVE 1 — the EXTERN PRELUDE half. Differs from the positive above in
+/// exactly one dimension: a leading `::`. That is the defect verbatim; the
+/// prompt and resource expansions emitted
+/// `::fastmcp_server::promote_legacy_prompt_messages`, and a leading `::` names
+/// an extern crate instead of the `use <facade>::__private::server as
+/// fastmcp_server;` alias the same `quote!` blocks use for everything else.
+/// This must fail as an unresolved module or unlinked crate. The identical line
+/// inside `crates/fastmcp/tests/` COMPILES, which is the whole reason this
+/// crate exists.
+#[cfg(feature = "planted-negative")]
+pub fn negative_leading_colon_names_an_unlinked_crate() {
+    let _ = ::fastmcp_server::promote_legacy_prompt_messages(Vec::new());
+}
+
+/// NEGATIVE 2 — the LIST-MEMBERSHIP half, which negative 1 does not cover.
+/// Negative 1 fails because of the manifest; this one fails because of the
+/// facade's re-export list, which is the property bd-jwvfb is actually about.
+/// `ServerBuilder` is the right choice because the facade's own comment at
+/// `crates/fastmcp/src/lib.rs:179-182` says exposing it here "would provide an
+/// unpinned `Server`/`ServerBuilder` construction route around the facade
+/// policy surfaces" — so this guards a stated policy, not just a mechanism.
+/// Only this negative would turn red if a future edit dropped a name from
+/// `__private::server`; negative 1 would stay red regardless.
+#[cfg(feature = "planted-negative")]
+pub fn negative_withheld_name_is_not_in_the_private_server_list() {
+    let _: Option<fastmcp_rust::__private::server::ServerBuilder> = None;
+}
+
+// ---------------------------------------------------------------------------
+// 7. The guard that keeps this instrument from being retired by accident.
 // ---------------------------------------------------------------------------
 //
 // Everything above is only evidence while this crate's extern prelude stays
