@@ -303,3 +303,155 @@ fn facade_sampling_effect_is_implementable_and_consent_is_explicit() {
         );
     });
 }
+
+/// MCP Apps embedder control hooks: the TRAIT-METHOD position, which the first
+/// closure sweep could not see because it matched only `pub fn` parameter and
+/// return lists.
+///
+/// WHY THIS POSITION IS STRICTLY STRONGER THAN A PARAMETER. The exemption that
+/// retired several earlier candidates was "the value is obtainable from a
+/// reachable accessor", and for a free function it holds: you can write
+/// `f(thing.accessor())` without ever naming the argument's type. A trait impl
+/// cannot do that. `impl Trait for MyType` must RESTATE each overridden
+/// method's parameter and return types verbatim, so possessing a value is no
+/// substitute for being able to write the name. `McpAppsJsonRpcRequestId` is
+/// the exact case: it has `new`/`string`/`host` constructors AND public
+/// variants, and it was still unnameable through the facade.
+///
+/// WHAT WAS BROKEN. The facade already exported `McpAppsWireHostPolicy`,
+/// `McpAppsWireHostEffects` and `McpAppsHostRequestOutcome` — a trait an
+/// embedder implements, a second trait of embedder callbacks, and the enum an
+/// Apps request resolves to — while every type their signatures demand lived
+/// in `fastmcp_protocol::mcp_apps_bridge`, which the facade did not forward.
+/// At the parent commit each path below resolved to NOTHING: all six names
+/// occurred exactly 0 times in `crates/fastmcp/src/`, against 4 occurrences of
+/// the `McpAppsWireHostEffects` control, so this test is its own planted
+/// negative and could not have passed before `pub use
+/// fastmcp_protocol::mcp_apps_bridge`.
+///
+/// NO-CLAIM. Every affected method is DEFAULTED, so the traits were always
+/// implementable; what was unreachable was *overriding* the progress,
+/// cancellation and initialize hooks without a direct dependency on
+/// `fastmcp-protocol`. This proves those six names resolve and that two
+/// overrides actually run — nothing about Apps conformance, and nothing about
+/// the hooks this test does not override.
+#[cfg(feature = "apps")]
+#[test]
+fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
+    use fastmcp_rust::mcp_apps_bridge::{
+        McpAppsCancelledControlParams, McpAppsJsonRpcError, McpAppsJsonRpcRequestId,
+        McpAppsPinnedInitializeParams, McpAppsPinnedInitializeResult,
+        McpAppsProgressControlParams,
+    };
+    use fastmcp_rust::{Cx, McpAppsHostError, McpAppsHostRequestOutcome, McpAppsWireHostEffects};
+
+    #[derive(Default)]
+    struct RecordingEffects {
+        progress_seen: usize,
+        cancels_seen: usize,
+        last_progress: f64,
+    }
+
+    // The two signatures are the assertion. Each one names a type that could
+    // not be written through the facade at the parent commit.
+    impl McpAppsWireHostEffects for RecordingEffects {
+        async fn progress(
+            &mut self,
+            request_id: &McpAppsJsonRpcRequestId,
+            params: &McpAppsProgressControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            assert_eq!(request_id, &params.progress_token);
+            self.progress_seen += 1;
+            self.last_progress = params.progress;
+            Ok(())
+        }
+
+        fn cancelled(
+            &mut self,
+            cx: &Cx,
+            request_id: &McpAppsJsonRpcRequestId,
+            params: &McpAppsCancelledControlParams,
+        ) -> Result<(), McpAppsHostError> {
+            assert!(cx.checkpoint().is_ok());
+            assert_eq!(params.request_id.as_ref(), Some(request_id));
+            self.cancels_seen += 1;
+            Ok(())
+        }
+    }
+
+    // The `initialize` override's exact shape. That hook additionally requires
+    // CONSTRUCTING its result, because
+    // `McpAppsWireHostConfiguration::initialize_result`
+    // (crates/fastmcp-client/src/mcp_apps.rs:794) is private, so an embedder
+    // cannot delegate to the default behaviour it replaces. That is a separate
+    // gap, recorded on the bead and deliberately not fixed here; this binding
+    // proves only that both names now resolve.
+    fn initialize_override_shape(
+        _params: &McpAppsPinnedInitializeParams,
+        prepared: McpAppsPinnedInitializeResult,
+    ) -> McpAppsPinnedInitializeResult {
+        prepared
+    }
+    let _shape: fn(
+        &McpAppsPinnedInitializeParams,
+        McpAppsPinnedInitializeResult,
+    ) -> McpAppsPinnedInitializeResult = initialize_override_shape;
+
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        let request_id = McpAppsJsonRpcRequestId::Number(7);
+        let progress_params = McpAppsProgressControlParams {
+            progress_token: McpAppsJsonRpcRequestId::Number(7),
+            progress: 0.5,
+            total: Some(1.0),
+            message: None,
+        };
+        let cancel_params = McpAppsCancelledControlParams {
+            request_id: Some(McpAppsJsonRpcRequestId::Number(7)),
+            reason: Some("view closed".to_owned()),
+        };
+
+        // POSITIVE: both overrides run and mutate embedder-owned state.
+        let mut effects = RecordingEffects::default();
+        effects
+            .progress(&request_id, &progress_params)
+            .await
+            .unwrap();
+        effects
+            .cancelled(&cx, &request_id, &cancel_params)
+            .unwrap();
+        assert_eq!(effects.progress_seen, 1);
+        assert_eq!(effects.cancels_seen, 1);
+        assert!((effects.last_progress - 0.5).abs() < f64::EPSILON);
+
+        // NEGATIVE (RH-5): the library's own no-op impl for `()`, invoked with
+        // the IDENTICAL arguments and differing only in whether the hook is
+        // overridden. It must succeed while recording nothing, which is what
+        // makes the counters above attributable to the override rather than to
+        // the call. Without this arm the positive passes vacuously.
+        ().progress(&request_id, &progress_params).await.unwrap();
+        ().cancelled(&cx, &request_id, &cancel_params).unwrap();
+        assert_eq!(effects.progress_seen, 1);
+        assert_eq!(effects.cancels_seen, 1);
+    });
+
+    // A peer error must be nameable to be PROPAGATED, not merely matched: the
+    // `let` annotation below is what an embedder storing the error in its own
+    // type has to write, and matching alone would never have detected its
+    // absence because a pattern binds the payload without naming it.
+    let outcome = McpAppsHostRequestOutcome::PeerError(McpAppsJsonRpcError {
+        code: -32601,
+        message: "method not found".to_owned(),
+        data: None,
+    });
+    let stored: McpAppsJsonRpcError = match outcome {
+        McpAppsHostRequestOutcome::PeerError(err) => err,
+        other => panic!("constructed PeerError must match itself, got {other:?}"),
+    };
+    assert_eq!(stored.code, -32601);
+    assert_eq!(stored.message, "method not found");
+    assert!(stored.data.is_none());
+}

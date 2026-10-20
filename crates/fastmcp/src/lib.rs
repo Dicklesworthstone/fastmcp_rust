@@ -945,6 +945,28 @@ pub use fastmcp_client::{
     McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
     mcp_apps_in_memory_wire_pair,
 };
+// `mcp_apps_bridge` is forwarded because the list immediately above already
+// hands consumers two traits an embedder IMPLEMENTS -- `McpAppsWireHostPolicy`
+// and `McpAppsWireHostEffects` -- plus `McpAppsHostRequestOutcome`, while the
+// types their signatures demand are declared only here:
+//   `McpAppsWireHostPolicy::initialize` takes `&McpAppsPinnedInitializeParams`
+//     and returns `McpAppsPinnedInitializeResult`,
+//   `::progress` takes `&McpAppsProgressControlParams`,
+//   `::cancelled` takes `&McpAppsCancelledControlParams`,
+//   both of those take `&McpAppsJsonRpcRequestId`, as do the identical pair on
+//     `McpAppsWireHostEffects`, and
+//   `McpAppsHostRequestOutcome::PeerError` carries `McpAppsJsonRpcError`.
+// A trait impl must RESTATE its parameter and return types verbatim, so the
+// exemption that covers a plain `pub fn` parameter -- "the value is obtainable
+// from an accessor" -- cannot apply here: `McpAppsJsonRpcRequestId::allocate`
+// yields a value, never the name. Every affected method is defaulted, so the
+// traits were implementable; what was unreachable was OVERRIDING the progress,
+// cancellation and initialize hooks that are the extension point's whole
+// purpose, without adding a direct dependency on `fastmcp-protocol`. Gated to
+// match the declaring module, which is `#[cfg(feature = "apps")]` at
+// crates/fastmcp-protocol/src/lib.rs:51.
+#[cfg(feature = "apps")]
+pub use fastmcp_protocol::mcp_apps_bridge;
 
 /// Exact-2024 HTTP request staging is available only with its adapter profile.
 #[cfg(feature = "legacy-2024-11-05")]

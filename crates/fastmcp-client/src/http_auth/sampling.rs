@@ -25,7 +25,7 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::common_types::SamplingContentBlock;
-use fastmcp_protocol::sampling::{SamplingToolLoop, SamplingToolLoopError, SamplingToolLoopStep};
+use fastmcp_protocol::sampling::{SamplingToolLoop, SamplingToolLoopStep};
 use fastmcp_protocol::{
     AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, admit_final_schema,
 };
@@ -45,7 +45,16 @@ use super::caller::with_caller;
 /// signature demanding it is here; the parent closed the identical defect class
 /// for `OAuthCredentialStore::open` with
 /// `pub use fastmcp_core::partition::PartitionAuthorization`.
-pub use fastmcp_protocol::sampling::SamplingToolLoopLimits;
+///
+/// `SamplingToolLoopError` joins it for a position the first pass did not
+/// examine: `SamplingRunError::Protocol` below carries one as its payload, and
+/// that enum IS facade-reachable. Matching the variant binds the payload
+/// without naming it, but a consumer who PROPAGATES the error -- storing it in
+/// their own error type or returning it -- must write the name, and could not.
+/// When this re-export was first added only `pub fn` parameter and return
+/// positions had been swept, which is why three of the four imported siblings
+/// were judged internal; an enum-variant payload is the same defect.
+pub use fastmcp_protocol::sampling::{SamplingToolLoopError, SamplingToolLoopLimits};
 
 /// Bounded sampling-only resolution of final input-required response maps.
 pub mod inputs;
