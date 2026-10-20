@@ -7549,10 +7549,15 @@ impl ModernHttpClient {
         .map_err(|_| {
             McpError::invalid_params("HTTP owned execution metadata byte limit exceeded")
         })?;
+        // The method name here is only a LENGTH PROXY: this request is measured
+        // and discarded, never sent. It must be a method the final union admits,
+        // because `build_post_discovery_request` validates it. `server/discover`
+        // is the canonical modern client-to-server request; the `+ 64` allowance
+        // below covers the difference between it and the longest admitted name.
         let request = self
             .build_post_discovery_request(
                 cx,
-                PING,
+                SERVER_DISCOVER,
                 serde_json::json!({}),
                 Some(RequestId::Number(i64::MAX)),
                 None,
@@ -11447,51 +11452,20 @@ fn with_optional_parameter_headers(
 }
 
 fn validate_final_method(method: &str, has_request_id: bool) -> Result<(), ModernHttpClientError> {
-    // Not a member of the official 2026 client-request union. The second half
-    // of this comment used to read "the server still answers `{}` on the
-    // stateless HTTP surface", and that is not what this project's server
-    // does: a modern-marked ping is refused -32601, measured on both stateless
+    // `ping` gets no special case here. It was REMOVED by MCP 2026-07-28, so on
+    // the modern path it is refused by the ordinary union check below, exactly
+    // like `logging/setLevel` which the same revision removed. This used to be a
+    // bypass that admitted a modern ping; it was removed under bd-ep6pp once the
+    // two things holding it in place were resolved. First, this repository's own
+    // server already refuses a modern-marked ping with -32601 on both stateless
     // dispatch chains and under both modern policies, because
-    // `fastmcp-server`'s `is_removed_legacy_method` lists `ping` beside
-    // `logging/setLevel` and no ping arm exists anywhere in the server's HTTP
-    // admission, router, or legacy modules. The frozen plan agrees: its
-    // protocol comparison table reads `| Ping | Removed | Present |
-    // Legacy-only |`, and it twice calls core ping "the removed MCP core
-    // method". So this bypass admits a request the peer half of this very
-    // repository rejects, and `logging/setLevel` -- removed by the same
-    // revision, refused three lines below -- shows the shape the rule would
-    // otherwise take here.
-    //
-    // The behaviour is deliberately LEFT AS IS: every modern-path ping test in
-    // this file answers from a hand-written TCP fixture hardcoded to reply
-    // `{"result":{}}`, so none of them can see the disagreement, and removing
-    // the bypass is a cross-crate contract change rather than a local repair.
-    // Tracked as bd-ep6pp for a ruling on which half moves.
-    //
-    // THIS BYPASS IS ALSO LOAD-BEARING FOR A SHIPPED PATH, which the test
-    // inventory above understates. `owned_core_metadata_bytes` builds a PING
-    // request purely to measure `request.body.len()` -- `ping` is a
-    // method-name LENGTH PROXY there, never sent -- and reaches this function
-    // through `build_post_discovery_request` ->
-    // `build_modern_request_with_extensions`. That call returns `Ok` only
-    // because of the special case below, so deleting the bypass WITHOUT also
-    // changing that sizing method makes the facade's `execute_core` and
-    // `execute_core_with_timeout_policy` fail with
-    // `invalid_params("HTTP owned execution metadata could not be encoded")`.
-    // Any admitted method serves as the proxy: `ping` is 4 bytes against a
-    // longest declared method const of 36, and that function's own 64-byte
-    // allowance covers either. Not changed here, because substituting it moves
-    // a measured byte boundary and belongs in the same unit of work as the
-    // ruling.
-    if method == PING {
-        return if has_request_id {
-            Ok(())
-        } else {
-            Err(ModernHttpClientError::MissingRequestId {
-                method: method.to_owned(),
-            })
-        };
-    }
+    // `is_removed_legacy_method` lists `ping` beside `logging/setLevel` and no
+    // ping arm exists in its HTTP admission, router, or legacy modules -- so the
+    // bypass was admitting a request the peer half of this repository rejects.
+    // Second, `owned_core_metadata_bytes` reached this function with `ping` as a
+    // method-name LENGTH PROXY for a request it measures and discards; that
+    // proxy is now `SERVER_DISCOVER`, which the union admits, so the facade's
+    // `execute_core` and `execute_core_with_timeout_policy` keep working.
     let final_method = final_2026_07_28_method(method).ok_or_else(|| {
         ModernHttpClientError::UnsupportedFinalMethod {
             method: method.to_owned(),
