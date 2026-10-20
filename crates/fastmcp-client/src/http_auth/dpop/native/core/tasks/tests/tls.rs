@@ -366,7 +366,15 @@ fn discovery_time_is_not_refunded_when_the_task_post_starts() {
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{").await.unwrap();
             socket.flush().await.unwrap();
             clock.advance(4_000_000_000);
-            timer.process_timers();
+            // The fired count is the property this test is named for: discovery
+            // spent 6s, so the deadline must come due at 10s rather than being
+            // refunded to 6+10. Bare-discarding it let the test pass even if
+            // the advance fired nothing. This was the only BARE discard among
+            // the workspace's 44 `process_timers` call sites; 43 state an
+            // expectation (now 28 `> 0`, 15 `== 0`) and one discards
+            // explicitly with `let _` in a drain arm that does not care
+            // (http_auth/discovery/client_credentials/lifetime.rs:338).
+            assert!(timer.process_timers() > 0);
             reached.cancel();
         };
         pair(application, peer).await;
