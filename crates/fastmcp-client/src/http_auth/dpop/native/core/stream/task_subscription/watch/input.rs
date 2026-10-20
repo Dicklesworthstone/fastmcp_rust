@@ -152,6 +152,9 @@ pub(super) enum InputDecision {
 struct PendingAnswers {
     keys: Vec<String>,
     fingerprints: BTreeMap<String, Sha256Digest>,
+    // Issuing a request crosses the local no-replay boundary even before the
+    // first network poll. Only unissued staging may be invalidated by a hint.
+    issued: bool,
 }
 
 pub(super) struct InputDriver<R, O> {
@@ -202,14 +205,25 @@ impl<R, O> InputDriver<R, O> {
         let keys: Vec<_> = responses.keys().cloned().collect();
         // Never send answers which cannot be remembered after acknowledgement.
         self.ledger.answer_bytes(&keys, &fingerprints, self.policy.maximum_state_bytes)?;
-        self.pending = Some(PendingAnswers { keys, fingerprints });
+        self.pending = Some(PendingAnswers { keys, fingerprints, issued: false });
+        Ok(())
+    }
+
+    // A ready resolver may stage answers just before the listen invalidates
+    // their snapshot. Dispose only those unsent controls. Never erase an issued
+    // update's uncertain disposition, acknowledged fingerprints or counters.
+    pub(super) fn discard_unissued_resolution(&mut self) -> Result<(), DpopTaskWatchError> {
+        if self.pending.as_ref().is_some_and(|pending| pending.issued) {
+            return Err(ManagedTaskDriverError::UnexpectedResponse.into());
+        }
+        self.pending = None;
         Ok(())
     }
 
     pub(super) fn update_request(
         &mut self, watch: &WatchState, task: Task, responses: TaskInputResponses,
     ) -> Result<(DpopTaskOperation, DpopStreamLimits), DpopTaskWatchError> {
-        if self.pending.is_none() {
+        if self.pending.as_ref().is_none_or(|pending| pending.issued) {
             return Err(ManagedTaskDriverError::UnexpectedResponse.into());
         }
         if self.updates >= self.policy.maximum_updates {
@@ -224,6 +238,8 @@ impl<R, O> InputDriver<R, O> {
             RequestId::String(format!("{}.input.{}.update", watch.prefix, self.updates)),
             ManagedTaskRequest::Update { task: Box::new(task), input_responses: responses },
         )?;
+        let pending = self.pending.as_mut().ok_or(ManagedTaskDriverError::UnexpectedResponse)?;
+        pending.issued = true;
         self.updates += 1;
         Ok((operation, limits))
     }
@@ -348,6 +364,14 @@ impl DpopHttpClient {
     /// input-required returns to the host, even if the input ledger has capacity.
     /// Reconnection never carries the former listen's mutation authority forward.
     ///
+    /// On the live listen, a selected-Task status hint drops pending input work
+    /// and discards only unissued answers before a fresh authenticated get.
+    /// The notification itself never selects a new Task state or input request.
+    /// Unacknowledged inputs may therefore reach a new resolver invocation;
+    /// host futures must support cancellation and must not detach their work.
+    /// Already-issued updates are not interrupted by hints or automatically
+    /// replayed. Teardown and invalid framing retain their fail-closed behavior.
+    ///
     /// ReturnToCaller and a zero-update policy return the full input snapshot,
     /// including metadata. Failed/cancelled Tasks retain their terminal variants.
     /// Host errors, panics, cancellation, revocation and dropping the future stop
@@ -433,5 +457,72 @@ mod reconnect_admission_tests {
         assert!(original.watch.reconnect.is_none());
         assert!(original.with_reconnects(0, Duration::from_millis(1)).is_err());
         assert!(original.with_reconnects(1, Duration::ZERO).is_err());
+    }
+}
+
+#[cfg(test)]
+mod invalidation_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn requests() -> TaskInputRequests {
+        serde_json::from_value(json!({"one":{"method":"roots/list"},"two":{"method":"roots/list"}})).unwrap()
+    }
+
+    fn answers(key: &str) -> TaskInputResponses {
+        serde_json::from_value(json!({key:{"roots":[]}})).unwrap()
+    }
+
+    fn driver() -> InputDriver<(), ()> {
+        let metadata = FinalRequestMeta::new(serde_json::from_value(json!({"roots":{}})).unwrap());
+        InputDriver::new(ManagedTaskDriverPolicy::default(), &metadata, (), ()).unwrap()
+    }
+
+    fn task() -> Task {
+        serde_json::from_value(json!({"taskId":"task-one","status":"input_required",
+            "createdAt":"2020-01-01T00:00:00Z","lastUpdatedAt":"2020-01-01T00:00:01Z",
+            "ttlMs":null,"inputRequests":requests()})).unwrap()
+    }
+
+    #[test]
+    fn invalidation_discards_only_unsent_staging_and_keeps_acknowledged_answers() {
+        let mut driver = driver();
+        let requests = requests();
+        let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
+        driver.stage(&pending, fingerprints, &answers("one")).unwrap();
+        let watch = WatchState::new("watch", DpopTaskWatchPolicy::new(8).unwrap(), DpopStreamLimits::default()).unwrap();
+        driver.update_request(&watch, task(), answers("one")).unwrap();
+        driver.acknowledged().unwrap();
+        let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
+        driver.stage(&pending, fingerprints, &answers("two")).unwrap();
+        driver.discard_unissued_resolution().unwrap();
+        assert!(driver.pending.is_none());
+        assert_eq!(driver.updates, 1);
+        let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
+        assert_eq!(pending.keys().map(String::as_str).collect::<Vec<_>>(), ["two"]);
+        driver.stage(&pending, fingerprints, &answers("two")).unwrap();
+        driver.update_request(&watch, task(), answers("two")).unwrap();
+        driver.acknowledged().unwrap();
+        assert!(driver.ledger.unanswered(&requests, driver.policy).unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn issued_answers_cannot_be_discarded_or_issued_again_before_acknowledgement() {
+        let mut driver = driver();
+        driver.discard_unissued_resolution().unwrap();
+        let requests = requests();
+        let (pending, fingerprints) = driver.ledger.unanswered(&requests, driver.policy).unwrap();
+        driver.stage(&pending, fingerprints, &answers("one")).unwrap();
+        let watch = WatchState::new("watch", DpopTaskWatchPolicy::new(8).unwrap(), DpopStreamLimits::default()).unwrap();
+        driver.update_request(&watch, task(), answers("one")).unwrap();
+        let saved = driver.pending.as_ref().unwrap().fingerprints.clone();
+        assert!(driver.discard_unissued_resolution().is_err());
+        assert!(driver.update_request(&watch, task(), answers("one")).is_err());
+        assert_eq!(driver.pending.as_ref().unwrap().fingerprints, saved);
+        assert!(driver.pending.as_ref().unwrap().issued);
+        assert_eq!(driver.updates, 1);
+        assert_eq!(driver.ledger.unanswered(&requests, driver.policy).unwrap().0.len(), 2);
+        driver.acknowledged().unwrap();
+        assert_eq!(driver.ledger.unanswered(&requests, driver.policy).unwrap().0.len(), 1);
     }
 }

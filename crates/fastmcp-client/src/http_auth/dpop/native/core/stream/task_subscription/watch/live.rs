@@ -42,6 +42,9 @@ impl<'a> ReadOwner<'a> {
 
 pub(super) enum Follow<T> {
     Completed(T),
+    // Only input resolution opts in. This is a request for an authoritative
+    // get, not adoption of the notification's Task or permission to replay.
+    Changed,
     // Terminal framing has retired mutation authority, even before clean EOF.
     // The caller still has to drain/validate the tail before any reconciliation.
     Stopped,
@@ -166,12 +169,36 @@ where
         }).await?
     }
 
+    // RPCs must settle even if a status hint arrives: aborting an update on a
+    // hint could lose its acknowledgement and cause an unsafe mutation retry.
+    pub(super) async fn follow<F, T>(
+        &mut self, owner: &ReadOwner<'_>, future: F,
+    ) -> Result<Follow<T>, DpopTaskWatchError>
+    where
+        F: Future<Output = Result<T, DpopTaskWatchError>>,
+    {
+        self.follow_using(owner, future, false).await
+    }
+
+    // Unsubmitted input is different: a selected-Task hint invalidates its
+    // snapshot before another host poll or answer publication. The host future
+    // is dropped, not detached. The watch must discard any unsent staging and
+    // perform a fresh authenticated get; this does not acknowledge any answer.
+    pub(super) async fn follow_input<F, T>(
+        &mut self, owner: &ReadOwner<'_>, future: F,
+    ) -> Result<Follow<T>, DpopTaskWatchError>
+    where
+        F: Future<Output = Result<T, DpopTaskWatchError>>,
+    {
+        self.follow_using(owner, future, true).await
+    }
+
     // Drain before polling the companion and again before publishing a ready
     // result. A ready terminal therefore beats host work and successor I/O.
     // A completed companion is kept exactly once across receive-side yields;
     // it is never repolled or used before the ready listen prefix is admitted.
-    pub(super) async fn follow<F, T>(
-        &mut self, owner: &ReadOwner<'_>, future: F,
+    async fn follow_using<F, T>(
+        &mut self, owner: &ReadOwner<'_>, future: F, invalidate_on_hint: bool,
     ) -> Result<Follow<T>, DpopTaskWatchError>
     where
         F: Future<Output = Result<T, DpopTaskWatchError>>,
@@ -184,10 +211,13 @@ where
                 match self.pump(task, owner, false, true) {
                     Ok(Pump::Closed | Pump::Teardown) => return Poll::Ready(Ok(Follow::Stopped)),
                     Err(error) => return Poll::Ready(Err(error)),
-                    // Never start/poll a companion ahead of a ready native
-                    // frame suffix: it may already contain peer teardown.
+                    // Never start/poll a companion or reconcile a hint ahead
+                    // of a ready native suffix: it may contain invalid framing.
                     Ok(Pump::Yielded) => return Poll::Pending,
                     Ok(_) => {}
+                }
+                if invalidate_on_hint && self.dirty {
+                    return Poll::Ready(Ok(Follow::Changed));
                 }
                 if ready.is_none() {
                     match future.as_mut().poll(task) {
@@ -200,6 +230,9 @@ where
                 if ready.is_some() {
                     match self.pump(task, owner, false, true) {
                         Ok(Pump::Idle) => {
+                            if invalidate_on_hint && self.dirty {
+                                return Poll::Ready(Ok(Follow::Changed));
+                            }
                             let Some(value) = ready.take() else {
                                 return Poll::Ready(Err(ManagedCoreError::InvalidResponse.into()));
                             };

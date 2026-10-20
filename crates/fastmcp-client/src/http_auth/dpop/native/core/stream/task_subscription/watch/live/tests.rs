@@ -361,3 +361,135 @@ fn status_hints_received_during_a_companion_remain_pending_for_reconciliation() 
         assert!(!listen.closed);
     });
 }
+
+#[test]
+fn selected_task_hint_invalidates_pending_or_unpolled_input_without_closing_the_listen() {
+    for already_pending in [false, true] {
+        fixture(|owner, timer, _| {
+            let (mut listen, control, _, body_drops) = listen(owner, 8);
+            let budget = listen.budget.clone();
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            let work = Work { polls: polls.clone(), drops: drops.clone(), ready: Rc::new(Cell::new(false)) };
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(wakes.clone());
+            let mut task = Context::from_waker(&waker);
+            let mut future = Box::pin(listen.follow_input(owner, work));
+            if already_pending {
+                assert!(future.as_mut().poll(&mut task).is_pending());
+            }
+            let before = polls.get();
+            control.send(status());
+            if already_pending { assert!(wakes.0.load(Ordering::SeqCst) > 0); }
+            assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Changed))));
+            assert_eq!(polls.get(), before, "no host poll after the invalidating hint");
+            drop(future);
+            assert_eq!(drops.get(), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(body_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(budget.usage().unwrap().1, 2);
+            assert!(listen.has_hint());
+            assert!(!listen.closed);
+            assert!(!owner.cancellation.is_cancel_requested());
+            assert!(!owner.owner.is_cancel_requested());
+        });
+    }
+}
+
+#[test]
+fn a_hint_after_host_completion_suppresses_the_ready_answer_without_repolling() {
+    for yields in [false, true] {
+        fixture(|owner, _, _| {
+            let (mut listen, control, _, _) = listen(owner, 8);
+            let calls = Cell::new(0);
+            let mut future = Box::pin(listen.follow_input(owner, async {
+                calls.set(calls.get() + 1);
+                if yields { for _ in 0..100 { control.send(Vec::new()); } }
+                control.send(status());
+                Ok::<u8, DpopTaskWatchError>(42)
+            }));
+            let mut task = Context::from_waker(Waker::noop());
+            let mut changed = false;
+            for _ in 0..8 {
+                match future.as_mut().poll(&mut task) {
+                    Poll::Pending => {}
+                    Poll::Ready(Ok(Follow::Changed)) => { changed = true; break; }
+                    _ => panic!("stale ready answer escaped"),
+                }
+            }
+            assert!(changed);
+            assert_eq!(calls.get(), 1);
+            drop(future);
+            assert!(listen.has_hint());
+        });
+    }
+}
+
+#[test]
+fn invalidation_cannot_overtake_a_ready_malformed_or_terminal_frame_suffix() {
+    for terminal_suffix in [false, true] {
+        fixture(|owner, _, _| {
+            let (mut listen, control, _, _) = listen(owner, 8);
+            let mut wire = status();
+            wire.extend(format!(":{}\n\n", "x".repeat(BYTES_PER_TURN + 64)).into_bytes());
+            wire.extend(if terminal_suffix { terminal() } else { b"data: {invalid}\n\n".to_vec() });
+            control.send(wire);
+            let mut future = Box::pin(listen.follow_input(owner, async {
+                panic!("unread listen suffix must win before host work");
+                #[allow(unreachable_code)]
+                Ok::<(), DpopTaskWatchError>(())
+            }));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            let result = future.as_mut().poll(&mut task);
+            if terminal_suffix {
+                assert!(matches!(result, Poll::Ready(Ok(Follow::Stopped))));
+            } else {
+                assert!(matches!(result, Poll::Ready(Err(_))));
+            }
+        });
+    }
+}
+
+#[test]
+fn invalidation_and_restarted_resolution_keep_the_original_idle_deadline() {
+    fixture(|owner, timer, clock| {
+        let (mut listen, control, _, _) = listen(owner, 8);
+        let mut task = Context::from_waker(Waker::noop());
+        {
+            let mut future = Box::pin(listen.follow_input(owner, std::future::pending::<Result<(), DpopTaskWatchError>>()));
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            clock.advance(9_000_000_000);
+            control.send(status());
+            assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Ok(Follow::Changed))));
+        }
+        assert_eq!(timer.pending_count(), 0);
+        listen.clear_hint();
+        let mut future = Box::pin(listen.follow_input(owner, std::future::pending::<Result<(), DpopTaskWatchError>>()));
+        assert!(future.as_mut().poll(&mut task).is_pending());
+        clock.advance(1_000_000_000);
+        assert!(timer.process_timers() > 0);
+        assert!(matches!(future.as_mut().poll(&mut task), Poll::Ready(Err(_))));
+        drop(future);
+        assert_eq!(timer.pending_count(), 0);
+        assert!(!owner.cx.is_cancel_requested());
+    });
+}
+
+#[test]
+fn foreign_task_notifications_cannot_invalidate_or_start_input_resolution() {
+    fixture(|owner, _, _| {
+        let (mut listen, control, _, _) = listen(owner, 8);
+        let budget = listen.budget.clone();
+        let before = budget.usage().unwrap();
+        let foreign = String::from_utf8(status()).unwrap().replace("task-one", "task-other");
+        control.send(foreign.into_bytes());
+        let mut future = Box::pin(listen.follow_input(owner, async {
+            panic!("unselected Task cannot authorize host work or reconciliation");
+            #[allow(unreachable_code)]
+            Ok::<(), DpopTaskWatchError>(())
+        }));
+        assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(_))));
+        assert_eq!(budget.usage().unwrap(), before);
+    });
+}

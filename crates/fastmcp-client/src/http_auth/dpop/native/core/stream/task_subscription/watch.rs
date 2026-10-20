@@ -474,11 +474,26 @@ impl DpopHttpClient {
             }
             let Some(input) = input.as_mut() else { return Ok(outcome(*snapshot)); };
             let life = Lifetime { cx, cancellation, session: &self.session, credential, bounds };
-            let decision = live.follow(owner,
-                input.on_snapshot(&life, state, &snapshot.task, may_update),
-            ).await?;
+            let resolution = input.on_snapshot(&life, state, &snapshot.task, may_update);
+            let decision = if may_update && matches!(&snapshot.task, Task::InputRequired { .. }) {
+                live.follow_input(owner, resolution).await?
+            } else {
+                // Authoritative terminal snapshots and observation-only
+                // handoffs are not invalidated by an unrelated late hint.
+                live.follow(owner, resolution).await?
+            };
             state.usage = live.budget.usage()?;
-            let Follow::Completed(decision) = decision else { return Ok(None); };
+            let decision = match decision {
+                Follow::Completed(decision) => decision,
+                Follow::Stopped => return Ok(None),
+                Follow::Changed => {
+                    // The host future is gone. A ready answer may have staged
+                    // fingerprints before the same-poll hint arrived, but no
+                    // update was issued. Do not acknowledge or reuse it.
+                    input.discard_unissued_resolution()?;
+                    continue;
+                }
+            };
             check_live(cx, cancellation, &self.session, credential, bounds)?;
             match decision {
                 InputDecision::Return => return Ok(outcome(*snapshot)),
