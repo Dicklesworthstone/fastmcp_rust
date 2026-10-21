@@ -834,7 +834,26 @@ pub use fastmcp_transport::{event_store, http, memory};
 pub use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pipe};
 
 // Re-export server types
-// FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
+//
+// FND-01 scope, stated exactly, because the previous one-line gloss here read
+// as a blanket ban and was the reason the shipped resource verifiers stayed
+// unreachable for a consumer. What the policy actually forbids, by its own
+// implemented rules rather than by prose:
+//   FACADE-NO-JSONWEBTOKEN   the external token crate, absent from every
+//                            dependency table of this manifest
+//   FACADE-NO-JWT-FEATURE    a [features] key named exactly `jwt`, and any
+//                            forwarding component equal to `jwt` after
+//                            splitting on `/`, `:` and `?`
+//   NO-JWT-ENCODING-KEY      local signing keys, zero `ident` matches in
+//                            crates/**/*.rs
+//   NO-JWT-VERIFIER-SURFACE  the removed verifier type's own identifier, zero
+//                            matches; the shipped type is deliberately named
+//                            differently
+// So the removed surface is the externally-backed, locally-SIGNING one. The
+// `jwt-resource-auth` feature is verification-only over in-workspace JOSE, is
+// what `fastmcp-server` and `fastmcp-cli` have both carried since 2026-10-14,
+// and trips none of those four rules. `providers` below re-exports its types
+// unconditionally, so the feature equation in Cargo.toml is the whole wiring.
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
     BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,

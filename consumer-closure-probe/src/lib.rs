@@ -254,6 +254,48 @@ pub fn promote_helpers_resolve_through_the_facade() {
     let _ = fastmcp_rust::__private::server::promote_legacy_prompt_messages(Vec::new());
 }
 
+/// POSITIVE — THE SHIPPED JWT RESOURCE VERIFIERS ARE INSTALLABLE BY A CONSUMER.
+///
+/// `fastmcp-server/providers/mod.rs` documents these types with a
+/// `use fastmcp_rust::providers::{...}` example, so the component crate has
+/// been advertising a facade route since 2026-10-14. Until the facade gained
+/// its `jwt-resource-auth` forwarding equation that route did not exist, and
+/// the failure was at the MANIFEST layer, not the name layer: Cargo refused to
+/// resolve `fastmcp-rust/jwt-resource-auth` and listed the fourteen features
+/// the facade did declare. That refusal is this function's planted negative and
+/// it needs no build to reproduce — remove the equation and `cargo metadata`
+/// alone fails.
+///
+/// The last two lines are the claim that matters. Naming a type only proves it
+/// is reachable; replicating the exact bound `TokenAuthProvider::new` demands
+/// (`V: TokenVerifier + 'static`, `fastmcp-server/src/auth.rs:611`) proves the
+/// shipped verifiers can actually be INSTALLED through the facade's own trait
+/// as a consumer sees it. Those are different facts and only the second one is
+/// the capability.
+///
+/// NO-CLAIM: this is a type-level proof. It does not run an RS256 verification,
+/// and it says nothing about whether either verifier is correct — the 23 tests
+/// inside those two modules are a separate question this probe cannot reach.
+#[cfg(feature = "jwt-provider-reachable")]
+pub fn jwt_resource_providers_install_through_the_facade() {
+    use fastmcp_rust::providers::{
+        JwksRefreshError, JwksRefreshOutcome, JwksRefreshPolicy, JwtResourceAuthError,
+        JwtResourcePolicy, JwtResourceVerifier, ManagedJwtResourceVerifier,
+    };
+
+    // All seven names `providers/mod.rs` advertises, so the whole re-exported
+    // surface has to close rather than just the two verifiers.
+    let _: Option<JwtResourceAuthError> = None;
+    let _: Option<JwtResourcePolicy> = None;
+    let _: Option<JwksRefreshPolicy> = None;
+    let _: Option<JwksRefreshOutcome> = None;
+    let _: Option<JwksRefreshError> = None;
+
+    fn installs_as_a_token_verifier<V: fastmcp_rust::TokenVerifier + 'static>() {}
+    installs_as_a_token_verifier::<JwtResourceVerifier>();
+    installs_as_a_token_verifier::<ManagedJwtResourceVerifier>();
+}
+
 /// NEGATIVE 1 — the EXTERN PRELUDE half. Differs from the positive above in
 /// exactly one dimension: a leading `::`. That is the defect verbatim; the
 /// prompt and resource expansions emitted

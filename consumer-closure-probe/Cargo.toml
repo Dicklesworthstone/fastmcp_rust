@@ -42,5 +42,14 @@ resolver = "3"
 # to work. src/lib.rs says what each negative proves.
 planted-negative = []
 
+# The two shipped JWT resource verifiers, reached the way a consumer must reach
+# them: through the facade alone. The forward below names `fastmcp-rust` and
+# could not name the component crate that implements them -- the guards in
+# src/lib.rs scan this file's raw bytes, comments included, and reject every
+# component spelling. So this feature cannot resolve at all unless the FACADE
+# declares its own forwarding equation. That is the point: the equation was
+# missing, and this stanza fails to resolve against any facade lacking it.
+jwt-provider-reachable = ["fastmcp-rust/jwt-resource-auth"]
+
 [dependencies]
 fastmcp-rust = { path = "../crates/fastmcp" }
