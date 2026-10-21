@@ -8625,7 +8625,23 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("rejected cursor variations preserve the original cached page"),
     );
-    assert_eq!(typed_page_identity(&unchanged_retry), first_identity);
+    // The counters are in the message because this assertion has been failing
+    // and the bare form cannot say WHY. Reading cache.rs end to end leaves
+    // exactly one path that can remove this entry -- `invalidate_result_set`,
+    // reachable only from `invalidate_notification`, which retires every Tools
+    // entry -- and `FinalCacheStats` distinguishes it from the alternatives in
+    // one line: `invalidations` for that path, `evictions` for a bounded-cache
+    // eviction, `stale` for TTL expiry. Capacity and expiry are already
+    // excluded by the defaults (128 entries, 128 MiB) and by the TTL still
+    // having minutes left, so a nonzero `invalidations` here is the answer
+    // rather than one hypothesis among several. bd-gt6za.
+    assert_eq!(
+        typed_page_identity(&unchanged_retry),
+        first_identity,
+        "rejected cursor variations must leave the original cached page \
+         byte-identical; cache counters at this point were {:?}",
+        client.final_result_cache_stats()
+    );
     assert_eq!(requests.load(Ordering::SeqCst), before_unchanged_requests);
     assert_eq!(
         client.final_result_cache_stats().fills,
