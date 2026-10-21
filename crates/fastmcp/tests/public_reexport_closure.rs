@@ -45,7 +45,7 @@ use fastmcp_rust::http_auth::dpop::{DpopClientError, DpopError, DpopKey, DpopSes
 use fastmcp_rust::http_auth::sampling::{SamplingRunLimits, SamplingToolLoopLimits};
 use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
 use fastmcp_rust::partition::{CredentialStoreKey, DurableOwnerKey, PartitionDescriptor};
-use fastmcp_rust::runtime::ProcessGenerationGuard;
+use fastmcp_rust::ProcessGenerationGuard;
 
 /// `DpopKey::generate` returns `Result<DpopKey, DpopError>`, so a consumer that
 /// wraps key generation must be able to name BOTH types. Declared as a real

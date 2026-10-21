@@ -2243,6 +2243,28 @@ pub use limits::{
     SealedAdmissionKeyError,
 };
 pub use runtime::block_on;
+// Process-generation IDENTITY, surfaced at the crate root so the facade can
+// forward these names without forwarding the module that declares them.
+//
+// `http_auth::secure_file::slot::coordinator::asynchronous::CredentialIoLane::new`
+// takes `&ProcessGenerationGuard` and is public in a tree the facade forwards,
+// so a consumer has to be able to write that name; the rest of this list is
+// the closure of what using the guard demands (`install` yields
+// `Result<&'static Self, ProcessGenerationError>`, `generation` yields
+// `ProcessGeneration`, `token` yields `ProcessBoundToken`, and
+// `admit_snapshot_stance` takes the stance and epoch types).
+//
+// It is a root re-export rather than a module forward because FND-01's facade
+// route pattern forbids `runtime` BY NAME (`forbid=runtime|block_on|...`), and
+// the verifier resolves `fastmcp_core::runtime::X` to the member `runtime`
+// regardless of what follows `X`, so no path through the module can satisfy
+// it. These names carry no runtime authority: `block_on`, `poll_on_cx`,
+// `enter_blocking_lane`, `BlockingLaneGuard` and
+// `bridge_would_starve_its_driver` stay reachable only as `runtime::*`.
+pub use runtime::{
+    ExternalEpoch, ProcessBoundToken, ProcessGeneration, ProcessGenerationError,
+    ProcessGenerationGuard, SNAPSHOT_CLONE_IS_DETECTABLE, SnapshotCloneStance,
+};
 pub use state::{DISABLED_PROMPTS_KEY, DISABLED_RESOURCES_KEY, DISABLED_TOOLS_KEY, SessionState};
 pub use uri::{
     ABSOLUTE_URI_HARD_MAX_BYTES, AbsoluteUri, AbsoluteUriComponent, AbsoluteUriError,

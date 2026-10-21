@@ -183,7 +183,12 @@ use fastmcp_rust::http_auth::dpop::{DpopClientError, DpopError, DpopKey, DpopSes
 use fastmcp_rust::http_auth::sampling::{SamplingRunLimits, SamplingToolLoopLimits};
 use fastmcp_rust::http_auth::{CanonicalHttpUrl, PartitionAuthorization};
 use fastmcp_rust::partition::{CredentialStoreKey, DurableOwnerKey, PartitionDescriptor};
-use fastmcp_rust::runtime::ProcessGenerationGuard;
+// `ProcessGenerationGuard` is named at the facade ROOT, not through a
+// `runtime` module. The module forward was removed because FND-01's facade
+// route pattern forbids `runtime` by name; the identity types it declares are
+// forwarded individually instead, and this import is the consumer-side proof
+// that the replacement still closes the guard parameter below.
+use fastmcp_rust::ProcessGenerationGuard;
 
 /// A name that cannot be reached through the facade makes this fail to
 /// resolve, which is the entire assertion. Parameters are underscore-prefixed
@@ -203,10 +208,11 @@ pub fn facade_closure_signatures(
 
 /// The positions where naming is not enough. `CredentialStoreKey` is
 /// obtainable ONLY through `derive` and is never returned by a reachable
-/// method -- which is the reason `partition` and `runtime` are forwarded at
-/// all, stated at `crates/fastmcp/src/lib.rs:531-536` -- so a consumer must be
-/// able to WRITE the parameter types. Binding the constructors as fn pointers
-/// fixes those types; a bare `use` would pass even if they were unusable.
+/// method -- which is the reason `partition` is forwarded as a module and the
+/// process-generation types are forwarded by name, stated in the comment above
+/// that forward in `crates/fastmcp/src/lib.rs` -- so a consumer must be able to
+/// WRITE the parameter types. Binding the constructors as fn pointers fixes
+/// those types; a bare `use` would pass even if they were unusable.
 pub fn constructors_are_callable() {
     let _derive: fn(
         &PartitionDescriptor,

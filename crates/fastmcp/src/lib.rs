@@ -534,7 +534,24 @@ pub use fastmcp_core::logging;
 // constructors through the facade but not call them without adding a direct
 // dependency on `fastmcp-core` — the same defect `PartitionAuthorization`
 // already had, fixed one parameter at a time until this closed the family.
-pub use fastmcp_core::{partition, runtime};
+//
+// `partition` is forwarded as a module; the process-generation types are
+// forwarded BY NAME. `f6a57876` forwarded `runtime` as a module too, by
+// analogy with the `{combinator, crypto, limits, logging, uri}` forward above,
+// and that analogy does not hold: FND-01's facade route pattern carries
+// `forbid=runtime|block_on|...` as literal text, the sibling mutant test
+// rejects `pub use fastmcp_core::runtime;` by name, and the verifier resolves
+// every `fastmcp_core::runtime::X` to the member `runtime`, so no path through
+// that module can satisfy the rule. Forwarding the module also published
+// `block_on`, `poll_on_cx` and `enter_blocking_lane` — the blocking runtime
+// bridge the curated `core` namespace above exists to withhold, in a project
+// whose contract is that the consumer owns the runtime. These seven names are
+// the identity half and carry no runtime authority.
+pub use fastmcp_core::partition;
+pub use fastmcp_core::{
+    ExternalEpoch, ProcessBoundToken, ProcessGeneration, ProcessGenerationError,
+    ProcessGenerationGuard, SNAPSHOT_CLONE_IS_DETECTABLE, SnapshotCloneStance,
+};
 
 // Re-export protocol types shared by both eras. Exact legacy initialization
 // types live in `legacy_2024`; modern discovery types live in `modern`.
