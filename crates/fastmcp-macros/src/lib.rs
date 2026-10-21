@@ -2480,9 +2480,19 @@ fn generate_final_resource_result_conversion(output: &syn::ReturnType) -> Option
 
 /// Marks a final `#[resource]` expansion as the author of its cache hints.
 fn explicit_final_resource_cache_hint_methods() -> TokenStream2 {
-    let server = handler_crate_paths()
-        .map(|paths| paths.server)
-        .unwrap_or_else(|_| quote!(::fastmcp_server));
+    // Every other crate-path resolution in this file propagates with `?`; this
+    // was the one site that swallowed the error and substituted a path, and the
+    // path it substituted was `::fastmcp_server`. A leading `::` names an
+    // EXTERN CRATE, which is exactly the shape that kept `#[prompt]` and
+    // `#[resource]` from expanding for any consumer whose manifest names only
+    // `fastmcp-rust` -- in-workspace tests could not see it because Cargo gives
+    // a package's own dependencies to its own test targets. Emit the macro's own
+    // diagnostic instead, so a consumer missing both entry points is told which
+    // dependency to add rather than shown an unresolved crate they never named.
+    let server = match handler_crate_paths() {
+        Ok(paths) => paths.server,
+        Err(error) => return error.to_compile_error(),
+    };
     quote! {
         fn final_resource_read_cache_hint_provenance(
             &self,
