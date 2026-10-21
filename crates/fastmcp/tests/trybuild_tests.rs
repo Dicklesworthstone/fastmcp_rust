@@ -1025,6 +1025,27 @@ fn compile_fail_tests() {
 
     let _compile_probe_guard = compile_probe_guard();
 
+    // trybuild passes `--offline` unconditionally (its `cargo_with_rustflags`
+    // does `cmd.arg("--offline")`) and it creates its own project under
+    // CARGO_TARGET_DIR/tests/trybuild with no Cargo.lock, so cargo has to
+    // RESOLVE that graph from the local cache alone. Every other compile probe
+    // in this file guarantees that cache first; this one did not, and it is
+    // the only probe here whose project it does not own.
+    //
+    // The consequence is not a loud failure. trybuild decides a compile_fail
+    // case by attributing rustc diagnostics to its path, with
+    // `Stderr::default { success: true }` as the fallback, so a cargo-level
+    // failure before any rustc invocation makes EVERY negative in the family
+    // report "Expected test case to fail to compile, but it succeeded" --
+    // which is exactly what the 2026-10-21 facade-surface run recorded for
+    // five consecutive prompt_*/resource_* cases (bd-e06g9). Fetching first
+    // removes that cause; if the fetch itself fails it panics by name here
+    // instead of turning nine planted negatives green-side-up.
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = workspace_root(manifest_dir);
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    ensure_workspace_lock_dependencies(&cargo, workspace_root);
+
     // trybuild owns nested Cargo processes internally and exposes no timeout.
     // Run the ordinary suite in an exact, recursively selected copy of this
     // test binary so the parent can bound and clean up the whole process group.
