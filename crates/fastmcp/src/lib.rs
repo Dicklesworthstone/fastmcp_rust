@@ -134,6 +134,23 @@
 //! # let _ = block_on(async {});
 //! ```
 //!
+//! The crate ROOT omits the implementation module too. This spelling is listed
+//! because the four above did not cover it and it is the one that regressed:
+//! `f6a57876` forwarded `fastmcp_core::runtime` at the root to make
+//! `CredentialIoLane::new` callable, which published the bridge through a path
+//! no case here denied. The identity types that forward needed are now named
+//! individually at the root, so the module itself is gone again:
+//!
+//! ```compile_fail
+//! use fastmcp_rust::runtime::block_on;
+//! # let _ = block_on(async {});
+//! ```
+//!
+//! ```compile_fail
+//! use fastmcp_rust::runtime::poll_on_cx;
+//! # let _ = poll_on_cx;
+//! ```
+//!
 //! The doc-hidden macro support route is also deliberately curated. It is not
 //! a runtime construction API for downstream consumers:
 //!
