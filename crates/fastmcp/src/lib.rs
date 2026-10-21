@@ -990,6 +990,35 @@ pub use fastmcp_server::providers;
 pub use fastmcp_server::rate_limiting::{
     RateLimitingMiddleware, SlidingWindowRateLimitingMiddleware,
 };
+
+// The SERVER half of the client's continuation-replay contract, which this
+// facade was already shipping without it.
+//
+// `http_auth::rpc::interaction::recovery::ContinuationReplayContract` is
+// reachable here, because `http_auth` is forwarded below as a module and the
+// chain to it is public the whole way. Its own doc states the dependency: "The
+// native server's `ContinuationReplayMiddleware` supplies that contract when
+// correctly placed around native MRTR dispatch", and it warns that
+// "misconfiguration can repeat remote effects. No wire flag or idempotent
+// annotation is accepted as a substitute." So a facade-only consumer could
+// DECLARE a trusted replay deployment and had no way to build the journal that
+// makes the declaration true, even though `fastmcp-server` has re-exported
+// these three at its own root all along. Every other middleware family here --
+// caching, both rate limiters, transforms -- was already forwarded; this one
+// was the only omission.
+//
+// Three names are the whole closure. Both constructors take `&Cx`,
+// `&ProcessGenerationGuard`, `SnapshotCloneStance`, `ContinuationReplayLimits`
+// and an authorize closure over `McpContext`/`JsonRpcRequest`; the authority
+// takes `ContinuationPartitionKey` (reached through the forwarded `partition`
+// module), `PartitionAuthorization` (through `http_auth`) and
+// `McpRequestCancellation`. All of those were already nameable EXCEPT the two
+// runtime identity types, which only became reachable without tripping
+// FND-01's `forbid=runtime` rule in the repair that removed the whole-module
+// forward. Until then this gap was blocked twice over.
+pub use fastmcp_server::{
+    ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
+};
 pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 

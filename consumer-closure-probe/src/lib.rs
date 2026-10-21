@@ -233,6 +233,45 @@ pub fn proof_failure_is_nameable(error: &DpopClientError) -> Option<&DpopError> 
     }
 }
 
+/// The SERVER half of the continuation-replay contract, which this crate could
+/// not name until the facade forwarded it.
+///
+/// `http_auth::rpc::interaction::recovery::ContinuationReplayContract` was
+/// already reachable here and its own doc says the native server's
+/// `ContinuationReplayMiddleware` is what supplies the contract -- so a
+/// consumer could declare a trusted replay deployment and had no way to build
+/// the journal that makes the declaration true. Binding the authority
+/// constructor as an fn pointer is the part that matters: it fixes all three
+/// parameter types, so this fails to resolve if any of
+/// `ContinuationPartitionKey` (through the forwarded `partition` module),
+/// `PartitionAuthorization` (through `http_auth`) or `McpRequestCancellation`
+/// stops being writable through the facade. A bare `use` would pass while the
+/// constructor remained uncallable, which is the exact defect shape this crate
+/// exists to catch.
+pub fn continuation_replay_is_installable_through_the_facade() {
+    use fastmcp_rust::partition::ContinuationPartitionKey;
+    use fastmcp_rust::{
+        ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
+    };
+
+    let _authority: fn(
+        ContinuationPartitionKey,
+        fastmcp_rust::http_auth::PartitionAuthorization,
+        fastmcp_rust::McpRequestCancellation,
+    ) -> ContinuationReplayAuthority = ContinuationReplayAuthority::new;
+
+    let _limits: fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        std::time::Duration,
+    ) -> Result<ContinuationReplayLimits, fastmcp_rust::McpError> = ContinuationReplayLimits::new;
+
+    fn journal_is_a_middleware<M: fastmcp_rust::Middleware + 'static>() {}
+    journal_is_a_middleware::<ContinuationReplayMiddleware>();
+}
+
 // ---------------------------------------------------------------------------
 // 6. The planted negative: proof that this crate can go red.
 // ---------------------------------------------------------------------------
