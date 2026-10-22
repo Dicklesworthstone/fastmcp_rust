@@ -52297,7 +52297,46 @@ activate = 1\n";
         let StrictJson::Number(negative_zero) = negative_zero else {
             panic!("negative zero was not classified as a number");
         };
-        assert_eq!(negative_zero.to_string(), "0", "FND01OBS uses serde_json::Number::to_string canonical form, not the source lexeme");
+        // The previous expectation here was "0", carrying the message "FND01OBS uses
+        // serde_json::Number::to_string canonical form, not the source lexeme". That message is a
+        // false specification claim: it asserts that the to_string form and the source lexeme are
+        // DIFFERENT things, and under the mandated arbitrary_precision they are THE SAME thing, so
+        // it also contradicted the lexeme-preservation assertion six lines above. Four independent
+        // sources agree that this encoding carries lexemes:
+        //   1. evidence/fnd-01/dependency-verification.toml:2732 DEFINES json_number_tag as
+        //      "0x0a followed by u64be byte length and serde_json::Number::to_string UTF-8 bytes";
+        //      the assertion-contract check in this same file asserts that sentence verbatim.
+        //   2. encode_json_observation emits exactly that: `output.byte(0x0a)` then
+        //      `output.sized_u64(value.to_string().as_bytes())`.
+        //   3. the visitor above reconstructs a Number from the raw
+        //      `$serde_json::private::Number` carrier text, i.e. from the source lexeme.
+        //   4. serde_json_rule (dependency-verification.toml:861) mandates arbitrary_precision,
+        //      under which serde_json::Number holds `type N = String` and Display forwards to it.
+        assert_eq!(negative_zero.to_string(), "-0", "FND01OBSv1 json_number_tag is serde_json::Number::to_string bytes and the mandated arbitrary_precision preserves the source lexeme, so -0 encodes as -0 (dependency-verification.toml:2732)");
+
+        // The negative this encoding's nature requires, in the opposite direction to numeric
+        // canonicalization: lexeme retention is DELIBERATE, so two spellings of one numeric value
+        // must produce DIFFERENT observation bytes. That is the property a digest comparison needs
+        // -- it must detect a source edit from 0 to -0 -- and a canonicalizing encoder would hide
+        // it. Asserted against the real encoder and against its exact output, because assert_ne!
+        // alone would also pass if the encoder emitted nothing at all.
+        let encode_number_observation = |source: &[u8]| -> Vec<u8> {
+            let parsed = parse_strict_json(source, "number-lexeme observation self-test").verified();
+            let mut output = ObservationEncoder::new(4096, "number-lexeme observation self-test").verified();
+            encode_json_observation(Some(&parsed), &mut output).verified();
+            output.bytes
+        };
+        let expected_number_observation = |lexeme: &[u8]| -> Vec<u8> {
+            let mut expected = vec![0x0a_u8];
+            expected.extend_from_slice(&u64::try_from(lexeme.len()).expect("test lexeme length").to_be_bytes());
+            expected.extend_from_slice(lexeme);
+            expected
+        };
+        let negative_zero_observation = encode_number_observation(b"-0");
+        let positive_zero_observation = encode_number_observation(b"0");
+        assert_eq!(negative_zero_observation, expected_number_observation(b"-0"), "a JSON number observation is the 0x0a tag, a u64be byte length and the to_string bytes");
+        assert_eq!(positive_zero_observation, expected_number_observation(b"0"), "a JSON number observation is the 0x0a tag, a u64be byte length and the to_string bytes");
+        assert_ne!(negative_zero_observation, positive_zero_observation, "FND01OBS is a byte-exact observation encoding, so -0 and 0 are different observations and MUST digest differently; folding them together would make a digest blind to a 0 -> -0 source edit");
 
         let duplicate = parse_strict_json(br#"{"same":1,"same":2}"#, "duplicate-key self-test").expect_err("duplicate JSON object members must fail closed");
         assert_eq!(duplicate.code, "E_JSON_SCHEMA");
