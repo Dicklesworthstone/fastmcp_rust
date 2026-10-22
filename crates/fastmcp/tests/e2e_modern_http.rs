@@ -8626,15 +8626,24 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         .expect("rejected cursor variations preserve the original cached page"),
     );
     // The counters are in the message because this assertion has been failing
-    // and the bare form cannot say WHY. Reading cache.rs end to end leaves
-    // exactly one path that can remove this entry -- `invalidate_result_set`,
-    // reachable only from `invalidate_notification`, which retires every Tools
-    // entry -- and `FinalCacheStats` distinguishes it from the alternatives in
-    // one line: `invalidations` for that path, `evictions` for a bounded-cache
-    // eviction, `stale` for TTL expiry. Capacity and expiry are already
-    // excluded by the defaults (128 entries, 128 MiB) and by the TTL still
-    // having minutes left, so a nonzero `invalidations` here is the answer
-    // rather than one hypothesis among several. bd-gt6za.
+    // and the bare form cannot say WHY. `invalidate_result_set` is the only
+    // path that can remove this entry, and `FinalCacheStats` separates it from
+    // the alternatives in one line: `invalidations` for that path, `evictions`
+    // for a bounded-cache eviction, `stale` for TTL expiry. Capacity and expiry
+    // are both excluded by the defaults (128 entries, 128 MiB) against two
+    // retained pages, and by the TTL still having minutes left.
+    //
+    // An earlier revision of this comment said `invalidate_result_set` is
+    // "reachable only from `invalidate_notification`". That was wrong and it
+    // pointed at the wrong suspect: I had read cache.rs end to end without
+    // reading its CALLERS. It has five call sites in fastmcp-client, and the
+    // one that fires here is `lib.rs:12780`, on the REFUSAL path of
+    // `request_final_core_with_cache_policy` -- an `InvalidParams` response to
+    // a request carrying any cursor string invalidates the entire result set.
+    // Two of the three negatives above are `tools/list` with a cursor present
+    // (the third's `""` satisfies the same `as_str().is_some()` guard), so
+    // each one alone retires every Tools page. Expect `invalidations == 3`
+    // here; an `evictions > 0` instead would refute that reading. bd-gt6za.
     assert_eq!(
         typed_page_identity(&unchanged_retry),
         first_identity,
