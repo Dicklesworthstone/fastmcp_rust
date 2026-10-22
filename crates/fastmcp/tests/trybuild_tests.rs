@@ -1026,21 +1026,37 @@ fn compile_fail_tests() {
     let _compile_probe_guard = compile_probe_guard();
 
     // trybuild passes `--offline` unconditionally (its `cargo_with_rustflags`
-    // does `cmd.arg("--offline")`) and it creates its own project under
-    // CARGO_TARGET_DIR/tests/trybuild with no Cargo.lock, so cargo has to
-    // RESOLVE that graph from the local cache alone. Every other compile probe
-    // in this file guarantees that cache first; this one did not, and it is
-    // the only probe here whose project it does not own.
+    // does `cmd.arg("--offline")`) and resolves the project it generates under
+    // CARGO_TARGET_DIR/tests/trybuild from the local cache alone. It copies
+    // THIS workspace's Cargo.lock in to do it (trybuild-1.0.122
+    // src/cargo.rs:80-88, falling back to `generate-lockfile` only when the
+    // workspace has no lock), so the pins it resolves against are ours while
+    // the cache it needs is the ambient one. Every other compile probe in this
+    // file guarantees that cache first and this one did not, so warming it is
+    // a real precondition for the probe.
     //
-    // The consequence is not a loud failure. trybuild decides a compile_fail
-    // case by attributing rustc diagnostics to its path, with
-    // `Stderr::default { success: true }` as the fallback, so a cargo-level
-    // failure before any rustc invocation makes EVERY negative in the family
-    // report "Expected test case to fail to compile, but it succeeded" --
-    // which is exactly what the 2026-10-21 facade-surface run recorded for
-    // five consecutive prompt_*/resource_* cases (bd-e06g9). Fetching first
-    // removes that cause; if the fetch itself fails it panics by name here
-    // instead of turning nine planted negatives green-side-up.
+    // It is NOT, however, the explanation for bd-e06g9's five
+    // "Expected test case to fail to compile, but it succeeded" rows, and this
+    // call should not be read as fixing that. Two things in those rows rule the
+    // dependency graph out as their cause:
+    //
+    //   - they printed at all, which means `prepare`/`write` returned Ok, and
+    //     `build_dependencies` is called from inside `write` (run.rs:211) under
+    //     a closure whose `unwrap_or_else` prints `prepare_fail` and panics
+    //     "tests failed". A dependency-level failure yields NO case rows.
+    //   - they carry `[should fail to compile]`, which `Test::run` prints only
+    //     when `has_pass && has_compile_fail` (run.rs:406), while the batch
+    //     path hardcodes `show_expected = false` (run.rs:371). Under
+    //     `--all-features` this target registers three `tests.pass(...)`, so
+    //     has_pass is true, the per-case path ran, and the `--bins
+    //     --keep-going` batch build never executed.
+    //
+    // The blindness is real but it lives in the per-case path: `build_test`
+    // (cargo.rs:119-139) returns `.output()`, whose nonzero exit nobody reads,
+    // and `check_compile_fail` then branches on a `Stderr::default
+    // { success: true }` fallback, so "no diagnostic attributed to this file"
+    // is indistinguishable from "this file compiled". The live candidates are
+    // feature forwarding and src_path attribution; see bd-e06g9.
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = workspace_root(manifest_dir);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
