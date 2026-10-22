@@ -12764,22 +12764,30 @@ impl HttpClient {
         .map_err(HttpClientError::Connection)?;
         let (mut response, result_source, receipt, _, _) = response;
         if let Some(error) = response.error.take() {
-            let error = json_rpc_error_to_mcp(error);
-            if error.code == McpErrorCode::InvalidParams
-                && parameters
-                    .get("cursor")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
-                && let Some(
-                    result_set @ (FinalCacheResultSet::Tools
-                    | FinalCacheResultSet::Resources
-                    | FinalCacheResultSet::ResourceTemplates
-                    | FinalCacheResultSet::Prompts),
-                ) = result_set.as_ref()
-            {
-                self.final_result_cache.invalidate_result_set(result_set);
-            }
-            return Err(HttpClientError::CoreResult(error));
+            // A REFUSED REQUEST LEAVES THE STORE UNCHANGED. This branch used to
+            // call `invalidate_result_set` whenever an InvalidParams response
+            // came back for a request carrying any cursor string, on the
+            // reading that a rejected cursor may mean the catalog moved. That
+            // reading conflates a statement about OUR parameters with a
+            // statement about the server's freshness, and because
+            // `invalidate_result_set` retains by result set rather than by key,
+            // one malformed call retired EVERY cached page for that result set
+            // -- including pages a hit had just served byte-exact. Three
+            // malformed calls were enough to force a refetch of a valid page,
+            // which is a cheap amplification against the upstream this cache
+            // exists to protect (bd-gt6za).
+            //
+            // Nothing is lost by not invalidating here, which is the question
+            // RH-1 requires be answered before a guard comes out. Genuine
+            // staleness is already detected twice, by paths driven by server
+            // signals instead of by client error: a real catalog change makes
+            // the server emit tools/list_changed, which the observer installed
+            // above routes to `invalidate_notification`; and drift discovered
+            // during a paginated walk is handled by the generation/scope checks
+            // in `advance_final_cache_pagination` and the list-restart bound.
+            // The remaining call sites invalidate deliberately before a
+            // security re-review, and are untouched.
+            return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
         let raw_result = response.result.take().ok_or_else(|| {
             HttpClientError::CoreResult(McpError::invalid_request("HTTP response has no result"))
