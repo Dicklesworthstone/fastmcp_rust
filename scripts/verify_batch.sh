@@ -354,6 +354,11 @@ fi
 remote_rc=$?
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_discovered.txt'" > "$OUT/discovered.txt" 2>/dev/null || :
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_run.log'"        > "$OUT/run.log"       2>/dev/null || :
+# The compiler/clippy diagnostic stream. The receipt greps this file ON THE
+# WORKER for counts and a truncated sample, so without fetching it a --clippy
+# or --check-only run leaves no diagnostics behind at all: run.log is the TEST
+# stream and is empty for those modes. A pass/fail verdict is not a work list.
+"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_build.log'"      > "$OUT/build.log"     2>/dev/null || :
 
 # Subject identity AFTER the run. Movement invalidates the receipt.
 git status --porcelain --untracked-files=no > "$OUT/dirty-after.txt"
