@@ -3953,6 +3953,10 @@ mod tests {
 
     use super::*;
     use fastmcp_core::{McpErrorCode, block_on};
+    // Test-module only: the three sampling-capability constructions below are
+    // all inside `#[cfg(test)]`, so importing this at file scope would be an
+    // unused import in a non-test build and the workspace lints at -D warnings.
+    use fastmcp_protocol::McpAppsSamplingCapability;
     use fastmcp_protocol::extensions::{
         ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionLocalEnablement,
         ExtensionSettings, ServerExtensionDiscovery, official_mcp_apps_empty_server_settings,
@@ -4262,7 +4266,7 @@ mod tests {
                             .get_mut(&token)
                             .unwrap()
                             .deadline
-                            .absolute = Time::ZERO
+                            .absolute = Time::ZERO;
                     }
                     "notification" => {
                         host.send_notification(&cx, McpAppsHostNotification::ResourcesListChanged)
@@ -4410,18 +4414,20 @@ mod tests {
                 let mut page = catalog_page(method, Some("never-exposed"));
                 match invalid {
                     "number" => {
-                        page["resources"][0]["_meta"] = json!({"unsafe":9_007_199_254_740_992_u64})
+                        page["resources"][0]["_meta"] =
+                            json!({"unsafe":9_007_199_254_740_992_u64});
                     }
                     "prompt-title" => {
                         page["prompts"][0]["arguments"] =
-                            json!([{"name":"argument","title":"SDK would strip"}])
+                            json!([{"name":"argument","title":"SDK would strip"}]);
                     }
                     "annotation" => {
-                        page["resources"][0]["annotations"] = json!({"example.com/custom":true})
+                        page["resources"][0]["annotations"] =
+                            json!({"example.com/custom":true});
                     }
                     _ => {
                         page["resources"][0]["annotations"] =
-                            json!({"lastModified":"2026-02-29T12:34Z"})
+                            json!({"lastModified":"2026-02-29T12:34Z"});
                     }
                 }
                 host.policy.responses.push_back(Ok(page));
@@ -7293,7 +7299,7 @@ exec sleep 10
                 let cx = Cx::for_testing();
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
                 let mut configuration = wire_configuration();
-                configuration.host_capabilities.sampling = Some(Default::default());
+                configuration.host_capabilities.sampling = Some(McpAppsSamplingCapability::default());
                 let mut effects = sampling_effects();
                 effects.allow = allow;
                 let events = Arc::clone(&effects.events);
@@ -7377,7 +7383,7 @@ exec sleep 10
             let cx = Cx::for_testing();
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
             let mut configuration = wire_configuration();
-            configuration.host_capabilities.sampling = Some(Default::default());
+            configuration.host_capabilities.sampling = Some(McpAppsSamplingCapability::default());
             let mut host = McpAppsWireHost::new_negotiated(
                 transport,
                 configuration,
@@ -7610,7 +7616,7 @@ exec sleep 10
                 let cx = Cx::current().unwrap();
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                 let mut configuration = wire_configuration();
-                configuration.host_capabilities.sampling = Some(Default::default());
+                configuration.host_capabilities.sampling = Some(McpAppsSamplingCapability::default());
                 let mut effects = sampling_effects();
                 effects.yield_once = true;
                 let events = Arc::clone(&effects.events);
