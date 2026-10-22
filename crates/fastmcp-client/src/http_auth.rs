@@ -28,6 +28,9 @@ use fastmcp_core::{AccessToken, McpRequestCancellation};
 
 mod caller;
 
+/// Explicit device-code sign-in for headless native public clients.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod device;
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
 /// Explicit DPoP proof, credential, and nonce handling for caller-owned HTTPS I/O.
@@ -315,7 +318,7 @@ mod tests {
     fn refuses_empty_and_header_hostile_tokens() {
         let resource = url("https://mcp.example/api");
         assert_eq!(
-            BoundBearerCredential::bind(resource.clone(), "").err(),
+            BoundBearerCredential::bind(url("https://mcp.example/api"), "").err(),
             Some(BearerBindingError::EmptyToken)
         );
         assert_eq!(
