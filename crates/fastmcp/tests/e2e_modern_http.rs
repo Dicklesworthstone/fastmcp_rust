@@ -8635,15 +8635,21 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     //
     // An earlier revision of this comment said `invalidate_result_set` is
     // "reachable only from `invalidate_notification`". That was wrong and it
-    // pointed at the wrong suspect: I had read cache.rs end to end without
+    // pointed at the wrong suspect: cache.rs had been read end to end without
     // reading its CALLERS. It has five call sites in fastmcp-client, and the
-    // one that fires here is `lib.rs:12780`, on the REFUSAL path of
+    // one that fired here was on the REFUSAL path of
     // `request_final_core_with_cache_policy` -- an `InvalidParams` response to
-    // a request carrying any cursor string invalidates the entire result set.
+    // a request carrying any cursor string invalidated the entire result set.
     // Two of the three negatives above are `tools/list` with a cursor present
-    // (the third's `""` satisfies the same `as_str().is_some()` guard), so
-    // each one alone retires every Tools page. Expect `invalidations == 3`
-    // here; an `evictions > 0` instead would refute that reading. bd-gt6za.
+    // (the third's `""` satisfied the same `as_str().is_some()` guard), so
+    // each one alone retired every Tools page.
+    //
+    // PAST TENSE ON PURPOSE: e79019db removed that branch. The diagnosis
+    // predicted `invalidations == 3` here and that prediction described the
+    // UNFIXED code; the expectation now is that nothing on the refusal path
+    // moves the counter, which the single-rejection negative below asserts
+    // directly. `evictions > 0` would still refute the whole reading and send
+    // the search back to capacity. bd-gt6za.
     assert_eq!(
         typed_page_identity(&unchanged_retry),
         first_identity,
@@ -8665,8 +8671,84 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         before_unchanged_retry.misses
     );
 
+    // THE PLANTED NEGATIVE FOR THE SAME PROPERTY, differing from the positive
+    // above in exactly one dimension: ONE rejected variation instead of three.
+    // That dimension is what separates the two mechanisms this defect could
+    // have had. A bounded-cache eviction needs enough retained entries to
+    // displace this one, so it would survive a single rejection; a refusal path
+    // that invalidates by RESULT SET destroys the page on the first one. Before
+    // the fix in `request_final_core_with_cache_policy` a single rejection was
+    // already sufficient, so this is a real negative rather than a restatement
+    // of the positive. bd-gt6za.
+    let before_single = client.final_result_cache_stats();
+    let single_error = runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(
+            &cx,
+            "tools/list",
+            json!({ "cursor": cursor.clone(), "includeTags": ["other"] }),
+        ),
+    )
+    .expect_err("one query-identity cursor variation is still refused");
+    assert!(matches!(
+        single_error,
+        fastmcp_rust::HttpClientError::CoreResult(error)
+            if error.code == McpErrorCode::InvalidParams
+    ));
+    assert_eq!(
+        client.final_result_cache_stats().invalidations,
+        before_single.invalidations,
+        "a refused request must not invalidate a result set; counters were {:?}",
+        client.final_result_cache_stats()
+    );
+    // Baselined AFTER the refusal on purpose. Whether a refused request is
+    // itself counted at the wire is this fixture's business, not this
+    // assertion's; what must hold is that the RETRY reaches no wire at all.
+    let after_single_refusal_requests = requests.load(Ordering::SeqCst);
+    let single_retry = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("one rejected cursor variation preserves the original cached page"),
+    );
+    assert_eq!(
+        typed_page_identity(&single_retry),
+        first_identity,
+        "a SINGLE rejected cursor variation must leave the original cached page \
+         byte-identical; cache counters at this point were {:?}",
+        client.final_result_cache_stats()
+    );
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        after_single_refusal_requests
+    );
+    assert_eq!(client.final_result_cache_stats().fills, before_single.fills);
+    assert_eq!(
+        client.final_result_cache_stats().hits,
+        before_single.hits + 1
+    );
+    assert_eq!(
+        client.final_result_cache_stats().evictions,
+        before_single.evictions
+    );
+    // The refused request still performs a lookup under its OWN distinct
+    // identity, and counting that miss is correct: what must not move is the
+    // stored page and the invalidation/eviction counters above.
+    assert_eq!(
+        client.final_result_cache_stats().misses,
+        before_single.misses + 1
+    );
+
     // Clearing a real populated client cache forces one new wire request and
     // a newly sealed first cursor while preserving the catalog's content.
+    //
+    // Baselined immediately below rather than against `before_unchanged_requests`.
+    // The property asserted is unchanged -- the clear costs EXACTLY ONE wire
+    // request -- but the old form also silently depended on nothing between
+    // that far-away baseline and here reaching the wire, which stopped being
+    // true when the single-rejection negative above was added.
+    let before_clear_requests = requests.load(Ordering::SeqCst);
     client.clear_final_result_cache();
     let refreshed = tools_page(
         runtime_block_on_bounded(
@@ -8675,10 +8757,7 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("explicit cache invalidation fetches a fresh paginated catalog"),
     );
-    assert_eq!(
-        requests.load(Ordering::SeqCst),
-        before_unchanged_requests + 1
-    );
+    assert_eq!(requests.load(Ordering::SeqCst), before_clear_requests + 1);
     assert_eq!(
         serde_json::to_value(&refreshed.tools).unwrap(),
         serde_json::to_value(&first.tools).unwrap()
