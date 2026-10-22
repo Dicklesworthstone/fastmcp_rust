@@ -12682,6 +12682,11 @@ impl HttpClient {
             None
         };
 
+        // Capture before lookup: an expired continuation may be the last
+        // retained evidence that its cursor belongs to this exact query.
+        let cursor_origin = key
+            .as_ref()
+            .and_then(|key| self.final_result_cache.capture_cursor_origin(key));
         // Every branch below assigns or returns before the value is read.
         let mut miss: Option<FinalCacheMiss>;
         if read_cache && let Some(key) = key.as_ref() {
@@ -12764,30 +12769,13 @@ impl HttpClient {
         .map_err(HttpClientError::Connection)?;
         let (mut response, result_source, receipt, _, _) = response;
         if let Some(error) = response.error.take() {
-            // A REFUSED REQUEST LEAVES THE STORE UNCHANGED. This branch used to
-            // call `invalidate_result_set` whenever an InvalidParams response
-            // came back for a request carrying any cursor string, on the
-            // reading that a rejected cursor may mean the catalog moved. That
-            // reading conflates a statement about OUR parameters with a
-            // statement about the server's freshness, and because
-            // `invalidate_result_set` retains by result set rather than by key,
-            // one malformed call retired EVERY cached page for that result set
-            // -- including pages a hit had just served byte-exact. Three
-            // malformed calls were enough to force a refetch of a valid page,
-            // which is a cheap amplification against the upstream this cache
-            // exists to protect (bd-gt6za).
-            //
-            // Nothing is lost by not invalidating here, which is the question
-            // RH-1 requires be answered before a guard comes out. Genuine
-            // staleness is already detected twice, by paths driven by server
-            // signals instead of by client error: a real catalog change makes
-            // the server emit tools/list_changed, which the observer installed
-            // above routes to `invalidate_notification`; and drift discovered
-            // during a paginated walk is handled by the generation/scope checks
-            // in `advance_final_cache_pagination` and the list-restart bound.
-            // The remaining call sites invalidate deliberately before a
-            // security re-review, and are untouched.
-            return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
+            let error = json_rpc_error_to_mcp(error);
+            if error.code == McpErrorCode::InvalidParams
+                && let Some(origin) = cursor_origin
+            {
+                self.final_result_cache.invalidate_rejected_cursor(origin);
+            }
+            return Err(HttpClientError::CoreResult(error));
         }
         let raw_result = response.result.take().ok_or_else(|| {
             HttpClientError::CoreResult(McpError::invalid_request("HTTP response has no result"))
@@ -14600,9 +14588,21 @@ impl HttpClient {
     fn final_cache_key(
         &self,
         method: &str,
-        semantic_parameters: serde_json::Value,
+        mut semantic_parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
     ) -> Result<FinalCacheKey, HttpClientError> {
+        // Cursor bytes have their own presence-aware identity below. Keep the
+        // query projection independent of the page so a rejected continuation
+        // can be tied to the exact cached query that supplied it.
+        let cursor = semantic_parameters
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        if cursor.is_some()
+            && let Some(parameters) = semantic_parameters.as_object_mut()
+        {
+            parameters.remove("cursor");
+        }
         let normalized_capabilities =
             serde_json::to_string(&self.client_capabilities).map_err(|_| {
                 HttpClientError::CoreResult(McpError::internal_error(
@@ -14635,10 +14635,7 @@ impl HttpClient {
             extension_settings,
             method,
             semantic_projection,
-            semantic_parameters
-                .get("cursor")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
+            cursor,
             FINAL_CACHE_POLICY_REVISION,
             FINAL_CACHE_EXTENSION_REVISION,
             FINAL_CACHE_REPRESENTATION_POLICY_REVISION,
@@ -19250,6 +19247,7 @@ impl Client {
 
         self.drain_final_cache_invalidations(pagination)?;
         let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
+        let cursor_origin = self.final_result_cache.capture_cursor_origin(&key);
         // A present nextCursor requires another peer page even when its opaque
         // token repeats. Reusing a prior page here can trap a stateful cursor
         // in a cached loop. Only the first page of an automatic traversal may
@@ -19283,9 +19281,10 @@ impl Client {
                 let result = match fetch(self) {
                     Ok(result) => result,
                     Err(error) => {
-                        if cursor.is_some() && error.code == McpErrorCode::InvalidParams {
-                            self.final_result_cache
-                                .invalidate_result_set(key.result_set());
+                        if error.code == McpErrorCode::InvalidParams
+                            && let Some(origin) = cursor_origin
+                        {
+                            self.final_result_cache.invalidate_rejected_cursor(origin);
                         }
                         return Err(error);
                     }
@@ -33100,6 +33099,103 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn cache_03_http_unrelated_cursor_rejections_preserve_cached_catalog() {
+        for (dimension, rejected_method, rejected_parameters) in [
+            (
+                "query",
+                "tools/list",
+                serde_json::json!({"cursor":"page-2", "includeTags":["other"]}),
+            ),
+            (
+                "catalog",
+                "resources/list",
+                serde_json::json!({"cursor":"page-2", "includeTags":["visible"]}),
+            ),
+            (
+                "empty cursor",
+                "tools/list",
+                serde_json::json!({"cursor":"", "includeTags":["visible"]}),
+            ),
+            (
+                "unknown cursor",
+                "tools/list",
+                serde_json::json!({"cursor":"foreign", "includeTags":["visible"]}),
+            ),
+        ] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let expected_rejection = rejected_parameters.clone();
+            let server = http_catalog_test_server(listener, 2, move |index, request| {
+                let response = if index == 0 {
+                    assert_eq!(request["method"], "tools/list");
+                    assert_eq!(
+                        request["params"]["includeTags"],
+                        serde_json::json!(["visible"])
+                    );
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "result":http_catalog_test_result("tools/list", "retained", Some("page-2"),
+                            60_000, "private")})
+                } else {
+                    assert_eq!(request["method"], rejected_method);
+                    assert_eq!(request["params"]["cursor"], expected_rejection["cursor"]);
+                    assert_eq!(
+                        request["params"]["includeTags"],
+                        expected_rejection["includeTags"]
+                    );
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "error":{"code":-32602,"message":"invalid cursor"}})
+                };
+                ("application/json", response.to_string())
+            });
+            let cx = Cx::for_request();
+            let parameters = serde_json::json!({"includeTags":["visible"]});
+            let first = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                "tools/list",
+                parameters.clone(),
+            ))
+            .expect("the original catalog page is cached");
+            let before = client.final_result_cache_stats();
+            let rejection = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                rejected_method,
+                rejected_parameters,
+            ));
+            assert!(matches!(rejection,
+                Err(HttpClientError::CoreResult(error)) if error.code == McpErrorCode::InvalidParams));
+            assert_eq!(server.join().unwrap().len(), 2);
+            let rejected_stats = client.final_result_cache_stats();
+            assert_eq!(rejected_stats.fills, before.fills, "{dimension}");
+            assert_eq!(
+                rejected_stats.invalidations, before.invalidations,
+                "{dimension}"
+            );
+            assert_eq!(rejected_stats.evictions, before.evictions, "{dimension}");
+            let next_id = client.next_id.load(Ordering::Relaxed);
+            let replay = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                "tools/list",
+                parameters,
+            ))
+            .expect("an unrelated rejection cannot force the original query back onto the wire");
+            assert_eq!(
+                replay.encode().unwrap(),
+                first.encode().unwrap(),
+                "{dimension}"
+            );
+            assert_eq!(
+                client.next_id.load(Ordering::Relaxed),
+                next_id,
+                "{dimension}"
+            );
+            let replay_stats = client.final_result_cache_stats();
+            assert_eq!(replay_stats.hits, rejected_stats.hits + 1, "{dimension}");
+            assert_eq!(replay_stats.misses, rejected_stats.misses, "{dimension}");
+            assert_eq!(replay_stats.fills, rejected_stats.fills, "{dimension}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn cache_03_http_single_page_cursor_rejection_flushes_cached_first_page() {
         let (mut client, listener) = http_owned_execution_fixture();
         let server = http_catalog_test_server(listener, 3, |index, request| {
@@ -46185,6 +46281,87 @@ exec sleep 2
         client
             .close()
             .expect("modern disabled-cache list-restart cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_unrelated_cursor_rejections_preserve_cached_catalog() {
+        for dimension in ["query", "catalog", "empty cursor", "unknown cursor"] {
+            let discovery = modern_discovery_response(
+                "cache-unrelated-cursor-modern-server",
+                &[MODERN_PROTOCOL_VERSION],
+            );
+            let script = format!(
+                "IFS= read -r discover || exit 1; \
+                 printf '%s\\n' '{discovery}'; \
+                 IFS= read -r first_page || exit 1; \
+                 case \"$first_page\" in *tools/list*visible*) \
+                 printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"nextCursor\":\"page-2\",\"ttlMs\":60000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+                 IFS= read -r rejected_page || exit 1; \
+                 case \"$rejected_page\" in *cursor*) \
+                 printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{{\"code\":-32602,\"message\":\"invalid cursor\"}}}}' ;; *) exit 1 ;; esac; \
+                 exec sleep 2"
+            );
+            let mut client = Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            )
+            .expect("modern discovery initializes the cursor-isolation client");
+            let parameters = ListToolsParams {
+                cursor: None,
+                include_tags: Some(vec!["visible".to_owned()]),
+                exclude_tags: None,
+            };
+            let first = client
+                .list_tools_typed_with_params(parameters.clone())
+                .unwrap();
+            let rejected = if dimension == "catalog" {
+                client.list_resources_typed_with_params(ListResourcesParams {
+                    cursor: Some("page-2".to_owned()),
+                    include_tags: parameters.include_tags.clone(),
+                    exclude_tags: None,
+                })
+            } else {
+                client.list_tools_typed_with_params(ListToolsParams {
+                    cursor: Some(
+                        match dimension {
+                            "empty cursor" => "",
+                            "unknown cursor" => "foreign",
+                            _ => "page-2",
+                        }
+                        .to_owned(),
+                    ),
+                    include_tags: Some(vec![if dimension == "query" {
+                        "other".to_owned()
+                    } else {
+                        "visible".to_owned()
+                    }]),
+                    exclude_tags: None,
+                })
+            };
+            assert_eq!(
+                rejected.unwrap_err().code,
+                McpErrorCode::InvalidParams,
+                "{dimension}"
+            );
+            let rejected_stats = client.final_result_cache_stats();
+            assert_eq!(rejected_stats.invalidations, 0, "{dimension}");
+            let replay = client
+                .list_tools_typed_with_params(parameters)
+                .expect("the refused variation preserves the cached first page");
+            assert_eq!(
+                replay.encode().unwrap(),
+                first.encode().unwrap(),
+                "{dimension}"
+            );
+            let replay_stats = client.final_result_cache_stats();
+            assert_eq!(replay_stats.hits, rejected_stats.hits + 1, "{dimension}");
+            assert_eq!(replay_stats.misses, rejected_stats.misses, "{dimension}");
+            assert_eq!(replay_stats.fills, rejected_stats.fills, "{dimension}");
+            client.close().expect("cursor-isolation client cleanup");
+        }
     }
 
     #[cfg(unix)]

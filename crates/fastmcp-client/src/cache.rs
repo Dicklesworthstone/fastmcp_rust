@@ -62,7 +62,8 @@ pub enum FinalCacheResultSet {
 /// `semantic_projection` must be produced by the shared protocol cache-key
 /// projection when that adapter is available. This cache intentionally never
 /// parses, normalizes, or infers semantics from it. An absent cursor and an
-/// empty cursor are distinct identities.
+/// empty cursor are distinct identities. Keep cursor bytes in the dedicated
+/// `cursor` field and omit them from the query's semantic projection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct FinalCacheKey {
     endpoint_configuration: String,
@@ -122,6 +123,40 @@ impl FinalCacheKey {
         &self.result_set
     }
 
+    /// Compares every request-identity dimension except the page cursor.
+    ///
+    /// Keep the destructuring exhaustive so adding a key dimension also
+    /// requires deciding how it binds cursor provenance.
+    fn same_catalog_query(&self, other: &Self) -> bool {
+        let Self {
+            endpoint_configuration,
+            protocol_version,
+            normalized_capabilities,
+            extension_settings,
+            method,
+            semantic_projection,
+            cursor: _,
+            policy_revision,
+            extension_revision,
+            representation_policy_revision,
+            limits_policy_revision,
+            partition,
+            result_set,
+        } = self;
+        endpoint_configuration == &other.endpoint_configuration
+            && protocol_version == &other.protocol_version
+            && normalized_capabilities == &other.normalized_capabilities
+            && extension_settings == &other.extension_settings
+            && method == &other.method
+            && semantic_projection == &other.semantic_projection
+            && policy_revision == &other.policy_revision
+            && extension_revision == &other.extension_revision
+            && representation_policy_revision == &other.representation_policy_revision
+            && limits_policy_revision == &other.limits_policy_revision
+            && partition == &other.partition
+            && result_set == &other.result_set
+    }
+
     fn estimated_bytes(&self) -> usize {
         let result_set_bytes = match &self.result_set {
             FinalCacheResultSet::ServerDiscovery
@@ -154,6 +189,15 @@ pub struct FinalCacheGeneration {
     epoch: u64,
     revision: u64,
     result_set: FinalCacheGenerationSet,
+}
+
+/// Request-local evidence that this exact catalog query previously supplied
+/// or successfully used its cursor. This borrows the request key, not the
+/// cache, so stale-entry eviction cannot erase the captured provenance.
+#[derive(Debug)]
+pub(crate) struct FinalCacheCursorOrigin<'key> {
+    key: &'key FinalCacheKey,
+    generation: FinalCacheGeneration,
 }
 
 /// Why a cache lookup did not return a fresh result.
@@ -226,7 +270,7 @@ pub struct FinalCacheStats {
     pub stale: u64,
     /// Complete results retained after a fetch.
     pub fills: u64,
-    /// Notification-driven result-set invalidations.
+    /// Result-set invalidations from notifications or a rejected known cursor.
     pub invalidations: u64,
     /// Entries evicted because the bounded cache was full.
     pub evictions: u64,
@@ -552,6 +596,49 @@ impl FinalResultCache {
         self.stats.invalidations = self.stats.invalidations.saturating_add(1);
     }
 
+    /// Captures cursor provenance before lookup can remove a stale page.
+    ///
+    /// An arbitrary cursor, or one reused with another query, is not evidence
+    /// that a retained catalog changed. Such a refusal must not evict valid
+    /// pages. The scan is bounded by the existing cache entry/byte limits and
+    /// uses only matching typed catalog pages, never open result members.
+    pub(crate) fn capture_cursor_origin<'key>(
+        &self,
+        key: &'key FinalCacheKey,
+    ) -> Option<FinalCacheCursorOrigin<'key>> {
+        let cursor = key.cursor.as_deref()?;
+        let generation = self.begin_fetch(key.result_set());
+        let supplied_by_baseline = self.entries.iter().any(|(stored_key, entry)| {
+            if entry.result_set_revision != generation.revision
+                || !stored_key.same_catalog_query(key)
+            {
+                return false;
+            }
+            // A successful continuation proves its own cursor even when its
+            // predecessor was already evicted, including a terminal page.
+            final_catalog_proves_cursor(
+                &entry.result,
+                key.result_set(),
+                stored_key.cursor.as_deref(),
+                cursor,
+            )
+        });
+        supplied_by_baseline.then_some(FinalCacheCursorOrigin { key, generation })
+    }
+
+    /// Retires a rejected cursor's baseline only while the request-local
+    /// provenance still names the current cache generation.
+    pub(crate) fn invalidate_rejected_cursor(
+        &mut self,
+        origin: FinalCacheCursorOrigin<'_>,
+    ) -> bool {
+        if origin.generation != self.begin_fetch(origin.key.result_set()) {
+            return false;
+        }
+        self.invalidate_result_set(origin.key.result_set());
+        true
+    }
+
     /// Invalidates cacheable result sets selected by a final server notification.
     pub fn invalidate_notification(&mut self, notification: &ServerNotification) {
         match notification {
@@ -616,6 +703,36 @@ impl Default for FinalResultCache {
     fn default() -> Self {
         Self::new(DEFAULT_FINAL_CACHE_CAPACITY)
     }
+}
+
+/// Only a complete page of the matching catalog can prove its successful
+/// request cursor or supply a typed continuation for the next page.
+fn final_catalog_proves_cursor(
+    result: &CoreResult,
+    result_set: &FinalCacheResultSet,
+    accepted_cursor: Option<&str>,
+    cursor: &str,
+) -> bool {
+    let next_cursor = match (result, result_set) {
+        (
+            CoreResult::Final(FinalCoreResult::ToolsList { result, .. }),
+            FinalCacheResultSet::Tools,
+        ) => result.payload.next_cursor.as_deref(),
+        (
+            CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }),
+            FinalCacheResultSet::Resources,
+        ) => result.payload.next_cursor.as_deref(),
+        (
+            CoreResult::Final(FinalCoreResult::ResourceTemplatesList { result, .. }),
+            FinalCacheResultSet::ResourceTemplates,
+        ) => result.payload.next_cursor.as_deref(),
+        (
+            CoreResult::Final(FinalCoreResult::PromptsList { result, .. }),
+            FinalCacheResultSet::Prompts,
+        ) => result.payload.next_cursor.as_deref(),
+        _ => return false,
+    };
+    accepted_cursor == Some(cursor) || next_cursor == Some(cursor)
 }
 
 pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheScope)> {
@@ -719,6 +836,171 @@ mod tests {
 
     fn tools_result(ttl_ms: u64, scope: &str, extra: Option<&str>) -> CoreResult {
         tools_result_with_ttl(&ttl_ms.to_string(), scope, extra)
+    }
+
+    #[test]
+    fn cursor_rejection_requires_the_exact_cached_query_and_security_identity() {
+        type KeyMutation = fn(&mut FinalCacheKey);
+        let variations: &[(&str, KeyMutation)] = &[
+            ("endpoint", |key| key.endpoint_configuration.push('x')),
+            ("version", |key| key.protocol_version.push('x')),
+            ("capabilities", |key| key.normalized_capabilities.push('x')),
+            ("extensions", |key| key.extension_settings.push('x')),
+            ("method", |key| key.method = "resources/list".to_owned()),
+            ("query", |key| key.semantic_projection.push('x')),
+            ("unknown cursor", |key| {
+                key.cursor = Some("foreign".to_owned())
+            }),
+            ("empty cursor", |key| key.cursor = Some(String::new())),
+            ("absent cursor", |key| key.cursor = None),
+            ("policy", |key| key.policy_revision += 1),
+            ("extension revision", |key| key.extension_revision += 1),
+            ("representation", |key| {
+                key.representation_policy_revision += 1
+            }),
+            ("limits", |key| key.limits_policy_revision += 1),
+            ("partition", |key| {
+                key.partition = CachePartitionKey::new("credential-b")
+            }),
+            ("result set", |key| {
+                key.result_set = FinalCacheResultSet::Resources
+            }),
+        ];
+        for (dimension, mutate) in variations {
+            let mut cache = FinalResultCache::default();
+            let first = key("credential-a", None);
+            let generation = cache.begin_fetch(first.result_set());
+            let original = tools_result(60_000, "private", Some(r#""nextCursor":"page-2""#));
+            let original_bytes = original.encode().unwrap();
+            assert_eq!(
+                cache.insert_if_current(first.clone(), generation, original),
+                FinalCacheInsert::Stored
+            );
+            let mut rejected = key("credential-a", Some("page-2"));
+            mutate(&mut rejected);
+            let before_stats = cache.stats();
+            let before_bytes = cache.retained_bytes;
+            assert!(
+                cache.capture_cursor_origin(&rejected).is_none(),
+                "a rejected {dimension} variation is not a stale-baseline signal"
+            );
+            assert_eq!(cache.stats(), before_stats, "{dimension}");
+            assert_eq!(cache.retained_bytes, before_bytes, "{dimension}");
+            assert_eq!(
+                cache.begin_fetch(first.result_set()),
+                generation,
+                "{dimension}"
+            );
+            assert_eq!(
+                cache.entries[&first].result.encode().unwrap(),
+                original_bytes,
+                "a rejected {dimension} variation preserves the exact cached page"
+            );
+        }
+    }
+
+    #[test]
+    fn rejected_issued_cursors_retire_the_current_baseline_including_empty_tokens() {
+        for cursor in ["page-2", ""] {
+            let mut cache = FinalResultCache::default();
+            let first = key("credential-a", None);
+            let generation = cache.begin_fetch(first.result_set());
+            let extra = format!(r#""nextCursor":{}"#, serde_json::to_string(cursor).unwrap());
+            let original = tools_result(60_000, "private", Some(&extra));
+            assert_eq!(
+                cache.insert_if_current(first.clone(), generation, original),
+                FinalCacheInsert::Stored
+            );
+            let rejected = key("credential-a", Some(cursor));
+            let origin = cache
+                .capture_cursor_origin(&rejected)
+                .expect("a retained page issued this exact query's cursor");
+            assert!(cache.invalidate_rejected_cursor(origin));
+            assert_ne!(cache.begin_fetch(first.result_set()), generation);
+            assert_eq!(cache.stats().invalidations, 1);
+            assert_eq!(cache.retained_bytes, 0);
+            assert!(cache.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn rejected_cursor_from_an_obsolete_fetch_cannot_retire_newer_pages() {
+        let mut cache = FinalResultCache::default();
+        let first = key("credential-a", None);
+        let obsolete = cache.begin_fetch(first.result_set());
+        let original = tools_result(60_000, "private", Some(r#""nextCursor":"page-2""#));
+        assert_eq!(
+            cache.insert_if_current(first.clone(), obsolete, original.clone()),
+            FinalCacheInsert::Stored
+        );
+        let rejected = key("credential-a", Some("page-2"));
+        let origin = cache
+            .capture_cursor_origin(&rejected)
+            .expect("the original request captures its cursor provenance");
+        cache.invalidate_result_set(first.result_set());
+        let current = cache.begin_fetch(first.result_set());
+        let original_bytes = original.encode().unwrap();
+        assert_eq!(
+            cache.insert_if_current(first.clone(), current, original),
+            FinalCacheInsert::Stored
+        );
+        let before_stats = cache.stats();
+        let before_bytes = cache.retained_bytes;
+        assert!(!cache.invalidate_rejected_cursor(origin));
+        assert_eq!(cache.stats(), before_stats);
+        assert_eq!(cache.retained_bytes, before_bytes);
+        assert_eq!(cache.begin_fetch(first.result_set()), current);
+        assert_eq!(
+            cache.entries[&first].result.encode().unwrap(),
+            original_bytes
+        );
+    }
+
+    #[test]
+    fn cursor_provenance_survives_predecessor_eviction_and_stale_page_removal() {
+        let mut cache = FinalResultCache::new(2);
+        let first = key("credential-a", None);
+        let second = key("credential-a", Some("page-2"));
+        let third = key("credential-a", Some("page-3"));
+        let generation = cache.begin_fetch(first.result_set());
+        let receipt = Instant::now();
+        for (page_key, ttl, next_cursor, elapsed) in [
+            (first.clone(), 60_000, Some(r#""nextCursor":"page-2""#), 0),
+            (second.clone(), 1, Some(r#""nextCursor":"page-3""#), 1),
+            (third.clone(), 60_000, None, 2),
+        ] {
+            assert_eq!(
+                cache.insert_if_current_at(
+                    page_key,
+                    generation,
+                    tools_result(ttl, "private", next_cursor),
+                    receipt + Duration::from_millis(elapsed),
+                ),
+                FinalCacheInsert::Stored
+            );
+        }
+        assert!(!cache.entries.contains_key(&first));
+        assert!(cache.entries.contains_key(&second));
+        assert!(cache.entries.contains_key(&third));
+        assert_eq!(cache.stats().evictions, 1);
+        let origin = cache
+            .capture_cursor_origin(&second)
+            .expect("the successful continuation proves its cursor after predecessor eviction");
+        assert!(matches!(
+            cache.lookup_at(&second, receipt + Duration::from_millis(10)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
+        assert!(!cache.entries.contains_key(&second));
+        assert!(
+            cache.capture_cursor_origin(&second).is_none(),
+            "a scan performed only after lookup would have lost the request's provenance"
+        );
+        assert!(cache.entries.contains_key(&third));
+        assert!(cache.invalidate_rejected_cursor(origin));
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.retained_bytes, 0);
+        assert_eq!(cache.stats().invalidations, 1);
+        assert_ne!(cache.begin_fetch(first.result_set()), generation);
     }
 
     #[test]
