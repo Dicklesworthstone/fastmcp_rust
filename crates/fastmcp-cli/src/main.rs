@@ -1644,8 +1644,8 @@ impl OutputMutationMetadata {
 
 /// Renders untrusted text as bounded, single-line printable ASCII through the
 /// shared [`UntrustedDisplayText::ascii`] path, with the CLI's redaction and
-/// truncation markers. Human and structured CLI output use the same
-/// representation and report every redaction, sanitation, and truncation.
+/// truncation markers. Inspect's machine JSON has a separate exact-string
+/// path; terminal previews report every redaction, sanitation, and truncation.
 fn sanitize_peer_text_with_metadata(value: &str, limit: usize) -> (String, OutputMutationMetadata) {
     let (rendered, mutation) = fastmcp_console::console::UntrustedDisplayText::ascii(
         value,
@@ -7323,7 +7323,7 @@ impl InspectCapabilities {
         }
     }
 
-    fn json_value(&self, budget: &mut JsonPreviewBudget) -> serde_json::Value {
+    fn json_value(&self, budget: &mut InspectJsonBudget) -> serde_json::Value {
         match self {
             #[cfg(any(test, feature = "legacy-2024-11-05"))]
             Self::Legacy(capabilities) => serde_json::json!({
@@ -7332,7 +7332,7 @@ impl InspectCapabilities {
                 "prompts": capabilities.prompts.is_some(),
                 "logging": capabilities.logging.is_some(),
             }),
-            Self::Final(capabilities) => bounded_json_preview_inner(
+            Self::Final(capabilities) => bounded_inspect_json_value(
                 &serde_json::Value::Object(capabilities.clone()),
                 0,
                 budget,
@@ -8045,21 +8045,149 @@ fn write_inspect_stdout(output: &str) -> McpResult<()> {
     write_inspect_output(&mut stdout.lock(), output)
 }
 
-fn bounded_json_string(value: &str, budget: &mut JsonPreviewBudget) -> serde_json::Value {
-    let limit = JSON_PREVIEW_MAX_STRING_CHARS.min(budget.string_chars_remaining);
-    let (rendered, mutation) = sanitize_peer_text_with_metadata(value, limit);
-    budget.mutation.merge(mutation);
-    budget.string_chars_remaining = budget
-        .string_chars_remaining
-        .saturating_sub(rendered.chars().count());
+/// Inspect JSON never uses terminal escapes. Retained strings and object keys
+/// keep their protocol spelling; only serde_json performs JSON escaping.
+/// Credential redaction remains a separate disclosure policy, and omitted
+/// strings are null rather than plausible truncated protocol identifiers.
+struct InspectJsonBudget {
+    nodes_remaining: usize,
+    string_bytes_remaining: usize,
+    mutation: OutputMutationMetadata,
+}
+
+impl Default for InspectJsonBudget {
+    fn default() -> Self {
+        Self {
+            nodes_remaining: JSON_PREVIEW_MAX_NODES,
+            // The terminal path's character limits bound ASCII bytes. Keep
+            // the same allocation ceilings for the exact UTF-8 JSON path.
+            string_bytes_remaining: JSON_PREVIEW_MAX_STRING_CHARS_TOTAL,
+            mutation: OutputMutationMetadata::default(),
+        }
+    }
+}
+
+fn bounded_json_string(value: &str, budget: &mut InspectJsonBudget) -> serde_json::Value {
+    let limit = JSON_PREVIEW_MAX_STRING_CHARS.min(budget.string_bytes_remaining);
+    if value.len() > limit {
+        budget.mutation.truncated = true;
+        return serde_json::Value::Null;
+    }
+    // Bound the complete source before scanning: cutting a credential or URI
+    // in half before redaction could disclose a value at the scan boundary.
+    let rendered = redact_free_text_credentials_with(value, REDACTED_ENV_VALUE);
+    budget.mutation.redacted |= rendered != value;
+    if rendered.len() > limit {
+        budget.mutation.truncated = true;
+        return serde_json::Value::Null;
+    }
+    budget.string_bytes_remaining -= rendered.len();
     serde_json::Value::String(rendered)
+}
+
+fn bounded_inspect_json_value(
+    value: &serde_json::Value,
+    depth: usize,
+    budget: &mut InspectJsonBudget,
+) -> serde_json::Value {
+    if budget.nodes_remaining == 0 || depth >= JSON_PREVIEW_MAX_DEPTH {
+        budget.mutation.truncated = true;
+        return serde_json::Value::Null;
+    }
+    budget.nodes_remaining -= 1;
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::Bool(value) => serde_json::Value::Bool(*value),
+        serde_json::Value::Number(value) => serde_json::Value::Number(value.clone()),
+        serde_json::Value::String(value) => bounded_json_string(value, budget),
+        serde_json::Value::Array(values) => {
+            if values.len() > JSON_PREVIEW_MAX_CONTAINER_ITEMS {
+                budget.mutation.truncated = true;
+                return serde_json::Value::Null;
+            }
+            serde_json::Value::Array(
+                values
+                    .iter()
+                    .map(|value| bounded_inspect_json_value(value, depth + 1, budget))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Object(values) => {
+            if values.len() > JSON_PREVIEW_MAX_CONTAINER_ITEMS {
+                budget.mutation.truncated = true;
+                return serde_json::Value::Null;
+            }
+            let mut rendered = serde_json::Map::new();
+            for (key, value) in values {
+                if key.len() > PEER_FIELD_LIMIT.min(budget.string_bytes_remaining) {
+                    budget.mutation.truncated = true;
+                    return serde_json::Value::Null;
+                }
+                if redact_free_text_credentials_with(key, REDACTED_ENV_VALUE) != key.as_str() {
+                    // Never rename a protocol key or resolve a redaction
+                    // collision with a fabricated suffix.
+                    budget.mutation.redacted = true;
+                    return serde_json::Value::Null;
+                }
+                budget.string_bytes_remaining -= key.len();
+                let value = if json_key_is_sensitive(key) {
+                    budget.mutation.redacted = true;
+                    bounded_inspect_json_value(
+                        &serde_json::Value::String(REDACTED_ENV_VALUE.to_owned()),
+                        depth + 1,
+                        budget,
+                    )
+                } else {
+                    bounded_inspect_json_value(value, depth + 1, budget)
+                };
+                rendered.insert(key.clone(), value);
+            }
+            serde_json::Value::Object(rendered)
+        }
+    }
+}
+
+fn insert_inspect_schema(
+    output: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    schema: &serde_json::Value,
+    budget: &mut InspectJsonBudget,
+) {
+    let mut schema_budget = InspectJsonBudget {
+        nodes_remaining: budget.nodes_remaining,
+        string_bytes_remaining: budget.string_bytes_remaining,
+        mutation: OutputMutationMetadata::default(),
+    };
+    let value = bounded_inspect_json_value(schema, 0, &mut schema_budget);
+    budget.nodes_remaining = schema_budget.nodes_remaining;
+    budget.string_bytes_remaining = schema_budget.string_bytes_remaining;
+    budget.mutation.merge(schema_budget.mutation);
+    let complete = !schema_budget.mutation.redacted && !schema_budget.mutation.truncated;
+    output.insert(
+        key.to_owned(),
+        if complete {
+            value
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    // A partial schema can validate a different language. Keep all mutation
+    // evidence outside the schema and never present a preview as executable.
+    output.insert(
+        format!("{key}Status"),
+        serde_json::json!({
+            "complete": complete,
+            "redacted": schema_budget.mutation.redacted,
+            "truncated": schema_budget.mutation.truncated,
+        }),
+    );
 }
 
 fn insert_optional_json_string(
     output: &mut serde_json::Map<String, serde_json::Value>,
     key: &str,
     value: Option<&str>,
-    budget: &mut JsonPreviewBudget,
+    budget: &mut InspectJsonBudget,
 ) {
     if let Some(value) = value {
         output.insert(key.to_owned(), bounded_json_string(value, budget));
@@ -8068,7 +8196,7 @@ fn insert_optional_json_string(
 
 fn bounded_icon_value(
     icon: &fastmcp_protocol::Icon,
-    budget: &mut JsonPreviewBudget,
+    budget: &mut InspectJsonBudget,
 ) -> serde_json::Value {
     let mut output = serde_json::Map::new();
     insert_optional_json_string(&mut output, "src", icon.src.as_deref(), budget);
@@ -8077,7 +8205,7 @@ fn bounded_icon_value(
     serde_json::Value::Object(output)
 }
 
-fn bounded_tags_value(tags: &[String], budget: &mut JsonPreviewBudget) -> serde_json::Value {
+fn bounded_tags_value(tags: &[String], budget: &mut InspectJsonBudget) -> serde_json::Value {
     budget.mutation.truncated |= tags.len() > JSON_PREVIEW_MAX_CONTAINER_ITEMS;
     serde_json::Value::Array(
         tags.iter()
@@ -8089,7 +8217,7 @@ fn bounded_tags_value(tags: &[String], budget: &mut JsonPreviewBudget) -> serde_
 
 fn bounded_tool_value(
     tool: &fastmcp_protocol::Tool,
-    budget: &mut JsonPreviewBudget,
+    budget: &mut InspectJsonBudget,
 ) -> serde_json::Value {
     let mut output = serde_json::Map::new();
     output.insert("name".to_owned(), bounded_json_string(&tool.name, budget));
@@ -8099,15 +8227,9 @@ fn bounded_tool_value(
         tool.description.as_deref(),
         budget,
     );
-    output.insert(
-        "inputSchema".to_owned(),
-        bounded_json_preview_inner(&tool.input_schema, 0, budget),
-    );
+    insert_inspect_schema(&mut output, "inputSchema", &tool.input_schema, budget);
     if let Some(schema) = &tool.output_schema {
-        output.insert(
-            "outputSchema".to_owned(),
-            bounded_json_preview_inner(schema, 0, budget),
-        );
+        insert_inspect_schema(&mut output, "outputSchema", schema, budget);
     }
     if let Some(icon) = &tool.icon {
         output.insert("icon".to_owned(), bounded_icon_value(icon, budget));
@@ -8121,7 +8243,7 @@ fn bounded_tool_value(
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
         output.insert(
             "annotations".to_owned(),
-            bounded_json_preview_inner(&value, 0, budget),
+            bounded_inspect_json_value(&value, 0, budget),
         );
     }
     serde_json::Value::Object(output)
@@ -8129,7 +8251,7 @@ fn bounded_tool_value(
 
 fn bounded_resource_value(
     resource: &fastmcp_protocol::Resource,
-    budget: &mut JsonPreviewBudget,
+    budget: &mut InspectJsonBudget,
 ) -> serde_json::Value {
     let mut output = serde_json::Map::new();
     output.insert("uri".to_owned(), bounded_json_string(&resource.uri, budget));
@@ -8164,7 +8286,7 @@ fn bounded_resource_value(
 
 fn bounded_resource_template_value(
     template: &fastmcp_protocol::ResourceTemplate,
-    budget: &mut JsonPreviewBudget,
+    budget: &mut InspectJsonBudget,
 ) -> serde_json::Value {
     let mut output = serde_json::Map::new();
     output.insert(
@@ -8202,7 +8324,7 @@ fn bounded_resource_template_value(
 
 fn bounded_prompt_value(
     prompt: &fastmcp_protocol::Prompt,
-    budget: &mut JsonPreviewBudget,
+    budget: &mut InspectJsonBudget,
 ) -> serde_json::Value {
     let mut output = serde_json::Map::new();
     output.insert("name".to_owned(), bounded_json_string(&prompt.name, budget));
@@ -8280,7 +8402,7 @@ fn format_inspect_json_for_capabilities_with_truncation(
     acquisition_truncated: bool,
     protocol_status: InspectProtocolStatus,
 ) -> McpResult<String> {
-    let mut budget = JsonPreviewBudget::default();
+    let mut budget = InspectJsonBudget::default();
     // `null` when a modern peer advertised no identity, which the 2026-07-28
     // schema permits. Emitting an invented name would be worse than absent.
     let server = server_info.map(|server_info| {
@@ -8318,6 +8440,7 @@ fn format_inspect_json_for_capabilities_with_truncation(
         || budget.mutation.truncated;
     budget.mutation.truncated = truncated;
     let output = serde_json::json!({
+        "schema": "fastmcp.cli.inspect/v1",
         "server": server,
         "protocol": {
             "policy": protocol_status.policy.server_launch_value(),
@@ -8334,8 +8457,51 @@ fn format_inspect_json_for_capabilities_with_truncation(
         "truncated": budget.mutation.truncated,
     });
 
-    serde_json::to_string_pretty(&output).map_err(|e| {
-        fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
+    serialize_inspect_json(&output)
+}
+
+/// Bound encoded bytes while serializing: control characters can expand to
+/// six JSON bytes each even when the retained UTF-8 strings fit their budget.
+fn serialize_inspect_json(value: &serde_json::Value) -> McpResult<String> {
+    struct BoundedWriter {
+        bytes: Vec<u8>,
+        overflow: Option<usize>,
+    }
+
+    impl Write for BoundedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let total = self.bytes.len().saturating_add(bytes.len());
+            if total > CLI_OUTPUT_MAX_BYTES {
+                self.overflow = Some(total);
+                return Err(io::Error::other("inspect JSON exceeds its byte limit"));
+            }
+            if total > self.bytes.capacity() {
+                let capacity = total
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(CLI_OUTPUT_MAX_BYTES);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = BoundedWriter {
+        bytes: Vec::new(),
+        overflow: None,
+    };
+    serde_json::to_writer_pretty(&mut writer, value).map_err(|error| {
+        writer.overflow.map_or_else(
+            || fastmcp_core::McpError::internal_error(format!("JSON serialization error: {error}")),
+            |bytes| output_too_large("inspect JSON", bytes),
+        )
+    })?;
+    String::from_utf8(writer.bytes).map_err(|_| {
+        fastmcp_core::McpError::internal_error("inspect JSON serializer produced invalid UTF-8")
     })
 }
 
@@ -17256,6 +17422,7 @@ IFS= read -r end
             assert!(json.contains("\"resources\": true"));
             assert!(json.contains("\"prompts\": false"));
             let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["schema"], "fastmcp.cli.inspect/v1");
             assert_eq!(value["redacted"], false);
             assert_eq!(value["sanitized"], false);
             assert_eq!(value["truncated"], false);
@@ -17323,6 +17490,257 @@ IFS= read -r end
         }
 
         #[test]
+        fn inspect_json_round_trips_protocol_strings_keys_and_schemas_exactly() {
+            let text = "資料 [bold]\nline\r\t\0\u{1b}[31m\u{202e}\u{200b} \\literal";
+            let server_info = fastmcp_protocol::ServerInfo {
+                name: "名前\nサーバー".to_owned(),
+                version: "版本\\一".to_owned(),
+            };
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "café": {"enum": ["é", "e\u{301}", "\n", "\\n", text]},
+                    "caf\\xC3\\xA9": {"type": "string"},
+                    "line\nkey": {"pattern": r"^\p{L}+\s+[A-Z\\]+$"},
+                    "line\\x0Akey": {"type": "boolean"},
+                },
+                "required": ["café", "line\nkey"],
+                "additionalProperties": false,
+            });
+            let mut tool = make_test_tool("計算\\tool", Some(text));
+            tool.input_schema = schema.clone();
+            tool.output_schema = Some(schema.clone());
+            tool.tags = vec!["分類".to_owned(), "line\nlabel".to_owned()];
+            let resource = make_test_resource("file:///資料/報告%20一.txt", "報告");
+            let template = make_test_resource_template("file:///資料/{識別子}", "ひな形");
+            let mut prompt = make_test_prompt("挨拶", Some(text));
+            prompt.arguments = vec![fastmcp_protocol::PromptArgument {
+                name: "名前\\argument".to_owned(),
+                description: Some(text.to_owned()),
+                required: true,
+            }];
+            let capabilities = serde_json::json!({
+                "tools": {},
+                "vendor/能力": {"text": text, "literal": "\\x1B"},
+            });
+            let output = format_inspect_json_for_capabilities_with_truncation(
+                Some(&server_info),
+                &InspectCapabilities::Final(capabilities.as_object().unwrap().clone()),
+                &[tool],
+                &[resource],
+                &[template],
+                &[prompt],
+                false,
+                make_test_protocol_status(),
+            )
+            .expect("bounded exact JSON");
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+            assert_eq!(value["server"]["name"], server_info.name);
+            assert_eq!(value["server"]["version"], server_info.version);
+            assert_eq!(value["capabilities"], capabilities);
+            assert_eq!(value["tools"][0]["name"], "計算\\tool");
+            assert_eq!(value["tools"][0]["description"], text);
+            assert_eq!(value["tools"][0]["inputSchema"], schema);
+            assert_eq!(value["tools"][0]["outputSchema"], schema);
+            assert_eq!(value["tools"][0]["inputSchemaStatus"]["complete"], true);
+            assert_eq!(value["tools"][0]["outputSchemaStatus"]["complete"], true);
+            assert_eq!(value["tools"][0]["tags"][1], "line\nlabel");
+            assert_eq!(value["resources"][0]["uri"], "file:///資料/報告%20一.txt");
+            assert_eq!(
+                value["resource_templates"][0]["uriTemplate"],
+                "file:///資料/{識別子}",
+            );
+            assert_eq!(value["prompts"][0]["name"], "挨拶");
+            assert_eq!(
+                value["prompts"][0]["arguments"][0]["name"],
+                "名前\\argument"
+            );
+            assert_eq!(value["prompts"][0]["arguments"][0]["description"], text);
+            assert_eq!(value["redacted"], false);
+            assert_eq!(value["sanitized"], false);
+            assert_eq!(value["truncated"], false);
+            assert!(!output.contains('\u{1b}'));
+            assert!(!output.contains('\0'));
+            assert!(output.contains("\\u001b"));
+            assert!(output.contains("\\u0000"));
+
+            // The human display still needs visible ASCII escapes. Sharing
+            // that representation with JSON would fail the equality above.
+            let human = sanitize_peer_text(text, PEER_DETAIL_LIMIT);
+            assert!(human.is_ascii());
+            assert_ne!(human, text);
+            assert!(!human.contains('\n'));
+        }
+
+        #[test]
+        fn inspect_json_redacted_schema_is_omitted_with_explicit_status() {
+            const SECRET: &str = "SCHEMA_CREDENTIAL_CANARY";
+            let public_schema = serde_json::json!({
+                "type": "object", "properties": {"value": {"type": "string"}},
+            });
+            for secret_in_key in [false, true] {
+                let mut tool = make_test_tool("safe", Some("token=DESCRIPTION_SECRET"));
+                tool.input_schema = public_schema.clone();
+                let key = if secret_in_key {
+                    format!("token={SECRET}")
+                } else {
+                    "password".to_owned()
+                };
+                tool.input_schema
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(key, serde_json::Value::String(SECRET.to_owned()));
+                tool.output_schema = Some(public_schema.clone());
+                let output = format_inspect_json(
+                    None,
+                    &make_test_capabilities(true, false, false),
+                    &[tool],
+                    &[],
+                    &[],
+                    &[],
+                    make_test_protocol_status(),
+                )
+                .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+                assert!(value["tools"][0]["inputSchema"].is_null());
+                assert_eq!(
+                    value["tools"][0]["inputSchemaStatus"],
+                    serde_json::json!({"complete": false, "redacted": true, "truncated": false}),
+                );
+                // Redaction of a different field cannot falsely mark a
+                // complete output schema as redacted or omit it.
+                assert_eq!(value["tools"][0]["outputSchema"], public_schema);
+                assert_eq!(
+                    value["tools"][0]["outputSchemaStatus"],
+                    serde_json::json!({"complete": true, "redacted": false, "truncated": false}),
+                );
+                assert_eq!(value["tools"][0]["description"], "token=<redacted>");
+                assert_eq!(value["redacted"], true);
+                assert_eq!(value["sanitized"], false);
+                assert_eq!(value["truncated"], false);
+                assert!(!output.contains(SECRET));
+                assert!(!output.contains("DESCRIPTION_SECRET"));
+            }
+        }
+
+        #[test]
+        fn inspect_json_schema_limits_preserve_exact_fit_and_omit_overflow() {
+            for extra_byte in [false, true] {
+                let mut pattern = "é".repeat(JSON_PREVIEW_MAX_STRING_CHARS / 2);
+                if extra_byte {
+                    pattern.push('x');
+                }
+                let schema = serde_json::json!({
+                    "type": "object", "properties": {"value": {"pattern": pattern}},
+                });
+                let mut tool = make_test_tool("bounded", None);
+                tool.input_schema = schema.clone();
+                let output = format_inspect_json(
+                    None,
+                    &make_test_capabilities(true, false, false),
+                    &[tool],
+                    &[],
+                    &[],
+                    &[],
+                    make_test_protocol_status(),
+                )
+                .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(value["truncated"], extra_byte);
+                assert_eq!(value["redacted"], false);
+                assert_eq!(value["sanitized"], false);
+                assert_eq!(
+                    value["tools"][0]["inputSchemaStatus"]["complete"],
+                    !extra_byte
+                );
+                assert_eq!(
+                    value["tools"][0]["inputSchemaStatus"]["truncated"],
+                    extra_byte
+                );
+                if extra_byte {
+                    assert!(value["tools"][0]["inputSchema"].is_null());
+                    assert!(!output.contains(TERMINAL_TRUNCATED));
+                } else {
+                    assert_eq!(value["tools"][0]["inputSchema"], schema);
+                }
+            }
+
+            for extra_item in [false, true] {
+                let count = JSON_PREVIEW_MAX_CONTAINER_ITEMS + usize::from(extra_item);
+                let schema = serde_json::json!({"enum": vec!["value"; count]});
+                let mut tool = make_test_tool("bounded", None);
+                tool.input_schema = schema.clone();
+                let output = format_inspect_json(
+                    None,
+                    &make_test_capabilities(true, false, false),
+                    &[tool],
+                    &[],
+                    &[],
+                    &[],
+                    make_test_protocol_status(),
+                )
+                .unwrap();
+                let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+                assert_eq!(
+                    value["tools"][0]["inputSchemaStatus"]["complete"],
+                    !extra_item
+                );
+                assert_eq!(value["truncated"], extra_item);
+                if extra_item {
+                    assert!(value["tools"][0]["inputSchema"].is_null());
+                } else {
+                    assert_eq!(value["tools"][0]["inputSchema"], schema);
+                }
+            }
+        }
+
+        #[test]
+        fn inspect_json_oversized_identifiers_are_null_instead_of_fabricated_strings() {
+            let tools = [make_test_tool(
+                &"名".repeat(JSON_PREVIEW_MAX_STRING_CHARS / 3 + 1),
+                None,
+            )];
+            let output = format_inspect_json(
+                None,
+                &make_test_capabilities(true, false, false),
+                &tools,
+                &[],
+                &[],
+                &[],
+                make_test_protocol_status(),
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert!(value["tools"][0]["name"].is_null());
+            assert_eq!(value["tools"][0]["inputSchema"], serde_json::json!({}));
+            assert_eq!(value["tools"][0]["inputSchemaStatus"]["complete"], true);
+            assert_eq!(value["truncated"], true);
+            assert_eq!(value["sanitized"], false);
+            assert!(!output.contains(TERMINAL_TRUNCATED));
+        }
+
+        #[test]
+        fn inspect_json_serializer_enforces_encoded_byte_boundary() {
+            let exact = serde_json::Value::String("x".repeat(CLI_OUTPUT_MAX_BYTES - 2));
+            let output = serialize_inspect_json(&exact).expect("exact encoded fit");
+            assert_eq!(output.len(), CLI_OUTPUT_MAX_BYTES);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+                exact
+            );
+
+            let overflow = serde_json::Value::String("x".repeat(CLI_OUTPUT_MAX_BYTES - 1));
+            let error = serialize_inspect_json(&overflow).expect_err("one extra encoded byte");
+            assert!(error.message.contains("maximum"));
+
+            // The raw source fits, but JSON's six-byte control escapes do not.
+            let controls = serde_json::Value::String("\0".repeat(CLI_OUTPUT_MAX_BYTES / 6 + 1));
+            assert!(serialize_inspect_json(&controls).is_err());
+        }
+
+        #[test]
         fn inspect_json_redacts_credentials_and_bounds_depth_and_items() {
             const SECRET: &str = "INSPECT_JSON_SECRET_CANARY";
             let server_info = fastmcp_protocol::ServerInfo {
@@ -17362,10 +17780,13 @@ IFS= read -r end
             );
             assert_eq!(json["truncated"].as_bool(), Some(true));
             assert_eq!(json["redacted"].as_bool(), Some(true));
-            assert_eq!(json["sanitized"].as_bool(), Some(true));
+            assert_eq!(json["sanitized"].as_bool(), Some(false));
             assert!(output.contains("<redacted>"));
             assert!(output.contains("[safe]"));
-            assert!(output.contains("depth limit"));
+            assert!(json["tools"][0]["inputSchema"].is_null());
+            assert_eq!(json["tools"][0]["inputSchemaStatus"]["complete"], false);
+            assert_eq!(json["tools"][0]["inputSchemaStatus"]["redacted"], true);
+            assert_eq!(json["tools"][0]["inputSchemaStatus"]["truncated"], true);
             assert!(!output.contains(SECRET));
             assert!(!output.contains('\u{1b}'));
             assert!(output.len() <= CLI_OUTPUT_MAX_BYTES);
