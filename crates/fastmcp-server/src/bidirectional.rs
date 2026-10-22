@@ -262,6 +262,9 @@ impl PendingIdDomain {
 pub(crate) enum PendingResponseDisposition {
     /// The response reached its live pending request.
     Delivered,
+    /// The response violates its live request's protocol era. The waiter is
+    /// retained so a subsequent valid reply can still complete the request.
+    Rejected,
     /// The response belongs to an issued exact-legacy negative ID that has
     /// already left the pending set.
     RetiredGeneric,
@@ -279,6 +282,7 @@ struct PendingState {
 #[derive(Debug)]
 struct PendingRequest {
     sender: ResponseSender,
+    response_era: Option<ProtocolEra>,
     #[cfg(feature = "legacy-2024-11-05")]
     request_cancellation: Option<McpRequestCancellation>,
 }
@@ -374,10 +378,20 @@ impl PendingRequests {
         self.lock_state().requests.len()
     }
 
-    /// Atomically allocates a collision-free ID and registers its response
-    /// channel. Allocation scans at most `max_in_flight + 1` candidates.
+    #[cfg(test)]
     fn register_with_cancellation(
         &self,
+        request_cancellation: Option<McpRequestCancellation>,
+    ) -> McpResult<(RequestId, ResponseReceiver)> {
+        self.register_for_era(None, request_cancellation)
+    }
+
+    /// Atomically allocates a collision-free ID and registers its response
+    /// channel and optional negotiated era. Allocation scans at most
+    /// `max_in_flight + 1` candidates.
+    fn register_for_era(
+        &self,
+        response_era: Option<ProtocolEra>,
         request_cancellation: Option<McpRequestCancellation>,
     ) -> McpResult<(RequestId, ResponseReceiver)> {
         // Only the exact-legacy pump sweeps waiters by owner cancellation
@@ -406,6 +420,7 @@ impl PendingRequests {
                 let (sender, receiver) = oneshot::channel();
                 entry.insert(PendingRequest {
                     sender,
+                    response_era,
                     #[cfg(feature = "legacy-2024-11-05")]
                     request_cancellation,
                 });
@@ -427,8 +442,9 @@ impl PendingRequests {
         )
     }
 
-    /// Routes a response and reports whether it was delivered, retired from
-    /// the exact-legacy negative ID suffix, or unmatched.
+    /// Routes a response and reports whether it was delivered, rejected for
+    /// its live request's era, retired from the exact-legacy negative ID
+    /// suffix, or unmatched.
     pub(crate) fn route_response_with_disposition(
         &self,
         response: &JsonRpcResponse,
@@ -442,6 +458,25 @@ impl PendingRequests {
 
         let (pending, retired_generic) = {
             let mut state = self.lock_state();
+            if state
+                .requests
+                .get(&key)
+                .is_some_and(|pending| pending.response_era == Some(ProtocolEra::Legacy2024))
+            {
+                // Keep potentially large response serialization and decoding
+                // outside the tracker lock. Issued IDs are never reused, so
+                // only this same waiter or its retirement can be observed
+                // when the lock is reacquired.
+                drop(state);
+                let admitted = serde_json::to_value(response).is_ok_and(|value| {
+                    fastmcp_protocol::methods::decode_legacy_2024_11_05_envelope_classified(value)
+                        .is_ok()
+                });
+                state = self.lock_state();
+                if !admitted && state.requests.contains_key(&key) {
+                    return PendingResponseDisposition::Rejected;
+                }
+            }
             let pending = state.requests.remove(&key);
             #[cfg(feature = "legacy-2024-11-05")]
             let retired_generic = pending.is_none()
@@ -455,7 +490,7 @@ impl PendingRequests {
         };
 
         if let Some(pending) = pending {
-            // Validate every response invariant before consuming the waiter.
+            // Validate generic response invariants before delivering the result.
             // This also rejects manually-constructed values that bypass serde's guards.
             let validated = ValidatedResponse::from_response(response);
             let outcome = validated.into_pending_response();
@@ -648,7 +683,7 @@ pub struct RequestSender {
     pending: Arc<PendingRequests>,
     /// Transport send callback.
     send_fn: TransportSendFn,
-    /// Exact protocol era that governs reverse-request cleanup controls.
+    /// Exact protocol era that governs reverse replies and cleanup controls.
     era: ProtocolEra,
     /// Request-local cancellation domain installed by server dispatch.
     request_cancellation: Option<McpRequestCancellation>,
@@ -667,6 +702,10 @@ impl RequestSender {
     /// Dropped reverse requests emit `notifications/cancelled` only for exact
     /// MCP 2024-11-05. MCP 2026-07-28 retains local cleanup but emits no
     /// server cancellation notification.
+    ///
+    /// Exact-2024 replies must pass that era's envelope decoder before they
+    /// can complete a request. Rejected replies leave the request pending so
+    /// the peer can still supply a valid response with the same ID.
     pub fn new_for_era(
         era: ProtocolEra,
         pending: Arc<PendingRequests>,
@@ -718,7 +757,7 @@ impl RequestSender {
 
         let (id, mut receiver) = self
             .pending
-            .register_with_cancellation(self.request_cancellation.clone())?;
+            .register_for_era(Some(self.era), self.request_cancellation.clone())?;
         let mut guard = PendingRequestGuard {
             pending: Arc::clone(&self.pending),
             send_fn: Arc::clone(&self.send_fn),
@@ -5365,6 +5404,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_reverse_reply_admission_preserves_waiter_for_corrected_roots_result() {
+        #[cfg(feature = "legacy-2024-11-05")]
+        let pending = Arc::new(PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap());
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let pending = Arc::new(PendingRequests::with_max_in_flight(1).unwrap());
+        let sent_id = Arc::new(Mutex::new(None));
+        let sent_id_for_send = Arc::clone(&sent_id);
+        let cancellation = McpRequestCancellation::new();
+        let sender = RequestSender::new(
+            Arc::clone(&pending),
+            Arc::new(move |message| {
+                if let JsonRpcMessage::Request(request) = message
+                    && request.id.is_some()
+                {
+                    *sent_id_for_send.lock().unwrap() = request.id.clone();
+                }
+                Ok(())
+            }),
+        )
+        .for_request(cancellation.clone());
+        let cx = Cx::for_testing();
+        let mut future = Box::pin(sender.send_request::<fastmcp_protocol::ListRootsResult>(
+            &cx,
+            "roots/list",
+            serde_json::json!({}),
+        ));
+        let waker = std::task::Waker::noop();
+        let mut task_cx = std::task::Context::from_waker(waker);
+        assert!(future.as_mut().poll(&mut task_cx).is_pending());
+        let id = sent_id.lock().unwrap().clone().expect("reverse request ID");
+
+        let mut rejected_results = vec![
+            serde_json::json!({"roots": [], "resultType": "complete"}),
+            serde_json::json!(null),
+        ];
+        for member in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/logLevel",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ] {
+            rejected_results.push(serde_json::json!({
+                "roots": [],
+                "_meta": {(member): null},
+            }));
+        }
+        for result in rejected_results {
+            let response = JsonRpcResponse::success(id.clone(), result);
+            assert_eq!(
+                pending.route_response_with_disposition(&response),
+                PendingResponseDisposition::Rejected,
+                "cross-era or non-object reply must not complete roots/list: {response:?}"
+            );
+            assert_eq!(pending.in_flight_len(), 1);
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+            assert!(!cancellation.is_terminal());
+        }
+        assert_eq!(
+            pending
+                .register_with_cancellation(None)
+                .unwrap_err()
+                .message,
+            IN_FLIGHT_LIMIT_ERROR,
+            "rejected replies must retain the original request's capacity reservation"
+        );
+
+        let corrected = JsonRpcResponse::success(
+            id.clone(),
+            serde_json::json!({
+                "roots": [{"uri": "file:///workspace", "name": "Workspace"}],
+                "_meta": {
+                    "vendor.example/trace": {
+                        "resultType": "complete",
+                        "io.modelcontextprotocol/protocolVersion": "application data"
+                    }
+                },
+            }),
+        );
+        assert_eq!(
+            pending.route_response_with_disposition(&corrected),
+            PendingResponseDisposition::Delivered,
+            "ordinary vendor metadata must remain valid in an exact-2024 reply"
+        );
+        let result = block_on(future).expect("corrected reply completes the original request");
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.roots[0].uri, "file:///workspace");
+        assert_eq!(result.roots[0].name.as_deref(), Some("Workspace"));
+        assert_eq!(pending.in_flight_len(), 0);
+
+        let late = JsonRpcResponse::success(
+            id,
+            serde_json::json!({"roots": [], "resultType": "complete"}),
+        );
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(
+            pending.route_response_with_disposition(&late),
+            PendingResponseDisposition::RetiredGeneric
+        );
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(
+            pending.route_response_with_disposition(&late),
+            PendingResponseDisposition::Unmatched
+        );
+    }
+
+    #[test]
+    fn modern_reverse_reply_admission_keeps_final_result_markers() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_for_send = Arc::clone(&pending);
+        let expected = serde_json::json!({
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "test", "version": "1"}},
+            "answer": 42,
+        });
+        let reply = expected.clone();
+        let sender = RequestSender::new_for_era(
+            ProtocolEra::Modern2026,
+            Arc::clone(&pending),
+            Arc::new(move |message| {
+                if let JsonRpcMessage::Request(request) = message {
+                    let response = JsonRpcResponse::success(
+                        request.id.clone().expect("reverse request ID"),
+                        reply.clone(),
+                    );
+                    assert_eq!(
+                        pending_for_send.route_response_with_disposition(&response),
+                        PendingResponseDisposition::Delivered
+                    );
+                }
+                Ok(())
+            }),
+        );
+        let cx = Cx::for_testing();
+        let result = block_on(sender.send_request::<serde_json::Value>(
+            &cx,
+            "test/modern",
+            serde_json::json!({}),
+        ))
+        .expect("an explicitly modern request must not inherit exact-2024 reply rules");
+        assert_eq!(result, expected);
+        assert_eq!(pending.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn unbound_pending_response_keeps_generic_json_rpc_admission() {
+        let pending = PendingRequests::new();
+        let (id, receiver) = pending.register_with_cancellation(None).unwrap();
+        let expected = serde_json::json!({
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+        });
+        assert_eq!(
+            pending
+                .route_response_with_disposition(&JsonRpcResponse::success(id, expected.clone())),
+            PendingResponseDisposition::Delivered
+        );
+        assert_eq!(receive_pending(receiver).unwrap(), expected);
+        assert_eq!(pending.in_flight_len(), 0);
+    }
+
     fn dropped_reverse_request_outbound(era: ProtocolEra) -> Vec<JsonRpcMessage> {
         let pending = Arc::new(PendingRequests::new());
         let pending_clone = Arc::clone(&pending);
@@ -5494,9 +5696,8 @@ mod tests {
         let send_fn: TransportSendFn = Arc::new(move |msg| {
             if let JsonRpcMessage::Request(req) = msg {
                 let id = req.id.clone().unwrap();
-                // Return a string value, which won't deserialize to Vec<String>
-                let response =
-                    JsonRpcResponse::success(id, serde_json::json!("not a vec of strings"));
+                // A valid legacy result object still cannot deserialize to Vec<String>.
+                let response = JsonRpcResponse::success(id, serde_json::json!({"answer": 42}));
                 pending_clone.route_response(&response);
             }
             Ok(())
@@ -6275,7 +6476,7 @@ mod tests {
         let send_fn: TransportSendFn = Arc::new(move |msg| {
             if let JsonRpcMessage::Request(req) = msg {
                 let id = req.id.clone().unwrap();
-                let response = JsonRpcResponse::success(id, serde_json::json!(null));
+                let response = JsonRpcResponse::success(id, serde_json::json!({}));
                 pending_clone.route_response(&response);
             }
             Ok(())
