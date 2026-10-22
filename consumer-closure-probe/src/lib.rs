@@ -272,6 +272,47 @@ pub fn continuation_replay_is_installable_through_the_facade() {
     journal_is_a_middleware::<ContinuationReplayMiddleware>();
 }
 
+/// MRTR elicitation, which was the only one of three input kinds a facade
+/// consumer could not use.
+///
+/// `MrtrInputResponse` is a facade root re-export and all three of its
+/// constructors are public, but their parameter types were reachable unevenly:
+/// `sampling(FinalCreateMessageResult)` and `roots(ListRootsResult)` were
+/// nameable here and `elicitation(ElicitResult)` was not, so two of three
+/// kinds could be answered through the facade and the third could not. Same
+/// on the request side, where `legacy_elicitation` takes
+/// `ElicitRequestParams`.
+///
+/// Binding them as fn POINTERS is the assertion: a pointer type fixes every
+/// parameter, so this stops resolving the moment a payload type stops being
+/// writable through the facade. Naming the response type alone would pass
+/// while its constructors remained uncallable, which is the defect shape that
+/// was actually present.
+///
+/// `sampling` is the CONTROL: its payload was already root-reachable, so if
+/// both arms fail together the cause is the response type rather than the
+/// elicitation payloads. The THIRD constructor, `roots(ListRootsResult)`, is
+/// deliberately absent: `ListRootsResult` is reachable only as
+/// `legacy_2024::ListRootsResult` behind `legacy-2024-11-05`, never at the
+/// root, so asserting it here would test a feature-gated namespace rather than
+/// the root closure this function is about -- and it means `roots` is now the
+/// asymmetric one. That is a question for the owner, not something to paper
+/// over by importing from a gated module.
+pub fn mrtr_elicitation_is_answerable_through_the_facade() {
+    use fastmcp_rust::{
+        ElicitRequestParams, ElicitResult, FinalCreateMessageResult, McpResult, MrtrInputRequest,
+        MrtrInputResponse,
+    };
+
+    let _elicitation: fn(ElicitResult) -> McpResult<MrtrInputResponse> =
+        MrtrInputResponse::elicitation;
+    let _sampling: fn(FinalCreateMessageResult) -> McpResult<MrtrInputResponse> =
+        MrtrInputResponse::sampling;
+
+    let _legacy_elicitation: fn(ElicitRequestParams) -> MrtrInputRequest =
+        MrtrInputRequest::legacy_elicitation;
+}
+
 // ---------------------------------------------------------------------------
 // 6. The planted negative: proof that this crate can go red.
 // ---------------------------------------------------------------------------
