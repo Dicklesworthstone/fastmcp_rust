@@ -257,8 +257,20 @@ pub struct Root {
     /// Unique identifier for the root. Must be a `file://` URI.
     pub uri: String,
     /// Optional human-readable name for display purposes.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Absence differs from an empty name; an explicit null is not a name.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_root_name"
+    )]
     pub name: Option<String>,
+}
+
+fn deserialize_optional_root_name<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 impl Root {
@@ -3688,6 +3700,55 @@ mod tests {
         let root = Root::with_name(uri, name);
         assert_eq!(root.uri, "file:///src");
         assert_eq!(root.name.unwrap(), "Source");
+    }
+
+    #[test]
+    fn root_name_preserves_absent_empty_and_display_text() {
+        for name in [
+            None,
+            Some(""),
+            Some("Workspace <untrusted> https://example.test"),
+        ] {
+            let root = Root {
+                uri: "file:///workspace/%41/./source".to_owned(),
+                name: name.map(str::to_owned),
+            };
+            let value = serde_json::to_value(&root).expect("serialize root");
+            assert_eq!(value.get("name").is_some(), name.is_some());
+            assert_eq!(value["uri"], root.uri);
+            let decoded: Root = serde_json::from_value(value.clone()).expect("decode root");
+            assert_eq!(decoded, root);
+            let payload = serde_json::json!({"roots": [value]});
+            let embedded: crate::messages::FinalEmbeddedRootsListResult =
+                serde_json::from_value(payload.clone()).expect("decode embedded roots");
+            assert_eq!(embedded.roots, vec![root]);
+            assert_eq!(serde_json::to_value(embedded).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn root_name_rejects_null_and_non_string_values_in_embedded_results() {
+        for name in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let root = serde_json::json!({"uri": "file:///workspace", "name": name});
+            assert!(serde_json::from_value::<Root>(root.clone()).is_err());
+            let payload = serde_json::json!({"roots": [root]});
+            assert!(
+                serde_json::from_value::<crate::messages::FinalEmbeddedRootsListResult>(
+                    payload.clone()
+                )
+                .is_err()
+            );
+            assert!(
+                serde_json::from_value::<crate::messages::FinalEmbeddedInputResponse>(payload)
+                    .is_err()
+            );
+        }
     }
 
     #[test]

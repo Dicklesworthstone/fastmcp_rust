@@ -33615,7 +33615,7 @@ mod lib_unit_tests {
             params["requestState"] = serde_json::json!(state);
             params["inputResponses"] = serde_json::json!({
                 "roots": bidirectional::MrtrInputResponse::roots(
-                    fastmcp_protocol::ListRootsResult::empty(),
+                    fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                 ).expect("valid roots response"),
             });
             request.body = serde_json::to_vec(&rpc).unwrap();
@@ -33900,7 +33900,7 @@ mod lib_unit_tests {
                     if !state_only {
                         params["inputResponses"] = serde_json::json!({
                             "roots": bidirectional::MrtrInputResponse::roots(
-                                fastmcp_protocol::ListRootsResult::empty(),
+                                fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                             ).unwrap(),
                         });
                     }
@@ -34112,7 +34112,7 @@ mod lib_unit_tests {
                         if !state_only {
                             params["inputResponses"] = serde_json::json!({
                                 "roots": bidirectional::MrtrInputResponse::roots(
-                                    fastmcp_protocol::ListRootsResult::empty(),
+                                    fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                                 ).unwrap(),
                             });
                         }
@@ -34282,7 +34282,7 @@ mod lib_unit_tests {
                         })?;
                     let roots = serde_json::to_value(
                         bidirectional::MrtrInputResponse::roots(
-                            fastmcp_protocol::ListRootsResult::empty(),
+                            fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                         )
                         .map_err(|error| format!("MRTR roots response failed: {error}"))?,
                     )
@@ -43322,7 +43322,7 @@ mod lib_unit_tests {
                         let calls_after_wrong_kind = client_calls.load(Ordering::Acquire);
                         let roots = serde_json::to_value(
                             bidirectional::MrtrInputResponse::roots(
-                                fastmcp_protocol::ListRootsResult::empty(),
+                                fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                             )
                             .map_err(|error| {
                                 format!("MRTR valid roots response failed: {error}")
@@ -43517,8 +43517,10 @@ mod lib_unit_tests {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "MRTR shutdown initial response omitted requestState".to_owned())?;
             let roots = serde_json::to_value(
-                bidirectional::MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                    .map_err(|error| format!("MRTR shutdown roots response failed: {error}"))?,
+                bidirectional::MrtrInputResponse::roots(
+                    fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
+                )
+                .map_err(|error| format!("MRTR shutdown roots response failed: {error}"))?,
             )
             .map_err(|error| format!("MRTR shutdown roots response did not serialize: {error}"))?;
             let retry = HttpRequest::new(HttpMethod::Post, "/mcp")
@@ -56342,8 +56344,10 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::Acquire), 1);
 
         let roots = serde_json::to_value(
-            bidirectional::MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                .expect("MRTR roots response must construct"),
+            bidirectional::MrtrInputResponse::roots(
+                fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
+            )
+            .expect("MRTR roots response must construct"),
         )
         .expect("MRTR roots response must serialize");
         let retry =

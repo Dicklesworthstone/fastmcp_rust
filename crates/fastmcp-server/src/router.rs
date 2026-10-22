@@ -2481,9 +2481,8 @@ impl Router {
                 // downstream client lists it. Intersect its remaining age-
                 // adjusted lifetime with the current application policy.
                 let local_ttl = hints.list_ttl_ms.try_as_millis().unwrap_or(0);
-                hints.list_ttl_ms = CacheTtl::milliseconds(
-                    local_ttl.min(upstream.remaining_ttl_ms(now)),
-                );
+                hints.list_ttl_ms =
+                    CacheTtl::milliseconds(local_ttl.min(upstream.remaining_ttl_ms(now)));
                 if upstream.cache_scope == CacheScope::Private {
                     hints.scope = CacheScope::Private;
                 }
@@ -11242,8 +11241,10 @@ mod router_tests {
 
     fn router_roots_response_wire() -> serde_json::Value {
         serde_json::to_value(
-            MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                .expect("roots response serializes"),
+            MrtrInputResponse::roots(fastmcp_protocol::FinalEmbeddedRootsListResult {
+                roots: Vec::new(),
+            })
+            .expect("roots response serializes"),
         )
         .expect("roots response converts to a wire value")
     }

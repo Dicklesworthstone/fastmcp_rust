@@ -1211,9 +1211,16 @@ impl MrtrInputRequest {
         }
     }
 
-    /// Creates one final-era elicitation descriptor without translating it
-    /// through the exact-2024 request shape.
-    fn final_elicitation(
+    /// Creates a modern form or URL elicitation descriptor.
+    ///
+    /// Uses the same admitted descriptor as modern client resolvers without
+    /// adding legacy elicitation identity or inherited request metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error if serialization fails, including a mode
+    /// discriminator that disagrees with the descriptor's variant.
+    pub fn final_elicitation(
         params: fastmcp_protocol::FinalEmbeddedElicitationParams,
     ) -> McpResult<Self> {
         serde_json::to_value(&params)
@@ -1438,13 +1445,16 @@ impl MrtrInputResponse {
         Self::with_value(MrtrInputKind::Sampling, value)
     }
 
-    /// Creates a roots response value.
+    /// Creates a final roots response value.
+    ///
+    /// Uses the same embedded payload as modern client resolvers, so creating
+    /// or resuming an MRTR exchange does not require the legacy protocol API.
     ///
     /// # Errors
     ///
     /// Returns an internal error only if its protocol value cannot be
     /// represented as JSON.
-    pub fn roots(value: fastmcp_protocol::ListRootsResult) -> McpResult<Self> {
+    pub fn roots(value: fastmcp_protocol::FinalEmbeddedRootsListResult) -> McpResult<Self> {
         Self::with_value(MrtrInputKind::Roots, value)
     }
 
@@ -1478,7 +1488,7 @@ impl MrtrInputResponse {
     }
 
     /// Returns this value as the roots result it was admitted as.
-    pub fn roots_result(&self) -> McpResult<fastmcp_protocol::ListRootsResult> {
+    pub fn roots_result(&self) -> McpResult<fastmcp_protocol::FinalEmbeddedRootsListResult> {
         if self.kind != MrtrInputKind::Roots {
             return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
         }
@@ -1505,10 +1515,18 @@ impl MrtrInputResponse {
                 serde_json::from_value(value)
                     .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
             )?,
-            MrtrInputKind::Roots => Self::roots(
-                serde_json::from_value(value)
-                    .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
-            )?,
+            MrtrInputKind::Roots => {
+                // Select roots before constructing the closed Task-input
+                // payload: MRTR admits inert peer siblings on this object.
+                let roots = value
+                    .get("roots")
+                    .cloned()
+                    .ok_or_else(|| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?;
+                Self::roots(fastmcp_protocol::FinalEmbeddedRootsListResult {
+                    roots: serde_json::from_value(roots)
+                        .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
+                })?
+            }
         };
         Ok(response)
     }
@@ -1826,7 +1844,10 @@ impl MrtrCompletedInputs {
     }
 
     /// Returns one framework-admitted roots response by its issued key.
-    pub fn roots(&self, key: &str) -> McpResult<Option<fastmcp_protocol::ListRootsResult>> {
+    pub fn roots(
+        &self,
+        key: &str,
+    ) -> McpResult<Option<fastmcp_protocol::FinalEmbeddedRootsListResult>> {
         self.responses
             .get(key)
             .map(MrtrInputResponse::roots_result)
@@ -2672,8 +2693,10 @@ mod tests {
     }
 
     fn mrtr_roots_response() -> MrtrInputResponse {
-        MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-            .expect("roots response must serialize")
+        MrtrInputResponse::roots(fastmcp_protocol::FinalEmbeddedRootsListResult {
+            roots: Vec::new(),
+        })
+        .expect("roots response must serialize")
     }
 
     fn final_form_elicitation_params() -> fastmcp_protocol::FinalEmbeddedElicitationParams {
@@ -2732,6 +2755,149 @@ mod tests {
             "model": "test-model",
         }))
         .expect("final sampling result with tool use must admit")
+    }
+
+    fn modern_roots_exchange() -> (MrtrExchangeRegistry, String) {
+        let registry = MrtrExchangeRegistry::new();
+        let requests =
+            MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap();
+        let issued = registry
+            .issue(McpRequestCancellation::new(), requests)
+            .unwrap();
+        let state = mrtr_state_from_wire(&issued);
+        (registry, state)
+    }
+
+    #[test]
+    fn mrtr_modern_roots_payload_round_trip() {
+        let (registry, state) = modern_roots_exchange();
+        let roots = fastmcp_protocol::FinalEmbeddedRootsListResult {
+            roots: vec![
+                fastmcp_protocol::Root::new("file:///workspace/project%20one"),
+                fastmcp_protocol::Root::with_name("file:///workspace/project%20one", ""),
+                fastmcp_protocol::Root::with_name("file:///workspace/project%20one", "Project one"),
+            ],
+        };
+        let response = MrtrInputResponse::roots(roots.clone()).unwrap();
+        assert_eq!(response.roots_result().unwrap(), roots);
+        let responses = MrtrInputResponses::new([("roots".to_owned(), response)]).unwrap();
+        let MrtrRetry::Complete(completed) = registry.accept(&state, responses).unwrap() else {
+            panic!("the final roots payload must complete the exchange");
+        };
+        let resumed: fastmcp_protocol::FinalEmbeddedRootsListResult =
+            completed.roots("roots").unwrap().unwrap();
+        assert_eq!(resumed, roots);
+        assert!(completed.roots("absent").unwrap().is_none());
+        assert_eq!(registry.active_len(), 0);
+        assert!(
+            registry
+                .accept(&state, MrtrInputResponses::default())
+                .is_err(),
+            "completed roots input cannot replay its one-use request state"
+        );
+    }
+
+    #[test]
+    fn mrtr_modern_roots_wrong_kind_preserves_pending_exchange() {
+        let (registry, state) = modern_roots_exchange();
+        let before = format!("{:?}", registry.lock_state().exchanges.get(&state));
+        let wrong =
+            MrtrInputResponse::elicitation(fastmcp_protocol::ElicitResult::decline()).unwrap();
+        assert_eq!(
+            wrong.roots_result().unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        let responses = MrtrInputResponses::new([("roots".to_owned(), wrong)]).unwrap();
+        assert_eq!(
+            registry.accept(&state, responses).unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        assert_eq!(
+            format!("{:?}", registry.lock_state().exchanges.get(&state)),
+            before,
+            "kind rejection must leave the pending roots exchange unchanged"
+        );
+
+        let invalid = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::json!({"roots": [{"uri": "file:///workspace", "name": null}]}),
+        )]);
+        assert_eq!(
+            registry.accept_wire(&state, &invalid).unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        assert_eq!(
+            format!("{:?}", registry.lock_state().exchanges.get(&state)),
+            before,
+            "a present null name must not consume or modify the pending exchange"
+        );
+        assert_eq!(registry.active_len(), 1);
+
+        let responses =
+            MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())]).unwrap();
+        let MrtrRetry::Complete(completed) = registry.accept(&state, responses).unwrap() else {
+            panic!("the original state must still accept a corrected roots response");
+        };
+        assert!(completed.roots("roots").unwrap().unwrap().roots.is_empty());
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_modern_roots_wire_siblings_remain_inert() {
+        let response = MrtrInputResponse::from_wire(
+            MrtrInputKind::Roots,
+            serde_json::json!({
+                "roots": [{"uri": "file:///workspace", "name": ""}],
+                "unknown": {"roots": [{"uri": "file:///unselected"}]},
+                "_meta": {"vendor.example/display": true},
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({"roots": [{"uri": "file:///workspace", "name": ""}]})
+        );
+        let roots: fastmcp_protocol::FinalEmbeddedRootsListResult =
+            response.roots_result().unwrap();
+        assert_eq!(roots.roots.len(), 1);
+        assert_eq!(roots.roots[0].uri, "file:///workspace");
+        assert_eq!(roots.roots[0].name.as_deref(), Some(""));
+        for invalid in [
+            serde_json::json!({"unknown": {"roots": []}}),
+            serde_json::json!({"roots": null}),
+            serde_json::json!({"roots": {}}),
+        ] {
+            assert_eq!(
+                MrtrInputResponse::from_wire(MrtrInputKind::Roots, invalid)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_final_elicitation_constructor_preserves_mode_and_rejects_mismatch() {
+        for mut params in [
+            final_form_elicitation_params(),
+            final_url_elicitation_params(),
+        ] {
+            let expected = serde_json::to_value(&params).unwrap();
+            let request = MrtrInputRequest::final_elicitation(params.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::json!({"method": "elicitation/create", "params": expected})
+            );
+            match &mut params {
+                fastmcp_protocol::FinalEmbeddedElicitationParams::Form(form) => {
+                    form.mode = fastmcp_protocol::ElicitMode::Url;
+                }
+                fastmcp_protocol::FinalEmbeddedElicitationParams::Url(url) => {
+                    url.mode = fastmcp_protocol::ElicitMode::Form;
+                }
+            }
+            assert!(MrtrInputRequest::final_elicitation(params).is_err());
+        }
     }
 
     #[test]
