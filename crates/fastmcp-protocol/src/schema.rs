@@ -2378,6 +2378,11 @@ fn validate_with_schema_features(
     {
         push_error(&mut errors, "root", "pattern input byte limit exceeded");
     }
+    if let Some(message) = context.recursion_limit_exceeded
+        && !errors.iter().any(|error| error.message == message)
+    {
+        push_error(&mut errors, "root", message);
+    }
 
     if errors.is_empty() {
         Ok(())
@@ -2502,10 +2507,11 @@ struct ValidationContext<'a> {
     root_schema: &'a Value,
     schema_depth: usize,
     reference_depth: usize,
-    dynamic_anchors: Vec<(String, Value)>,
+    dynamic_scope: Vec<&'a serde_json::Map<String, Value>>,
     remaining_work: usize,
     work_exhausted: bool,
     pattern_input_exceeded: bool,
+    recursion_limit_exceeded: Option<&'static str>,
     enforce_unevaluated_properties: bool,
 }
 
@@ -2515,10 +2521,11 @@ impl<'a> ValidationContext<'a> {
             root_schema,
             schema_depth: 0,
             reference_depth: 0,
-            dynamic_anchors: Vec::new(),
+            dynamic_scope: Vec::new(),
             remaining_work: MAX_SCHEMA_VALIDATION_WORK,
             work_exhausted: false,
             pattern_input_exceeded: false,
+            recursion_limit_exceeded: None,
             enforce_unevaluated_properties,
         }
     }
@@ -2533,7 +2540,12 @@ impl<'a> ValidationContext<'a> {
     }
 
     fn enter_schema(&mut self) -> bool {
-        if self.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH || !self.consume_work() {
+        if self.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+            self.recursion_limit_exceeded
+                .get_or_insert("schema validation nesting limit exceeded");
+            return false;
+        }
+        if !self.consume_work() {
             return false;
         }
         self.schema_depth += 1;
@@ -2546,6 +2558,8 @@ impl<'a> ValidationContext<'a> {
 
     fn enter_reference(&mut self) -> bool {
         if self.reference_depth >= MAX_LOCAL_REFERENCE_DEPTH {
+            self.recursion_limit_exceeded
+                .get_or_insert("local schema reference depth limit exceeded");
             return false;
         }
         self.reference_depth += 1;
@@ -2556,20 +2570,43 @@ impl<'a> ValidationContext<'a> {
         self.reference_depth -= 1;
     }
 
-    fn push_dynamic_anchor(&mut self, name: &str, schema: &Value) {
-        self.dynamic_anchors.push((name.to_owned(), schema.clone()));
+    fn push_dynamic_scope(&mut self, schema: &'a serde_json::Map<String, Value>) {
+        self.dynamic_scope.push(schema);
     }
 
-    fn pop_dynamic_anchor(&mut self) {
-        let _ = self.dynamic_anchors.pop();
+    fn pop_dynamic_scope(&mut self) {
+        let _ = self.dynamic_scope.pop();
     }
 
-    fn dynamic_anchor_target(&self, name: &str) -> Option<Value> {
-        self.dynamic_anchors
-            .iter()
-            .rev()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, schema)| schema.clone())
+    fn dynamic_anchor_target(&mut self, name: &str) -> Result<Option<&'a Value>, &'static str> {
+        let root_schema = self.root_schema;
+        let mut previous_resource: Option<&Value> = None;
+        // Draft 2020-12 Core 8.2.3.2 selects the outermost resource, not the
+        // nearest visited anchor. An anchor under that resource's $defs also
+        // participates even when its schema has not itself been evaluated.
+        for index in 0..self.dynamic_scope.len() {
+            let source = self.dynamic_scope[index];
+            let mut charge = || {
+                if self.consume_work() {
+                    Ok(())
+                } else {
+                    Err("schema validation work limit exceeded")
+                }
+            };
+            let scope = find_schema_resource_scope(root_schema, source, &mut charge)?
+                .ok_or("unresolved local schema reference")?;
+            if previous_resource.is_some_and(|previous| std::ptr::eq(previous, scope.resource)) {
+                continue;
+            }
+            previous_resource = Some(scope.resource);
+            if let Some(target) =
+                find_resource_anchor_with_charge(scope.resource, name, &mut charge)?
+                && target.get("$dynamicAnchor").and_then(Value::as_str) == Some(name)
+            {
+                return Ok(Some(target));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -2712,12 +2749,12 @@ fn push_error(errors: &mut Vec<ValidationError>, path: &str, message: impl Into<
 }
 
 /// Internal recursive validation function.
-fn validate_internal(
-    schema: &Value,
+fn validate_internal<'a>(
+    schema: &'a Value,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.enter_schema() {
         let reason = if context.remaining_work == 0 {
@@ -2768,14 +2805,10 @@ fn validate_internal(
         }
     }
 
-    let has_dynamic_anchor = context.enforce_unevaluated_properties
-        && schema_obj
-            .get("$dynamicAnchor")
-            .and_then(Value::as_str)
-            .map(|name| {
-                context.push_dynamic_anchor(name, schema);
-            })
-            .is_some();
+    let tracks_dynamic_scope = context.enforce_unevaluated_properties;
+    if tracks_dynamic_scope {
+        context.push_dynamic_scope(schema_obj);
+    }
 
     validate_local_reference(schema_obj, value, path, errors, context);
     validate_dynamic_reference(schema_obj, value, path, errors, context);
@@ -2832,8 +2865,8 @@ fn validate_internal(
         }
         _ => {}
     }
-    if has_dynamic_anchor {
-        context.pop_dynamic_anchor();
+    if tracks_dynamic_scope {
+        context.pop_dynamic_scope();
     }
     context.leave_schema();
 }
@@ -2883,17 +2916,8 @@ fn validate_dynamic_reference(
         return;
     }
     let root_schema = context.root_schema;
-    match resolve_local_reference_with_work(root_schema, schema, reference, context) {
-        Ok(target) => {
-            let dynamic_anchor = target
-                .as_object()
-                .and_then(|object| object.get("$dynamicAnchor"))
-                .and_then(Value::as_str);
-            let selected = dynamic_anchor
-                .and_then(|name| context.dynamic_anchor_target(name))
-                .unwrap_or_else(|| target.clone());
-            validate_internal(&selected, value, path, errors, context);
-        }
+    match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
+        Ok(target) => validate_internal(target, value, path, errors, context),
         Err(message) => push_error(errors, path, message),
     }
     context.leave_reference();
@@ -2902,6 +2926,28 @@ fn validate_dynamic_reference(
 struct SchemaResourceScope<'a> {
     resource: &'a Value,
     base: Option<String>,
+}
+
+fn resolve_dynamic_reference_with_work<'a>(
+    root_schema: &'a Value,
+    source: &serde_json::Map<String, Value>,
+    reference: &str,
+    context: &mut ValidationContext<'a>,
+) -> Result<&'a Value, &'static str> {
+    let target = resolve_local_reference_with_work(root_schema, source, reference, context)?;
+    // Only a plain-name fragment defined by $dynamicAnchor activates dynamic
+    // scope. A JSON Pointer to the very same schema remains a static reference.
+    let dynamic_anchor = split_uri_reference_fragment(reference)
+        .1
+        .and_then(decode_uri_fragment)
+        .filter(|fragment| !fragment.is_empty() && !fragment.starts_with('/'))
+        .filter(|fragment| {
+            target.get("$dynamicAnchor").and_then(Value::as_str) == Some(fragment.as_str())
+        });
+    match dynamic_anchor {
+        Some(name) => Ok(context.dynamic_anchor_target(&name)?.unwrap_or(target)),
+        None => Ok(target),
+    }
 }
 
 fn resolve_local_reference<'a>(
@@ -3569,12 +3615,12 @@ fn unescape_json_pointer_segment(segment: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn validate_composition(
-    schema: &serde_json::Map<String, Value>,
+fn validate_composition<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     validate_all_of(schema, value, path, errors, context);
     validate_any_of(schema, value, path, errors, context);
@@ -3601,12 +3647,12 @@ fn bounded_subschemas<'a>(
     Some(subschemas)
 }
 
-fn validate_all_of(
-    schema: &serde_json::Map<String, Value>,
+fn validate_all_of<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if let Some(subschemas) = bounded_subschemas(schema, "allOf", path, errors) {
         for subschema in subschemas {
@@ -3615,12 +3661,12 @@ fn validate_all_of(
     }
 }
 
-fn validate_any_of(
-    schema: &serde_json::Map<String, Value>,
+fn validate_any_of<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, "anyOf", path, errors) else {
         return;
@@ -3637,12 +3683,12 @@ fn validate_any_of(
     }
 }
 
-fn validate_one_of(
-    schema: &serde_json::Map<String, Value>,
+fn validate_one_of<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, "oneOf", path, errors) else {
         return;
@@ -3658,12 +3704,12 @@ fn validate_one_of(
     }
 }
 
-fn validate_not(
-    schema: &serde_json::Map<String, Value>,
+fn validate_not<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if let Some(subschema) = schema.get("not") {
         if branch_is_valid(subschema, value, path, context) {
@@ -3672,12 +3718,12 @@ fn validate_not(
     }
 }
 
-fn validate_conditional(
-    schema: &serde_json::Map<String, Value>,
+fn validate_conditional<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(condition) = schema.get("if") else {
         return;
@@ -3692,11 +3738,11 @@ fn validate_conditional(
     }
 }
 
-fn branch_is_valid(
-    schema: &Value,
+fn branch_is_valid<'a>(
+    schema: &'a Value,
     value: &Value,
     path: &str,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) -> bool {
     if context.enforce_unevaluated_properties && !context.consume_work() {
         return false;
@@ -3764,13 +3810,13 @@ fn json_type_name_with_final_semantics(value: &Value, final_semantics: bool) -> 
 }
 
 /// Validates object-specific constraints.
-fn validate_object(
-    schema: &serde_json::Map<String, Value>,
+fn validate_object<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     // Check required fields
     if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
@@ -3890,13 +3936,13 @@ fn validate_object(
 
 /// Applies the Draft 2020-12 `unevaluatedProperties` keyword after every
 /// sibling applicator has had an opportunity to evaluate object members.
-fn validate_unevaluated_properties(
-    schema: &serde_json::Map<String, Value>,
+fn validate_unevaluated_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(unevaluated_schema) = schema.get("unevaluatedProperties") else {
         return;
@@ -3935,15 +3981,39 @@ fn validate_unevaluated_properties(
 /// `unevaluatedProperties` consumes all remaining members when it belongs to
 /// a successful nested applicator. The outer invocation leaves its own keyword
 /// out of the annotation set so that it can validate those remaining members.
-fn mark_evaluated_object_properties(
-    schema: &serde_json::Map<String, Value>,
+fn mark_evaluated_object_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     include_unevaluated_properties: bool,
     evaluated: &mut std::collections::HashSet<String>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
+) {
+    context.push_dynamic_scope(schema);
+    mark_evaluated_object_properties_inner(
+        schema,
+        value,
+        obj,
+        path,
+        include_unevaluated_properties,
+        evaluated,
+        errors,
+        context,
+    );
+    context.pop_dynamic_scope();
+}
+
+fn mark_evaluated_object_properties_inner<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    value: &Value,
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    include_unevaluated_properties: bool,
+    evaluated: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.consume_work() {
         push_error(errors, path, "schema validation work limit exceeded");
@@ -4009,23 +4079,16 @@ fn mark_evaluated_object_properties(
             push_error(errors, path, "local schema reference depth limit exceeded");
         } else {
             let root_schema = context.root_schema;
-            let target =
-                resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
-            if let Some(target) = target {
-                let dynamic_anchor = target
-                    .as_object()
-                    .and_then(|object| object.get("$dynamicAnchor"))
-                    .and_then(Value::as_str);
-                let selected = dynamic_anchor
-                    .and_then(|name| context.dynamic_anchor_target(name))
-                    .unwrap_or_else(|| target.clone());
-                if branch_is_valid(&selected, value, path, context)
-                    && let Some(selected) = selected.as_object()
-                {
-                    mark_evaluated_object_properties(
-                        selected, value, obj, path, true, evaluated, errors, context,
-                    );
+            match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
+                Ok(target) if branch_is_valid(target, value, path, context) => {
+                    if let Some(target) = target.as_object() {
+                        mark_evaluated_object_properties(
+                            target, value, obj, path, true, evaluated, errors, context,
+                        );
+                    }
                 }
+                Ok(_) => {}
+                Err(message) => push_error(errors, path, message),
             }
             context.leave_reference();
         }
@@ -4093,15 +4156,15 @@ fn mark_evaluated_object_properties(
 }
 
 /// Merges annotations from every successful `allOf` or `anyOf` branch.
-fn mark_composition_evaluated_properties(
-    schema: &serde_json::Map<String, Value>,
+fn mark_composition_evaluated_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     keyword: &str,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     evaluated: &mut std::collections::HashSet<String>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, keyword, path, errors) else {
         return;
@@ -4149,13 +4212,13 @@ fn compile_pattern_properties<'a>(
     patterns
 }
 
-fn validate_dependencies(
-    schema: &serde_json::Map<String, Value>,
+fn validate_dependencies<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object) {
         for (trigger, required) in dependent_required {
@@ -4194,12 +4257,12 @@ fn validate_dependencies(
 }
 
 /// Validates array-specific constraints.
-fn validate_array(
-    schema: &serde_json::Map<String, Value>,
+fn validate_array<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     // Validate prefixItems (tuple validation)
     let mut prefix_len = 0;
@@ -4356,12 +4419,12 @@ fn validate_array(
 
 /// Applies Draft 2020-12 `unevaluatedItems` after sibling applicators have
 /// contributed their successful item annotations.
-fn validate_unevaluated_items(
-    schema: &serde_json::Map<String, Value>,
+fn validate_unevaluated_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(unevaluated_schema) = schema.get("unevaluatedItems") else {
         return;
@@ -4385,14 +4448,36 @@ fn validate_unevaluated_items(
     }
 }
 
-fn mark_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     arr: &[Value],
     path: &str,
     include_unevaluated_items: bool,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
+) {
+    context.push_dynamic_scope(schema);
+    mark_evaluated_array_items_inner(
+        schema,
+        arr,
+        path,
+        include_unevaluated_items,
+        evaluated,
+        errors,
+        context,
+    );
+    context.pop_dynamic_scope();
+}
+
+fn mark_evaluated_array_items_inner<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    arr: &[Value],
+    path: &str,
+    include_unevaluated_items: bool,
+    evaluated: &mut HashSet<usize>,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !consume_validation_work(context, path, errors) {
         return;
@@ -4506,14 +4591,14 @@ fn mark_evaluated_array_items(
     }
 }
 
-fn mark_reference_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_reference_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     reference: &str,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.enter_reference() {
         push_error(errors, path, "local schema reference depth limit exceeded");
@@ -4530,46 +4615,40 @@ fn mark_reference_evaluated_array_items(
     context.leave_reference();
 }
 
-fn mark_dynamic_reference_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_dynamic_reference_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     reference: &str,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.enter_reference() {
         push_error(errors, path, "local schema reference depth limit exceeded");
         return;
     }
     let root_schema = context.root_schema;
-    let target = resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
-    if let Some(target) = target {
-        let dynamic_anchor = target
-            .as_object()
-            .and_then(|object| object.get("$dynamicAnchor"))
-            .and_then(Value::as_str);
-        let selected = dynamic_anchor
-            .and_then(|name| context.dynamic_anchor_target(name))
-            .unwrap_or_else(|| target.clone());
-        if branch_is_valid(&selected, &Value::Array(arr.to_vec()), path, context)
-            && let Some(selected) = selected.as_object()
-        {
-            mark_evaluated_array_items(selected, arr, path, true, evaluated, errors, context);
+    match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
+        Ok(target) if branch_is_valid(target, &Value::Array(arr.to_vec()), path, context) => {
+            if let Some(target) = target.as_object() {
+                mark_evaluated_array_items(target, arr, path, true, evaluated, errors, context);
+            }
         }
+        Ok(_) => {}
+        Err(message) => push_error(errors, path, message),
     }
     context.leave_reference();
 }
 
-fn mark_composition_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_composition_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     keyword: &str,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, keyword, path, errors) else {
         return;
@@ -5906,6 +5985,224 @@ mod tests {
             .expect_err("changing only the dynamically referenced value must reject");
         assert!(errors.iter().any(|error| error.path == "root.child.value"));
         assert_eq!(accepted, json!({"value": 1, "child": {"value": 2}}));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_preserves_recursive_lexical_identity() {
+        let source = json!({
+            "$defs": {
+                "label": {"type": "string", "minLength": 1},
+                "node": {
+                    "$dynamicAnchor": "node",
+                    "type": "object",
+                    "properties": {
+                        "label": {"$ref": "#/$defs/label"},
+                        "child": {"$dynamicRef": "#node"}
+                    },
+                    "required": ["label"],
+                    "additionalProperties": false
+                }
+            },
+            "$ref": "#node"
+        });
+        let schema = admit_final_schema(source.clone()).expect("recursive schemas admit");
+        let accepted = json!({
+            "label": "first",
+            "child": {"label": "second", "child": {"label": "third"}}
+        });
+        schema
+            .validate(&accepted)
+            .expect("every recursive level retains its original lexical reference scope");
+        let mut planted = accepted.clone();
+        planted["child"]["child"]["label"] = json!(7);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("the same referenced label constraint applies at the deepest level");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == "root.child.child.label")
+        );
+        assert_eq!(schema.schema(), &source);
+        assert_eq!(accepted["child"]["child"]["label"], json!("third"));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_uses_outermost_resource_override() {
+        let schema = admit_final_schema(json!({
+            "$id": "https://schemas.example.test/strict",
+            "$dynamicAnchor": "node",
+            "$ref": "tree",
+            "properties": {"strict": {"const": true}},
+            "required": ["strict"],
+            "$defs": {"tree": {
+                "$id": "tree",
+                "$dynamicAnchor": "node",
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"},
+                    "child": {"$dynamicRef": "#node"}
+                },
+                "required": ["value"]
+            }}
+        }))
+        .expect("independent resources may extend the same dynamic anchor");
+        let accepted = json!({
+            "value": 1, "strict": true,
+            "child": {"value": 2, "strict": true}
+        });
+        schema
+            .validate(&accepted)
+            .expect("the outer resource's constraints apply to recursive children");
+        let mut planted = accepted.clone();
+        planted["child"]["strict"] = json!(false);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("the inner tree cannot bypass an outer recursive constraint");
+        assert!(errors.iter().any(|error| error.path == "root.child.strict"));
+        assert_eq!(accepted["child"]["strict"], json!(true));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_finds_unvisited_resource_anchor() {
+        let schema = admit_final_schema(json!({
+            "$id": "https://schemas.example.test/outer",
+            "properties": {"entry": {"$ref": "inner"}},
+            "$defs": {
+                "outerConstraint": {
+                    "$dynamicAnchor": "value",
+                    "type": "string", "minLength": 3
+                },
+                "inner": {
+                    "$id": "inner",
+                    "properties": {"value": {"$dynamicRef": "#value"}},
+                    "$defs": {"defaultConstraint": {
+                        "$dynamicAnchor": "value", "type": "string"
+                    }}
+                }
+            }
+        }))
+        .expect("anchors under $defs belong to their containing resource");
+        let accepted = json!({"entry": {"value": "ready"}});
+        schema
+            .validate(&accepted)
+            .expect("the extended value satisfies both constraints");
+        let mut planted = accepted.clone();
+        planted["entry"]["value"] = json!("x");
+        let errors = schema
+            .validate(&planted)
+            .expect_err("an outer anchor participates before its schema is directly visited");
+        assert!(errors.iter().any(|error| error.path == "root.entry.value"));
+        assert_eq!(accepted["entry"]["value"], json!("ready"));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_pointer_target_remains_static() {
+        let source = json!({
+            "$id": "https://schemas.example.test/outer",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "properties": {"value": {"$dynamicRef": "inner#/$defs/node"}},
+            "$defs": {"inner": {
+                "$id": "inner",
+                "$defs": {"node": {"$dynamicAnchor": "node", "type": "string"}}
+            }}
+        });
+        let schema =
+            admit_final_schema(source.clone()).expect("a pointer may name an anchor schema");
+        let accepted = json!({"value": "ready"});
+        schema
+            .validate(&accepted)
+            .expect("a pointer reference does not activate the containing object's override");
+        assert!(schema.validate(&json!({"value": 1})).is_err());
+
+        let mut dynamic = source;
+        dynamic["properties"]["value"]["$dynamicRef"] = json!("inner#node");
+        let schema = admit_final_schema(dynamic).expect("the plain-name anchor also admits");
+        let errors = schema
+            .validate(&accepted)
+            .expect_err("changing only the URI fragment activates the outer object constraint");
+        assert!(errors.iter().any(|error| error.path == "root.value"));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_annotations_preserve_object_and_array_evaluation() {
+        for (constraints, accepted, planted, expected_path, unevaluated_keyword) in [
+            (
+                json!({"properties": {"answer": {"type": "integer"}}}),
+                json!({"answer": 42}),
+                json!({"answer": 42, "extra": true}),
+                "root.extra",
+                "unevaluatedProperties",
+            ),
+            (
+                json!({"prefixItems": [{"type": "integer"}]}),
+                json!([42]),
+                json!([42, true]),
+                "root[1]",
+                "unevaluatedItems",
+            ),
+        ] {
+            let schema = admit_final_schema(json!({
+                "$defs": {
+                    "selected": {"$dynamicAnchor": "shape", "$ref": "#/$defs/constraints"},
+                    "constraints": constraints
+                },
+                "$dynamicRef": "#shape",
+                unevaluated_keyword: false
+            }))
+            .expect("dynamic references and their lexical references remain admitted");
+            schema
+                .validate(&accepted)
+                .expect("annotations survive dynamic reference and lexical reference traversal");
+            let errors = schema
+                .validate(&planted)
+                .expect_err("one additional unevaluated member remains rejected");
+            assert!(errors.iter().any(|error| error.path == expected_path));
+        }
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_cycle_and_lookup_limits_fail_closed() {
+        let terminating = json!({
+            "$defs": {"node": {"$dynamicAnchor": "node", "type": "object"}},
+            "not": {"$dynamicRef": "#node"}
+        });
+        admit_final_schema(terminating.clone())
+            .expect("the terminating reference admits")
+            .validate(&Value::Null)
+            .expect("a real type mismatch may satisfy not");
+        let mut cycle = terminating;
+        cycle["$defs"]["node"] = json!({"$dynamicAnchor": "node", "$dynamicRef": "#node"});
+        let errors = admit_final_schema(cycle)
+            .expect("admission permits bounded recursive references")
+            .validate(&Value::Null)
+            .expect_err("a recursion limit is never a successful not-branch mismatch");
+        assert!(errors.iter().any(|error| {
+            error.message == "local schema reference depth limit exceeded"
+                || error.message == "schema validation nesting limit exceeded"
+                || error.message == "schema validation work limit exceeded"
+        }));
+
+        let root = json!({"$defs": {"node": {"$dynamicAnchor": "node", "type": "integer"}}});
+        let source = root.as_object().expect("the schema is an object");
+        let mut exact = ValidationContext::new(&root, true);
+        exact.push_dynamic_scope(source);
+        exact.remaining_work = 3;
+        let target = exact
+            .dynamic_anchor_target("node")
+            .expect("one scope visit and two anchor visits fit the exact budget")
+            .expect("the configured anchor exists");
+        assert!(std::ptr::eq(target, &root["$defs"]["node"]));
+        assert_eq!(exact.remaining_work, 0);
+        let mut exhausted = ValidationContext::new(&root, true);
+        exhausted.push_dynamic_scope(source);
+        exhausted.remaining_work = 2;
+        assert_eq!(
+            exhausted.dynamic_anchor_target("node").unwrap_err(),
+            "schema validation work limit exceeded"
+        );
+        assert!(exhausted.work_exhausted);
     }
 
     #[test]
