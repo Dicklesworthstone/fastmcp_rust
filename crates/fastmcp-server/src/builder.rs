@@ -39,9 +39,9 @@ use crate::proxy::ProxyFinalCatalog;
 use crate::proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
 use crate::proxy::{
-    ProxyCompletionHandler, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
-    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
-    ProxyTypedCatalog,
+    ProxyCatalogRelay, ProxyCompletionHandler, ProxyPromptCatalog, ProxyPromptHandler,
+    ProxyResourceCatalog, ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+    ProxyToolHandler, ProxyTypedCatalog,
 };
 #[cfg(all(test, feature = "tasks"))]
 use crate::tasks::SharedTaskManager;
@@ -299,6 +299,9 @@ pub struct ServerBuilder {
     /// cannot disambiguate two independent upstream task-ID namespaces.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
+    /// Core subscription routes are available without the Tasks extension.
+    #[cfg(feature = "proxy")]
+    catalog_relay: Option<Arc<ProxyCatalogRelay>>,
     /// Registrations refused so far. A nonempty list fails the build.
     refused_registrations: Vec<RefusedRegistration>,
 }
@@ -425,6 +428,8 @@ impl ServerBuilder {
             max_concurrent_task_handoffs: DEFAULT_CONCURRENT_TASK_HANDOFFS,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
+            #[cfg(feature = "proxy")]
+            catalog_relay: None,
             refused_registrations: Vec::new(),
         }
     }
@@ -1336,6 +1341,43 @@ impl ServerBuilder {
         }
     }
 
+    #[cfg(feature = "proxy")]
+    fn install_proxy_catalog_relay(
+        &mut self,
+        relay: Option<Arc<ProxyCatalogRelay>>,
+    ) -> fastmcp_core::McpResult<()> {
+        if let Some(relay) = relay {
+            self.catalog_relay = Some(match self.catalog_relay.as_ref() {
+                Some(existing) => Arc::new(existing.merge(&relay)?),
+                None => relay,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "proxy")]
+    fn install_mounted_catalog_relay(
+        &mut self,
+        relay: Option<Arc<ProxyCatalogRelay>>,
+        result: &crate::MountResult,
+        resource_prefix: Option<&str>,
+        mount_prefix: Option<&str>,
+    ) {
+        if result.is_success()
+            && let Some(relay) = relay
+        {
+            let relay = relay.mounted(
+                result.tools > 0,
+                result.resources > 0 || result.resource_templates > 0,
+                result.prompts > 0,
+                resource_prefix,
+            );
+            if let Err(error) = self.install_proxy_catalog_relay(Some(Arc::new(relay))) {
+                self.refuse_mount(mount_prefix, error.to_string());
+            }
+        }
+    }
+
     /// Installs modern Tasks discovery and dispatch once, then adds later
     /// upstream routes to that broker. Exact-2024 supplies no Tasks relay.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -1384,6 +1426,7 @@ impl ServerBuilder {
     ) -> fastmcp_core::McpResult<Self> {
         client.admit_catalog(&catalog)?;
         let catalog_era = catalog.era()?;
+        self.install_proxy_catalog_relay(client.catalog_relay(&catalog)?)?;
         let completion_supported = match client.supports_completion() {
             Ok(supported) => supported,
             Err(error) => {
@@ -1786,6 +1829,7 @@ impl ServerBuilder {
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
         self.adopt_upstream_proxy_implementation(&proxy_client)?;
+        self.install_proxy_catalog_relay(proxy_client.typed_catalog_relay(&catalog)?)?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
@@ -2138,6 +2182,7 @@ impl ServerBuilder {
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
         self.adopt_upstream_proxy_implementation(&proxy_client)?;
+        self.install_proxy_catalog_relay(proxy_client.typed_catalog_relay(&catalog)?)?;
         #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
         #[cfg(not(feature = "tasks"))]
@@ -2369,10 +2414,15 @@ impl ServerBuilder {
         let has_resources = server.has_resources();
         let has_prompts = server.has_prompts();
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result = self
             .router
             .mount_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, prefix, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2420,10 +2470,15 @@ impl ServerBuilder {
         let has_resources = server.has_resources();
         let has_prompts = server.has_prompts();
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_namespaced_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, None, prefix);
 
         for warning in &result.warnings {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
@@ -2476,10 +2531,15 @@ impl ServerBuilder {
             return self;
         }
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_tools_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, None, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2526,10 +2586,15 @@ impl ServerBuilder {
             return self;
         }
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_resources_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, prefix, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2572,10 +2637,15 @@ impl ServerBuilder {
     /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate).
     #[must_use]
     pub fn mount_prompts(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_prompts_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, None, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2964,6 +3034,8 @@ impl ServerBuilder {
             self.console_config.should_use_rich(),
         );
         let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
+        #[cfg(feature = "proxy")]
+        let catalog_relay = self.catalog_relay.clone();
         #[cfg(feature = "tasks")]
         let final_task_runtime = self.final_task_runtime.clone();
         #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -3077,6 +3149,8 @@ impl ServerBuilder {
             task_service_host,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay,
+            #[cfg(feature = "proxy")]
+            catalog_relay,
             final_subscriptions,
         }
     }

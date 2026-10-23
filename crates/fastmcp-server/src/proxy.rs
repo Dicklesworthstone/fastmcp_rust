@@ -6,16 +6,13 @@
 #[cfg(feature = "tasks")]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg(feature = "tasks")]
 use std::future::Future;
-#[cfg(feature = "tasks")]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Instant;
 
 use asupersync::Cx;
-#[cfg(feature = "tasks")]
 use asupersync::cx::{ChildRegion, ChildRegionSpec};
 #[cfg(feature = "tasks")]
 use base64::Engine as _;
@@ -503,7 +500,6 @@ impl ProxyFinalTaskListenerRequest {
 }
 
 /// One independent HTTP catalog `subscriptions/listen` opening.
-#[cfg(feature = "tasks")]
 pub struct ProxyCatalogListenerRequest {
     client: ModernHttpClient,
     request_id: RequestId,
@@ -511,7 +507,6 @@ pub struct ProxyCatalogListenerRequest {
     limits: SseLimits,
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyCatalogListenerRequest {
     async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyCatalogListener>> {
         let listener = await_proxy_request_or_cancellation(
@@ -538,12 +533,10 @@ impl ProxyCatalogListenerRequest {
 }
 
 /// One live HTTP catalog listener detached from the proxy route mutex.
-#[cfg(feature = "tasks")]
 struct ProxyHttpCatalogListener {
     listener: ModernHttpSubscriptionListener,
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyHttpCatalogListener {
     fn map_listen_event(
         event: Option<ModernHttpSubscriptionListenEvent>,
@@ -577,7 +570,6 @@ impl ProxyHttpCatalogListener {
     }
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyCatalogListener for ProxyHttpCatalogListener {
     fn next_async<'a>(
         &'a mut self,
@@ -788,7 +780,6 @@ pub trait ProxyFinalTaskListener: Send {
 /// One live upstream catalog `subscriptions/listen` owned by a downstream
 /// request. HTTP uses an independent SSE POST so the route mutex stays free;
 /// stdio drives the incremental listener under a brief lock.
-#[cfg(feature = "tasks")]
 pub trait ProxyCatalogListener: Send {
     /// Awaits the next upstream catalog listener event on the caller's `Cx`.
     fn next_async<'a>(
@@ -800,7 +791,6 @@ pub trait ProxyCatalogListener: Send {
 
 /// One event emitted by a [`ProxyCatalogListener`].
 #[derive(Debug)]
-#[cfg(feature = "tasks")]
 pub enum ProxyCatalogListenerEvent {
     /// Upstream accepted the requested catalog filter.
     Acknowledged(SubscriptionFilter),
@@ -1833,13 +1823,18 @@ pub trait ProxyBackend: Send {
 
     /// Reserves an independent HTTP catalog listener opening without beginning
     /// upstream I/O. Incremental stdio backends return `None`.
-    #[cfg(feature = "tasks")]
     #[doc(hidden)]
     fn start_catalog_listener_request(
         &mut self,
         _notifications: SubscriptionFilter,
     ) -> McpResult<Option<ProxyCatalogListenerRequest>> {
         Ok(None)
+    }
+
+    /// Reports live core subscription support without opening an upstream
+    /// request. It is independent of the optional Tasks extension.
+    fn supports_catalog_listener(&mut self) -> McpResult<bool> {
+        self.supports_incremental_catalog_listener()
     }
 
     /// Reports whether this backend uses the sequential stdio ingress loop
@@ -1957,7 +1952,6 @@ pub trait ProxyBackend: Send {
 
     /// Retires a live incremental catalog listener so later route requests can
     /// use the sole stdio ingress reader again.
-    #[cfg(feature = "tasks")]
     fn cancel_incremental_catalog_listener(&mut self, _cx: &Cx) -> McpResult<()> {
         Ok(())
     }
@@ -4027,7 +4021,6 @@ impl ProxyBackend for Client {
         Client::try_next_subscription_event(self, cx, request_cancellation)
     }
 
-    #[cfg(feature = "tasks")]
     fn cancel_incremental_catalog_listener(&mut self, cx: &Cx) -> McpResult<()> {
         Client::cancel_live_catalog_subscription(self, cx)
     }
@@ -4197,7 +4190,6 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
 
 /// A route-owned bridge to a stdio catalog listener. Each `next_async` call
 /// briefly obtains the route mutex only to drive one bounded receive turn.
-#[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioCatalogListener {
     client: ProxyClient,
     /// Owned context for best-effort Drop-time cancellation. Derived from the
@@ -4218,7 +4210,6 @@ struct ProxyIncrementalStdioCatalogListener {
 /// when its request has gone away, drops the returned child handle and triggers
 /// its close backstop. Admission observation must not checkpoint or charge the
 /// caller's shared context.
-#[cfg(feature = "tasks")]
 async fn open_owned_proxy_listener_region(
     cx: &Cx,
     listener_kind: &'static str,
@@ -4255,7 +4246,6 @@ async fn open_owned_proxy_listener_region(
     }
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
     fn next_async<'a>(
         &'a mut self,
@@ -4290,7 +4280,6 @@ impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
     }
 }
 
-#[cfg(feature = "tasks")]
 impl Drop for ProxyIncrementalStdioCatalogListener {
     fn drop(&mut self) {
         let cx = self.cx.clone();
@@ -4546,6 +4535,410 @@ impl std::fmt::Debug for ProxyClient {
             .field("upstream_binding", &self.upstream_binding)
             .field("observed_era", &self.observed_protocol_era().ok())
             .finish_non_exhaustive()
+    }
+}
+
+const MAX_PROXY_CATALOG_ROUTES: usize = 32;
+
+fn admit_proxy_catalog_acknowledgement(
+    expected: &SubscriptionFilter,
+    event: ProxyCatalogListenerEvent,
+) -> McpResult<()> {
+    match event {
+        ProxyCatalogListenerEvent::Acknowledged(accepted)
+            if accepted.additional.is_empty()
+                && crate::subscription_filter_admission_matches(expected, &accepted)? =>
+        {
+            Ok(())
+        }
+        ProxyCatalogListenerEvent::Acknowledged(_) => Err(McpError::invalid_params(
+            "Proxy upstream changed the admitted catalog subscription filter",
+        )),
+        ProxyCatalogListenerEvent::Notification(_) | ProxyCatalogListenerEvent::Terminal => {
+            Err(McpError::invalid_request(
+                "Proxy upstream catalog listener did not acknowledge before events",
+            ))
+        }
+    }
+}
+
+/// Core subscriptions keep the immutable upstream route and catalog ownership
+/// separately from the optional Tasks service. Composition copies these
+/// receipts; an active downstream listen never borrows a mutable broker.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProxyCatalogRelay {
+    routes: Vec<ProxyCatalogRoute>,
+}
+
+#[derive(Clone, Debug)]
+struct ProxyCatalogRoute {
+    client: ProxyClient,
+    binding: ProxyUpstreamBinding,
+    tools: bool,
+    resources: bool,
+    prompts: bool,
+    resource_uris: HashSet<String>,
+    resource_templates: Vec<fastmcp_protocol::uri_template::ReversibleResourceTemplate>,
+}
+
+impl ProxyCatalogRoute {
+    fn owns_resource(&self, uri: &str) -> McpResult<Option<String>> {
+        if !self.resources {
+            return Ok(None);
+        }
+        if self.resource_uris.contains(uri) {
+            return Ok(Some(uri.to_owned()));
+        }
+        for template in &self.resource_templates {
+            if template
+                .match_uri(uri)
+                .map_err(|_| McpError::invalid_params("invalid proxied resource subscription URI"))?
+                .is_some()
+            {
+                return Ok(Some(uri.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn ensure_binding(&self) -> McpResult<()> {
+        if self.client.upstream_binding() == Some(self.binding)
+            && self.binding.era() == ProtocolEra::Modern2026
+            && matches!(
+                self.binding.adapter(),
+                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
+            )
+        {
+            Ok(())
+        } else {
+            Err(McpError::invalid_request(
+                "Proxy catalog listener lost its admitted upstream route",
+            ))
+        }
+    }
+}
+
+impl ProxyCatalogRelay {
+    pub(crate) fn merge(&self, other: &Self) -> McpResult<Self> {
+        let mut routes = self.routes.clone();
+        for route in &other.routes {
+            if let Some(existing) = routes.iter_mut().find(|existing| {
+                Arc::ptr_eq(&existing.client.inner, &route.client.inner)
+                    && existing.binding == route.binding
+            }) {
+                existing.tools |= route.tools;
+                existing.resources |= route.resources;
+                existing.prompts |= route.prompts;
+                existing
+                    .resource_uris
+                    .extend(route.resource_uris.iter().cloned());
+                for template in &route.resource_templates {
+                    if !existing.resource_templates.contains(template) {
+                        existing.resource_templates.push(template.clone());
+                    }
+                }
+            } else {
+                if routes.len() == MAX_PROXY_CATALOG_ROUTES {
+                    return Err(McpError::invalid_params(
+                        "Proxy catalog subscription route capacity exhausted",
+                    ));
+                }
+                routes.push(route.clone());
+            }
+        }
+        Ok(Self { routes })
+    }
+
+    /// Mount only the selected component families. A nonempty resource prefix
+    /// creates relative exact-2024 keys in Router and removes their modern
+    /// visibility; only URI-preserving mounts may relay core resource events.
+    pub(crate) fn mounted(
+        &self,
+        tools: bool,
+        resources: bool,
+        prompts: bool,
+        resource_prefix: Option<&str>,
+    ) -> Self {
+        let routes = self
+            .routes
+            .iter()
+            .cloned()
+            .filter_map(|mut route| {
+                route.tools &= tools;
+                route.resources &= resources;
+                route.prompts &= prompts;
+                if resource_prefix.is_some_and(|prefix| !prefix.is_empty()) {
+                    route.resources = false;
+                }
+                (route.tools || route.resources || route.prompts).then_some(route)
+            })
+            .collect();
+        Self { routes }
+    }
+
+    pub(crate) async fn open_listener_async(
+        &self,
+        ctx: &McpContext,
+        requested: SubscriptionFilter,
+        router: &crate::Router,
+    ) -> McpResult<Option<Box<dyn ProxyCatalogListener>>> {
+        ctx.ensure_live()?;
+        // Admit all route/filter receipts and the fan-out bound before any
+        // upstream side effect. No URI may select two independent authorities.
+        if self.routes.len() > MAX_PROXY_CATALOG_ROUTES {
+            return Err(McpError::invalid_params(
+                "Proxy catalog subscription route capacity exhausted",
+            ));
+        }
+        let downstream_filter = crate::core_accepted_subscription_filter(&requested);
+        let mut owners = HashSet::new();
+        let mut prepared = Vec::new();
+        for route in &self.routes {
+            route.ensure_binding()?;
+            let (owns_tools, owns_resources, owns_prompts) =
+                router.proxy_catalog_membership(&route.client);
+            let mut rewrites = HashMap::new();
+            if let Some(uris) = &downstream_filter.resource_subscriptions {
+                for uri in uris {
+                    if router.proxy_resource_owned_by(uri, &route.client)
+                        && let Some(upstream_uri) = route.owns_resource(uri)?
+                    {
+                        if !owners.insert(uri.clone()) && !rewrites.contains_key(&upstream_uri) {
+                            return Err(McpError::invalid_params(
+                                "Proxy resource subscription matches multiple upstream routes",
+                            ));
+                        }
+                        rewrites.insert(upstream_uri, uri.clone());
+                    }
+                }
+            }
+            let mut resource_subscriptions: Vec<_> = rewrites.keys().cloned().collect();
+            resource_subscriptions.sort();
+            let filter = SubscriptionFilter {
+                tools_list_changed: (route.tools
+                    && owns_tools
+                    && downstream_filter.tools_list_changed == Some(true))
+                .then_some(true),
+                resources_list_changed: (route.resources
+                    && owns_resources
+                    && downstream_filter.resources_list_changed == Some(true))
+                .then_some(true),
+                prompts_list_changed: (route.prompts
+                    && owns_prompts
+                    && downstream_filter.prompts_list_changed == Some(true))
+                .then_some(true),
+                resource_subscriptions: (!resource_subscriptions.is_empty())
+                    .then_some(resource_subscriptions),
+                additional: BTreeMap::new(),
+            };
+            if crate::catalog_filter_requests_events(&filter) {
+                prepared.push((route.clone(), filter, rewrites));
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(None);
+        }
+        let mut listeners: Vec<Box<dyn ProxyCatalogListener>> = Vec::with_capacity(prepared.len());
+        for (route, filter, rewrites) in prepared {
+            ctx.ensure_live()?;
+            let mut inner = route
+                .client
+                .open_catalog_listener_async(ctx, filter.clone())
+                .await?;
+            let cancellation = ctx.request_cancellation();
+            admit_proxy_catalog_acknowledgement(
+                &filter,
+                inner.next_async(ctx.cx(), &cancellation).await?,
+            )?;
+            ctx.ensure_live()?;
+            listeners.push(Box::new(AdmittedProxyCatalogListener {
+                inner,
+                route,
+                filter,
+                rewrites,
+                context: ctx.clone(),
+            }));
+        }
+        Ok(Some(Box::new(MultiplexedProxyCatalogListener::new(
+            listeners,
+            downstream_filter,
+        ))))
+    }
+}
+
+struct AdmittedProxyCatalogListener {
+    inner: Box<dyn ProxyCatalogListener>,
+    route: ProxyCatalogRoute,
+    filter: SubscriptionFilter,
+    rewrites: HashMap<String, String>,
+    context: McpContext,
+}
+
+impl ProxyCatalogListener for AdmittedProxyCatalogListener {
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            let ctx = self
+                .context
+                .clone()
+                .with_request_cx(cx.clone())
+                .with_request_cancellation(cancellation.clone());
+            ctx.ensure_live()?;
+            self.route.ensure_binding()?;
+            let event = self.inner.next_async(cx, cancellation).await?;
+            ctx.ensure_live()?;
+            self.route.ensure_binding()?;
+            match event {
+                ProxyCatalogListenerEvent::Notification(mut notification) => {
+                    if !crate::subscription_filter_accepts(&self.filter, &notification) {
+                        return Err(McpError::invalid_request(
+                            "Proxy upstream event is outside the admitted catalog subscription",
+                        ));
+                    }
+                    if let ServerNotification::ResourceUpdated(params) = &mut notification {
+                        let uri = self.rewrites.get(params.uri.as_str()).ok_or_else(|| {
+                            McpError::invalid_request(
+                                "Proxy resource event has no admitted URI mapping",
+                            )
+                        })?;
+                        params.uri = AbsoluteUri::parse(uri).map_err(|_| {
+                            McpError::invalid_params(
+                                "Proxy resource subscription URI is not absolute",
+                            )
+                        })?;
+                    }
+                    Ok(ProxyCatalogListenerEvent::Notification(notification))
+                }
+                ProxyCatalogListenerEvent::Acknowledged(_) => Err(McpError::invalid_request(
+                    "Proxy upstream catalog listener acknowledged more than once",
+                )),
+                ProxyCatalogListenerEvent::Terminal => Ok(ProxyCatalogListenerEvent::Terminal),
+            }
+        })
+    }
+}
+
+type ProxyCatalogListenTurn = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Box<dyn ProxyCatalogListener>,
+                    McpResult<ProxyCatalogListenerEvent>,
+                ),
+            > + Send,
+    >,
+>;
+
+/// At most one owned read per admitted route: a ready sibling never drops an
+/// unfinished HTTP/stdio read. The existing transport and delivery queues
+/// retain their byte/count bounds; this broker adds no unbounded event queue.
+struct MultiplexedProxyCatalogListener {
+    listeners: Vec<Option<Box<dyn ProxyCatalogListener>>>,
+    turns: Vec<Option<ProxyCatalogListenTurn>>,
+    acknowledgement: Option<SubscriptionFilter>,
+    next_route: usize,
+    terminated: bool,
+}
+
+impl MultiplexedProxyCatalogListener {
+    fn new(listeners: Vec<Box<dyn ProxyCatalogListener>>, filter: SubscriptionFilter) -> Self {
+        Self {
+            turns: (0..listeners.len()).map(|_| None).collect(),
+            listeners: listeners.into_iter().map(Some).collect(),
+            acknowledgement: Some(filter),
+            next_route: 0,
+            terminated: false,
+        }
+    }
+
+    fn terminate(&mut self) {
+        self.terminated = true;
+        self.acknowledgement = None;
+        self.turns.clear();
+        self.listeners.clear();
+    }
+
+    async fn next_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyCatalogListenerEvent> {
+        if self.terminated {
+            return Err(McpError::invalid_request(
+                "Proxy catalog listener was polled after terminal completion",
+            ));
+        }
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.terminate();
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(filter) = self.acknowledgement.take() {
+            return Ok(ProxyCatalogListenerEvent::Acknowledged(filter));
+        }
+        let event = await_proxy_operation_or_cancellation(
+            cx,
+            cancellation,
+            Box::pin(std::future::poll_fn(|task_cx| {
+                let route_count = self.listeners.len();
+                for offset in 0..route_count {
+                    let index = (self.next_route + offset) % route_count;
+                    if self.turns[index].is_none() {
+                        let mut listener = self.listeners[index]
+                            .take()
+                            .expect("catalog route is owned by its listener or read turn");
+                        let owned_cx = cx.clone();
+                        let owned_cancellation = cancellation.clone();
+                        self.turns[index] = Some(Box::pin(async move {
+                            let event = listener.next_async(&owned_cx, &owned_cancellation).await;
+                            (listener, event)
+                        }));
+                    }
+                    let turn = self.turns[index]
+                        .as_mut()
+                        .expect("catalog read was installed");
+                    if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
+                        self.turns[index] = None;
+                        self.listeners[index] = Some(listener);
+                        self.next_route = (index + 1) % route_count;
+                        return Poll::Ready(event);
+                    }
+                }
+                Poll::Pending
+            })),
+        )
+        .await;
+        match event {
+            Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
+                Ok(ProxyCatalogListenerEvent::Notification(notification))
+            }
+            Ok(ProxyCatalogListenerEvent::Terminal) => {
+                self.terminate();
+                Ok(ProxyCatalogListenerEvent::Terminal)
+            }
+            Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
+                self.terminate();
+                Err(McpError::invalid_request(
+                    "Proxy upstream catalog listener acknowledged more than once",
+                ))
+            }
+            Err(error) => {
+                self.terminate();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ProxyCatalogListener for MultiplexedProxyCatalogListener {
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>> {
+        Box::pin(self.next_event(cx, cancellation))
     }
 }
 
@@ -5558,17 +5951,6 @@ impl ProxyFinalTaskRelay {
                     notifications,
                 )) as Box<dyn ProxyFinalTaskListener>
             })
-    }
-
-    pub(crate) async fn open_catalog_listener_async(
-        &self,
-        ctx: &McpContext,
-        notifications: SubscriptionFilter,
-    ) -> McpResult<Box<dyn ProxyCatalogListener>> {
-        self.ensure_modern_route()?;
-        self.client
-            .open_catalog_listener_async(ctx, notifications)
-            .await
     }
 }
 
@@ -7459,7 +7841,6 @@ impl ProxyBackend for ProxyHttpClient {
         }))
     }
 
-    #[cfg(feature = "tasks")]
     fn start_catalog_listener_request(
         &mut self,
         notifications: SubscriptionFilter,
@@ -7473,6 +7854,10 @@ impl ProxyBackend for ProxyHttpClient {
             notifications,
             limits: Self::sse_limits(),
         }))
+    }
+
+    fn supports_catalog_listener(&mut self) -> McpResult<bool> {
+        Ok(modern_http_client(&self.connection).is_some())
     }
 
     #[cfg(feature = "tasks")]
@@ -8224,9 +8609,8 @@ async fn await_proxy_final_tool_body_or_cancellation(
 
 /// Awaits an upstream operation or a request-owned cancellation token when no
 /// full [`McpContext`] can be moved into the operation. This is used by the
-/// final Tasks listener, whose upstream SSE read must wake even when it is
-/// otherwise silent.
-#[cfg(feature = "tasks")]
+/// catalog and Tasks listeners, whose upstream SSE reads must wake even when
+/// they are otherwise silent.
 async fn await_proxy_operation_or_cancellation<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
@@ -9246,12 +9630,104 @@ impl ProxyClient {
         self.upstream_binding
     }
 
+    pub(crate) fn same_upstream_route(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) && self.upstream_binding == other.upstream_binding
+    }
+
     /// Returns the era sealed by an admitted typed catalog or result.
     fn observed_protocol_era(&self) -> McpResult<Option<ProtocolEra>> {
         self.observed_era
             .lock()
             .map(|era| *era)
             .map_err(|_| McpError::internal_error("Proxy observed-era lock poisoned"))
+    }
+
+    pub(crate) fn catalog_relay(
+        &self,
+        catalog: &ProxyCatalog,
+    ) -> McpResult<Option<Arc<ProxyCatalogRelay>>> {
+        if catalog.era()? != ProtocolEra::Modern2026 {
+            return Ok(None);
+        }
+        self.catalog_relay_for_components(
+            !catalog.final_tools.is_empty(),
+            !catalog.final_prompts.is_empty(),
+            &catalog.final_resources,
+            &catalog.final_resource_templates,
+        )
+    }
+
+    pub(crate) fn typed_catalog_relay(
+        &self,
+        catalog: &ProxyTypedCatalog,
+    ) -> McpResult<Option<Arc<ProxyCatalogRelay>>> {
+        catalog.era()?;
+        match (
+            &catalog.tools,
+            &catalog.resources,
+            &catalog.resource_templates,
+            &catalog.prompts,
+        ) {
+            (
+                ProxyToolCatalog::Final(tools),
+                ProxyResourceCatalog::Final(resources),
+                ProxyResourceTemplateCatalog::Final(templates),
+                ProxyPromptCatalog::Final(prompts),
+            ) => self.catalog_relay_for_components(
+                !tools.entries.is_empty(),
+                !prompts.entries.is_empty(),
+                &resources.entries,
+                &templates.entries,
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    fn catalog_relay_for_components(
+        &self,
+        tools: bool,
+        prompts: bool,
+        resources: &[fastmcp_protocol::FinalResource],
+        templates: &[fastmcp_protocol::FinalResourceTemplate],
+    ) -> McpResult<Option<Arc<ProxyCatalogRelay>>> {
+        let Some(binding) = self.upstream_binding else {
+            return Ok(None);
+        };
+        if binding.era() != ProtocolEra::Modern2026
+            || !matches!(
+                binding.adapter(),
+                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
+            )
+            || !self.with_backend(|backend| backend.supports_catalog_listener())?
+        {
+            return Ok(None);
+        }
+        let resource_templates = templates
+            .iter()
+            .map(|template| {
+                fastmcp_protocol::UriTemplate::parse(&template.uri_template)
+                    .and_then(|template| template.compile_reversible())
+                    .map_err(|_| {
+                        McpError::invalid_params(
+                            "Proxy resource subscription template cannot be routed unambiguously",
+                        )
+                    })
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(Some(Arc::new(ProxyCatalogRelay {
+            routes: vec![ProxyCatalogRoute {
+                client: self.clone(),
+                binding,
+                tools,
+                resources: !resources.is_empty() || !templates.is_empty(),
+                prompts,
+                resource_uris: resources
+                    .iter()
+                    .map(|resource| resource.uri.as_str().to_owned())
+                    .collect(),
+                resource_templates,
+            }],
+        })))
     }
 
     /// Returns a route-bound relay only when the selected upstream is modern
@@ -10761,7 +11237,6 @@ impl ProxyClient {
         self.with_backend(|backend| backend.open_final_task_listener(notifications))
     }
 
-    #[cfg(feature = "tasks")]
     async fn open_catalog_listener_async(
         &self,
         ctx: &McpContext,
@@ -11915,6 +12390,10 @@ impl ProxyToolHandler {
 }
 
 impl ToolHandler for ProxyToolHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Tool {
         self.tool.clone()
     }
@@ -12174,6 +12653,10 @@ impl ProxyResourceHandler {
 }
 
 impl ResourceHandler for ProxyResourceHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Resource {
         self.resource.clone()
     }
@@ -12385,6 +12868,10 @@ impl ProxyPromptHandler {
 }
 
 impl PromptHandler for ProxyPromptHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Prompt {
         self.prompt.clone()
     }
@@ -12559,6 +13046,238 @@ mod tests {
     use crate::handler::{FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     #[cfg(feature = "tasks")]
     use std::task::Poll;
+
+    #[test]
+    fn core_catalog_same_origin_mounts_share_one_upstream_listener_route() {
+        let binding = proxy_binding(ProtocolEra::Modern2026);
+        let client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            binding,
+            "2026-07-28",
+        )
+        .unwrap();
+        let source = super::ProxyCatalogRelay {
+            routes: vec![super::ProxyCatalogRoute {
+                client: client.clone(),
+                binding,
+                tools: true,
+                resources: true,
+                prompts: true,
+                resource_uris: std::collections::HashSet::from(["resource://shared".to_owned()]),
+                resource_templates: Vec::new(),
+            }],
+        };
+        let left = source.mounted(true, true, true, Some("left"));
+        let right = source.mounted(true, true, true, Some("right"));
+        let combined = left.merge(&right).unwrap();
+        assert_eq!(
+            combined.routes.len(),
+            1,
+            "different name prefixes cannot duplicate an origin's catalog stream"
+        );
+        assert!(combined.routes[0].tools && combined.routes[0].prompts);
+        assert!(
+            !combined.routes[0].resources,
+            "ordinary prefixed mounts remove modern resource visibility"
+        );
+        assert_eq!(
+            combined.routes[0]
+                .owns_resource("resource://shared")
+                .unwrap(),
+            None
+        );
+
+        let preserved = source.mounted(false, true, false, None);
+        let combined = combined.merge(&preserved).unwrap();
+        assert_eq!(
+            combined.routes.len(),
+            1,
+            "an exact-URI resource mount shares the same origin's one listener"
+        );
+        assert!(
+            combined.routes[0].tools && combined.routes[0].resources && combined.routes[0].prompts
+        );
+        assert_eq!(
+            combined.routes[0]
+                .owns_resource("resource://shared")
+                .unwrap(),
+            Some("resource://shared".to_owned())
+        );
+        assert_eq!(
+            combined.routes[0]
+                .owns_resource("left/resource://shared")
+                .unwrap(),
+            None
+        );
+        assert_eq!(combined.routes[0].resource_uris.len(), 1);
+
+        let mut independent = preserved;
+        independent.routes[0].client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            binding,
+            "2026-07-28",
+        )
+        .unwrap();
+        assert_eq!(
+            combined.merge(&independent).unwrap().routes.len(),
+            2,
+            "equal adapter/generation metadata cannot merge independent origins"
+        );
+    }
+
+    #[test]
+    fn core_catalog_acknowledgement_rejects_filter_changes_before_delivery() {
+        use super::{ProxyCatalogListenerEvent, admit_proxy_catalog_acknowledgement};
+
+        let requested = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resource_subscriptions: Some(vec!["resource://a".into(), "resource://b".into()]),
+            ..SubscriptionFilter::default()
+        };
+        let mut reordered = requested.clone();
+        reordered.resource_subscriptions = Some(vec![
+            "resource://b".into(),
+            "resource://a".into(),
+            "resource://a".into(),
+        ]);
+        reordered.prompts_list_changed = Some(false);
+        admit_proxy_catalog_acknowledgement(
+            &requested,
+            ProxyCatalogListenerEvent::Acknowledged(reordered),
+        )
+        .expect("set-equivalent core acknowledgement is admitted");
+
+        let mut narrowed = requested.clone();
+        narrowed.resource_subscriptions = Some(vec!["resource://a".into()]);
+        let mut widened = requested.clone();
+        widened.prompts_list_changed = Some(true);
+        let mut extension = requested.clone();
+        extension
+            .additional
+            .insert("example.org/extra".into(), serde_json::json!(true));
+        for changed in [narrowed, widened, extension] {
+            let error = admit_proxy_catalog_acknowledgement(
+                &requested,
+                ProxyCatalogListenerEvent::Acknowledged(changed),
+            )
+            .expect_err("one-field filter drift must not acknowledge downstream");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+        }
+        for event in [
+            ProxyCatalogListenerEvent::Terminal,
+            ProxyCatalogListenerEvent::Notification(ServerNotification::ToolsListChanged(None)),
+        ] {
+            let error = admit_proxy_catalog_acknowledgement(&requested, event)
+                .expect_err("acknowledgement must precede every other event");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn core_catalog_multiplexer_retains_pending_reads_and_closes_every_leg() {
+        use super::{ProxyCatalogListener, ProxyCatalogListenerEvent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct ReadLifetime(Arc<AtomicUsize>);
+        impl Drop for ReadLifetime {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Listener {
+            gate: Arc<AtomicBool>,
+            read_drops: Arc<AtomicUsize>,
+            listener_drops: Arc<AtomicUsize>,
+            terminal: bool,
+        }
+        impl Drop for Listener {
+            fn drop(&mut self) {
+                self.listener_drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl ProxyCatalogListener for Listener {
+            fn next_async<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _cancellation: &'a McpRequestCancellation,
+            ) -> super::Pin<
+                Box<
+                    dyn super::Future<Output = fastmcp_core::McpResult<ProxyCatalogListenerEvent>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let lifetime = ReadLifetime(Arc::clone(&self.read_drops));
+                Box::pin(async move {
+                    let _lifetime = lifetime;
+                    std::future::poll_fn(|_| {
+                        if self.terminal {
+                            super::Poll::Ready(Ok(ProxyCatalogListenerEvent::Terminal))
+                        } else if self.gate.swap(false, Ordering::SeqCst) {
+                            self.terminal = true;
+                            super::Poll::Ready(Ok(ProxyCatalogListenerEvent::Notification(
+                                ServerNotification::ToolsListChanged(None),
+                            )))
+                        } else {
+                            super::Poll::Pending
+                        }
+                    })
+                    .await
+                })
+            }
+        }
+
+        let slow_gate = Arc::new(AtomicBool::new(false));
+        let slow_read_drops = Arc::new(AtomicUsize::new(0));
+        let slow_listener_drops = Arc::new(AtomicUsize::new(0));
+        let fast_listener_drops = Arc::new(AtomicUsize::new(0));
+        let mut listener = super::MultiplexedProxyCatalogListener::new(
+            vec![
+                Box::new(Listener {
+                    gate: Arc::clone(&slow_gate),
+                    read_drops: Arc::clone(&slow_read_drops),
+                    listener_drops: Arc::clone(&slow_listener_drops),
+                    terminal: false,
+                }),
+                Box::new(Listener {
+                    gate: Arc::new(AtomicBool::new(true)),
+                    read_drops: Arc::new(AtomicUsize::new(0)),
+                    listener_drops: Arc::clone(&fast_listener_drops),
+                    terminal: false,
+                }),
+            ],
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+        );
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            block_on(listener.next_event(&cx, &cancellation)).unwrap(),
+            ProxyCatalogListenerEvent::Acknowledged(_)
+        ));
+        assert!(matches!(
+            block_on(listener.next_event(&cx, &cancellation)).unwrap(),
+            ProxyCatalogListenerEvent::Notification(_)
+        ));
+        assert_eq!(
+            slow_read_drops.load(Ordering::SeqCst),
+            0,
+            "a ready sibling cannot discard a partially consumed upstream read"
+        );
+        assert!(matches!(
+            block_on(listener.next_event(&cx, &cancellation)).unwrap(),
+            ProxyCatalogListenerEvent::Terminal
+        ));
+        assert_eq!(slow_read_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_listener_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(fast_listener_drops.load(Ordering::SeqCst), 1);
+        assert!(
+            block_on(listener.next_event(&cx, &cancellation)).is_err(),
+            "a terminal broker must not reconnect or replay"
+        );
+    }
 
     #[cfg(feature = "tasks")]
     fn catalog_listener_filter() -> SubscriptionFilter {

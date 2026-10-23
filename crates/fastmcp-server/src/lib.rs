@@ -141,6 +141,8 @@ use oauth::{
     OAuthHttpRoutes, OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName,
     TokenRequest,
 };
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+use proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
 pub use proxy::{
     FinalProgressCallback, ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog,
@@ -148,8 +150,8 @@ pub use proxy::{
     ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
     ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyFinalTaskRelay};
+#[cfg(feature = "proxy")]
+use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyCatalogRelay};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
 pub use router::{
@@ -200,7 +202,7 @@ pub use bidirectional::{
 
 use std::any::Any;
 use std::cell::Cell;
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(feature = "proxy")]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -5131,6 +5133,14 @@ struct FinalSubscriptionLease {
 }
 
 impl FinalSubscriptionLease {
+    /// A relayed event belongs to this exact downstream listen request. It
+    /// must never enter the application-wide notification broadcast path.
+    #[cfg(feature = "proxy")]
+    fn publish(&self, notification: ServerNotification) -> McpResult<usize> {
+        self.registry
+            .publish_selected(notification, Some((self.key, &self.election)))
+    }
+
     fn has_graceful_completion(&self) -> bool {
         self.election.graceful_completion.load(Ordering::Acquire)
     }
@@ -5570,6 +5580,14 @@ impl FinalSubscriptionRegistry {
     }
 
     fn publish(&self, notification: ServerNotification) -> McpResult<usize> {
+        self.publish_selected(notification, None)
+    }
+
+    fn publish_selected(
+        &self,
+        notification: ServerNotification,
+        target_subscription: Option<(usize, &Arc<FinalSubscriptionElection>)>,
+    ) -> McpResult<usize> {
         if !is_final_subscription_event(&notification) {
             return Err(McpError::invalid_params(
                 "only final catalog or resource change notifications may use subscriptions/listen",
@@ -5602,9 +5620,14 @@ impl FinalSubscriptionRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .entries
-                .values()
-                .filter(|entry| subscription_filter_accepts(&entry.accepted_filter, &notification))
-                .cloned()
+                .iter()
+                .filter_map(|(key, entry)| {
+                    let selected = target_subscription.is_none_or(|(target_key, election)| {
+                        *key == target_key && Arc::ptr_eq(&entry.election, election)
+                    });
+                    (selected && subscription_filter_accepts(&entry.accepted_filter, &notification))
+                        .then(|| entry.clone())
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -6065,13 +6088,19 @@ fn accepted_subscription_filter(
 /// extension members cannot make an upstream acknowledgement appear narrower;
 /// every admitted category plus the resource URI and Tasks ID sets must still
 /// match.
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(feature = "proxy")]
 fn subscription_filter_admission_matches(
     expected: &SubscriptionFilter,
     acknowledged: &SubscriptionFilter,
 ) -> McpResult<bool> {
+    #[cfg(feature = "tasks")]
     let expected = accepted_subscription_filter(expected, true)?;
+    #[cfg(not(feature = "tasks"))]
+    let expected = accepted_subscription_filter(expected, true);
+    #[cfg(feature = "tasks")]
     let acknowledged = accepted_subscription_filter(acknowledged, true)?;
+    #[cfg(not(feature = "tasks"))]
+    let acknowledged = accepted_subscription_filter(acknowledged, true);
     let expected_resource_subscriptions = expected
         .resource_subscriptions
         .as_deref()
@@ -6145,12 +6174,15 @@ fn subscription_cancellation_notification(
     })
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-fn catalog_filter_requests_resource_updates(filter: &SubscriptionFilter) -> bool {
-    filter
-        .resource_subscriptions
-        .as_ref()
-        .is_some_and(|uris| !uris.is_empty())
+#[cfg(feature = "proxy")]
+fn catalog_filter_requests_events(filter: &SubscriptionFilter) -> bool {
+    filter.tools_list_changed == Some(true)
+        || filter.resources_list_changed == Some(true)
+        || filter.prompts_list_changed == Some(true)
+        || filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| !uris.is_empty())
 }
 
 fn is_final_subscription_event(notification: &ServerNotification) -> bool {
@@ -13191,6 +13223,9 @@ pub struct Server {
     /// task state because its identifiers and lifecycle remain upstream-owned.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
+    /// Independently admitted upstream routes for core catalog subscriptions.
+    #[cfg(feature = "proxy")]
+    catalog_relay: Option<Arc<ProxyCatalogRelay>>,
     /// Request-owned final subscription streams shared by stdio and HTTP.
     final_subscriptions: Arc<FinalSubscriptionRegistry>,
 }
@@ -14772,16 +14807,16 @@ impl Server {
             relay_listener = Some(listener);
         }
 
-        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        #[cfg(feature = "proxy")]
         let mut catalog_relay_listener: Option<Box<dyn ProxyCatalogListener>> = None;
-        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        #[cfg(feature = "proxy")]
         if !tasks_requested
-            && catalog_filter_requests_resource_updates(&params.notifications)
-            && let Some(relay) = self.final_task_relay.as_ref()
+            && catalog_filter_requests_events(&params.notifications)
+            && let Some(relay) = self.catalog_relay.as_ref()
+            && let Some(mut listener) = relay
+                .open_listener_async(request_ctx, params.notifications.clone(), &self.router)
+                .await?
         {
-            let mut listener = relay
-                .open_catalog_listener_async(request_ctx, params.notifications.clone())
-                .await?;
             match listener
                 .next_async(request_ctx.cx(), &request_cancellation)
                 .await?
@@ -14870,18 +14905,18 @@ impl Server {
                     Err(error) => return Err(error),
                 }
             }
-            #[cfg(all(feature = "proxy", feature = "tasks"))]
+            #[cfg(feature = "proxy")]
             if let Some(listener) = catalog_relay_listener.as_mut() {
                 match listener
                     .next_async(request_ctx.cx(), &request_cancellation)
                     .await
                 {
-                    Ok(ProxyCatalogListenerEvent::Notification(
-                        notification @ ServerNotification::ResourceUpdated(_),
-                    )) => {
-                        self.final_subscriptions.publish(notification)?;
+                    Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
+                        // This upstream request belongs to one downstream
+                        // lease. Publishing globally duplicates overlapping
+                        // listeners and crosses their authorization boundary.
+                        lease.publish(notification)?;
                     }
-                    Ok(ProxyCatalogListenerEvent::Notification(_)) => {}
                     Ok(ProxyCatalogListenerEvent::Terminal) => {
                         return self.final_subscription_complete_result(&subscription_id);
                     }

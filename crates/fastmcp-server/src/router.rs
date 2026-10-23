@@ -3931,6 +3931,47 @@ impl Router {
             .map(|entry| &entry.template)
     }
 
+    /// Catalog receipts cannot override the handler retained by duplicate
+    /// policy or composition. Resolve modern visibility and its actual origin.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn proxy_resource_owned_by(
+        &self,
+        uri: &str,
+        client: &crate::proxy::ProxyClient,
+    ) -> bool {
+        self.resolve_resource_for_era(uri, Some(ProtocolEra::Modern2026))
+            .and_then(|resolved| resolved.handler.proxy_catalog_client())
+            .is_some_and(|owner| owner.same_upstream_route(client))
+    }
+
+    /// Returns only final component families with a surviving handler from
+    /// this origin. Ignored or locally replaced registrations confer no relay.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn proxy_catalog_membership(
+        &self,
+        client: &crate::proxy::ProxyClient,
+    ) -> (bool, bool, bool) {
+        let owns = |owner: Option<&crate::proxy::ProxyClient>| {
+            owner.is_some_and(|owner| owner.same_upstream_route(client))
+        };
+        let tools = self.tools.values().any(|entry| {
+            entry.final_registration.is_some() && owns(entry.handler.proxy_catalog_client())
+        });
+        let resources = self.resources.iter().any(|(uri, handler)| {
+            self.final_resources.contains_key(uri) && owns(handler.proxy_catalog_client())
+        }) || self.resource_templates.values().any(|entry| {
+            entry.final_definition.is_some()
+                && entry
+                    .handler
+                    .as_ref()
+                    .is_some_and(|handler| owns(handler.proxy_catalog_client()))
+        });
+        let prompts = self.prompts.iter().any(|(name, handler)| {
+            self.final_prompts.contains_key(name) && owns(handler.proxy_catalog_client())
+        });
+        (tools, resources, prompts)
+    }
+
     /// Returns true if a resource exists for the given URI (static or template match).
     #[must_use]
     pub fn resource_exists(&self, uri: &str) -> bool {
