@@ -919,13 +919,91 @@ fn elicit_request_params_from_embedded(
 
 /// Maximum input responses accepted for one MRTR continuation.
 ///
-/// This is an individual continuation bound. The multi-round stdio driver also
-/// limits cumulative entries across the complete MRTR operation.
+/// This is an individual continuation bound. Automatic MRTR drivers also
+/// limit cumulative entries across the complete operation.
 pub const MAX_MRTR_INPUT_RESPONSES: usize = 128;
-/// Maximum `input_required` continuations for one stdio MRTR operation.
+/// Maximum `input_required` continuations for one MRTR operation.
 pub const MAX_MRTR_CONTINUATION_ROUNDS: usize = 4;
 /// Maximum response entries admitted across every continuation in one MRTR operation.
 pub const MAX_MRTR_TOTAL_INPUT_RESPONSES: usize = MAX_MRTR_INPUT_RESPONSES;
+
+fn mrtr_operation_deadline(cx: &Cx, policy: RequestTimeoutPolicy) -> McpResult<Instant> {
+    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+    Instant::now()
+        .checked_add(policy.absolute_timeout())
+        .ok_or_else(|| McpError::internal_error("MRTR operation deadline exceeds the clock range"))
+}
+
+fn check_mrtr_operation(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+    deadline: Instant,
+) -> McpResult<()> {
+    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        || cx.checkpoint().is_err()
+        || cx
+            .budget()
+            .deadline
+            .is_some_and(|deadline| cx.now() >= deadline)
+    {
+        return Err(McpError::request_cancelled());
+    }
+    if Instant::now() >= deadline {
+        return Err(McpError::with_data(
+            McpErrorCode::InternalError,
+            "MRTR operation absolute deadline elapsed",
+            serde_json::json!({"timeoutSource": "absolute"}),
+        ));
+    }
+    Ok(())
+}
+
+/// Bounds caller-owned work even when its future never arranges another wake.
+/// Only use this around work whose abandonment already owns its cleanup.
+async fn wait_for_mrtr_operation<T, E>(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+    deadline: Instant,
+    operation: impl Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<McpError>,
+{
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(async {
+        match cancellation {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    });
+    let mut wake = Box::pin(asupersync::time::sleep(
+        cx.now(),
+        REVERSE_CALLBACK_POLL_SLICE,
+    ));
+    std::future::poll_fn(|task_cx| {
+        if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
+            return std::task::Poll::Ready(Err(error.into()));
+        }
+        if cancelled.as_mut().poll(task_cx).is_ready() {
+            return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
+        }
+        let result = operation.as_mut().poll(task_cx);
+        // A callback may cancel its owner or finish after the deadline in
+        // this same poll. Its late result must never authorize another RPC.
+        if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
+            return std::task::Poll::Ready(Err(error.into()));
+        }
+        if result.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
+            wake.set(asupersync::time::sleep(
+                cx.now(),
+                REVERSE_CALLBACK_POLL_SLICE,
+            ));
+            task_cx.waker().wake_by_ref();
+        }
+        result
+    })
+    .await
+}
 
 fn mrtr_retry_parameters(
     mut parameters: serde_json::Value,
@@ -5349,6 +5427,8 @@ where
     session: ClientSession,
     reverse_request_handlers: ReverseRequestHandlers,
     reverse_callback_pool: WebSocketReverseCallbackPool<IO>,
+    /// Absolute budget shared by automatic MRTR rounds and their callbacks.
+    request_timeout_policy: RequestTimeoutPolicy,
     final_server_notifications: VecDeque<ServerNotification>,
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
     /// Exact-2024 server notifications retained from the WebSocket receive loop.
@@ -5588,6 +5668,7 @@ where
             session,
             reverse_request_handlers,
             reverse_callback_pool,
+            request_timeout_policy: RequestTimeoutPolicy::default(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             legacy_server_notifications: VecDeque::new(),
@@ -5668,6 +5749,14 @@ where
         let auto_plan = ClientProtocolPlan::websocket(ProtocolPolicy::Auto);
         validate_protocol_plan_feature(&auto_plan)?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        // Modern MRTR callbacks belong to the selected modern connection.
+        // Keep exact-2024 reverse RPC handlers out of that constructor while
+        // retaining the original configuration for a fresh legacy fallback.
+        let modern_handlers = ReverseRequestHandlers {
+            sampling_create_message: None,
+            roots_list: None,
+            ..reverse_request_handlers.clone()
+        };
         let first = fresh_transport(cx).await?;
         match Self::connect_with_builder_configuration_with_cx(
             cx,
@@ -5675,7 +5764,7 @@ where
             client_info.clone(),
             None,
             client_capabilities.clone(),
-            ReverseRequestHandlers::new(),
+            modern_handlers,
             mcp_apps_settings.clone(),
             client_extension_runtime.clone(),
             first,
@@ -6918,6 +7007,9 @@ where
     ///
     /// When modern reverse handlers are installed, a peer `input_required`
     /// result is fulfilled locally and retried with `inputResponses`.
+    /// Input callbacks and continuation admission share the configured absolute
+    /// request budget and cumulative input limit. A rejected round invokes no
+    /// host callbacks; transport response waits retain their own lifecycle.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -7228,13 +7320,35 @@ where
     where
         IO: Send + 'static,
     {
-        let handlers = self
-            .reverse_request_handlers
-            .has_modern_handlers()
-            .then(|| self.reverse_request_handlers.clone());
+        if self.selected_protocol_era() != ProtocolEra::Modern2026
+            || !self.reverse_request_handlers.has_modern_handlers()
+        {
+            return match cancellation {
+                Some(cancellation) => {
+                    self.request_core_verb_with_cancellation(
+                        cx,
+                        cancellation,
+                        method,
+                        original_parameters,
+                    )
+                    .await
+                }
+                None => {
+                    self.request_core_verb(cx, method, original_parameters)
+                        .await
+                }
+            };
+        }
+        let handlers = self.reverse_request_handlers.clone();
+        let deadline = mrtr_operation_deadline(cx, self.request_timeout_policy)?;
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
         let mut parameters = original_parameters.clone();
-        let mut rounds = 0_usize;
         loop {
+            driver.before_request()?;
             let result = match cancellation {
                 Some(cancellation) => {
                     self.request_core_verb_with_cancellation(cx, cancellation, method, parameters)
@@ -7242,26 +7356,27 @@ where
                 }
                 None => self.request_core_verb(cx, method, parameters).await?,
             };
+            check_mrtr_operation(cx, cancellation, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
                 return Ok(result);
             };
-            let Some(handlers) = handlers.as_ref() else {
-                return Ok(result);
-            };
-            if rounds >= MAX_MRTR_CONTINUATION_ROUNDS {
-                return Err(McpError::invalid_request(
-                    "MRTR continuation-round limit exceeded",
-                ));
-            }
-            rounds += 1;
-            let input_responses = handlers
-                .respond_to_input_required_async(cx, input_required, || {
-                    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-                        return Err(McpError::request_cancelled());
-                    }
-                    cx.checkpoint().map_err(|_| McpError::request_cancelled())
-                })
-                .await?;
+            driver.begin_continuation()?;
+            // Installed handlers answer every descriptor. Reserve the whole
+            // round before any host callback can have an effect.
+            driver.admit_input_responses(
+                input_required
+                    .input_requests()
+                    .map_or(0, |inputs| inputs.members().len()),
+            )?;
+            let input_responses = wait_for_mrtr_operation(
+                cx,
+                cancellation,
+                deadline,
+                handlers.respond_to_input_required_async(cx, input_required, || {
+                    check_mrtr_operation(cx, cancellation, deadline)
+                }),
+            )
+            .await?;
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
@@ -13713,6 +13828,9 @@ impl HttpClient {
     /// When modern reverse handlers are installed, a peer `input_required`
     /// result is fulfilled locally and retried with `inputResponses` instead of
     /// being returned to the caller.
+    /// The configured absolute timeout covers the entire operation, including
+    /// every POST and input callback. Continuations share one cumulative input
+    /// limit; a rejected round invokes no host callbacks.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -13928,42 +14046,70 @@ impl HttpClient {
             .modern_reverse_request_handlers()
             .filter(|handlers| handlers.has_modern_handlers())
             .cloned();
-        let mut parameters = original_parameters.clone();
-        let mut rounds = 0_usize;
-        loop {
-            let result = match cancellation {
+        let Some(handlers) = handlers else {
+            return match cancellation {
                 Some(cancellation) => {
-                    self.request_final_core_with_cancellation(cx, cancellation, method, parameters)
-                        .await?
+                    self.request_final_core_with_cancellation(
+                        cx,
+                        cancellation,
+                        method,
+                        original_parameters,
+                    )
+                    .await
                 }
-                None => self.request_final_core(cx, method, parameters).await?,
+                None => {
+                    self.request_final_core(cx, method, original_parameters)
+                        .await
+                }
             };
-            let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
-                return Ok(result);
-            };
-            let Some(handlers) = handlers.as_ref() else {
-                return Ok(result);
-            };
-            if rounds >= MAX_MRTR_CONTINUATION_ROUNDS {
-                return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                    "MRTR continuation-round limit exceeded",
-                )));
-            }
-            rounds += 1;
-            let input_responses = handlers
-                .respond_to_input_required_async(cx, input_required, || {
-                    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-                        return Err(McpError::request_cancelled());
+        };
+        let deadline = mrtr_operation_deadline(cx, self.request_timeout_policy)?;
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
+        // HTTP execution owns cancellation on drop. One bound therefore
+        // safely encloses every POST and every caller-owned input callback.
+        wait_for_mrtr_operation(cx, cancellation, deadline, async {
+            let mut parameters = original_parameters.clone();
+            loop {
+                driver.before_request()?;
+                let result = match cancellation {
+                    Some(cancellation) => {
+                        self.request_final_core_with_cancellation(
+                            cx,
+                            cancellation,
+                            method,
+                            parameters,
+                        )
+                        .await?
                     }
-                    cx.checkpoint().map_err(|_| McpError::request_cancelled())
-                })
-                .await?;
-            parameters = mrtr_retry_parameters(
-                original_parameters.clone(),
-                input_required,
-                input_responses,
-            )?;
-        }
+                    None => self.request_final_core(cx, method, parameters).await?,
+                };
+                check_mrtr_operation(cx, cancellation, deadline)?;
+                let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                    return Ok(result);
+                };
+                driver.begin_continuation()?;
+                driver.admit_input_responses(
+                    input_required
+                        .input_requests()
+                        .map_or(0, |inputs| inputs.members().len()),
+                )?;
+                let input_responses = handlers
+                    .respond_to_input_required_async(cx, input_required, || {
+                        check_mrtr_operation(cx, cancellation, deadline)
+                    })
+                    .await?;
+                parameters = mrtr_retry_parameters(
+                    original_parameters.clone(),
+                    input_required,
+                    input_responses,
+                )?;
+            }
+        })
+        .await
     }
 
     /// Sends one raw final extension request after exact bilateral admission.
@@ -24254,10 +24400,14 @@ impl Client {
                     return Ok(result);
                 }
                 driver.begin_continuation()?;
+                driver.admit_input_responses(
+                    input_required
+                        .input_requests()
+                        .map_or(0, |inputs| inputs.members().len()),
+                )?;
                 let responses = handlers
                     .respond_to_input_required_async(cx, input_required, check)
                     .await?;
-                driver.admit_input_responses(responses.len())?;
                 parameters =
                     mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
             }
@@ -27247,6 +27397,269 @@ mod tests {
 
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
+    fn websocket_async_auto_modern_retains_mrtr_handlers_without_legacy_dispatch() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives Auto discovery")
+                    else {
+                        panic!("Auto must send discovery first");
+                    };
+                    assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                    let capabilities = &discover.params.as_ref().expect("discovery parameters")
+                        ["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
+                    for capability in ["sampling", "roots", "elicitation"] {
+                        assert!(capabilities[capability].is_object());
+                    }
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery has an ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer selects modern");
+                    let JsonRpcMessage::Request(initial) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives initial tool call")
+                    else {
+                        panic!("initial tool call must be a request");
+                    };
+                    assert_eq!(initial.method, "tools/call");
+                    let initial_id = initial.id.expect("initial tool call has an ID");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initial_id.clone(),
+                                serde_json::json!({
+                                    "resultType": "input_required",
+                                    "requestState": "auto-modern-round",
+                                    "inputRequests": {
+                                        "sampling": {
+                                            "method": "sampling/createMessage",
+                                            "params": {
+                                                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                                                "maxTokens": 8
+                                            }
+                                        },
+                                        "roots": {"method": "roots/list"},
+                                        "elicitation": {
+                                            "method": "elicitation/create",
+                                            "params": {
+                                                "mode": "form",
+                                                "message": "Choose a name",
+                                                "requestedSchema": {
+                                                    "type": "object",
+                                                    "properties": {"name": {"type": "string"}},
+                                                    "required": ["name"]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer requests all three modern inputs");
+                    let JsonRpcMessage::Request(retry) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives MRTR continuation")
+                    else {
+                        panic!("modern callbacks must produce a continuation request");
+                    };
+                    assert_eq!(retry.method, "tools/call");
+                    let retry_id = retry.id.expect("MRTR continuation has an ID");
+                    assert!(!retry_id.correlates_with(&initial_id));
+                    let parameters = retry.params.expect("MRTR continuation parameters");
+                    assert_eq!(parameters["name"], "auto-modern");
+                    assert_eq!(parameters["arguments"], serde_json::json!({"value": 7}));
+                    assert_eq!(parameters["requestState"], "auto-modern-round");
+                    let responses = parameters["inputResponses"]
+                        .as_object()
+                        .expect("MRTR response map");
+                    assert_eq!(responses.len(), 3);
+                    assert_eq!(responses["sampling"]["model"], "auto-modern-model");
+                    assert_eq!(responses["sampling"]["content"]["text"], "sampled");
+                    assert_eq!(responses["roots"]["roots"][0]["uri"], "file:///workspace");
+                    assert_eq!(responses["elicitation"]["action"], "accept");
+                    assert_eq!(responses["elicitation"]["content"]["name"], "Ada");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                retry_id,
+                                serde_json::json!({"resultType": "complete", "content": [], "isError": false}),
+                            )),
+                        )
+                        .await
+                        .expect("peer completes the modern operation");
+
+                    let JsonRpcMessage::Request(next) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives next modern request")
+                    else {
+                        panic!("next modern operation must be a request");
+                    };
+                    assert_eq!(next.method, "tools/list");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({"messages": [], "maxTokens": 1})),
+                                RequestId::Number(99),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends forbidden exact-legacy reverse RPC");
+                    let JsonRpcMessage::Response(rejected) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives the exact-legacy request refusal")
+                    else {
+                        panic!("wrong-era reverse request must receive an error response");
+                    };
+                    assert!(rejected.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(99))));
+                    assert_eq!(rejected.error.expect("wrong-era request error").code, (-32602).into());
+                    assert!(rejected.result.is_none());
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                next.id.expect("tools/list ID"),
+                                async_modern_tools_list_result(),
+                            )),
+                        )
+                        .await
+                        .expect("ordinary modern operation survives rejected reverse RPC");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn Auto modern MRTR peer");
+
+            let modern_calls = Arc::new([
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ]);
+            let legacy_calls = Arc::new(AtomicUsize::new(0));
+            let handlers = ReverseRequestHandlers::new()
+                .with_sampling_create_message({
+                    let calls = Arc::clone(&legacy_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(CreateMessageResult::text("legacy", "legacy")) })
+                    }
+                })
+                .with_modern_sampling_create_message({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, params| {
+                        calls[0].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            assert_eq!(params.max_tokens.to_string(), "8");
+                            Ok(FinalCreateMessageResult {
+                                content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                                    fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                        text: "sampled".to_owned(),
+                                        annotations: None,
+                                        meta: None,
+                                        additional: BTreeMap::new(),
+                                    },
+                                ),
+                                model: "auto-modern-model".to_owned(),
+                                role: fastmcp_protocol::Role::Assistant,
+                                stop_reason: None,
+                                meta: None,
+                            })
+                        })
+                    }
+                })
+                .with_modern_roots_list({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls[1].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(FinalEmbeddedRootsListResult {
+                                roots: vec![fastmcp_protocol::Root::new("file:///workspace")],
+                            })
+                        })
+                    }
+                })
+                .with_modern_elicitation_create({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, params| {
+                        calls[2].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            assert_eq!(params.message(), "Choose a name");
+                            Ok(ElicitResult::accept(HashMap::from([(
+                                "name".to_owned(),
+                                fastmcp_protocol::ElicitContentValue::String("Ada".to_owned()),
+                            )])))
+                        })
+                    }
+                });
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_counter = Arc::clone(&factory_calls);
+            let mut transport = Some(AsyncWsClientTransport::from_upgraded(client_io));
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::Auto))
+                .reverse_request_handlers(handlers)
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    factory_counter.fetch_add(1, Ordering::SeqCst);
+                    let first = transport.take();
+                    async move {
+                        first.ok_or_else(|| McpError::internal_error("unexpected Auto fallback"))
+                    }
+                })
+                .await
+                .expect("Auto retains modern callbacks from a mixed-era configuration");
+            assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+            let result = client
+                .call_tool(&cx, "auto-modern", serde_json::json!({"value": 7}))
+                .await
+                .expect("Auto modern tool call fulfills installed MRTR callbacks");
+            assert!(mrtr_input_required_for_method("tools/call", &result).is_none());
+            assert!(matches!(
+                result,
+                CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+            ));
+            for calls in modern_calls.iter() {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            let listed = client.list_tools(&cx, None).await.expect(
+                "Auto modern selection rejects legacy reverse RPC without invoking a callback",
+            );
+            assert!(matches!(
+                listed,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            for calls in modern_calls.iter() {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert!(!client.closed);
+            client.close(&cx).await.expect("close Auto modern client");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
     fn websocket_async_auto_uses_one_fresh_legacy_transport_after_recognized_refusal() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
@@ -27302,6 +27715,10 @@ mod tests {
                     };
                     legacy_contacts_for_peer.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(initialize.method, "initialize");
+                    let capabilities = &initialize.params.as_ref().expect("initialize parameters")
+                        ["capabilities"];
+                    assert!(capabilities["roots"].is_object());
+                    assert!(capabilities.get("elicitation").is_none());
                     server
                         .send(
                             &peer_cx,
@@ -27324,6 +27741,48 @@ mod tests {
                         panic!("exact legacy connection must send initialized notification");
                     };
                     assert_eq!(initialized.method, "notifications/initialized");
+                    let JsonRpcMessage::Request(completion) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("fresh legacy peer receives completion")
+                    else {
+                        panic!("legacy operation must be a request");
+                    };
+                    assert_eq!(completion.method, "completion/complete");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "roots/list",
+                                Some(serde_json::json!({})),
+                                RequestId::Number(41),
+                            )),
+                        )
+                        .await
+                        .expect("fresh legacy peer requests roots");
+                    let JsonRpcMessage::Response(roots) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("fresh legacy peer receives roots response")
+                    else {
+                        panic!("legacy callback must produce a JSON-RPC response");
+                    };
+                    assert!(roots.error.is_none());
+                    assert!(roots.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(41))));
+                    assert_eq!(
+                        roots.result.expect("roots result")["roots"][0]["uri"],
+                        "file:///legacy"
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                completion.id.expect("completion ID"),
+                                serde_json::json!({"completion": {"values": ["staging"], "total": 1, "hasMore": false}}),
+                            )),
+                        )
+                        .await
+                        .expect("legacy operation completes after the retained callback");
                     assert!(matches!(
                         server.recv(&peer_cx).await,
                         Err(TransportError::Closed)
@@ -27336,10 +27795,39 @@ mod tests {
                 AsyncWsClientTransport::from_upgraded(first_client_io),
                 AsyncWsClientTransport::from_upgraded(legacy_client_io),
             ]);
-            let mut client = WebSocketClient::connect_auto_with_cx(
+            let legacy_calls = Arc::new(AtomicUsize::new(0));
+            let modern_calls = Arc::new(AtomicUsize::new(0));
+            let handlers = ReverseRequestHandlers::new()
+                .with_roots_list({
+                    let calls = Arc::clone(&legacy_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
+                                "file:///legacy",
+                            )]))
+                        })
+                    }
+                })
+                .with_modern_roots_list({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+                    }
+                })
+                .with_modern_elicitation_create({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(ElicitResult::accept(HashMap::new())) })
+                    }
+                });
+            let mut client = WebSocketClient::connect_auto_with_reverse_request_handlers_with_cx(
                 &cx,
                 async_websocket_client_info(),
                 ClientCapabilities::default(),
+                handlers,
                 move |_| {
                     factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
                     let transport = transports.pop_front();
@@ -27358,6 +27846,25 @@ mod tests {
             assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
             assert_eq!(first_contacts.load(Ordering::SeqCst), 1);
             assert_eq!(legacy_contacts.load(Ordering::SeqCst), 1);
+            let result = client
+                .complete(
+                    &cx,
+                    CompletionParams {
+                        reference: CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: CompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("fresh legacy fallback retains only exact-legacy callback dispatch");
+            assert!(matches!(result, CoreResult::Legacy(LegacyCoreResult::Completion(_))));
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(modern_calls.load(Ordering::SeqCst), 0);
             assert_eq!(
                 first_close_frames.load(Ordering::SeqCst),
                 1,
@@ -31577,7 +32084,7 @@ mod tests {
                 } else {
                     // The cancellation/deadline negatives deliberately never
                     // arrange a callback wake. The framework must observe them.
-                    if mode != 1 && mode != 2 {
+                    if mode != 1 && mode != 2 && mode != 7 {
                         *state.wake.lock().unwrap() = Some(cx.waker().clone());
                     }
                     std::task::Poll::Pending
@@ -31640,7 +32147,8 @@ mod tests {
         use std::task::Poll;
 
         // 0=success, 1=cancel, 2=deadline, 3=drop, 4=creation panic,
-        // 5=panic after await, 6=cancel in the completing callback poll.
+        // 5=panic after await, 6=cancel in the completing callback poll,
+        // 7=configured operation deadline with an unlimited caller context.
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .blocking_threads(0, 0)
@@ -31833,6 +32341,11 @@ mod tests {
                     state.permit.store(false, Ordering::Release);
                     let cancellation = if attempt == 0 { state.request_cancellation.clone() } else { McpRequestCancellation::new() };
                     let operation_cx = if current == 2 { &limited } else { &cx };
+                    client.request_timeout_policy = if current == 0 || current == 7 {
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap()
+                    } else {
+                        RequestTimeoutPolicy::default()
+                    };
                     let mut operation = Box::pin(invoke_http_mrtr_callback_probe(&mut client, operation_cx, &cancellation, verb, &target));
                     // Sibling runaway guard, raised with the accept guard
                     // above. Fixing only one of a pair leaves the other to
@@ -31861,7 +32374,7 @@ mod tests {
                             assert_eq!(std::thread::current().id(), worker);
                             match current {
                                 1 => { sibling_state.request_cancellation.cancel(); }
-                                2 => {}
+                                2 | 7 => {}
                                 _ => {
                                     sibling_state.permit.store(true, Ordering::Release);
                                     if let Some(wake) = sibling_state.wake.lock().unwrap().take() { wake.wake(); }
@@ -31880,11 +32393,15 @@ mod tests {
                     } else {
                         if let Some(result) = observed {
                             let HttpClientError::CoreResult(error) = result.unwrap_err() else { panic!("local callback errors retain their typed class"); };
-                            assert_eq!(error.code, if current == 4 || current == 5 { McpErrorCode::InternalError } else { McpErrorCode::RequestCancelled });
+                            assert_eq!(error.code, if current == 4 || current == 5 || current == 7 { McpErrorCode::InternalError } else { McpErrorCode::RequestCancelled });
                             if current == 4 || current == 5 { assert_eq!(error.message, "Client reverse request handler failed"); }
+                            if current == 7 {
+                                assert_eq!(error.message, "MRTR operation absolute deadline elapsed");
+                                assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                            }
                         }
                         assert!(retained.is_cancel_requested(), "abandoned callback token is cancelled");
-                        if (1..=3).contains(&current) {
+                        if (1..=3).contains(&current) || current == 7 {
                             assert_eq!(state.dropped.load(Ordering::Acquire), dropped_before + 1);
                             assert!(state.cancelled_at_drop.load(Ordering::Acquire), "token is cancelled before dropping callback state");
                         }
@@ -31914,6 +32431,343 @@ mod tests {
                 public_http_mrtr_callback_caller_runtime_probe(verb, mode);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_configured_deadline_retires_stalled_callbacks_and_allows_reuse() {
+        for verb in 0..3 {
+            public_http_mrtr_callback_caller_runtime_probe(verb, 7);
+        }
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn installed_mrtr_roots_result(count: usize, state: &str) -> serde_json::Value {
+        let inputs: serde_json::Map<String, serde_json::Value> = (0..count)
+            .map(|index| {
+                (
+                    format!("root-{index}"),
+                    serde_json::json!({"method":"roots/list"}),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "resultType":"input_required",
+            "inputRequests":inputs,
+            "requestState":state,
+        })
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn installed_mrtr_counting_roots_handler(count: &Arc<AtomicUsize>) -> ReverseRequestHandlers {
+        let count = Arc::clone(count);
+        ReverseRequestHandlers::new().with_modern_roots_list(move |_cx, _token, _params| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+        })
+    }
+
+    #[cfg(unix)]
+    fn public_http_installed_mrtr_input_budget(second_round_count: usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let rejected = second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let discovery = read_http_cache_test_request(&mut stream);
+            assert_eq!(discovery["method"], "server/discover");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                modern_discovery_response("input-budget-peer", &[MODERN_PROTOCOL_VERSION])
+                    .as_bytes(),
+            );
+            for (id, count, state) in [
+                (2, MAX_MRTR_TOTAL_INPUT_RESPONSES / 2, "first"),
+                (3, second_round_count, "second"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], id);
+                assert_eq!(request["method"], "tools/call");
+                if id == 3 {
+                    assert_eq!(request["params"]["requestState"], "first");
+                    assert_eq!(
+                        request["params"]["inputResponses"]
+                            .as_object()
+                            .unwrap()
+                            .len(),
+                        64
+                    );
+                }
+                let response = serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":installed_mrtr_roots_result(count, state),
+                });
+                write_http_cache_test_response(
+                    &mut stream,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["id"], 4);
+            let result = if rejected {
+                assert_eq!(
+                    request["method"], "tools/list",
+                    "rejection must not send another continuation"
+                );
+                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
+            } else {
+                assert_eq!(request["method"], "tools/call");
+                assert_eq!(request["params"]["requestState"], "second");
+                assert_eq!(
+                    request["params"]["inputResponses"]
+                        .as_object()
+                        .unwrap()
+                        .len(),
+                    64
+                );
+                serde_json::json!({"resultType":"complete","content":[]})
+            };
+            let response = serde_json::json!({"jsonrpc":"2.0","id":4,"result":result});
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &serde_json::to_vec(&response).unwrap(),
+            );
+        });
+        let cx = Cx::for_request();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&format!("http://{address}/mcp")))
+                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let result =
+            http_test_runtime_block_on(client.call_tool(&cx, "budget-tool", serde_json::json!({})));
+        if rejected {
+            assert!(matches!(result, Err(HttpClientError::CoreResult(ref error))
+                if error.code == McpErrorCode::InvalidParams && error.message == "MRTR total input-response limit exceeded"));
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                64,
+                "rejected round must not invoke any host callback"
+            );
+            let reused = http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
+            assert!(matches!(
+                reused,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+            ));
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                MAX_MRTR_TOTAL_INPUT_RESPONSES
+            );
+        }
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_installed_mrtr_accepts_exact_cumulative_input_budget() {
+        public_http_installed_mrtr_input_budget(64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
+        public_http_installed_mrtr_input_budget(65);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn public_websocket_installed_mrtr_input_budget(second_round_count: usize) {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            for (id, count, state) in [(2, 64, "first"), (3, second_round_count, "second")] {
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::json!({
+                        "jsonrpc":"2.0", "id":id,
+                        "result":installed_mrtr_roots_result(count, state),
+                    })
+                    .to_string(),
+                )
+                .await;
+            }
+            let rejected = second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+            let result = if rejected {
+                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
+            } else {
+                serde_json::json!({"resultType":"complete","content":[]})
+            };
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::json!({"jsonrpc":"2.0","id":4,"result":result}).to_string(),
+            )
+            .await;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            let result = client
+                .call_tool(&cx, "budget-tool", serde_json::json!({}))
+                .await;
+            if rejected {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(error.message, "MRTR total input-response limit exceeded");
+                assert_eq!(callbacks.load(Ordering::SeqCst), 64);
+                assert_eq!(
+                    client.next_id, 4,
+                    "rejected round must not allocate another request"
+                );
+                assert!(matches!(
+                    client.list_tools(&cx, None).await.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                ));
+                assert_eq!(
+                    callbacks.load(Ordering::SeqCst),
+                    MAX_MRTR_TOTAL_INPUT_RESPONSES
+                );
+            }
+            assert_eq!(client.next_id, 5);
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_accepts_exact_cumulative_input_budget() {
+        public_websocket_installed_mrtr_input_budget(64);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
+        public_websocket_installed_mrtr_input_budget(65);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn public_websocket_installed_mrtr_callback_budget(stall: bool) {
+        run_test(|| async {
+            struct CallbackDrop {
+                token: ReverseRequestCancellation,
+                observed: Arc<Mutex<Option<bool>>>,
+            }
+            impl Drop for CallbackDrop {
+                fn drop(&mut self) {
+                    *self.observed.lock().unwrap() = Some(self.token.is_cancel_requested());
+                }
+            }
+            let cx = Cx::current().unwrap();
+            let observed = Arc::new(Mutex::new(None));
+            let callback_observed = Arc::clone(&observed);
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |_cx, token, _params| {
+                    let observed = Arc::clone(&callback_observed);
+                    Box::pin(async move {
+                        let _drop = CallbackDrop { token, observed };
+                        if stall {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                    })
+                });
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::json!({
+                    "jsonrpc":"2.0", "id":2,
+                    "result":installed_mrtr_roots_result(1, "callback-state"),
+                })
+                .to_string(),
+            )
+            .await;
+            let result = if stall {
+                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
+            } else {
+                serde_json::json!({"resultType":"complete","content":[]})
+            };
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::json!({"jsonrpc":"2.0","id":3,"result":result}).to_string(),
+            )
+            .await;
+            let policy =
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(200))
+                    .unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(policy)
+                .reverse_request_handlers(handlers)
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            assert_eq!(client.request_timeout_policy, policy);
+            let result = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(3),
+                client.call_tool(&cx, "callback-tool", serde_json::json!({})),
+            )
+            .await
+            .expect("configured deadline must wake even a callback that never wakes itself");
+            if stall {
+                let error = result.unwrap_err();
+                assert_eq!(error.message, "MRTR operation absolute deadline elapsed");
+                assert_eq!(
+                    client.next_id, 3,
+                    "timed-out callback must not allocate a continuation"
+                );
+                assert_eq!(
+                    *observed.lock().unwrap(),
+                    Some(true),
+                    "callback cancellation precedes its destruction"
+                );
+                assert!(matches!(
+                    client.list_tools(&cx, None).await.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                ));
+                assert_eq!(*observed.lock().unwrap(), Some(false));
+            }
+            assert!(!cx.is_cancel_requested());
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_callback_completes_within_operation_budget() {
+        public_websocket_installed_mrtr_callback_budget(false);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_callback_deadline_cancels_and_preserves_connection() {
+        public_websocket_installed_mrtr_callback_budget(true);
     }
 
     #[cfg(unix)]
@@ -44231,7 +45085,9 @@ exec sleep 5
                 let expected_calls = match mode {
                     "warm" | "deferred" | "deadline-rounds" => 2,
                     "round-bound" => 4,
-                    "total-bound" => 129,
+                    // The second 64-input round exceeds the remaining 63
+                    // entries, so none of its callbacks may run.
+                    "total-bound" => 65,
                     "handler-error" | "deadline-callback" => 1,
                     m if m.starts_with("callback-") => 1,
                     m if m.starts_with("ready-callback-") => 1,

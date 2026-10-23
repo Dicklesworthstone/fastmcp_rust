@@ -1112,7 +1112,7 @@ impl ClientBuilder {
         let client_implementation = self.client_implementation_for_session();
         // Negotiation owns several protocol states. Pin it separately so
         // wrapping this connection in a caller deadline keeps a small future.
-        Box::pin(WebSocketClient::connect_with_builder_configuration_with_cx(
+        let mut client = Box::pin(WebSocketClient::connect_with_builder_configuration_with_cx(
             cx,
             self.protocol_plan,
             self.client_info,
@@ -1123,7 +1123,9 @@ impl ClientBuilder {
             self.client_extension_runtime,
             transport,
         ))
-        .await
+        .await?;
+        client.request_timeout_policy = self.timeout_policy;
+        Ok(client)
     }
 
     /// Negotiates Auto with a caller-owned factory that creates a fresh
@@ -1146,7 +1148,7 @@ impl ClientBuilder {
                 "connect_websocket_auto_with_cx requires the Auto protocol policy",
             ));
         }
-        WebSocketClient::connect_auto_with_builder_configuration_with_cx(
+        let mut client = WebSocketClient::connect_auto_with_builder_configuration_with_cx(
             cx,
             self.client_info,
             self.capabilities,
@@ -1155,7 +1157,9 @@ impl ClientBuilder {
             self.client_extension_runtime,
             fresh_transport,
         )
-        .await
+        .await?;
+        client.request_timeout_policy = self.timeout_policy;
+        Ok(client)
     }
 
     #[cfg(feature = "websocket-experimental")]
