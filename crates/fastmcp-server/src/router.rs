@@ -20296,6 +20296,117 @@ mod router_tests {
     }
 
     #[test]
+    fn legacy_tool_validation_errors_redact_schema_and_instance_literals() {
+        const SCHEMA_CANARY: &str = "rpc-schema-secret-canary";
+        const INSTANCE_CANARY: &str = "rpc-instance-secret-canary";
+
+        struct SensitiveSchemaTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for SensitiveSchemaTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "sensitive-schema".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "token": {
+                                "type": "string",
+                                "enum": [SCHEMA_CANARY],
+                                "const": SCHEMA_CANARY,
+                                "pattern": format!("^{SCHEMA_CANARY}$")
+                            }
+                        },
+                        "required": ["token"]
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Content::text("validated")])
+            }
+        }
+
+        for strict in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router.set_strict_input_validation(strict);
+            router
+                .add_tool(SensitiveSchemaTool {
+                    calls: Arc::clone(&calls),
+                })
+                .expect("a schema containing literal values still admits");
+            let router = Arc::new(router);
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 146, Budget::INFINITE, &state);
+            let accepted = serde_json::json!({"token": SCHEMA_CANARY});
+            let rejected = serde_json::json!({"token": INSTANCE_CANARY});
+
+            let valid = block_on(router.handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "sensitive-schema".to_owned(),
+                    arguments: Some(accepted.clone()),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            ))
+            .expect("matching input still reaches the handler");
+            assert!(!valid.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let direct = block_on(router.handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "sensitive-schema".to_owned(),
+                    arguments: Some(rejected.clone()),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            ))
+            .expect_err("invalid input fails before handler execution");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let caller = RouterToolCaller::new(Arc::clone(&router), state);
+            let nested = block_on(caller.call_tool(&request_ctx, "sensitive-schema", accepted, 1))
+                .expect("matching nested input still reaches the handler");
+            assert!(!nested.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let nested = block_on(caller.call_tool(&request_ctx, "sensitive-schema", rejected, 1))
+                .expect_err("invalid nested input fails before handler execution");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            for error in [direct, nested] {
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert!(error.message.contains("root.token"));
+                for constraint in ["enum", "const", "pattern"] {
+                    assert!(error.message.contains(constraint));
+                }
+                let wire = serde_json::to_string(&error).expect("the JSON-RPC error serializes");
+                let debug = format!("{error:?}");
+                for rendered in [&wire, &debug] {
+                    assert!(!rendered.contains(SCHEMA_CANARY));
+                    assert!(!rendered.contains(INSTANCE_CANARY));
+                    assert!(rendered.len() < 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn final_tools_call_input_schema_failure_is_bounded_tool_error_without_handler_call() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let legacy_calls = Arc::new(AtomicUsize::new(0));
