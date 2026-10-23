@@ -5871,6 +5871,20 @@ where
     where
         IO: Send + 'static,
     {
+        self.request_admitted_with_raw_result_with_deadline(cx, request, cancellation, None)
+            .await
+    }
+
+    async fn request_admitted_with_raw_result_with_deadline(
+        &mut self,
+        cx: &Cx,
+        request: JsonRpcRequest,
+        cancellation: Option<&McpRequestCancellation>,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
         {
@@ -5879,6 +5893,18 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
+        if let Some(deadline) = operation_deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
+        }
+        let timeout_policy = self.request_timeout_policy;
+        timeout_policy.validate()?;
+        let expected_progress_key = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get("progressToken"))
+            .and_then(|marker| serde_json::from_value::<ProgressMarker>(marker.clone()).ok())
+            .and_then(|marker| execution::progress_marker_key(&marker));
         let id = request.id.clone().ok_or_else(|| {
             McpError::internal_error("WebSocket admitted request requires a JSON-RPC ID")
         })?;
@@ -5889,8 +5915,26 @@ where
             return Err(self.terminal_transport_error(cx, error).await);
         }
 
+        // Response budgets begin only after the send commits. Keep their
+        // deadlines in the caller's runtime clock, including progress resets,
+        // so a virtual timer cannot accidentally restart a wall-clock budget.
+        let committed_at = cx.now();
+        let mut idle_deadline = committed_at + timeout_policy.idle_timeout();
+        let mut absolute_deadline = committed_at + timeout_policy.absolute_timeout();
+        if let Some(deadline) = operation_deadline {
+            absolute_deadline = absolute_deadline
+                .min(committed_at + deadline.saturating_duration_since(Instant::now()));
+        }
+        let mut last_progress = None;
+        let mut last_final_progress = None;
         loop {
-            if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+            if cx.checkpoint().is_err()
+                || cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline)
+                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            {
                 return Err(self
                     .retire_committed_request_after_cancellation(id, false)
                     .await);
@@ -5898,7 +5942,55 @@ where
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx, cancellation).await {
+            if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(self
+                    .retire_committed_request_after_timeout(id, RequestTimeoutSource::Absolute)
+                    .await);
+            }
+            let timeout_source = if absolute_deadline <= idle_deadline {
+                RequestTimeoutSource::Absolute
+            } else {
+                RequestTimeoutSource::Idle
+            };
+            let response_deadline = idle_deadline.min(absolute_deadline);
+            if cx.now() >= response_deadline {
+                return Err(self
+                    .retire_committed_request_after_timeout(id, timeout_source)
+                    .await);
+            }
+            let receive_deadline = cx.budget().deadline.map_or(response_deadline, |deadline| {
+                deadline.min(response_deadline)
+            });
+            // The native reader is borrowed in place and retains partial
+            // framing state when this wait is dropped. Retire the exact ID
+            // before returning so a late response cannot poison the next call.
+            let received = match asupersync::time::timeout_at(
+                receive_deadline,
+                self.recv_with_callback_terminal(cx, cancellation),
+            )
+            .await
+            {
+                Ok(received) => received,
+                Err(_)
+                    if cx.checkpoint().is_err()
+                        || cx
+                            .budget()
+                            .deadline
+                            .is_some_and(|deadline| cx.now() >= deadline)
+                        || cancellation
+                            .is_some_and(McpRequestCancellation::is_cancel_requested) =>
+                {
+                    return Err(self
+                        .retire_committed_request_after_cancellation(id, false)
+                        .await);
+                }
+                Err(_) => {
+                    return Err(self
+                        .retire_committed_request_after_timeout(id, timeout_source)
+                        .await);
+                }
+            };
+            let frame = match received {
                 Ok(frame) => frame,
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
@@ -5911,7 +6003,8 @@ where
                         .await);
                 }
                 Err(TransportError::Cancelled)
-                    if cx.is_cancel_requested()
+                    if cx.checkpoint().is_err()
+                        || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
                         || cancellation
                             .is_some_and(McpRequestCancellation::is_cancel_requested) =>
                 {
@@ -5921,9 +6014,53 @@ where
                 }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
             };
+            let received_at = cx.now();
             let JsonRpcMessage::Response(response) = frame.message() else {
+                let retained_progress = self.final_progress_notifications.len();
                 if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame).await {
                     return Err(self.terminal_callback_error(cx, error).await);
+                }
+                if timeout_policy.resets_idle_on_matching_progress()
+                    && let Some(expected_key) = expected_progress_key.as_ref()
+                {
+                    let advances = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+                        if self.final_progress_notifications.len() > retained_progress
+                            && let JsonRpcMessage::Request(notification) = frame.message()
+                            && let Some(params) = notification.params.as_ref()
+                            // Optional members must be absent or typed. The
+                            // retained serde view maps explicit null to None,
+                            // which must not acquire idle-timer authority.
+                            && !["total", "message", "_meta"].iter().any(|member| {
+                                params.get(*member).is_some_and(serde_json::Value::is_null)
+                            })
+                            && let Some(progress) = self.final_progress_notifications.back()
+                            && execution::progress_marker_key(&progress.progress_token)
+                                .as_ref() == Some(expected_key)
+                            && last_final_progress
+                                .as_ref()
+                                .is_none_or(|last| progress.progress.cmp(last).is_gt())
+                        {
+                            last_final_progress = Some(progress.progress.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    } else if let JsonRpcMessage::Request(notification) = frame.message()
+                        && server_notification_kind(notification)
+                            == Some(ServerNotificationKind::Progress)
+                        && let Some(params) = notification.params.as_ref()
+                        && let Some(progress) = parse_valid_client_progress(params, last_progress)
+                        && execution::progress_marker_key(&progress.marker).as_ref()
+                            == Some(expected_key)
+                    {
+                        last_progress = Some(progress.progress);
+                        true
+                    } else {
+                        false
+                    };
+                    if advances {
+                        idle_deadline = received_at + timeout_policy.idle_timeout();
+                    }
                 }
                 continue;
             };
@@ -6002,6 +6139,26 @@ where
                 response,
                 raw_result,
             });
+        }
+    }
+
+    async fn retire_committed_request_after_timeout(
+        &mut self,
+        request_id: RequestId,
+        source: RequestTimeoutSource,
+    ) -> McpError
+    where
+        IO: Send + 'static,
+    {
+        let cleanup = self
+            .retire_committed_request_after_cancellation(request_id, false)
+            .await;
+        if cleanup.code == McpErrorCode::RequestCancelled && !self.closed {
+            request_timeout_error(source)
+        } else {
+            // A failed cancellation send or teardown is the actionable
+            // connection failure; do not disguise it as a reusable timeout.
+            cleanup
         }
     }
 
@@ -7007,9 +7164,10 @@ where
     ///
     /// When modern reverse handlers are installed, a peer `input_required`
     /// result is fulfilled locally and retried with `inputResponses`.
-    /// Input callbacks and continuation admission share the configured absolute
-    /// request budget and cumulative input limit. A rejected round invokes no
-    /// host callbacks; transport response waits retain their own lifecycle.
+    /// Response waits and input callbacks across all continuations share the
+    /// configured absolute deadline. Response waits start after each send
+    /// commits and are capped by the remaining operation budget. The cumulative
+    /// input limit rejects an over-budget round before invoking host callbacks.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -7038,8 +7196,28 @@ where
     where
         IO: Send + 'static,
     {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        self.request_core_verb_with_options(cx, Some(cancellation), None, method, parameters)
+            .await
+    }
+
+    async fn request_core_verb_with_options(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Option<Instant>,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.checkpoint().is_err()
+        {
             return Err(McpError::request_cancelled());
+        }
+        if let Some(deadline) = deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
         }
         let era = self.selected_protocol_era();
         let parameters = if era == ProtocolEra::Modern2026 {
@@ -7057,10 +7235,11 @@ where
         }
         let request_id = self.allocate_request_id()?;
         let received = self
-            .request_admitted_with_raw_result(
+            .request_admitted_with_raw_result_with_deadline(
                 cx,
                 JsonRpcRequest::new(method, Some(parameters), request_id),
-                Some(cancellation),
+                cancellation,
+                deadline,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -7349,13 +7528,15 @@ where
         let mut parameters = original_parameters.clone();
         loop {
             driver.before_request()?;
-            let result = match cancellation {
-                Some(cancellation) => {
-                    self.request_core_verb_with_cancellation(cx, cancellation, method, parameters)
-                        .await?
-                }
-                None => self.request_core_verb(cx, method, parameters).await?,
-            };
+            let result = self
+                .request_core_verb_with_options(
+                    cx,
+                    cancellation,
+                    Some(deadline),
+                    method,
+                    parameters,
+                )
+                .await?;
             check_mrtr_operation(cx, cancellation, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
                 return Ok(result);
@@ -7430,8 +7611,9 @@ where
 
     /// Calls a modern tool and follows bounded input-required MRTR rounds.
     ///
-    /// The supplied deadline covers every request in the operation; a retry
-    /// cannot restart the caller's absolute time budget.
+    /// The supplied deadline caps every response wait and is checked after
+    /// each synchronous responder returns. A retry cannot restart the caller's
+    /// absolute time budget.
     pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -7457,8 +7639,9 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_final_core(cx, "tools/call", parameters)
+                .request_core_verb_with_options(cx, None, Some(deadline), "tools/call", parameters)
                 .await?;
+            check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
                 let CoreResult::Final(result) = result else {
                     return Err(McpError::invalid_request(
@@ -7469,6 +7652,7 @@ where
             };
             driver.begin_continuation()?;
             let input_responses = respond(input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
@@ -7481,7 +7665,8 @@ where
 
     /// Reads a modern resource and follows bounded input-required MRTR rounds.
     ///
-    /// The caller-owned deadline covers the initial read and every retry.
+    /// The caller-owned deadline caps response waits in the initial read and
+    /// every retry. Synchronous responder results are rechecked before retrying.
     pub async fn read_resource_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -7503,8 +7688,9 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_final_core(cx, "resources/read", parameters)
+                .request_core_verb_with_options(cx, None, Some(deadline), "resources/read", parameters)
                 .await?;
+            check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("resources/read", &result)
             else {
                 let CoreResult::Final(result) = result else {
@@ -7516,6 +7702,7 @@ where
             };
             driver.begin_continuation()?;
             let input_responses = respond(input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
@@ -7528,8 +7715,9 @@ where
 
     /// Gets a modern prompt and follows bounded input-required MRTR rounds.
     ///
-    /// The caller-owned deadline covers the initial prompt request and every
-    /// retry.
+    /// The caller-owned deadline caps response waits in the initial prompt
+    /// request and every retry. Synchronous responder results are rechecked
+    /// before retrying.
     pub async fn get_prompt_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -7555,8 +7743,9 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_final_core(cx, "prompts/get", parameters)
+                .request_core_verb_with_options(cx, None, Some(deadline), "prompts/get", parameters)
                 .await?;
+            check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result)
             else {
                 let CoreResult::Final(result) = result else {
@@ -7568,6 +7757,7 @@ where
             };
             driver.begin_continuation()?;
             let input_responses = respond(input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
@@ -25144,6 +25334,627 @@ mod tests {
     }
 
     #[cfg(feature = "websocket-experimental")]
+    async fn websocket_response_wait_timeout_reuse_probe(
+        policy: RequestTimeoutPolicy,
+        expected_source: &'static str,
+        send_late_response: bool,
+    ) {
+        let cx = Cx::current().expect("test runtime installs caller context");
+        let (client_io, server_io) = async_websocket_pair();
+        let mut peer = cx
+            .spawn(move |peer_cx| async move {
+                let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                let JsonRpcMessage::Request(discover) =
+                    server.recv(&peer_cx).await.expect("receive discovery")
+                else {
+                    panic!("client must discover before ordinary requests");
+                };
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            discover.id.expect("discovery has an ID"),
+                            async_modern_discovery_result(),
+                        )),
+                    )
+                    .await
+                    .expect("send discovery result");
+                let JsonRpcMessage::Request(control) =
+                    server.recv(&peer_cx).await.expect("receive timely request")
+                else {
+                    panic!("timely operation must be a request");
+                };
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            control.id.expect("timely request has an ID"),
+                            serde_json::json!({"timely": true}),
+                        )),
+                    )
+                    .await
+                    .expect("send timely response");
+                let JsonRpcMessage::Request(pending) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive pending request")
+                else {
+                    panic!("pending operation must be a request");
+                };
+                let pending_id = pending.id.expect("pending request has an ID");
+                // Deliberately send no response until the client's own policy
+                // selects a timeout; no caller cancellation wakes this wait.
+                let JsonRpcMessage::Request(cancellation) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive timeout cancellation")
+                else {
+                    panic!("timeout must send one cancellation notification");
+                };
+                let CancellationWireMessage::Modern2026 { params, .. } =
+                    CancellationWireMessage::decode(
+                        ProtocolEra::Modern2026,
+                        CancellationSender::Client,
+                        &cancellation,
+                    )
+                    .expect("timeout cancellation is admitted")
+                else {
+                    panic!("modern connection must send modern cancellation");
+                };
+                assert!(params.request_id.correlates_with(&pending_id));
+                let JsonRpcMessage::Request(next) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive request after timeout")
+                else {
+                    panic!("connection reuse must send a request");
+                };
+                assert_eq!(next.method, "tools/list", "no duplicate cancellation");
+                let next_id = next.id.expect("reused request has an ID");
+                assert!(!next_id.correlates_with(&pending_id));
+                if send_late_response {
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                pending_id,
+                                serde_json::json!({"late": true}),
+                            )),
+                        )
+                        .await
+                        .expect("send late timed-out response");
+                }
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            next_id,
+                            serde_json::json!({"reused": true}),
+                        )),
+                    )
+                    .await
+                    .expect("send next correlated response");
+                assert!(matches!(
+                    server.recv(&peer_cx).await,
+                    Err(TransportError::Closed)
+                ));
+            })
+            .expect("spawn timeout peer");
+        let mut client = WebSocketClient::connect_with_cx(
+            &cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities::default(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .expect("connect before response-wait probe");
+        client.request_timeout_policy = policy;
+        let parameters = client
+            .with_modern_request_metadata(serde_json::json!({}))
+            .expect("construct ordinary request parameters");
+        let timely = client
+            .request_with_raw_result(&cx, "tools/list", Some(parameters.clone()))
+            .await
+            .expect("response before the deadline succeeds");
+        assert_eq!(
+            timely.response.result,
+            Some(serde_json::json!({"timely": true}))
+        );
+        let error = asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(2),
+            client.request_with_raw_result(&cx, "tools/list", Some(parameters.clone())),
+        )
+        .await
+        .expect("response policy wakes a silent peer wait")
+        .expect_err("silent request must expire");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": expected_source}))
+        );
+        assert!(
+            !cx.is_cancel_requested(),
+            "timeout does not cancel the caller"
+        );
+        assert!(
+            !client.closed,
+            "successful timeout cleanup keeps the connection"
+        );
+        assert!(
+            client.receiver.is_some(),
+            "timeout retains the native reader"
+        );
+        assert_eq!(client.retired_requests.len(), 1, "one exact ID is retired");
+        let reused = client
+            .request_with_raw_result(&cx, "tools/list", Some(parameters))
+            .await
+            .expect("next request succeeds with a silent or late previous response");
+        assert_eq!(
+            reused.response.result,
+            Some(serde_json::json!({"reused": true}))
+        );
+        assert_eq!(
+            client.retired_requests.len(),
+            usize::from(!send_late_response),
+            "only the exact late response consumes its tombstone",
+        );
+        client
+            .close(&cx)
+            .await
+            .expect("close reused timeout client");
+        assert!(matches!(peer.join(&cx).await, Ok(())));
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_idle_timeout_retires_without_poisoning_reuse() {
+        run_test(|| async {
+            for send_late_response in [false, true] {
+                websocket_response_wait_timeout_reuse_probe(
+                    RequestTimeoutPolicy::new(
+                        Duration::from_millis(40),
+                        Duration::from_millis(400),
+                    )
+                    .expect("valid idle-first policy"),
+                    "idle",
+                    send_late_response,
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_absolute_timeout_retires_without_poisoning_reuse() {
+        run_test(|| async {
+            for send_late_response in [false, true] {
+                websocket_response_wait_timeout_reuse_probe(
+                    RequestTimeoutPolicy::new(
+                        Duration::from_millis(400),
+                        Duration::from_millis(40),
+                    )
+                    .expect("valid absolute-first policy"),
+                    "absolute",
+                    send_late_response,
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn websocket_response_wait_progress_probe(
+        progress: &[(serde_json::Value, u64)],
+        policy: RequestTimeoutPolicy,
+        expected_timeout: Option<&'static str>,
+        null_optional: Option<&'static str>,
+        request_marker: serde_json::Value,
+    ) {
+        let cx = Cx::current().expect("test runtime installs caller context");
+        let (client_io, server_io) = async_websocket_pair();
+        let sent_progress = progress.to_vec();
+        let peer_marker = request_marker.clone();
+        let mut peer = cx
+            .spawn(move |peer_cx| async move {
+                let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                let JsonRpcMessage::Request(discover) =
+                    server.recv(&peer_cx).await.expect("receive discovery")
+                else {
+                    panic!("client discovery must be a request");
+                };
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            discover.id.expect("discovery ID"),
+                            async_modern_discovery_result(),
+                        )),
+                    )
+                    .await
+                    .expect("send discovery result");
+                let JsonRpcMessage::Request(request) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive progressed request")
+                else {
+                    panic!("progress owner must be a request");
+                };
+                assert_eq!(
+                    request
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("_meta"))
+                        .and_then(|meta| meta.get("progressToken")),
+                    Some(&peer_marker),
+                );
+                let request_id = request.id.expect("progress owner ID");
+                for (marker, value) in sent_progress {
+                    asupersync::time::sleep(peer_cx.now(), Duration::from_millis(120)).await;
+                    let mut params =
+                        serde_json::json!({"progressToken": marker, "progress": value});
+                    if let Some(member) = null_optional {
+                        params[member] = serde_json::Value::Null;
+                    }
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                NOTIFICATIONS_PROGRESS,
+                                Some(params),
+                            )),
+                        )
+                        .await
+                        .expect("send admitted progress notification");
+                }
+                asupersync::time::sleep(peer_cx.now(), Duration::from_millis(120)).await;
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            request_id.clone(),
+                            serde_json::json!({"progressed": true}),
+                        )),
+                    )
+                    .await
+                    .expect("send progressed response");
+                if expected_timeout.is_some() {
+                    let JsonRpcMessage::Request(cancellation) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("receive progress-policy cancellation")
+                    else {
+                        panic!("expired progress wait must cancel");
+                    };
+                    let CancellationWireMessage::Modern2026 { params, .. } =
+                        CancellationWireMessage::decode(
+                            ProtocolEra::Modern2026,
+                            CancellationSender::Client,
+                            &cancellation,
+                        )
+                        .expect("decode progress-policy cancellation")
+                    else {
+                        panic!("progress owner negotiated modern cancellation");
+                    };
+                    assert!(params.request_id.correlates_with(&request_id));
+                    let JsonRpcMessage::Request(next) =
+                        server.recv(&peer_cx).await.expect("receive reused request")
+                    else {
+                        panic!("reuse must be a request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                next.id.expect("reused request ID"),
+                                serde_json::json!({"reused": true}),
+                            )),
+                        )
+                        .await
+                        .expect("send reused result after late progressed result");
+                }
+                assert!(matches!(
+                    server.recv(&peer_cx).await,
+                    Err(TransportError::Closed)
+                ));
+            })
+            .expect("spawn progress-policy peer");
+        let mut client = WebSocketClient::connect_with_cx(
+            &cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities::default(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .expect("connect progress-policy client");
+        client.request_timeout_policy = policy;
+        let parameters = client
+            .with_modern_request_metadata(serde_json::json!({
+                "_meta": {"progressToken": request_marker}
+            }))
+            .expect("build progress-owned request");
+        let result = asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(2),
+            client.request_with_raw_result(&cx, "tools/list", Some(parameters)),
+        )
+        .await
+        .expect("progress policy must bound the request");
+        if let Some(expected_source) = expected_timeout {
+            let error = result.expect_err("ineligible progress cannot extend the selected limit");
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": expected_source}))
+            );
+            client.request_timeout_policy = RequestTimeoutPolicy::default();
+            let next_parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("build request with no previous progress authority");
+            let reused = client
+                .request_with_raw_result(&cx, "tools/list", Some(next_parameters))
+                .await
+                .expect("late progressed response is retired before reuse");
+            assert_eq!(
+                reused.response.result,
+                Some(serde_json::json!({"reused": true}))
+            );
+            assert!(client.retired_requests.is_empty());
+        } else {
+            let response =
+                result.expect("matching increasing progress extends only the idle timer");
+            assert_eq!(
+                response.response.result,
+                Some(serde_json::json!({"progressed": true}))
+            );
+            assert!(
+                client.retired_requests.is_empty(),
+                "timely completion is not retired"
+            );
+        }
+        assert_eq!(
+            client.take_final_progress_notifications().len(),
+            progress.len()
+        );
+        client
+            .close(&cx)
+            .await
+            .expect("close progress-policy client");
+        assert!(matches!(peer.join(&cx).await, Ok(())));
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_matching_progress_extends_only_idle() {
+        run_test(|| async {
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 2),
+                    (serde_json::json!("active-progress"), 3),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid progress policy"),
+                None,
+                None,
+                serde_json::json!("active-progress"),
+            )
+            .await;
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 2),
+                    (serde_json::json!("active-progress"), 3),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid disabled-progress policy")
+                    .reset_idle_on_matching_progress(false),
+                Some("idle"),
+                None,
+                serde_json::json!("active-progress"),
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_unrelated_or_nonmonotonic_progress_cannot_extend_idle() {
+        run_test(|| async {
+            for progress in [
+                &[
+                    (serde_json::json!("foreign-progress"), 1),
+                    (serde_json::json!("foreign-progress"), 2),
+                    (serde_json::json!("foreign-progress"), 3),
+                ][..],
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 0),
+                ][..],
+            ] {
+                websocket_response_wait_progress_probe(
+                    progress,
+                    RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                        .expect("valid progress rejection policy"),
+                    Some("idle"),
+                    None,
+                    serde_json::json!("active-progress"),
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_progress_cannot_extend_absolute_deadline() {
+        run_test(|| async {
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 2),
+                    (serde_json::json!("active-progress"), 3),
+                    (serde_json::json!("active-progress"), 4),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(420))
+                    .expect("valid absolute progress policy"),
+                Some("absolute"),
+                None,
+                serde_json::json!("active-progress"),
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_null_progress_members_cannot_extend_idle() {
+        run_test(|| async {
+            for member in ["total", "message", "_meta"] {
+                websocket_response_wait_progress_probe(
+                    &[
+                        (serde_json::json!("active-progress"), 1),
+                        (serde_json::json!("active-progress"), 2),
+                        (serde_json::json!("active-progress"), 3),
+                    ],
+                    RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                        .expect("valid malformed-progress policy"),
+                    Some("idle"),
+                    Some(member),
+                    serde_json::json!("active-progress"),
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_numeric_progress_aliases_preserve_token_type() {
+        run_test(|| async {
+            websocket_response_wait_progress_probe(
+                &[
+                    (
+                        serde_json::from_str("4.2e1").expect("integral exponent token"),
+                        1,
+                    ),
+                    (
+                        serde_json::from_str("420e-1").expect("integral scaled token"),
+                        2,
+                    ),
+                    (
+                        serde_json::from_str("42.0").expect("integral decimal token"),
+                        3,
+                    ),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid numeric-token policy"),
+                None,
+                None,
+                serde_json::json!(42),
+            )
+            .await;
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("42"), 1),
+                    (serde_json::json!("42"), 2),
+                    (serde_json::json!("42"), 3),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid numeric-versus-string policy"),
+                Some("idle"),
+                None,
+                serde_json::json!(42),
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_timeout_preserves_cancellation_send_failure() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = stalled_cancellation_async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) =
+                        server.recv(&peer_cx).await.expect("receive discovery")
+                    else {
+                        panic!("discovery must be a request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("send discovery result");
+                    let JsonRpcMessage::Request(request) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("receive committed request")
+                    else {
+                        panic!("pending operation must be a request");
+                    };
+                    assert_eq!(request.method, "tools/list");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn unsendable-cancellation peer");
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("connect before timeout cleanup failure");
+            client.request_timeout_policy =
+                RequestTimeoutPolicy::from_application_timeout_ms(40).expect("valid short policy");
+            let parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("construct pending request parameters");
+            let error = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(2),
+                client.request_with_raw_result(&cx, "tools/list", Some(parameters)),
+            )
+            .await
+            .expect("response timeout and cancellation cleanup are bounded")
+            .expect_err("stalled cancellation delivery is a connection failure");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, "Request timed out");
+            assert!(
+                error
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data.get("timeoutSource").is_none()),
+                "cleanup transport failure must not be replaced by an ordinary response timeout",
+            );
+            assert!(
+                client.closed,
+                "failed cancellation commit prevents connection reuse"
+            );
+            assert!(
+                client.close_settled,
+                "transport failure settles native teardown"
+            );
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_async_cancellation_returns_promptly_when_peer_suppresses_terminal_response() {
         run_test(|| async {
@@ -32768,6 +33579,260 @@ mod tests {
     #[test]
     fn public_websocket_installed_mrtr_callback_deadline_cancels_and_preserves_connection() {
         public_websocket_installed_mrtr_callback_budget(true);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn public_websocket_mrtr_continuation_budget(
+        late: bool,
+        explicit_method: Option<&'static str>,
+    ) {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let method = explicit_method.unwrap_or("tools/call");
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&callbacks);
+            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                move |callback_cx, _cancellation, _params| {
+                    let callback_cx = callback_cx.clone();
+                    let callback_calls = Arc::clone(&callback_calls);
+                    Box::pin(async move {
+                        callback_calls.fetch_add(1, Ordering::SeqCst);
+                        asupersync::time::sleep(callback_cx.now(), Duration::from_millis(1_200))
+                            .await;
+                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                    })
+                },
+            );
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discovery) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR peer expects discovery");
+                    };
+                    assert_eq!(discovery.method, "server/discover");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discovery.id.unwrap(),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(initial) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR peer expects initial tool call");
+                    };
+                    assert_eq!(initial.method, method);
+                    assert!(initial.id.as_ref().unwrap().correlates_with(&RequestId::Number(2)));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initial.id.unwrap(),
+                                installed_mrtr_roots_result(1, "remaining-budget"),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(continuation) =
+                        server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR peer expects callback-driven continuation");
+                    };
+                    assert_eq!(continuation.method, method);
+                    assert!(continuation.id.as_ref().unwrap().correlates_with(&RequestId::Number(3)));
+                    let parameters = continuation.params.as_ref().unwrap();
+                    assert_eq!(parameters["requestState"], "remaining-budget");
+                    assert_eq!(parameters["inputResponses"]["root-0"]["roots"], serde_json::json!([]));
+                    // The late reply is after the original two-second budget
+                    // but before a fresh two-second continuation budget. The
+                    // observable proof is exact-ID retirement and reuse, not
+                    // a scheduler-sensitive elapsed-time assertion.
+                    asupersync::time::sleep(
+                        peer_cx.now(),
+                        Duration::from_millis(if late { 1_200 } else { 200 }),
+                    )
+                    .await;
+                    let terminal = match method {
+                        "tools/call" => serde_json::json!({"resultType":"complete","content":[]}),
+                        "resources/read" => serde_json::json!({"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}),
+                        "prompts/get" => serde_json::json!({"resultType":"complete","messages":[]}),
+                        _ => unreachable!(),
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                continuation.id.unwrap(),
+                                terminal,
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    if late {
+                        let JsonRpcMessage::Request(cancelled) =
+                            server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("expired continuation must emit correlated cancellation");
+                        };
+                        assert_eq!(cancelled.method, "notifications/cancelled");
+                        assert!(cancelled.id.is_none());
+                        assert_eq!(cancelled.params.unwrap()["requestId"], 3);
+                    }
+                    let JsonRpcMessage::Request(reused) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR connection must remain usable after the operation");
+                    };
+                    assert_eq!(reused.method, "tools/list");
+                    assert!(reused.id.as_ref().unwrap().correlates_with(&RequestId::Number(4)));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                reused.id.unwrap(),
+                                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(server.recv(&peer_cx).await, Err(TransportError::Closed)));
+                })
+                .unwrap();
+            let policy =
+                RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(policy)
+                .reverse_request_handlers(if explicit_method.is_some() {
+                    ReverseRequestHandlers::new()
+                } else {
+                    handlers
+                })
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            let deadline = Instant::now() + policy.absolute_timeout();
+            let respond = |input_required: &InputRequiredResult| {
+                assert_eq!(input_required.request_state(), Some("remaining-budget"));
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                // These public adapters deliberately accept synchronous host
+                // work. Its consumed time must reduce the subsequent wait.
+                std::thread::sleep(Duration::from_millis(1_200));
+                Ok(BTreeMap::from([(
+                    "root-0".to_owned(),
+                    serde_json::json!({"roots":[]}),
+                )]))
+            };
+            let result = asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                match explicit_method {
+                    None => {
+                        client
+                            .call_tool(&cx, "continuation-budget", serde_json::json!({}))
+                            .await
+                    }
+                    Some("tools/call") => client
+                        .call_tool_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "continuation-budget",
+                            serde_json::json!({}),
+                            respond,
+                        )
+                        .await
+                        .map(CoreResult::Final),
+                    Some("resources/read") => client
+                        .read_resource_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "file:///continuation-budget",
+                            respond,
+                        )
+                        .await
+                        .map(CoreResult::Final),
+                    Some("prompts/get") => client
+                        .get_prompt_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "continuation-budget",
+                            std::collections::HashMap::from([(
+                                "topic".to_owned(),
+                                "deadline".to_owned(),
+                            )]),
+                            respond,
+                        )
+                        .await
+                        .map(CoreResult::Final),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .expect("MRTR continuation must remain bounded independently of the fixture");
+            if late {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                assert_eq!(
+                    client.retired_requests.len(),
+                    1,
+                    "the pending continuation owns a tombstone"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.method(), method);
+                assert!(matches!(result, CoreResult::Final(_)));
+                assert!(client.retired_requests.is_empty());
+            }
+            assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                client.next_id, 4,
+                "only the initial and continuation RPCs were admitted"
+            );
+            assert!(!client.closed);
+            assert!(matches!(
+                client.list_tools(&cx, None).await.unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            assert!(
+                client.retired_requests.is_empty(),
+                "the late reply was consumed by its exact retired ID"
+            );
+            assert!(!cx.is_cancel_requested());
+            client.close(&cx).await.unwrap();
+            peer.join(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_continuation_completes_within_remaining_budget() {
+        public_websocket_mrtr_continuation_budget(false, None);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_continuation_keeps_original_deadline_and_retires_late_reply()
+    {
+        public_websocket_mrtr_continuation_budget(true, None);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_explicit_mrtr_continuations_complete_within_remaining_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_websocket_mrtr_continuation_budget(false, Some(method));
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_explicit_mrtr_continuations_keep_deadline_and_retire_late_replies() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_websocket_mrtr_continuation_budget(true, Some(method));
+        }
     }
 
     #[cfg(unix)]

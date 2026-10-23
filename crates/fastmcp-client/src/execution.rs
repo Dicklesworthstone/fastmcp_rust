@@ -965,7 +965,7 @@ fn progress_notification_marker(notification: &JsonRpcRequest) -> Option<Progres
 /// Progress tokens use the same exact integer/string identity as request IDs.
 /// Keep their wire spelling in the request while using one mathematical key
 /// for ownership, including integral decimal/exponent and signed-zero aliases.
-fn progress_marker_key(marker: &ProgressMarker) -> Option<CorrelationKey> {
+pub(super) fn progress_marker_key(marker: &ProgressMarker) -> Option<CorrelationKey> {
     match marker {
         ProgressMarker::String(marker) => Some(CorrelationKey::String(marker.clone())),
         ProgressMarker::Number(marker) => RequestId::Integer(marker.as_str().to_owned())
