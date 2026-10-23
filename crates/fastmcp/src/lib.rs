@@ -2681,6 +2681,22 @@ pub mod auto {
             self.inner.serve_websocket(cx, addr).await
         }
 
+        /// Serves Auto-selected MCP over caller-owned asynchronous NDJSON I/O.
+        ///
+        /// The opening request selects modern or exact MCP 2024-11-05 once;
+        /// the protocol era remains fixed for the connection. Ingress, request
+        /// execution, and egress share the caller's runtime. This returning
+        /// lifecycle creates no nested runtime, thread, or detached receive pump.
+        /// The reader and writer must already be nonblocking async endpoints.
+        /// Synchronous tools require a caller-configured blocking facility.
+        pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.serve_stdio_io(cx, reader, writer).await
+        }
+
         /// Runs this Auto server over stdio on the supplied caller-owned context.
         ///
         /// The facade does not create a runtime or detach the stdio pump; the
@@ -7396,9 +7412,11 @@ pub mod modern {
 
         /// Serves final MCP over caller-owned asynchronous NDJSON I/O.
         ///
-        /// Request execution, ingress and egress share the supplied runtime.
-        /// This returning lifecycle leaves process ownership with the caller;
-        /// the reader and writer must already be nonblocking async endpoints.
+        /// The modern protocol era is fixed before input. Ingress, request
+        /// execution, and egress share the caller's runtime. This returning
+        /// lifecycle creates no nested runtime, thread, or detached receive pump.
+        /// The reader and writer must already be nonblocking async endpoints.
+        /// Synchronous tools require a caller-configured blocking facility.
         pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
         where
             R: asupersync::io::AsyncRead + Unpin + Send + 'static,
@@ -8148,6 +8166,21 @@ pub mod legacy_2024 {
         #[must_use]
         pub const fn protocol_policy(&self) -> ProtocolPolicy {
             ProtocolPolicy::LegacyOnly
+        }
+
+        /// Serves exact MCP 2024-11-05 over caller-owned asynchronous NDJSON I/O.
+        ///
+        /// The legacy protocol era is fixed before input. Ingress, request
+        /// execution, and egress share the caller's runtime. This returning
+        /// lifecycle creates no nested runtime, thread, or detached receive pump.
+        /// The reader and writer must already be nonblocking async endpoints.
+        /// Synchronous tools require a caller-configured blocking facility.
+        pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.serve_stdio_io(cx, reader, writer).await
         }
 
         /// Runs this exact-2024 server over stdio on the supplied caller-owned context.
