@@ -286,7 +286,7 @@ pub mod client {
         ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+        CollectedCatalog, CompletionContext, CompletionParams, CompletionReference,
         DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason,
         ExecutionTerminalRecord, ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert,
         FinalCacheKey, FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
@@ -1016,10 +1016,10 @@ pub use fastmcp_server::rate_limiting::{
 // runtime identity types, which only became reachable without tripping
 // FND-01's `forbid=runtime` rule in the repair that removed the whole-module
 // forward. Until then this gap was blocked twice over.
+pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
 pub use fastmcp_server::{
     ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
 };
-pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
@@ -1028,7 +1028,7 @@ pub use fastmcp_client::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
     ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-    CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+    CollectedCatalog, CompletionContext, CompletionParams, CompletionReference,
     DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason,
     ExecutionTerminalRecord, ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert,
     FinalCacheKey, FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
@@ -1140,7 +1140,7 @@ pub mod auto {
         Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference, HttpClient,
+        CollectedCatalog, CompletionContext, CompletionParams, CompletionReference, HttpClient,
         HttpClientError, HttpSubscriptionListener, MAX_HTTP_EXECUTION_REQUEST_BYTES,
         MAX_HTTP_IN_FLIGHT_EXECUTIONS, MAX_HTTP_RETAINED_EXECUTION_BYTES, MrtrInputResponses,
         Request, RequestExecution, RequestExecutor, ReverseRequest, ReverseRequestCancellation,
@@ -10850,7 +10850,7 @@ pub mod prelude {
         ClientRoot,
         ClientSession,
         ClientTransportRecvHalf,
-        CollectedHttpCatalog,
+        CollectedCatalog,
         CompleteResult,
         CompletionContext,
         CompletionHandler,
