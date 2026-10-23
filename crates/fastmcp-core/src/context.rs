@@ -1028,6 +1028,13 @@ impl ToolContentItem {
 pub struct ToolCallResult {
     /// The content items returned by the tool.
     pub content: Vec<ToolContentItem>,
+    /// The tool's structured result, when present.
+    ///
+    /// `Some(Value::Null)` is an explicitly present JSON null; `None` means
+    /// the tool did not provide structured content. Legacy calls leave this
+    /// absent. Modern local calls validate any declared output schema before
+    /// returning this value to the calling handler.
+    pub structured_content: Option<serde_json::Value>,
     /// Whether the tool returned an error.
     pub is_error: bool,
 }
@@ -1038,6 +1045,7 @@ impl ToolCallResult {
     pub fn success(content: Vec<ToolContentItem>) -> Self {
         Self {
             content,
+            structured_content: None,
             is_error: false,
         }
     }
@@ -1047,6 +1055,7 @@ impl ToolCallResult {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
             content: vec![ToolContentItem::text(text)],
+            structured_content: None,
             is_error: false,
         }
     }
@@ -1056,8 +1065,16 @@ impl ToolCallResult {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             content: vec![ToolContentItem::text(message)],
+            structured_content: None,
             is_error: true,
         }
+    }
+
+    /// Attaches structured content, preserving explicit JSON null.
+    #[must_use]
+    pub fn with_structured_content(mut self, value: serde_json::Value) -> Self {
+        self.structured_content = Some(value);
+        self
     }
 
     /// Returns the first text content, if present.
@@ -4291,15 +4308,17 @@ impl McpContext {
 
     /// Calls a tool and parses the result as JSON.
     ///
-    /// This is a convenience method that calls a tool and deserializes
-    /// the text content as JSON.
+    /// This method prefers explicitly present structured content, including
+    /// JSON null. If structured content is absent, it parses the first text
+    /// item as JSON. A structured value that does not match `T` is an error;
+    /// it never falls back to a different text representation.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The tool call fails
     /// - The tool returns an error result
-    /// - The tool has no text content
+    /// - The tool has neither structured nor text content
     /// - JSON deserialization fails
     ///
     /// # Example
@@ -4318,8 +4337,25 @@ impl McpContext {
         name: &str,
         args: serde_json::Value,
     ) -> crate::McpResult<T> {
-        let text = self.call_tool_text(name, args).await?;
-        serde_json::from_str(&text).map_err(|e| {
+        let mut result = self.call_tool(name, args).await?;
+        if result.is_error {
+            let error_msg = result.first_text().unwrap_or("Tool returned an error");
+            return Err(crate::McpError::new(
+                crate::McpErrorCode::InternalError,
+                format!("Tool '{}' failed: {}", name, error_msg),
+            ));
+        }
+        if let Some(value) = result.structured_content.take() {
+            return serde_json::from_value(value).map_err(|_error| {
+                crate::McpError::internal_error(
+                    "Tool structured output does not match the requested result type",
+                )
+            });
+        }
+        let text = result.first_text().ok_or_else(|| {
+            crate::McpError::internal_error(format!("Tool '{}' returned no result content", name))
+        })?;
+        serde_json::from_str(text).map_err(|e| {
             crate::McpError::new(
                 crate::McpErrorCode::InternalError,
                 format!("Failed to parse tool '{}' result as JSON: {}", name, e),

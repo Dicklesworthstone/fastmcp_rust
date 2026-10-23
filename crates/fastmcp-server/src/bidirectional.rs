@@ -1833,6 +1833,19 @@ pub enum MrtrRetry {
 pub struct MrtrCompletedInputs {
     responses: MrtrInputResponses,
     handler_request_state: Option<MrtrRequestState>,
+    continuation: MrtrContinuationBudget,
+}
+
+/// Authority retained after one input map completes, while its handler may
+/// still ask for another round of the same logical operation. This is private
+/// to the registry and never serialized or exposed to application handlers.
+#[derive(Clone)]
+struct MrtrContinuationBudget {
+    owner_cancellation: McpRequestCancellation,
+    expires_at: Instant,
+    round: u8,
+    total_input_requests: usize,
+    binding: Option<MrtrExchangeBinding>,
 }
 
 impl std::fmt::Debug for MrtrCompletedInputs {
@@ -2026,6 +2039,7 @@ impl MrtrExchangeRegistry {
             None,
             input_requests,
             None,
+            None,
             Instant::now(),
         )
     }
@@ -2045,6 +2059,28 @@ impl MrtrExchangeRegistry {
             Some(binding),
             input_requests,
             handler_request_state,
+            None,
+            Instant::now(),
+        )
+    }
+
+    /// Issues the next handler-requested round of an already admitted logical
+    /// exchange. Finishing the previous input map does not renew its lifetime
+    /// or reset the cumulative round and input-request budgets.
+    pub(crate) fn issue_successor_bound(
+        &self,
+        owner_cancellation: McpRequestCancellation,
+        binding: MrtrExchangeBinding,
+        input_requests: MrtrInputRequests,
+        handler_request_state: Option<String>,
+        completed: &MrtrCompletedInputs,
+    ) -> McpResult<MrtrInputRequired> {
+        self.issue_at(
+            owner_cancellation,
+            Some(binding),
+            input_requests,
+            handler_request_state,
+            Some(completed),
             Instant::now(),
         )
     }
@@ -2286,6 +2322,7 @@ impl MrtrExchangeRegistry {
         binding: Option<MrtrExchangeBinding>,
         input_requests: MrtrInputRequests,
         handler_request_state: Option<String>,
+        completed: Option<&MrtrCompletedInputs>,
         now: Instant,
     ) -> McpResult<MrtrInputRequired> {
         // This registry retains private, one-use state even for stateless
@@ -2309,9 +2346,41 @@ impl MrtrExchangeRegistry {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
 
-        let expires_at = now
-            .checked_add(self.request_state_ttl)
-            .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR))?;
+        let (owner_cancellation, expires_at, round, total_input_requests) =
+            if let Some(completed) = completed {
+                let previous = &completed.continuation;
+                if previous.binding != binding {
+                    return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+                }
+                if previous.owner_cancellation.is_cancel_requested() {
+                    return Err(McpError::request_cancelled());
+                }
+                if now >= previous.expires_at {
+                    return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+                }
+                let round = previous
+                    .round
+                    .checked_add(1)
+                    .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+                let total = previous
+                    .total_input_requests
+                    .checked_add(input_requests.len())
+                    .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+                if round > self.max_rounds || total > self.max_total_input_requests {
+                    return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
+                }
+                (
+                    previous.owner_cancellation.clone(),
+                    previous.expires_at,
+                    round,
+                    total,
+                )
+            } else {
+                let expires_at = now.checked_add(self.request_state_ttl).ok_or_else(|| {
+                    McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR)
+                })?;
+                (owner_cancellation, expires_at, 1, input_requests.len())
+            };
         let mut state = self.lock_state();
         Self::purge_stale(&mut state, now);
         if state.stateless_closed
@@ -2333,8 +2402,8 @@ impl MrtrExchangeRegistry {
             MrtrExchange {
                 owner_cancellation,
                 expires_at,
-                round: 1,
-                total_input_requests: input_requests.as_ref().map_or(0, MrtrInputRequests::len),
+                round,
+                total_input_requests,
                 expected,
                 requests: input_requests.clone().unwrap_or_default(),
                 responses: MrtrInputResponses::default(),
@@ -2423,6 +2492,13 @@ impl MrtrExchangeRegistry {
             return Ok(MrtrRetry::Complete(MrtrCompletedInputs {
                 responses: accepted_responses,
                 handler_request_state: exchange.handler_request_state,
+                continuation: MrtrContinuationBudget {
+                    owner_cancellation: exchange.owner_cancellation,
+                    expires_at: exchange.expires_at,
+                    round: exchange.round,
+                    total_input_requests: exchange.total_input_requests,
+                    binding: exchange.binding,
+                },
             }));
         }
 
@@ -4012,6 +4088,316 @@ mod tests {
     }
 
     #[test]
+    fn mrtr_completed_rounds_share_partial_retry_and_total_input_limits() {
+        for (max_rounds, max_total_inputs) in [(3, 8), (8, 4)] {
+            let registry = MrtrExchangeRegistry::with_limits(
+                4,
+                max_rounds,
+                2,
+                max_total_inputs,
+                Duration::from_secs(60),
+            )
+            .expect("independent round and cumulative-input limits admit");
+            let binding = MrtrExchangeBinding::new(
+                "tools/call",
+                "multi-round".to_owned(),
+                [1; 32],
+                [2; 32],
+                None,
+                [3; 32],
+            );
+            let requests = |keys: &[&str]| {
+                MrtrInputRequests::new(
+                    keys.iter()
+                        .map(|key| ((*key).to_owned(), MrtrInputRequest::roots())),
+                )
+                .expect("unique roots requests")
+            };
+            let responses = |key: &str| {
+                BTreeMap::from([(
+                    key.to_owned(),
+                    serde_json::to_value(mrtr_roots_response()).unwrap(),
+                )])
+            };
+            let initial = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    requests(&["first", "second"]),
+                    None,
+                )
+                .expect("the first round admits two inputs");
+            let initial_state = mrtr_state_from_wire(&initial);
+            let MrtrRetry::InputRequired(partial) = registry
+                .accept_wire_bound(&initial_state, &binding, &responses("first"))
+                .expect("one response reissues only the missing input")
+            else {
+                panic!("the second input remains outstanding");
+            };
+            assert_eq!(partial.input_requests().unwrap().len(), 1);
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(
+                    &mrtr_state_from_wire(&partial),
+                    &binding,
+                    &responses("second"),
+                )
+                .expect("the partial retry finishes the first handler stage")
+            else {
+                panic!("both responses complete the stage");
+            };
+            assert!(completed.roots("first").unwrap().is_some());
+            assert!(completed.roots("second").unwrap().is_some());
+            let next = registry
+                .issue_successor_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    requests(&["third"]),
+                    Some("next-handler-stage".to_owned()),
+                    &completed,
+                )
+                .expect("a completed stage may request another bounded round");
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(&mrtr_state_from_wire(&next), &binding, &responses("third"))
+                .expect("the next handler stage accepts its own response")
+            else {
+                panic!("the one requested response completes the stage");
+            };
+            assert!(completed.roots("third").unwrap().is_some());
+            assert_eq!(
+                completed.handler_request_state(),
+                Some("next-handler-stage")
+            );
+            let error = registry
+                .issue_successor_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    requests(&["fourth"]),
+                    None,
+                    &completed,
+                )
+                .expect_err(
+                    "either the fourth round or fifth cumulative input exceeds its own limit",
+                );
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, MRTR_ROUND_LIMIT_ERROR);
+            assert_eq!(registry.active_len(), 0);
+            assert!(
+                registry
+                    .accept_wire_bound(&initial_state, &binding, &responses("first"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_completed_round_successor_keeps_the_original_expiry() {
+        for (successor_ms, response_ms, accepted) in [(9, 9, true), (9, 10, false), (10, 10, false)]
+        {
+            let registry = MrtrExchangeRegistry::with_limits(4, 3, 1, 3, Duration::from_millis(10))
+                .expect("bounded clock fixture");
+            let binding = MrtrExchangeBinding::new(
+                "resources/read",
+                "file:///multi-round".to_owned(),
+                [1; 32],
+                [2; 32],
+                None,
+                [3; 32],
+            );
+            let requests = || {
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap()
+            };
+            let responses =
+                || MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())]).unwrap();
+            let started = Instant::now();
+            let initial = registry
+                .issue_at(
+                    McpRequestCancellation::new(),
+                    Some(binding.clone()),
+                    requests(),
+                    None,
+                    None,
+                    started,
+                )
+                .expect("initial round starts at the injected clock");
+            let MrtrRetry::Complete(completed) = registry
+                .accept_at(
+                    &mrtr_state_from_wire(&initial),
+                    Some(&binding),
+                    responses(),
+                    false,
+                    started + Duration::from_millis(1),
+                )
+                .expect("initial input arrives before expiry")
+            else {
+                panic!("the initial input completes its stage");
+            };
+            let successor = registry.issue_at(
+                McpRequestCancellation::new(),
+                Some(binding.clone()),
+                requests(),
+                None,
+                Some(&completed),
+                started + Duration::from_millis(successor_ms),
+            );
+            if successor_ms == 10 {
+                let error =
+                    successor.expect_err("a handler cannot renew an expired logical exchange");
+                assert_eq!(error.message, MRTR_REQUEST_STATE_ERROR);
+            } else {
+                let successor =
+                    successor.expect("a successor before the original deadline is allowed");
+                let result = registry.accept_at(
+                    &mrtr_state_from_wire(&successor),
+                    Some(&binding),
+                    responses(),
+                    false,
+                    started + Duration::from_millis(response_ms),
+                );
+                if accepted {
+                    assert!(matches!(result, Ok(MrtrRetry::Complete(_))));
+                } else {
+                    let error = result.expect_err("the successor expires at the original deadline");
+                    assert_eq!(error.message, MRTR_REQUEST_STATE_ERROR);
+                }
+            }
+            assert_eq!(
+                registry.active_len(),
+                0,
+                "completion and expiry both release the record"
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_completed_round_successor_preserves_binding_and_cancellation() {
+        for failure in [
+            "binding",
+            "original-owner",
+            "current-owner",
+            "later-original-owner",
+        ] {
+            let registry = MrtrExchangeRegistry::new();
+            let binding = MrtrExchangeBinding::new(
+                "prompts/get",
+                "multi-round".to_owned(),
+                [1; 32],
+                [2; 32],
+                None,
+                [3; 32],
+            );
+            let requests = || {
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap()
+            };
+            let responses = BTreeMap::from([(
+                "roots".to_owned(),
+                serde_json::to_value(mrtr_roots_response()).unwrap(),
+            )]);
+            let original_owner = McpRequestCancellation::new();
+            let initial = registry
+                .issue_bound(original_owner.clone(), binding.clone(), requests(), None)
+                .expect("the original owner may issue a round");
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(&mrtr_state_from_wire(&initial), &binding, &responses)
+                .expect("the first stage completes")
+            else {
+                panic!("the requested input completes the stage");
+            };
+            let current_owner = McpRequestCancellation::new();
+            let mut successor_binding = binding.clone();
+            match failure {
+                "binding" => successor_binding.target = "other-prompt".to_owned(),
+                "original-owner" => {
+                    assert!(original_owner.cancel());
+                }
+                "current-owner" => {
+                    assert!(current_owner.cancel());
+                }
+                _ => {}
+            }
+            let next = registry.issue_successor_bound(
+                current_owner,
+                successor_binding,
+                requests(),
+                None,
+                &completed,
+            );
+            let error = if failure == "later-original-owner" {
+                let next = next.expect("an uncancelled owner may issue its successor");
+                assert!(original_owner.cancel());
+                registry
+                    .accept_wire_bound(&mrtr_state_from_wire(&next), &binding, &responses)
+                    .expect_err("the successor remains owned by the original cancellation token")
+            } else {
+                next.expect_err("changed binding or cancelled ownership cannot renew an exchange")
+            };
+            assert_eq!(
+                error.code,
+                if failure == "binding" {
+                    McpErrorCode::InvalidParams
+                } else {
+                    McpErrorCode::RequestCancelled
+                }
+            );
+            assert_eq!(registry.active_len(), 0);
+        }
+    }
+
+    #[test]
+    fn mrtr_completed_state_only_rounds_remain_bounded() {
+        let registry =
+            MrtrExchangeRegistry::with_limits(4, 2, 1, 2, Duration::from_secs(60)).unwrap();
+        let binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "state-only".to_owned(),
+            [1; 32],
+            [2; 32],
+            None,
+            [3; 32],
+        );
+        let initial = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::default(),
+                None,
+            )
+            .expect("state-only first round issues");
+        let MrtrRetry::Complete(completed) = registry
+            .accept_state_only_bound(&mrtr_state_from_wire(&initial), &binding)
+            .expect("absence of inputResponses resumes the first stage")
+        else {
+            panic!("state-only retry completes");
+        };
+        let next = registry
+            .issue_successor_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::default(),
+                None,
+                &completed,
+            )
+            .expect("the second state-only stage remains usable");
+        assert!(next.input_requests().is_none());
+        let MrtrRetry::Complete(completed) = registry
+            .accept_state_only_bound(&mrtr_state_from_wire(&next), &binding)
+            .expect("the second state-only stage completes")
+        else {
+            panic!("state-only retry completes");
+        };
+        let error = registry
+            .issue_successor_bound(
+                McpRequestCancellation::new(),
+                binding,
+                MrtrInputRequests::default(),
+                None,
+                &completed,
+            )
+            .expect_err("state-only results cannot evade the logical round limit");
+        assert_eq!(error.message, MRTR_ROUND_LIMIT_ERROR);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
     fn stateless_elicitation_state_only_retry_observes_cancellation_and_expiry_first() {
         let binding = MrtrExchangeBinding::stateless(
             "tools/call",
@@ -4061,6 +4447,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 Some(binding.clone()),
                 input_requests(),
+                None,
                 None,
                 issued_at,
             )

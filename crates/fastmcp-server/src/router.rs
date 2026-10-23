@@ -895,6 +895,24 @@ struct FinalToolSchemas {
     errors: Option<FinalToolErrorStructuredContent>,
 }
 
+impl FinalToolSchemas {
+    fn validate_complete_output(&self, result: &FinalCallToolResult) -> McpResult<()> {
+        if let Some(schema) = &self.output {
+            let structured_content = result.structured_content.as_ref().ok_or_else(|| {
+                McpError::internal_error(
+                    "tool output is missing structuredContent required by the declared output schema",
+                )
+            })?;
+            if schema.validate(structured_content).is_err() {
+                return Err(McpError::internal_error(
+                    "tool output does not match the declared output schema",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct FinalToolErrorStructuredContent {
     input_validation: serde_json::Value,
@@ -5052,18 +5070,30 @@ impl Router {
         continuation_cancellation: fastmcp_core::McpRequestCancellation,
         binding: MrtrExchangeBinding,
         handler_result: InputRequiredResult,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         // The handler may describe the input it needs, but it never controls
         // downstream requestState. Retain its state privately for this exact
         // conversation; only admitted resume inputs can return it to a proxy.
         // Open result siblings are not forwarded across this boundary.
         let input_requests = handler_mrtr_input_requests(request_ctx, &handler_result)?;
-        let required = self.mrtr_exchanges.issue_bound(
-            continuation_cancellation,
-            binding,
-            input_requests,
-            handler_result.request_state().map(str::to_owned),
-        )?;
+        let handler_state = handler_result.request_state().map(str::to_owned);
+        let required = if let Some(completed) = resume_inputs {
+            self.mrtr_exchanges.issue_successor_bound(
+                continuation_cancellation,
+                binding,
+                input_requests,
+                handler_state,
+                completed,
+            )
+        } else {
+            self.mrtr_exchanges.issue_bound(
+                continuation_cancellation,
+                binding,
+                input_requests,
+                handler_state,
+            )
+        }?;
         encode_mrtr_input_required_result(required)
     }
 
@@ -5155,6 +5185,7 @@ impl Router {
                     continuation_cancellation.clone(),
                     binding,
                     result,
+                    resume_inputs.as_ref(),
                 )
             }
             #[cfg(feature = "tasks")]
@@ -5229,6 +5260,7 @@ impl Router {
                     continuation_cancellation.clone(),
                     binding,
                     result,
+                    resume_inputs.as_ref(),
                 )
             }
         }
@@ -5273,6 +5305,7 @@ impl Router {
                     continuation_cancellation.clone(),
                     binding,
                     result,
+                    resume_inputs.as_ref(),
                 )
             }
         }
@@ -5769,7 +5802,6 @@ impl Router {
             ));
         }
         let input_schema = final_registration.schemas.input.as_ref();
-        let output_schema = final_registration.schemas.output.as_ref();
         // FinalArguments deserialization rejects an explicit null before this
         // point, so `arguments` is here always Absent or a typed value.
         #[cfg(feature = "tasks")]
@@ -5871,22 +5903,9 @@ impl Router {
             Outcome::Ok(result) => {
                 match &result {
                     FinalToolOutcome::Complete(result) => {
-                        if let Some(output_schema) = output_schema {
-                            let structured_content = result
-                                .payload
-                                .structured_content
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    McpError::internal_error(
-                                        "tool output is missing structuredContent required by the declared output schema",
-                                    )
-                                })?;
-                            if output_schema.validate(structured_content).is_err() {
-                                return Err(McpError::internal_error(
-                                    "tool output does not match the declared output schema",
-                                ));
-                            }
-                        }
+                        final_registration
+                            .schemas
+                            .validate_complete_output(&result.payload)?;
                     }
                     #[cfg(feature = "tasks")]
                     FinalToolOutcome::CreateTask { .. } if !declares_final_tasks => {
@@ -8958,9 +8977,14 @@ impl RouterToolCaller {
             None => false,
         };
         if input_validation_failed {
-            return Ok(ToolCallResult::error(
-                "Tool arguments do not match the declared input schema.",
-            ));
+            let mut result =
+                ToolCallResult::error("Tool arguments do not match the declared input schema.");
+            result.structured_content = final_registration
+                .schemas
+                .errors
+                .as_ref()
+                .map(|errors| errors.input_validation.clone());
+            return Ok(result);
         }
         let handler_timeout =
             read_handler_timeout(parent_ctx.cx(), "tool_timeout", || handler.timeout())?;
@@ -8993,15 +9017,21 @@ impl RouterToolCaller {
         .await?;
         match outcome {
             Outcome::Ok(result) => match result {
-                FinalToolOutcome::Complete(complete) => Ok(ToolCallResult {
-                    content: complete
-                        .payload
-                        .content
-                        .into_iter()
-                        .map(nested_tool_content_from_final)
-                        .collect(),
-                    is_error: complete.payload.is_error,
-                }),
+                FinalToolOutcome::Complete(complete) => {
+                    final_registration
+                        .schemas
+                        .validate_complete_output(&complete.payload)?;
+                    Ok(ToolCallResult {
+                        content: complete
+                            .payload
+                            .content
+                            .into_iter()
+                            .map(nested_tool_content_from_final)
+                            .collect(),
+                        structured_content: complete.payload.structured_content,
+                        is_error: complete.payload.is_error,
+                    })
+                }
                 FinalToolOutcome::InputRequired(_) => Err(McpError::internal_error(
                     "nested tool call cannot complete an input_required outcome",
                 )),
@@ -9015,7 +9045,13 @@ impl RouterToolCaller {
                 if is_framework_terminal_final_tool_error(&error) {
                     return Err(error);
                 }
-                Ok(ToolCallResult::error(error.message))
+                let mut result = ToolCallResult::error(error.message);
+                result.structured_content = final_registration
+                    .schemas
+                    .errors
+                    .as_ref()
+                    .map(|errors| errors.handler.clone());
+                Ok(result)
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(parent_ctx.cx(), "tool")),
@@ -10136,6 +10172,55 @@ mod router_tests {
             is_error: false,
             structured_content: Some(serde_json::json!({"weather":"clear"})),
         })
+    }
+
+    struct NestedStructuredTool {
+        output_schema: Option<serde_json::Value>,
+        structured_content: Option<serde_json::Value>,
+        is_error: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for NestedStructuredTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "nested-structured".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: self.output_schema.clone(),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text(r#"{"legacy":true}"#)])
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            _kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"valid": true}))
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text(r#"{"fallback":true}"#)],
+                    is_error: self.is_error,
+                    structured_content: self.structured_content.clone(),
+                },
+            )))
+        }
     }
 
     struct SchemaBoundaryTool {
@@ -20218,6 +20303,165 @@ mod router_tests {
     }
 
     #[test]
+    fn nested_tool_results_preserve_structured_values_and_typed_consumption() {
+        for expected in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(false)),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!([1, "two"])),
+            Some(serde_json::json!({"value": 7})),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router
+                .add_tool(NestedStructuredTool {
+                    output_schema: None,
+                    structured_content: expected.clone(),
+                    is_error: false,
+                    calls: Arc::clone(&calls),
+                })
+                .expect("arbitrary structured results are allowed without an output schema");
+            let router = Arc::new(router);
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let ctx = request_context(&cx, 144, Budget::INFINITE, &state)
+                .with_final_request_surface(true)
+                .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::clone(&router), state)));
+
+            let result = block_on(ctx.call_tool("nested-structured", serde_json::json!({})))
+                .expect("nested modern calls retain structured content");
+            assert_eq!(result.structured_content, expected);
+            assert!(!result.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let typed: serde_json::Value =
+                block_on(ctx.call_tool_json("nested-structured", serde_json::json!({})))
+                    .expect("typed nested calls use structured content before text");
+            assert_eq!(
+                typed,
+                expected
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"fallback": true}))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            if expected == Some(serde_json::Value::Null) {
+                let error = block_on(ctx.call_tool_json::<HashMap<String, bool>>(
+                    "nested-structured",
+                    serde_json::json!({}),
+                ))
+                .expect_err("present null cannot fall back to otherwise-decodable object text");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+            }
+
+            let legacy = ctx.clone().with_final_request_surface(false);
+            let result = block_on(legacy.call_tool("nested-structured", serde_json::json!({})))
+                .expect("the legacy handler remains available");
+            assert!(result.structured_content.is_none());
+            let typed: serde_json::Value =
+                block_on(legacy.call_tool_json("nested-structured", serde_json::json!({})))
+                    .expect("legacy typed calls retain their text fallback");
+            assert_eq!(typed, serde_json::json!({"legacy": true}));
+        }
+    }
+
+    #[test]
+    fn nested_tool_outputs_enforce_schema_for_success_and_error_results() {
+        for is_error in [false, true] {
+            for (structured_content, accepted) in [
+                (Some(serde_json::json!({"valid": true})), true),
+                (Some(serde_json::json!({"valid": "wrong type"})), false),
+                (Some(serde_json::Value::Null), false),
+                (None, false),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut router = Router::new();
+                router
+                    .add_tool(NestedStructuredTool {
+                        output_schema: Some(serde_json::json!({
+                            "type": "object",
+                            "properties": {"valid": {"type": "boolean"}},
+                            "required": ["valid"]
+                        })),
+                        structured_content: structured_content.clone(),
+                        is_error,
+                        calls: Arc::clone(&calls),
+                    })
+                    .expect("the tool and both error mappings are admitted");
+                let router = Arc::new(router);
+                let cx = Cx::for_testing();
+                let state = SessionState::new();
+                let ctx = request_context(&cx, 145, Budget::INFINITE, &state)
+                    .with_final_request_surface(true)
+                    .with_tool_caller(Arc::new(RouterToolCaller::new(router, state)));
+
+                let result = block_on(ctx.call_tool("nested-structured", serde_json::json!({})));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                if accepted {
+                    let result = result.expect("conforming complete output is preserved");
+                    assert_eq!(result.structured_content, structured_content);
+                    assert_eq!(result.is_error, is_error);
+                } else {
+                    let error = result.expect_err("invalid declared output never reaches a caller");
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert!(error.message.contains("declared output schema"));
+                    assert!(!error.message.contains("wrong type"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_tool_errors_preserve_admitted_structured_error_mappings() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ErrorMappedTool {
+                mode: ErrorMapperMode::Complete,
+                calls: Arc::clone(&calls),
+            })
+            .expect("both error mapper branches satisfy outputSchema");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = request_context(&cx, 146, Budget::INFINITE, &state)
+            .with_final_request_surface(true)
+            .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::new(router), state)));
+
+        let input_error =
+            block_on(ctx.call_tool("error-mapped-tool", serde_json::json!({"value": 7})))
+                .expect("input rejection remains a tool-level error");
+        assert!(input_error.is_error);
+        assert_eq!(
+            input_error.structured_content,
+            Some(serde_json::json!({"error": "input-validation"}))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let handler_error = block_on(ctx.call_tool(
+            "error-mapped-tool",
+            serde_json::json!({"value": "accepted"}),
+        ))
+        .expect("ordinary handler failure remains a tool-level error");
+        assert!(handler_error.is_error);
+        assert_eq!(
+            handler_error.structured_content,
+            Some(serde_json::json!({"error": "handler"}))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let typed = block_on(ctx.call_tool_json::<serde_json::Value>(
+            "error-mapped-tool",
+            serde_json::json!({"value": "accepted"}),
+        ));
+        assert!(
+            typed.is_err(),
+            "a structured error is never typed successful data"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn final_tool_dispatch_validates_recursive_dynamic_schemas_with_strict_mode() {
         struct RecursiveTool {
             schema: serde_json::Value,
@@ -22940,6 +23184,299 @@ mod router_tests {
         assert_eq!(completed["content"][0]["text"], "state-only resumed");
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn modern_mrtr_tool_completes_after_two_input_rounds_with_new_request_ids() {
+        struct TwoRoundMrtrTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for TwoRoundMrtrTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "two-round-mrtr-tool".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![Content::text("legacy result")])
+            }
+
+            fn declares_final_mrtr(&self) -> bool {
+                true
+            }
+
+            fn call_final_outcome_async_resuming_in_request<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                _request_cx: &'a Cx,
+                _arguments: serde_json::Value,
+                resume_inputs: Option<&'a MrtrCompletedInputs>,
+            ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    let Some(inputs) = resume_inputs else {
+                        return Outcome::Ok(FinalToolOutcome::InputRequired(
+                            input_required_result("first-handler-stage"),
+                        ));
+                    };
+                    let roots = match inputs.roots("roots") {
+                        Ok(Some(roots)) => roots,
+                        Ok(None) => {
+                            return Outcome::Err(McpError::internal_error(
+                                "MRTR roots input was lost",
+                            ));
+                        }
+                        Err(error) => return Outcome::Err(error),
+                    };
+                    match roots.roots.first().map(|root| root.uri.as_str()) {
+                        Some("file:///first") => Outcome::Ok(FinalToolOutcome::InputRequired(
+                            input_required_result("second-handler-stage"),
+                        )),
+                        Some("file:///second") => Outcome::Ok(FinalToolOutcome::Complete(
+                            final_tool_complete_result(FinalCallToolResult {
+                                content: vec![ContentBlock::text("file:///second")],
+                                is_error: false,
+                                structured_content: None,
+                            }),
+                        )),
+                        _ => Outcome::Err(McpError::invalid_params("unexpected MRTR roots input")),
+                    }
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.mrtr_exchanges = Arc::new(
+            MrtrExchangeRegistry::with_limits(4, 2, 1, 2, std::time::Duration::from_secs(60))
+                .expect("two input rounds fit the configured budget"),
+        );
+        router
+            .add_tool(TwoRoundMrtrTool {
+                calls: Arc::clone(&calls),
+            })
+            .expect("two-round tool registers");
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let dispatch = |request: &JsonRpcRequest, request_id: u64| {
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                request_id,
+                InboundRequestTransport::Memory,
+                &connection,
+            );
+            let request_ctx = inbound
+                .request_context()
+                .with_client_capabilities(ClientCapabilityInfo::new().with_roots(false));
+            let cancellation = inbound
+                .mrtr_continuation_cancellation()
+                .expect("the retained connection owns continuation cancellation");
+            let raw_params = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+            block_on(
+                router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    &request_ctx,
+                    request,
+                    Some(&raw_params),
+                    &cancellation,
+                ),
+            )
+        };
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {"roots": {}},
+        });
+        let initial = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "two-round-mrtr-tool",
+                "arguments": {},
+            })),
+            2600_i64,
+        );
+        let initial_result = dispatch(&initial, 2600).expect("the first input round is issued");
+        assert_eq!(initial_result["resultType"], "input_required");
+        let mut state = initial_result["requestState"].as_str().unwrap().to_owned();
+        let original_state = state.clone();
+        for (index, uri) in ["file:///first", "file:///second"].into_iter().enumerate() {
+            let request_id = 2601 + index as u64;
+            let retry = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "_meta": metadata.clone(),
+                    "name": "two-round-mrtr-tool",
+                    "arguments": {},
+                    "inputResponses": {"roots": {"roots": [{"uri": uri}]}},
+                    "requestState": state.clone(),
+                })),
+                request_id as i64,
+            );
+            let result = dispatch(&retry, request_id).expect("the bounded handler round succeeds");
+            if index == 0 {
+                assert_eq!(result["resultType"], "input_required");
+                let next_state = result["requestState"].as_str().unwrap().to_owned();
+                assert_ne!(next_state, state);
+                state = next_state;
+                assert_eq!(router.mrtr_exchanges.active_len(), 1);
+            } else {
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(result["content"][0]["text"], "file:///second");
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(router.mrtr_exchanges.active_len(), 0);
+        let replay = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "name": "two-round-mrtr-tool",
+                "arguments": {},
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": original_state,
+            })),
+            2603_i64,
+        );
+        assert_eq!(
+            dispatch(&replay, 2603)
+                .expect_err("completed round states remain one-use")
+                .code,
+            McpErrorCode::InvalidParams,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn modern_mrtr_completed_round_limits_apply_to_tools_resources_and_prompts() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.mrtr_exchanges = Arc::new(
+            MrtrExchangeRegistry::with_limits(4, 2, 1, 2, std::time::Duration::from_secs(60))
+                .expect("two rounds fit the configured logical exchange budget"),
+        );
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_calls),
+            })
+            .expect("MRTR tool registers");
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&resource_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&prompt_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let dispatch = |request: &JsonRpcRequest, request_id: u64| {
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                request_id,
+                InboundRequestTransport::Memory,
+                &connection,
+            );
+            let request_ctx = inbound
+                .request_context()
+                .with_client_capabilities(ClientCapabilityInfo::new().with_roots(false));
+            let cancellation = inbound
+                .mrtr_continuation_cancellation()
+                .expect("the retained connection owns continuation cancellation");
+            let raw_params = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+            block_on(
+                router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    &request_ctx,
+                    request,
+                    Some(&raw_params),
+                    &cancellation,
+                ),
+            )
+        };
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {"roots": {}},
+        });
+        for (index, (method, mut params, calls)) in [
+            (
+                "tools/call",
+                serde_json::json!({"name": "input-required-tool", "arguments": {}}),
+                tool_calls,
+            ),
+            (
+                "resources/read",
+                serde_json::json!({"uri": "file:///input-required-resource"}),
+                resource_calls,
+            ),
+            (
+                "prompts/get",
+                serde_json::json!({"name": "input-required-prompt"}),
+                prompt_calls,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            params["_meta"] = metadata.clone();
+            let initial_id = 2700 + index as u64 * 10;
+            let initial = JsonRpcRequest::new(method, Some(params.clone()), initial_id as i64);
+            let first = dispatch(&initial, initial_id).expect("the initial handler round succeeds");
+            assert_eq!(first["resultType"], "input_required");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(router.mrtr_exchanges.active_len(), 1);
+            let retry_params = |state: &str| {
+                let mut params = params.clone();
+                params["requestState"] = serde_json::Value::String(state.to_owned());
+                params["inputResponses"] =
+                    serde_json::json!({"roots": router_roots_response_wire()});
+                params
+            };
+            let first_retry = JsonRpcRequest::new(
+                method,
+                Some(retry_params(first["requestState"].as_str().unwrap())),
+                (initial_id + 1) as i64,
+            );
+            let second = dispatch(&first_retry, initial_id + 1)
+                .expect("a completed input map may start its second bounded handler round");
+            assert_eq!(second["resultType"], "input_required");
+            assert_ne!(first["requestState"], second["requestState"]);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+            let second_retry = JsonRpcRequest::new(
+                method,
+                Some(retry_params(second["requestState"].as_str().unwrap())),
+                (initial_id + 2) as i64,
+            );
+            let error = dispatch(&second_retry, initial_id + 2)
+                .expect_err("completing an input map cannot reset the logical exchange limit");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "MRTR exchange limit reached");
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(router.mrtr_exchanges.active_len(), 0);
+
+            let replay =
+                JsonRpcRequest::new(method, second_retry.params.clone(), (initial_id + 3) as i64);
+            assert_eq!(
+                dispatch(&replay, initial_id + 3)
+                    .expect_err("a refused successor does not restore its consumed predecessor")
+                    .code,
+                McpErrorCode::InvalidParams,
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(router.mrtr_exchanges.active_len(), 0);
+        }
     }
 
     #[test]
