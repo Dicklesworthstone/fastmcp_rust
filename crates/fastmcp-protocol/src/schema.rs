@@ -807,6 +807,16 @@ impl AdmittedSchema {
     pub fn validate(&self, value: &Value) -> ValidationResult {
         validate_admitted_final_schema(&self.schema, value)
     }
+
+    /// Validates an instance with the admitted vocabulary in strict mode.
+    ///
+    /// Object schemas without an explicit `additionalProperties` policy reject
+    /// additional properties. References, evaluated annotations, and numeric
+    /// semantics retain the same behavior as [`Self::validate`].
+    pub fn validate_strict(&self, value: &Value) -> ValidationResult {
+        let strict_schema = make_strict_schema(&self.schema);
+        validate_admitted_final_schema(&strict_schema, value)
+    }
 }
 
 /// A final form elicitation schema that passed both shared Draft 2020-12
@@ -9477,6 +9487,65 @@ mod tests {
     // ========================================================================
     // Strict Validation Tests
     // ========================================================================
+
+    #[test]
+    fn admitted_strict_validation_preserves_numeric_semantics_and_object_policy() {
+        let schema = admit_final_schema(json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"]
+        }))
+        .expect("the object schema is admitted");
+
+        assert!(schema.validate_strict(&json!({"count": 1.0})).is_ok());
+        assert!(schema.validate_strict(&json!({"count": 1.5})).is_err());
+        assert!(
+            schema
+                .validate(&json!({"count": 1.0, "extra": true}))
+                .is_ok()
+        );
+        assert!(
+            schema
+                .validate_strict(&json!({"count": 1.0, "extra": true}))
+                .is_err()
+        );
+
+        let explicit_policy = admit_final_schema(json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "additionalProperties": true
+        }))
+        .expect("the explicit additional-property policy is admitted");
+        assert!(
+            explicit_policy
+                .validate_strict(&json!({"count": 1.0, "extra": true}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn admitted_strict_validation_preserves_unevaluated_items() {
+        let schema = admit_final_schema(json!({
+            "type": "object",
+            "properties": {
+                "values": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}],
+                    "unevaluatedItems": false
+                }
+            },
+            "required": ["values"]
+        }))
+        .expect("the evaluated array schema is admitted");
+
+        assert!(schema.validate_strict(&json!({"values": [1.0]})).is_ok());
+        assert!(
+            schema
+                .validate_strict(&json!({"values": [1.0, 2]}))
+                .is_err()
+        );
+        assert!(schema.validate_strict(&json!({"values": ["one"]})).is_err());
+    }
 
     #[test]
     fn test_validate_strict_rejects_extra_properties() {

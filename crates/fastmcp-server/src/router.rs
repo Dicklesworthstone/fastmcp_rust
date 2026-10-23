@@ -5757,7 +5757,7 @@ impl Router {
         let input_validation_failed = match input_schema {
             Some(schema) => {
                 let validation = if self.strict_input_validation {
-                    validate_strict(schema.schema(), &arguments)
+                    schema.validate_strict(&arguments)
                 } else {
                     schema.validate(&arguments)
                 };
@@ -8905,7 +8905,7 @@ impl RouterToolCaller {
         let input_validation_failed = match input_schema {
             Some(schema) => {
                 let validation = if router.strict_input_validation {
-                    validate_strict(schema.schema(), &args)
+                    schema.validate_strict(&args)
                 } else {
                     schema.validate(&args)
                 };
@@ -20174,6 +20174,125 @@ mod router_tests {
             serde_json::json!({"weather": "clear"})
         );
         assert_eq!(MACRO_DUAL_ERA_TOOL_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_tool_dispatch_validates_recursive_dynamic_schemas_with_strict_mode() {
+        struct RecursiveTool {
+            schema: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for RecursiveTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "recursive-tree".to_owned(),
+                    description: None,
+                    input_schema: self.schema.clone(),
+                    output_schema: Some(self.schema.clone()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Content::text("validated recursive tree")])
+            }
+
+            fn final_tool_error_structured_content(
+                &self,
+                _kind: ToolErrorKind,
+            ) -> Option<serde_json::Value> {
+                Some(serde_json::json!({"label": "validation error"}))
+            }
+
+            fn call_final_outcome(
+                &self,
+                _ctx: &McpContext,
+                args: serde_json::Value,
+            ) -> McpResult<FinalToolOutcome> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                    FinalCallToolResult {
+                        content: vec![ContentBlock::text("validated recursive tree")],
+                        is_error: false,
+                        structured_content: Some(args),
+                    },
+                )))
+            }
+        }
+
+        let schema = serde_json::json!({
+            "$id": "https://example.test/recursive-tool-tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "$defs": {"label": {"type": "string"}},
+            "properties": {
+                "label": {"$ref": "#/$defs/label"},
+                "children": {
+                    "type": "array",
+                    "items": {"$dynamicRef": "#node"}
+                }
+            },
+            "required": ["label"],
+            "unevaluatedProperties": false
+        });
+        let accepted = serde_json::json!({
+            "label": "root",
+            "children": [{"label": "child", "children": [{"label": "leaf"}]}]
+        });
+        let mut rejected = accepted.clone();
+        rejected["children"][0]["children"][0]["label"] = serde_json::json!(7);
+        for strict in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router.set_strict_input_validation(strict);
+            router
+                .add_tool(RecursiveTool {
+                    schema: schema.clone(),
+                    calls: Arc::clone(&calls),
+                })
+                .expect("recursive input and output schemas are admitted together");
+            let router = Arc::new(router);
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 148, Budget::INFINITE, &state);
+
+            let modern = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("recursive-tree", accepted.clone(), 148_i64),
+            ))
+            .expect("deep recursive arguments and structured output validate");
+            assert_eq!(modern["resultType"], "complete");
+            assert!(modern.get("isError").is_none());
+            assert_eq!(modern["structuredContent"], accepted);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let invalid_modern = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("recursive-tree", rejected.clone(), 149_i64),
+            ))
+            .expect("a recursive input violation produces a bounded tool error");
+            assert_eq!(invalid_modern["isError"], true);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let caller = RouterToolCaller::new(Arc::clone(&router), state);
+            let nested_ctx = request_ctx.clone().with_final_request_surface(true);
+            let nested =
+                block_on(caller.call_tool(&nested_ctx, "recursive-tree", accepted.clone(), 1))
+                    .expect("nested dispatch accepts the same recursive input");
+            assert!(!nested.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            let refused =
+                block_on(caller.call_tool(&nested_ctx, "recursive-tree", rejected.clone(), 1))
+                    .expect("modern validation returns a tool error");
+            assert!(refused.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[test]
