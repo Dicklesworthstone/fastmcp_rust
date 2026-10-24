@@ -14797,24 +14797,32 @@ impl Server {
             return Err(McpError::request_cancelled());
         }
 
-        // A route-bound relay owns a distinct upstream listen request. Require
-        // its acknowledgement before acknowledging downstream, and refuse a
-        // narrowed upstream filter rather than advertising task IDs we cannot
-        // later deliver. The listener itself remains owned by this downstream
-        // request future; dropping it closes its upstream response body.
+        // Each event family owns a distinct upstream request. Admit both
+        // projected filters before acknowledging their combined downstream
+        // selection; a Tasks-only adapter cannot forward core catalog events.
+        // Every opened listener remains owned by this request future, including
+        // when a later leg fails admission before the downstream lease exists.
         #[cfg(all(feature = "proxy", feature = "tasks"))]
         let mut relay_listener: Option<Box<dyn ProxyFinalTaskListener>> = None;
         #[cfg(all(feature = "proxy", feature = "tasks"))]
         if tasks_requested && let Some(relay) = self.final_task_relay.as_ref() {
+            let mut task_filter = SubscriptionFilter::default();
+            set_task_subscription_ids(
+                &mut task_filter,
+                task_subscription_ids(&params.notifications)
+                    .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+                    .unwrap_or_default(),
+            )
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
             let mut listener = relay
-                .open_listener_async(request_ctx, params.notifications.clone())
+                .open_listener_async(request_ctx, task_filter.clone())
                 .await?;
             match listener
                 .next_async(request_ctx.cx(), &request_cancellation)
                 .await?
             {
                 ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
-                    if !subscription_filter_admission_matches(&params.notifications, &accepted)? {
+                    if !subscription_filter_admission_matches(&task_filter, &accepted)? {
                         return Err(McpError::invalid_params(
                             "Proxy upstream narrowed the final Tasks subscription filter",
                         ));
@@ -14833,11 +14841,12 @@ impl Server {
         #[cfg(feature = "proxy")]
         let mut catalog_relay_listener: Option<Box<dyn ProxyCatalogListener>> = None;
         #[cfg(feature = "proxy")]
-        if !tasks_requested
-            && catalog_filter_requests_events(&params.notifications)
+        let catalog_filter = core_accepted_subscription_filter(&params.notifications);
+        #[cfg(feature = "proxy")]
+        if catalog_filter_requests_events(&catalog_filter)
             && let Some(relay) = self.catalog_relay.as_ref()
             && let Some(mut listener) = relay
-                .open_listener_async(request_ctx, params.notifications.clone(), &self.router)
+                .open_listener_async(request_ctx, catalog_filter.clone(), &self.router)
                 .await?
         {
             match listener
@@ -14845,7 +14854,7 @@ impl Server {
                 .await?
             {
                 ProxyCatalogListenerEvent::Acknowledged(accepted) => {
-                    if !subscription_filter_admission_matches(&params.notifications, &accepted)? {
+                    if !subscription_filter_admission_matches(&catalog_filter, &accepted)? {
                         return Err(McpError::invalid_params(
                             "Proxy upstream narrowed the catalog subscription filter",
                         ));
@@ -14860,6 +14869,19 @@ impl Server {
             }
             catalog_relay_listener = Some(listener);
         }
+
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        let mut mixed_relay_listener = match (catalog_relay_listener.take(), relay_listener.take())
+        {
+            (Some(catalog), Some(tasks)) => {
+                Some(proxy::ProxyMixedSubscriptionListener::new(catalog, tasks))
+            }
+            (catalog, tasks) => {
+                catalog_relay_listener = catalog;
+                relay_listener = tasks;
+                None
+            }
+        };
 
         #[cfg(feature = "tasks")]
         let task_principal = if tasks_requested && self.final_task_runtime.is_some() {
@@ -14893,6 +14915,30 @@ impl Server {
                     delivery.mark_failed();
                 }
                 return Err(McpError::request_cancelled());
+            }
+            #[cfg(all(feature = "proxy", feature = "tasks"))]
+            if let Some(listener) = mixed_relay_listener.as_mut() {
+                match listener.next_event(request_ctx.cx(), &request_cancellation).await {
+                    Ok(proxy::ProxyMixedSubscriptionEvent::Catalog(notification)) => {
+                        lease.publish(notification)?;
+                    }
+                    Ok(proxy::ProxyMixedSubscriptionEvent::Task(notification)) => {
+                        lease.publish_task(notification)?;
+                    }
+                    Ok(proxy::ProxyMixedSubscriptionEvent::Terminal) => {
+                        return self.final_subscription_complete_result(&subscription_id);
+                    }
+                    Err(error) if error.code == McpErrorCode::RequestCancelled => {
+                        if lease.has_graceful_completion() {
+                            return self.final_subscription_complete_result(&subscription_id);
+                        }
+                        if let Some(delivery) = &terminal_delivery {
+                            delivery.mark_failed();
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             if let Some(listener) = relay_listener.as_mut() {

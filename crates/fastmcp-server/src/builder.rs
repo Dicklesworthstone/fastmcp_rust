@@ -3772,6 +3772,7 @@ mod tests {
             std::collections::VecDeque<ProxyFinalTaskListenerEvent>,
             Option<std::task::Waker>,
         )>,
+        requested: Mutex<Option<SubscriptionFilter>>,
         dropped: std::sync::atomic::AtomicBool,
     }
 
@@ -3792,6 +3793,16 @@ mod tests {
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     type OrdinaryProxyTasksListenerControls =
         Arc<Mutex<Vec<Arc<OrdinaryProxyTasksListenerControl>>>>;
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[derive(Default)]
+    struct OrdinaryProxyCatalogListenerControl {
+        pending: std::collections::VecDeque<fastmcp_client::StdioSubscriptionEvent>,
+        requested: Vec<SubscriptionFilter>,
+        active: bool,
+        cancellations: usize,
+        narrow_acknowledgement: bool,
+    }
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     impl Drop for OrdinaryProxyTasksListener {
@@ -3867,6 +3878,9 @@ mod tests {
         updates: Arc<Mutex<Vec<serde_json::Value>>>,
         task: CreateTaskResult,
         listener_controls: Option<OrdinaryProxyTasksListenerControls>,
+        catalog_control: Option<Arc<Mutex<OrdinaryProxyCatalogListenerControl>>>,
+        relay_tasks: bool,
+        narrow_task_acknowledgement: bool,
     }
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -3919,7 +3933,65 @@ mod tests {
         }
 
         fn supports_final_tasks_relay(&mut self) -> McpResult<bool> {
+            Ok(self.relay_tasks)
+        }
+
+        fn supports_incremental_catalog_listener(&mut self) -> McpResult<bool> {
+            Ok(self.catalog_control.is_some())
+        }
+
+        fn start_incremental_catalog_listener(
+            &mut self,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<bool> {
+            let Some(control) = &self.catalog_control else {
+                return Ok(false);
+            };
+            let mut control = control.lock().expect("catalog listener control");
+            assert!(
+                !control.active,
+                "the fixture has one incremental catalog owner"
+            );
+            control.active = true;
+            control.requested.push(notifications.clone());
+            let accepted = if control.narrow_acknowledgement {
+                SubscriptionFilter::default()
+            } else {
+                notifications
+            };
+            control
+                .pending
+                .push_back(fastmcp_client::StdioSubscriptionEvent::Acknowledged(
+                    accepted,
+                ));
             Ok(true)
+        }
+
+        fn try_next_incremental_catalog_listener(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &fastmcp_core::McpRequestCancellation,
+        ) -> McpResult<Option<fastmcp_client::StdioSubscriptionEvent>> {
+            let mut control = self
+                .catalog_control
+                .as_ref()
+                .expect("catalog capability")
+                .lock()
+                .expect("catalog listener control");
+            assert!(control.active, "only the live catalog owner polls ingress");
+            Ok(control.pending.pop_front())
+        }
+
+        fn cancel_incremental_catalog_listener(&mut self, _cx: &Cx) -> McpResult<()> {
+            if let Some(control) = &self.catalog_control {
+                let mut control = control.lock().expect("catalog listener control");
+                if control.active {
+                    control.active = false;
+                    control.cancellations += 1;
+                    control.pending.clear();
+                }
+            }
+            Ok(())
         }
 
         fn call_tool_final_outcome(
@@ -3983,6 +4055,8 @@ mod tests {
                 .push("subscriptions/listen".to_owned());
             let control = self.listener_controls.as_ref().map(|listeners| {
                 let control = Arc::new(OrdinaryProxyTasksListenerControl::default());
+                *control.requested.lock().expect("Tasks listener filter") =
+                    Some(notifications.clone());
                 listeners
                     .lock()
                     .expect("upstream listener controls")
@@ -3990,7 +4064,11 @@ mod tests {
                 control
             });
             Ok(Box::new(OrdinaryProxyTasksListener {
-                accepted: Some(notifications),
+                accepted: Some(if self.narrow_task_acknowledgement {
+                    SubscriptionFilter::default()
+                } else {
+                    notifications
+                }),
                 control,
             }))
         }
@@ -6017,6 +6095,25 @@ mod tests {
             updates: Arc<Mutex<Vec<serde_json::Value>>>,
             listener_controls: Option<OrdinaryProxyTasksListenerControls>,
         ) -> ProxyClient {
+            ordinary_proxy_tasks_client_with_catalog(
+                calls,
+                updates,
+                listener_controls,
+                None,
+                true,
+                false,
+            )
+        }
+
+        #[cfg(feature = "tasks")]
+        fn ordinary_proxy_tasks_client_with_catalog(
+            calls: Arc<Mutex<Vec<String>>>,
+            updates: Arc<Mutex<Vec<serde_json::Value>>>,
+            listener_controls: Option<OrdinaryProxyTasksListenerControls>,
+            catalog_control: Option<Arc<Mutex<OrdinaryProxyCatalogListenerControl>>>,
+            relay_tasks: bool,
+            narrow_task_acknowledgement: bool,
+        ) -> ProxyClient {
             let task = serde_json::from_value(serde_json::json!({
                 "resultType": "task",
                 "taskId": "ordinary-proxy-task-71",
@@ -6033,6 +6130,9 @@ mod tests {
                     updates,
                     task,
                     listener_controls,
+                    catalog_control,
+                    relay_tasks,
+                    narrow_task_acknowledgement,
                 },
                 ProtocolEra::Modern2026,
             )
@@ -6717,11 +6817,14 @@ mod tests {
                     notification.method,
                     fastmcp_protocol::TASK_STATUS_NOTIFICATION
                 );
-                let task = &notification.params.as_ref().unwrap()["task"];
-                assert_eq!(task["taskId"], serde_json::json!(task_id));
+                let update: fastmcp_protocol::TaskStatusNotification =
+                    serde_json::from_value(serde_json::to_value(notification).unwrap())
+                        .expect("the listener delivered an admitted Task notification");
+                let task = update.params.task.base();
+                assert_eq!(task.task_id.as_str(), task_id);
                 assert_eq!(
-                    task["statusMessage"],
-                    serde_json::json!(format!("update-{revision}"))
+                    task.status_message.as_deref(),
+                    Some(format!("update-{revision}").as_str())
                 );
             }
         }
@@ -6898,6 +7001,491 @@ mod tests {
         #[test]
         fn public_builder_proxy_task_listener_drop_isolates_overlapping_streams() {
             assert_public_proxy_task_listener_isolation(false);
+        }
+
+        #[cfg(feature = "tasks")]
+        async fn drive_proxy_listener_until<F>(
+            cx: &Cx,
+            mut listen: std::pin::Pin<&mut F>,
+            received: &Arc<Mutex<Vec<JsonRpcRequest>>>,
+            count: usize,
+        ) where
+            F: std::future::Future<Output = Option<fastmcp_protocol::JsonRpcResponse>>,
+        {
+            asupersync::time::timeout_at(
+                cx.now().saturating_add_nanos(1_000_000_000),
+                std::future::poll_fn(|task_cx| {
+                    if let std::task::Poll::Ready(response) = listen.as_mut().poll(task_cx) {
+                        panic!(
+                            "the live listener ended before {count} notifications: {response:?}"
+                        );
+                    }
+                    if received.lock().unwrap().len() >= count {
+                        std::task::Poll::Ready(())
+                    } else {
+                        std::task::Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .expect("a selected event must progress while its sibling family is quiet");
+        }
+
+        #[cfg(feature = "tasks")]
+        fn mixed_listener_meta() -> serde_json::Value {
+            serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                },
+            })
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_mixed_subscription_combines_local_tasks_with_proxy_catalog_and_checks_owner() {
+            use crate::tasks::FinalTaskStore;
+            for foreign_owner in [false, true] {
+                let ((), report) = asupersync::lab::run_async_under_lab(
+                    0x63_17,
+                    move |cx| async move {
+                        let catalog =
+                            Arc::new(Mutex::new(OrdinaryProxyCatalogListenerControl::default()));
+                        let task_controls = Arc::new(Mutex::new(Vec::new()));
+                        let proxy = ordinary_proxy_tasks_client_with_catalog(
+                            Arc::new(Mutex::new(Vec::new())),
+                            Arc::new(Mutex::new(Vec::new())),
+                            Some(Arc::clone(&task_controls)),
+                            Some(Arc::clone(&catalog)),
+                            false,
+                            false,
+                        );
+                        // Seed a retained application Task with its real owner;
+                        // this listen test does not manufacture service readiness.
+                        let task: fastmcp_protocol::Task =
+                            serde_json::from_value(serde_json::json!({
+                                "taskId": "local-mixed-task", "status": "working",
+                                "createdAt": "2026-07-28T12:00:00Z",
+                                "lastUpdatedAt": "2026-07-28T12:00:00Z", "ttlMs": null,
+                            }))
+                            .unwrap();
+                        let store = Arc::new(crate::tasks::InMemoryFinalTaskStore::new(2).unwrap());
+                        let auth = fastmcp_core::AuthContext::with_subject(if foreign_owner {
+                            "another-user"
+                        } else {
+                            "test-user"
+                        });
+                        store
+                            .create_task_with_authenticated_work(
+                                task.clone(),
+                                crate::tasks::final_task_notification(&task),
+                                crate::tasks::FinalTaskWorkDescriptor::new(
+                                    serde_json::json!({"operation": "mixed-listen-test"}),
+                                )
+                                .unwrap(),
+                                crate::auth::principal_fingerprint(Some(&auth)).unwrap(),
+                            )
+                            .unwrap();
+                        let tasks = crate::tasks::FinalTaskRuntime::new(
+                            store,
+                            crate::tasks::FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+                            Arc::new(|_| {}),
+                        );
+                        let server = Arc::new(
+                            ServerBuilder::new("mixed-local-task-proxy-catalog", "1")
+                                .auth_provider(TestAuthProvider)
+                                .final_tasks(tasks.clone())
+                                .unwrap()
+                                .proxy(proxy, final_proxy_catalog())
+                                .unwrap()
+                                .build(),
+                        );
+                        assert!(server.final_task_relay.is_none());
+                        let connection = crate::ModernConnection::new();
+                        let inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            807,
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let received = Arc::new(Mutex::new(Vec::new()));
+                        let cancellation = fastmcp_core::McpRequestCancellation::new();
+                        let mut listen = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        server.protocol_policy, &inbound,
+                        JsonRpcRequest::new("subscriptions/listen", Some(serde_json::json!({
+                            "notifications": {"toolsListChanged": true, "taskIds": [task.base().task_id]},
+                            "_meta": mixed_listener_meta(),
+                        })), 807_i64),
+                        None, None, None, None, cancellation.clone(), None, task_listener_sender(&received),
+                    ));
+                        if foreign_owner {
+                            let response = listen
+                                .await
+                                .expect("foreign task selection receives an error");
+                            assert_eq!(
+                                response.error.unwrap().code,
+                                fastmcp_core::McpErrorCode::InvalidParams as i32
+                            );
+                            assert!(received.lock().unwrap().is_empty());
+                            assert!(catalog.lock().unwrap().requested.is_empty());
+                        } else {
+                            drive_proxy_listener_until(&cx, listen.as_mut(), &received, 1).await;
+                            assert_eq!(
+                                serde_json::to_value(&catalog.lock().unwrap().requested).unwrap(),
+                                serde_json::json!([{"toolsListChanged": true}])
+                            );
+                            catalog.lock().unwrap().pending.push_back(
+                                fastmcp_client::StdioSubscriptionEvent::Notification(
+                                    fastmcp_protocol::ServerNotification::ToolsListChanged(None),
+                                ),
+                            );
+                            drive_proxy_listener_until(&cx, listen.as_mut(), &received, 2).await;
+                            tasks
+                                .cancel_task(&task.base().task_id)
+                                .expect("a real local Task transition reaches the same lease");
+                            drive_proxy_listener_until(&cx, listen.as_mut(), &received, 3).await;
+                            {
+                                let received = received.lock().unwrap();
+                                assert_eq!(received.len(), 3);
+                                assert_eq!(
+                                    received[0].params.as_ref().unwrap()["notifications"],
+                                    serde_json::json!({"toolsListChanged": true, "taskIds": [task.base().task_id]})
+                                );
+                                assert_eq!(received[1].method, "notifications/tools/list_changed");
+                                let update: fastmcp_protocol::TaskStatusNotification =
+                                    serde_json::from_value(
+                                        serde_json::to_value(&received[2]).unwrap(),
+                                    )
+                                    .unwrap();
+                                assert_eq!(update.params.task.base().task_id, task.base().task_id);
+                                assert_eq!(
+                                    update.params.task.base().status,
+                                    fastmcp_protocol::FinalTaskStatus::Cancelled
+                                );
+                                for notification in received.iter() {
+                                    assert_eq!(
+                                        notification.params.as_ref().unwrap()["_meta"]
+                                            [fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY],
+                                        807
+                                    );
+                                }
+                            }
+                            cancellation.cancel();
+                            assert!(listen.await.is_none());
+                            let catalog = catalog.lock().unwrap();
+                            assert!(!catalog.active);
+                            assert_eq!(catalog.cancellations, 1);
+                        }
+                        assert!(
+                            task_controls.lock().unwrap().is_empty(),
+                            "local Tasks never opens an upstream Tasks listener"
+                        );
+                        assert!(
+                            server
+                                .final_subscriptions
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .entries
+                                .is_empty()
+                        );
+                        for _ in 0..4 {
+                            asupersync::runtime::yield_now().await;
+                        }
+                    },
+                );
+                assert!(
+                    report.lab_test_passed(),
+                    "mixed local/proxy listener lifetime: {report:?}"
+                );
+            }
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_mixed_proxy_subscription_cancel_or_drop_preserves_overlapping_task_listener() {
+            use std::sync::atomic::Ordering;
+            for cancel_first in [false, true] {
+                let ((), report) = asupersync::lab::run_async_under_lab(
+                    0x63_18,
+                    move |cx| async move {
+                        let catalog =
+                            Arc::new(Mutex::new(OrdinaryProxyCatalogListenerControl::default()));
+                        let controls = Arc::new(Mutex::new(Vec::new()));
+                        let proxy = ordinary_proxy_tasks_client_with_catalog(
+                            Arc::new(Mutex::new(Vec::new())),
+                            Arc::new(Mutex::new(Vec::new())),
+                            Some(Arc::clone(&controls)),
+                            Some(Arc::clone(&catalog)),
+                            true,
+                            false,
+                        );
+                        let server = Arc::new(
+                            ServerBuilder::new("mixed-proxy-listener-isolation", "1")
+                                .auth_provider(TestAuthProvider)
+                                .proxy(proxy, final_proxy_catalog())
+                                .unwrap()
+                                .build(),
+                        );
+                        let connection = crate::ModernConnection::new();
+                        let create_inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            808,
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let created = Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        server.protocol_policy, &create_inbound,
+                        JsonRpcRequest::new("tools/call", Some(serde_json::json!({
+                            "name": "weather", "arguments": {"outcome": "task"}, "_meta": mixed_listener_meta(),
+                        })), 808_i64),
+                        None, None, None, None, fastmcp_core::McpRequestCancellation::new(), None, Arc::new(|_| {}),
+                    ).await.unwrap();
+                        let created: CreateTaskResult =
+                            serde_json::from_value(created.result.unwrap()).unwrap();
+                        let task_id = created.task.base().task_id.clone();
+                        assert_ne!(task_id.as_str(), "ordinary-proxy-task-71");
+                        let mixed_inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            809,
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let sibling_inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            810,
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let mixed_received = Arc::new(Mutex::new(Vec::new()));
+                        let sibling_received = Arc::new(Mutex::new(Vec::new()));
+                        let cancellation = fastmcp_core::McpRequestCancellation::new();
+                        let mut mixed = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        server.protocol_policy, &mixed_inbound,
+                        JsonRpcRequest::new("subscriptions/listen", Some(serde_json::json!({
+                            "notifications": {"toolsListChanged": true, "taskIds": [task_id]}, "_meta": mixed_listener_meta(),
+                        })), 809_i64),
+                        None, None, None, None, cancellation.clone(), None, task_listener_sender(&mixed_received),
+                    ));
+                        let mut sibling = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        server.protocol_policy, &sibling_inbound,
+                        JsonRpcRequest::new("subscriptions/listen", Some(serde_json::json!({
+                            "notifications": {"taskIds": [task_id]}, "_meta": mixed_listener_meta(),
+                        })), 810_i64),
+                        None, None, None, None, fastmcp_core::McpRequestCancellation::new(), None, task_listener_sender(&sibling_received),
+                    ));
+                        drive_proxy_listener_until(&cx, mixed.as_mut(), &mixed_received, 1).await;
+                        drive_proxy_listener_until(&cx, sibling.as_mut(), &sibling_received, 1)
+                            .await;
+                        let listeners = controls.lock().unwrap().clone();
+                        assert_eq!(listeners.len(), 2);
+                        for listener in &listeners {
+                            assert_eq!(
+                                serde_json::to_value(
+                                    listener.requested.lock().unwrap().as_ref().unwrap()
+                                )
+                                .unwrap(),
+                                serde_json::json!({"taskIds": ["ordinary-proxy-task-71"]})
+                            );
+                        }
+                        assert_eq!(
+                            serde_json::to_value(&catalog.lock().unwrap().requested).unwrap(),
+                            serde_json::json!([{"toolsListChanged": true}])
+                        );
+                        catalog.lock().unwrap().pending.push_back(
+                            fastmcp_client::StdioSubscriptionEvent::Notification(
+                                fastmcp_protocol::ServerNotification::ToolsListChanged(None),
+                            ),
+                        );
+                        drive_proxy_listener_until(&cx, mixed.as_mut(), &mixed_received, 2).await;
+                        listeners[0].push(ProxyFinalTaskListenerEvent::Notification(
+                            proxy_listener_task_notification("ordinary-proxy-task-71", 1),
+                        ));
+                        drive_proxy_listener_until(&cx, mixed.as_mut(), &mixed_received, 3).await;
+                        assert_eq!(
+                            sibling_received.lock().unwrap().len(),
+                            1,
+                            "the mixed lease cannot broadcast into the overlapping Task lease"
+                        );
+                        listeners[1].push(ProxyFinalTaskListenerEvent::Notification(
+                            proxy_listener_task_notification("ordinary-proxy-task-71", 2),
+                        ));
+                        drive_proxy_listener_until(&cx, sibling.as_mut(), &sibling_received, 2)
+                            .await;
+                        assert_eq!(mixed_received.lock().unwrap().len(), 3);
+                        if cancel_first {
+                            cancellation.cancel();
+                            assert!(mixed.as_mut().await.is_none());
+                        }
+                        drop(mixed);
+                        assert!(listeners[0].dropped.load(Ordering::Acquire));
+                        assert!(!listeners[1].dropped.load(Ordering::Acquire));
+                        assert!(!catalog.lock().unwrap().active);
+                        assert_eq!(catalog.lock().unwrap().cancellations, 1);
+                        listeners[1].push(ProxyFinalTaskListenerEvent::Notification(
+                            proxy_listener_task_notification("ordinary-proxy-task-71", 3),
+                        ));
+                        drive_proxy_listener_until(&cx, sibling.as_mut(), &sibling_received, 3)
+                            .await;
+                        for (received, request_id, revisions) in [
+                            (&mixed_received, 809_i64, vec![1_u8]),
+                            (&sibling_received, 810_i64, vec![2_u8, 3]),
+                        ] {
+                            let received = received.lock().unwrap();
+                            assert_eq!(received.len(), 3);
+                            assert_eq!(
+                                received[0].method,
+                                "notifications/subscriptions/acknowledged"
+                            );
+                            let updates: Vec<fastmcp_protocol::TaskStatusNotification> = received
+                                .iter()
+                                .filter(|notification| {
+                                    notification.method
+                                        == fastmcp_protocol::TASK_STATUS_NOTIFICATION
+                                })
+                                .map(|notification| {
+                                    serde_json::from_value(
+                                        serde_json::to_value(notification).unwrap(),
+                                    )
+                                    .unwrap()
+                                })
+                                .collect();
+                            assert_eq!(updates.len(), revisions.len());
+                            for (update, revision) in updates.iter().zip(revisions) {
+                                assert_eq!(update.params.task.base().task_id, task_id);
+                                assert_eq!(
+                                    update.params.task.base().status_message.as_deref(),
+                                    Some(format!("update-{revision}").as_str())
+                                );
+                            }
+                            for notification in received.iter() {
+                                assert_eq!(
+                                    notification.params.as_ref().unwrap()["_meta"]
+                                        [fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY],
+                                    request_id
+                                );
+                            }
+                        }
+                        assert_eq!(
+                            mixed_received.lock().unwrap()[1].method,
+                            "notifications/tools/list_changed"
+                        );
+                        drop(sibling);
+                        assert!(listeners[1].dropped.load(Ordering::Acquire));
+                        assert!(
+                            server
+                                .final_subscriptions
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .entries
+                                .is_empty()
+                        );
+                        for _ in 0..4 {
+                            asupersync::runtime::yield_now().await;
+                        }
+                    },
+                );
+                assert!(
+                    report.lab_test_passed(),
+                    "mixed overlapping subscription isolation: {report:?}"
+                );
+            }
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_mixed_proxy_subscription_refuses_either_narrowed_leg_before_acknowledgement() {
+            use std::sync::atomic::Ordering;
+            for narrow_tasks in [false, true] {
+                let ((), report) = asupersync::lab::run_async_under_lab(
+                    0x63_19,
+                    move |cx| async move {
+                        let catalog = Arc::new(Mutex::new(OrdinaryProxyCatalogListenerControl {
+                            narrow_acknowledgement: !narrow_tasks,
+                            ..OrdinaryProxyCatalogListenerControl::default()
+                        }));
+                        let controls = Arc::new(Mutex::new(Vec::new()));
+                        let proxy = ordinary_proxy_tasks_client_with_catalog(
+                            Arc::new(Mutex::new(Vec::new())),
+                            Arc::new(Mutex::new(Vec::new())),
+                            Some(Arc::clone(&controls)),
+                            Some(Arc::clone(&catalog)),
+                            true,
+                            narrow_tasks,
+                        );
+                        let server = Arc::new(
+                            ServerBuilder::new("mixed-proxy-admission", "1")
+                                .auth_provider(TestAuthProvider)
+                                .proxy(proxy, final_proxy_catalog())
+                                .unwrap()
+                                .build(),
+                        );
+                        let connection = crate::ModernConnection::new();
+                        let create_inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            811,
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let created = Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        server.protocol_policy, &create_inbound,
+                        JsonRpcRequest::new("tools/call", Some(serde_json::json!({
+                            "name": "weather", "arguments": {"outcome": "task"}, "_meta": mixed_listener_meta(),
+                        })), 811_i64),
+                        None, None, None, None, fastmcp_core::McpRequestCancellation::new(), None, Arc::new(|_| {}),
+                    ).await.unwrap();
+                        let created: CreateTaskResult =
+                            serde_json::from_value(created.result.unwrap()).unwrap();
+                        let inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            812,
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let received = Arc::new(Mutex::new(Vec::new()));
+                        let response = Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        server.protocol_policy, &inbound,
+                        JsonRpcRequest::new("subscriptions/listen", Some(serde_json::json!({
+                            "notifications": {"toolsListChanged": true, "taskIds": [created.task.base().task_id]},
+                            "_meta": mixed_listener_meta(),
+                        })), 812_i64),
+                        None, None, None, None, fastmcp_core::McpRequestCancellation::new(), None, task_listener_sender(&received),
+                    ).await.unwrap();
+                        assert!(response.result.is_none());
+                        assert!(response.error.is_some());
+                        assert!(
+                            received.lock().unwrap().is_empty(),
+                            "neither a partial acknowledgement nor data may escape refused admission"
+                        );
+                        let listeners = controls.lock().unwrap();
+                        assert_eq!(listeners.len(), 1);
+                        assert!(listeners[0].dropped.load(Ordering::Acquire));
+                        let catalog = catalog.lock().unwrap();
+                        assert!(!catalog.active);
+                        assert_eq!(catalog.requested.len(), usize::from(!narrow_tasks));
+                        assert_eq!(catalog.cancellations, usize::from(!narrow_tasks));
+                        assert!(
+                            server
+                                .final_subscriptions
+                                .inner
+                                .lock()
+                                .unwrap()
+                                .entries
+                                .is_empty()
+                        );
+                        drop(catalog);
+                        drop(listeners);
+                        for _ in 0..4 {
+                            asupersync::runtime::yield_now().await;
+                        }
+                    },
+                );
+                assert!(
+                    report.lab_test_passed(),
+                    "mixed listener admission rollback: {report:?}"
+                );
+            }
         }
 
         #[cfg(feature = "tasks")]
