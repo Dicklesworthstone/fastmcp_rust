@@ -11827,7 +11827,7 @@ mod tests {
     }
 
     const LEGACY_TEST_PEER_BOUND: Duration = Duration::from_secs(2);
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks"))]
     const LEGACY_TEST_PEER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     #[test]
@@ -11987,7 +11987,7 @@ mod tests {
     /// client failure to strand the peer thread. The caller's deadline bounds
     /// every accept in the scripted wire exchange, while the stop signal
     /// closes the no-connection path before its owner joins the thread.
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks"))]
     fn accept_legacy_test_peer(
         listener: &TcpListener,
         stop: &mpsc::Receiver<()>,
@@ -12019,7 +12019,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "legacy-2024-11-05")]
+    #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks"))]
     fn signal_legacy_test_peer_stop(stop: &mpsc::SyncSender<()>) {
         match stop.try_send(()) {
             Ok(()) | Err(mpsc::TrySendError::Full(()) | mpsc::TrySendError::Disconnected(())) => {}

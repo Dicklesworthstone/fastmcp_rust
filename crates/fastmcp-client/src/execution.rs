@@ -1181,6 +1181,9 @@ impl DecodedFinalResponse {
 struct Tombstone {
     generation: u64,
     expires_at: Instant,
+    /// Retired subscription traffic remains owned by this bounded correlation
+    /// record; it cannot become an event of a replacement listener.
+    subscription: bool,
     /// Peer-produced terminal outcomes remain observable as duplicate
     /// diagnostics; abandoned-owner finals are silently discarded instead.
     retain_late_response_diagnostic: bool,
@@ -1537,6 +1540,23 @@ where
         };
         let state = self.state.borrow();
         state.pending.contains_key(&key) || state.tombstones.contains_key(&key)
+    }
+
+    /// Whether this exact canonical ID belongs to a retired listen operation.
+    /// Reuses the bounded response tombstones rather than retaining a separate
+    /// set of subscription identities. An ordinary request grants no event
+    /// suppression authority, and expired records are never treated as live.
+    pub(crate) fn is_retired_subscription_id(&self, subscription_id: &RequestId) -> bool {
+        let Ok(key) = subscription_id.correlation_key() else {
+            return false;
+        };
+        self.state
+            .borrow()
+            .tombstones
+            .get(&key)
+            .is_some_and(|tombstone| {
+                tombstone.subscription && tombstone.expires_at > Instant::now()
+            })
     }
 
     /// Returns whether a progress notification names one live request owner.
@@ -2598,12 +2618,36 @@ where
     /// acknowledgement order, and task filter.
     #[cfg(feature = "tasks")]
     pub fn owns_task_subscription_notification(&self, notification: &JsonRpcRequest) -> bool {
-        notification.id.is_none()
-            && matches!(
-                notification.method.as_str(),
-                "notifications/subscriptions/acknowledged" | TASK_STATUS_NOTIFICATION
-            )
-            && !self.state.borrow().task_subscriptions.is_empty()
+        if notification.id.is_some() {
+            return false;
+        }
+        let state = self.state.borrow();
+        if notification.method == TASK_STATUS_NOTIFICATION {
+            return !state.task_subscriptions.is_empty();
+        }
+        if notification.method != "notifications/subscriptions/acknowledged" {
+            return false;
+        }
+        let Some(subscription_id) = notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|id| serde_json::from_value::<RequestId>(id.clone()).ok())
+        else {
+            return false;
+        };
+        // Catalog and Tasks listeners share ingress. Claim only the exact
+        // Tasks owner; a catalog acknowledgement must reach its own harvester.
+        let Ok(key) = subscription_id.correlation_key() else {
+            return false;
+        };
+        state.pending.get(&key).is_some_and(|pending| {
+            state.task_subscriptions.contains_key(&(
+                pending.record.request_id.clone(),
+                pending.record.execution_generation,
+            ))
+        })
     }
 
     /// Returns snapshots of every active request correlation.
@@ -3018,6 +3062,7 @@ where
             Tombstone {
                 generation,
                 expires_at,
+                subscription: pending.method == SUBSCRIPTIONS_LISTEN,
                 retain_late_response_diagnostic: true,
             },
         );
@@ -3243,6 +3288,7 @@ where
             Tombstone {
                 generation,
                 expires_at,
+                subscription: pending.method == SUBSCRIPTIONS_LISTEN,
                 retain_late_response_diagnostic: false,
             },
         );
@@ -4151,6 +4197,7 @@ impl<T> Drop for RequestExecution<T> {
             Tombstone {
                 generation: self.generation,
                 expires_at,
+                subscription: pending.method == SUBSCRIPTIONS_LISTEN,
                 retain_late_response_diagnostic: false,
             },
         );

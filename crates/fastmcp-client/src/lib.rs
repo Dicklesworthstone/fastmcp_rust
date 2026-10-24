@@ -221,6 +221,8 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+#[cfg(feature = "websocket-experimental")]
+use std::sync::atomic::AtomicU8;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1283,6 +1285,84 @@ fn subscription_acknowledgement_is_foreign(
 ) -> bool {
     subscription_acknowledgement_request_id(acknowledgement)
         .is_some_and(|subscription_id| !subscription_id.correlates_with(expected_id))
+}
+
+/// Extracts the typed owner of a core subscription notification without
+/// guessing from its category or the currently active listener. Absence is
+/// valid for connection-level invalidations; a present malformed ID is never
+/// downgraded to that unscoped form.
+fn subscription_notification_request_id(
+    notification: &ServerNotification,
+) -> McpResult<Option<RequestId>> {
+    let metadata = match notification {
+        ServerNotification::SubscriptionsAcknowledged(params) => params.meta.as_ref(),
+        ServerNotification::ResourceUpdated(params) => params.meta.as_ref(),
+        ServerNotification::Cancelled(params) => params.meta.as_ref(),
+        ServerNotification::ResourcesListChanged(params)
+        | ServerNotification::ToolsListChanged(params)
+        | ServerNotification::PromptsListChanged(params) => {
+            params.as_ref().and_then(|params| params.meta.as_ref())
+        }
+        ServerNotification::Message(_) | ServerNotification::Progress(_) => None,
+    };
+    let Some(value) = metadata.and_then(|metadata| metadata.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+    else {
+        if matches!(
+            notification,
+            ServerNotification::SubscriptionsAcknowledged(_)
+        ) {
+            return Err(subscription_listener_protocol_error(
+                "Subscription acknowledgement is missing its subscription ID",
+            ));
+        }
+        return Ok(None);
+    };
+    let invalid_id = || {
+        subscription_listener_protocol_error(
+            "Subscription notification has an invalid subscription ID",
+        )
+    };
+    let request_id: RequestId = serde_json::from_value(value.clone()).map_err(|_| invalid_id())?;
+    request_id.correlation_key().map_err(|_| invalid_id())?;
+    Ok(Some(request_id))
+}
+
+fn subscription_notification_belongs_to(
+    notification: &ServerNotification,
+    expected_id: &RequestId,
+) -> McpResult<bool> {
+    Ok(subscription_notification_request_id(notification)?
+        .is_some_and(|subscription_id| subscription_id.correlates_with(expected_id)))
+}
+
+/// The stdio connection queue retains typed wire data separately from the
+/// listener that existed when it arrived. An unknown ID cannot acquire a
+/// future listener merely because the request allocator later reaches it.
+#[derive(Debug)]
+struct QueuedServerNotification {
+    notification: ServerNotification,
+    subscription_owner: Option<RequestId>,
+}
+
+impl QueuedServerNotification {
+    fn new<'a>(
+        notification: ServerNotification,
+        live_ids: impl IntoIterator<Item = &'a RequestId>,
+    ) -> McpResult<Self> {
+        let subscription_id = subscription_notification_request_id(&notification)?;
+        let subscription_owner = live_ids
+            .into_iter()
+            .find(|live_id| {
+                subscription_id
+                    .as_ref()
+                    .is_some_and(|id| id.correlates_with(live_id))
+            })
+            .cloned();
+        Ok(Self {
+            notification,
+            subscription_owner,
+        })
+    }
 }
 
 fn catalog_subscription_requested(filter: &SubscriptionFilter) -> bool {
@@ -4965,6 +5045,123 @@ pub struct WebSocketResponse {
     pub raw_result: Option<String>,
 }
 
+/// The one request whose send or receive turn currently borrows the client.
+/// Its shared election outlives that borrow, so dropping a public future does
+/// not forget a committed request or silently reuse a partially written frame.
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketTransientRequest {
+    request_id: RequestId,
+    subscription: bool,
+    state: Arc<WebSocketTransientRequestState>,
+}
+
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketTransientRequestState {
+    phase: AtomicU8,
+    callbacks: Arc<ReverseCallbackState>,
+    send_failure_message: &'static str,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl WebSocketTransientRequestState {
+    const SENDING: u8 = 0;
+    const WAITING: u8 = 1;
+    const TERMINAL: u8 = 2;
+    const ABANDONED_SEND: u8 = 3;
+    const ABANDONED_RESPONSE: u8 = 4;
+
+    fn abandon(&self) {
+        match self.phase.compare_exchange(
+            Self::SENDING,
+            Self::ABANDONED_SEND,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => self
+                .callbacks
+                .fail_connection(McpError::internal_error(self.send_failure_message)),
+            Err(Self::WAITING) => {
+                let _ = self.phase.compare_exchange(
+                    Self::WAITING,
+                    Self::ABANDONED_RESPONSE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketRequestDropGuard {
+    state: Arc<WebSocketTransientRequestState>,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl Drop for WebSocketRequestDropGuard {
+    fn drop(&mut self) {
+        self.state.abandon();
+    }
+}
+
+/// Publishes a failed send before destroying the inner future, whose fields
+/// may still hold the serialized writer. A queued reverse callback must see
+/// the closed election before that writer is released and can wake it.
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketOwnedSend<F> {
+    inner: Pin<Box<F>>,
+    state: Arc<WebSocketTransientRequestState>,
+    completed: bool,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<F> WebSocketOwnedSend<F> {
+    fn new(inner: F, state: Arc<WebSocketTransientRequestState>) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            state,
+            completed: false,
+        }
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<F> Future for WebSocketOwnedSend<F>
+where
+    F: Future<Output = Result<(), TransportError>>,
+{
+    type Output = Result<(), TransportError>;
+
+    fn poll(
+        self: Pin<&mut Self>,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll(task_cx) {
+            std::task::Poll::Ready(result) => {
+                this.completed = true;
+                if result.is_ok() {
+                    this.state
+                        .phase
+                        .store(WebSocketTransientRequestState::WAITING, Ordering::Release);
+                }
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<F> Drop for WebSocketOwnedSend<F> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.abandon();
+        }
+    }
+}
+
 /// A cancelled write may have committed no bytes or only a frame prefix.
 /// Until commitment is proven, abandoning that send makes the connection
 /// unusable. Explicit close still drains its owned transport because it uses
@@ -5506,6 +5703,7 @@ where
     /// Exact-2024 server notifications retained from the WebSocket receive loop.
     legacy_server_notifications: VecDeque<JsonRpcRequest>,
     retired_requests: VecDeque<RetiredWebSocketRequest>,
+    transient_request: Option<WebSocketTransientRequest>,
     live_catalog_subscription: Option<LiveWebSocketCatalogSubscription>,
     #[cfg(feature = "tasks")]
     live_task_subscription: Option<LiveWebSocketTaskSubscription>,
@@ -5749,6 +5947,7 @@ where
             prompts_list_generation: 0,
             legacy_server_notifications: VecDeque::new(),
             retired_requests: VecDeque::new(),
+            transient_request: None,
             live_catalog_subscription: None,
             #[cfg(feature = "tasks")]
             live_task_subscription: None,
@@ -5915,6 +6114,9 @@ where
     ///
     /// The frozen negotiated era admits the method, direction, envelope, and
     /// parameter shape before this method allocates an ID or writes a frame.
+    /// Dropping a committed request retires its exact ID on the next client
+    /// drive before another request is allocated. Dropping an incomplete send
+    /// makes the connection unusable because its frame may be only partial.
     pub async fn request_with_raw_result(
         &mut self,
         cx: &Cx,
@@ -5932,7 +6134,7 @@ where
         }
         let method = method.into();
         self.admit_raw_client_request(&method, params.as_ref())?;
-        let id = self.allocate_request_id()?;
+        let id = self.allocate_request_id().await?;
         let request = JsonRpcRequest::new(method, params, id.clone());
         self.request_admitted_with_raw_result(cx, request, None)
             .await
@@ -5984,9 +6186,13 @@ where
         let id = request.id.clone().ok_or_else(|| {
             McpError::internal_error("WebSocket admitted request requires a JSON-RPC ID")
         })?;
-        if let Err(error) = self
-            .send_message(cx, &JsonRpcMessage::Request(request))
-            .await
+        let owner =
+            self.begin_websocket_request(id.clone(), request.method == "subscriptions/listen")?;
+        if let Err(error) = WebSocketOwnedSend::new(
+            self.send_message(cx, &JsonRpcMessage::Request(request)),
+            Arc::clone(&owner.state),
+        )
+        .await
         {
             return Err(self.terminal_transport_error(cx, error).await);
         }
@@ -6107,6 +6313,7 @@ where
                 // The receive owner already has its final response. Preserve
                 // it (including durable Tasks handles) before unrelated
                 // listener cleanup can await or fail its control send.
+                self.finish_websocket_request(&id);
                 let response = response.clone();
                 let raw_result = raw_result_from_admitted_response(&response, frame, "WebSocket")?;
                 if let Err(error) = self.drain_completed_reverse_callbacks() {
@@ -6325,11 +6532,6 @@ where
             subscription.pending_notifications.clear();
             selected = true;
         }
-        if selected {
-            self.final_server_notifications.retain(|notification| {
-                !Self::websocket_notification_belongs_to_subscription(notification, request_id)
-            });
-        }
         selected
     }
 
@@ -6414,6 +6616,7 @@ where
             key,
             subscription: true,
         });
+        self.finish_websocket_request(request_id);
         Ok(())
     }
 
@@ -6841,8 +7044,12 @@ where
         // cannot make the next receive owner mis-correlate it.
         self.retired_requests.push_back(RetiredWebSocketRequest {
             key: request_key,
-            subscription,
+            subscription: subscription
+                || self.transient_request.as_ref().is_some_and(|owner| {
+                    owner.request_id.correlates_with(&request_id) && owner.subscription
+                }),
         });
+        self.finish_websocket_request(&request_id);
         let connection_cx = self.connection_cx.clone();
         if self.reverse_callback_pool.terminal_error().is_some() {
             return self
@@ -6850,6 +7057,11 @@ where
                 .await;
         }
         let sender = Arc::clone(&self.sender);
+        let send_state = Arc::new(WebSocketTransientRequestState {
+            phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
+            callbacks: Arc::clone(&self.reverse_callback_pool.state),
+            send_failure_message: "WebSocket cancellation control did not commit",
+        });
         let mut commitment = WebSocketCancellationSendGuard {
             closed: &mut self.closed,
             callbacks: &self.reverse_callback_pool,
@@ -6863,10 +7075,9 @@ where
         // is the one cancelled, an ambient cancelled task would otherwise
         // end the bound's timer at once and misreport the send as timed out.
         let cancellation_send = {
-            let mut send = Box::pin(send_websocket_callback_message(
-                &sender,
-                &connection_cx,
-                &control,
+            let mut send = Box::pin(WebSocketOwnedSend::new(
+                send_websocket_callback_message(&sender, &connection_cx, &control),
+                send_state,
             ));
             let masked_send = std::future::poll_fn(|task_cx| {
                 connection_cx.masked(|| send.as_mut().poll(task_cx))
@@ -7457,7 +7668,7 @@ where
         } else {
             ("ping", serde_json::json!({}))
         };
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let received = self
             .request_admitted_with_raw_result(
                 cx,
@@ -7586,6 +7797,7 @@ where
             NOTIFICATIONS_ROOTS_LIST_CHANGED,
             None,
         ));
+        self.settle_abandoned_websocket_request().await?;
         if let Err(error) = self.send_message(cx, &notification).await {
             return Err(self.terminal_transport_error(cx, error).await);
         }
@@ -7962,7 +8174,7 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let received = self
             .request_admitted_with_raw_result_with_deadline(
                 cx,
@@ -8317,7 +8529,7 @@ where
             return Err(McpError::request_cancelled());
         }
         let parameters = self.with_modern_request_metadata(parameters)?;
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let received = self
             .request_admitted_with_raw_result(
                 cx,
@@ -8515,6 +8727,8 @@ where
     /// The configured subscription idle/absolute policy bounds the committed
     /// stream, and at most 64 owned catalog/Tasks events are retained. An
     /// awaited timeout or caller cancellation retires only this request.
+    /// Dropping this collector also abandons its committed listen request;
+    /// the next client drive retires that ID before opening another request.
     pub async fn listen_subscriptions_typed(
         &mut self,
         cx: &Cx,
@@ -8579,15 +8793,18 @@ where
         .map_err(|_| {
             McpError::invalid_params("Modern WebSocket subscription parameters are invalid")
         })?;
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let request = JsonRpcRequest::new(
             "subscriptions/listen",
             Some(parameters.clone()),
             request_id.clone(),
         );
-        if let Err(error) = self
-            .send_message(cx, &JsonRpcMessage::Request(request))
-            .await
+        let owner = self.begin_websocket_request(request_id.clone(), true)?;
+        if let Err(error) = WebSocketOwnedSend::new(
+            self.send_message(cx, &JsonRpcMessage::Request(request)),
+            Arc::clone(&owner.state),
+        )
+        .await
         {
             return Err(self.terminal_transport_error(cx, error).await);
         }
@@ -8667,6 +8884,7 @@ where
                             )
                             .await);
                     }
+                    self.finish_websocket_request(&request_id);
                     if let Some(error) = response.error.clone() {
                         return Err(json_rpc_error_to_mcp(error));
                     }
@@ -8916,26 +9134,33 @@ where
         .map_err(|_| {
             McpError::invalid_params("Modern WebSocket subscription parameters are invalid")
         })?;
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let request =
             JsonRpcRequest::new("subscriptions/listen", Some(parameters), request_id.clone());
-        if let Err(error) = self
-            .send_message(cx, &JsonRpcMessage::Request(request))
-            .await
+        let owner = self.begin_websocket_request(request_id.clone(), true)?;
+        if let Err(error) = WebSocketOwnedSend::new(
+            self.send_message(cx, &JsonRpcMessage::Request(request)),
+            Arc::clone(&owner.state),
+        )
+        .await
         {
             return Err(self.terminal_transport_error(cx, error).await);
         }
         self.live_catalog_subscription = Some(LiveWebSocketCatalogSubscription {
-            request_id,
+            request_id: request_id.clone(),
             core_request,
             requested_filter: notifications,
             accepted_filter: None,
             acknowledgement_delivered: false,
             pending_notifications: VecDeque::new(),
             terminal_response: None,
-            lifetime: WebSocketSubscriptionLifetime::committed(cx, self.subscription_timeout_policy),
+            lifetime: WebSocketSubscriptionLifetime::committed(
+                cx,
+                self.subscription_timeout_policy,
+            ),
             terminal_error: None,
         });
+        self.finish_websocket_request(&request_id);
         Ok(())
     }
 
@@ -8961,16 +9186,25 @@ where
     where
         IO: Send + 'static,
     {
-        if self.closed {
-            if self.live_catalog_subscription.as_ref().is_some_and(|subscription| {
+        if self
+            .live_catalog_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
                 subscription.terminal_error.is_some() || subscription.terminal_response.is_some()
-            }) {
-                return self.take_ready_catalog_subscription_event()?.ok_or_else(|| {
-                    McpError::internal_error("WebSocket catalog listener lost its selected terminal outcome")
+            })
+        {
+            return self
+                .take_ready_catalog_subscription_event()?
+                .ok_or_else(|| {
+                    McpError::internal_error(
+                        "WebSocket catalog listener lost its selected terminal outcome",
+                    )
                 });
-            }
+        }
+        if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
+        self.settle_abandoned_websocket_request().await?;
         loop {
             self.expire_live_websocket_subscriptions().await?;
             let terminal_selected =
@@ -9254,9 +9488,6 @@ where
                 McpError::invalid_request("No live final catalog WebSocket subscription is active")
             })?
             .request_id;
-        self.final_server_notifications.retain(|notification| {
-            !Self::websocket_notification_belongs_to_subscription(notification, &request_id)
-        });
         // Retire the local route before the first await. The shared request
         // cancellation path installs its tombstone before writing, bounds the
         // control send, and uses the retained connection context.
@@ -9326,26 +9557,33 @@ where
         .map_err(|_| {
             McpError::invalid_params("Modern WebSocket subscription parameters are invalid")
         })?;
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let request =
             JsonRpcRequest::new("subscriptions/listen", Some(parameters), request_id.clone());
-        if let Err(error) = self
-            .send_message(cx, &JsonRpcMessage::Request(request))
-            .await
+        let owner = self.begin_websocket_request(request_id.clone(), true)?;
+        if let Err(error) = WebSocketOwnedSend::new(
+            self.send_message(cx, &JsonRpcMessage::Request(request)),
+            Arc::clone(&owner.state),
+        )
+        .await
         {
             return Err(self.terminal_transport_error(cx, error).await);
         }
         self.live_task_subscription = Some(LiveWebSocketTaskSubscription {
-            request_id,
+            request_id: request_id.clone(),
             core_request,
             requested_filter: notifications,
             accepted_filter: None,
             acknowledgement_delivered: false,
             pending_notifications: VecDeque::new(),
             terminal_response: None,
-            lifetime: WebSocketSubscriptionLifetime::committed(cx, self.subscription_timeout_policy),
+            lifetime: WebSocketSubscriptionLifetime::committed(
+                cx,
+                self.subscription_timeout_policy,
+            ),
             terminal_error: None,
         });
+        self.finish_websocket_request(&request_id);
         Ok(())
     }
 
@@ -9369,16 +9607,23 @@ where
     where
         IO: Send + 'static,
     {
-        if self.closed {
-            if self.live_task_subscription.as_ref().is_some_and(|subscription| {
+        if self
+            .live_task_subscription
+            .as_ref()
+            .is_some_and(|subscription| {
                 subscription.terminal_error.is_some() || subscription.terminal_response.is_some()
-            }) {
-                return self.take_ready_task_subscription_event()?.ok_or_else(|| {
-                    McpError::internal_error("WebSocket Tasks listener lost its selected terminal outcome")
-                });
-            }
+            })
+        {
+            return self.take_ready_task_subscription_event()?.ok_or_else(|| {
+                McpError::internal_error(
+                    "WebSocket Tasks listener lost its selected terminal outcome",
+                )
+            });
+        }
+        if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
+        self.settle_abandoned_websocket_request().await?;
         loop {
             self.expire_live_websocket_subscriptions().await?;
             let terminal_selected =
@@ -9673,9 +9918,6 @@ where
                 McpError::invalid_request("No live final Tasks WebSocket subscription is active")
             })?
             .request_id;
-        self.final_server_notifications.retain(|notification| {
-            !Self::websocket_notification_belongs_to_subscription(notification, &request_id)
-        });
         let outcome = self
             .retire_committed_request_after_cancellation(request_id, true)
             .await;
@@ -10143,7 +10385,7 @@ where
         let params = serde_json::to_value(parameters).map_err(|_| {
             McpError::invalid_params("Modern Tasks request parameters could not serialize")
         })?;
-        let request_id = self.allocate_request_id()?;
+        let request_id = self.allocate_request_id().await?;
         let received = self
             .request_admitted_with_raw_result(
                 cx,
@@ -10573,7 +10815,107 @@ where
         Ok(())
     }
 
-    fn allocate_request_id(&mut self) -> McpResult<RequestId> {
+    fn begin_websocket_request(
+        &mut self,
+        request_id: RequestId,
+        subscription: bool,
+    ) -> McpResult<WebSocketRequestDropGuard> {
+        if self.transient_request.is_some() {
+            return Err(McpError::internal_error(
+                "WebSocket client already owns an unsettled request",
+            ));
+        }
+        let state = Arc::new(WebSocketTransientRequestState {
+            phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
+            callbacks: Arc::clone(&self.reverse_callback_pool.state),
+            send_failure_message: "WebSocket request send was dropped before commitment",
+        });
+        self.transient_request = Some(WebSocketTransientRequest {
+            request_id,
+            subscription,
+            state: Arc::clone(&state),
+        });
+        Ok(WebSocketRequestDropGuard { state })
+    }
+
+    fn finish_websocket_request(&mut self, request_id: &RequestId) {
+        if self
+            .transient_request
+            .as_ref()
+            .is_some_and(|owner| owner.request_id.correlates_with(request_id))
+        {
+            let owner = self
+                .transient_request
+                .take()
+                .expect("matching request owner");
+            owner
+                .state
+                .phase
+                .store(WebSocketTransientRequestState::TERMINAL, Ordering::Release);
+        }
+    }
+
+    /// A dropped receive has no task left to send its cancellation. The next
+    /// operation owns that bounded control write, before it allocates an ID,
+    /// sends a frame, or takes another receive turn. Partial input remains in
+    /// the connection-owned reader until its exact tombstone can discard it.
+    async fn settle_abandoned_websocket_request(&mut self) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        let Some(owner) = self.transient_request.as_ref() else {
+            return Ok(());
+        };
+        match owner.state.phase.load(Ordering::Acquire) {
+            WebSocketTransientRequestState::ABANDONED_RESPONSE => {
+                let owner = self
+                    .transient_request
+                    .take()
+                    .expect("abandoned request owner");
+                let outcome = self
+                    .retire_committed_request_after_cancellation(
+                        owner.request_id,
+                        owner.subscription,
+                    )
+                    .await;
+                if outcome.code == McpErrorCode::RequestCancelled && !self.closed {
+                    Ok(())
+                } else {
+                    Err(outcome)
+                }
+            }
+            WebSocketTransientRequestState::ABANDONED_SEND => {
+                let error = self
+                    .reverse_callback_pool
+                    .terminal_error()
+                    .unwrap_or_else(|| {
+                        McpError::internal_error(
+                            "WebSocket request send was dropped before commitment",
+                        )
+                    });
+                let connection_cx = self.connection_cx.clone();
+                self.closed = true;
+                self.settle_close(&connection_cx).await?;
+                Err(error)
+            }
+            WebSocketTransientRequestState::TERMINAL => {
+                self.transient_request = None;
+                Ok(())
+            }
+            _ => Err(McpError::internal_error(
+                "WebSocket client already owns an active request",
+            )),
+        }
+    }
+
+    async fn allocate_request_id(&mut self) -> McpResult<RequestId>
+    where
+        IO: Send + 'static,
+    {
+        self.settle_abandoned_websocket_request().await?;
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1).ok_or_else(|| {
             McpError::internal_error("WebSocket client request ID space exhausted")
@@ -10608,6 +10950,12 @@ where
     }
 
     async fn settle_close(&mut self, cx: &Cx) -> McpResult<()> {
+        if let Some(owner) = self.transient_request.take() {
+            owner
+                .state
+                .phase
+                .store(WebSocketTransientRequestState::TERMINAL, Ordering::Release);
+        }
         if self.close_settled {
             return Ok(());
         }
@@ -12001,6 +12349,17 @@ enum ResponseRoute {
     ConnectionClosed,
 }
 
+struct PendingResponse {
+    sender: oneshot::Sender<CorrelatedResponse>,
+    subscription: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RetiredResponse {
+    expires_at: Instant,
+    subscription: bool,
+}
+
 /// Correlation state owned by the single-reader stdio client.
 ///
 /// Only registered IDs can receive a response. A committed request timeout
@@ -12011,8 +12370,8 @@ enum ResponseRoute {
 /// for every ID registered with the one receive loop and provides bounded
 /// state for a future multiplexed adapter.
 struct ResponseRegistry {
-    pending: std::collections::HashMap<CorrelationKey, oneshot::Sender<CorrelatedResponse>>,
-    tombstones: std::collections::HashMap<CorrelationKey, Instant>,
+    pending: std::collections::HashMap<CorrelationKey, PendingResponse>,
+    tombstones: std::collections::HashMap<CorrelationKey, RetiredResponse>,
     /// Live local owners whose one permitted cancellation control has been
     /// claimed. This remains distinct from response tombstones so a timeout
     /// can retain its late-response guard after its outbound control write.
@@ -12033,6 +12392,18 @@ impl ResponseRegistry {
     }
 
     fn register(&mut self, id: RequestId) -> McpResult<ResponseWaiter> {
+        self.register_with_subscription(id, false)
+    }
+
+    fn register_subscription(&mut self, id: RequestId) -> McpResult<ResponseWaiter> {
+        self.register_with_subscription(id, true)
+    }
+
+    fn register_with_subscription(
+        &mut self,
+        id: RequestId,
+        subscription: bool,
+    ) -> McpResult<ResponseWaiter> {
         self.prune_expired_retained_state(Instant::now());
         if let Some(error) = &self.terminal_error {
             return Err(error.clone());
@@ -12062,7 +12433,13 @@ impl ResponseRegistry {
         let (sender, receiver) = oneshot::channel();
         // A new local owner begins a fresh cancellation-control generation.
         self.cancellation_controls.remove(&key);
-        self.pending.insert(key, sender);
+        self.pending.insert(
+            key,
+            PendingResponse {
+                sender,
+                subscription,
+            },
+        );
         Ok(ResponseWaiter { id, receiver })
     }
 
@@ -12096,15 +12473,32 @@ impl ResponseRegistry {
             self.fail_all(McpError::internal_error(INVALID_RESPONSE_ENVELOPE_ERROR));
             return ResponseRoute::InvalidEnvelope;
         };
-        if self.tombstones.remove(&key).is_some() {
+        if let Some(retired) = self.tombstones.get(&key) {
+            // A subscription's late terminal does not release its event
+            // ownership fence: already-sent data may follow it on the pipe.
+            // The same absolute expiry and correlation quota still apply.
+            if !retired.subscription {
+                self.tombstones.remove(&key);
+            }
             return ResponseRoute::TombstoneRetired;
         }
-        let Some(sender) = self.pending.remove(&key) else {
+        let Some(pending) = self.pending.remove(&key) else {
             self.note_uncorrelated_response("response received for unknown or completed request");
             return ResponseRoute::UnknownId;
         };
 
-        match sender.send_blocking(Ok(ReceivedJsonRpcResponse {
+        if pending.subscription {
+            let now = Instant::now();
+            let expires_at = now.checked_add(RESPONSE_TOMBSTONE_RETENTION).unwrap_or(now);
+            self.tombstones.insert(
+                key,
+                RetiredResponse {
+                    expires_at,
+                    subscription: true,
+                },
+            );
+        }
+        match pending.sender.send_blocking(Ok(ReceivedJsonRpcResponse {
             response,
             raw_result,
         })) {
@@ -12120,10 +12514,10 @@ impl ResponseRegistry {
         let Ok(key) = id.correlation_key() else {
             return false;
         };
-        let Some(sender) = self.pending.remove(&key) else {
+        let Some(pending) = self.pending.remove(&key) else {
             return false;
         };
-        let _ = sender.send_blocking(Err(error));
+        let _ = pending.sender.send_blocking(Err(error));
         true
     }
 
@@ -12148,12 +12542,27 @@ impl ResponseRegistry {
         let expires_at = now
             .checked_add(RESPONSE_TOMBSTONE_RETENTION)
             .ok_or_else(|| McpError::internal_error("Tombstone retention exceeds clock range"))?;
-        let Some(sender) = self.pending.remove(&key) else {
+        let Some(pending) = self.pending.remove(&key) else {
             return Ok(false);
         };
-        self.tombstones.insert(key, expires_at);
-        let _ = sender.send_blocking(Err(error));
+        self.tombstones.insert(
+            key,
+            RetiredResponse {
+                expires_at,
+                subscription: pending.subscription,
+            },
+        );
+        let _ = pending.sender.send_blocking(Err(error));
         Ok(true)
+    }
+
+    fn is_retired_subscription_id(&self, id: &RequestId) -> bool {
+        let Ok(key) = id.correlation_key() else {
+            return false;
+        };
+        self.tombstones
+            .get(&key)
+            .is_some_and(|retired| retired.subscription && retired.expires_at > Instant::now())
     }
 
     /// Removes a registered request which was cancelled before any frame was
@@ -12212,7 +12621,8 @@ impl ResponseRegistry {
     }
 
     fn prune_expired_retained_state(&mut self, now: Instant) {
-        self.tombstones.retain(|_, expires_at| *expires_at > now);
+        self.tombstones
+            .retain(|_, retired| retired.expires_at > now);
         self.cancellation_controls
             .retain(|_, expires_at| *expires_at > now);
     }
@@ -12226,8 +12636,8 @@ impl ResponseRegistry {
         self.terminal_error = Some(error.clone());
 
         let mut failed = 0;
-        for (_, sender) in self.pending.drain() {
-            let _ = sender.send_blocking(Err(error.clone()));
+        for (_, pending) in self.pending.drain() {
+            let _ = pending.sender.send_blocking(Err(error.clone()));
             failed += 1;
         }
         failed
@@ -12292,6 +12702,14 @@ impl SharedResponseRegistry {
 
     fn register(&self, id: RequestId) -> McpResult<ResponseWaiter> {
         self.lock()?.register(id)
+    }
+
+    fn register_subscription(&self, id: RequestId) -> McpResult<ResponseWaiter> {
+        self.lock()?.register_subscription(id)
+    }
+
+    fn is_retired_subscription_id(&self, id: &RequestId) -> McpResult<bool> {
+        Ok(self.lock()?.is_retired_subscription_id(id))
     }
 
     #[cfg(test)]
@@ -16393,6 +16811,10 @@ impl StdioRequestExecutor {
         self.executor.owns_response_id(response_id)
     }
 
+    fn is_retired_subscription_id(&self, subscription_id: &RequestId) -> bool {
+        self.executor.is_retired_subscription_id(subscription_id)
+    }
+
     fn owns_progress_notification(&self, notification: &JsonRpcRequest) -> bool {
         self.executor.owns_progress_notification(notification)
     }
@@ -16507,7 +16929,7 @@ pub struct Client {
     /// Strict response correlation for every in-flight request.
     responses: SharedResponseRegistry,
     /// Exact non-progress notifications received from a modern server.
-    final_server_notifications: VecDeque<ServerNotification>,
+    final_server_notifications: VecDeque<QueuedServerNotification>,
     /// Exact-2024 server notifications retained from the stdio receive pump.
     ///
     /// Modern sessions leave this empty and use
@@ -17947,7 +18369,10 @@ impl Client {
     /// [`Self::take_legacy_notifications`] for the 2024 receive pump.
     #[must_use]
     pub fn take_final_server_notifications(&mut self) -> Vec<ServerNotification> {
-        self.final_server_notifications.drain(..).collect()
+        self.final_server_notifications
+            .drain(..)
+            .map(|queued| queued.notification)
+            .collect()
     }
 
     /// Pops one exact-2024 server notification retained by the stdio receive
@@ -17957,7 +18382,7 @@ impl Client {
         self.legacy_server_notifications.pop_front()
     }
 
-    /// Drains exact-2024 server notifications retained by the stdio receive
+/// Drains exact-2024 server notifications retained by the stdio receive
     /// pump. Modern sessions never retain values here.
     #[must_use]
     pub fn take_legacy_notifications(&mut self) -> Vec<JsonRpcRequest> {
@@ -19519,14 +19944,27 @@ impl Client {
         let raw_params = raw_notification_params_from_frame(frame.source())?;
         let notification = decode_final_server_notification(request, raw_params.as_deref())
             .map_err(|error| {
-                McpError::invalid_request(format!("Invalid final server notification: {error}"))
+                self.terminate_connection(McpError::invalid_request(format!(
+                    "Invalid final server notification: {error}"
+                )))
             })?;
+        let subscription_id = subscription_notification_request_id(&notification)
+            .map_err(|error| self.terminate_connection(error))?;
 
         // Advance the matching generation before exposing the notification or
         // accepting a late fetch completion. A fetch captures its generation
         // before send and can only fill while it remains current.
         self.final_result_cache
             .invalidate_notification(&notification);
+
+        // Valid late events still conservatively invalidate same-connection
+        // cache data, but their retired owner cannot acquire a new queue or
+        // renew the active listener's lifetime. The executor bounds retention.
+        if let Some(subscription_id) = subscription_id.as_ref()
+            && self.is_retired_stdio_subscription_id(subscription_id)?
+        {
+            return Ok(Some(ModernServerNotification::Retained));
+        }
 
         let ServerNotification::Progress(progress) = notification else {
             if self.final_server_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
@@ -19540,7 +19978,13 @@ impl Client {
                 }
                 _ => None,
             };
-            self.final_server_notifications.push_back(notification);
+            self.final_server_notifications
+                .push_back(QueuedServerNotification::new(
+                    notification,
+                    self.live_catalog_subscription
+                        .as_ref()
+                        .map(|subscription| subscription.execution.request_id()),
+                )?);
             // Admit subscription activity while the frame is being consumed,
             // including while a sibling ordinary request owns the reader.
             // Delaying until the application polls the listener would let an
@@ -22012,6 +22456,17 @@ impl Client {
                             ));
                             }
                         };
+                    let subscription_id = subscription_notification_request_id(&notification)
+                        .map_err(|error| self.terminate_connection(error))?;
+                    if let Some(subscription_id) = subscription_id.as_ref()
+                        && self
+                            .is_retired_stdio_subscription_id(subscription_id)
+                            .map_err(|error| self.terminate_connection(error))?
+                    {
+                        self.final_result_cache
+                            .invalidate_notification(&notification);
+                        continue;
+                    }
                     match notification {
                         ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
                             if accepted_filter.is_some() {
@@ -22042,6 +22497,16 @@ impl Client {
                         | ServerNotification::ToolsListChanged(_)
                         | ServerNotification::PromptsListChanged(_)
                         | ServerNotification::ResourceUpdated(_)) => {
+                            let belongs_to_listener =
+                                subscription_notification_belongs_to(&notification, &expected_id)
+                                    .map_err(|error| self.terminate_connection(error))?;
+                            if !belongs_to_listener {
+                                self.retain_modern_server_notification(&frame)
+                                    .map_err(|error| self.terminate_connection(error))?;
+                                continue;
+                            }
+                            self.final_result_cache
+                                .invalidate_notification(&notification);
                             let Some(accepted_filter) = accepted_filter.as_ref() else {
                                 return Err(self.terminate_connection(
                                         subscription_listener_protocol_error(
@@ -24556,7 +25021,7 @@ impl Client {
         let id_i64 = i64::try_from(id).expect("request ID allocator enforces the i64 bound");
         let request_id = RequestId::Number(id_i64);
         let request = JsonRpcRequest::new("subscriptions/listen", Some(params_value), id_i64);
-        let waiter = self.responses.register(request_id.clone())?;
+        let waiter = self.responses.register_subscription(request_id.clone())?;
         if let Err(error) = self.send_to_server(&JsonRpcMessage::Request(request)) {
             return Err(self.record_send_failure(Some(&request_id), error));
         }
@@ -24725,31 +25190,55 @@ impl Client {
         }
     }
 
+    fn is_retired_stdio_subscription_id(&self, subscription_id: &RequestId) -> McpResult<bool> {
+        Ok(self.responses.is_retired_subscription_id(subscription_id)?
+            || self
+                .multiplexed_executor
+                .as_ref()
+                .is_some_and(|executor| executor.is_retired_subscription_id(subscription_id)))
+    }
+
     fn harvest_live_catalog_subscription_notifications(&mut self) -> McpResult<()> {
         if self.live_catalog_subscription.is_none() {
             return Ok(());
         }
-        let queued: Vec<ServerNotification> = self.final_server_notifications.drain(..).collect();
+        let queued: Vec<QueuedServerNotification> =
+            self.final_server_notifications.drain(..).collect();
         let mut remainder = VecDeque::new();
         let mut harvest_error = None;
-        for notification in queued {
+        for queued_notification in queued {
             if harvest_error.is_some() {
-                remainder.push_back(notification);
+                remainder.push_back(queued_notification);
                 continue;
             }
             let Some(subscription) = self.live_catalog_subscription.as_mut() else {
-                remainder.push_back(notification);
+                remainder.push_back(queued_notification);
                 continue;
             };
+            if !queued_notification
+                .subscription_owner
+                .as_ref()
+                .is_some_and(|owner| owner.correlates_with(subscription.execution.request_id()))
+            {
+                remainder.push_back(queued_notification);
+                continue;
+            }
+            let QueuedServerNotification {
+                notification,
+                subscription_owner,
+            } = queued_notification;
             match notification {
                 ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
                     if subscription_acknowledgement_is_foreign(
                         subscription.execution.request_id(),
                         &acknowledgement,
                     ) {
-                        remainder.push_back(ServerNotification::SubscriptionsAcknowledged(
-                            acknowledgement,
-                        ));
+                        remainder.push_back(QueuedServerNotification {
+                            notification: ServerNotification::SubscriptionsAcknowledged(
+                                acknowledgement,
+                            ),
+                            subscription_owner,
+                        });
                         continue;
                     }
                     if subscription.accepted_filter.is_some() {
@@ -24777,6 +25266,23 @@ impl Client {
                 | ServerNotification::ToolsListChanged(_)
                 | ServerNotification::PromptsListChanged(_)
                 | ServerNotification::ResourceUpdated(_)) => {
+                    match subscription_notification_belongs_to(
+                        &notification,
+                        subscription.execution.request_id(),
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            remainder.push_back(QueuedServerNotification {
+                                notification,
+                                subscription_owner,
+                            });
+                            continue;
+                        }
+                        Err(error) => {
+                            harvest_error = Some(error);
+                            continue;
+                        }
+                    }
                     let Some(accepted_filter) = subscription.accepted_filter.as_ref() else {
                         harvest_error = Some(subscription_listener_protocol_error(
                             "Subscription listener received an event before acknowledgement",
@@ -24804,7 +25310,10 @@ impl Client {
                         subscription.pending_notifications.push_back(notification);
                     }
                 }
-                other => remainder.push_back(other),
+                other => remainder.push_back(QueuedServerNotification {
+                    notification: other,
+                    subscription_owner,
+                }),
             }
         }
         self.final_server_notifications = remainder;
@@ -24814,7 +25323,7 @@ impl Client {
         Ok(())
     }
 
-    /// Drives the sole stdio ingress reader until one live catalog listener
+/// Drives the sole stdio ingress reader until one live catalog listener
     /// event is available.
     ///
     /// Catalog and resource-update events admitted while another sequential
@@ -27473,6 +27982,837 @@ mod tests {
 
     #[cfg(feature = "websocket-experimental")]
     #[test]
+    fn websocket_request_drop_retires_once_and_preserves_partial_response_frames() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let source = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"result":{{"abandoned":"{}"}}}}"#,
+                "x".repeat(128)
+            );
+            let mut frame = vec![0x81, 126];
+            frame.extend_from_slice(&u16::try_from(source.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(source.as_bytes());
+            for split in [1, 3, 17, frame.len() - 1, frame.len()] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let parameters = client
+                    .with_modern_request_metadata(serde_json::json!({}))
+                    .unwrap();
+                peer_io.write_all(&frame[..split]).await.unwrap();
+                {
+                    let mut request = Box::pin(client.request_with_raw_result(
+                        &cx,
+                        "tools/list",
+                        Some(parameters),
+                    ));
+                    let polled =
+                        std::future::poll_fn(|task_cx| Poll::Ready(request.as_mut().poll(task_cx)))
+                            .await;
+                    if split == frame.len() {
+                        assert!(
+                            matches!(polled, Poll::Ready(Ok(_))),
+                            "a complete response wins before future destruction"
+                        );
+                    } else {
+                        assert!(
+                            polled.is_pending(),
+                            "a response split at {split} stays pending"
+                        );
+                    }
+                }
+                assert!(
+                    client.receiver.is_some(),
+                    "the connection retains partial framing state"
+                );
+                assert_eq!(client.next_id, 3);
+                if split == frame.len() {
+                    assert!(client.transient_request.is_none());
+                } else {
+                    assert_eq!(
+                        client
+                            .transient_request
+                            .as_ref()
+                            .unwrap()
+                            .state
+                            .phase
+                            .load(Ordering::Acquire),
+                        WebSocketTransientRequestState::ABANDONED_RESPONSE
+                    );
+                    peer_io.write_all(&frame[split..]).await.unwrap();
+                }
+                for id in [3, 4] {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::to_string(&JsonRpcResponse::success(
+                            RequestId::Number(id),
+                            async_modern_tools_list_result(),
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                    client
+                        .list_tools(&cx, None)
+                        .await
+                        .expect("a subsequent request owns its own response");
+                    assert!(client.transient_request.is_none());
+                    assert!(
+                        client.retired_requests.is_empty(),
+                        "only the exact late response consumes its tombstone"
+                    );
+                }
+                client.close(&cx).await.unwrap();
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                for (method, id) in [(SERVER_DISCOVER_METHOD, 1), ("tools/list", 2)] {
+                    let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                        panic!("expected request");
+                    };
+                    assert_eq!(request.method, method);
+                    assert_eq!(request.id, Some(RequestId::Number(id)));
+                }
+                if split != frame.len() {
+                    let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                        panic!("expected one cancellation");
+                    };
+                    assert_eq!(control.method, "notifications/cancelled");
+                    assert!(control.id.is_none());
+                    assert_eq!(control.params.unwrap()["requestId"], 2);
+                }
+                for id in [3, 4] {
+                    let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                        panic!("expected reused request");
+                    };
+                    assert_eq!(request.method, "tools/list");
+                    assert_eq!(
+                        request.id,
+                        Some(RequestId::Number(id)),
+                        "no repeated cancellation or replacement ID"
+                    );
+                }
+                assert!(matches!(
+                    server.recv(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_collector_drop_retires_owned_events_before_connection_reuse() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_subscription_test_ack(2, serde_json::json!({"toolsListChanged": true})),
+            )
+            .await;
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#).await;
+            {
+                let mut collector = Box::pin(
+                    client.listen_subscriptions_typed(&cx, websocket_catalog_test_filter()),
+                );
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(collector.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+            }
+            assert!(client.live_catalog_subscription.is_none());
+            assert!(client.transient_request.as_ref().unwrap().subscription);
+            // Both a late data event and the terminal response still belong
+            // to the dropped collector, not the next ordinary request.
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#).await;
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(
+                    RequestId::Number(3),
+                    async_modern_tools_list_result(),
+                ))
+                .unwrap(),
+            )
+            .await;
+            client.list_tools(&cx, None).await.unwrap();
+            assert!(client.transient_request.is_none());
+            assert!(
+                client.take_final_server_notifications().is_empty(),
+                "owned collector events never become generic events on Drop"
+            );
+            client.close(&cx).await.unwrap();
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for expected in [
+                SERVER_DISCOVER_METHOD,
+                "subscriptions/listen",
+                "notifications/cancelled",
+                "tools/list",
+            ] {
+                let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                    panic!("expected request or control");
+                };
+                assert_eq!(request.method, expected);
+                if expected == "notifications/cancelled" {
+                    assert_eq!(request.params.unwrap()["requestId"], 2);
+                }
+            }
+            assert!(matches!(
+                server.recv(&cx).await,
+                Err(TransportError::Closed)
+            ));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_send_drop_closes_callback_election_before_inner_future_destruction() {
+        struct PendingWriter {
+            callbacks: Arc<ReverseCallbackState>,
+            callback_id: RequestId,
+            cancellation: ReverseRequestCancellation,
+            claimed_on_drop: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            complete: bool,
+        }
+        impl Future for PendingWriter {
+            type Output = Result<(), TransportError>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                if self.complete {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+        impl Drop for PendingWriter {
+            fn drop(&mut self) {
+                // Models a queued callback awakened when the held writer is
+                // destroyed: its response election must already be closed.
+                self.claimed_on_drop.store(
+                    self.callbacks
+                        .claim_response_if_open(&self.callback_id, &self.cancellation),
+                    Ordering::Release,
+                );
+                self.dropped.store(true, Ordering::Release);
+            }
+        }
+        run_test(|| async {
+            for complete in [false, true] {
+                let callbacks = Arc::new(ReverseCallbackState::default());
+                let callback_id = RequestId::String("queued-callback".to_owned());
+                let cancellation = callbacks.admit(&callback_id).unwrap();
+                let claimed = Arc::new(AtomicBool::new(false));
+                let dropped = Arc::new(AtomicBool::new(false));
+                let state = Arc::new(WebSocketTransientRequestState {
+                    phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
+                    callbacks: Arc::clone(&callbacks),
+                    send_failure_message: "test request or cancellation send did not commit",
+                });
+                let mut sending = Box::pin(WebSocketOwnedSend::new(
+                    PendingWriter {
+                        callbacks: Arc::clone(&callbacks),
+                        callback_id,
+                        cancellation,
+                        claimed_on_drop: Arc::clone(&claimed),
+                        dropped: Arc::clone(&dropped),
+                        complete,
+                    },
+                    state,
+                ));
+                let polled =
+                    std::future::poll_fn(|task_cx| Poll::Ready(sending.as_mut().poll(task_cx)))
+                        .await;
+                assert_eq!(polled.is_ready(), complete);
+                drop(sending);
+                assert!(dropped.load(Ordering::Acquire));
+                assert_eq!(
+                    claimed.load(Ordering::Acquire),
+                    complete,
+                    "only a fully committed send leaves the queued callback eligible"
+                );
+                assert_eq!(callbacks.terminal_error().is_none(), complete);
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_abandoned_request_cleanup_is_bounded_and_never_allocates_a_successor() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for drop_cleanup in [false, true] {
+                let (client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                {
+                    let mut request = Box::pin(client.list_tools(&cx, None));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(request.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                }
+                assert_eq!(client.next_id, 3);
+                if drop_cleanup {
+                    let mut next = Box::pin(client.list_tools(&cx, None));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(next.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                    drop(next);
+                    assert!(
+                        !client.close_settled,
+                        "dropping the control leaves explicit close owed"
+                    );
+                } else {
+                    let error = asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(2),
+                        client.list_tools(&cx, None),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert_eq!(
+                        error.message, "Request timed out",
+                        "preserve the failed cleanup error"
+                    );
+                }
+                assert!(client.closed);
+                assert!(client.reverse_callback_pool.terminal_error().is_some());
+                assert!(client.transient_request.is_none());
+                assert_eq!(client.retired_requests.len(), 1);
+                assert_eq!(
+                    client.next_id, 3,
+                    "cleanup runs before successor ID allocation"
+                );
+                assert!(client.list_tools(&cx, None).await.is_err());
+                assert_eq!(client.next_id, 3);
+                client.close(&cx).await.unwrap();
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                for expected in [SERVER_DISCOVER_METHOD, "tools/list"] {
+                    let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                        panic!("expected the original committed requests");
+                    };
+                    assert_eq!(request.method, expected);
+                }
+                assert!(
+                    matches!(server.recv(&cx).await, Err(TransportError::Closed)),
+                    "no replacement request or detached cancellation reaches the peer"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_request_send_drop_refuses_reuse_for_rpc_collector_and_listener_open() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let kinds = [
+                "rpc",
+                "collector",
+                "catalog",
+                #[cfg(feature = "tasks")]
+                "tasks",
+            ];
+            for kind in kinds {
+                let (mut client_io, mut peer_io) = stalled_cancellation_async_websocket_pair();
+                client_io.text_frames_before_stall = 1;
+                let mut discovery = async_modern_discovery_result();
+                discovery["capabilities"] =
+                    serde_json::json!({"extensions": {"io.modelcontextprotocol/tasks": {}}});
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(1),
+                        discovery,
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let callback_id = RequestId::String("queued".to_owned());
+                let callback = client
+                    .reverse_callback_pool
+                    .state
+                    .admit(&callback_id)
+                    .unwrap();
+                {
+                    let mut sending = Box::pin(async {
+                        match kind {
+                            "rpc" => client.list_tools(&cx, None).await.map(|_| ()),
+                            "collector" => client
+                                .listen_subscriptions_typed(&cx, websocket_catalog_test_filter())
+                                .await
+                                .map(|_| ()),
+                            "catalog" => {
+                                client
+                                    .open_subscriptions_listener(
+                                        &cx,
+                                        websocket_catalog_test_filter(),
+                                    )
+                                    .await
+                            }
+                            #[cfg(feature = "tasks")]
+                            "tasks" => {
+                                client
+                                    .open_final_task_subscription_listener(
+                                        &cx,
+                                        serde_json::from_value(
+                                            serde_json::json!({"taskIds": ["job-a"]}),
+                                        )
+                                        .unwrap(),
+                                    )
+                                    .await
+                            }
+                            _ => unreachable!(),
+                        }
+                    });
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(sending.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                }
+                assert_eq!(
+                    client
+                        .transient_request
+                        .as_ref()
+                        .unwrap()
+                        .state
+                        .phase
+                        .load(Ordering::Acquire),
+                    WebSocketTransientRequestState::ABANDONED_SEND
+                );
+                assert!(client.reverse_callback_pool.terminal_error().is_some());
+                assert!(
+                    !client
+                        .reverse_callback_pool
+                        .state
+                        .claim_response_if_open(&callback_id, &callback),
+                    "a queued callback cannot write after {kind} send Drop"
+                );
+                assert!(client.live_catalog_subscription.is_none());
+                #[cfg(feature = "tasks")]
+                assert!(client.live_task_subscription.is_none());
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(2),
+                    client.list_tools(&cx, None),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert_eq!(
+                    error.message,
+                    "WebSocket request send was dropped before commitment"
+                );
+                assert!(client.closed);
+                assert_eq!(
+                    client.next_id, 3,
+                    "no successor ID is allocated after an uncertain send"
+                );
+                assert!(
+                    client.retired_requests.is_empty(),
+                    "an uncommitted frame cannot authorize a cancellation frame"
+                );
+                client.close(&cx).await.unwrap();
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                let JsonRpcMessage::Request(discovery) = server.recv(&cx).await.unwrap() else {
+                    panic!("discovery request");
+                };
+                assert_eq!(discovery.method, SERVER_DISCOVER_METHOD);
+                assert!(
+                    matches!(server.recv(&cx).await, Err(TransportError::Closed)),
+                    "only discovery committed before the stalled {kind} send"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_request_drop_settles_before_incremental_listener_receive() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            client
+                .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                .await
+                .unwrap();
+            assert!(
+                client.transient_request.is_none(),
+                "successful open transfers custody to the persistent listener"
+            );
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_subscription_test_ack(2, serde_json::json!({"toolsListChanged": true})),
+            )
+            .await;
+            {
+                let mut ordinary = Box::pin(client.list_tools(&cx, None));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(ordinary.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+            }
+            let cancellation = McpRequestCancellation::new();
+            assert!(matches!(
+                client.next_subscription_event(&cx, &cancellation).await,
+                Ok(StdioSubscriptionEvent::Acknowledged(_))
+            ));
+            assert!(client.transient_request.is_none());
+            assert_eq!(client.next_id, 4, "receive-only settlement allocates no ID");
+            assert_eq!(client.retired_requests.len(), 1);
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(
+                    RequestId::Number(3),
+                    async_modern_tools_list_result(),
+                ))
+                .unwrap(),
+            )
+            .await;
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#).await;
+            assert!(matches!(
+                client.next_subscription_event(&cx, &cancellation).await,
+                Ok(StdioSubscriptionEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                ))
+            ));
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#).await;
+            assert!(matches!(
+                client.next_subscription_event(&cx, &cancellation).await,
+                Ok(StdioSubscriptionEvent::Terminal)
+            ));
+            assert!(client.retired_requests.is_empty());
+            client.close(&cx).await.unwrap();
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for expected in [
+                SERVER_DISCOVER_METHOD,
+                "subscriptions/listen",
+                "tools/list",
+                "notifications/cancelled",
+            ] {
+                let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                    panic!("request or cancellation");
+                };
+                assert_eq!(request.method, expected);
+                if expected == "notifications/cancelled" {
+                    assert_eq!(request.params.unwrap()["requestId"], 3);
+                }
+            }
+            assert!(
+                matches!(server.recv(&cx).await, Err(TransportError::Closed)),
+                "the sibling listen is never cancelled"
+            );
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_listener_cancellation_preserves_events_received_before_its_id_existed() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for peer_cancel in [false, true] {
+                let (client_io, mut peer_io) = async_websocket_pair();
+                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+                let mut client = WebSocketClient::connect_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let future_ack = websocket_subscription_test_ack(
+                    3,
+                    serde_json::json!({"toolsListChanged": true}),
+                );
+                let future_event = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#;
+                write_server_text_frame(&mut peer_io, &future_ack).await;
+                write_server_text_frame(&mut peer_io, future_event).await;
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(2),
+                        async_modern_tools_list_result(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                client.list_tools(&cx, None).await.unwrap();
+                assert_eq!(client.final_server_notifications.len(), 2);
+                client
+                    .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                    .await
+                    .unwrap();
+                write_server_text_frame(&mut peer_io, &future_ack).await;
+                write_server_text_frame(&mut peer_io, future_event).await;
+                if peer_cancel {
+                    write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#).await;
+                }
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(4),
+                        async_modern_tools_list_result(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                client.list_tools(&cx, None).await.unwrap();
+                let cancellation = McpRequestCancellation::new();
+                if !peer_cancel {
+                    cancellation.cancel();
+                }
+                let error = client
+                    .next_subscription_event(&cx, &cancellation)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                let generic = client.take_final_server_notifications();
+                assert_eq!(
+                    generic.len(),
+                    2,
+                    "cancelling the later owner cannot erase earlier connection-owned frames"
+                );
+                assert!(matches!(
+                    generic[0],
+                    ServerNotification::SubscriptionsAcknowledged(_)
+                ));
+                assert!(matches!(
+                    generic[1],
+                    ServerNotification::ToolsListChanged(_)
+                ));
+                assert!(client.live_catalog_subscription.is_none());
+                client.close(&cx).await.unwrap();
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                for expected in [
+                    SERVER_DISCOVER_METHOD,
+                    "tools/list",
+                    "subscriptions/listen",
+                    "tools/list",
+                ] {
+                    let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                        panic!("request");
+                    };
+                    assert_eq!(request.method, expected);
+                }
+                if !peer_cancel {
+                    let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                        panic!("one local cancellation");
+                    };
+                    assert_eq!(control.method, "notifications/cancelled");
+                    assert_eq!(control.params.unwrap()["requestId"], 3);
+                }
+                assert!(
+                    matches!(server.recv(&cx).await, Err(TransportError::Closed)),
+                    "peer cancellation is never echoed"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn websocket_request_drop_preserves_tasks_and_catalog_siblings_and_prior_generic_ack() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (client_io, mut peer_io) = async_websocket_pair();
+            let mut discovery = async_modern_discovery_result();
+            discovery["capabilities"] =
+                serde_json::json!({"extensions": {"io.modelcontextprotocol/tasks": {}}});
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(RequestId::Number(1), discovery))
+                    .unwrap(),
+            )
+            .await;
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .unwrap();
+            let task_filter = serde_json::json!({"taskIds": ["job-a"]});
+            let tasks_ack = websocket_subscription_test_ack(3, task_filter.clone());
+            write_server_text_frame(&mut peer_io, &tasks_ack).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(
+                    RequestId::Number(2),
+                    async_modern_tools_list_result(),
+                ))
+                .unwrap(),
+            )
+            .await;
+            client.list_tools(&cx, None).await.unwrap();
+            assert_eq!(client.final_server_notifications.len(), 1);
+            client
+                .open_final_task_subscription_listener(
+                    &cx,
+                    serde_json::from_value(task_filter).unwrap(),
+                )
+                .await
+                .unwrap();
+            client
+                .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                .await
+                .unwrap();
+            write_server_text_frame(&mut peer_io, &tasks_ack).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_subscription_test_ack(4, serde_json::json!({"toolsListChanged": true})),
+            )
+            .await;
+            {
+                let mut ordinary = Box::pin(client.list_tools(&cx, None));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(ordinary.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+            }
+            let live = McpRequestCancellation::new();
+            assert!(matches!(
+                client.next_final_task_subscription_event(&cx, &live).await,
+                Ok(StdioTaskSubscriptionEvent::Acknowledged(_))
+            ));
+            assert!(client.transient_request.is_none());
+            assert_eq!(client.next_id, 6);
+            assert!(client.live_catalog_subscription.is_some());
+            assert!(client.live_task_subscription.is_some());
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            assert_eq!(
+                client
+                    .next_final_task_subscription_event(&cx, &cancelled)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Acknowledged(_))
+            ));
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(
+                    RequestId::Number(5),
+                    async_modern_tools_list_result(),
+                ))
+                .unwrap(),
+            )
+            .await;
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#).await;
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":4}}}"#).await;
+            write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":4}}}"#).await;
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Notification(
+                    ServerNotification::ToolsListChanged(_)
+                ))
+            ));
+            assert!(matches!(
+                client.next_subscription_event(&cx, &live).await,
+                Ok(StdioSubscriptionEvent::Terminal)
+            ));
+            let generic = client.take_final_server_notifications();
+            assert_eq!(
+                generic.len(),
+                1,
+                "Tasks cancellation preserves the acknowledgement received before its ID existed"
+            );
+            assert!(matches!(
+                generic[0],
+                ServerNotification::SubscriptionsAcknowledged(_)
+            ));
+            assert!(client.retired_requests.is_empty());
+            client.close(&cx).await.unwrap();
+            let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+            for expected in [
+                SERVER_DISCOVER_METHOD,
+                "tools/list",
+                "subscriptions/listen",
+                "subscriptions/listen",
+                "tools/list",
+            ] {
+                let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
+                    panic!("request");
+                };
+                assert_eq!(request.method, expected);
+            }
+            for id in [5, 3] {
+                let JsonRpcMessage::Request(control) = server.recv(&cx).await.unwrap() else {
+                    panic!("owned cancellation");
+                };
+                assert_eq!(control.method, "notifications/cancelled");
+                assert_eq!(control.params.unwrap()["requestId"], id);
+            }
+            assert!(
+                matches!(server.recv(&cx).await, Err(TransportError::Closed)),
+                "catalog sibling never receives cancellation"
+            );
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
     fn websocket_async_cancellation_bounds_a_stalled_control_send_without_detaching_it() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
@@ -29098,13 +30438,13 @@ mod tests {
                                 );
                             }
                         }
-                        peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(2_i64, serde_json::json!({
+                        peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(2), serde_json::json!({
                             "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
                         })))).await.unwrap();
                         peer.send(
                             &cx,
                             &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                3_i64,
+                                RequestId::Number(3),
                                 async_modern_tools_list_result(),
                             )),
                         )
@@ -29151,10 +30491,10 @@ mod tests {
                 let JsonRpcMessage::Request(cancel) = peer.recv(&peer_cx).await.unwrap() else { panic!("listener cancellation"); };
                 assert_eq!(cancel.method, "notifications/cancelled");
                 assert_eq!(cancel.params.unwrap()["requestId"], serde_json::json!(2));
-                peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(2_i64, serde_json::json!({
+                peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(2), serde_json::json!({
                     "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
                 })))).await.unwrap();
-                peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(3_i64, async_modern_tools_list_result()))).await.unwrap();
+                peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(3), async_modern_tools_list_result()))).await.unwrap();
                 assert!(matches!(peer.recv(&peer_cx).await, Err(TransportError::Closed)));
             }).unwrap();
             asupersync::time::timeout(
@@ -29500,10 +30840,10 @@ mod tests {
                         r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#
                     } else { websocket_subscription_test_task_event() }).unwrap();
                     peer.send(&peer_cx, &event).await.unwrap();
-                    peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(expired_id, serde_json::json!({
+                    peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(expired_id), serde_json::json!({
                         "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": expired_id},
                     })))).await.unwrap();
-                    peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(5_i64, async_modern_tools_list_result()))).await.unwrap();
+                    peer.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(5), async_modern_tools_list_result()))).await.unwrap();
                     assert!(matches!(peer.recv(&peer_cx).await, Err(TransportError::Closed)));
                 }).unwrap();
                 asupersync::time::timeout(
@@ -29823,11 +31163,11 @@ mod tests {
                         };
                         assert_eq!(cancel.method, "notifications/cancelled");
                         assert_eq!(cancel.params.unwrap()["requestId"], serde_json::json!(2));
-                        peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(2_i64, serde_json::json!({"resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": 2}})))).await.unwrap();
+                        peer.send(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(2), serde_json::json!({"resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": 2}})))).await.unwrap();
                         peer.send(
                             &cx,
                             &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                3_i64,
+                                RequestId::Number(3),
                                 async_modern_tools_list_result(),
                             )),
                         )
@@ -29895,6 +31235,8 @@ mod tests {
                 response.response.result,
                 Some(serde_json::json!({"ready_response_kept": true}))
             );
+            assert!(client.transient_request.is_none(), "the admitted final disarms Drop custody before unrelated cleanup");
+            assert!(client.retired_requests.is_empty(), "the ready RPC never acquires a cancellation tombstone");
             assert!(
                 listener_cx.is_cancel_requested(),
                 "the read boundary elected listener cancellation"
@@ -45456,23 +46798,26 @@ exec sleep 30
 
     #[test]
     fn response_registry_precommit_abandonment_retains_no_late_response_route() {
-        let mut registry = ResponseRegistry::new();
-        let request_id = RequestId::Number(81);
-        let _waiter = registry
-            .register(request_id.clone())
-            .expect("request obtains a local correlation owner");
+        for subscription in [false, true] {
+            let mut registry = ResponseRegistry::new();
+            let request_id = RequestId::Number(81);
+            let _waiter = registry
+                .register_with_subscription(request_id.clone(), subscription)
+                .expect("request obtains a local correlation owner");
 
-        assert!(registry.abandon_before_commit(&request_id));
-        assert_eq!(registry.pending_len(), 0);
-        assert_eq!(registry.tombstone_len(), 0);
-        assert_eq!(
-            registry.route(JsonRpcResponse::success(
-                request_id,
-                serde_json::json!({"impossible": "uncommitted"}),
-            )),
-            ResponseRoute::UnknownId,
-            "a pre-commit cancellation retains no route because no upstream frame exists"
-        );
+            assert!(registry.abandon_before_commit(&request_id));
+            assert_eq!(registry.pending_len(), 0);
+            assert_eq!(registry.tombstone_len(), 0);
+            assert!(!registry.is_retired_subscription_id(&request_id));
+            assert_eq!(
+                registry.route(JsonRpcResponse::success(
+                    request_id,
+                    serde_json::json!({"impossible": "uncommitted"}),
+                )),
+                ResponseRoute::UnknownId,
+                "a pre-commit cancellation retains no route because no upstream frame exists"
+            );
+        }
     }
 
     #[test]
@@ -45501,6 +46846,105 @@ exec sleep 30
     }
 
     #[test]
+    fn response_registry_retired_subscription_survives_late_final_without_renewal() {
+        let mut registry = ResponseRegistry::new();
+        let request_id = RequestId::Number(88);
+        let numeric_alias = RequestId::Integer("8.8e1".to_owned());
+        let mut waiter = registry
+            .register_subscription(request_id.clone())
+            .expect("subscription owns its terminal response");
+        let ordinary_id = RequestId::Number(89);
+        let _ordinary_waiter = registry
+            .register(ordinary_id.clone())
+            .expect("ordinary request also owns a response");
+
+        for id in [&request_id, &ordinary_id] {
+            assert!(
+                registry
+                    .tombstone(id, McpError::request_cancelled())
+                    .expect("committed owner can be retired")
+            );
+        }
+        waiter
+            .try_response()
+            .expect_err("retirement delivers the owner's cancellation");
+        assert!(registry.is_retired_subscription_id(&numeric_alias));
+        assert!(!registry.is_retired_subscription_id(&RequestId::String("88".to_owned())));
+        assert!(!registry.is_retired_subscription_id(&ordinary_id));
+
+        let key = request_id.correlation_key().expect("valid numeric ID");
+        let expires_at = registry.tombstones[&key].expires_at;
+        for _ in 0..2 {
+            assert_eq!(
+                registry.route(JsonRpcResponse::success(
+                    numeric_alias.clone(),
+                    serde_json::json!({}),
+                )),
+                ResponseRoute::TombstoneRetired
+            );
+            assert!(registry.is_retired_subscription_id(&request_id));
+            assert_eq!(registry.tombstones[&key].expires_at, expires_at);
+        }
+        assert_eq!(registry.uncorrelated_diagnostics, 0);
+        assert!(registry.register_subscription(numeric_alias).is_err());
+
+        registry
+            .tombstones
+            .get_mut(&key)
+            .expect("late final retains subscription ownership")
+            .expires_at = Instant::now();
+        assert!(!registry.is_retired_subscription_id(&request_id));
+        registry
+            .register_subscription(request_id)
+            .expect("absolute expiry releases the old owner's correlation capacity");
+        assert_eq!(registry.pending_len(), 1);
+        assert_eq!(registry.tombstone_len(), 1);
+    }
+
+    #[test]
+    fn response_registry_completed_subscription_keeps_its_bounded_retirement() {
+        let mut registry = ResponseRegistry::new();
+        let request_id = RequestId::String("completed-listener".to_owned());
+        let mut waiter = registry
+            .register_subscription(request_id.clone())
+            .expect("listener owns its final response");
+        assert!(!registry.is_retired_subscription_id(&request_id));
+
+        assert_eq!(
+            registry.route(JsonRpcResponse::success(
+                request_id.clone(),
+                serde_json::json!({}),
+            )),
+            ResponseRoute::Delivered
+        );
+        assert_eq!(
+            waiter
+                .try_response()
+                .expect("valid terminal response")
+                .expect("listener receives its terminal response")
+                .id,
+            Some(request_id.clone())
+        );
+        assert_eq!(registry.pending_len(), 0);
+        assert_eq!(registry.tombstone_len(), 1);
+        assert!(registry.is_retired_subscription_id(&request_id));
+        assert!(registry.register_subscription(request_id.clone()).is_err());
+        assert_eq!(
+            registry.route(JsonRpcResponse::success(
+                request_id.clone(),
+                serde_json::json!({"duplicate": true}),
+            )),
+            ResponseRoute::TombstoneRetired
+        );
+        assert!(registry.is_retired_subscription_id(&request_id));
+        assert_eq!(registry.uncorrelated_diagnostics, 0);
+
+        registry.fail_all(McpError::internal_error("connection closed"));
+        assert!(!registry.is_retired_subscription_id(&request_id));
+        assert_eq!(registry.tombstone_len(), 0);
+    }
+
+    #[test]
     fn response_registry_combined_correlation_bound_includes_tombstones() {
         let mut registry = ResponseRegistry::new();
         let expires_at = Instant::now()
@@ -45513,7 +46957,10 @@ exec sleep 30
                     RequestId::String(format!("retired-{id}"))
                         .correlation_key()
                         .expect("test IDs are valid"),
-                    expires_at,
+                    RetiredResponse {
+                        expires_at,
+                        subscription: false,
+                    },
                 )
             }));
 
@@ -45538,7 +46985,10 @@ exec sleep 30
                     RequestId::String(format!("expired-{id}"))
                         .correlation_key()
                         .expect("test IDs are valid"),
-                    Instant::now(),
+                    RetiredResponse {
+                        expires_at: Instant::now(),
+                        subscription: false,
+                    },
                 )
             }));
 
@@ -47909,7 +49359,7 @@ while IFS= read -r unexpected; do exit 31; done
              IFS= read -r call || exit 1; \
              case \"$call\" in *tools/call*) ;; *) exit 1 ;; esac; \
              case \"$call\" in *io.modelcontextprotocol/protocolVersion*2026-07-28*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}'; \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"resultType\":\"complete\",\"content\":[{{\"type\":\"text\",\"text\":\"hidden\"}}],\"isError\":false}}}}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' ;; *) exit 1 ;; esac; \
              exec sleep 2"
@@ -51753,7 +53203,7 @@ exec sleep 5
         let script = modern_subscriptions_listen_client_script(
             2,
             &[
-                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
             ],
         );
@@ -51775,7 +53225,8 @@ exec sleep 5
         assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
         assert!(matches!(
             collector.notifications.as_slice(),
-            [ServerNotification::ToolsListChanged(None)]
+            [notification @ ServerNotification::ToolsListChanged(Some(_))]
+                if subscription_notification_request_id(notification).unwrap() == Some(RequestId::Number(2))
         ));
         assert!(matches!(
             collector.terminal.payload,
@@ -51790,7 +53241,7 @@ exec sleep 5
         let script = modern_subscriptions_listen_client_script(
             2,
             &[
-                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
             ],
         );
@@ -51821,7 +53272,8 @@ exec sleep 5
             client
                 .next_subscription_event(&cx, &cancellation)
                 .expect("public selected-stdio ingress routes the catalog event"),
-            StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(None))
+            StdioSubscriptionEvent::Notification(ref notification @ ServerNotification::ToolsListChanged(Some(_)))
+                if subscription_notification_request_id(notification).unwrap() == Some(RequestId::Number(2))
         ));
         assert!(matches!(
             client
@@ -51836,6 +53288,519 @@ exec sleep 5
         client
             .close()
             .expect("incremental catalog listener cleanup");
+    }
+
+    #[cfg(unix)]
+    fn catalog_listener_replacement_probe(cancelled: bool) {
+        let discovery = modern_discovery_response("catalog-owner", &[MODERN_PROTOCOL_VERSION]);
+        let probes = [4, 5, 6].map(|id| discovery.replacen("\"id\":1", &format!("\"id\":{id}"), 1));
+        let script = r#"
+IFS= read -r discover || exit 90
+printf '%s\n' "$1"
+IFS= read -r first || exit 91
+case "$first" in *subscriptions/listen*'"id":2'*) ;; *) exit 92;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}'
+if [ "$2" = cancel ]; then
+    IFS= read -r cancel || exit 93
+    case "$cancel" in *notifications/cancelled*'"requestId":2'*) ;; *) exit 94;; esac
+else
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}'
+fi
+IFS= read -r second || exit 95
+case "$second" in *subscriptions/listen*'"id":3'*) ;; *) exit 96;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":99}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"3"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3e0},"notifications":{"toolsListChanged":true}}}'
+IFS= read -r ping || exit 97
+case "$ping" in *'"method":"server/discover"'*'"id":4'*) ;; *) exit 98;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2e0},"notifications":{"toolsListChanged":true}}}'
+if [ "$2" = cancel ]; then
+    printf '%s\n' '{"jsonrpc":"2.0","id":2.0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2e0}}}'
+fi
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2e0}}}'
+printf '%s\n' "$3"
+IFS= read -r ping || exit 99
+case "$ping" in *'"method":"server/discover"'*'"id":5'*) ;; *) exit 100;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3.0}}}'
+printf '%s\n' "$4"
+IFS= read -r ping || exit 101
+case "$ping" in *'"method":"server/discover"'*'"id":6'*) ;; *) exit 102;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}'
+printf '%s\n' "$5"
+exec sleep 2
+"#;
+        let mode = if cancelled { "cancel" } else { "complete" };
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
+            "sh",
+            &[
+                "-c",
+                script,
+                "catalog-owner",
+                &discovery,
+                mode,
+                &probes[0],
+                &probes[1],
+                &probes[2],
+            ],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+        )
+        .unwrap();
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        client.open_subscriptions_listener(filter.clone()).unwrap();
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Acknowledged(_)
+        ));
+        if cancelled {
+            client.cancel_live_catalog_subscription(&cx).unwrap();
+        } else {
+            assert!(matches!(
+                client.next_subscription_event(&cx, &cancellation).unwrap(),
+                StdioSubscriptionEvent::Terminal
+            ));
+        }
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        assert!(executor.is_retired_subscription_id(&serde_json::from_str("2e0").unwrap()));
+        assert!(!executor.is_retired_subscription_id(&RequestId::String("2".to_owned())));
+        client.open_subscriptions_listener(filter).unwrap();
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Acknowledged(_)
+        ));
+        let before = executor.executor.pending_records().remove(0);
+        let generation = client
+            .final_result_cache
+            .begin_fetch(&FinalCacheResultSet::Tools);
+        client
+            .ping()
+            .expect("late retired frames cannot strand an ordinary sibling");
+        let after = executor.executor.pending_records().remove(0);
+        assert_eq!(
+            after.idle_deadline, before.idle_deadline,
+            "A's late event must not renew B"
+        );
+        assert_eq!(after.absolute_deadline, before.absolute_deadline);
+        assert_ne!(
+            client
+                .final_result_cache
+                .begin_fetch(&FinalCacheResultSet::Tools),
+            generation,
+            "a valid stale scope still conservatively invalidates the connection cache"
+        );
+        assert!(
+            client
+                .live_catalog_subscription
+                .as_ref()
+                .unwrap()
+                .pending_notifications
+                .is_empty()
+        );
+        let connection_events = client.take_final_server_notifications();
+        assert_eq!(
+            connection_events.len(),
+            3,
+            "known retired traffic is suppressed; unknown and unscoped traffic stays bounded and visible"
+        );
+        assert_eq!(
+            subscription_notification_request_id(&connection_events[0]).unwrap(),
+            Some(RequestId::Number(99))
+        );
+        assert_eq!(
+            subscription_notification_request_id(&connection_events[1]).unwrap(),
+            Some(RequestId::String("3".to_owned()))
+        );
+        assert_eq!(
+            subscription_notification_request_id(&connection_events[2]).unwrap(),
+            None
+        );
+        assert!(
+            !client
+                .is_retired_stdio_subscription_id(&RequestId::Number(4))
+                .unwrap(),
+            "an ordinary request tombstone has no subscription authority"
+        );
+        client.ping().unwrap();
+        let after_owned = executor.executor.pending_records().remove(0);
+        assert!(after_owned.idle_deadline > after.idle_deadline);
+        assert_eq!(after_owned.absolute_deadline, before.absolute_deadline);
+        let StdioSubscriptionEvent::Notification(notification) =
+            client.next_subscription_event(&cx, &cancellation).unwrap()
+        else {
+            panic!("B's exact numeric alias must deliver one event");
+        };
+        assert!(
+            subscription_notification_belongs_to(&notification, &RequestId::Number(3)).unwrap()
+        );
+        client.ping().unwrap();
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Terminal
+        ));
+        assert!(client.live_catalog_subscription.is_none());
+        assert!(client.is_initialized());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_event_ownership_stdio_cancelled_listener_cannot_transfer_to_replacement() {
+        catalog_listener_replacement_probe(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_event_ownership_stdio_completed_listener_cannot_transfer_to_replacement() {
+        catalog_listener_replacement_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_event_ownership_stdio_unknown_future_id_stays_connection_owned() {
+        let discovery =
+            modern_discovery_response("future-catalog-owner", &[MODERN_PROTOCOL_VERSION]);
+        let probes = [2, 4].map(|id| discovery.replacen("\"id\":1", &format!("\"id\":{id}"), 1));
+        let script = r#"
+IFS= read -r discover || exit 90
+printf '%s\n' "$1"
+IFS= read -r ping || exit 91
+case "$ping" in *'"method":"server/discover"'*'"id":2'*) ;; *) exit 92;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"notifications":{"toolsListChanged":true}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}'
+printf '%s\n' "$2"
+IFS= read -r listen || exit 93
+case "$listen" in *subscriptions/listen*'"id":3'*) ;; *) exit 94;; esac
+IFS= read -r ping || exit 95
+case "$ping" in *'"method":"server/discover"'*'"id":4'*) ;; *) exit 96;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3.0},"notifications":{"toolsListChanged":true}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3e0}}}'
+printf '%s\n' "$3"
+IFS= read -r cancel || exit 97
+case "$cancel" in *notifications/cancelled*'"requestId":3'*) ;; *) exit 98;; esac
+exec sleep 2
+"#;
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
+            "sh",
+            &[
+                "-c",
+                script,
+                "future-catalog-owner",
+                &discovery,
+                &probes[0],
+                &probes[1],
+            ],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+        )
+        .unwrap();
+        client.ping().unwrap();
+        assert_eq!(client.final_server_notifications.len(), 2);
+        client
+            .open_subscriptions_listener(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .unwrap();
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(
+            client
+                .try_next_subscription_event(&cx, &cancellation)
+                .unwrap()
+                .is_none(),
+            "pre-request traffic must neither acknowledge nor deliver to the newly allocated ID"
+        );
+        assert!(
+            client
+                .live_catalog_subscription
+                .as_ref()
+                .unwrap()
+                .accepted_filter
+                .is_none()
+        );
+        client.ping().unwrap();
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Acknowledged(_)
+        ));
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Notification(_)
+        ));
+        let retained = client.take_final_server_notifications();
+        assert!(matches!(
+            retained.as_slice(),
+            [
+                ServerNotification::SubscriptionsAcknowledged(_),
+                ServerNotification::ToolsListChanged(_)
+            ]
+        ));
+        client.cancel_live_catalog_subscription(&cx).unwrap();
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_event_ownership_stdio_malformed_scope_fails_before_cache_invalidation() {
+        for incremental in [false, true] {
+            for (method, invalid_id, extra) in [
+                ("notifications/tools/list_changed", "null", ""),
+                ("notifications/resources/list_changed", "true", ""),
+                ("notifications/prompts/list_changed", "[]", ""),
+                (
+                    "notifications/resources/updated",
+                    "{}",
+                    r#", "uri":"file:///owned""#,
+                ),
+            ] {
+                let event = format!(
+                    r#"{{"jsonrpc":"2.0","method":"{method}","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":{invalid_id}}}{extra}}}}}"#
+                );
+                let script = modern_subscriptions_listen_client_script(2, &[&event]);
+                let mut client = Client::stdio_with_protocol_plan_with_cx(
+                    Cx::for_request(),
+                    "sh",
+                    &["-c", &script],
+                    ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+                )
+                .unwrap();
+                let before = client.final_result_cache.stats().invalidations;
+                let filter = SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                };
+                let error = if incremental {
+                    client.open_subscriptions_listener(filter).unwrap();
+                    let cx = Cx::for_request();
+                    let cancellation = McpRequestCancellation::new();
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &cancellation).unwrap(),
+                        StdioSubscriptionEvent::Acknowledged(_)
+                    ));
+                    client
+                        .next_subscription_event(&cx, &cancellation)
+                        .unwrap_err()
+                } else {
+                    client.listen_subscriptions_typed(filter).unwrap_err()
+                };
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert_eq!(
+                    client.final_result_cache.stats().invalidations,
+                    before,
+                    "malformed scope cannot mutate any catalog or resource generation"
+                );
+                assert!(!client.is_initialized());
+                assert!(client.transport_is_closed());
+                let _ = client.close();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_event_ownership_stdio_collectors_ignore_retired_ack_but_preserve_connection_events()
+    {
+        for incremental_first in [false, true] {
+            let discovery =
+                modern_discovery_response("collector-owner", &[MODERN_PROTOCOL_VERSION]);
+            let script = r#"
+IFS= read -r discover || exit 90
+printf '%s\n' "$1"
+IFS= read -r first || exit 91
+case "$first" in *subscriptions/listen*'"id":2'*) ;; *) exit 92;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}'
+if [ "$2" = cancel ]; then
+    IFS= read -r cancel || exit 93
+    case "$cancel" in *notifications/cancelled*'"requestId":2'*) ;; *) exit 94;; esac
+else
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}'
+fi
+IFS= read -r second || exit 95
+case "$second" in *subscriptions/listen*'"id":3'*) ;; *) exit 96;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2e0},"notifications":{"toolsListChanged":true}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":"3"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3},"notifications":{"toolsListChanged":true}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3e0}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}'
+exec sleep 2
+"#;
+            let mode = if incremental_first {
+                "cancel"
+            } else {
+                "complete"
+            };
+            let mut client = Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
+                "sh",
+                &["-c", script, "collector-owner", &discovery, mode],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            )
+            .unwrap();
+            let filter = SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            };
+            if incremental_first {
+                client.open_subscriptions_listener(filter.clone()).unwrap();
+                let cx = Cx::for_request();
+                assert!(matches!(
+                    client
+                        .next_subscription_event(&cx, &McpRequestCancellation::new())
+                        .unwrap(),
+                    StdioSubscriptionEvent::Acknowledged(_)
+                ));
+                client.cancel_live_catalog_subscription(&cx).unwrap();
+            } else {
+                assert!(
+                    client
+                        .listen_subscriptions_typed(filter.clone())
+                        .unwrap()
+                        .notifications
+                        .is_empty()
+                );
+            }
+            assert!(
+                client
+                    .is_retired_stdio_subscription_id(&RequestId::Number(2))
+                    .unwrap()
+            );
+            let result = client.listen_subscriptions_typed(filter).unwrap();
+            assert_eq!(result.notifications.len(), 1);
+            assert!(
+                subscription_notification_belongs_to(
+                    &result.notifications[0],
+                    &RequestId::Number(3)
+                )
+                .unwrap()
+            );
+            let retained = client.take_final_server_notifications();
+            assert!(matches!(
+                retained.as_slice(),
+                [
+                    ServerNotification::ResourcesListChanged(None),
+                    ServerNotification::ToolsListChanged(Some(_))
+                ]
+            ));
+            assert_eq!(
+                subscription_notification_request_id(&retained[1]).unwrap(),
+                Some(RequestId::String("3".to_owned()))
+            );
+            assert_eq!(
+                client.final_result_cache.stats().invalidations,
+                6,
+                "retired, unscoped, foreign and owned events all preserve cache invalidation semantics"
+            );
+            client.close().unwrap();
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn catalog_event_ownership_stdio_tasks_and_catalog_acknowledgements_keep_their_owners() {
+        let discovery =
+            modern_tasks_discovery_response("overlapping-listeners", serde_json::json!({}));
+        let probes = [4, 5].map(|id| discovery.replacen("\"id\":1", &format!("\"id\":{id}"), 1));
+        let script = r#"
+IFS= read -r discover || exit 90
+printf '%s\n' "$1"
+IFS= read -r tasks || exit 91
+case "$tasks" in *subscriptions/listen*'"id":2'*) ;; *) exit 92;; esac
+case "$tasks" in *'"taskIds":["task-owned"]'*) ;; *) exit 93;; esac
+IFS= read -r catalog || exit 94
+case "$catalog" in *subscriptions/listen*'"id":3'*) ;; *) exit 95;; esac
+case "$catalog" in *'"toolsListChanged":true'*) ;; *) exit 96;; esac
+IFS= read -r ping || exit 97
+case "$ping" in *'"method":"server/discover"'*'"id":4'*) ;; *) exit 98;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3e0},"notifications":{"toolsListChanged":true}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3.0}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2e0},"notifications":{"taskIds":["task-owned"]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/tasks","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2.0},"taskId":"task-owned","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}'
+printf '%s\n' "$2"
+IFS= read -r ping || exit 99
+case "$ping" in *'"method":"server/discover"'*'"id":5'*) ;; *) exit 100;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2.0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2e0}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3.0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3e0}}}'
+printf '%s\n' "$3"
+exec sleep 2
+"#;
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
+            "sh",
+            &[
+                "-c",
+                script,
+                "overlapping-listeners",
+                &discovery,
+                &probes[0],
+                &probes[1],
+            ],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+        )
+        .unwrap();
+        let task_id = FinalTaskId::parse("task-owned").unwrap();
+        let mut task_filter = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut task_filter, vec![task_id.clone()])
+            .unwrap();
+        client
+            .open_final_task_subscription_listener(task_filter)
+            .unwrap();
+        client
+            .open_subscriptions_listener(SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            })
+            .unwrap();
+        client
+            .ping()
+            .expect("a Tasks listener must not claim another listener's acknowledgement");
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Acknowledged(ref filter)
+                if filter.tools_list_changed == Some(true)
+        ));
+        assert!(matches!(
+            client.next_final_task_subscription_event(&cx, &cancellation).unwrap(),
+            StdioTaskSubscriptionEvent::Acknowledged(ref filter)
+                if task_subscription_ids(filter).unwrap() == Some(vec![task_id.clone()])
+        ));
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Notification(ref notification)
+                if subscription_notification_belongs_to(notification, &RequestId::Number(3)).unwrap()
+        ));
+        assert!(matches!(
+            client.next_final_task_subscription_event(&cx, &cancellation).unwrap(),
+            StdioTaskSubscriptionEvent::Notification(ref notification)
+                if notification.params.task.base().task_id == task_id
+        ));
+        assert!(client.take_final_server_notifications().is_empty());
+        client.ping().unwrap();
+        assert!(matches!(
+            client
+                .next_final_task_subscription_event(&cx, &cancellation)
+                .unwrap(),
+            StdioTaskSubscriptionEvent::Terminal
+        ));
+        assert!(matches!(
+            client.next_subscription_event(&cx, &cancellation).unwrap(),
+            StdioSubscriptionEvent::Terminal
+        ));
+        assert!(client.live_task_subscription.is_none());
+        assert!(client.live_catalog_subscription.is_none());
+        assert!(client.is_initialized());
+        assert_eq!(client.peek_next_request_id(), 6);
+        client.close().unwrap();
     }
 
     #[cfg(all(unix, feature = "tasks"))]
@@ -51903,8 +53868,12 @@ exec sleep 5
                 StdioSubscriptionEvent::Notification(notification) => {
                     assert!(matches!(
                         notification,
-                        ServerNotification::ToolsListChanged(None)
+                        ServerNotification::ToolsListChanged(Some(_))
                     ));
+                    assert_eq!(
+                        subscription_notification_request_id(&notification).unwrap(),
+                        Some(RequestId::Number(2))
+                    );
                     Ok(1)
                 }
                 StdioSubscriptionEvent::Terminal => Ok(2),
@@ -51931,7 +53900,7 @@ exec sleep 5
                     format!(r#""method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"taskId":"{task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#)
                 } else {
                     let catalog = if mode == "bad-filter" { "resources" } else { "tools" };
-                    format!(r#""method":"notifications/{catalog}/list_changed"}}"#)
+                    format!(r#""method":"notifications/{catalog}/list_changed","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}}}}}}"#)
                 };
                 // The cancellation neighbor sends the same delayed event as
                 // the positive peer; only caller cancellation differs before
@@ -52187,7 +54156,8 @@ exec sleep 5
             client
                 .next_subscription_event(&cx, &cancellation)
                 .expect("catalog events queued during tools/call stay request-owned"),
-            StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(None))
+            StdioSubscriptionEvent::Notification(ref notification @ ServerNotification::ToolsListChanged(Some(_)))
+                if subscription_notification_request_id(notification).unwrap() == Some(RequestId::Number(2))
         ));
         assert!(matches!(
             client
@@ -52278,7 +54248,7 @@ exec sleep 2
              printf '%s\\n' '{discovery_response}' ;; *) exit 1 ;; esac; \
              IFS= read -r request || exit 1; \
              case \"$request\" in *subscriptions/listen*) \
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}' \
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}' \
              ;; *) exit 1 ;; esac; \
              exec sleep 2"
         );
@@ -52339,7 +54309,7 @@ exec sleep 2
         let script = modern_subscriptions_listen_client_script(
             2,
             &[
-                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
             ],
         );
@@ -52640,7 +54610,7 @@ exec sleep 2
         let script = modern_subscriptions_listen_client_script(
             3,
             &[
-                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
                 r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
             ],
         );
@@ -52667,7 +54637,7 @@ exec sleep 2
     #[test]
     fn clt_01_subscriptions_listen_notification_overflow_fails_closed() {
         let stream_frames = vec![
-            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#;
             MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS + 1
         ];
         let script = modern_subscriptions_listen_client_script(2, &stream_frames);
@@ -52740,7 +54710,7 @@ exec sleep 2
                 r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"reason":null}}"#,
                 r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#,
                 r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2,"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
-                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
+                r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
                 r#"{"jsonrpc":"2.0","id":2e0,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}"#,
             ],
         );
@@ -52760,10 +54730,17 @@ exec sleep 2
             .expect("invalid and foreign controls are inert for the owned live listener");
         assert!(matches!(
             collector.notifications.as_slice(),
-            [ServerNotification::ToolsListChanged(None)]
+            [notification @ ServerNotification::ToolsListChanged(Some(_))]
+                if subscription_notification_request_id(notification).unwrap() == Some(RequestId::Number(2))
         ));
         assert_eq!(client.responses.pending_len(), 0);
-        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert!(
+            client
+                .responses
+                .is_retired_subscription_id(&RequestId::Number(2))
+                .unwrap()
+        );
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert!(client.is_initialized());
         assert!(client.responses.terminal_error().is_none());
@@ -52794,13 +54771,19 @@ exec sleep 2
             FinalSubscriptionsListenResult {}
         ));
         assert_eq!(client.responses.pending_len(), 0);
-        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
 
         client.list_tools_typed(None).expect(
             "the next request starts after the listener consumed its own terminal response",
         );
-        assert_eq!(client.responses.tombstone_len(), 0);
+        assert_eq!(client.responses.tombstone_len(), 1);
+        assert!(
+            client
+                .responses
+                .is_retired_subscription_id(&RequestId::Number(2))
+                .unwrap()
+        );
         assert_eq!(client.responses.uncorrelated_diagnostics(), 0);
         assert!(client.is_initialized());
         assert!(client.responses.terminal_error().is_none());
