@@ -13157,9 +13157,14 @@ impl FinalTaskHandle {
                 "final task snapshot does not match this handle",
             )));
         }
-        if self.is_terminal() {
+        if self.is_terminal() || self.snapshot_is_identical(&task)? {
             return Ok(false);
         }
+        self.task = task;
+        Ok(true)
+    }
+
+    fn snapshot_is_identical(&self, task: &FinalTask) -> Result<bool, HttpClientError> {
         // Compare the retained representation, including exact nested result
         // source. Timestamp spellings participate only in equality; their
         // lexicographic order is never a chronology or reconciliation rule.
@@ -13168,16 +13173,28 @@ impl FinalTaskHandle {
                 "final task snapshot could not be compared",
             ))
         })?;
-        let candidate = serde_json::to_vec(&task).map_err(|_| {
+        let candidate = serde_json::to_vec(task).map_err(|_| {
             HttpClientError::CoreResult(McpError::internal_error(
                 "final task snapshot could not be compared",
             ))
         })?;
-        if previous == candidate {
-            return Ok(false);
-        }
-        self.task = task;
-        Ok(true)
+        Ok(previous == candidate)
+    }
+
+    fn notification_needs_reconciliation(&self, task: &FinalTask) -> Result<bool, HttpClientError> {
+        use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
+
+        let invalid_timestamp = |_| {
+            HttpClientError::CoreResult(McpError::invalid_request(
+                "final task timestamp cannot form a checked instant",
+            ))
+        };
+        let previous =
+            timestamp_nanos(&self.task.base().last_updated_at).map_err(invalid_timestamp)?;
+        let observed = timestamp_nanos(&task.base().last_updated_at).map_err(invalid_timestamp)?;
+        // A timestamp is only a hint for whether a notification needs a fresh
+        // read. It never orders or rejects an authoritative tasks/get result.
+        Ok(observed <= previous)
     }
 
     /// Reads the authoritative current snapshot through `tasks/get`.
@@ -13232,7 +13249,9 @@ impl FinalTaskHandle {
     /// Opens one live `notifications/tasks` stream for exactly this task.
     ///
     /// The resulting watcher is caller-driven and does not reconnect or poll
-    /// after stream termination. The Tasks extension exposes neither a replay
+    /// after stream termination. Conflicting notifications with equal or older
+    /// update instants cause one bounded authoritative `tasks/get` read before
+    /// the handle changes. The Tasks extension exposes neither a replay
     /// cursor nor a resumption token, so a new watch must begin from an
     /// explicit [`Self::poll`] reconciliation. An already terminal handle
     /// returns an exhausted watcher without opening a subscription. A live
@@ -13247,6 +13266,7 @@ impl FinalTaskHandle {
             return Ok(FinalTaskWatch {
                 listener: None,
                 handle: self,
+                client,
             });
         }
         let mut notifications = SubscriptionFilter::default();
@@ -13265,6 +13285,7 @@ impl FinalTaskHandle {
         Ok(FinalTaskWatch {
             listener: Some(listener),
             handle: self,
+            client,
         })
     }
 }
@@ -13281,6 +13302,19 @@ pub enum FinalTaskWatchEvent {
     /// A changed task snapshot replaced the handle's previous snapshot.
     /// Terminal Task snapshots are yielded once and exhaust this watcher.
     TaskUpdated(FinalTaskStatusNotification),
+    /// One ambiguous notification was reconciled through authoritative `tasks/get`.
+    ///
+    /// This is yielded even when the read confirms the retained snapshot, so
+    /// one call to `next_event` never performs more than one reconciliation.
+    /// A terminal authoritative snapshot exhausts the watcher.
+    TaskReconciled {
+        /// The observed notification that required reconciliation. Its source
+        /// metadata is retained; its Task was not admitted merely by receipt.
+        observed: Box<FinalTaskStatusNotification>,
+        /// The authoritative snapshot retained by the handle after the read.
+        /// Its update timestamp may equal or precede either earlier snapshot.
+        authoritative: FinalTask,
+    },
     /// The request-owned subscription stream terminated normally.
     Terminal {
         /// The JSON-RPC ID that owns the terminating subscription result.
@@ -13294,11 +13328,12 @@ pub enum FinalTaskWatchEvent {
 ///
 /// Holding this watcher prevents concurrent polling or input submission with
 /// the same [`HttpClient`] and handle, preserving the client's existing
-/// request-ID ownership and a single ordered task snapshot.
+/// request-ID ownership and a single retained task snapshot.
 #[cfg(feature = "tasks")]
 pub struct FinalTaskWatch<'client, 'handle> {
-    listener: Option<HttpSubscriptionListener<'client>>,
+    listener: Option<ModernHttpSubscriptionListener>,
     handle: &'handle mut FinalTaskHandle,
+    client: &'client mut HttpClient,
 }
 
 #[cfg(feature = "tasks")]
@@ -13309,7 +13344,28 @@ impl FinalTaskWatch<'_, '_> {
     /// was yielded, or immediately when the handle was already terminal when
     /// the watcher opened. A Task terminal closes only this response body;
     /// buffered later snapshots cannot replace or repeat its outcome.
+    ///
+    /// A changed notification with an equal or older update instant triggers
+    /// one `tasks/get` under this same caller context and the client's request
+    /// timeout policy. That read produces [`FinalTaskWatchEvent::TaskReconciled`]
+    /// instead of treating the notification as authoritative. Failed or
+    /// cancelled reconciliation closes this watch and preserves its previous
+    /// snapshot. Dropping the reconciliation future also closes this watch;
+    /// a later attempt must explicitly poll or open a new watch.
     pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<FinalTaskWatchEvent>, HttpClientError> {
+        let result = self.next_event_inner(cx).await;
+        if result.is_err()
+            && let Some(mut listener) = self.listener.take()
+        {
+            listener.cancel();
+        }
+        result
+    }
+
+    async fn next_event_inner(
         &mut self,
         cx: &Cx,
     ) -> Result<Option<FinalTaskWatchEvent>, HttpClientError> {
@@ -13317,7 +13373,9 @@ impl FinalTaskWatch<'_, '_> {
             let Some(listener) = self.listener.as_mut() else {
                 return Ok(None);
             };
-            let event = listener.next_event(cx).await?;
+            let event = listener.next_event(cx).await.map_err(|error| {
+                HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(error))
+            })?;
             match event {
                 None => {
                     self.listener = None;
@@ -13350,12 +13408,30 @@ impl FinalTaskWatch<'_, '_> {
                             "final task notification does not match this handle",
                         )));
                     }
-                    if !self
-                        .handle
-                        .admit_snapshot(notification.params.task.clone())?
-                    {
+                    if self.handle.snapshot_is_identical(&notification.params.task)? {
                         continue;
                     }
+                    if self
+                        .handle
+                        .notification_needs_reconciliation(&notification.params.task)?
+                    {
+                        // Retain ownership in this future while awaiting the
+                        // read: cancellation/drop cannot forget the conflict
+                        // and silently resume the old notification stream.
+                        let listener = self.listener.take();
+                        let task = self.client
+                            .get_final_task_snapshot(cx, self.handle.task_id().clone())
+                            .await?;
+                        self.handle.admit_snapshot(task)?;
+                        if !self.handle.is_terminal() {
+                            self.listener = listener;
+                        }
+                        return Ok(Some(FinalTaskWatchEvent::TaskReconciled {
+                            observed: Box::new(notification),
+                            authoritative: self.handle.task().clone(),
+                        }));
+                    }
+                    self.handle.admit_snapshot(notification.params.task.clone())?;
                     if self.handle.is_terminal()
                         && let Some(mut listener) = self.listener.take()
                     {
@@ -15718,20 +15794,15 @@ impl HttpClient {
         cx: &Cx,
         notifications: SubscriptionFilter,
         limits: sse::SseLimits,
-    ) -> Result<HttpSubscriptionListener<'_>, HttpClientError> {
+    ) -> Result<ModernHttpSubscriptionListener, HttpClientError> {
         if cx.checkpoint().is_err() {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         let request_id = self.next_request_id()?;
-        let listener = self
-            .connection
+        self.connection
             .open_subscriptions_listener(cx, request_id, notifications, limits)
             .await
-            .map_err(HttpClientError::Connection)?;
-        Ok(HttpSubscriptionListener {
-            listener,
-            final_result_cache: &mut self.final_result_cache,
-        })
+            .map_err(HttpClientError::Connection)
     }
 
     /// Starts an incremental HTTP catalog listener on this client.
@@ -39221,6 +39292,29 @@ mod tests {
                         "text/event-stream",
                         events.as_bytes(),
                     );
+                    listener.set_nonblocking(true).unwrap();
+                    for (id, snapshot) in [
+                        (4, INPUT_REQUIRED),
+                        (5, changed_input.as_str()),
+                        (6, earlier_working.as_str()),
+                    ] {
+                        let mut reconcile = accept_http_catalog_test_request(&listener);
+                        let request = read_http_cache_test_request(&mut reconcile);
+                        assert_eq!(request["id"], id);
+                        assert_eq!(request["method"], "tasks/get");
+                        assert_eq!(request["params"]["taskId"], "terminal-task");
+                        let response = [
+                            format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","#),
+                            snapshot[1..].to_owned(),
+                            "}".to_owned(),
+                        ]
+                        .concat();
+                        write_http_cache_test_response(
+                            &mut reconcile,
+                            "application/json",
+                            response.as_bytes(),
+                        );
+                    }
                 }
             }
             done_receiver
@@ -39263,35 +39357,40 @@ mod tests {
                 Some(FinalTaskWatchEvent::Acknowledged { .. })
             ));
             // The unchanged initial Working notification and exact repeated
-            // InputRequired snapshot are skipped. A same-time changed payload
-            // and an earlier-timestamp Working update remain visible.
+            // InputRequired snapshot are skipped. Same-time and earlier-time
+            // conflicts remain visible only after authoritative reconciliation.
             for expected_message in [None, Some("changed input")] {
-                let Some(FinalTaskWatchEvent::TaskUpdated(notification)) =
+                let Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) =
                     http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
                 else {
                     panic!("changed input snapshot");
                 };
-                assert!(matches!(
-                    notification.params.task,
-                    FinalTask::InputRequired { .. }
-                ));
                 assert_eq!(
-                    notification.params.task.base().status_message.as_deref(),
+                    serde_json::to_string(&observed.params.task).unwrap(),
+                    serde_json::to_string(&authoritative).unwrap(),
+                );
+                assert!(matches!(authoritative, FinalTask::InputRequired { .. }));
+                assert_eq!(
+                    authoritative.base().status_message.as_deref(),
                     expected_message
                 );
                 assert_eq!(
-                    notification.params.task.base().last_updated_at.as_str(),
+                    authoritative.base().last_updated_at.as_str(),
                     "2026-07-28T12:00:00Z"
                 );
             }
-            let Some(FinalTaskWatchEvent::TaskUpdated(notification)) =
+            let Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) =
                 http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
             else {
                 panic!("changed nonterminal snapshot");
             };
-            assert!(matches!(notification.params.task, FinalTask::Working(_)));
             assert_eq!(
-                notification.params.task.base().last_updated_at.as_str(),
+                serde_json::to_string(&observed.params.task).unwrap(),
+                serde_json::to_string(&authoritative).unwrap(),
+            );
+            assert!(matches!(authoritative, FinalTask::Working(_)));
+            assert_eq!(
+                authoritative.base().last_updated_at.as_str(),
                 "2026-07-28T11:59:59Z"
             );
             let Some(FinalTaskWatchEvent::TaskUpdated(notification)) =
@@ -39328,10 +39427,10 @@ mod tests {
             );
             drop(watch);
         }
-        let expected_next_id = if matches!(entry, HttpTaskTerminalEntry::Attach) {
-            3
-        } else {
-            4
+        let expected_next_id = match entry {
+            HttpTaskTerminalEntry::Attach => 3,
+            HttpTaskTerminalEntry::Poll => 4,
+            HttpTaskTerminalEntry::Watch => 7,
         };
         assert_eq!(client.next_id.load(Ordering::Relaxed), expected_next_id);
         for _ in 0..2 {
@@ -39389,6 +39488,756 @@ mod tests {
         for status in ["completed", "failed", "cancelled"] {
             run_public_http_final_task_terminal_preservation(status, HttpTaskTerminalEntry::Watch);
         }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn http_task_reconciliation_snapshot(status: &str, updated: &str, extra: &str) -> String {
+        format!(
+            r#"{{"taskId":"reconcile-task","status":"{status}","createdAt":"1950-01-01T00:00:00Z","lastUpdatedAt":"{updated}","ttlMs":null{extra}}}"#
+        )
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn http_task_reconciliation_response(id: u64, snapshot: &str) -> String {
+        [
+            format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"resultType":"complete","#),
+            snapshot[1..].to_owned(),
+            "}".to_owned(),
+        ]
+        .concat()
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn http_task_reconciliation_events(initial: &str, observed: &str) -> String {
+        let mut events = String::from(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3},\"notifications\":{\"taskIds\":[\"reconcile-task\"]}}}\n\n",
+        );
+        // The initial exact duplicate must never request reconciliation.
+        // Repeated conflicting records after the first one prove a single
+        // next_event cannot hide a sequence of fresh-budget authoritative reads.
+        for snapshot in [initial, observed, observed, observed] {
+            events.push_str("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tasks\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3},\"x-source\":\"notification\",");
+            events.push_str(&snapshot[1..]);
+            events.push_str("}\n\n");
+        }
+        events.push_str("data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n\n");
+        events
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn run_public_http_final_task_reconciliation(
+        initial: &str,
+        observed: &str,
+        authoritative: Option<&str>,
+    ) -> (FinalTaskWatchEvent, FinalTask, u64) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let initial = initial.to_owned();
+        let observed = observed.to_owned();
+        let authoritative = authoritative.map(str::to_owned);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let mut discovery = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], SERVER_DISCOVER_METHOD);
+            let response = modern_tasks_discovery_response("task-reconcile", serde_json::json!({}));
+            write_http_cache_test_response(&mut discovery, "application/json", response.as_bytes());
+
+            let mut get = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut get);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["params"]["taskId"], "reconcile-task");
+            let response = http_task_reconciliation_response(2, &initial);
+            write_http_cache_test_response(&mut get, "application/json", response.as_bytes());
+
+            let mut watch = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut watch);
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "subscriptions/listen");
+            assert_eq!(
+                request["params"]["notifications"]["taskIds"],
+                serde_json::json!(["reconcile-task"])
+            );
+            let events = http_task_reconciliation_events(&initial, &observed);
+            write_http_cache_test_response(&mut watch, "text/event-stream", events.as_bytes());
+
+            if let Some(snapshot) = authoritative {
+                let mut reconcile = accept_http_catalog_test_request(&listener);
+                let request = read_http_cache_test_request(&mut reconcile);
+                assert_eq!(request["id"], 4);
+                assert_eq!(request["method"], "tasks/get");
+                assert_eq!(request["params"]["taskId"], "reconcile-task");
+                let response = http_task_reconciliation_response(4, &snapshot);
+                write_http_cache_test_response(
+                    &mut reconcile,
+                    "application/json",
+                    response.as_bytes(),
+                );
+            }
+            done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            match listener.accept() {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!(
+                    "one watcher event must not issue another reconciliation or terminal poll"
+                ),
+                Err(error) => panic!("observe task reconciliation request count: {error}"),
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_secs(1))
+                        .unwrap(),
+                )
+                .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let mut handle = http_test_runtime_block_on(
+            client.attach_final_task(&cx, FinalTaskId::parse("reconcile-task").unwrap()),
+        )
+        .unwrap();
+        let mut watch = http_test_runtime_block_on(handle.watch(
+            &cx,
+            &mut client,
+            sse::SseLimits::new(2_048, 16_384, 8).unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            http_test_runtime_block_on(watch.next_event(&cx)).unwrap(),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
+        let event = http_test_runtime_block_on(watch.next_event(&cx))
+            .unwrap()
+            .unwrap();
+        if watch.handle.is_terminal() {
+            assert!(watch.listener.is_none());
+            assert!(
+                http_test_runtime_block_on(watch.next_event(&cx))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        drop(watch);
+        let snapshot = handle.task().clone();
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        if handle.is_terminal() {
+            http_test_runtime_block_on(handle.poll(&cx, &mut client)).unwrap();
+            let mut finished = http_test_runtime_block_on(handle.watch(
+                &cx,
+                &mut client,
+                sse::SseLimits::new(2_048, 16_384, 8).unwrap(),
+            ))
+            .unwrap();
+            assert!(
+                http_test_runtime_block_on(finished.next_event(&cx))
+                    .unwrap()
+                    .is_none()
+            );
+            drop(finished);
+            assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+        }
+        done_sender.send(()).unwrap();
+        server.join().unwrap();
+        (event, snapshot, next_id)
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_reconciles_equal_offset_and_regressed_instants() {
+        let initial =
+            http_task_reconciliation_snapshot("working", "2026-07-28T12:00:00.100000000Z", "");
+        let authoritative = http_task_reconciliation_snapshot(
+            "input_required",
+            "2026-07-28T12:00:00.099Z",
+            r#", "statusMessage":"authoritative", "inputRequests":{}"#,
+        );
+        for timestamp in [
+            "2026-07-28T12:00:00.100000000Z",
+            "2026-07-28T12:00:00.1Z",
+            "2026-07-28T14:00:00.100+02:00",
+            "2026-07-28T07:00:00.100-05:00",
+            "2026-07-28T12:00:00.099999999Z",
+        ] {
+            let observed = http_task_reconciliation_snapshot(
+                "completed",
+                timestamp,
+                r#", "result":{"content":[]}"#,
+            );
+            let (event, retained, next_id) = run_public_http_final_task_reconciliation(
+                &initial,
+                &observed,
+                Some(&authoritative),
+            );
+            let FinalTaskWatchEvent::TaskReconciled {
+                observed,
+                authoritative,
+            } = event
+            else {
+                panic!(
+                    "equal or regressed instant requires authoritative reconciliation: {timestamp}"
+                );
+            };
+            assert!(matches!(observed.params.task, FinalTask::Completed { .. }));
+            assert_eq!(
+                observed.params.task.base().last_updated_at.as_str(),
+                timestamp
+            );
+            assert_eq!(
+                observed.params.additional.get("x-source"),
+                Some(&serde_json::json!("notification"))
+            );
+            assert!(matches!(authoritative, FinalTask::InputRequired { .. }));
+            assert_eq!(
+                authoritative.base().last_updated_at.as_str(),
+                "2026-07-28T12:00:00.099Z"
+            );
+            assert_eq!(
+                authoritative.base().status_message.as_deref(),
+                Some("authoritative")
+            );
+            assert_eq!(
+                serde_json::to_string(&retained).unwrap(),
+                serde_json::to_string(&authoritative).unwrap()
+            );
+            assert_eq!(
+                next_id, 5,
+                "exactly one authoritative read uses this client's allocator"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_later_hints_and_exact_repeats_do_not_poll() {
+        for (initial_time, observed_time) in [
+            ("2026-07-28T12:00:00Z", "2026-07-28T11:01:00-01:00"),
+            (
+                "1969-12-31T23:59:59.999999998Z",
+                "1969-12-31T23:59:59.999999999Z",
+            ),
+            ("2024-02-29T23:59:59Z", "2024-03-01T00:00:00Z"),
+        ] {
+            let initial = http_task_reconciliation_snapshot("working", initial_time, "");
+            let observed = http_task_reconciliation_snapshot(
+                "input_required",
+                observed_time,
+                r#", "inputRequests":{}"#,
+            );
+            let (event, retained, next_id) =
+                run_public_http_final_task_reconciliation(&initial, &observed, None);
+            let FinalTaskWatchEvent::TaskUpdated(notification) = event else {
+                panic!("a later checked instant is a freshness hint without a hidden read");
+            };
+            assert_eq!(
+                notification.params.task.base().last_updated_at.as_str(),
+                observed_time
+            );
+            assert!(matches!(retained, FinalTask::InputRequired { .. }));
+            assert_eq!(retained.base().last_updated_at.as_str(), observed_time);
+            assert_eq!(
+                next_id, 4,
+                "exact duplicate and later hint allocate no get request"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_unchanged_reconciliation_returns_after_one_get() {
+        let initial = http_task_reconciliation_snapshot("working", "2026-07-28T12:00:00Z", "");
+        let observed = http_task_reconciliation_snapshot("cancelled", "2026-07-28T12:00:00Z", "");
+        let (event, retained, next_id) =
+            run_public_http_final_task_reconciliation(&initial, &observed, Some(&initial));
+        let FinalTaskWatchEvent::TaskReconciled {
+            observed,
+            authoritative,
+        } = event
+        else {
+            panic!("an unchanged authoritative result must still end this bounded read");
+        };
+        assert!(matches!(observed.params.task, FinalTask::Cancelled(_)));
+        assert!(matches!(authoritative, FinalTask::Working(_)));
+        assert_eq!(serde_json::to_string(&retained).unwrap(), initial);
+        assert_eq!(
+            next_id, 5,
+            "queued repeated conflicts cannot start a second get in one call"
+        );
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_reconciliation_preserves_terminal_result_source() {
+        const NESTED: &str = r#"{"content":[],"z-exact":{"huge":123456789012345678901234567890,"ratio":1.2300e+40},"a-last":"authoritative"}"#;
+        let initial = http_task_reconciliation_snapshot("working", "2026-07-28T12:00:00Z", "");
+        let observed = http_task_reconciliation_snapshot(
+            "input_required",
+            "2026-07-28T12:00:00Z",
+            r#", "inputRequests":{}"#,
+        );
+        for (status, extra) in [
+            ("completed", format!(r#", "result":{NESTED}"#)),
+            (
+                "failed",
+                r#", "error":{"code":-32000,"message":"authoritative failure"}"#.to_owned(),
+            ),
+            ("cancelled", String::new()),
+        ] {
+            let authoritative =
+                http_task_reconciliation_snapshot(status, "2026-07-28T11:59:59Z", &extra);
+            let (event, retained, next_id) = run_public_http_final_task_reconciliation(
+                &initial,
+                &observed,
+                Some(&authoritative),
+            );
+            let FinalTaskWatchEvent::TaskReconciled {
+                observed,
+                authoritative,
+            } = event
+            else {
+                panic!("terminal authoritative result retains its provenance");
+            };
+            assert!(matches!(
+                observed.params.task,
+                FinalTask::InputRequired { .. }
+            ));
+            assert_eq!(
+                authoritative.base().last_updated_at.as_str(),
+                "2026-07-28T11:59:59Z"
+            );
+            let source = serde_json::to_string(&authoritative).unwrap();
+            assert_eq!(serde_json::to_string(&retained).unwrap(), source);
+            if status == "completed" {
+                assert!(
+                    source.contains(NESTED),
+                    "nested source and numeric lexemes survive reconciliation"
+                );
+            }
+            assert_eq!(
+                next_id, 5,
+                "terminal watch and poll stop after the one authoritative read"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[derive(Clone, Copy, Debug)]
+    enum HttpTaskReconciliationFailure {
+        ForeignTask,
+        InvalidTimestamp,
+        RemoteError,
+        CallerCancelled,
+        Timeout,
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn run_public_http_final_task_failed_reconciliation(failure: HttpTaskReconciliationFailure) {
+        let initial = http_task_reconciliation_snapshot("working", "2026-07-28T12:00:00Z", "");
+        let observed = http_task_reconciliation_snapshot("cancelled", "2026-07-28T12:00:00Z", "");
+        let recovery = http_task_reconciliation_snapshot(
+            "input_required",
+            "2026-07-28T12:00:01Z",
+            r#", "inputRequests":{}"#,
+        );
+        let server_initial = initial.clone();
+        let server_recovery = recovery.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let caller = Cx::for_request();
+        let stopped_caller = caller.clone();
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let mut discovery = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], SERVER_DISCOVER_METHOD);
+            let response =
+                modern_tasks_discovery_response("failed-task-reconcile", serde_json::json!({}));
+            write_http_cache_test_response(&mut discovery, "application/json", response.as_bytes());
+
+            let mut get = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut get);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tasks/get");
+            let response = http_task_reconciliation_response(2, &server_initial);
+            write_http_cache_test_response(&mut get, "application/json", response.as_bytes());
+
+            let mut watch = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut watch);
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "subscriptions/listen");
+            let events = http_task_reconciliation_events(&server_initial, &observed);
+            write_http_cache_test_response(&mut watch, "text/event-stream", events.as_bytes());
+
+            let mut reconcile = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut reconcile);
+            assert_eq!(request["id"], 4);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["params"]["taskId"], "reconcile-task");
+            match failure {
+                HttpTaskReconciliationFailure::ForeignTask => {
+                    let snapshot = server_recovery.replace("reconcile-task", "foreign-task");
+                    let response = http_task_reconciliation_response(4, &snapshot);
+                    write_http_cache_test_response(
+                        &mut reconcile,
+                        "application/json",
+                        response.as_bytes(),
+                    );
+                }
+                HttpTaskReconciliationFailure::InvalidTimestamp => {
+                    let snapshot = server_recovery
+                        .replace("2026-07-28T12:00:01Z", "2026-07-28T12:00:01+24:00");
+                    let response = http_task_reconciliation_response(4, &snapshot);
+                    write_http_cache_test_response(
+                        &mut reconcile,
+                        "application/json",
+                        response.as_bytes(),
+                    );
+                }
+                HttpTaskReconciliationFailure::RemoteError => {
+                    write_http_cache_test_response(&mut reconcile, "application/json",
+                        br#"{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"reconciliation unavailable"}}"#);
+                }
+                HttpTaskReconciliationFailure::CallerCancelled
+                | HttpTaskReconciliationFailure::Timeout => {
+                    if matches!(failure, HttpTaskReconciliationFailure::CallerCancelled) {
+                        stopped_caller.set_cancel_requested(true);
+                    }
+                    reconcile
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut byte = [0_u8; 1];
+                    match reconcile.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                        other => panic!(
+                            "cancelled or timed-out reconciliation closes its socket: {other:?}"
+                        ),
+                    }
+                }
+            }
+
+            let mut reused = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut reused);
+            assert_eq!(request["id"], 5);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["params"]["taskId"], "reconcile-task");
+            let response = http_task_reconciliation_response(5, &server_recovery);
+            write_http_cache_test_response(&mut reused, "application/json", response.as_bytes());
+            done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        });
+
+        let healthy = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_secs(1))
+                        .unwrap(),
+                )
+                .connect_http_client_with_cx(&healthy),
+        )
+        .unwrap();
+        let mut handle = http_test_runtime_block_on(
+            client.attach_final_task(&healthy, FinalTaskId::parse("reconcile-task").unwrap()),
+        )
+        .unwrap();
+        let mut watch = http_test_runtime_block_on(handle.watch(
+            &healthy,
+            &mut client,
+            sse::SseLimits::new(2_048, 16_384, 8).unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            http_test_runtime_block_on(watch.next_event(&healthy)).unwrap(),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
+        let error = http_test_runtime_block_on(watch.next_event(&caller))
+            .expect_err("failed reconciliation cannot admit the observed terminal");
+        match failure {
+            HttpTaskReconciliationFailure::ForeignTask => assert!(
+                matches!(
+                    &error, HttpClientError::Connection(ClientHttpConnectionError::Modern(http_executor::ModernHttpClientError::TasksGetIdMismatch { expected, actual }))
+                        if expected.as_str() == "reconcile-task" && actual.as_str() == "foreign-task"
+                ),
+                "{error:?}"
+            ),
+            HttpTaskReconciliationFailure::InvalidTimestamp => assert!(
+                matches!(
+                    &error, HttpClientError::Connection(ClientHttpConnectionError::Modern(http_executor::ModernHttpClientError::TasksResultDecode { method })) if *method == "tasks/get"
+                ),
+                "{error:?}"
+            ),
+            HttpTaskReconciliationFailure::RemoteError => assert!(
+                matches!(
+                    &error, HttpClientError::Connection(ClientHttpConnectionError::Modern(http_executor::ModernHttpClientError::TasksRemoteError { method, message, .. }))
+                        if *method == "tasks/get" && message == "reconciliation unavailable"
+                ),
+                "{error:?}"
+            ),
+            HttpTaskReconciliationFailure::CallerCancelled => assert!(
+                matches!(
+                    &error,
+                    HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                        http_executor::ModernHttpClientError::Executor(
+                            http_executor::ModernHttpExecutorError::Cancelled
+                        )
+                    ))
+                ),
+                "{error:?}"
+            ),
+            HttpTaskReconciliationFailure::Timeout => assert!(
+                matches!(
+                    &error,
+                    HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                        http_executor::ModernHttpClientError::Executor(
+                            http_executor::ModernHttpExecutorError::Timeout(
+                                RequestTimeoutSource::Idle
+                            )
+                        )
+                    ))
+                ),
+                "{error:?}"
+            ),
+        }
+        assert!(
+            http_test_runtime_block_on(watch.next_event(&healthy))
+                .unwrap()
+                .is_none(),
+            "a failed read cannot silently continue past the conflict"
+        );
+        drop(watch);
+        assert_eq!(
+            serde_json::to_string(handle.task()).unwrap(),
+            initial,
+            "failure leaves the admitted snapshot unchanged"
+        );
+        assert_eq!(
+            client.next_id.load(Ordering::Relaxed),
+            5,
+            "no automatic reconciliation retry"
+        );
+        assert!(
+            healthy.checkpoint().is_ok(),
+            "only the owning read/stream may stop"
+        );
+        let current = http_test_runtime_block_on(handle.poll(&healthy, &mut client)).unwrap();
+        assert!(matches!(current, FinalTask::InputRequired { .. }));
+        assert_eq!(
+            current.base().last_updated_at.as_str(),
+            "2026-07-28T12:00:01Z"
+        );
+        assert_eq!(
+            serde_json::to_string(current).unwrap(),
+            serde_json::to_string(&serde_json::from_str::<FinalTask>(&recovery).unwrap()).unwrap()
+        );
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 6);
+        done_sender.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_reconciliation_rejections_preserve_state_and_client() {
+        for failure in [
+            HttpTaskReconciliationFailure::ForeignTask,
+            HttpTaskReconciliationFailure::InvalidTimestamp,
+            HttpTaskReconciliationFailure::RemoteError,
+        ] {
+            run_public_http_final_task_failed_reconciliation(failure);
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_reconciliation_cancellation_and_timeout_are_bounded() {
+        for failure in [
+            HttpTaskReconciliationFailure::CallerCancelled,
+            HttpTaskReconciliationFailure::Timeout,
+        ] {
+            run_public_http_final_task_failed_reconciliation(failure);
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_dropped_reconciliation_closes_live_exchanges() {
+        let initial = http_task_reconciliation_snapshot("working", "2026-07-28T12:00:00Z", "");
+        let observed = http_task_reconciliation_snapshot("cancelled", "2026-07-28T12:00:00Z", "");
+        let recovery = http_task_reconciliation_snapshot(
+            "input_required",
+            "2026-07-28T12:00:01Z",
+            r#", "inputRequests":{}"#,
+        );
+        let server_initial = initial.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (committed_sender, committed_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let mut discovery = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], SERVER_DISCOVER_METHOD);
+            let response =
+                modern_tasks_discovery_response("dropped-task-reconcile", serde_json::json!({}));
+            write_http_cache_test_response(&mut discovery, "application/json", response.as_bytes());
+
+            let mut get = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut get);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tasks/get");
+            let response = http_task_reconciliation_response(2, &server_initial);
+            write_http_cache_test_response(&mut get, "application/json", response.as_bytes());
+
+            let mut watch = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut watch);
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "subscriptions/listen");
+            let events = http_task_reconciliation_events(&server_initial, &observed);
+            let events = events
+                .split("data: {\"jsonrpc\":\"2.0\",\"id\":3")
+                .next()
+                .unwrap();
+            // Leave both native framing and subscription lifetime open. A
+            // complete Content-Length response could already have released its
+            // socket while the Task notifications remained buffered.
+            write!(watch,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                events.len() + 1_024,
+            ).unwrap();
+            watch.write_all(events.as_bytes()).unwrap();
+            watch.flush().unwrap();
+
+            let mut reconcile = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut reconcile);
+            assert_eq!(request["id"], 4);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["params"]["taskId"], "reconcile-task");
+            for (name, stream) in [("watch", &mut watch), ("get", &mut reconcile)] {
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                let mut byte = [0_u8; 1];
+                assert!(
+                    matches!(stream.read(&mut byte), Err(error)
+                    if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+                    "{name} socket must still be live before the caller drops reconciliation"
+                );
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+            }
+            committed_sender.send(()).unwrap();
+            for (name, stream) in [("get", &mut reconcile), ("watch", &mut watch)] {
+                let mut byte = [0_u8; 1];
+                match stream.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    other => panic!(
+                        "dropping reconciliation must close the live {name} socket: {other:?}"
+                    ),
+                }
+            }
+
+            let mut reused = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut reused);
+            assert_eq!(request["id"], 5);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["params"]["taskId"], "reconcile-task");
+            let response = http_task_reconciliation_response(5, &recovery);
+            write_http_cache_test_response(&mut reused, "application/json", response.as_bytes());
+            done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(3))
+                        .unwrap(),
+                )
+                .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let mut handle = http_test_runtime_block_on(
+            client.attach_final_task(&cx, FinalTaskId::parse("reconcile-task").unwrap()),
+        )
+        .unwrap();
+        let mut watch = http_test_runtime_block_on(handle.watch(
+            &cx,
+            &mut client,
+            sse::SseLimits::new(2_048, 16_384, 8).unwrap(),
+        ))
+        .unwrap();
+        assert!(matches!(
+            http_test_runtime_block_on(watch.next_event(&cx)).unwrap(),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
+        http_test_runtime_block_on(async {
+            let mut pending = Box::pin(watch.next_event(&cx));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                assert!(
+                    std::future::poll_fn(|task_cx| { Poll::Ready(pending.as_mut().poll(task_cx)) })
+                        .await
+                        .is_pending(),
+                    "the peer withholds the authoritative result"
+                );
+                match committed_receiver.try_recv() {
+                    Ok(()) => break,
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(error) => panic!("pending reconciliation peer: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reconciliation get must reach the peer"
+                );
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            drop(pending);
+        });
+        assert!(
+            http_test_runtime_block_on(watch.next_event(&cx))
+                .unwrap()
+                .is_none()
+        );
+        drop(watch);
+        assert_eq!(serde_json::to_string(handle.task()).unwrap(), initial);
+        assert_eq!(
+            client.next_id.load(Ordering::Relaxed),
+            5,
+            "abandoned reconciliation is not retried"
+        );
+        assert!(
+            cx.checkpoint().is_ok(),
+            "dropping the request must not cancel the shared context"
+        );
+        let current = http_test_runtime_block_on(handle.poll(&cx, &mut client)).unwrap();
+        assert!(matches!(current, FinalTask::InputRequired { .. }));
+        assert_eq!(
+            current.base().last_updated_at.as_str(),
+            "2026-07-28T12:00:01Z"
+        );
+        assert_eq!(client.next_id.load(Ordering::Relaxed), 6);
+        done_sender.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[cfg(all(unix, feature = "tasks"))]

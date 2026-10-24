@@ -13554,6 +13554,21 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case
                 );
                 break;
             }
+            Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) => {
+                assert_eq!(observed.params.task.base().task_id, task_id);
+                assert_eq!(
+                    authoritative.base().task_id,
+                    task_id,
+                    "the as_proxy authoritative Task must keep the created id"
+                );
+                if matches!(authoritative, FinalTask::Cancelled(_)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the as_proxy relay reconciles cancellation within the public bound"
+                );
+            }
             Some(FinalTaskWatchEvent::TaskUpdated(_))
             | Some(FinalTaskWatchEvent::Acknowledged { .. }) => {
                 assert!(
@@ -14538,6 +14553,21 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
                     "the stdio as_proxy Tasks notification must keep the created id"
                 );
                 break;
+            }
+            Some(FinalTaskWatchEvent::TaskReconciled { observed, authoritative }) => {
+                assert_eq!(observed.params.task.base().task_id, task_id);
+                assert_eq!(
+                    authoritative.base().task_id,
+                    task_id,
+                    "the stdio as_proxy authoritative Task must keep the created id"
+                );
+                if matches!(authoritative, FinalTask::Cancelled(_)) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < notification_deadline,
+                    "the stdio as_proxy relay reconciles cancellation within the public bound"
+                );
             }
             Some(FinalTaskWatchEvent::TaskUpdated(_))
             | Some(FinalTaskWatchEvent::Acknowledged { .. }) => {

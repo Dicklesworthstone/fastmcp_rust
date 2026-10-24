@@ -2886,11 +2886,19 @@ fn workflow_final_tasks_public_facade_lifecycle_and_legacy_negative() {
     .expect("official tasks/update accepts matching typed input");
     let task_notification = final_tasks_runtime_block_on_bounded(&cx, task_watch.next_event(&cx))
         .expect("live task subscription observes the post-update status");
-    assert!(matches!(
-        task_notification,
-        Some(FinalTaskWatchEvent::TaskUpdated(ref notification))
-            if matches!(&notification.params.task, FinalTask::Working(_))
-    ));
+    let watched_task = match task_notification {
+        Some(FinalTaskWatchEvent::TaskUpdated(notification)) => notification.params.task,
+        Some(FinalTaskWatchEvent::TaskReconciled {
+            observed,
+            authoritative,
+        }) => {
+            assert_eq!(observed.params.task.base().task_id, task_id);
+            authoritative
+        }
+        event => panic!("post-update watch must expose a Task snapshot: {event:?}"),
+    };
+    assert!(matches!(watched_task, FinalTask::Working(_)));
+    assert_eq!(watched_task.base().task_id, task_id);
     drop(task_watch);
     let resumed = final_tasks_runtime_block_on_bounded(
         &cx,

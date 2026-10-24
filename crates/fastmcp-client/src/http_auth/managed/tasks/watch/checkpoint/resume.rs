@@ -426,7 +426,7 @@ fn duration_nanos(duration: Duration) -> i128 {
 // Convert only an already-admitted timestamp; this is not a second parser.
 // The Gregorian ordinal uses bounded arithmetic and preserves sub-millisecond
 // precision. Offsets affect the instant, not the retained wire spelling.
-fn timestamp_nanos(timestamp: &TaskTimestamp) -> Result<i128, TaskResumeError> {
+pub(crate) fn timestamp_nanos(timestamp: &TaskTimestamp) -> Result<i128, TaskResumeError> {
     let text = timestamp.as_str();
     let number = |range: std::ops::Range<usize>| -> Result<i128, TaskResumeError> {
         text.get(range)
