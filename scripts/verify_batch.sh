@@ -113,6 +113,17 @@ mkdir -p "$OUT" || die "cannot create $OUT"
 SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 \
      -o ServerAliveInterval=60 -o ServerAliveCountMax=30 "$WORKER")
 
+# The channel the BUILD will actually resolve, read from the file the build
+# reads. $TOOLCHAIN only steers the `rustc +<channel> -vV` probe that fills the
+# receipt's three compiler fields; the compile itself resolves rust-toolchain.toml.
+# If the two disagree the receipt names a compiler that did not build the
+# subject, which is the same class as measuring a stale mirror: the claim and
+# the thing claimed about come apart. Compared on the receipt, never assumed
+# equal, and not a hard pre-dispatch failure so a deliberate cross-toolchain run
+# still produces its diagnostics -- it just cannot be read as clean.
+PINNED_CHANNEL="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    rust-toolchain.toml | head -1)"
+
 # ---------------------------------------------------------------------------
 # Subject identity, captured BEFORE the run.
 #
@@ -368,12 +379,14 @@ head_after="$(git rev-parse HEAD)"
 python3 - "$OUT" "$head_sha" "$head_after" "$tree_sha" "$dirty_before" \
     "$dirty_after" "$manifest_local" "$manifest_files" "$MANIFEST_PATHS" \
     "$TOOLCHAIN" "$PROFILE" "$SCOPE" "$FEATURES" "$BEADS" "$remote_rc" \
-    "$rsync_rc" "$WORKER" "$remote_dir" "$THREADS" "${FILTERS[*]-}" <<'PY'
+    "$rsync_rc" "$WORKER" "$remote_dir" "$THREADS" "${FILTERS[*]-}" \
+    "$PINNED_CHANNEL" <<'PY'
 import json, re, sys, pathlib
 
 (out, head_before, head_after, tree, dirty_before, dirty_after, manifest_local,
  manifest_files, manifest_paths, toolchain, profile, scope, features, beads,
- remote_rc, rsync_rc, worker, remote_dir, threads, filters) = sys.argv[1:21]
+ remote_rc, rsync_rc, worker, remote_dir, threads, filters,
+ pinned_channel) = sys.argv[1:22]
 root = pathlib.Path(out)
 raw = (root / 'remote.out').read_text(errors='replace')
 
@@ -440,6 +453,34 @@ if manifest_remote != manifest_local:
                    f'{(manifest_remote or "<none>")[:16]} - a stale or partial mirror was measured')
 if field('MANIFEST_FILES') != manifest_files:
     reasons.append(f'manifest file count differs: local {manifest_files} vs worker {field("MANIFEST_FILES")}')
+# PL-3 proof-configuration binding. The three compiler fields come from
+# `rustc +<channel> -vV 2>/dev/null` run BEFORE the build, under `set -u`
+# without `set -e`, so all three are empty whenever that probe fails and the
+# run continues regardless. The reachable case is mundane: the pinned channel is
+# not installed on the worker yet, the probe fails, and rustup then installs it
+# on demand for the compile that follows -- which goes green. The receipt then
+# carries rustc: null and still reads as a clean verification. These were the
+# only receipt fields captured and never checked; an unbound toolchain makes a
+# receipt void, not green.
+compiler_fields = {'rustc': field('RUSTC'), 'rustc commit': field('COMMIT_HASH'),
+                   'host target': field('TARGET')}
+unbound = sorted(name for name, value in compiler_fields.items() if not value)
+if unbound:
+    reasons.append(
+        f'receipt does not bind the compiler: {", ".join(unbound)} empty or absent. '
+        f'`rustc +{toolchain} -vV` produced nothing on the worker, so this run records no '
+        'toolchain identity and cannot satisfy PL-3. Usually the channel was not installed '
+        'when the probe ran, which rustup then fixes silently for the build. VOID, not red: '
+        'the subject may be fine, but this receipt cannot say so.'
+    )
+# The probe channel and the channel the compile resolves are independent inputs.
+# $TOOLCHAIN steers only the probe; rust-toolchain.toml steers the build.
+if pinned_channel and pinned_channel != toolchain:
+    reasons.append(
+        f'the receipt describes a compiler the build did not use: probed +{toolchain} while '
+        f'rust-toolchain.toml pins {pinned_channel}, and the compile resolves the pin. Re-run '
+        'without --toolchain, or treat the compiler fields as describing neither.'
+    )
 # Worker capacity is read BEFORE the compile verdict, because an exhausted
 # filesystem makes the compile verdict mean something different. ld dies of
 # SIGBUS on a full disk and cargo reports it as "could not compile", so a
@@ -583,6 +624,10 @@ receipt = {
         'worker': worker, 'worker_host': field('HOST'), 'remote_dir': remote_dir,
         'toolchain': toolchain, 'rustc': field('RUSTC'),
         'rustc_commit': field('COMMIT_HASH'), 'host_target': field('TARGET'),
+        # Recorded separately from `toolchain` because they are separate inputs:
+        # this is what the compile resolved, `toolchain` is what the probe asked.
+        'rust_toolchain_toml_channel': pinned_channel or '(unreadable)',
+        'compiler_bound': not unbound and bool(pinned_channel) and pinned_channel == toolchain,
         'profile': profile, 'scope': scope, 'features': effective_features,
         'test_threads': threads or '(default)', 'filters': filters or '(none)',
         'scheduler': 'none: direct ssh, bypassing the RCH queue',
