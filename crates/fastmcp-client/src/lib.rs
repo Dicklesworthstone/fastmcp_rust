@@ -6955,14 +6955,9 @@ where
             if self.retain_modern_websocket_notification(received_at, frame)? {
                 return Ok(());
             }
-            if let Some(dispatch) = self.try_dispatch_modern_reverse_request(request)? {
-                if let LiveServerRequestDispatch::Immediate(reverse_response) = dispatch {
-                    self.send_message(cx, &reverse_response)
-                        .await
-                        .map_err(transport_error_to_mcp)?;
-                }
-                return Ok(());
-            }
+            // Modern sampling, elicitation, and roots are embedded MRTR
+            // inputs. Installing their resolvers does not admit independent
+            // server requests or authorize a host callback on this ingress.
             return Err(McpError::invalid_request(
                 "MCP 2026-07-28 WebSocket client rejected a non-notification server request",
             ));
@@ -10402,115 +10397,6 @@ where
         serde_json::from_str(&source).map_err(|_| {
             McpError::invalid_request("Modern Tasks response has an invalid result shape")
         })
-    }
-
-    fn try_dispatch_modern_reverse_request(
-        &self,
-        request: &JsonRpcRequest,
-    ) -> McpResult<Option<LiveServerRequestDispatch>>
-    where
-        IO: Send + 'static,
-    {
-        if !self.reverse_request_handlers.has_modern_handlers() {
-            return Ok(None);
-        }
-        let Some(id) = request.id.clone() else {
-            return Ok(None);
-        };
-        match request.method.as_str() {
-            "sampling/createMessage" => {
-                let Some(handler) = self
-                    .reverse_request_handlers
-                    .modern_sampling_create_message
-                    .as_ref()
-                else {
-                    return Ok(None);
-                };
-                let params =
-                    match decode_reverse_request_params::<FinalCreateMessageParams>(request) {
-                        Ok(params) => params,
-                        Err(error) => {
-                            return Ok(Some(LiveServerRequestDispatch::Immediate(
-                                reverse_request_response::<FinalCreateMessageResult>(
-                                    id,
-                                    Err(error),
-                                ),
-                            )));
-                        }
-                    };
-                match self
-                    .reverse_callback_pool
-                    .dispatch(id.clone(), params, Arc::clone(handler))
-                {
-                    Ok(()) => Ok(Some(LiveServerRequestDispatch::CallbackAdmitted)),
-                    Err(error) if self.reverse_callback_pool.terminal_error().is_some() => {
-                        Err(error)
-                    }
-                    Err(error) => Ok(Some(LiveServerRequestDispatch::Immediate(
-                        reverse_request_response::<FinalCreateMessageResult>(id, Err(error)),
-                    ))),
-                }
-            }
-            "elicitation/create" => {
-                let Some(handler) = self
-                    .reverse_request_handlers
-                    .modern_elicitation_create
-                    .as_ref()
-                else {
-                    return Ok(None);
-                };
-                let params = match decode_reverse_request_params::<ElicitRequestParams>(request) {
-                    Ok(params) => params,
-                    Err(error) => {
-                        return Ok(Some(LiveServerRequestDispatch::Immediate(
-                            reverse_request_response::<ElicitResult>(id, Err(error)),
-                        )));
-                    }
-                };
-                match self
-                    .reverse_callback_pool
-                    .dispatch(id.clone(), params, Arc::clone(handler))
-                {
-                    Ok(()) => Ok(Some(LiveServerRequestDispatch::CallbackAdmitted)),
-                    Err(error) if self.reverse_callback_pool.terminal_error().is_some() => {
-                        Err(error)
-                    }
-                    Err(error) => Ok(Some(LiveServerRequestDispatch::Immediate(
-                        reverse_request_response::<ElicitResult>(id, Err(error)),
-                    ))),
-                }
-            }
-            "roots/list" => {
-                let Some(handler) = self.reverse_request_handlers.modern_roots_list.as_ref() else {
-                    return Ok(None);
-                };
-                let params =
-                    match decode_reverse_request_params::<FinalEmbeddedRootsListParams>(request) {
-                        Ok(params) => params,
-                        Err(error) => {
-                            return Ok(Some(LiveServerRequestDispatch::Immediate(
-                                reverse_request_response::<FinalEmbeddedRootsListResult>(
-                                    id,
-                                    Err(error),
-                                ),
-                            )));
-                        }
-                    };
-                match self
-                    .reverse_callback_pool
-                    .dispatch(id.clone(), params, Arc::clone(handler))
-                {
-                    Ok(()) => Ok(Some(LiveServerRequestDispatch::CallbackAdmitted)),
-                    Err(error) if self.reverse_callback_pool.terminal_error().is_some() => {
-                        Err(error)
-                    }
-                    Err(error) => Ok(Some(LiveServerRequestDispatch::Immediate(
-                        reverse_request_response::<FinalEmbeddedRootsListResult>(id, Err(error)),
-                    ))),
-                }
-            }
-            _ => Ok(None),
-        }
     }
 
     fn dispatch_legacy_reverse_request(
@@ -33113,30 +32999,12 @@ mod tests {
                         )
                         .await
                         .expect("peer sends forbidden exact-legacy reverse RPC");
-                    let JsonRpcMessage::Response(rejected) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives the exact-legacy request refusal")
-                    else {
-                        panic!("wrong-era reverse request must receive an error response");
-                    };
-                    assert!(rejected.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(99))));
-                    assert_eq!(rejected.error.expect("wrong-era request error").code, (-32602).into());
-                    assert!(rejected.result.is_none());
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                next.id.expect("tools/list ID"),
-                                async_modern_tools_list_result(),
-                            )),
-                        )
-                        .await
-                        .expect("ordinary modern operation survives rejected reverse RPC");
                     assert!(matches!(
-                        server.recv(&peer_cx).await,
+                        asupersync::time::timeout(
+                            peer_cx.now(), Duration::from_secs(2), server.recv(&peer_cx),
+                        ).await.expect("wrong-era request closes the selected modern connection promptly"),
                         Err(TransportError::Closed)
-                    ));
+                    ), "wrong-era requests receive no JSON-RPC response or host data");
                 })
                 .expect("spawn Auto modern MRTR peer");
 
@@ -33229,19 +33097,22 @@ mod tests {
             for calls in modern_calls.iter() {
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             }
-            let listed = client.list_tools(&cx, None).await.expect(
-                "Auto modern selection rejects legacy reverse RPC without invoking a callback",
-            );
-            assert!(matches!(
-                listed,
-                CoreResult::Final(FinalCoreResult::ToolsList { .. })
-            ));
+            let error = asupersync::time::timeout(
+                cx.now(), Duration::from_secs(2), client.list_tools(&cx, None),
+            ).await.expect("Auto modern direction refusal must settle promptly")
+                .expect_err("installed handlers cannot admit independent modern server requests");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
             for calls in modern_calls.iter() {
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             }
             assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
             assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
-            assert!(!client.closed);
+            assert!(client.closed);
+            assert!(client.close_settled);
+            let next_id = client.next_id;
+            assert!(client.list_tools(&cx, None).await.is_err());
+            assert_eq!(client.next_id, next_id);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1, "an ordinary refusal cannot retry another protocol era");
             client.close(&cx).await.expect("close Auto modern client");
             assert!(matches!(peer.join(&cx).await, Ok(())));
         });
@@ -34918,92 +34789,165 @@ mod tests {
     }
 
     #[cfg(feature = "websocket-experimental")]
-    #[test]
-    fn websocket_modern_sampling_reverse_request_is_answered_by_the_typed_handler() {
+    fn websocket_modern_input_handler_direction_probe(
+        method: &'static str,
+        parameters: serde_json::Value,
+        expected_response: serde_json::Value,
+        make_handlers: impl Fn(Arc<AtomicUsize>) -> ReverseRequestHandlers,
+    ) {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
-            let (client_io, server_io) = async_websocket_pair();
-            let mut peer = cx
-                .spawn(move |peer_cx| async move {
-                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
-                    let JsonRpcMessage::Request(discover) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives discovery")
-                    else {
-                        panic!("expected discovery request");
-                    };
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                discover.id.expect("discovery ID"),
-                                async_modern_discovery_result(),
-                            )),
-                        )
-                        .await
-                        .expect("peer sends discovery result");
-                    let _ = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives modern tools/list");
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Request(JsonRpcRequest::new(
-                                "sampling/createMessage",
-                                Some(serde_json::json!({
-                                    "_meta": {
-                                        "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
-                                        "io.modelcontextprotocol/clientCapabilities": {}
-                                    },
-                                    "messages": [{
-                                        "role": "user",
-                                        "content": {"type": "text", "text": "hello"}
-                                    }],
-                                    "maxTokens": 8
-                                })),
-                                RequestId::Number(99),
-                            )),
-                        )
-                        .await
-                        .expect("peer sends modern sampling reverse request");
-                    let JsonRpcMessage::Response(sampling) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives modern sampling response")
-                    else {
-                        panic!("expected sampling response");
-                    };
-                    assert!(
-                        sampling
-                            .id
-                            .as_ref()
-                            .is_some_and(|id| id.correlates_with(&RequestId::Number(99)))
+            for independent_request in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let handlers = make_handlers(Arc::clone(&calls));
+                let parameters = parameters.clone();
+                let expected_response = expected_response.clone();
+                let (client_io, server_io, close_frames) = close_counting_async_websocket_pair();
+                let mut peer = cx
+                    .spawn(move |peer_cx| async move {
+                        let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                        let JsonRpcMessage::Request(discover) = server.recv(&peer_cx).await.unwrap() else {
+                            panic!("expected discovery request");
+                        };
+                        assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                        server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            discover.id.expect("discovery ID"), async_modern_discovery_result(),
+                        ))).await.unwrap();
+                        let JsonRpcMessage::Request(initial) = server.recv(&peer_cx).await.unwrap() else {
+                            panic!("expected the original client tool request");
+                        };
+                        assert_eq!(initial.method, "tools/call");
+                        let initial_id = initial.id.expect("original request ID");
+                        let original = initial.params.expect("original tool parameters");
+                        if independent_request {
+                            let mut parameters = parameters;
+                            if method == "sampling/createMessage" {
+                                // Preserve the previously accepted ordinary sampling
+                                // shape, so direction alone now prevents the callback.
+                                parameters["_meta"] = serde_json::json!({
+                                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                                    "io.modelcontextprotocol/clientCapabilities": {},
+                                });
+                            }
+                            server.send(&peer_cx, &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                method, Some(parameters), RequestId::Number(99),
+                            ))).await.unwrap();
+                        } else {
+                            server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initial_id.clone(), serde_json::json!({
+                                    "resultType": "input_required",
+                                    "requestState": "typed-input-round",
+                                    "inputRequests": {"input": {"method": method, "params": parameters}},
+                                }),
+                            ))).await.unwrap();
+                            let JsonRpcMessage::Request(retry) = server.recv(&peer_cx).await.unwrap() else {
+                                panic!("typed MRTR handlers must produce a new client request");
+                            };
+                            assert_eq!(retry.method, initial.method);
+                            let retry_id = retry.id.expect("retry request ID");
+                            assert!(!retry_id.correlates_with(&initial_id));
+                            let retry_parameters = retry.params.expect("retry parameters");
+                            assert_eq!(retry_parameters["name"], original["name"]);
+                            assert_eq!(retry_parameters["arguments"], original["arguments"]);
+                            assert_eq!(retry_parameters["requestState"], "typed-input-round");
+                            assert_eq!(retry_parameters["inputResponses"], serde_json::json!({"input": expected_response}));
+                            server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                retry_id, serde_json::json!({"resultType": "complete", "content": [], "isError": false}),
+                            ))).await.unwrap();
+                            let JsonRpcMessage::Request(next) = server.recv(&peer_cx).await.unwrap() else {
+                                panic!("successful MRTR leaves the connection reusable");
+                            };
+                            assert_eq!(next.method, "tools/list");
+                            server.send(&peer_cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                next.id.expect("next request ID"), async_modern_tools_list_result(),
+                            ))).await.unwrap();
+                        }
+                        assert!(matches!(
+                            asupersync::time::timeout(peer_cx.now(), Duration::from_secs(2), server.recv(&peer_cx)).await.unwrap(),
+                            Err(TransportError::Closed)
+                        ), "forbidden requests receive no JSON-RPC response or host data");
+                    })
+                    .expect("spawn modern input direction peer");
+                let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    handlers,
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let result = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(2),
+                    client.call_tool(&cx, "typed-input", serde_json::json!({"value": 7})),
+                )
+                .await
+                .expect("input handling or direction refusal must settle promptly");
+                if independent_request {
+                    let error = result.expect_err(
+                        "an installed MRTR handler cannot admit standalone server requests",
                     );
-                    assert!(sampling.error.is_none());
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
                     assert_eq!(
-                        sampling.result.as_ref().and_then(|value| value.get("model")),
-                        Some(&serde_json::json!("modern-ws-model"))
+                        error.message,
+                        "MCP 2026-07-28 WebSocket client rejected a non-notification server request"
                     );
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                RequestId::Number(2),
-                                async_modern_tools_list_result(),
-                            )),
-                        )
-                        .await
-                        .expect("peer completes tools/list after sampling");
-                    let _ = server.recv(&peer_cx).await;
-                })
-                .expect("spawn modern sampling reverse peer");
-            let handlers = ReverseRequestHandlers::new().with_modern_sampling_create_message(
-                |_cx, _cancellation, params| {
-                    Box::pin(async move {
-                        assert_eq!(params.max_tokens.to_string(), "8");
-                        Ok(FinalCreateMessageResult {
+                    assert_eq!(
+                        calls.load(Ordering::SeqCst),
+                        0,
+                        "no host handler is invoked before refusal"
+                    );
+                    assert!(client.closed);
+                    assert!(client.close_settled);
+                    let next_id = client.next_id;
+                    let after = client.list_tools(&cx, None).await.unwrap_err();
+                    assert_eq!(after.message, "WebSocket client is closed");
+                    assert_eq!(
+                        client.next_id, next_id,
+                        "refused connection cannot allocate or send another request"
+                    );
+                } else {
+                    assert!(matches!(
+                        result.unwrap(),
+                        CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                    ));
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert!(!client.closed);
+                    assert!(matches!(
+                        client.list_tools(&cx, None).await.unwrap(),
+                        CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                    ));
+                }
+                client.close(&cx).await.unwrap();
+                assert!(matches!(peer.join(&cx).await, Ok(())));
+                assert_eq!(
+                    close_frames.load(Ordering::SeqCst),
+                    1,
+                    "both split halves share one terminal close election"
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_modern_sampling_handler_uses_mrtr_and_rejects_independent_requests() {
+        websocket_modern_input_handler_direction_probe(
+            "sampling/createMessage",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                "maxTokens": 8,
+            }),
+            serde_json::json!({"content": {"type": "text", "text": "sampled"}, "model": "modern-ws-model", "role": "assistant"}),
+            |calls| {
+                ReverseRequestHandlers::new().with_modern_sampling_create_message(
+                    move |_cx, _cancellation, params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            assert_eq!(params.max_tokens.to_string(), "8");
+                            Ok(FinalCreateMessageResult {
                             content: fastmcp_protocol::FinalSamplingMessageContent::Block(
                                 fastmcp_protocol::common_types::SamplingContentBlock::Text {
                                     text: "sampled".to_owned(),
@@ -35017,262 +34961,65 @@ mod tests {
                             stop_reason: None,
                             meta: None,
                         })
-                    })
-                },
-            );
-            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
-                &cx,
-                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
-                async_websocket_client_info(),
-                ClientCapabilities::default(),
-                handlers,
-                AsyncWsClientTransport::from_upgraded(client_io),
-            )
-            .await
-            .expect("modern client connects with sampling handler");
-            let listed = client
-                .list_tools(&cx, None)
-                .await
-                .expect("tools/list completes after modern sampling is answered");
-            assert!(matches!(
-                listed,
-                CoreResult::Final(FinalCoreResult::ToolsList { .. })
-            ));
-            client
-                .close(&cx)
-                .await
-                .expect("close modern sampling reverse client");
-            assert!(matches!(peer.join(&cx).await, Ok(())));
-        });
-    }
-
-    #[cfg(feature = "websocket-experimental")]
-    #[test]
-    fn websocket_modern_elicitation_reverse_request_is_answered_by_the_typed_handler() {
-        run_test(|| async {
-            let cx = Cx::current().expect("test runtime installs caller context");
-            let (client_io, server_io) = async_websocket_pair();
-            let mut peer = cx
-                .spawn(move |peer_cx| async move {
-                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
-                    let JsonRpcMessage::Request(discover) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives discovery")
-                    else {
-                        panic!("expected discovery request");
-                    };
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                discover.id.expect("discovery ID"),
-                                async_modern_discovery_result(),
-                            )),
-                        )
-                        .await
-                        .expect("peer sends discovery result");
-                    let _ = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives modern tools/list");
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Request(JsonRpcRequest::new(
-                                "elicitation/create",
-                                Some(serde_json::json!({
-                                    "mode": "form",
-                                    "message": "Choose a name",
-                                    "requestedSchema": {
-                                        "type": "object",
-                                        "properties": {"name": {"type": "string"}},
-                                        "required": ["name"]
-                                    }
-                                })),
-                                RequestId::Number(77),
-                            )),
-                        )
-                        .await
-                        .expect("peer sends modern elicitation reverse request");
-                    let JsonRpcMessage::Response(elicited) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives modern elicitation response")
-                    else {
-                        panic!("expected elicitation response");
-                    };
-                    assert!(
-                        elicited
-                            .id
-                            .as_ref()
-                            .is_some_and(|id| id.correlates_with(&RequestId::Number(77)))
-                    );
-                    assert!(elicited.error.is_none());
-                    assert_eq!(
-                        elicited
-                            .result
-                            .as_ref()
-                            .and_then(|value| value.get("action")),
-                        Some(&serde_json::json!("accept"))
-                    );
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                RequestId::Number(2),
-                                async_modern_tools_list_result(),
-                            )),
-                        )
-                        .await
-                        .expect("peer completes tools/list after elicitation");
-                    let _ = server.recv(&peer_cx).await;
-                })
-                .expect("spawn modern elicitation reverse peer");
-            let handlers = ReverseRequestHandlers::new().with_modern_elicitation_create(
-                |_cx, _cancellation, params| {
-                    Box::pin(async move {
-                        assert_eq!(params.message(), "Choose a name");
-                        let mut content = std::collections::HashMap::new();
-                        content.insert(
-                            "name".to_owned(),
-                            fastmcp_protocol::ElicitContentValue::String("Ada".to_owned()),
-                        );
-                        Ok(ElicitResult::accept(content))
-                    })
-                },
-            );
-            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
-                &cx,
-                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
-                async_websocket_client_info(),
-                ClientCapabilities::default(),
-                handlers,
-                AsyncWsClientTransport::from_upgraded(client_io),
-            )
-            .await
-            .expect("modern client connects with elicitation handler");
-            let listed = client
-                .list_tools(&cx, None)
-                .await
-                .expect("tools/list completes after modern elicitation is answered");
-            assert!(matches!(
-                listed,
-                CoreResult::Final(FinalCoreResult::ToolsList { .. })
-            ));
-            client
-                .close(&cx)
-                .await
-                .expect("close modern elicitation reverse client");
-            assert!(matches!(peer.join(&cx).await, Ok(())));
-        });
-    }
-
-    #[cfg(feature = "websocket-experimental")]
-    #[test]
-    fn websocket_modern_roots_reverse_request_is_answered_by_the_typed_handler() {
-        run_test(|| async {
-            let cx = Cx::current().expect("test runtime installs caller context");
-            let (client_io, server_io) = async_websocket_pair();
-            let mut peer = cx
-                .spawn(move |peer_cx| async move {
-                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
-                    let JsonRpcMessage::Request(discover) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives discovery")
-                    else {
-                        panic!("expected discovery request");
-                    };
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                discover.id.expect("discovery ID"),
-                                async_modern_discovery_result(),
-                            )),
-                        )
-                        .await
-                        .expect("peer sends discovery result");
-                    let _ = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives modern tools/list");
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Request(JsonRpcRequest::new(
-                                "roots/list",
-                                Some(serde_json::json!({})),
-                                RequestId::Number(55),
-                            )),
-                        )
-                        .await
-                        .expect("peer sends modern roots reverse request");
-                    let JsonRpcMessage::Response(roots) = server
-                        .recv(&peer_cx)
-                        .await
-                        .expect("peer receives modern roots response")
-                    else {
-                        panic!("expected roots response");
-                    };
-                    assert!(
-                        roots
-                            .id
-                            .as_ref()
-                            .is_some_and(|id| id.correlates_with(&RequestId::Number(55)))
-                    );
-                    assert!(roots.error.is_none());
-                    assert_eq!(
-                        roots.result.as_ref().and_then(|value| value.get("roots")),
-                        Some(&serde_json::json!([{"uri":"file:///workspace"}]))
-                    );
-                    server
-                        .send(
-                            &peer_cx,
-                            &JsonRpcMessage::Response(JsonRpcResponse::success(
-                                RequestId::Number(2),
-                                async_modern_tools_list_result(),
-                            )),
-                        )
-                        .await
-                        .expect("peer completes tools/list after roots/list");
-                    let _ = server.recv(&peer_cx).await;
-                })
-                .expect("spawn modern roots reverse peer");
-            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
-                |_cx, _cancellation, _params| {
-                    Box::pin(async move {
-                        Ok(FinalEmbeddedRootsListResult {
-                            roots: vec![fastmcp_protocol::Root::new("file:///workspace")],
                         })
-                    })
+                    },
+                )
+            },
+        );
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_modern_elicitation_handler_uses_mrtr_and_rejects_independent_requests() {
+        websocket_modern_input_handler_direction_probe(
+            "elicitation/create",
+            serde_json::json!({
+                "mode": "form",
+                "message": "Choose a name",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
                 },
-            );
-            let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
-                &cx,
-                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
-                async_websocket_client_info(),
-                ClientCapabilities::default(),
-                handlers,
-                AsyncWsClientTransport::from_upgraded(client_io),
-            )
-            .await
-            .expect("modern client connects with roots handler");
-            let listed = client
-                .list_tools(&cx, None)
-                .await
-                .expect("tools/list completes after modern roots/list is answered");
-            assert!(matches!(
-                listed,
-                CoreResult::Final(FinalCoreResult::ToolsList { .. })
-            ));
-            client
-                .close(&cx)
-                .await
-                .expect("close modern roots reverse client");
-            assert!(matches!(peer.join(&cx).await, Ok(())));
-        });
+            }),
+            serde_json::json!({"action": "accept", "content": {"name": "Ada"}}),
+            |calls| {
+                ReverseRequestHandlers::new().with_modern_elicitation_create(
+                    move |_cx, _cancellation, params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            assert_eq!(params.message(), "Choose a name");
+                            Ok(ElicitResult::accept(HashMap::from([(
+                                "name".to_owned(),
+                                fastmcp_protocol::ElicitContentValue::String("Ada".to_owned()),
+                            )])))
+                        })
+                    },
+                )
+            },
+        );
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_modern_roots_handler_uses_mrtr_and_rejects_independent_requests() {
+        websocket_modern_input_handler_direction_probe(
+            "roots/list",
+            serde_json::json!({}),
+            serde_json::json!({"roots": [{"uri": "file:///workspace"}]}),
+            |calls| {
+                ReverseRequestHandlers::new().with_modern_roots_list(
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(FinalEmbeddedRootsListResult {
+                                roots: vec![fastmcp_protocol::Root::new("file:///workspace")],
+                            })
+                        })
+                    },
+                )
+            },
+        );
     }
 
     #[test]
