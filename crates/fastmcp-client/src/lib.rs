@@ -3880,6 +3880,11 @@ const MAX_QUEUED_WEBSOCKET_CANCELLED_RESPONSE_KEYS: usize = 64;
 // closed; no detached sender survives the caller's cancellation.
 #[cfg(feature = "websocket-experimental")]
 const WEBSOCKET_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS: u64 = 100_000_000;
+// Closing owns the existing callback shutdown allowance plus one short control
+// write. The deadline is retained across retries; a caller cannot restart it by
+// dropping and recreating the close future.
+#[cfg(feature = "websocket-experimental")]
+const WEBSOCKET_CLOSE_TIMEOUT_NANOS: u64 = 350_000_000;
 /// Wake the one owned ingress reader often enough to observe a caller-owned
 /// cancellation domain without waiting for a peer frame. Exact-2024 peers may
 /// suppress a cancelled request's terminal JSON-RPC result forever.
@@ -5059,6 +5064,7 @@ struct WebSocketTransientRequest {
 struct WebSocketTransientRequestState {
     phase: AtomicU8,
     callbacks: Arc<ReverseCallbackState>,
+    uncertain_writer: Arc<AtomicBool>,
     send_failure_message: &'static str,
 }
 
@@ -5077,9 +5083,11 @@ impl WebSocketTransientRequestState {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => self
-                .callbacks
-                .fail_connection(McpError::internal_error(self.send_failure_message)),
+            Ok(_) => {
+                self.uncertain_writer.store(true, Ordering::Release);
+                self.callbacks
+                    .fail_connection(McpError::internal_error(self.send_failure_message));
+            }
             Err(Self::WAITING) => {
                 let _ = self.phase.compare_exchange(
                     Self::WAITING,
@@ -5145,6 +5153,8 @@ where
                     this.state
                         .phase
                         .store(WebSocketTransientRequestState::WAITING, Ordering::Release);
+                } else {
+                    this.state.abandon();
                 }
                 std::task::Poll::Ready(result)
             }
@@ -5162,9 +5172,75 @@ impl<F> Drop for WebSocketOwnedSend<F> {
     }
 }
 
+/// Retains the close election independently of an individual drive future.
+/// Once the sender is extracted, its owning future either commits Close or
+/// drops the native halves. No later drive may start a second wire close.
+#[derive(Default)]
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketCloseState {
+    deadline: Option<asupersync::types::Time>,
+    transport_retired: bool,
+    error: Option<McpError>,
+}
+
+#[cfg(feature = "websocket-experimental")]
+struct WebSocketOwnedClose<F> {
+    inner: Pin<Box<F>>,
+    state: Arc<Mutex<WebSocketCloseState>>,
+    completed: bool,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<F> WebSocketOwnedClose<F> {
+    fn finish(&mut self, result: McpResult<()>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.transport_retired = true;
+        if let Err(error) = result {
+            state.error.get_or_insert(error);
+        }
+        self.completed = true;
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<F> Future for WebSocketOwnedClose<F>
+where
+    F: Future<Output = McpResult<()>>,
+{
+    type Output = ();
+
+    fn poll(
+        self: Pin<&mut Self>,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll(task_cx) {
+            std::task::Poll::Ready(result) => {
+                this.finish(result);
+                std::task::Poll::Ready(())
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<F> Drop for WebSocketOwnedClose<F> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.finish(Err(McpError::internal_error(
+                "WebSocket close was interrupted before transport commitment",
+            )));
+        }
+    }
+}
+
 /// A cancelled write may have committed no bytes or only a frame prefix.
 /// Until commitment is proven, abandoning that send makes the connection
-/// unusable. Explicit close still drains its owned transport because it uses
+/// unusable. Explicit close still retires its owned transport because it uses
 /// the separate `close_settled` election.
 #[cfg(feature = "websocket-experimental")]
 struct WebSocketCancellationSendGuard<'a, IO>
@@ -5206,7 +5282,8 @@ where
 {
     state: Arc<ReverseCallbackState>,
     terminal: Arc<WebSocketReverseCallbackTerminal>,
-    response_sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    response_sender: Arc<AsyncMutex<Option<AsyncWsClientSendHalf<IO>>>>,
+    uncertain_writer: Arc<AtomicBool>,
     cx: Cx,
     tasks: Mutex<
         Vec<(
@@ -5306,11 +5383,12 @@ impl<IO> WebSocketReverseCallbackPool<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    fn new(response_sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>, cx: Cx) -> Self {
+    fn new(response_sender: Arc<AsyncMutex<Option<AsyncWsClientSendHalf<IO>>>>, cx: Cx) -> Self {
         Self {
             state: Arc::new(ReverseCallbackState::default()),
             terminal: Arc::new(WebSocketReverseCallbackTerminal::default()),
             response_sender,
+            uncertain_writer: Arc::new(AtomicBool::new(false)),
             cx,
             tasks: Mutex::new(Vec::new()),
         }
@@ -5349,6 +5427,7 @@ where
         let callback_terminal = Arc::clone(&self.terminal);
         let terminal_cx = self.cx.clone();
         let response_sender = Arc::clone(&self.response_sender);
+        let uncertain_writer = Arc::clone(&self.uncertain_writer);
         let callback_id = request_id.clone();
         let response_id = request_id.clone();
         let invoke_cancellation = cancellation.clone();
@@ -5382,6 +5461,7 @@ where
                 &callback_state,
                 &callback_id,
                 &response_sender,
+                &uncertain_writer,
                 &callback_cx,
                 &cancellation,
                 &response,
@@ -5396,12 +5476,14 @@ where
                 // aborts this callback's Cx while it may be queued on the
                 // writer. That is a successful suppression, not a transport
                 // write failure and therefore not connection-terminal.
-                Err(TransportError::Cancelled) if !cancellation.is_open() => {
+                Err(TransportError::Cancelled) if cancellation.is_cancel_requested() => {
                     completion_guard.disarm();
                     callback_state.complete(&callback_id, &cancellation);
                 }
                 Err(error) => {
-                    let error = transport_error_to_mcp(error);
+                    let error = callback_state
+                        .terminal_error()
+                        .unwrap_or_else(|| transport_error_to_mcp(error));
                     completion_guard.fail(error);
                     callback_state.complete(&callback_id, &cancellation);
                 }
@@ -5479,7 +5561,7 @@ where
             // immediate error response before the sole receive owner is woken.
             self.terminal.publish(&self.cx, error.clone());
             self.state.fail_connection(error.clone());
-            return Err(error);
+            return Err(self.state.terminal_error().unwrap_or(error));
         }
         Ok(active_count)
     }
@@ -5498,9 +5580,12 @@ where
     }
 
     fn terminal_error(&self) -> Option<McpError> {
-        self.terminal
-            .error()
-            .or_else(|| self.state.terminal_error())
+        // A send owner publishes into the shared gate before releasing its
+        // writer. A later worker panic must not replace that first failure
+        // merely because it also populated the callback terminal mirror.
+        self.state
+            .terminal_error()
+            .or_else(|| self.terminal.error())
     }
 }
 
@@ -5522,9 +5607,10 @@ where
 /// active election before any callback frame can be emitted.
 #[cfg(feature = "websocket-experimental")]
 async fn commit_websocket_reverse_callback_response<IO>(
-    state: &ReverseCallbackState,
+    state: &Arc<ReverseCallbackState>,
     request_id: &RequestId,
-    sender: &Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    sender: &Arc<AsyncMutex<Option<AsyncWsClientSendHalf<IO>>>>,
+    uncertain_writer: &Arc<AtomicBool>,
     cx: &Cx,
     cancellation: &ReverseRequestCancellation,
     response: &JsonRpcMessage,
@@ -5540,16 +5626,31 @@ where
             asupersync::sync::LockError::Poisoned
             | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
         })?;
+    let sender = sender.as_mut().ok_or(TransportError::Closed)?;
     if !state.claim_response_if_open(request_id, cancellation) {
         return Ok(false);
     }
-    sender.send(cx, response).await?;
+    let commitment = Arc::new(WebSocketTransientRequestState {
+        phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
+        callbacks: Arc::clone(state),
+        uncertain_writer: Arc::clone(uncertain_writer),
+        send_failure_message: "WebSocket reverse callback response did not commit",
+    });
+    let result = WebSocketOwnedSend::new(sender.send(cx, response), Arc::clone(&commitment)).await;
+    if result.is_err() {
+        // A response election closes the callback token before the send. That
+        // token phase cannot turn an interrupted write into benign suppression.
+        // Publish while the outer serialized writer is still exclusively held.
+        commitment.abandon();
+    }
+    result?;
     Ok(true)
 }
 
 #[cfg(feature = "websocket-experimental")]
 async fn send_websocket_callback_message<IO>(
-    sender: &Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    sender: &Arc<AsyncMutex<Option<AsyncWsClientSendHalf<IO>>>>,
+    callbacks: &ReverseCallbackState,
     cx: &Cx,
     message: &JsonRpcMessage,
 ) -> Result<(), TransportError>
@@ -5564,6 +5665,12 @@ where
             asupersync::sync::LockError::Poisoned
             | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
         })?;
+    // A callback can fail while this ordinary/control write waits for the
+    // serialized writer. Recheck after acquisition before emitting any bytes.
+    if callbacks.closing.load(Ordering::Acquire) || callbacks.terminal_error().is_some() {
+        return Err(TransportError::Closed);
+    }
+    let sender = sender.as_mut().ok_or(TransportError::Closed)?;
     sender.send(cx, message).await
 }
 
@@ -5686,7 +5793,7 @@ where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     receiver: Option<AsyncWsClientRecvHalf<IO>>,
-    sender: Arc<AsyncMutex<AsyncWsClientSendHalf<IO>>>,
+    sender: Arc<AsyncMutex<Option<AsyncWsClientSendHalf<IO>>>>,
     connection_cx: Cx,
     session: ClientSession,
     reverse_request_handlers: ReverseRequestHandlers,
@@ -5710,6 +5817,7 @@ where
     next_id: u64,
     closed: bool,
     close_settled: bool,
+    close_state: Arc<Mutex<WebSocketCloseState>>,
     /// Modern request-only `io.modelcontextprotocol/logLevel`.
     final_log_level: Option<LoggingLevel>,
 }
@@ -5927,7 +6035,7 @@ where
         let session =
             admit_websocket_session_or_close(&mut receiver, &mut sender, cx, session).await?;
 
-        let sender = Arc::new(AsyncMutex::with_name("websocket-client-send", sender));
+        let sender = Arc::new(AsyncMutex::with_name("websocket-client-send", Some(sender)));
         let reverse_callback_pool =
             WebSocketReverseCallbackPool::new(Arc::clone(&sender), cx.clone());
 
@@ -5954,6 +6062,7 @@ where
             next_id: 2,
             closed: false,
             close_settled: false,
+            close_state: Arc::new(Mutex::new(WebSocketCloseState::default())),
             final_log_level: None,
         })
     }
@@ -7055,6 +7164,7 @@ where
         let send_state = Arc::new(WebSocketTransientRequestState {
             phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
             callbacks: Arc::clone(&self.reverse_callback_pool.state),
+            uncertain_writer: Arc::clone(&self.reverse_callback_pool.uncertain_writer),
             send_failure_message: "WebSocket cancellation control did not commit",
         });
         let mut commitment = WebSocketCancellationSendGuard {
@@ -7071,7 +7181,12 @@ where
         // end the bound's timer at once and misreport the send as timed out.
         let cancellation_send = {
             let mut send = Box::pin(WebSocketOwnedSend::new(
-                send_websocket_callback_message(&sender, &connection_cx, &control),
+                send_websocket_callback_message(
+                    &sender,
+                    &self.reverse_callback_pool.state,
+                    &connection_cx,
+                    &control,
+                ),
                 send_state,
             ));
             let masked_send = std::future::poll_fn(|task_cx| {
@@ -7108,10 +7223,15 @@ where
         McpError::request_cancelled()
     }
 
-    /// Closes both transport halves through the supplied caller context.
+    /// Closes both transport halves within one retained cleanup deadline.
+    ///
+    /// Cleanup uses the connection context even when the supplied caller has
+    /// been cancelled. An interrupted or timed-out wire close retires its
+    /// owned halves; later calls finish any remaining callback cleanup and
+    /// report the first cleanup failure without emitting another Close frame.
     pub async fn close(&mut self, cx: &Cx) -> McpResult<()> {
         if self.close_settled {
-            return Ok(());
+            return self.websocket_close_result();
         }
         self.closed = true;
         self.live_catalog_subscription = None;
@@ -10644,7 +10764,13 @@ where
         if self.reverse_callback_pool.terminal_error().is_some() {
             return Err(TransportError::Closed);
         }
-        send_websocket_callback_message(&self.sender, cx, message).await
+        send_websocket_callback_message(
+            &self.sender,
+            &self.reverse_callback_pool.state,
+            cx,
+            message,
+        )
+        .await
     }
 
     fn admit_raw_client_request(
@@ -10714,6 +10840,7 @@ where
         let state = Arc::new(WebSocketTransientRequestState {
             phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
             callbacks: Arc::clone(&self.reverse_callback_pool.state),
+            uncertain_writer: Arc::clone(&self.reverse_callback_pool.uncertain_writer),
             send_failure_message: "WebSocket request send was dropped before commitment",
         });
         self.transient_request = Some(WebSocketTransientRequest {
@@ -10835,7 +10962,7 @@ where
         McpError::invalid_request(message)
     }
 
-    async fn settle_close(&mut self, cx: &Cx) -> McpResult<()> {
+    async fn settle_close(&mut self, _cx: &Cx) -> McpResult<()> {
         if let Some(owner) = self.transient_request.take() {
             owner
                 .state
@@ -10843,42 +10970,155 @@ where
                 .store(WebSocketTransientRequestState::TERMINAL, Ordering::Release);
         }
         if self.close_settled {
-            return Ok(());
+            return self.websocket_close_result();
         }
         self.closed = true;
-        // A panicked callback is already terminal, but its retained task has
-        // been observed and removed by `join_bounded`.  Continue closing both
-        // transport halves before surfacing that callback failure so every
-        // terminal path has the same structural close election.
-        let callbacks_result = self.reverse_callback_pool.join_bounded(cx).await;
-        let sender_result = self
-            .send_message_close(cx)
-            .await
-            .map_err(transport_error_to_mcp);
-        let receiver_result = match self.receiver.as_mut() {
-            Some(receiver) => receiver.close(cx).await.map_err(transport_error_to_mcp),
-            None => Ok(()),
+        self.reverse_callback_pool.cancel_all();
+        // Both native halves close through the same serialized writer. Release
+        // the read owner now instead of awaiting a second, identical Close.
+        // A timeout after extracting the sender then releases the actual I/O.
+        drop(self.receiver.take());
+        let connection_cx = self.connection_cx.clone();
+        let close_state = Arc::clone(&self.close_state);
+        let deadline = {
+            let mut state = close_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *state.deadline.get_or_insert_with(|| {
+                connection_cx
+                    .now()
+                    .saturating_add_nanos(WEBSOCKET_CLOSE_TIMEOUT_NANOS)
+            })
         };
-        callbacks_result?;
-        match (sender_result, receiver_result) {
-            (Ok(()), Ok(())) => {
-                self.close_settled = true;
-                Ok(())
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
+        {
+            let mut cleanup =
+                std::pin::pin!(self.settle_websocket_owned_transport(&connection_cx, deadline));
+            let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
+            let mut polled = false;
+            std::future::poll_fn(|task_cx| {
+                let _connection = Cx::set_current(Some(connection_cx.clone()));
+                connection_cx.masked(|| {
+                    // A resumed close may reap already-finished workers and
+                    // retire an immediately available sender after expiry.
+                    // The inner future checks the original deadline before
+                    // starting Close; an in-flight Close gets no later poll.
+                    if !polled || connection_cx.now() < deadline {
+                        polled = true;
+                        if cleanup.as_mut().poll(task_cx).is_ready() {
+                            return std::task::Poll::Ready(());
+                        }
+                    }
+                    if connection_cx.now() >= deadline || elapsed.as_mut().poll(task_cx).is_ready()
+                    {
+                        // Select the timeout before dropping the owned close
+                        // future, so its abandonment guard cannot replace it.
+                        close_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .error
+                            .get_or_insert_with(|| transport_error_to_mcp(TransportError::Timeout));
+                        return std::task::Poll::Ready(());
+                    }
+                    std::task::Poll::Pending
+                })
+            })
+            .await;
         }
+        match self.reverse_callback_pool.reap_finished_tasks() {
+            Ok(0) => {
+                self.close_settled = close_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .transport_retired;
+            }
+            Ok(_) => {}
+            Err(error) => self.record_websocket_close_error(error),
+        }
+        self.websocket_close_result()
     }
 
-    async fn send_message_close(&self, cx: &Cx) -> Result<(), TransportError> {
-        let mut sender = OwnedMutexGuard::lock(Arc::clone(&self.sender), cx)
-            .await
-            .map_err(|error| match error {
-                asupersync::sync::LockError::Cancelled => TransportError::Cancelled,
-                asupersync::sync::LockError::TimedOut(_) => TransportError::Timeout,
-                asupersync::sync::LockError::Poisoned
-                | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
-            })?;
-        sender.close(cx).await
+    fn record_websocket_close_error(&self, error: McpError) {
+        self.close_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .error
+            .get_or_insert(error);
+    }
+
+    fn websocket_close_result(&self) -> McpResult<()> {
+        self.close_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .error
+            .clone()
+            .map_or(Ok(()), Err)
+    }
+
+    async fn settle_websocket_owned_transport(
+        &mut self,
+        cx: &Cx,
+        deadline: asupersync::types::Time,
+    ) {
+        if let Err(error) = self.reverse_callback_pool.join_bounded(cx).await {
+            // Preserve this failure while still retiring the transport. A
+            // callback panic cannot skip the connection's close ownership.
+            self.record_websocket_close_error(error);
+        }
+        if self
+            .close_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport_retired
+        {
+            return;
+        }
+        let mut slot = match OwnedMutexGuard::lock(Arc::clone(&self.sender), cx).await {
+            Ok(sender) => sender,
+            Err(error) => {
+                let error = match error {
+                    asupersync::sync::LockError::Cancelled => TransportError::Cancelled,
+                    asupersync::sync::LockError::TimedOut(_) => TransportError::Timeout,
+                    asupersync::sync::LockError::Poisoned
+                    | asupersync::sync::LockError::PolledAfterCompletion => TransportError::Closed,
+                };
+                self.record_websocket_close_error(transport_error_to_mcp(error));
+                return;
+            }
+        };
+        let sender = slot.take();
+        drop(slot);
+        let uncertain_writer = self
+            .reverse_callback_pool
+            .uncertain_writer
+            .load(Ordering::Acquire);
+        let callback_failure = self.reverse_callback_pool.terminal_error();
+        let retirement = WebSocketOwnedClose {
+            inner: Box::pin(async move {
+                match sender {
+                    Some(mut sender) => {
+                        let result = if uncertain_writer {
+                            // Native Close first flushes any buffered frame
+                            // suffix. An abandoned response must be retired,
+                            // never flushed by a later control frame after its
+                            // owner has disappeared.
+                            Err(callback_failure.unwrap_or_else(|| {
+                                McpError::internal_error("WebSocket writer commitment is unknown")
+                            }))
+                        } else if cx.now() >= deadline {
+                            Err(transport_error_to_mcp(TransportError::Timeout))
+                        } else {
+                            sender.close(cx).await.map_err(transport_error_to_mcp)
+                        };
+                        drop(sender);
+                        result
+                    }
+                    None => Ok(()),
+                }
+            }),
+            state: Arc::clone(&self.close_state),
+            completed: false,
+        };
+        retirement.await;
     }
 }
 
@@ -26996,6 +27236,144 @@ mod tests {
         )
     }
 
+    #[derive(Default)]
+    #[cfg(feature = "websocket-experimental")]
+    struct WebSocketWriteProbe {
+        opcode: AtomicU8,
+        prefix_remaining: AtomicUsize,
+        released: AtomicBool,
+        started: AtomicBool,
+        accepted: Mutex<Vec<u8>>,
+        dropped: AtomicBool,
+        waker: Mutex<Option<std::task::Waker>>,
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl WebSocketWriteProbe {
+        fn arm(&self, opcode: u8, prefix: usize, released: bool) {
+            self.prefix_remaining.store(prefix, Ordering::Release);
+            self.released.store(released, Ordering::Release);
+            self.opcode.store(opcode, Ordering::Release);
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            if let Some(waker) = self.waker.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
+
+        fn park(&self, cx: &Context<'_>) {
+            *self.waker.lock().unwrap() = Some(cx.waker().clone());
+        }
+    }
+
+    /// Parks an actual native frame after an observable accepted prefix. It
+    /// keeps the underlying stream live until the split owners are released.
+    #[cfg(feature = "websocket-experimental")]
+    struct WebSocketWriteProbeIo {
+        inner: asupersync::net::tcp::VirtualTcpStream,
+        probe: Arc<WebSocketWriteProbe>,
+        active: bool,
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl AsyncRead for WebSocketWriteProbeIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl AsyncWrite for WebSocketWriteProbeIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let opcode = this.probe.opcode.load(Ordering::Acquire);
+            if !this.active {
+                if opcode == 0 || !bytes.first().is_some_and(|byte| byte & 0x0F == opcode) {
+                    return Pin::new(&mut this.inner).poll_write(cx, bytes);
+                }
+                this.active = true;
+                this.probe.started.store(true, Ordering::Release);
+            }
+            let released = this.probe.released.load(Ordering::Acquire);
+            let remaining = this.probe.prefix_remaining.load(Ordering::Acquire);
+            if !released && remaining == 0 {
+                this.probe.park(cx);
+                return Poll::Pending;
+            }
+            let count = if released {
+                bytes.len()
+            } else {
+                bytes.len().min(remaining)
+            };
+            let result = Pin::new(&mut this.inner).poll_write(cx, &bytes[..count]);
+            if let Poll::Ready(Ok(written)) = result {
+                this.probe
+                    .accepted
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&bytes[..written]);
+                if !released {
+                    this.probe
+                        .prefix_remaining
+                        .fetch_sub(written, Ordering::AcqRel);
+                }
+            }
+            result
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.active
+                && !this.probe.released.load(Ordering::Acquire)
+                && this.probe.prefix_remaining.load(Ordering::Acquire) == 0
+            {
+                this.probe.park(cx);
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    impl Drop for WebSocketWriteProbeIo {
+        fn drop(&mut self) {
+            self.probe.dropped.store(true, Ordering::Release);
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn probed_async_websocket_pair() -> (
+        WebSocketWriteProbeIo,
+        asupersync::net::tcp::VirtualTcpStream,
+        Arc<WebSocketWriteProbe>,
+    ) {
+        let (client, peer) = async_websocket_pair();
+        let probe = Arc::new(WebSocketWriteProbe::default());
+        (
+            WebSocketWriteProbeIo {
+                inner: client,
+                probe: Arc::clone(&probe),
+                active: false,
+            },
+            peer,
+            probe,
+        )
+    }
+
     #[cfg(feature = "websocket-experimental")]
     fn async_modern_discovery_result() -> serde_json::Value {
         serde_json::json!({
@@ -27938,6 +28316,346 @@ mod tests {
     }
 
     #[cfg(feature = "websocket-experimental")]
+    async fn connect_probed_modern_websocket(
+        cx: &Cx,
+    ) -> (
+        WebSocketClient<WebSocketWriteProbeIo>,
+        asupersync::net::tcp::VirtualTcpStream,
+        Arc<WebSocketWriteProbe>,
+    ) {
+        let (client_io, mut peer_io, probe) = probed_async_websocket_pair();
+        write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+        let client = WebSocketClient::connect_with_cx(
+            cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities::default(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .unwrap();
+        (client, peer_io, probe)
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_close_bounds_stalled_native_close_and_retires_both_halves() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for prefix in [None, Some(0), Some(3)] {
+                // This connection context deliberately has no ambient deadline.
+                let connection_cx = Cx::for_testing();
+                let (mut client, _peer, probe) =
+                    connect_probed_modern_websocket(&connection_cx).await;
+                probe.arm(0x08, prefix.unwrap_or(0), prefix.is_none());
+                let result =
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(2), client.close(&cx))
+                        .await
+                        .expect("close owns a bound even when its caller has none");
+                assert!(client.closed);
+                assert!(client.close_settled);
+                assert!(client.receiver.is_none());
+                assert!(client.sender.try_lock().unwrap().is_none());
+                assert!(
+                    probe.dropped.load(Ordering::Acquire),
+                    "both native owners actually release I/O"
+                );
+                let accepted = probe.accepted.lock().unwrap().clone();
+                match prefix {
+                    Some(prefix) => {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.message, "Request timed out");
+                        assert_eq!(accepted.len(), prefix);
+                        let repeated = client.close(&cx).await.unwrap_err();
+                        assert_eq!(repeated.code, error.code);
+                        assert_eq!(repeated.message, error.message);
+                    }
+                    None => {
+                        result.unwrap();
+                        assert_eq!(accepted[0] & 0x0F, 0x08);
+                        assert_eq!(accepted.len(), 8, "one masked normal Close frame");
+                        client.close(&cx).await.unwrap();
+                    }
+                }
+                probe.release();
+                let next_id = client.next_id;
+                assert!(client.list_tools(&cx, None).await.is_err());
+                assert_eq!(client.next_id, next_id);
+                assert_eq!(*probe.accepted.lock().unwrap(), accepted);
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_close_uses_connection_context_after_caller_cancellation() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for cancelled_connection in [false, true] {
+                let connection_cx = Cx::for_testing();
+                let (mut client, _peer, probe) =
+                    connect_probed_modern_websocket(&connection_cx).await;
+                probe.arm(0x08, 0, true);
+                let caller = Cx::for_testing();
+                caller.set_cancel_requested(true);
+                if cancelled_connection {
+                    connection_cx.set_cancel_requested(true);
+                }
+                asupersync::time::timeout(cx.now(), Duration::from_secs(2), client.close(&caller))
+                    .await
+                    .expect("cancelled caller cannot suppress owned cleanup")
+                    .unwrap();
+                assert!(probe.dropped.load(Ordering::Acquire));
+                assert!(client.close_settled);
+                assert_eq!(probe.accepted.lock().unwrap().len(), 8);
+                client.close(&caller).await.unwrap();
+                assert_eq!(probe.accepted.lock().unwrap().len(), 8);
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_close_drop_retires_extracted_transport_without_restarting_close() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (mut client, _peer, probe) = connect_probed_modern_websocket(&cx).await;
+            probe.arm(0x08, 3, false);
+            {
+                let mut closing = Box::pin(client.close(&cx));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(closing.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+            }
+            assert!(client.closed);
+            assert!(client.receiver.is_none());
+            assert!(client.sender.try_lock().unwrap().is_none());
+            assert!(
+                probe.dropped.load(Ordering::Acquire),
+                "abandoned close owns and drops its native writer"
+            );
+            let deadline = client.close_state.lock().unwrap().deadline;
+            probe.release();
+            let error = client.close(&cx).await.unwrap_err();
+            assert_eq!(
+                error.message,
+                "WebSocket close was interrupted before transport commitment"
+            );
+            assert!(client.close_settled);
+            assert_eq!(client.close_state.lock().unwrap().deadline, deadline);
+            assert_eq!(
+                probe.accepted.lock().unwrap().len(),
+                3,
+                "no continuation or second Close can write"
+            );
+            assert_eq!(client.close(&cx).await.unwrap_err().message, error.message);
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_close_waiting_for_writer_resumes_without_renewing_deadline() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for expired in [false, true] {
+                let (mut client, _peer, probe) = connect_probed_modern_websocket(&cx).await;
+                probe.arm(0x08, 0, true);
+                let writer = OwnedMutexGuard::lock(Arc::clone(&client.sender), &cx)
+                    .await
+                    .unwrap();
+                {
+                    let mut closing = Box::pin(client.close(&cx));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(closing.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                }
+                let deadline = client.close_state.lock().unwrap().deadline;
+                assert!(!client.close_settled);
+                assert!(!client.close_state.lock().unwrap().transport_retired);
+                assert!(!probe.dropped.load(Ordering::Acquire));
+                assert!(probe.accepted.lock().unwrap().is_empty());
+                if expired {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(400)).await;
+                }
+                drop(writer);
+                let result = client.close(&cx).await;
+                assert_eq!(client.close_state.lock().unwrap().deadline, deadline);
+                assert!(client.close_settled);
+                assert!(probe.dropped.load(Ordering::Acquire));
+                if expired {
+                    assert_eq!(result.unwrap_err().message, "Request timed out");
+                    assert!(
+                        probe.accepted.lock().unwrap().is_empty(),
+                        "expired cleanup retires instead of starting a fresh Close"
+                    );
+                } else {
+                    result.unwrap();
+                    assert_eq!(probe.accepted.lock().unwrap().len(), 8);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_protocol_error_survives_stalled_close_and_retains_cleanup_failure() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for stalled in [false, true] {
+                let (mut client, mut peer, probe) = connect_probed_modern_websocket(&cx).await;
+                probe.arm(0x08, 3, !stalled);
+                write_server_text_frame(
+                    &mut peer,
+                    r#"{"jsonrpc":"2.0","id":41,"method":"roots/list","params":{}}"#,
+                )
+                .await;
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(2),
+                    client.list_tools(&cx, None),
+                )
+                .await
+                .expect("a refused frame cannot strand its caller in transport close")
+                .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    McpErrorCode::InvalidRequest,
+                    "cleanup must not replace the protocol failure"
+                );
+                assert!(client.closed);
+                assert!(client.close_settled);
+                assert!(probe.dropped.load(Ordering::Acquire));
+                if stalled {
+                    assert_eq!(
+                        client.close(&cx).await.unwrap_err().message,
+                        "Request timed out"
+                    );
+                    assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                } else {
+                    client.close(&cx).await.unwrap();
+                    assert_eq!(probe.accepted.lock().unwrap().len(), 8);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_close_never_flushes_abandoned_request_or_cancellation_frame_suffixes() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for cancellation_send in [false, true] {
+                for commit in [false, true] {
+                    let (mut client, mut peer_io, probe) =
+                        connect_probed_modern_websocket(&cx).await;
+                    let cancellation = McpRequestCancellation::new();
+                    if !cancellation_send {
+                        probe.arm(0x01, 3, false);
+                    }
+                    let mut pending =
+                        Box::pin(client.list_tools_with_cancellation(&cx, &cancellation, None));
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(pending.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                    if cancellation_send {
+                        probe.arm(0x01, 3, false);
+                        cancellation.cancel();
+                        assert!(
+                            std::future::poll_fn(|task_cx| Poll::Ready(
+                                pending.as_mut().poll(task_cx)
+                            ))
+                            .await
+                            .is_pending()
+                        );
+                    }
+                    assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                    if commit {
+                        probe.release();
+                        if cancellation_send {
+                            assert_eq!(
+                                pending.await.unwrap_err().code,
+                                McpErrorCode::RequestCancelled
+                            );
+                        } else {
+                            write_server_text_frame(
+                                &mut peer_io,
+                                &serde_json::to_string(&JsonRpcResponse::success(
+                                    RequestId::Number(2),
+                                    async_modern_tools_list_result(),
+                                ))
+                                .unwrap(),
+                            )
+                            .await;
+                            pending.await.unwrap();
+                        }
+                        assert!(
+                            !client
+                                .reverse_callback_pool
+                                .uncertain_writer
+                                .load(Ordering::Acquire)
+                        );
+                        assert!(!client.closed);
+                        client.close(&cx).await.unwrap();
+                        let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                        for method in [SERVER_DISCOVER_METHOD, "tools/list"] {
+                            let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap()
+                            else {
+                                panic!("fully committed request");
+                            };
+                            assert_eq!(request.method, method);
+                        }
+                        if cancellation_send {
+                            let JsonRpcMessage::Request(control) = peer.recv(&cx).await.unwrap()
+                            else {
+                                panic!("fully committed cancellation");
+                            };
+                            assert_eq!(control.method, "notifications/cancelled");
+                            assert_eq!(control.params.unwrap()["requestId"], 2);
+                        }
+                        assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    } else {
+                        drop(pending);
+                        assert!(
+                            client
+                                .reverse_callback_pool
+                                .uncertain_writer
+                                .load(Ordering::Acquire)
+                        );
+                        // A healthy writer after abandonment must not make a
+                        // later Close flush the previously buffered suffix.
+                        probe.release();
+                        let error = client.close(&cx).await.unwrap_err();
+                        assert_eq!(
+                            error.message,
+                            if cancellation_send {
+                                "WebSocket cancellation control did not commit"
+                            } else {
+                                "WebSocket request send was dropped before commitment"
+                            }
+                        );
+                        assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                        assert_eq!(client.close(&cx).await.unwrap_err().message, error.message);
+                    }
+                    assert!(client.close_settled);
+                    assert!(client.receiver.is_none());
+                    assert!(client.sender.try_lock().unwrap().is_none());
+                    assert!(probe.dropped.load(Ordering::Acquire));
+                    let next_id = client.next_id;
+                    assert!(client.list_tools(&cx, None).await.is_err());
+                    assert_eq!(client.next_id, next_id);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
     #[test]
     fn websocket_request_drop_retires_once_and_preserves_partial_response_frames() {
         run_test(|| async {
@@ -28181,6 +28899,7 @@ mod tests {
                 let state = Arc::new(WebSocketTransientRequestState {
                     phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
                     callbacks: Arc::clone(&callbacks),
+                    uncertain_writer: Arc::new(AtomicBool::new(false)),
                     send_failure_message: "test request or cancellation send did not commit",
                 });
                 let mut sending = Box::pin(WebSocketOwnedSend::new(
@@ -28273,7 +28992,7 @@ mod tests {
                 );
                 assert!(client.list_tools(&cx, None).await.is_err());
                 assert_eq!(client.next_id, 3);
-                client.close(&cx).await.unwrap();
+                assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket cancellation control did not commit");
                 let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
                 for expected in [SERVER_DISCOVER_METHOD, "tools/list"] {
                     let JsonRpcMessage::Request(request) = server.recv(&cx).await.unwrap() else {
@@ -28410,7 +29129,7 @@ mod tests {
                     client.retired_requests.is_empty(),
                     "an uncommitted frame cannot authorize a cancellation frame"
                 );
-                client.close(&cx).await.unwrap();
+                assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket request send was dropped before commitment");
                 let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
                 let JsonRpcMessage::Request(discovery) = server.recv(&cx).await.unwrap() else {
                     panic!("discovery request");
@@ -31142,7 +31861,11 @@ mod tests {
                             "only the listener ID receives cancellation"
                         );
                     }
-                    client.close(&cx).await.unwrap();
+                    if stalled {
+                        assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket cancellation control did not commit");
+                    } else {
+                        client.close(&cx).await.unwrap();
+                    }
                     request_region.close().await.unwrap();
                 }
             }
@@ -31234,7 +31957,7 @@ mod tests {
                 assert_eq!(request.method, method);
             }
             assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
-            client.close(&cx).await.unwrap();
+            assert_eq!(client.close(&cx).await.unwrap_err().message, "WebSocket cancellation control did not commit");
             listener_region.close().await.unwrap();
         });
     }
@@ -32043,7 +32766,7 @@ mod tests {
             client
                 .close(&cx)
                 .await
-                .expect("explicit close still settles both halves");
+                .expect_err("explicit close retires both halves and retains the uncommitted control failure");
             assert!(client.close_settled);
             let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
             for expected_method in [SERVER_DISCOVER_METHOD, "subscriptions/listen"] {
@@ -34197,6 +34920,231 @@ mod tests {
                 .await
                 .expect("close exact legacy reverse client");
             assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_callback_send_drop_refuses_queued_writes_and_never_flushes_its_suffix() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for abort_response in [false, true] {
+                let (client_io, mut peer_io, probe) = probed_async_websocket_pair();
+                write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"callback-write-owner","version":"1.0"}}}"#).await;
+                let calls = Arc::new(AtomicUsize::new(0));
+                let handler_calls = Arc::clone(&calls);
+                let handlers = ReverseRequestHandlers::new().with_roots_list(move |_, _, _| {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(ListRootsResult::new(Vec::new())) })
+                });
+                let mut client = WebSocketClient::connect_with_reverse_request_handlers_with_cx(
+                    &cx,
+                    ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
+                    async_websocket_client_info(),
+                    ClientCapabilities::default(),
+                    handlers,
+                    AsyncWsClientTransport::from_upgraded(client_io),
+                )
+                .await
+                .unwrap();
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                for method in ["initialize", "notifications/initialized"] {
+                    let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap() else {
+                        panic!("legacy handshake must precede callback traffic");
+                    };
+                    assert_eq!(request.method, method);
+                }
+                let mut request = Box::pin(client.list_tools(&cx, None));
+                assert!(
+                    std::future::poll_fn(|task_cx| Poll::Ready(request.as_mut().poll(task_cx)))
+                        .await
+                        .is_pending()
+                );
+                let JsonRpcMessage::Request(tools) = peer.recv(&cx).await.unwrap() else {
+                    panic!("ordinary request must commit before callback writes are armed");
+                };
+                assert_eq!(tools.method, "tools/list");
+                probe.arm(0x01, 3, false);
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "roots/list",
+                        Some(serde_json::json!({})),
+                        RequestId::Number(41),
+                    )),
+                )
+                .await
+                .unwrap();
+                let first_deadline = Instant::now() + Duration::from_secs(2);
+                while !probe.started.load(Ordering::Acquire) {
+                    assert!(
+                        Instant::now() < first_deadline,
+                        "first response must reach the native writer"
+                    );
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(request.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::new(
+                        "roots/list",
+                        Some(serde_json::json!({})),
+                        RequestId::Number(42),
+                    )),
+                )
+                .await
+                .unwrap();
+                let second_deadline = Instant::now() + Duration::from_secs(2);
+                while calls.load(Ordering::Acquire) < 2 {
+                    assert!(
+                        Instant::now() < second_deadline,
+                        "sibling handler must queue behind the first response"
+                    );
+                    assert!(
+                        std::future::poll_fn(|task_cx| Poll::Ready(request.as_mut().poll(task_cx)))
+                            .await
+                            .is_pending()
+                    );
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                // Releasing the operation borrow does not cancel either
+                // connection-owned callback. Its ordinary request is retired
+                // during the later close if the callback send fails.
+                drop(request);
+                let sender = Arc::clone(&client.sender);
+                let callbacks = Arc::clone(&client.reverse_callback_pool.state);
+                let queued_started = Arc::new(AtomicBool::new(false));
+                let started = Arc::clone(&queued_started);
+                let mut queued = cx
+                    .spawn(move |queued_cx| async move {
+                        started.store(true, Ordering::Release);
+                        send_websocket_callback_message(
+                            &sender,
+                            &callbacks,
+                            &queued_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                "notifications/roots/list_changed",
+                                None,
+                            )),
+                        )
+                        .await
+                    })
+                    .unwrap();
+                wait_for_websocket_test_flag(
+                    &cx,
+                    &queued_started,
+                    "queued ordinary/control writer",
+                )
+                .await;
+                if abort_response {
+                    {
+                        let tasks = client.reverse_callback_pool.tasks.lock().unwrap();
+                        let (_, cancellation, task) = tasks
+                            .iter()
+                            .find(|(id, _, _)| id.correlates_with(&RequestId::Number(41)))
+                            .unwrap();
+                        assert!(
+                            !cancellation.is_open(),
+                            "response election already owns the first frame"
+                        );
+                        assert!(
+                            !cancellation.is_cancel_requested(),
+                            "this is not pre-claim protocol suppression"
+                        );
+                        task.abort();
+                    }
+                    wait_for_websocket_test_flag(
+                        &cx,
+                        &client.reverse_callback_pool.uncertain_writer,
+                        "aborted callback publishes writer uncertainty before release",
+                    )
+                    .await;
+                }
+                probe.release();
+                let queued_result =
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(2), queued.join(&cx))
+                        .await
+                        .expect("queued writer must settle after response owner exits")
+                        .unwrap();
+                if abort_response {
+                    assert!(matches!(queued_result, Err(TransportError::Closed)));
+                    let error = client.close(&cx).await.unwrap_err();
+                    assert_eq!(
+                        error.message,
+                        "WebSocket reverse callback response did not commit"
+                    );
+                    assert!(client.close_settled);
+                    assert!(probe.dropped.load(Ordering::Acquire));
+                    assert_eq!(
+                        probe.accepted.lock().unwrap().len(),
+                        3,
+                        "neither sibling data nor Close may flush the abandoned suffix"
+                    );
+                    assert!(asupersync::time::timeout(
+                        cx.now(), Duration::from_secs(2), peer.recv(&cx),
+                    ).await.unwrap().is_err(), "partial response is never admitted as host data");
+                    assert_eq!(client.close(&cx).await.unwrap_err().message, error.message);
+                } else {
+                    queued_result.unwrap();
+                    let mut responses = Vec::new();
+                    let mut notifications = 0;
+                    for _ in 0..3 {
+                        match peer.recv(&cx).await.unwrap() {
+                            JsonRpcMessage::Response(response) => {
+                                assert!(response.error.is_none());
+                                responses.push(response.id.unwrap());
+                            }
+                            JsonRpcMessage::Request(notification) => {
+                                assert!(notification.id.is_none());
+                                assert_eq!(notification.method, "notifications/roots/list_changed");
+                                notifications += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(responses.len(), 2);
+                    assert!(
+                        responses
+                            .iter()
+                            .any(|id| id.correlates_with(&RequestId::Number(41)))
+                    );
+                    assert!(
+                        responses
+                            .iter()
+                            .any(|id| id.correlates_with(&RequestId::Number(42)))
+                    );
+                    assert_eq!(notifications, 1);
+                    assert!(
+                        !client
+                            .reverse_callback_pool
+                            .uncertain_writer
+                            .load(Ordering::Acquire)
+                    );
+                    // The deliberately dropped ordinary request still owns
+                    // its deferred retirement; close must not manufacture a
+                    // second callback response while settling that owner.
+                    peer.send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            tools.id.unwrap(),
+                            serde_json::json!({"tools": []}),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                    assert!(probe.dropped.load(Ordering::Acquire));
+                }
+                assert_eq!(calls.load(Ordering::Acquire), 2);
+                let next_id = client.next_id;
+                assert!(client.list_tools(&cx, None).await.is_err());
+                assert_eq!(client.next_id, next_id);
+            }
         });
     }
 

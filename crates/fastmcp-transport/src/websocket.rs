@@ -357,6 +357,101 @@ fn terminal_unavailable(terminal: &AtomicU8) -> bool {
     !WebSocketTerminalState::load(terminal).is_open()
 }
 
+const CLIENT_FAILURE_CLOSE_TIMEOUT_NANOS: u64 = 100_000_000;
+
+/// Publishes an uncertain native data write before dropping its future. The
+/// outer sender still owns the serialized writer, so a queued failure Close
+/// observes `Failed` before it can flush the abandoned frame suffix.
+struct ClientDataSend<F> {
+    inner: Pin<Box<F>>,
+    terminal: Arc<AtomicU8>,
+    completed: bool,
+}
+
+impl<F> Future for ClientDataSend<F>
+where
+    F: Future<Output = Result<(), WsError>>,
+{
+    type Output = Result<(), WsError>;
+
+    fn poll(self: Pin<&mut Self>, task_cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll(task_cx) {
+            Poll::Ready(result) => {
+                if result.is_err() {
+                    this.terminal
+                        .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+                }
+                this.completed = true;
+                Poll::Ready(result)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<F> Drop for ClientDataSend<F> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.terminal
+                .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+        }
+    }
+}
+
+/// Publishes a failed close before dropping its inner future and writer guard.
+/// A protocol failure has already closed admission; abandoning its best-effort
+/// Close must never leave an apparently retryable write election behind.
+struct ClientFailureClose<F> {
+    inner: Pin<Box<F>>,
+    terminal: Arc<AtomicU8>,
+    completed: bool,
+}
+
+impl<F> Future for ClientFailureClose<F>
+where
+    F: Future<Output = Result<(), TransportError>>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, task_cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll(task_cx) {
+            Poll::Ready(result) => {
+                let next = if result.is_ok() {
+                    WebSocketTerminalState::Closed
+                } else {
+                    WebSocketTerminalState::Failed
+                };
+                // A data sender can fail while this close waits for its lock.
+                // Its failed commitment remains terminal even if cleanup races.
+                let _ = this.terminal.compare_exchange(
+                    WebSocketTerminalState::Closing.as_u8(),
+                    next.as_u8(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                this.completed = true;
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<F> Drop for ClientFailureClose<F> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.terminal.compare_exchange(
+                WebSocketTerminalState::Closing.as_u8(),
+                WebSocketTerminalState::Failed.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
 /// Writes an elected close frame while holding the one shared writer lock.
 ///
 /// Normal close election occurs only after the lock is acquired. Therefore a
@@ -407,6 +502,7 @@ async fn terminate_split_connection<IO>(
     cx: &Cx,
     writer: &Arc<Mutex<WebSocketWrite<IO>>>,
     terminal: &Arc<AtomicU8>,
+    deadline: asupersync::types::Time,
     reason: CloseReason,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -423,24 +519,36 @@ async fn terminate_split_connection<IO>(
         return;
     }
 
-    let result = async {
-        let mut writer = OwnedMutexGuard::lock(Arc::clone(writer), cx)
-            .await
-            .map_err(|error| websocket_lock_error(cx, error))?;
-        writer
-            .send(cx, NativeWsMessage::Close(Some(reason)))
-            .await
-            .map_err(|error| native_websocket_error(cx, error))
-    }
+    let mut close = std::pin::pin!(ClientFailureClose {
+        inner: Box::pin(async {
+            let mut writer = OwnedMutexGuard::lock(Arc::clone(writer), cx)
+                .await
+                .map_err(|error| websocket_lock_error(cx, error))?;
+            if WebSocketTerminalState::load(terminal) != WebSocketTerminalState::Closing {
+                return Err(TransportError::Closed);
+            }
+            if cx.now() >= deadline {
+                return Err(TransportError::Timeout);
+            }
+            writer
+                .send(cx, NativeWsMessage::Close(Some(reason)))
+                .await
+                .map_err(|error| native_websocket_error(cx, error))
+        }),
+        terminal: Arc::clone(terminal),
+        completed: false,
+    });
+    let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
+    std::future::poll_fn(|task_cx| {
+        // The retained deadline and its timer use the operation context's
+        // clock, even when a different caller context drives this future.
+        let _current = Cx::set_current(Some(cx.clone()));
+        if cx.now() >= deadline || elapsed.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(());
+        }
+        close.as_mut().poll(task_cx)
+    })
     .await;
-    terminal.store(
-        if result.is_ok() {
-            WebSocketTerminalState::Closed.as_u8()
-        } else {
-            WebSocketTerminalState::Failed.as_u8()
-        },
-        Ordering::Release,
-    );
 }
 
 pub struct AsyncWsClientTransport<IO> {
@@ -589,6 +697,8 @@ where
                 reader,
                 writer: Arc::clone(&writer),
                 terminal: Arc::clone(&terminal),
+                pending_error: None,
+                failure_close_deadline: None,
             },
             AsyncWsClientSendHalf {
                 writer,
@@ -607,6 +717,8 @@ pub struct AsyncWsClientRecvHalf<IO> {
     reader: WebSocketRead<IO>,
     writer: Arc<Mutex<WebSocketWrite<IO>>>,
     terminal: Arc<AtomicU8>,
+    pending_error: Option<TransportError>,
+    failure_close_deadline: Option<asupersync::types::Time>,
 }
 
 impl<IO> AsyncWsClientRecvHalf<IO>
@@ -628,6 +740,12 @@ where
         &mut self,
         cx: &Cx,
     ) -> Result<ReceivedTransportFrame, TransportError> {
+        // A caller may drop this future while the failure Close is pending.
+        // The admitted error belongs to this sole reader, not to that dropped
+        // drive future; return it once without starting another Close.
+        if let Some(error) = self.pending_error.take() {
+            return Err(error);
+        }
         if terminal_unavailable(&self.terminal) {
             return Err(TransportError::Closed);
         }
@@ -680,8 +798,13 @@ where
         close_reason: CloseReason,
         error: TransportError,
     ) -> TransportError {
-        terminate_split_connection(cx, &self.writer, &self.terminal, close_reason).await;
-        error
+        self.pending_error = Some(error);
+        let deadline = *self.failure_close_deadline.get_or_insert_with(|| {
+            cx.now()
+                .saturating_add_nanos(CLIENT_FAILURE_CLOSE_TIMEOUT_NANOS)
+        });
+        terminate_split_connection(cx, &self.writer, &self.terminal, deadline, close_reason).await;
+        self.pending_error.take().unwrap_or(TransportError::Closed)
     }
 }
 
@@ -716,16 +839,19 @@ where
         if terminal_unavailable(&self.terminal) {
             return Err(TransportError::Closed);
         }
-        let send_result = writer.send(cx, message).await;
-        drop(writer);
-        match send_result {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let close_reason = native_websocket_close_reason(&error);
-                let error = native_websocket_error(cx, error);
-                Err(self.terminate(cx, close_reason, error).await)
-            }
+        // The native writer retains an unsent suffix after a partial frame.
+        // A later Close would flush it before its own frame. Publish failure
+        // while the writer is still exclusively owned, including when this
+        // future is dropped, and never attempt cleanup after a returned error.
+        let result = ClientDataSend {
+            inner: Box::pin(writer.send(cx, message)),
+            terminal: Arc::clone(&self.terminal),
+            completed: false,
         }
+        .await
+        .map_err(|error| native_websocket_error(cx, error));
+        drop(writer);
+        result
     }
 
     /// Initiates a normal RFC 6455 close under the caller's context.
@@ -739,16 +865,6 @@ where
         reason: CloseReason,
     ) -> Result<(), TransportError> {
         close_split_connection(cx, &self.writer, &self.terminal, reason).await
-    }
-
-    async fn terminate(
-        &mut self,
-        cx: &Cx,
-        close_reason: CloseReason,
-        error: TransportError,
-    ) -> TransportError {
-        terminate_split_connection(cx, &self.writer, &self.terminal, close_reason).await;
-        error
     }
 }
 
@@ -3996,6 +4112,77 @@ mod tests {
         }
     }
 
+    /// Accepts a native frame prefix, then either returns one write error and
+    /// immediately becomes writable again or parks until explicitly released.
+    /// The real peer stream and byte capture expose any abandoned suffix that
+    /// an automatic Close or a subsequent operation wrongly flushes.
+    struct ClientWriteFaultIo {
+        inner: asupersync::net::tcp::VirtualTcpStream,
+        prefix: usize,
+        fail_after_prefix: bool,
+        released: Arc<AtomicBool>,
+        returned_error: Arc<AtomicBool>,
+        output: Arc<std::sync::Mutex<Vec<u8>>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl AsyncRead for ClientWriteFaultIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ClientWriteFaultIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let accepted = this.output.lock().expect("captured client bytes").len();
+            let length = if accepted < this.prefix {
+                bytes.len().min(this.prefix - accepted)
+            } else {
+                if this.fail_after_prefix && !this.returned_error.swap(true, Ordering::AcqRel) {
+                    // A later native write would now succeed, including a
+                    // Close that accidentally retries the retained suffix.
+                    this.released.store(true, Ordering::Release);
+                    return Poll::Ready(Err(io::Error::other("injected native write failure")));
+                }
+                if !this.released.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+                bytes.len()
+            };
+            let result = Pin::new(&mut this.inner).poll_write(cx, &bytes[..length]);
+            if let Poll::Ready(Ok(written)) = result {
+                this.output
+                    .lock()
+                    .expect("capture native client write")
+                    .extend_from_slice(&bytes[..written]);
+            }
+            result
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    impl Drop for ClientWriteFaultIo {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+
     /// Commits a chosen prefix once, then remains pending until the test opens
     /// the gate. Capturing the bytes makes frame splicing observable.
     struct ServerPrefixWriteIo {
@@ -5743,6 +5930,438 @@ mod tests {
                 panic!("expected server response");
             };
             assert_eq!(response.id, Some(RequestId::Number(18)));
+        });
+    }
+
+    async fn assert_client_split_returned_write_error(fail_after_prefix: bool) {
+        let cx = Cx::current().expect("runtime root context");
+        for prefix in [3, 12] {
+            let (client_socket, peer_socket) = virtual_socket_pair();
+            let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let released = Arc::new(AtomicBool::new(!fail_after_prefix));
+            let returned_error = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let client = AsyncWsClientTransport::from_upgraded(ClientWriteFaultIo {
+                inner: client_socket,
+                prefix,
+                fail_after_prefix,
+                released: Arc::clone(&released),
+                returned_error: Arc::clone(&returned_error),
+                output: Arc::clone(&output),
+                dropped: Arc::clone(&dropped),
+            });
+            let (mut receiver, mut sender) = client.into_split();
+            let first = JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(741),
+                serde_json::json!({"roots": [{"uri": "file:///owned", "name": "host data"}]}),
+            ));
+            let successor = JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 742_i64));
+            let result = asupersync::time::timeout(
+                cx.now(),
+                std::time::Duration::from_secs(2),
+                sender.send(&cx, &first),
+            )
+            .await
+            .expect("one returned write error cannot strand its caller in Close");
+
+            if fail_after_prefix {
+                assert!(matches!(
+                    result,
+                    Err(TransportError::Io(ref source))
+                        if source.kind() == io::ErrorKind::Other
+                            && source.to_string() == "injected native write failure"
+                ));
+                assert!(returned_error.load(Ordering::Acquire));
+                assert!(
+                    released.load(Ordering::Acquire),
+                    "the underlying writer has recovered"
+                );
+                assert_eq!(
+                    WebSocketTerminalState::load(&receiver.terminal),
+                    WebSocketTerminalState::Failed,
+                );
+                assert_eq!(output.lock().expect("failed frame prefix").len(), prefix);
+                assert!(matches!(
+                    sender.send(&cx, &successor).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(matches!(
+                    sender.close(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(matches!(
+                    receiver.close(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(matches!(
+                    receiver.recv_with_source(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert_eq!(
+                    output.lock().expect("no suffix or successor frame").len(),
+                    prefix,
+                    "neither automatic nor explicit Close may flush abandoned host data",
+                );
+                drop(sender);
+                assert!(
+                    !dropped.load(Ordering::Acquire),
+                    "the receive half still owns I/O"
+                );
+                drop(receiver);
+                assert!(dropped.load(Ordering::Acquire));
+                let mut peer = peer_socket;
+                let mut wire = Vec::new();
+                asupersync::time::timeout(
+                    cx.now(),
+                    std::time::Duration::from_secs(2),
+                    peer.read_to_end(&mut wire),
+                )
+                .await
+                .expect("released failed transport reaches peer EOF")
+                .expect("read exact accepted prefix");
+                assert_eq!(wire, *output.lock().expect("recorded failed wire"));
+                assert_eq!(wire.len(), prefix);
+            } else {
+                result.expect("the same partial native write succeeds without the injected error");
+                assert!(!returned_error.load(Ordering::Acquire));
+                assert_eq!(
+                    WebSocketTerminalState::load(&receiver.terminal),
+                    WebSocketTerminalState::Open,
+                );
+                sender
+                    .send(&cx, &successor)
+                    .await
+                    .expect("healthy sender remains usable");
+                sender
+                    .close(&cx)
+                    .await
+                    .expect("healthy writer commits its one Close");
+                let bytes = output.lock().expect("complete healthy frames").clone();
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer_socket);
+                for expected in [&first, &successor] {
+                    let received = peer
+                        .recv(&cx)
+                        .await
+                        .expect("peer admits the complete JSON-RPC frame");
+                    assert_eq!(
+                        serde_json::to_value(&received).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                }
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                receiver
+                    .close(&cx)
+                    .await
+                    .expect("paired Close is idempotent");
+                assert_eq!(*output.lock().expect("no duplicate Close"), bytes);
+                drop(sender);
+                drop(receiver);
+                assert!(dropped.load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[test]
+    fn async_client_split_returned_write_error_never_flushes_abandoned_data() {
+        run_test(|| async { assert_client_split_returned_write_error(true).await });
+    }
+
+    #[test]
+    fn async_client_split_partial_write_without_error_stays_usable() {
+        run_test(|| async { assert_client_split_returned_write_error(false).await });
+    }
+
+    async fn assert_client_split_failure_close_after_pending_send(commit: bool) {
+        let cx = Cx::current().expect("runtime root context");
+        let (client_socket, mut peer_socket) = virtual_socket_pair();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let client = AsyncWsClientTransport::from_upgraded(ClientWriteFaultIo {
+            inner: client_socket,
+            prefix: 3,
+            fail_after_prefix: false,
+            released: Arc::clone(&released),
+            returned_error: Arc::new(AtomicBool::new(false)),
+            output: Arc::clone(&output),
+            dropped: Arc::clone(&dropped),
+        });
+        let (mut receiver, mut sender) = client.into_split();
+        let terminal = Arc::clone(&receiver.terminal);
+        let writer = Arc::clone(&sender.writer);
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(744),
+            serde_json::json!({"retained": "callback data"}),
+        ));
+        let mut send = Box::pin(sender.send(&cx, &message));
+        std::future::poll_fn(|task_cx| {
+            assert!(send.as_mut().poll(task_cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(output.lock().expect("native data prefix").len(), 3);
+
+        let mut invalid = BytesMut::new();
+        FrameCodec::server()
+            .encode(Frame::text(Bytes::from_static(b"not json")), &mut invalid)
+            .expect("encode malformed JSON-RPC in a valid text frame");
+        peer_socket
+            .write_all(&invalid)
+            .await
+            .expect("peer triggers failure cleanup");
+        let mut receive = Box::pin(receiver.recv_with_source(&cx));
+        std::future::poll_fn(|task_cx| {
+            assert!(receive.as_mut().poll(task_cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            WebSocketTerminalState::load(&terminal),
+            WebSocketTerminalState::Closing
+        );
+        assert_eq!(
+            writer.waiters(),
+            1,
+            "failure Close must already be queued behind data"
+        );
+
+        if commit {
+            released.store(true, Ordering::Release);
+            send.await
+                .expect("the admitted data frame commits before failure Close");
+        } else {
+            drop(send);
+            assert_eq!(
+                WebSocketTerminalState::load(&terminal),
+                WebSocketTerminalState::Failed
+            );
+            released.store(true, Ordering::Release);
+        }
+        let error = asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(2), receive)
+            .await
+            .expect("queued failure cleanup is bounded")
+            .expect_err("receive keeps the original JSON-RPC error");
+        assert!(matches!(error, TransportError::Codec(_)));
+        assert_eq!(writer.waiters(), 0);
+        drop(writer);
+        if commit {
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_socket);
+            let received = peer
+                .recv(&cx)
+                .await
+                .expect("complete data wins before the queued Close");
+            assert_eq!(
+                serde_json::to_value(received).unwrap(),
+                serde_json::to_value(&message).unwrap()
+            );
+            assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+            sender
+                .close(&cx)
+                .await
+                .expect("the one failure Close already committed");
+        } else {
+            assert_eq!(output.lock().expect("no resumed suffix or Close").len(), 3);
+            assert!(matches!(
+                sender.close(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert!(matches!(
+                receiver.close(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert_eq!(output.lock().expect("no late Close").len(), 3);
+        }
+        drop(sender);
+        drop(receiver);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn async_client_split_queued_failure_close_cannot_flush_dropped_data() {
+        run_test(|| async { assert_client_split_failure_close_after_pending_send(false).await });
+    }
+
+    #[test]
+    fn async_client_split_queued_failure_close_follows_committed_data() {
+        run_test(|| async { assert_client_split_failure_close_after_pending_send(true).await });
+    }
+
+    #[derive(Clone, Copy)]
+    enum ClientFailureCloseDrive {
+        Writable,
+        Stalled,
+        Dropped,
+    }
+
+    async fn assert_client_split_protocol_failure_close(drive: ClientFailureCloseDrive) {
+        let cx = Cx::current().expect("runtime root context");
+        for prefix in [0, 3, 7] {
+            let (client_socket, mut peer) = virtual_socket_pair();
+            let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let released = Arc::new(AtomicBool::new(matches!(
+                drive,
+                ClientFailureCloseDrive::Writable
+            )));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let client = AsyncWsClientTransport::from_upgraded(ClientWriteFaultIo {
+                inner: client_socket,
+                prefix,
+                fail_after_prefix: false,
+                released: Arc::clone(&released),
+                returned_error: Arc::new(AtomicBool::new(false)),
+                output: Arc::clone(&output),
+                dropped: Arc::clone(&dropped),
+            });
+            let (mut receiver, mut sender) = client.into_split();
+            let mut invalid = BytesMut::new();
+            FrameCodec::server()
+                .encode(Frame::text(Bytes::from_static(b"not json")), &mut invalid)
+                .expect("encode a valid text frame with invalid JSON-RPC");
+            peer.write_all(&invalid)
+                .await
+                .expect("peer supplies the protocol failure");
+
+            let mut pending_diagnostic = None;
+            if matches!(drive, ClientFailureCloseDrive::Dropped) {
+                {
+                    let mut receive = Box::pin(receiver.recv_with_source(&cx));
+                    std::future::poll_fn(|task_cx| {
+                        assert!(receive.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert_eq!(output.lock().expect("partial failure Close").len(), prefix);
+                assert_eq!(
+                    WebSocketTerminalState::load(&receiver.terminal),
+                    WebSocketTerminalState::Failed
+                );
+                pending_diagnostic = Some(
+                    receiver
+                        .pending_error
+                        .as_ref()
+                        .expect("admitted error outlives its drive future")
+                        .to_string(),
+                );
+                released.store(true, Ordering::Release);
+            }
+
+            let error = asupersync::time::timeout(
+                cx.now(),
+                std::time::Duration::from_secs(2),
+                receiver.recv_with_source(&cx),
+            )
+            .await
+            .expect("protocol-error cleanup has its own finite bound")
+            .expect_err("the original invalid JSON-RPC remains the receive outcome");
+            assert!(matches!(&error, TransportError::Codec(_)), "{error:?}");
+            if let Some(diagnostic) = pending_diagnostic {
+                assert_eq!(error.to_string(), diagnostic);
+            }
+            assert!(
+                receiver.pending_error.is_none(),
+                "the admitted failure is delivered once"
+            );
+            let deadline = receiver
+                .failure_close_deadline
+                .expect("one retained cleanup deadline");
+            released.store(true, Ordering::Release);
+            let bytes = output.lock().expect("failure Close capture").clone();
+            match drive {
+                ClientFailureCloseDrive::Writable => {
+                    assert_eq!(
+                        WebSocketTerminalState::load(&receiver.terminal),
+                        WebSocketTerminalState::Closed
+                    );
+                    assert_eq!(bytes.len(), 8, "one masked Close frame");
+                    let mut encoded = BytesMut::from(bytes.as_slice());
+                    let close = FrameCodec::server().decode(&mut encoded).unwrap().unwrap();
+                    assert_eq!(close.opcode, Opcode::Close);
+                    assert_eq!(
+                        close.payload.as_ref(),
+                        &[0x03, 0xEF],
+                        "invalid JSON uses Close1007"
+                    );
+                    assert!(encoded.is_empty());
+                    sender
+                        .close(&cx)
+                        .await
+                        .expect("successful failure Close remains idempotent");
+                    receiver
+                        .close(&cx)
+                        .await
+                        .expect("paired Close emits no second frame");
+                }
+                ClientFailureCloseDrive::Stalled | ClientFailureCloseDrive::Dropped => {
+                    assert_eq!(
+                        WebSocketTerminalState::load(&receiver.terminal),
+                        WebSocketTerminalState::Failed
+                    );
+                    assert_eq!(
+                        bytes.len(),
+                        prefix,
+                        "a stopped Close cannot resume its suffix"
+                    );
+                    assert!(matches!(
+                        sender.close(&cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                    assert!(matches!(
+                        receiver.close(&cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                }
+            }
+            assert!(matches!(
+                receiver.recv_with_source(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert!(matches!(
+                sender
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Request(JsonRpcRequest::new("ping", None, 743_i64))
+                    )
+                    .await,
+                Err(TransportError::Closed)
+            ));
+            assert_eq!(
+                receiver.failure_close_deadline,
+                Some(deadline),
+                "retry cannot renew the failure cleanup budget"
+            );
+            assert_eq!(
+                *output.lock().expect("no late failure cleanup write"),
+                bytes
+            );
+            assert!(
+                cx.checkpoint().is_ok(),
+                "cleanup must not cancel its caller"
+            );
+            drop(sender);
+            drop(receiver);
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn async_client_split_protocol_failure_close_is_bounded_and_preserves_error() {
+        run_test(|| async {
+            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Stalled).await
+        });
+    }
+
+    #[test]
+    fn async_client_split_protocol_failure_writes_one_close_when_healthy() {
+        run_test(|| async {
+            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Writable).await
+        });
+    }
+
+    #[test]
+    fn async_client_split_dropped_protocol_failure_keeps_original_error_without_new_close() {
+        run_test(|| async {
+            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Dropped).await
         });
     }
 
