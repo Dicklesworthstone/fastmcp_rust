@@ -12801,11 +12801,12 @@ impl HttpSubscriptionListener<'_> {
     }
 }
 
-/// A durable final Tasks snapshot attached to one HTTP client on demand.
+/// A retained final Tasks snapshot attached to one HTTP client on demand.
 ///
-/// The handle intentionally owns only the latest admitted task snapshot. Each
-/// operation receives the owning [`HttpClient`] so that every wire request
-/// continues to use that client's sole monotonic JSON-RPC ID allocator.
+/// The handle owns the latest admitted snapshot and preserves the first
+/// terminal outcome. Each operation receives the owning [`HttpClient`] so
+/// every wire request uses that client's sole monotonic JSON-RPC ID allocator.
+/// This in-process handle does not persist or resume Tasks across a restart.
 #[cfg(feature = "tasks")]
 #[derive(Clone, Debug)]
 pub struct FinalTaskHandle {
@@ -12824,25 +12825,65 @@ impl FinalTaskHandle {
         &self.task
     }
 
-    /// Returns this handle's opaque durable task identifier.
+    /// Returns this handle's opaque task identifier.
     #[must_use]
     pub fn task_id(&self) -> &FinalTaskId {
         &self.task.base().task_id
     }
 
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.task,
+            FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+        )
+    }
+
+    fn admit_snapshot(&mut self, task: FinalTask) -> Result<bool, HttpClientError> {
+        if &task.base().task_id != self.task_id() {
+            return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                "final task snapshot does not match this handle",
+            )));
+        }
+        if self.is_terminal() {
+            return Ok(false);
+        }
+        // Compare the retained representation, including exact nested result
+        // source. Timestamp spellings participate only in equality; their
+        // lexicographic order is never a chronology or reconciliation rule.
+        let previous = serde_json::to_vec(&self.task).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "final task snapshot could not be compared",
+            ))
+        })?;
+        let candidate = serde_json::to_vec(&task).map_err(|_| {
+            HttpClientError::CoreResult(McpError::internal_error(
+                "final task snapshot could not be compared",
+            ))
+        })?;
+        if previous == candidate {
+            return Ok(false);
+        }
+        self.task = task;
+        Ok(true)
+    }
+
     /// Reads the authoritative current snapshot through `tasks/get`.
     ///
     /// The stored snapshot changes only after the response has passed the
-    /// exact task-ID check in the HTTP Tasks decoder.
+    /// exact task-ID check in the HTTP Tasks decoder. Once a terminal snapshot
+    /// is admitted, returns that retained outcome without another request.
     pub async fn poll(
         &mut self,
         cx: &Cx,
         client: &mut HttpClient,
     ) -> Result<&FinalTask, HttpClientError> {
+        if self.is_terminal() {
+            return Ok(&self.task);
+        }
         let task = client
             .get_final_task_snapshot(cx, self.task_id().clone())
             .await?;
-        self.task = task;
+        self.admit_snapshot(task)?;
         Ok(&self.task)
     }
 
@@ -12880,13 +12921,21 @@ impl FinalTaskHandle {
     /// The resulting watcher is caller-driven and does not reconnect or poll
     /// after stream termination. The Tasks extension exposes neither a replay
     /// cursor nor a resumption token, so a new watch must begin from an
-    /// explicit [`Self::poll`] reconciliation.
+    /// explicit [`Self::poll`] reconciliation. An already terminal handle
+    /// returns an exhausted watcher without opening a subscription. A live
+    /// watcher stops after yielding its first terminal Task snapshot.
     pub async fn watch<'client, 'handle>(
         &'handle mut self,
         cx: &Cx,
         client: &'client mut HttpClient,
         limits: sse::SseLimits,
     ) -> Result<FinalTaskWatch<'client, 'handle>, HttpClientError> {
+        if self.is_terminal() {
+            return Ok(FinalTaskWatch {
+                listener: None,
+                handle: self,
+            });
+        }
         let mut notifications = SubscriptionFilter::default();
         fastmcp_protocol::set_task_subscription_ids(
             &mut notifications,
@@ -12901,7 +12950,7 @@ impl FinalTaskHandle {
             .open_final_task_watch_listener(cx, notifications, limits)
             .await?;
         Ok(FinalTaskWatch {
-            listener,
+            listener: Some(listener),
             handle: self,
         })
     }
@@ -12916,7 +12965,8 @@ pub enum FinalTaskWatchEvent {
         /// The task-only subscription filter accepted by the server.
         accepted_filter: SubscriptionFilter,
     },
-    /// A full task snapshot replaced the handle's previous snapshot.
+    /// A changed task snapshot replaced the handle's previous snapshot.
+    /// Terminal Task snapshots are yielded once and exhaust this watcher.
     TaskUpdated(FinalTaskStatusNotification),
     /// The request-owned subscription stream terminated normally.
     Terminal {
@@ -12934,24 +12984,34 @@ pub enum FinalTaskWatchEvent {
 /// request-ID ownership and a single ordered task snapshot.
 #[cfg(feature = "tasks")]
 pub struct FinalTaskWatch<'client, 'handle> {
-    listener: HttpSubscriptionListener<'client>,
+    listener: Option<HttpSubscriptionListener<'client>>,
     handle: &'handle mut FinalTaskHandle,
 }
 
 #[cfg(feature = "tasks")]
 impl FinalTaskWatch<'_, '_> {
-    /// Reads one task watcher event and applies each admitted task snapshot.
+    /// Reads one task watcher event, skipping exact repeated Task snapshots.
     ///
-    /// `None` is returned only after the terminal event was already yielded.
+    /// `None` is returned after a terminal Task snapshot or subscription result
+    /// was yielded, or immediately when the handle was already terminal when
+    /// the watcher opened. A Task terminal closes only this response body;
+    /// buffered later snapshots cannot replace or repeat its outcome.
     pub async fn next_event(
         &mut self,
         cx: &Cx,
     ) -> Result<Option<FinalTaskWatchEvent>, HttpClientError> {
-        let event = self.listener.next_event(cx).await?;
-        match event {
-            None => Ok(None),
-            Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
-                let accepted_task_ids = task_subscription_ids(&accepted_filter)
+        loop {
+            let Some(listener) = self.listener.as_mut() else {
+                return Ok(None);
+            };
+            let event = listener.next_event(cx).await?;
+            match event {
+                None => {
+                    self.listener = None;
+                    return Ok(None);
+                }
+                Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }) => {
+                    let accepted_task_ids = task_subscription_ids(&accepted_filter)
                     .map_err(|_| {
                         HttpClientError::CoreResult(McpError::invalid_request(
                             "final task subscription acknowledgement has invalid task IDs",
@@ -12962,35 +13022,49 @@ impl FinalTaskWatch<'_, '_> {
                             "final task subscription acknowledgement omitted the requested task",
                         ))
                     })?;
-                if accepted_task_ids.len() != 1
-                    || accepted_task_ids.first() != Some(self.handle.task_id())
-                {
+                    if accepted_task_ids.len() != 1
+                        || accepted_task_ids.first() != Some(self.handle.task_id())
+                    {
+                        return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                            "final task subscription acknowledgement did not accept the requested task",
+                        )));
+                    }
+                    return Ok(Some(FinalTaskWatchEvent::Acknowledged { accepted_filter }));
+                }
+                Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
+                    if &notification.params.task.base().task_id != self.handle.task_id() {
+                        return Err(HttpClientError::CoreResult(McpError::invalid_request(
+                            "final task notification does not match this handle",
+                        )));
+                    }
+                    if !self
+                        .handle
+                        .admit_snapshot(notification.params.task.clone())?
+                    {
+                        continue;
+                    }
+                    if self.handle.is_terminal()
+                        && let Some(mut listener) = self.listener.take()
+                    {
+                        listener.cancel();
+                    }
+                    return Ok(Some(FinalTaskWatchEvent::TaskUpdated(notification)));
+                }
+                Some(ModernHttpSubscriptionListenEvent::Terminal {
+                    subscription_id,
+                    result,
+                }) => {
+                    self.listener = None;
+                    return Ok(Some(FinalTaskWatchEvent::Terminal {
+                        subscription_id,
+                        result,
+                    }));
+                }
+                Some(ModernHttpSubscriptionListenEvent::Notification(_)) => {
                     return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                        "final task subscription acknowledgement did not accept the requested task",
+                        "final task watcher received a non-Tasks subscription event",
                     )));
                 }
-                Ok(Some(FinalTaskWatchEvent::Acknowledged { accepted_filter }))
-            }
-            Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
-                if &notification.params.task.base().task_id != self.handle.task_id() {
-                    return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                        "final task notification does not match this handle",
-                    )));
-                }
-                self.handle.task = notification.params.task.clone();
-                Ok(Some(FinalTaskWatchEvent::TaskUpdated(notification)))
-            }
-            Some(ModernHttpSubscriptionListenEvent::Terminal {
-                subscription_id,
-                result,
-            }) => Ok(Some(FinalTaskWatchEvent::Terminal {
-                subscription_id,
-                result,
-            })),
-            Some(ModernHttpSubscriptionListenEvent::Notification(_)) => {
-                Err(HttpClientError::CoreResult(McpError::invalid_request(
-                    "final task watcher received a non-Tasks subscription event",
-                )))
             }
         }
     }
@@ -37462,6 +37536,304 @@ mod tests {
         assert!(matches!(task, FinalTask::Working(_)));
         assert_eq!(task.base().last_updated_at.as_str(), "2026-07-28T12:00:00Z");
         assert_eq!(next_id, 4);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[derive(Clone, Copy, Debug)]
+    enum HttpTaskTerminalEntry {
+        Attach,
+        Poll,
+        Watch,
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn run_public_http_final_task_terminal_preservation(
+        status: &str,
+        entry: HttpTaskTerminalEntry,
+    ) {
+        const NESTED_RESULT: &str = r#"{"content":[],"z-exact":{"huge":123456789012345678901234567890,"ratio":1.2300e+40},"a-last":"retained"}"#;
+        const WORKING: &str = r#"{"taskId":"terminal-task","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null}"#;
+        const INPUT_REQUIRED: &str = r#"{"taskId":"terminal-task","status":"input_required","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"inputRequests":{}}"#;
+        let terminal_fields = match status {
+            "completed" => format!(r#", "result":{NESTED_RESULT}"#),
+            "failed" => {
+                r#", "error":{"code":-32000,"message":"first failure","data":{"retained":true}}"#
+                    .to_owned()
+            }
+            "cancelled" => String::new(),
+            _ => panic!("terminal status fixture"),
+        };
+        let terminal_source = format!(
+            r#"{{"taskId":"terminal-task","status":"{status}","statusMessage":"first terminal","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null{terminal_fields}}}"#
+        );
+        let expected_terminal: FinalTask = serde_json::from_str(&terminal_source).unwrap();
+        let expected_source = serde_json::to_string(&expected_terminal).unwrap();
+        let server_terminal = terminal_source.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().unwrap();
+            let request = read_http_cache_test_request(&mut discovery);
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], SERVER_DISCOVER_METHOD);
+            let result =
+                modern_tasks_discovery_response("terminal-preservation", serde_json::json!({}));
+            write_http_cache_test_response(&mut discovery, "application/json", result.as_bytes());
+
+            let (mut get, _) = listener.accept().unwrap();
+            let request = read_http_cache_test_request(&mut get);
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "tasks/get");
+            assert_eq!(request["params"]["taskId"], "terminal-task");
+            let initial = if matches!(entry, HttpTaskTerminalEntry::Attach) {
+                server_terminal.as_str()
+            } else {
+                WORKING
+            };
+            let response = [
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","#,
+                &initial[1..],
+                "}",
+            ]
+            .concat();
+            write_http_cache_test_response(&mut get, "application/json", response.as_bytes());
+
+            match entry {
+                HttpTaskTerminalEntry::Attach => {}
+                HttpTaskTerminalEntry::Poll => {
+                    let (mut poll, _) = listener.accept().unwrap();
+                    let request = read_http_cache_test_request(&mut poll);
+                    assert_eq!(request["id"], 3);
+                    assert_eq!(request["method"], "tasks/get");
+                    assert_eq!(request["params"]["taskId"], "terminal-task");
+                    let response = [
+                        r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","#,
+                        &server_terminal[1..],
+                        "}",
+                    ]
+                    .concat();
+                    write_http_cache_test_response(
+                        &mut poll,
+                        "application/json",
+                        response.as_bytes(),
+                    );
+                }
+                HttpTaskTerminalEntry::Watch => {
+                    let (mut watch, _) = listener.accept().unwrap();
+                    let request = read_http_cache_test_request(&mut watch);
+                    assert_eq!(request["id"], 3);
+                    assert_eq!(request["method"], "subscriptions/listen");
+                    assert_eq!(
+                        request["params"]["notifications"]["taskIds"],
+                        serde_json::json!(["terminal-task"])
+                    );
+                    let mut events = String::from(
+                        "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3},\"notifications\":{\"taskIds\":[\"terminal-task\"]}}}\n\n",
+                    );
+                    let changed_input = INPUT_REQUIRED.replace(
+                        "\"inputRequests\":{}",
+                        "\"statusMessage\":\"changed input\",\"inputRequests\":{}",
+                    );
+                    let earlier_working = WORKING.replace(
+                        "\"lastUpdatedAt\":\"2026-07-28T12:00:00Z\"",
+                        "\"lastUpdatedAt\":\"2026-07-28T11:59:59Z\"",
+                    );
+                    let later_working = WORKING.replace(
+                        "\"lastUpdatedAt\":\"2026-07-28T12:00:00Z\"",
+                        "\"lastUpdatedAt\":\"2026-07-28T12:00:01Z\"",
+                    );
+                    let conflicting_terminal = server_terminal
+                        .replace("first terminal", "second terminal")
+                        .replace("1.2300e+40", "9.9000e+80");
+                    for snapshot in [
+                        WORKING,
+                        INPUT_REQUIRED,
+                        INPUT_REQUIRED,
+                        changed_input.as_str(),
+                        earlier_working.as_str(),
+                        server_terminal.as_str(),
+                        later_working.as_str(),
+                        conflicting_terminal.as_str(),
+                    ] {
+                        events.push_str("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tasks\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3},");
+                        events.push_str(&snapshot[1..]);
+                        events.push_str("}\n\n");
+                    }
+                    events.push_str("data: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n\n");
+                    write_http_cache_test_response(
+                        &mut watch,
+                        "text/event-stream",
+                        events.as_bytes(),
+                    );
+                }
+            }
+            done_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("terminal handle operations complete without another request");
+            listener.set_nonblocking(true).unwrap();
+            match listener.accept() {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Ok(_) => panic!("terminal poll/watch must not contact the server again"),
+                Err(error) => panic!("terminal request isolation: {error}"),
+            }
+        });
+
+        let cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_millis(250), Duration::from_secs(1))
+                        .unwrap(),
+                )
+                .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let mut handle = http_test_runtime_block_on(
+            client.attach_final_task(&cx, FinalTaskId::parse("terminal-task").unwrap()),
+        )
+        .unwrap();
+        if matches!(entry, HttpTaskTerminalEntry::Poll) {
+            assert!(matches!(handle.task(), FinalTask::Working(_)));
+            let task = http_test_runtime_block_on(handle.poll(&cx, &mut client)).unwrap();
+            assert_eq!(serde_json::to_string(task).unwrap(), expected_source);
+        }
+        if matches!(entry, HttpTaskTerminalEntry::Watch) {
+            let limits = sse::SseLimits::new(1_024, 8_192, 16).unwrap();
+            let mut watch =
+                http_test_runtime_block_on(handle.watch(&cx, &mut client, limits)).unwrap();
+            assert!(matches!(
+                http_test_runtime_block_on(watch.next_event(&cx)).unwrap(),
+                Some(FinalTaskWatchEvent::Acknowledged { .. })
+            ));
+            // The unchanged initial Working notification and exact repeated
+            // InputRequired snapshot are skipped. A same-time changed payload
+            // and an earlier-timestamp Working update remain visible.
+            for expected_message in [None, Some("changed input")] {
+                let Some(FinalTaskWatchEvent::TaskUpdated(notification)) =
+                    http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
+                else {
+                    panic!("changed input snapshot");
+                };
+                assert!(matches!(
+                    notification.params.task,
+                    FinalTask::InputRequired { .. }
+                ));
+                assert_eq!(
+                    notification.params.task.base().status_message.as_deref(),
+                    expected_message
+                );
+                assert_eq!(
+                    notification.params.task.base().last_updated_at.as_str(),
+                    "2026-07-28T12:00:00Z"
+                );
+            }
+            let Some(FinalTaskWatchEvent::TaskUpdated(notification)) =
+                http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
+            else {
+                panic!("changed nonterminal snapshot");
+            };
+            assert!(matches!(notification.params.task, FinalTask::Working(_)));
+            assert_eq!(
+                notification.params.task.base().last_updated_at.as_str(),
+                "2026-07-28T11:59:59Z"
+            );
+            let Some(FinalTaskWatchEvent::TaskUpdated(notification)) =
+                http_test_runtime_block_on(watch.next_event(&cx)).unwrap()
+            else {
+                panic!("first terminal snapshot");
+            };
+            assert_eq!(
+                serde_json::to_string(&notification.params.task).unwrap(),
+                expected_source
+            );
+            assert_eq!(
+                notification
+                    .params
+                    .meta
+                    .as_ref()
+                    .unwrap()
+                    .get(FINAL_SUBSCRIPTION_ID_META_KEY),
+                Some(&serde_json::json!(3))
+            );
+            assert!(
+                watch.listener.is_none(),
+                "terminal delivery releases the live response body immediately"
+            );
+            assert!(
+                http_test_runtime_block_on(watch.next_event(&cx))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                http_test_runtime_block_on(watch.next_event(&cx))
+                    .unwrap()
+                    .is_none()
+            );
+            drop(watch);
+        }
+        let expected_next_id = if matches!(entry, HttpTaskTerminalEntry::Attach) {
+            3
+        } else {
+            4
+        };
+        assert_eq!(client.next_id.load(Ordering::Relaxed), expected_next_id);
+        for _ in 0..2 {
+            let task = http_test_runtime_block_on(handle.poll(&cx, &mut client)).unwrap();
+            let retained = serde_json::to_string(task).unwrap();
+            assert_eq!(
+                retained, expected_source,
+                "terminal data cannot regress or be replaced"
+            );
+            if status == "completed" {
+                assert!(
+                    retained.contains(NESTED_RESULT),
+                    "exact nested result members, order and number lexemes survive"
+                );
+            }
+        }
+        let mut finished_watch = http_test_runtime_block_on(handle.watch(
+            &cx,
+            &mut client,
+            sse::SseLimits::new(1_024, 8_192, 16).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            http_test_runtime_block_on(finished_watch.next_event(&cx))
+                .unwrap()
+                .is_none()
+        );
+        drop(finished_watch);
+        assert_eq!(
+            client.next_id.load(Ordering::Relaxed),
+            expected_next_id,
+            "terminal poll/watch allocate no request IDs"
+        );
+        assert_eq!(
+            serde_json::to_string(handle.task()).unwrap(),
+            expected_source
+        );
+        done_sender.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_terminal_handles_stop_poll_and_watch_requests() {
+        for status in ["completed", "failed", "cancelled"] {
+            for entry in [HttpTaskTerminalEntry::Attach, HttpTaskTerminalEntry::Poll] {
+                run_public_http_final_task_terminal_preservation(status, entry);
+            }
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_deduplicates_exact_snapshots_and_preserves_terminal_source() {
+        for status in ["completed", "failed", "cancelled"] {
+            run_public_http_final_task_terminal_preservation(status, HttpTaskTerminalEntry::Watch);
+        }
     }
 
     #[cfg(all(unix, feature = "tasks"))]
