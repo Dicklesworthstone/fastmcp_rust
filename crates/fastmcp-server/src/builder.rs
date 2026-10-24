@@ -3762,6 +3762,52 @@ mod tests {
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     struct OrdinaryProxyTasksListener {
         accepted: Option<SubscriptionFilter>,
+        control: Option<Arc<OrdinaryProxyTasksListenerControl>>,
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[derive(Default)]
+    struct OrdinaryProxyTasksListenerControl {
+        pending: Mutex<(
+            std::collections::VecDeque<ProxyFinalTaskListenerEvent>,
+            Option<std::task::Waker>,
+        )>,
+        dropped: std::sync::atomic::AtomicBool,
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    impl OrdinaryProxyTasksListenerControl {
+        fn push(&self, event: ProxyFinalTaskListenerEvent) {
+            let wake = {
+                let mut pending = self.pending.lock().expect("listener event queue");
+                pending.0.push_back(event);
+                pending.1.take()
+            };
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+        }
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    type OrdinaryProxyTasksListenerControls =
+        Arc<Mutex<Vec<Arc<OrdinaryProxyTasksListenerControl>>>>;
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    impl Drop for OrdinaryProxyTasksListener {
+        fn drop(&mut self) {
+            if let Some(control) = &self.control {
+                control
+                    .dropped
+                    .store(true, std::sync::atomic::Ordering::Release);
+                control
+                    .pending
+                    .lock()
+                    .expect("listener event queue")
+                    .1
+                    .take();
+            }
+        }
     }
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -3773,8 +3819,42 @@ mod tests {
         ) -> McpResult<ProxyFinalTaskListenerEvent> {
             match self.accepted.take() {
                 Some(accepted) => Ok(ProxyFinalTaskListenerEvent::Acknowledged(accepted)),
+                None if self.control.is_some() => Err(fastmcp_core::McpError::internal_error(
+                    "controlled Tasks listener requires async polling",
+                )),
                 None => Ok(ProxyFinalTaskListenerEvent::Terminal),
             }
+        }
+
+        fn next_async<'a>(
+            &'a mut self,
+            cx: &'a Cx,
+            request_cancellation: &'a fastmcp_core::McpRequestCancellation,
+        ) -> crate::handler::BoxFuture<'a, McpResult<ProxyFinalTaskListenerEvent>> {
+            if self.accepted.is_some() || self.control.is_none() {
+                let result = self.next(cx, request_cancellation);
+                return Box::pin(async move { result });
+            }
+            let control = self.control.as_ref().expect("controlled listener");
+            Box::pin(async move {
+                let mut cancelled = std::pin::pin!(request_cancellation.cancelled());
+                std::future::poll_fn(|context| {
+                    if std::future::Future::poll(cancelled.as_mut(), context).is_ready() {
+                        return std::task::Poll::Ready(Err(
+                            fastmcp_core::McpError::request_cancelled(),
+                        ));
+                    }
+                    let mut pending = control.pending.lock().expect("listener event queue");
+                    match pending.0.pop_front() {
+                        Some(event) => std::task::Poll::Ready(Ok(event)),
+                        None => {
+                            pending.1 = Some(context.waker().clone());
+                            std::task::Poll::Pending
+                        }
+                    }
+                })
+                .await
+            })
         }
     }
 
@@ -3786,6 +3866,7 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         updates: Arc<Mutex<Vec<serde_json::Value>>>,
         task: CreateTaskResult,
+        listener_controls: Option<OrdinaryProxyTasksListenerControls>,
     }
 
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -3900,8 +3981,17 @@ mod tests {
                 .lock()
                 .expect("ordinary proxy task call log is not poisoned")
                 .push("subscriptions/listen".to_owned());
+            let control = self.listener_controls.as_ref().map(|listeners| {
+                let control = Arc::new(OrdinaryProxyTasksListenerControl::default());
+                listeners
+                    .lock()
+                    .expect("upstream listener controls")
+                    .push(Arc::clone(&control));
+                control
+            });
             Ok(Box::new(OrdinaryProxyTasksListener {
                 accepted: Some(notifications),
+                control,
             }))
         }
     }
@@ -5925,6 +6015,7 @@ mod tests {
         fn ordinary_proxy_tasks_client(
             calls: Arc<Mutex<Vec<String>>>,
             updates: Arc<Mutex<Vec<serde_json::Value>>>,
+            listener_controls: Option<OrdinaryProxyTasksListenerControls>,
         ) -> ProxyClient {
             let task = serde_json::from_value(serde_json::json!({
                 "resultType": "task",
@@ -5941,6 +6032,7 @@ mod tests {
                     calls,
                     updates,
                     task,
+                    listener_controls,
                 },
                 ProtocolEra::Modern2026,
             )
@@ -6308,7 +6400,7 @@ mod tests {
         fn public_builder_proxy_relays_modern_tasks_input_required_and_listener() {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let updates = Arc::new(Mutex::new(Vec::new()));
-            let proxy = ordinary_proxy_tasks_client(Arc::clone(&calls), Arc::clone(&updates));
+            let proxy = ordinary_proxy_tasks_client(Arc::clone(&calls), Arc::clone(&updates), None);
             let server = Arc::new(
                 ServerBuilder::new("ordinary-proxy-tasks", "1.0")
                     .auth_provider(TestAuthProvider)
@@ -6564,6 +6656,344 @@ mod tests {
                 ],
                 "public task update, listener, and input_required requests stay on the one admitted modern upstream"
             );
+        }
+
+        #[cfg(feature = "tasks")]
+        fn proxy_listener_task_notification(
+            task_id: &str,
+            revision: u8,
+        ) -> fastmcp_protocol::TaskStatusNotification {
+            let task = serde_json::from_value(serde_json::json!({
+                "taskId": task_id,
+                "status": "input_required",
+                "createdAt": "2026-07-28T12:00:00Z",
+                "lastUpdatedAt": format!("2026-07-28T12:00:{revision:02}Z"),
+                "statusMessage": format!("update-{revision}"),
+                "ttlMs": null,
+                "inputRequests": {},
+            }))
+            .expect("a complete upstream Task snapshot");
+            crate::tasks::final_task_notification(&task)
+        }
+
+        #[cfg(feature = "tasks")]
+        fn task_listener_sender(
+            received: &Arc<Mutex<Vec<JsonRpcRequest>>>,
+        ) -> crate::NotificationSender {
+            let received = Arc::clone(received);
+            Arc::new(move |notification| {
+                received
+                    .lock()
+                    .expect("listener notifications")
+                    .push(notification);
+            })
+        }
+
+        #[cfg(feature = "tasks")]
+        fn assert_task_listener_notifications(
+            received: &Arc<Mutex<Vec<JsonRpcRequest>>>,
+            request_id: i64,
+            task_id: &str,
+            revisions: &[u8],
+        ) {
+            let received = received.lock().expect("listener notifications");
+            assert_eq!(received.len(), 1 + revisions.len());
+            assert_eq!(
+                received[0].method,
+                "notifications/subscriptions/acknowledged"
+            );
+            assert_eq!(
+                received[0].params.as_ref().unwrap()["notifications"]["taskIds"],
+                serde_json::json!([task_id]),
+            );
+            for notification in received.iter() {
+                assert_eq!(
+                    notification.params.as_ref().unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    serde_json::json!(request_id),
+                );
+            }
+            for (notification, revision) in received[1..].iter().zip(revisions) {
+                assert_eq!(
+                    notification.method,
+                    fastmcp_protocol::TASK_STATUS_NOTIFICATION
+                );
+                let task = &notification.params.as_ref().unwrap()["task"];
+                assert_eq!(task["taskId"], serde_json::json!(task_id));
+                assert_eq!(
+                    task["statusMessage"],
+                    serde_json::json!(format!("update-{revision}"))
+                );
+            }
+        }
+
+        #[cfg(feature = "tasks")]
+        fn assert_public_proxy_task_listener_isolation(cancel_first: bool) {
+            use std::future::Future;
+            use std::sync::atomic::Ordering;
+
+            let controls = Arc::new(Mutex::new(Vec::new()));
+            let proxy = ordinary_proxy_tasks_client(
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Mutex::new(Vec::new())),
+                Some(Arc::clone(&controls)),
+            );
+            let server = Arc::new(
+                ServerBuilder::new("overlapping-proxy-task-listeners", "1.0")
+                    .auth_provider(TestAuthProvider)
+                    .proxy(proxy, final_proxy_catalog())
+                    .expect("install the modern Tasks proxy")
+                    .build(),
+            );
+            let cx = Cx::for_testing();
+            let connection = crate::ModernConnection::new();
+            let meta = serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {
+                    "extensions": {"io.modelcontextprotocol/tasks": {}}
+                },
+            });
+            let create_inbound = crate::InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                800,
+                crate::InboundRequestTransport::Memory,
+                &connection,
+            );
+            let created = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                server.protocol_policy,
+                &create_inbound,
+                JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "weather", "arguments": {"outcome": "task"}, "_meta": meta,
+                    })),
+                    800_i64,
+                ),
+                None,
+                None,
+                None,
+                None,
+                fastmcp_core::McpRequestCancellation::new(),
+                None,
+                Arc::new(|_| {}),
+            ))
+            .expect("the owning caller receives a Task result");
+            let created: CreateTaskResult = serde_json::from_value(
+                created
+                    .result
+                    .expect("the public proxy creates a mapped Task"),
+            )
+            .expect("typed mapped Task");
+            let task_id = created.task.base().task_id.as_str();
+            assert_ne!(task_id, "ordinary-proxy-task-71");
+
+            let received_a = Arc::new(Mutex::new(Vec::new()));
+            let received_b = Arc::new(Mutex::new(Vec::new()));
+            let cancellation_a = fastmcp_core::McpRequestCancellation::new();
+            let cancellation_b = fastmcp_core::McpRequestCancellation::new();
+            let inbound_a = crate::InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                801,
+                crate::InboundRequestTransport::Memory,
+                &connection,
+            );
+            let inbound_b = crate::InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                802,
+                crate::InboundRequestTransport::Memory,
+                &connection,
+            );
+            let listen_request = |id| {
+                JsonRpcRequest::new(
+                    "subscriptions/listen",
+                    Some(
+                        serde_json::json!({"notifications": {"taskIds": [task_id]}, "_meta": meta}),
+                    ),
+                    id,
+                )
+            };
+            let mut listen_a = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                server.protocol_policy,
+                &inbound_a,
+                listen_request(801_i64),
+                None,
+                None,
+                None,
+                None,
+                cancellation_a.clone(),
+                None,
+                task_listener_sender(&received_a),
+            ));
+            let mut listen_b = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                server.protocol_policy,
+                &inbound_b,
+                listen_request(802_i64),
+                None,
+                None,
+                None,
+                None,
+                cancellation_b.clone(),
+                None,
+                task_listener_sender(&received_b),
+            ));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(listen_a.as_mut().poll(&mut context).is_pending());
+            assert!(listen_b.as_mut().poll(&mut context).is_pending());
+            let listeners = controls.lock().expect("upstream listener controls").clone();
+            assert_eq!(
+                listeners.len(),
+                2,
+                "each downstream listen owns an upstream listen"
+            );
+            assert_task_listener_notifications(&received_a, 801, task_id, &[]);
+            assert_task_listener_notifications(&received_b, 802, task_id, &[]);
+
+            listeners[0].push(ProxyFinalTaskListenerEvent::Notification(
+                proxy_listener_task_notification("ordinary-proxy-task-71", 1),
+            ));
+            assert!(listen_a.as_mut().poll(&mut context).is_pending());
+            assert_task_listener_notifications(&received_a, 801, task_id, &[1]);
+            assert_task_listener_notifications(&received_b, 802, task_id, &[]);
+
+            listeners[1].push(ProxyFinalTaskListenerEvent::Notification(
+                proxy_listener_task_notification("ordinary-proxy-task-71", 2),
+            ));
+            assert!(listen_b.as_mut().poll(&mut context).is_pending());
+            assert_task_listener_notifications(&received_a, 801, task_id, &[1]);
+            assert_task_listener_notifications(&received_b, 802, task_id, &[2]);
+
+            if cancel_first {
+                cancellation_a.cancel();
+                assert!(
+                    matches!(
+                        listen_a.as_mut().poll(&mut context),
+                        std::task::Poll::Ready(None)
+                    ),
+                    "peer cancellation retires only its owning listen without a terminal response",
+                );
+            }
+            drop(listen_a);
+            assert!(listeners[0].dropped.load(Ordering::Acquire));
+            assert!(!listeners[1].dropped.load(Ordering::Acquire));
+            assert!(!cancellation_b.is_cancel_requested());
+            listeners[0].push(ProxyFinalTaskListenerEvent::Notification(
+                proxy_listener_task_notification("ordinary-proxy-task-71", 3),
+            ));
+            listeners[1].push(ProxyFinalTaskListenerEvent::Notification(
+                proxy_listener_task_notification("ordinary-proxy-task-71", 3),
+            ));
+            assert!(listen_b.as_mut().poll(&mut context).is_pending());
+            assert_task_listener_notifications(&received_a, 801, task_id, &[1]);
+            assert_task_listener_notifications(&received_b, 802, task_id, &[2, 3]);
+            drop(listen_b);
+            assert!(listeners[1].dropped.load(Ordering::Acquire));
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_builder_proxy_task_listener_cancel_isolates_overlapping_streams() {
+            assert_public_proxy_task_listener_isolation(true);
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_builder_proxy_task_listener_drop_isolates_overlapping_streams() {
+            assert_public_proxy_task_listener_isolation(false);
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn public_task_status_broadcast_preserves_matching_listener_lifetimes() {
+            let server = ServerBuilder::new("local-task-broadcast", "1.0").build();
+            let task_id = fastmcp_protocol::FinalTaskId::parse("local-task").unwrap();
+            let mut filter = SubscriptionFilter::default();
+            fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+                .unwrap();
+            let received_a = Arc::new(Mutex::new(Vec::new()));
+            let received_b = Arc::new(Mutex::new(Vec::new()));
+            let first = server
+                .open_subscription_listen(
+                    803_i64.into(),
+                    filter.clone(),
+                    task_listener_sender(&received_a),
+                )
+                .expect("first public embedding lease");
+            let second = server
+                .open_subscription_listen(804_i64.into(), filter, task_listener_sender(&received_b))
+                .expect("second public embedding lease");
+            assert_eq!(
+                server
+                    .publish_task_status_notification(proxy_listener_task_notification(
+                        task_id.as_str(),
+                        1
+                    ),)
+                    .unwrap(),
+                2
+            );
+            assert_task_listener_notifications(&received_a, 803, task_id.as_str(), &[1]);
+            assert_task_listener_notifications(&received_b, 804, task_id.as_str(), &[1]);
+            drop(first);
+            assert_eq!(
+                server
+                    .publish_task_status_notification(proxy_listener_task_notification(
+                        task_id.as_str(),
+                        2
+                    ),)
+                    .unwrap(),
+                1
+            );
+            assert_task_listener_notifications(&received_a, 803, task_id.as_str(), &[1]);
+            assert_task_listener_notifications(&received_b, 804, task_id.as_str(), &[1, 2]);
+            drop(second);
+            assert_eq!(
+                server
+                    .publish_task_status_notification(proxy_listener_task_notification(
+                        task_id.as_str(),
+                        3
+                    ),)
+                    .unwrap(),
+                0
+            );
+        }
+
+        #[cfg(feature = "tasks")]
+        #[test]
+        fn proxy_task_listener_selected_publication_rejects_stale_lease_and_wrong_task() {
+            let server = ServerBuilder::new("selected-task-lease", "1.0").build();
+            let task_id = fastmcp_protocol::FinalTaskId::parse("selected-task").unwrap();
+            let mut filter = SubscriptionFilter::default();
+            fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()])
+                .unwrap();
+            let previous = server
+                .open_subscription_listen(805_i64.into(), filter.clone(), Arc::new(|_| {}))
+                .expect("original embedding lease");
+            let key = previous.lease().key;
+            let old_election = Arc::clone(&previous.lease().election);
+            drop(previous);
+            server.final_subscriptions.inner.lock().unwrap().next_key = key;
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let replacement = server
+                .open_subscription_listen(806_i64.into(), filter, task_listener_sender(&received))
+                .expect("replacement embedding lease");
+            assert_eq!(replacement.lease().key, key);
+            let notification = proxy_listener_task_notification(task_id.as_str(), 1);
+            assert_eq!(
+                server
+                    .final_subscriptions
+                    .publish_selected_task(notification.clone(), None, Some((key, &old_election)),)
+                    .unwrap(),
+                0,
+                "a reused key does not grant the old lease event authority"
+            );
+            assert_eq!(
+                replacement
+                    .lease()
+                    .publish_task(proxy_listener_task_notification("unrequested-task", 1),)
+                    .unwrap(),
+                0
+            );
+            assert_task_listener_notifications(&received, 806, task_id.as_str(), &[]);
+            assert_eq!(replacement.lease().publish_task(notification).unwrap(), 1);
+            assert_task_listener_notifications(&received, 806, task_id.as_str(), &[1]);
         }
 
         #[test]
@@ -8359,7 +8789,7 @@ mod tests {
             let server = ServerBuilder::new("prefixed-proxy-tasks", "1.0")
                 .as_proxy_typed(
                     "ext",
-                    ordinary_proxy_tasks_client(calls, updates),
+                    ordinary_proxy_tasks_client(calls, updates, None),
                     final_completion_proxy_catalog(),
                 )
                 .expect("as_proxy_typed admits a modern catalog with a Tasks-capable route")

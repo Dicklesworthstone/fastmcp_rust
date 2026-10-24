@@ -5141,6 +5141,15 @@ impl FinalSubscriptionLease {
             .publish_selected(notification, Some((self.key, &self.election)))
     }
 
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    fn publish_task(&self, notification: FinalTaskStatusNotification) -> McpResult<usize> {
+        // Proxy listeners authorize their task mappings before producing an
+        // event. Their registry entries have no local-runtime principal, and
+        // this event belongs only to the listener that performed that check.
+        self.registry
+            .publish_selected_task(notification, None, Some((self.key, &self.election)))
+    }
+
     fn has_graceful_completion(&self) -> bool {
         self.election.graceful_completion.load(Ordering::Acquire)
     }
@@ -5658,6 +5667,16 @@ impl FinalSubscriptionRegistry {
         notification: FinalTaskStatusNotification,
         principal: Option<Sha256Digest>,
     ) -> McpResult<usize> {
+        self.publish_selected_task(notification, principal, None)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn publish_selected_task(
+        &self,
+        notification: FinalTaskStatusNotification,
+        principal: Option<Sha256Digest>,
+        target_subscription: Option<(usize, &Arc<FinalSubscriptionElection>)>,
+    ) -> McpResult<usize> {
         if final_subscription_event_bytes(&notification).is_none() {
             return Err(McpError::new(
                 McpErrorCode::Custom(RESOURCE_EXHAUSTED_ERROR_CODE),
@@ -5672,9 +5691,13 @@ impl FinalSubscriptionRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .entries
-                .values()
-                .filter(|entry| {
-                    entry.task_principal == principal
+                .iter()
+                .filter_map(|(key, entry)| {
+                    let selected = target_subscription.is_none_or(|(target_key, election)| {
+                        *key == target_key && Arc::ptr_eq(&entry.election, election)
+                    });
+                    (selected
+                        && entry.task_principal == principal
                         && task_subscription_ids(&entry.accepted_filter)
                             .ok()
                             .flatten()
@@ -5682,9 +5705,9 @@ impl FinalSubscriptionRegistry {
                                 task_ids
                                     .iter()
                                     .any(|candidate| candidate.as_str() == task_id)
-                            })
+                            }))
+                    .then(|| entry.clone())
                 })
-                .cloned()
                 .collect::<Vec<_>>()
         };
 
@@ -14878,7 +14901,7 @@ impl Server {
                     .await
                 {
                     Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
-                        self.final_subscriptions.publish_task(notification)?;
+                        lease.publish_task(notification)?;
                     }
                     Ok(ProxyFinalTaskListenerEvent::Terminal) => {
                         return self.final_subscription_complete_result(&subscription_id);
