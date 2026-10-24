@@ -6080,7 +6080,10 @@ where
                 }
                 Err(TransportError::Cancelled)
                     if cx.checkpoint().is_err()
-                        || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+                        || cx
+                            .budget()
+                            .deadline
+                            .is_some_and(|deadline| cx.now() >= deadline)
                         || cancellation
                             .is_some_and(McpRequestCancellation::is_cancel_requested) =>
                 {
@@ -8414,7 +8417,13 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_core_verb_with_options(cx, None, Some(deadline), "resources/read", parameters)
+                .request_core_verb_with_options(
+                    cx,
+                    None,
+                    Some(deadline),
+                    "resources/read",
+                    parameters,
+                )
                 .await?;
             check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("resources/read", &result)
@@ -17362,6 +17371,17 @@ impl Client {
         cx: &Cx,
         cancellation: Option<&McpRequestCancellation>,
     ) -> McpResult<()> {
+        self.ensure_initialized_with_cancellation_until(cx, cancellation, None)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn ensure_initialized_with_cancellation_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<()> {
         if let Some(error) = self.responses.terminal_error() {
             return Err(error);
         }
@@ -17376,12 +17396,22 @@ impl Client {
         if self.initialized.load(Ordering::SeqCst) {
             return self.ensure_initialized();
         }
+        // An uncommitted timeout leaves the connection reusable. A retained
+        // handshake must instead run through its normal terminal cleanup.
+        if self.pending_initialization.is_none()
+            && operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(request_timeout_error(RequestTimeoutSource::Absolute));
+        }
         // Keep the cold handshake/cleanup future out of every ordinary RPC's
         // concrete type. Deep proxy/CLI consumers otherwise exceed the Send
         // trait solver's recursion bound. Initialized requests allocate nothing.
         let initialization: Pin<Box<dyn Future<Output = McpResult<()>> + Send + '_>> =
             Box::pin(async move {
-                match self.initialize_yielding(cx, false, cancellation).await {
+                match self
+                    .initialize_yielding_until(cx, false, cancellation, operation_deadline)
+                    .await
+                {
                     Ok(None) => Ok(()),
                     Ok(Some(_)) => unreachable!("retained clients cannot select a fallback child"),
                     Err(error) => {
@@ -17407,6 +17437,18 @@ impl Client {
         auto_probe: bool,
         cancellation: Option<&McpRequestCancellation>,
     ) -> McpResult<Option<AutoStdioFallbackSignal>> {
+        self.initialize_yielding_until(cx, auto_probe, cancellation, None)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn initialize_yielding_until(
+        &mut self,
+        cx: &Cx,
+        auto_probe: bool,
+        cancellation: Option<&McpRequestCancellation>,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<Option<AutoStdioFallbackSignal>> {
         if auto_probe && self.session.protocol_plan().policy() != ProtocolPolicy::ModernOnly {
             return Err(McpError::internal_error(
                 "Auto stdio probe requires a modern-only client session",
@@ -17420,7 +17462,13 @@ impl Client {
                 return Err(McpError::request_cancelled());
             }
             if self.pending_initialization.is_none() {
-                self.pending_initialization = Some(self.start_initialization(cx, None)?);
+                self.pending_initialization =
+                    Some(self.start_initialization(cx, operation_deadline)?);
+            }
+            if let (Some(pending), Some(deadline)) =
+                (self.pending_initialization.as_mut(), operation_deadline)
+            {
+                pending.deadlines.cap_absolute_at(deadline);
             }
             if let std::task::Poll::Ready(result) =
                 self.poll_pending_initialization(cx, auto_probe, true)?
@@ -18675,10 +18723,19 @@ impl Client {
     /// On Unix, partial frames survive a polling slice; the executor's real
     /// request deadlines still bound incomplete-frame reads.
     pub fn drive_yielding_stdio_slice(&mut self) -> McpResult<()> {
+        self.drive_yielding_stdio_slice_until(None)
+    }
+
+    fn drive_yielding_stdio_slice_until(
+        &mut self,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<()> {
         let connection_cx = self.cx.clone();
         let receive_deadline = Instant::now()
             .checked_add(REVERSE_CALLBACK_POLL_SLICE)
             .unwrap_or_else(Instant::now);
+        let receive_deadline =
+            operation_deadline.map_or(receive_deadline, |deadline| deadline.min(receive_deadline));
         self.drive_multiplexed_stdio_until(&connection_cx, Some(receive_deadline))
     }
 
@@ -20787,6 +20844,274 @@ impl Client {
         )
     }
 
+    /// Collects exact pages through the shared executor without monopolizing
+    /// the caller runtime. Rebuilds retain the original cumulative budget.
+    #[cfg(unix)]
+    async fn collect_stdio_catalog_with_cx_and_budget(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        result_set: FinalCacheResultSet,
+        initial_cursor: Option<String>,
+        semantic_parameters: serde_json::Value,
+        mut budget: PaginationBudget,
+    ) -> McpResult<CollectedCatalog> {
+        if initial_cursor.is_some() {
+            return Err(McpError::invalid_params(
+                "Complete catalog collection requires an absent initial cursor",
+            ));
+        }
+        let method = match &result_set {
+            FinalCacheResultSet::Tools => "tools/list",
+            FinalCacheResultSet::Resources => "resources/list",
+            FinalCacheResultSet::ResourceTemplates => "resources/templates/list",
+            FinalCacheResultSet::Prompts => "prompts/list",
+            FinalCacheResultSet::ServerDiscovery | FinalCacheResultSet::Resource(_) => {
+                return Err(McpError::invalid_params(
+                    "Automatic pagination requires a catalog result set",
+                ));
+            }
+        };
+        // Translate each context's clock once. Discovery, all pages and any
+        // rebuild then share this deadline instead of restarting per request.
+        for owner in [cx, &self.cx] {
+            let wall_now = Instant::now();
+            if let Some(deadline) = owner.budget().deadline {
+                let remaining = Duration::from_nanos(deadline.duration_since(owner.now()))
+                    .min(budget.deadline.saturating_duration_since(wall_now));
+                budget.deadline = budget.deadline.min(wall_now + remaining);
+            }
+        }
+        if self.pending_initialization.is_none() {
+            if cancellation.is_cancel_requested()
+                || cx.checkpoint().is_err()
+                || self.cx.checkpoint().is_err()
+            {
+                return Err(McpError::request_cancelled());
+            }
+            budget.check_deadline()?;
+        }
+        self.ensure_initialized_with_cancellation_until(
+            cx,
+            Some(cancellation),
+            Some(budget.deadline),
+        )
+        .await?;
+
+        let mut rebuilds = 0;
+        'rebuild: loop {
+            let mut pages = Vec::new();
+            let mut item_count = 0;
+            let mut cursor: Option<String> = None;
+            let mut baseline = None;
+            loop {
+                if cancellation.is_cancel_requested()
+                    || cx.checkpoint().is_err()
+                    || self.cx.checkpoint().is_err()
+                {
+                    return Err(McpError::request_cancelled());
+                }
+                budget.begin_page()?;
+                let page = self
+                    .request_paginated_catalog_page_with_cx(
+                        cx,
+                        cancellation,
+                        result_set.clone(),
+                        &semantic_parameters,
+                        cursor.as_deref(),
+                        &budget,
+                    )
+                    .await;
+                let cancelled = cancellation.is_cancel_requested()
+                    || cx.checkpoint().is_err()
+                    || self.cx.checkpoint().is_err();
+                let result = match page {
+                    Err(error)
+                        if cursor.is_some()
+                            && error.code == McpErrorCode::InvalidParams
+                            && rebuilds == 0
+                            && !cancelled =>
+                    {
+                        self.final_result_cache.invalidate_result_set(&result_set);
+                        rebuilds += 1;
+                        continue 'rebuild;
+                    }
+                    other => other?,
+                };
+                // A page failure may carry a failed cancellation control or
+                // connection cleanup outcome. Preserve it before applying a
+                // caller cancellation to an otherwise successful page.
+                if cancelled {
+                    return Err(McpError::request_cancelled());
+                }
+                let (page_items, next_cursor) = catalog_page(method, &result)?;
+                budget.account_core_page(&result, page_items)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
+                let cached_prefix = budget.pages == 1
+                    && next_cursor.is_some()
+                    && self
+                        .last_final_cache_page
+                        .as_ref()
+                        .is_some_and(|state| state.miss.is_none());
+                let changed = self.final_list_restart_needed(&result_set, &mut baseline);
+                if cached_prefix || changed {
+                    self.final_result_cache.invalidate_result_set(&result_set);
+                    if rebuilds != 0 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ));
+                    }
+                    rebuilds += 1;
+                    continue 'rebuild;
+                }
+                // Accounting includes discarded rebuild pages, while only
+                // the consistent traversal becomes the returned collection.
+                item_count += page_items;
+                pages.push(result);
+                cursor = next_cursor;
+                budget.check_deadline()?;
+                if cursor.is_none() {
+                    return Ok(CollectedCatalog {
+                        method,
+                        pages,
+                        item_count,
+                    });
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn request_paginated_catalog_page_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        result_set: FinalCacheResultSet,
+        semantic_parameters: &serde_json::Value,
+        cursor: Option<&str>,
+        budget: &PaginationBudget,
+    ) -> McpResult<CoreResult> {
+        budget.check_deadline()?;
+        self.last_final_cache_page = None;
+        let method = match &result_set {
+            FinalCacheResultSet::Tools => "tools/list",
+            FinalCacheResultSet::Resources => "resources/list",
+            FinalCacheResultSet::ResourceTemplates => "resources/templates/list",
+            FinalCacheResultSet::Prompts => "prompts/list",
+            FinalCacheResultSet::ServerDiscovery | FinalCacheResultSet::Resource(_) => {
+                return Err(McpError::invalid_params(
+                    "Automatic pagination requires a catalog result set",
+                ));
+            }
+        };
+        let mut parameters = semantic_parameters.clone();
+        if let Some(cursor) = cursor {
+            parameters["cursor"] = serde_json::json!(cursor);
+        }
+        if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return self
+                .request_core_with_cx_until(
+                    cx,
+                    cancellation,
+                    method,
+                    parameters,
+                    Some(budget.deadline),
+                )
+                .await;
+        }
+
+        self.drain_final_cache_invalidations_with_cx(cx, cancellation, budget)
+            .await?;
+        let key = self.final_cache_key(method, semantic_parameters.clone(), cursor, result_set)?;
+        let cursor_origin = self.final_result_cache.capture_cursor_origin(&key);
+        // Only a first page can use a cached entry. Present opaque cursors
+        // always cause a new request, even if their bytes repeat.
+        let lookup = (budget.pages == 1)
+            .then(|| self.final_result_cache.lookup_page_at(&key, Instant::now()));
+        let miss = match lookup {
+            Some(FinalCachePageLookup::Fresh(page)) => {
+                self.last_final_cache_page = Some(FinalCachePageState {
+                    generation: page.generation,
+                    scope: page.scope,
+                    miss: None,
+                });
+                return Ok(page.result);
+            }
+            Some(FinalCachePageLookup::Miss(miss)) => Some(miss),
+            None => None,
+        };
+        let generation = self.final_result_cache.begin_fetch(key.result_set());
+        let result = match self
+            .request_core_with_cx_until(cx, cancellation, method, parameters, Some(budget.deadline))
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if error.code == McpErrorCode::InvalidParams
+                    && let Some(origin) = cursor_origin
+                {
+                    self.final_result_cache.invalidate_rejected_cursor(origin);
+                }
+                return Err(error);
+            }
+        };
+        budget.check_deadline()?;
+        if cancellation.is_cancel_requested()
+            || cx.checkpoint().is_err()
+            || self.cx.checkpoint().is_err()
+        {
+            return Err(McpError::request_cancelled());
+        }
+        let scope = final_cache_hints(&result).map(|(_, scope)| scope);
+        let receipt = self
+            .last_core_result_receipt
+            .take()
+            .unwrap_or_else(Instant::now);
+        let page_result_set = key.result_set().clone();
+        let _ =
+            self.final_result_cache
+                .insert_if_current_at(key, generation, result.clone(), receipt);
+        let current_generation = self.final_result_cache.begin_fetch(&page_result_set);
+        if let Some(scope) = scope {
+            self.last_final_cache_page = Some(FinalCachePageState {
+                generation: current_generation,
+                scope,
+                miss: if generation != current_generation {
+                    Some(FinalCacheMiss::Invalidated)
+                } else {
+                    miss
+                },
+            });
+        }
+        Ok(result)
+    }
+
+    #[cfg(unix)]
+    async fn drain_final_cache_invalidations_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        budget: &PaginationBudget,
+    ) -> McpResult<()> {
+        let deadline =
+            (Instant::now() + FINAL_CACHE_NOTIFICATION_DRAIN_WINDOW).min(budget.deadline);
+        let connection_cx = self.cx.clone();
+        loop {
+            if cancellation.is_cancel_requested()
+                || cx.checkpoint().is_err()
+                || connection_cx.checkpoint().is_err()
+            {
+                return Err(McpError::request_cancelled());
+            }
+            budget.check_deadline()?;
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            self.drive_multiplexed_stdio_until(&connection_cx, Some(deadline))?;
+            asupersync::runtime::yield_now().await;
+        }
+    }
+
     /// Routes one frame admitted by the selected connection reader.
     ///
     /// Matching request-owned response and progress traffic goes to the
@@ -22212,6 +22537,103 @@ impl Client {
             params.exclude_tags,
             PaginationBudget::for_request(self.timeout_policy),
         )
+    }
+
+    /// Collects every tools page while yielding the caller's Unix runtime.
+    ///
+    /// Preserves the exact typed pages, opaque cursors, cumulative limits and
+    /// one permitted cache rebuild described by [`Self::list_all_tools`]. One
+    /// absolute deadline covers fresh or retained initialization, every page
+    /// and any rebuild; an earlier caller or connection deadline wins. The
+    /// shared ingress executor continues routing sibling requests and reverse
+    /// callbacks during the collection.
+    ///
+    /// Explicit cancellation retires the active page. Dropping the future
+    /// queues its request cancellation for the next client drive, send or
+    /// close. A dropped discovery future retains the committed handshake;
+    /// explicit cancellation of that handshake ends the connection. Pipe
+    /// writes remain bounded synchronous operations. Errors return no partial
+    /// collection, and the initial cursor must be absent.
+    #[cfg(unix)]
+    pub async fn list_all_tools_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> McpResult<CollectedCatalog> {
+        let semantic_parameters = list_tools_semantic_parameters(&params);
+        self.collect_stdio_catalog_with_cx_and_budget(
+            cx,
+            cancellation,
+            FinalCacheResultSet::Tools,
+            params.cursor,
+            semantic_parameters,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects resource pages with the cooperative execution, exact result
+    /// preservation and bounds of [`Self::list_all_tools_with_cx`].
+    #[cfg(unix)]
+    pub async fn list_all_resources_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> McpResult<CollectedCatalog> {
+        let semantic_parameters = list_resources_semantic_parameters(&params);
+        self.collect_stdio_catalog_with_cx_and_budget(
+            cx,
+            cancellation,
+            FinalCacheResultSet::Resources,
+            params.cursor,
+            semantic_parameters,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects resource-template pages with the cooperative execution, exact
+    /// result preservation and bounds of [`Self::list_all_tools_with_cx`].
+    #[cfg(unix)]
+    pub async fn list_all_resource_templates_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CollectedCatalog> {
+        let semantic_parameters = list_resource_templates_semantic_parameters(&params);
+        self.collect_stdio_catalog_with_cx_and_budget(
+            cx,
+            cancellation,
+            FinalCacheResultSet::ResourceTemplates,
+            params.cursor,
+            semantic_parameters,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects prompt pages with the cooperative execution, exact result
+    /// preservation and bounds of [`Self::list_all_tools_with_cx`].
+    #[cfg(unix)]
+    pub async fn list_all_prompts_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> McpResult<CollectedCatalog> {
+        let semantic_parameters = list_prompts_semantic_parameters(&params);
+        self.collect_stdio_catalog_with_cx_and_budget(
+            cx,
+            cancellation,
+            FinalCacheResultSet::Prompts,
+            params.cursor,
+            semantic_parameters,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+        .await
     }
 
     /// Lists available tools.
@@ -25235,6 +25657,19 @@ impl Client {
         method: &str,
         parameters: serde_json::Value,
     ) -> McpResult<CoreResult> {
+        self.request_core_with_cx_until(cx, cancellation, method, parameters, None)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn request_core_with_cx_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<CoreResult> {
         if (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
             && self.pending_initialization.is_none()
         {
@@ -25255,7 +25690,7 @@ impl Client {
                 "Method is not an ordinary core catalog, content or completion request",
             ));
         }
-        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+        self.ensure_initialized_with_cancellation_until(cx, Some(cancellation), operation_deadline)
             .await?;
         let parameters = self.prepare_request_parameters(parameters)?;
         #[cfg(feature = "tasks")]
@@ -25272,7 +25707,13 @@ impl Client {
         })?;
         self.last_core_result_receipt = None;
         let received = self
-            .send_yielding_prepared_request(cx, cancellation, method, parameters)
+            .send_yielding_prepared_request_until(
+                cx,
+                cancellation,
+                method,
+                parameters,
+                operation_deadline,
+            )
             .await?;
         let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
             &request,
@@ -25320,30 +25761,52 @@ impl Client {
         method: &str,
         parameters: Option<serde_json::Value>,
     ) -> McpResult<ReceivedPreparedResult> {
+        self.send_yielding_prepared_request_until(cx, cancellation, method, parameters, None)
+            .await
+    }
+
+    #[cfg(unix)]
+    async fn send_yielding_prepared_request_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Option<serde_json::Value>,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<ReceivedPreparedResult> {
         let connection_cx = self.cx.clone();
         let executor = self.multiplexed_stdio_executor()?;
         executor.service(&connection_cx)?;
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(request_timeout_error(RequestTimeoutSource::Absolute));
+        }
         // Parameters are already typed and extension-admitted. Preparing them
         // again here would re-advertise Tasks on an ordinary tools/call.
         let mut execution = executor.execute(&connection_cx, method, parameters)?;
         loop {
-            let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
+            let stopped = if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                Some(McpError::request_cancelled())
+            } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                Some(request_timeout_error(RequestTimeoutSource::Absolute))
+            } else {
+                None
+            };
             let mut terminal = executor
                 .executor
                 .try_take_response_with_raw_result_and_stream(&mut execution.execution)
                 .map_err(|error| {
-                    if cancelled {
-                        McpError::request_cancelled()
+                    if let Some(stopped) = &stopped {
+                        stopped.clone()
                     } else if error.code == McpErrorCode::InvalidRequest {
                         self.terminate_connection(error)
                     } else {
                         error
                     }
                 })?;
-            if cancelled {
+            if let Some(error) = stopped {
                 if terminal.is_none() {
                     self.cancel_multiplexed_request_with_connection_cx(
                         &connection_cx,
@@ -25351,7 +25814,7 @@ impl Client {
                         &mut execution,
                     )?;
                 }
-                return Err(McpError::request_cancelled());
+                return Err(error);
             }
             let notifications = match &mut terminal {
                 Some((_, _, stream)) => std::mem::take(stream),
@@ -25374,7 +25837,7 @@ impl Client {
                     receipt: Instant::now(),
                 });
             }
-            self.drive_yielding_stdio_slice()?;
+            self.drive_yielding_stdio_slice_until(operation_deadline)?;
             asupersync::runtime::yield_now().await;
         }
     }
@@ -31646,7 +32109,10 @@ mod tests {
                 )
                 .await
                 .expect("fresh legacy fallback retains only exact-legacy callback dispatch");
-            assert!(matches!(result, CoreResult::Legacy(LegacyCoreResult::Completion(_))));
+            assert!(matches!(
+                result,
+                CoreResult::Legacy(LegacyCoreResult::Completion(_))
+            ));
             assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
             assert_eq!(modern_calls.load(Ordering::SeqCst), 0);
             assert_eq!(
@@ -46345,6 +46811,479 @@ while IFS= read -r unexpected; do exit 28; done
     }
 
     #[cfg(unix)]
+    async fn stdio_async_catalog_test_collect(
+        client: &mut Client,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        cursor: Option<String>,
+    ) -> McpResult<CollectedCatalog> {
+        let include_tags = Some(vec!["visible".to_owned()]);
+        let exclude_tags = Some(vec!["hidden".to_owned()]);
+        match method {
+            "tools/list" => {
+                client
+                    .list_all_tools_with_cx(
+                        cx,
+                        cancellation,
+                        ListToolsParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "resources/list" => {
+                client
+                    .list_all_resources_with_cx(
+                        cx,
+                        cancellation,
+                        ListResourcesParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "resources/templates/list" => {
+                client
+                    .list_all_resource_templates_with_cx(
+                        cx,
+                        cancellation,
+                        ListResourceTemplatesParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            "prompts/list" => {
+                client
+                    .list_all_prompts_with_cx(
+                        cx,
+                        cancellation,
+                        ListPromptsParams {
+                            cursor,
+                            include_tags,
+                            exclude_tags,
+                        },
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalogs_preserve_pages_and_allow_same_worker_sibling() {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
+            let mut script = stdio_catalog_test_discovery_script();
+            for index in 0..3 {
+                let id = if index == 0 { 2 } else { index + 3 };
+                script.push_str(&format!(
+                    "IFS= read -r request || exit 20\n\
+                     case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 21 ;; esac\n\
+                     case \"$request\" in *'\"id\":{id},'*|*'\"id\":{id}}}'*) ;; *) exit 22 ;; esac\n\
+                     case \"$request\" in *'\"includeTags\":[\"visible\"]'*) ;; *) exit 23 ;; esac\n\
+                     case \"$request\" in *'\"excludeTags\":[\"hidden\"]'*) ;; *) exit 24 ;; esac\n\
+                     case \"$request\" in *'\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"typed-catalog-client\",\"version\":\"7.2\"}}'*) ;; *) exit 25 ;; esac\n"
+                ));
+                if index == 0 {
+                    script.push_str(
+                        r#"case "$request" in *'"cursor":'*) exit 26 ;; esac
+IFS= read -r sibling || exit 27
+case "$sibling" in *'"method":"prompts/list"'*) ;; *) exit 28 ;; esac
+case "$sibling" in *'"id":3,'*|*'"id":3}'*) ;; *) exit 29 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","prompts":[{"name":"heartbeat"}],"ttlMs":0,"cacheScope":"private"}}'
+"#,
+                    );
+                } else {
+                    script.push_str(
+                        "case \"$request\" in *'\"cursor\":\"\"'*) ;; *) exit 30 ;; esac\n",
+                    );
+                }
+                let mut result = http_catalog_test_result(
+                    method,
+                    &format!("page-{index}"),
+                    (index < 2).then_some(""),
+                    60_000,
+                    "private",
+                )
+                .to_string();
+                result.pop();
+                result.push_str(
+                    ",\"vendorExact\":922337203685477580812345678901234567890,\"vendorDecimal\":1.2300e+42}",
+                );
+                script.push_str(&format!(
+                    "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}'\n"
+                ));
+            }
+            script.push_str("while IFS= read -r unexpected; do exit 31; done\n");
+            let client = connect_stdio_catalog_test_client(&script);
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let root = Cx::current().unwrap();
+                let mut work = root
+                    .spawn(move |cx| async move {
+                        let mut client = client;
+                        let cancellation = McpRequestCancellation::new();
+                        for cursor in ["", "opaque"] {
+                            let error = stdio_async_catalog_test_collect(
+                                &mut client,
+                                &cx,
+                                &cancellation,
+                                method,
+                                Some(cursor.to_owned()),
+                            )
+                            .await
+                            .unwrap_err();
+                            assert_eq!(error.code, McpErrorCode::InvalidParams);
+                            assert_eq!(client.peek_next_request_id(), 2);
+                        }
+                        let executor = client.multiplexed_stdio_executor().unwrap();
+                        let sibling_executor = executor.clone();
+                        let next_id = Arc::clone(&client.next_id);
+                        let worker = std::thread::current().id();
+                        let mut sibling = cx
+                            .spawn(move |sibling_cx| async move {
+                                let deadline = Instant::now() + Duration::from_secs(2);
+                                while next_id.load(Ordering::SeqCst) < 3 {
+                                    assert!(Instant::now() < deadline);
+                                    asupersync::runtime::yield_now().await;
+                                }
+                                assert_eq!(std::thread::current().id(), worker);
+                                sibling_executor
+                                    .execute(
+                                        &sibling_cx,
+                                        "prompts/list",
+                                        Some(serde_json::json!({})),
+                                    )
+                                    .unwrap()
+                            })
+                            .unwrap();
+                        // The real peer withholds page one until the sibling
+                        // runs on this worker and commits its own request.
+                        let collection = stdio_async_catalog_test_collect(
+                            &mut client,
+                            &cx,
+                            &cancellation,
+                            method,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(collection.method(), method);
+                        assert_eq!(collection.item_count(), 3);
+                        assert_eq!(collection.pages().len(), 3);
+                        for (index, page) in collection.pages().iter().enumerate() {
+                            assert!(matches!(page, CoreResult::Final(_)));
+                            let encoded = page.encode().unwrap();
+                            assert!(encoded.contains(&format!("page-{index}")));
+                            assert!(encoded.contains("\"ttlMs\":60000"));
+                            assert!(encoded.contains("\"cacheScope\":\"private\""));
+                            assert!(encoded.contains(
+                                "\"vendorExact\":922337203685477580812345678901234567890"
+                            ));
+                            assert!(encoded.contains("\"vendorDecimal\":1.2300e+42"));
+                        }
+                        let mut sibling_request = sibling.join(&cx).await.unwrap();
+                        let response = executor
+                            .try_take_response(&mut sibling_request)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(response.result.unwrap()["prompts"][0]["name"], "heartbeat");
+                        assert!(executor.executor.pending_records().is_empty());
+                        assert_eq!(client.peek_next_request_id(), 6);
+                        client.close_with_cx(&cx).await.unwrap();
+                    })
+                    .unwrap();
+                work.join(&root).await.unwrap();
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_rebuilds_cached_prefix_without_mixing_pages() {
+        let script = stdio_catalog_test_script(&[
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "stale", Some("expired"), 60_000, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "fresh-first", Some("fresh"), 0, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                Some("fresh"),
+                http_catalog_test_result("tools/list", "fresh-last", None, 0, "private")
+                    .to_string(),
+            ),
+        ]);
+        let mut client = connect_stdio_catalog_test_client(&script);
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: Some(vec!["visible".to_owned()]),
+            exclude_tags: Some(vec!["hidden".to_owned()]),
+        };
+        client.list_tools_typed_with_params(params.clone()).unwrap();
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let collection =
+            http_test_runtime_block_on(client.list_all_tools_with_cx(&cx, &cancellation, params))
+                .unwrap();
+        assert_eq!(collection.item_count(), 2);
+        assert_eq!(collection.pages().len(), 2);
+        for (page, expected) in collection.pages().iter().zip(["fresh-first", "fresh-last"]) {
+            let encoded = page.encode().unwrap();
+            assert!(encoded.contains(expected));
+            assert!(!encoded.contains("stale"));
+        }
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_rejects_second_scope_drift() {
+        let script = stdio_catalog_test_script(&[
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "first", Some("a"), 0, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                Some("a"),
+                http_catalog_test_result("tools/list", "changed", Some("b"), 0, "public")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "rebuilt", Some("c"), 0, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                Some("c"),
+                http_catalog_test_result("tools/list", "changed-again", None, 0, "public")
+                    .to_string(),
+            ),
+        ]);
+        let mut client = connect_stdio_catalog_test_client(&script);
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let error = http_test_runtime_block_on(stdio_async_catalog_test_collect(
+            &mut client,
+            &cx,
+            &cancellation,
+            "tools/list",
+            None,
+        ))
+        .unwrap_err();
+        assert_eq!(error.message, FINAL_CACHE_LIST_RESTART_LIMIT_ERROR);
+        assert_eq!(client.peek_next_request_id(), 6);
+        assert!(!client.transport_is_closed());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_rebuild_keeps_cumulative_page_bound() {
+        let script = stdio_catalog_test_script(&[
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "first", Some("a"), 0, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                Some("a"),
+                http_catalog_test_result("tools/list", "changed", Some("b"), 0, "public")
+                    .to_string(),
+            ),
+        ]);
+        let mut client = connect_stdio_catalog_test_client(&script);
+        let cx = Cx::for_request();
+        let cancellation = McpRequestCancellation::new();
+        let budget = PaginationBudget::with_limits(PaginationLimits {
+            pages: 2,
+            ..PaginationLimits::DEFAULT
+        });
+        let error = http_test_runtime_block_on(client.collect_stdio_catalog_with_cx_and_budget(
+            &cx,
+            &cancellation,
+            FinalCacheResultSet::Tools,
+            None,
+            serde_json::json!({"includeTags":["visible"], "excludeTags":["hidden"]}),
+            budget,
+        ))
+        .unwrap_err();
+        assert_eq!(error.message, PAGINATION_PAGE_LIMIT_ERROR);
+        assert_eq!(client.peek_next_request_id(), 4);
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn stdio_async_catalog_cancellation_probe(drop_future: bool, fail_control: bool) {
+        let mut script = stdio_catalog_test_discovery_script();
+        script.push_str(
+            r#"IFS= read -r first || exit 20
+case "$first" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
+case "$first" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 22 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"first","inputSchema":{"type":"object"}}],"nextCursor":"pending","ttlMs":0,"cacheScope":"private"}}'
+IFS= read -r continuation || exit 23
+case "$continuation" in *'"cursor":"pending"'*) ;; *) exit 24 ;; esac
+case "$continuation" in *'"id":3,'*|*'"id":3}'*) ;; *) exit 25 ;; esac
+IFS= read -r sibling || exit 26
+case "$sibling" in *'"method":"prompts/list"'*) ;; *) exit 27 ;; esac
+case "$sibling" in *'"id":4,'*|*'"id":4}'*) ;; *) exit 28 ;; esac
+IFS= read -r cancellation || exit 29
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":3'*) ;; *) exit 30 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","prompts":[{"name":"sibling"}],"ttlMs":0,"cacheScope":"private"}}'
+IFS= read -r recovery || exit 31
+case "$recovery" in *'"method":"prompts/list"'*) ;; *) exit 32 ;; esac
+case "$recovery" in *'"id":5,'*|*'"id":5}'*) ;; *) exit 33 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","prompts":[{"name":"reused"}],"ttlMs":0,"cacheScope":"private"}}'
+while IFS= read -r unexpected; do exit 34; done
+"#,
+        );
+        let mut client = connect_stdio_catalog_test_client(&script);
+        let cx = Cx::for_request();
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let next_id = Arc::clone(&client.next_id);
+        let response_sender = Arc::clone(&client.response_sender);
+        http_test_runtime_block_on(async {
+            let cancellation = McpRequestCancellation::new();
+            let mut collection = Box::pin(client.list_all_tools_with_cx(
+                &cx,
+                &cancellation,
+                ListToolsParams::default(),
+            ));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let polled = std::future::poll_fn(|task_cx| {
+                    std::task::Poll::Ready(collection.as_mut().poll(task_cx))
+                })
+                .await;
+                assert!(
+                    polled.is_pending(),
+                    "peer withholds the continuation result"
+                );
+                if next_id.load(Ordering::SeqCst) == 4 {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                asupersync::runtime::yield_now().await;
+            }
+            let mut sibling = executor
+                .execute(&cx, "prompts/list", Some(serde_json::json!({})))
+                .unwrap();
+            if fail_control {
+                // Only the cancellation writer differs from the successful
+                // control: both requests are already committed to the peer.
+                SharedStdioSend(Arc::clone(&response_sender))
+                    .close(&cx)
+                    .unwrap();
+            }
+            if drop_future {
+                drop(collection);
+            } else {
+                cancellation.cancel();
+                let error = collection.await.unwrap_err();
+                if fail_control {
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    let terminal = client.responses.terminal_error().unwrap();
+                    assert_eq!(error.message, terminal.message);
+                    assert_eq!(error.code, terminal.code);
+                    assert!(error.message.contains("closed"));
+                    assert!(client.transport_is_closed());
+                    assert!(executor.executor.pending_records().is_empty());
+                    assert_eq!(client.peek_next_request_id(), 5);
+                    assert!(!client.cx.is_cancel_requested());
+                    let retry_error = client
+                        .list_all_prompts_with_cx(
+                            &cx,
+                            &McpRequestCancellation::new(),
+                            ListPromptsParams::default(),
+                        )
+                        .await
+                        .unwrap_err();
+                    assert_eq!(retry_error.message, error.message);
+                    assert_eq!(client.peek_next_request_id(), 5);
+                    client.close_with_cx(&cx).await.unwrap();
+                    return;
+                }
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            }
+            let pending = executor.executor.pending_records();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].request_id, RequestId::Number(4));
+            assert!(client.responses.terminal_error().is_none());
+            // The next drive flushes a dropped owner's cancellation and routes
+            // its late response past the live sibling and fresh catalog.
+            let recovered = client
+                .list_all_prompts_with_cx(
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    ListPromptsParams::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(recovered.item_count(), 1);
+            assert!(recovered.pages()[0].encode().unwrap().contains("reused"));
+            let sibling_response = executor.try_take_response(&mut sibling).unwrap().unwrap();
+            assert_eq!(
+                sibling_response.result.unwrap()["prompts"][0]["name"],
+                "sibling"
+            );
+            assert!(executor.executor.pending_records().is_empty());
+            assert!(!client.cx.is_cancel_requested());
+            assert!(!client.transport_is_closed());
+            assert_eq!(client.peek_next_request_id(), 6);
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_cancel_preserves_sibling_and_connection() {
+        stdio_async_catalog_cancellation_probe(false, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_cancel_preserves_failed_control_error() {
+        stdio_async_catalog_cancellation_probe(false, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_drop_preserves_sibling_and_connection() {
+        stdio_async_catalog_cancellation_probe(true, false);
+    }
+
+    #[cfg(unix)]
     fn deferred_stdio_catalog_test_client(cx: &Cx, script: &str) -> Client {
         block_on(
             ClientBuilder::new()
@@ -46359,6 +47298,205 @@ while IFS= read -r unexpected; do exit 28; done
                 .connect_stdio_with_cx(cx, "sh", &["-c", script]),
         )
         .expect("the public builder retains a deferred stdio client")
+    }
+
+    #[cfg(unix)]
+    fn stdio_async_catalog_initialization_deadline_probe(retain_handshake: bool) {
+        let cx = Cx::for_request();
+        let script = "IFS= read -r request || exit 1; \
+            case \"$request\" in *server/discover*) ;; *) exit 2 ;; esac; \
+            exec sleep 3";
+        let mut client = deferred_stdio_catalog_test_client(&cx, script);
+        assert!(!client.is_initialized());
+        if retain_handshake {
+            http_test_runtime_block_on(async {
+                let mut initializing = Box::pin(client.ensure_initialized_with_cx(&cx));
+                let first_poll = std::future::poll_fn(|task_cx| {
+                    std::task::Poll::Ready(initializing.as_mut().poll(task_cx))
+                })
+                .await;
+                assert!(first_poll.is_pending());
+            });
+            assert_eq!(client.peek_next_request_id(), 2);
+        }
+        let budget = PaginationBudget::for_request(
+            RequestTimeoutPolicy::new(Duration::from_millis(80), Duration::from_millis(80))
+                .unwrap(),
+        );
+        let started = Instant::now();
+        let error = http_test_runtime_block_on(client.collect_stdio_catalog_with_cx_and_budget(
+            &cx,
+            &McpRequestCancellation::new(),
+            FinalCacheResultSet::Tools,
+            None,
+            serde_json::json!({}),
+            budget,
+        ))
+        .unwrap_err();
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource":"absolute"}))
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            client.peek_next_request_id(),
+            2,
+            "no repeated handshake or first page"
+        );
+        assert!(!client.is_initialized());
+        assert!(client.pending_initialization.is_none());
+        assert!(client.child_cleanup_complete());
+        assert_eq!(client.ensure_initialized().unwrap_err().code, error.code);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_fresh_initialization_uses_original_deadline() {
+        stdio_async_catalog_initialization_deadline_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_retained_initialization_uses_original_deadline() {
+        stdio_async_catalog_initialization_deadline_probe(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_expired_deadline_leaves_deferred_client_reusable() {
+        let script = stdio_catalog_test_script(&[(
+            "tools/list",
+            None,
+            http_catalog_test_result("tools/list", "healthy", None, 0, "private").to_string(),
+        )]);
+        let cx = Cx::for_request();
+        let mut client = deferred_stdio_catalog_test_client(&cx, &script);
+        let cancellation = McpRequestCancellation::new();
+        let mut budget = PaginationBudget::new();
+        budget.deadline = Instant::now() - Duration::from_millis(1);
+        let error = http_test_runtime_block_on(client.collect_stdio_catalog_with_cx_and_budget(
+            &cx,
+            &cancellation,
+            FinalCacheResultSet::Tools,
+            None,
+            serde_json::json!({}),
+            budget,
+        ))
+        .unwrap_err();
+        assert_eq!(error.message, PAGINATION_DEADLINE_ERROR);
+        assert_eq!(client.peek_next_request_id(), 1);
+        assert!(!client.is_initialized());
+        assert!(!client.transport_is_closed());
+        let collection = http_test_runtime_block_on(stdio_async_catalog_test_collect(
+            &mut client,
+            &cx,
+            &cancellation,
+            "tools/list",
+            None,
+        ))
+        .unwrap();
+        assert_eq!(collection.item_count(), 1);
+        assert_eq!(client.peek_next_request_id(), 3);
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn stdio_async_catalog_traversal_deadline_probe(include_discovery: bool) {
+        let discovery = modern_discovery_response("typed-catalog-peer", &[MODERN_PROTOCOL_VERSION]);
+        let mut script = if include_discovery {
+            format!(
+                "IFS= read -r discovery || exit 1\n\
+                 case \"$discovery\" in *server/discover*) ;; *) exit 2 ;; esac\n\
+                 sleep 0.12\n\
+                 printf '%s\\n' '{discovery}'\n"
+            )
+        } else {
+            stdio_catalog_test_discovery_script()
+        };
+        if !include_discovery {
+            script.push_str(
+                r#"IFS= read -r first || exit 20
+case "$first" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
+case "$first" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 22 ;; esac
+sleep 0.12
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"nextCursor":"next","ttlMs":0,"cacheScope":"private"}}'
+"#,
+            );
+        }
+        let pending_id = if include_discovery { 2 } else { 3 };
+        let recovery_id = pending_id + 1;
+        script.push_str(&format!(
+            r#"IFS= read -r pending || exit 23
+case "$pending" in *'"method":"tools/list"'*) ;; *) exit 24 ;; esac
+case "$pending" in *'"id":{pending_id},'*|*'"id":{pending_id}}}'*) ;; *) exit 25 ;; esac
+sleep 0.12
+printf '%s\n' '{{"jsonrpc":"2.0","id":{pending_id},"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}'
+IFS= read -r cancellation || exit 26
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":{pending_id}'*) ;; *) exit 27 ;; esac
+IFS= read -r recovery || exit 28
+case "$recovery" in *'"method":"prompts/list"'*) ;; *) exit 29 ;; esac
+case "$recovery" in *'"id":{recovery_id},'*|*'"id":{recovery_id}}}'*) ;; *) exit 30 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":{recovery_id},"result":{{"resultType":"complete","prompts":[{{"name":"reused"}}],"ttlMs":0,"cacheScope":"private"}}}}'
+while IFS= read -r unexpected; do exit 31; done
+"#,
+        ));
+        let cx = Cx::for_request();
+        let mut client = if include_discovery {
+            deferred_stdio_catalog_test_client(&cx, &script)
+        } else {
+            connect_stdio_catalog_test_client(&script)
+        };
+        let cancellation = McpRequestCancellation::new();
+        let budget = PaginationBudget::for_request(
+            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(200))
+                .unwrap(),
+        );
+        let error = http_test_runtime_block_on(client.collect_stdio_catalog_with_cx_and_budget(
+            &cx,
+            &cancellation,
+            FinalCacheResultSet::Tools,
+            None,
+            serde_json::json!({}),
+            budget,
+        ))
+        .unwrap_err();
+        // Both 120ms stages fit a restarted 200ms budget, so success would
+        // reveal a reset at discovery completion or the continuation page.
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource":"absolute"}))
+        );
+        assert_eq!(client.peek_next_request_id(), recovery_id);
+        assert!(client.is_initialized());
+        let recovered = http_test_runtime_block_on(client.list_all_prompts_with_cx(
+            &cx,
+            &McpRequestCancellation::new(),
+            ListPromptsParams::default(),
+        ))
+        .unwrap();
+        assert!(recovered.pages()[0].encode().unwrap().contains("reused"));
+        assert!(
+            client
+                .multiplexed_stdio_executor()
+                .unwrap()
+                .executor
+                .pending_records()
+                .is_empty()
+        );
+        assert!(!client.transport_is_closed());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_deadline_spans_all_pages() {
+        stdio_async_catalog_traversal_deadline_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_async_catalog_deadline_spans_discovery_and_first_page() {
+        stdio_async_catalog_traversal_deadline_probe(true);
     }
 
     #[cfg(unix)]
