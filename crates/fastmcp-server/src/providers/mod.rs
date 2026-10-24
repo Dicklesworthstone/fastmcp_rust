@@ -17,6 +17,10 @@
 //! - With the `proxy` feature, `ClientCredentialsProvider`: the same exact
 //!   tool, resource, prompt, template and completion handlers using an explicitly
 //!   provisioned machine identity instead of an interactive OAuth login.
+//! - With `jwt-resource-auth`, `JwtResourceVerifier`: local RS256 access-token
+//!   authentication through the existing `TokenAuthProvider` server hook.
+//!   `ManagedJwtResourceVerifier` adds expiring keys and caller-driven,
+//!   single-flight JWKS refresh with revocation and stale-result fencing.
 //!
 //! # Example
 //!
@@ -41,6 +45,20 @@ mod filesystem;
 #[cfg(feature = "apps")]
 mod mcp_apps;
 mod schema_tool;
+
+/// Explicitly provisioned JWT resource-server authentication; no key discovery.
+#[cfg(feature = "jwt-resource-auth")]
+pub mod jwt_resource;
+#[cfg(feature = "jwt-resource-auth")]
+pub use jwt_resource::{JwtResourceAuthError, JwtResourcePolicy, JwtResourceVerifier};
+
+/// Expiring JWT key generations with caller-driven, revocation-safe renewal.
+#[cfg(feature = "jwt-resource-auth")]
+pub mod managed_jwks;
+#[cfg(feature = "jwt-resource-auth")]
+pub use managed_jwks::{
+    JwksRefreshError, JwksRefreshOutcome, JwksRefreshPolicy, ManagedJwtResourceVerifier,
+};
 
 /// Authenticated, request-owned modern core forwarding using a managed login.
 #[cfg(feature = "proxy")]
@@ -140,6 +158,8 @@ mod host_cancelled_pairing {
 
     /// Conversion sites with no `host_cancelled_*_by_variant` +
     /// `host_cancelled_*_planted_negative` pair declared in the same file.
+    ///
+    /// Exact name equality, so a comment cannot supply a missing declaration.
     fn host_cancelled_conversions_missing_their_pair(sources: &[(String, String)]) -> Vec<String> {
         let mut missing = Vec::new();
         for (path, contents) in sources {

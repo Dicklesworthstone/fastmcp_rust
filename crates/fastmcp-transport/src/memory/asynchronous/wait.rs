@@ -4,16 +4,58 @@ use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
 use std::task::Poll;
 
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use asupersync::time::Sleep;
 use asupersync::{Cx, channel::oneshot};
 
 use crate::TransportError;
+
+// Capture the host's effect ceiling BEFORE installing the explicit caller.
+// set_current preserves the supplied context's own mask, not the narrower
+// ambient view it replaces. This is the same intersection used by native
+// stdio and request-region admission. The host contributes only restrictions,
+// never its identity, cancellation state, clock, deadline or timer driver.
+fn ambient_capability_ceiling() -> CapMask {
+    let Some(active) = Cx::current() else {
+        return CapMask::all();
+    };
+    let capabilities = active.capabilities();
+    let mut ceiling = CapMask::all();
+    for (allowed, without_effect) in [
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
+    ] {
+        if !allowed {
+            ceiling = ceiling.intersect(without_effect);
+        }
+    }
+    ceiling
+}
 
 /// Register cancellation independently of channel readiness. The channel future
 /// still owns its FIFO waiter and checked send obligation; dropping it rolls
 /// those back. Nothing polls cancellation after publication or dequeue succeeds.
 /// Pending operations also register the caller's deadline with its timer driver:
 /// a checkpoint alone cannot wake a task parked on an idle or full channel.
+/// Binding that driver must not restore effects relinquished by the host scope.
 pub(super) async fn await_channel<T>(
     cx: &Cx,
     operation: impl Future<Output = Result<T, TransportError>>,
@@ -26,9 +68,12 @@ pub(super) async fn await_channel<T>(
     let mut deadline_timer: Option<Sleep> = None;
     let mut deadline_observed = false;
     poll_fn(|task| {
-        // Sleep resolves its driver during polling. Keep both the operation
-        // and its timer on the supplied caller, never an unrelated ambient Cx.
+        // Re-evaluate the host ceiling on every poll: a suspended operation
+        // can resume in a narrower scope. Both guards unwind before yielding.
+        // Sleep still resolves the explicit caller's driver, not the host's.
+        let ceiling = ambient_capability_ceiling();
         let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(ceiling);
         if cx.checkpoint().is_err() {
             return Poll::Ready(Err(TransportError::Cancelled));
         }
@@ -45,6 +90,16 @@ pub(super) async fn await_channel<T>(
             // Only a pending operation needs a timer. This preserves immediately
             // ready operations on driverless contexts, including masked cleanup,
             // without silently parking a bounded wait that cannot be woken.
+            // Check authority separately from driver availability: a retained
+            // driver is not permission to use it under a narrower host scope.
+            if !ceiling.contains(CapSet::<false, true, false, false, false>::MASK)
+                || !cx.capabilities().time
+            {
+                return Poll::Ready(Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "pending memory transport deadline requires the time capability",
+                ))));
+            }
             if cx.timer_driver().is_none() {
                 return Poll::Ready(Err(TransportError::Io(std::io::Error::other(
                     "pending memory transport deadline requires an asupersync timer driver",
@@ -125,9 +180,8 @@ mod tests {
             .with_timer_driver(timer.clone())
             .build()
             .unwrap();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         test(&cx, &clock, &timer);
         assert_eq!(timer.pending_count(), 0);
         drop(cx);
@@ -377,14 +431,17 @@ mod tests {
             );
             assert!(cx.timer_driver().is_none());
             let polls = AtomicUsize::new(0);
-            let result = ready(await_channel(&cx, poll_fn(|_| {
-                polls.fetch_add(1, Ordering::SeqCst);
-                if pending {
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Ok(42))
-                }
-            })));
+            let result = ready(await_channel(
+                &cx,
+                poll_fn(|_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    if pending {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(42))
+                    }
+                }),
+            ));
             if pending {
                 let Err(TransportError::Io(error)) = result else {
                     panic!("a driverless deadline must not park a pending wait");
@@ -449,5 +506,234 @@ mod tests {
             drop(foreign_cx);
             assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
         });
+    }
+
+    mod authority {
+        use super::*;
+
+        fn effects(cx: &Cx) -> [bool; 5] {
+            let row = cx.capabilities();
+            [row.spawn, row.time, row.entropy, row.io, row.remote]
+        }
+
+        fn rows() -> [(CapMask, [bool; 5]); 7] {
+            [
+                (CapMask::all(), [true; 5]),
+                (CapMask::none(), [false; 5]),
+                (CapSet::<false, true, true, true, true>::MASK, [false, true, true, true, true]),
+                (CapSet::<true, false, true, true, true>::MASK, [true, false, true, true, true]),
+                (CapSet::<true, true, false, true, true>::MASK, [true, true, false, true, true]),
+                (CapSet::<true, true, true, false, true>::MASK, [true, true, true, false, true]),
+                (CapSet::<true, true, true, true, false>::MASK, [true, true, true, true, false]),
+            ]
+        }
+
+        fn scoped<T>(cx: &Cx, mask: CapMask, operation: impl FnOnce() -> T) -> T {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(mask);
+            operation()
+        }
+
+        fn no_time() -> CapMask {
+            CapSet::<true, false, true, true, true>::MASK
+        }
+
+        fn denied(result: Result<(), TransportError>) {
+            let Err(TransportError::Io(error)) = result else {
+                panic!("a pending deadline without time authority must be refused");
+            };
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        }
+
+        #[test]
+        fn channel_poll_intersects_every_caller_and_host_effect_dimension() {
+            for (caller_mask, caller_effects) in rows() {
+                let caller = scoped(&Cx::for_testing(), caller_mask, || Cx::current().unwrap());
+                for (host_mask, host_effects) in rows() {
+                    let host = Cx::for_testing();
+                    scoped(&host, host_mask, || {
+                        let actual = ready(await_channel(&caller, async {
+                            Ok(effects(&Cx::current().unwrap()))
+                        })).unwrap();
+                        let expected = std::array::from_fn(|index| {
+                            caller_effects[index] && host_effects[index]
+                        });
+                        assert_eq!(actual, expected);
+                        assert_eq!(effects(&Cx::current().unwrap()), host_effects);
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn resumed_channel_wait_rechecks_host_scope_without_leaking_it() {
+            let caller = Cx::for_testing();
+            let host = Cx::for_testing();
+            let observed = std::cell::RefCell::new(Vec::new());
+            {
+                let mut waiting = pin!(await_channel(&caller, poll_fn(|_| {
+                    observed.borrow_mut().push(effects(&Cx::current().unwrap()));
+                    Poll::<Result<(), TransportError>>::Pending
+                })));
+                for (mask, expected) in rows() {
+                    scoped(&host, mask, || {
+                        assert!(poll(waiting.as_mut(), Waker::noop()).is_pending());
+                        assert_eq!(observed.borrow().last(), Some(&expected));
+                        assert_eq!(effects(&Cx::current().unwrap()), expected);
+                    });
+                }
+            }
+            assert_eq!(observed.borrow().len(), 7);
+            assert_eq!(effects(&caller), [true; 5]);
+            assert!(caller.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn pending_receive_send_and_reservation_refuse_missing_time_authority_without_leaks() {
+            for held_restriction in [false, true] {
+                for operation in 0..3 {
+                    with_deadline(|cx, _clock, timer| {
+                        let caller = if held_restriction {
+                            scoped(cx, no_time(), || Cx::current().unwrap())
+                        } else {
+                            cx.clone()
+                        };
+                        let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+                        let live = Cx::for_testing();
+                        if operation != 0 {
+                            client.send(&live, &request(61)).unwrap();
+                        }
+                        let mask = if held_restriction { CapMask::all() } else { no_time() };
+                        let result = scoped(cx, mask, || match operation {
+                            0 => ready(server.recv_async(&caller)).map(|_| ()),
+                            1 => ready(client.send_async(&caller, &request(62))),
+                            2 => ready(client.reserve_send_async(&caller)).map(|permit| permit.abort()),
+                            _ => unreachable!(),
+                        });
+                        denied(result);
+                        assert_eq!(timer.pending_count(), 0);
+                        assert!(!client.is_closed() && !server.is_closed());
+                        if operation != 0 {
+                            assert_eq!(json(&server.recv(&live).unwrap()), json(&request(61)));
+                        }
+                        // Neither a failed receive nor a blocked producer may
+                        // keep capacity, publish its rejected frame or poison
+                        // the next call made under a live, admitted context.
+                        ready(client.send_async(&live, &request(63))).unwrap();
+                        assert_eq!(json(&ready(server.recv_async(&live)).unwrap()), json(&request(63)));
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn ready_channel_commit_does_not_require_unused_timer_authority() {
+            for operation in 0..3 {
+                with_deadline(|cx, _clock, timer| {
+                    let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+                    let live = Cx::for_testing();
+                    if operation == 0 {
+                        client.send(&live, &request(71)).unwrap();
+                    }
+                    scoped(cx, no_time(), || {
+                        match operation {
+                            0 => assert_eq!(json(&ready(server.recv_async(cx)).unwrap()), json(&request(71))),
+                            1 => ready(client.send_async(cx, &request(71))).unwrap(),
+                            2 => ready(client.reserve_send_async(cx)).unwrap().send(&request(71)).unwrap(),
+                            _ => unreachable!(),
+                        }
+                    });
+                    assert_eq!(timer.pending_count(), 0);
+                    if operation != 0 {
+                        assert_eq!(json(&server.recv(&live).unwrap()), json(&request(71)));
+                    }
+                    assert!(!client.is_closed() && !server.is_closed());
+                });
+            }
+        }
+
+        #[test]
+        fn narrowing_a_pending_wait_retires_its_timer_and_cancellation_waker() {
+            with_deadline(|cx, clock, timer| {
+                let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+                let wakes = Arc::new(WakeCount::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                {
+                    let mut receiving = pin!(server.recv_async(cx));
+                    scoped(cx, CapMask::all(), || {
+                        assert!(poll(receiving.as_mut(), &waker).is_pending());
+                    });
+                    assert!(timer.pending_count() > 0);
+                    scoped(cx, no_time(), || {
+                        let Poll::Ready(result) = poll(receiving.as_mut(), &waker) else {
+                            panic!("the retained driver must not bypass a narrower host");
+                        };
+                        denied(result.map(|_| ()));
+                    });
+                    // Completion, not later parent shutdown, retires observers.
+                    assert_eq!(timer.pending_count(), 0);
+                }
+                let before = wakes.0.load(Ordering::SeqCst);
+                clock.advance(10_000_000);
+                assert_eq!(timer.process_timers(), 0);
+                cx.set_cancel_requested(true);
+                assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+                let live = Cx::for_testing();
+                client.send(&live, &request(81)).unwrap();
+                assert_eq!(json(&ready(server.recv_async(&live)).unwrap()), json(&request(81)));
+            });
+        }
+
+        #[test]
+        fn stopped_host_contributes_restrictions_not_a_replacement_lifetime() {
+            with_deadline(|cx, _clock, timer| {
+                let host = Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(Time::ZERO));
+                host.set_cancel_requested(true);
+                let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+                let live = Cx::for_testing();
+                let mask = CapSet::<true, true, true, false, true>::MASK;
+                {
+                    let mut receiving = pin!(server.recv_async(cx));
+                    scoped(&host, mask, || {
+                        assert!(poll(receiving.as_mut(), Waker::noop()).is_pending());
+                        assert!(!Cx::current().unwrap().capabilities().io);
+                    });
+                    assert!(timer.pending_count() > 0);
+                    assert!(!cx.is_cancel_requested());
+                    client.send(&live, &request(91)).unwrap();
+                    scoped(&host, mask, || {
+                        let Poll::Ready(Ok(frame)) = poll(receiving.as_mut(), Waker::noop()) else {
+                            panic!("a stopped foreign host must not cancel the live caller");
+                        };
+                        assert_eq!(json(&frame), json(&request(91)));
+                    });
+                }
+                assert_eq!(timer.pending_count(), 0);
+                assert!(host.checkpoint().is_err());
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn deadline_free_memory_wait_progresses_with_all_host_effects_disabled() {
+            let caller = Cx::for_testing();
+            let host = Cx::for_testing();
+            let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
+            let wakes = Arc::new(WakeCount::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut receiving = pin!(server.recv_async(&caller));
+            scoped(&host, CapMask::none(), || {
+                assert!(poll(receiving.as_mut(), &waker).is_pending());
+            });
+            client.send(&caller, &request(101)).unwrap();
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            scoped(&host, CapMask::none(), || {
+                let Poll::Ready(Ok(frame)) = poll(receiving.as_mut(), &waker) else {
+                    panic!("local channel progress needs no spawn, timer or I/O driver");
+                };
+                assert_eq!(json(&frame), json(&request(101)));
+                assert_eq!(effects(&Cx::current().unwrap()), [false; 5]);
+            });
+        }
     }
 }

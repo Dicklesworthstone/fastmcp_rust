@@ -1,4 +1,4 @@
-//! Modern connection dispatch driven entirely by the embedding's async task.
+//! Connection dispatch driven entirely by the embedding's async task.
 //!
 //! The connection polls ingress independently of egress and request work. No
 //! receive thread, blocking-pool pump, or nested runtime participates. Explicit
@@ -16,10 +16,10 @@ use std::task::Poll;
 use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::sync::Notify;
 use asupersync::time::Sleep;
+use fastmcp_transport::memory::{MemoryRecvHalf, MemorySendHalf, MemoryTransport};
 use fastmcp_transport::{
     AsyncStdioRecvHalf, AsyncStdioSendHalf, AsyncStdioTransport, ReceivedTransportFrame,
 };
-use fastmcp_transport::memory::{MemoryRecvHalf, MemorySendHalf, MemoryTransport};
 
 // This module is split out of lib.rs and shares its private items. The set
 // it uses differs per feature profile, so an explicit list computed for one
@@ -94,9 +94,27 @@ impl ConnectionWriter for MemorySendHalf {
         // neither publishes a partial frame nor poisons the next reservation.
         self.send_async(cx, message).await
     }
-    async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        // Memory close only releases the sender; it performs no blocking I/O.
-        fastmcp_transport::TransportSendHalf::close(self, cx)
+    // `TransportSendHalf::close` is genuinely synchronous (lib.rs:285), so this
+    // impl has nothing to await, and the two clippy lints that notice that are
+    // in direct conflict: as an `async fn` it draws `unused_async`, and in this
+    // block form it draws `manual_async_fn`. One of them has to be allowed.
+    // Allowing `manual_async_fn` is the one that works -- an item-level
+    // `#[allow(clippy::unused_async)]` does NOT suppress the other direction on
+    // a trait impl method (measured: clippy still reported it at this site with
+    // the attribute directly above).
+    //
+    // Both forms are lazy, which is the property that actually matters here.
+    // What is NOT acceptable is `std::future::ready(..)`, which the RPITIT
+    // trait signature would also accept: that evaluates the close when the
+    // future is CONSTRUCTED, so building one and dropping it without awaiting
+    // would already have released the sender. Every other effect on this
+    // transport is drop-safe by design and this one stays that way.
+    #[allow(clippy::manual_async_fn)]
+    fn close(&mut self, cx: &Cx) -> impl Future<Output = Result<(), TransportError>> + Send {
+        async move {
+            // Memory close only releases the sender; no blocking I/O.
+            fastmcp_transport::TransportSendHalf::close(self, cx)
+        }
     }
     fn is_closed(&self) -> bool {
         Self::is_closed(self)
@@ -151,18 +169,90 @@ impl ConnectionBinding {
 struct OutputOwner {
     reservation: ModernDispatchReservation,
     log_level: Option<LoggingLevel>,
+    #[cfg(feature = "legacy-2024-11-05")]
+    legacy: Option<Mutex<LegacyOutputState>>,
 }
 
 impl OutputOwner {
     fn cancelled(&self) -> bool {
+        #[cfg(feature = "legacy-2024-11-05")]
+        if self.legacy.is_some() {
+            // Local deadline cancellation still needs its terminal error on
+            // the wire. Only peer cancellation or connection stop withdraws
+            // legacy output before that final wire election.
+            return self.reservation.cancellation.is_peer_cancel_requested()
+                || self.reservation.queue.is_stopping();
+        }
         self.reservation.cancellation.is_cancel_requested()
     }
+
+    fn suppresses_message(&self, message: &JsonRpcMessage) -> bool {
+        if self.cancelled() {
+            return true;
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        if self.legacy.is_some() && !matches!(message, JsonRpcMessage::Response(_)) {
+            // A local timeout may still publish its terminal response, but
+            // logs and reverse requests must stop with the owning request.
+            return self.reservation.cancellation.is_cancel_requested();
+        }
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let _ = message;
+        false
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_budget(&self) -> Option<Budget> {
+        self.legacy.as_ref().and_then(|legacy| {
+            legacy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .budget
+        })
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_timed_out(&self, cx: &Cx) -> bool {
+        self.legacy_budget()
+            .is_some_and(|budget| cx.budget().meet(budget).is_past_deadline(cx.now()))
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Default)]
+struct LegacyOutputState {
+    budget: Option<Budget>,
+    // Keep dispatcher registration alive through actual terminal output
+    // commitment, rather than only through handler completion.
+    active: Option<LiveLegacy2024ActiveRequest>,
 }
 
 struct OutputFrame {
     message: JsonRpcMessage,
     owner: Option<Arc<OutputOwner>>,
     bytes: usize,
+}
+
+/// Count encoded bytes without allocating another maximum-sized payload.
+/// The retained charge includes the NDJSON newline.
+fn output_frame_bytes(message: &JsonRpcMessage) -> Option<usize> {
+    struct Counter(usize);
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|size| *size <= DOCUMENT_BYTES)
+                .ok_or_else(|| io::Error::other("async stdio output exceeds frame bound"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Counter(0);
+    serde_json::to_writer(&mut count, message).ok()?;
+    count.0.checked_add(1)
 }
 
 #[derive(Default)]
@@ -196,45 +286,37 @@ impl OutputQueue {
             .insert(owner.reservation.cancellation_id, Arc::downgrade(owner));
     }
 
-    fn enqueue(&self, message: JsonRpcMessage, owner: Option<Arc<OutputOwner>>) {
-        if owner.as_ref().is_some_and(|owner| owner.cancelled()) {
-            return;
+    fn enqueue(&self, message: JsonRpcMessage, owner: Option<Arc<OutputOwner>>) -> bool {
+        if owner
+            .as_ref()
+            .is_some_and(|owner| owner.suppresses_message(&message))
+        {
+            return false;
         }
-        // Count before queue mutation, without allocating encoded copies of
-        // a potentially maximum-sized response or notification.
-        struct Counter(usize);
-        impl Write for Counter {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.0 = self
-                    .0
-                    .checked_add(bytes.len())
-                    .filter(|size| *size <= DOCUMENT_BYTES)
-                    .ok_or_else(|| io::Error::other("async stdio output exceeds frame bound"))?;
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut count = Counter(0);
-        let measured = serde_json::to_writer(&mut count, &message).is_ok();
+        let measured = output_frame_bytes(&message);
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.stopped || state.failure.is_some() {
-            return;
+        // Cancellation can win while serialization is running or this
+        // producer is waiting for the queue lock. Recheck inside the same
+        // critical section as insertion: a completed cancellation sweep must
+        // never be followed by this producer retaining another dead frame.
+        if state.stopped
+            || state.failure.is_some()
+            || owner
+                .as_ref()
+                .is_some_and(|owner| owner.suppresses_message(&message))
+        {
+            return false;
         }
         if !Self::log_has_owner(&state, &message, owner.as_ref()) {
-            return;
+            return false;
         }
-        let bytes = count.0.saturating_add(1);
-        if !measured
-            || state.retained_frames >= MAX_DISPATCH_QUEUE_DEPTH
-            || bytes > MAX_DISPATCH_QUEUE_BYTES.saturating_sub(state.retained_bytes)
+        let admitted = if let Some(bytes) = measured
+            && state.retained_frames < MAX_DISPATCH_QUEUE_DEPTH
+            && bytes <= MAX_DISPATCH_QUEUE_BYTES.saturating_sub(state.retained_bytes)
         {
-            state.failure = Some("output_capacity");
-        } else {
             state.retained_frames += 1;
             state.retained_bytes += bytes;
             state.frames.push_back(OutputFrame {
@@ -242,9 +324,14 @@ impl OutputQueue {
                 owner,
                 bytes,
             });
-        }
+            true
+        } else {
+            state.failure = Some("output_capacity");
+            false
+        };
         drop(state);
         self.changed.notify_waiters();
+        admitted
     }
 
     fn log_has_owner(
@@ -256,6 +343,12 @@ impl OutputQueue {
             return true;
         };
         if notification.method != "notifications/message" {
+            return true;
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        if owner.is_some_and(|owner| owner.legacy.is_some()) {
+            // The legacy session already applied its negotiated log floor,
+            // and this callback captured the originating request explicitly.
             return true;
         }
         // Identifier-free logs have no safe adjacency-based owner. Check both
@@ -291,7 +384,76 @@ impl OutputQueue {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Self::log_has_owner(&state, &frame.message, frame.owner.as_ref())
+        !state.stopped
+            && state.failure.is_none()
+            && !frame
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.suppresses_message(&frame.message))
+            && Self::log_has_owner(&state, &frame.message, frame.owner.as_ref())
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn accepts_output(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !state.stopped && state.failure.is_none()
+    }
+
+    /// Called after the writer's request deadline wins and the caller has
+    /// rejected a partially written frame.
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn replace_expired_legacy_response(
+        &self,
+        frame: &mut OutputFrame,
+    ) -> Result<bool, TransportError> {
+        let Some(owner) = frame.owner.as_ref().filter(|owner| owner.legacy.is_some()) else {
+            return Ok(false);
+        };
+        // An earlier peer cancellation keeps its original cause and must
+        // never become an eligible timeout response.
+        owner.reservation.cancellation.cancel();
+        if owner.cancelled() {
+            return Ok(false);
+        }
+        let JsonRpcMessage::Response(response) = &frame.message else {
+            return Ok(false);
+        };
+        let replacement = JsonRpcMessage::Response(JsonRpcResponse::error(
+            response.id.clone(),
+            JsonRpcError {
+                code: McpErrorCode::RequestCancelled.into(),
+                message: "Request timeout exceeded".to_owned(),
+                data: None,
+            },
+        ));
+        let measured = output_frame_bytes(&replacement);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped || state.failure.is_some() || owner.cancelled() {
+            return Ok(false);
+        }
+        let retained_without_frame = state.retained_bytes.saturating_sub(frame.bytes);
+        let Some(bytes) = measured.filter(|bytes| {
+            *bytes <= MAX_DISPATCH_QUEUE_BYTES.saturating_sub(retained_without_frame)
+        }) else {
+            state.failure = Some("output_capacity");
+            drop(state);
+            self.changed.notify_waiters();
+            return Err(TransportError::Io(io::Error::other(
+                "async stdio timeout response exceeds output capacity",
+            )));
+        };
+        state.retained_bytes = retained_without_frame + bytes;
+        drop(state);
+        frame.message = replacement;
+        frame.bytes = bytes;
+        self.changed.notify_waiters();
+        Ok(true)
     }
 
     fn pop(&self) -> Option<OutputFrame> {
@@ -309,6 +471,47 @@ impl OutputQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.retained_frames = state.retained_frames.saturating_sub(1);
         state.retained_bytes = state.retained_bytes.saturating_sub(bytes);
+    }
+
+    /// Release uncommitted frames whose request cancellation has won, even
+    /// when a different request has the output writer parked on backpressure.
+    /// The frame already owned by the writer is deliberately not here: that
+    /// writer alone decides whether suppression is safe or partial output
+    /// requires terminating the connection.
+    fn discard_cancelled(&self) -> usize {
+        let discarded = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut discarded = Vec::new();
+            // Rotate the original queue once. Live frames retain their FIFO
+            // order and existing allocation; no payload is cloned. The only
+            // additional storage is a bounded list of frames being retired.
+            for _ in 0..state.frames.len() {
+                let frame = state.frames.pop_front().expect("counted queued frame");
+                if frame
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.suppresses_message(&frame.message))
+                {
+                    state.retained_frames = state.retained_frames.saturating_sub(1);
+                    state.retained_bytes = state.retained_bytes.saturating_sub(frame.bytes);
+                    discarded.push(frame);
+                } else {
+                    state.frames.push_back(frame);
+                }
+            }
+            discarded
+        };
+        let count = discarded.len();
+        // A frame may own the last request reservation. Its destructor can
+        // acquire the admission mutex, so it must run AFTER the queue unlocks.
+        drop(discarded);
+        if count != 0 {
+            self.changed.notify_waiters();
+        }
+        count
     }
 
     fn has_frames(&self) -> bool {
@@ -369,6 +572,84 @@ fn receive<R: ConnectionReader>(mut reader: R, cx: Cx) -> ReadWork<R> {
     })
 }
 
+enum WriteAttempt {
+    Complete(Result<(), TransportError>),
+    #[cfg(feature = "legacy-2024-11-05")]
+    RequestDeadline,
+}
+
+async fn send_frame<W: ConnectionWriter>(
+    writer: &mut W,
+    cx: &Cx,
+    frame: &OutputFrame,
+    mut timeout: Pin<&mut Sleep>,
+    #[cfg(feature = "legacy-2024-11-05")] observe_legacy_deadline: bool,
+) -> WriteAttempt {
+    let mut sending = pin!(writer.send(cx, &frame.message));
+    let cancellation = frame
+        .owner
+        .as_ref()
+        .map(|owner| owner.reservation.cancellation());
+    let mut cancelled = cancellation
+        .as_ref()
+        .map(|cancel| Box::pin(cancel.cancelled()));
+    #[cfg(feature = "legacy-2024-11-05")]
+    let mut request_deadline = observe_legacy_deadline
+        .then(|| {
+            frame
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.legacy_budget())
+                .and_then(|budget| cx.budget().meet(budget).deadline)
+        })
+        .flatten()
+        .map(|deadline| Box::pin(Sleep::new(deadline)));
+    poll_fn(|task| {
+        if frame
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.suppresses_message(&frame.message))
+        {
+            return Poll::Ready(WriteAttempt::Complete(Ok(())));
+        }
+        if cancelled
+            .as_mut()
+            .is_some_and(|cancelled| cancelled.as_mut().poll(task).is_ready())
+        {
+            // A local legacy timeout does not suppress its error response.
+            // Consume this wake once instead of rearming an already-ready
+            // cancellation future on every subsequent writer poll.
+            cancelled = None;
+            if frame
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.suppresses_message(&frame.message))
+            {
+                return Poll::Ready(WriteAttempt::Complete(Ok(())));
+            }
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        if observe_legacy_deadline
+            && (frame
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.legacy_timed_out(cx))
+                || request_deadline
+                    .as_mut()
+                    .is_some_and(|deadline| deadline.as_mut().poll(task).is_ready()))
+        {
+            return Poll::Ready(WriteAttempt::RequestDeadline);
+        }
+        // Keep this absolute timeout across a timeout-response replacement;
+        // starting another send must never extend the connection's drain.
+        if timeout.as_mut().poll(task).is_ready() {
+            return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Timeout)));
+        }
+        sending.as_mut().poll(task).map(WriteAttempt::Complete)
+    })
+    .await
+}
+
 fn write<W: ConnectionWriter>(
     mut writer: W,
     cx: Cx,
@@ -376,41 +657,54 @@ fn write<W: ConnectionWriter>(
     output: Arc<OutputQueue>,
 ) -> WriteWork<W> {
     Box::pin(async move {
+        #[cfg(feature = "legacy-2024-11-05")]
+        let mut frame = frame;
         if !output.admits_write(&frame) {
             return (writer, Ok(()), frame.bytes);
         }
-        let result = {
-            let mut sending = pin!(writer.send(&cx, &frame.message));
-            let mut timeout = pin!(asupersync::time::sleep(
-                cx.now(),
-                STDIO_OUTPUT_COMMIT_TIMEOUT
-            ));
-            let cancellation = frame
-                .owner
-                .as_ref()
-                .map(|owner| owner.reservation.cancellation());
-            let mut cancelled = cancellation
-                .as_ref()
-                .map(|cancel| Box::pin(cancel.cancelled()));
-            poll_fn(|task| {
-                if frame.owner.as_ref().is_some_and(|owner| owner.cancelled()) {
-                    return Poll::Ready(Ok(()));
+        let mut timeout = pin!(asupersync::time::sleep(
+            cx.now(),
+            STDIO_OUTPUT_COMMIT_TIMEOUT
+        ));
+        let attempt = send_frame(
+            &mut writer,
+            &cx,
+            &frame,
+            timeout.as_mut(),
+            #[cfg(feature = "legacy-2024-11-05")]
+            true,
+        )
+        .await;
+        let result = match attempt {
+            WriteAttempt::Complete(result) => result,
+            #[cfg(feature = "legacy-2024-11-05")]
+            WriteAttempt::RequestDeadline => {
+                // The pending send was dropped before examining the writer.
+                // A partial write is terminal; a zero-byte response wait can
+                // safely replace its result under the same commit bound.
+                if writer.is_closed() {
+                    Err(TransportError::Closed)
+                } else {
+                    match output.replace_expired_legacy_response(&mut frame) {
+                        Ok(keep_response) => {
+                            output.discard_cancelled();
+                            if keep_response {
+                                match send_frame(&mut writer, &cx, &frame, timeout.as_mut(), false)
+                                    .await
+                                {
+                                    WriteAttempt::Complete(result) => result,
+                                    // Never re-arm the expired request timer
+                                    // while draining its terminal error.
+                                    WriteAttempt::RequestDeadline => Err(TransportError::Timeout),
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-                if cancelled
-                    .as_mut()
-                    .is_some_and(|cancelled| cancelled.as_mut().poll(task).is_ready())
-                {
-                    return Poll::Ready(Ok(()));
-                }
-                if let Poll::Ready(result) = sending.as_mut().poll(task) {
-                    return Poll::Ready(result);
-                }
-                if timeout.as_mut().poll(task).is_ready() {
-                    return Poll::Ready(Err(TransportError::Timeout));
-                }
-                Poll::Pending
-            })
-            .await
+            }
         };
         // Dropping a cancelled send after a partial write poisons the shared
         // transport. Never interpret that case as a harmless suppressed frame.
@@ -497,6 +791,10 @@ fn prepare_request(
             lifetime
                 .admission
                 .cancel_reserved(Server::cancellation_wire_request_id(&cancellation));
+            // Authentication and the request's cancellation election precede
+            // reclamation. Do not wait for a blocked writer to discover these
+            // dead frames or let them consume a later live request's capacity.
+            lifetime.output.discard_cancelled();
         }
         return Ok(None);
     }
@@ -536,6 +834,8 @@ fn prepare_request(
     let owner = Arc::new(OutputOwner {
         log_level: lifetime.server.final_request_log_level(&request),
         reservation,
+        #[cfg(feature = "legacy-2024-11-05")]
+        legacy: None,
     });
     // Authentication binds connection ownership before the next inbound
     // cancellation may be admitted, even if this child has not been polled.
@@ -675,6 +975,779 @@ fn prepare_request(
     Ok(Some(work))
 }
 
+/// The exact-2024 adapter serializes lifecycle and application mutations, but
+/// ingress remains independently pollable to deliver reverse responses and
+/// cancellation while its current handler is suspended.
+#[cfg(feature = "legacy-2024-11-05")]
+struct LegacyIngress {
+    sender: Option<asupersync_mpsc::Sender<LegacyQueuedRequest>>,
+    pending: Arc<PendingRequests>,
+    principal: SessionPrincipalBinding,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+struct LegacyQueuedRequest {
+    request: JsonRpcRequest,
+    invocation: LegacyInvocation,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Clone)]
+struct LegacyInvocation {
+    owner: Arc<OutputOwner>,
+    // Share the retained sanitized document across the worker and adapter
+    // callback; cloning it again would bypass admission byte accounting.
+    authentication: Arc<AuthAdmissionReceipt>,
+}
+
+/// Validate the exact wire surface before authentication can bind a peer or
+/// the adapter can change lifecycle state. Notification refusals stay silent.
+#[cfg(feature = "legacy-2024-11-05")]
+fn admit_legacy_envelope(output: &OutputQueue, request: &JsonRpcRequest) -> bool {
+    if request
+        .params
+        .as_ref()
+        .and_then(|params| params.get("_meta"))
+        .is_some_and(|metadata| !metadata.is_object())
+    {
+        if let Some(id) = &request.id {
+            output.enqueue(
+                error_response(
+                    Some(id.clone()),
+                    if request.method == "initialize" {
+                        -32600
+                    } else {
+                        -32602
+                    },
+                    "Exact-2024 metadata must be an object",
+                ),
+                None,
+            );
+        }
+        return false;
+    }
+    let wire = serde_json::to_value(request)
+        .expect("a validated JSON-RPC request must serialize for legacy admission");
+    let Err(error) = fastmcp_protocol::methods::decode_legacy_2024_11_05_envelope_classified(wire)
+    else {
+        return true;
+    };
+    use fastmcp_protocol::methods::Legacy2024EnvelopeError;
+    let (code, message) = match error {
+        Legacy2024EnvelopeError::Envelope(_) => (-32600, "Invalid exact-2024 envelope"),
+        Legacy2024EnvelopeError::Method(_) => {
+            (-32601, "Method is not part of exact MCP 2024-11-05")
+        }
+        Legacy2024EnvelopeError::MethodParams(_) => (-32602, "Invalid exact-2024 parameters"),
+    };
+    if let Some(id) = &request.id {
+        output.enqueue(error_response(Some(id.clone()), code, message), None);
+    }
+    false
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacyIngress {
+    fn install(lifetime: &ConnectionLifetime, cx: &Cx) -> McpResult<(Self, RequestWork)> {
+        let server = Arc::clone(&lifetime.server);
+        let session = Session::new(server.info.clone(), server.capabilities.clone());
+        let session_id = session.id();
+        let principal = session.principal_binding();
+        let binding = runtime_legacy_binding(session_id);
+        let pending = Arc::new(PendingRequests::with_max_in_flight_for_exact_legacy(
+            server.max_bidirectional_requests_per_connection,
+        )?);
+        let runtime = LiveLegacy2024ConnectionRuntime::new(
+            SessionState::new(),
+            Arc::new(|_| {}),
+            None,
+            server.logging.level,
+        );
+        let invocation = Arc::new(Mutex::new(None));
+        let region_failure = Arc::new(Mutex::new(None));
+        let handler = NativeLegacyHandler {
+            server: Arc::clone(&server),
+            cx: cx.clone(),
+            session_id,
+            principal: principal.clone(),
+            runtime: runtime.clone(),
+            pending: Arc::clone(&pending),
+            output: Arc::clone(&lifetime.output),
+            invocation: Arc::clone(&invocation),
+            region_failure: Arc::clone(&region_failure),
+        };
+        let mut adapter = server
+            .install_legacy_2024_adapter(binding, handler)
+            .map_err(|_| McpError::internal_error("Native legacy adapter installation failed"))?;
+        let (sender, mut receiver) =
+            asupersync_mpsc::channel::<LegacyQueuedRequest>(MAX_DISPATCH_QUEUE_DEPTH);
+        let caller = cx.clone();
+        let admission = Arc::clone(&lifetime.admission);
+        let output = Arc::clone(&lifetime.output);
+        let work: RequestWork = Box::pin(async move {
+            while !admission.is_stopping() {
+                let queued = match receiver.recv(&caller).await {
+                    Ok(queued) => queued,
+                    Err(asupersync_mpsc::RecvError::Empty) => continue,
+                    Err(
+                        asupersync_mpsc::RecvError::Disconnected
+                        | asupersync_mpsc::RecvError::Cancelled,
+                    ) => break,
+                };
+                let LegacyQueuedRequest {
+                    request,
+                    invocation: current,
+                } = queued;
+                if current.owner.cancelled()
+                    || admission.begin_modern_dispatch(request.id.as_ref())
+                        != ModernDispatchStart::Ready
+                {
+                    continue;
+                }
+                let budget = current
+                    .owner
+                    .legacy
+                    .as_ref()
+                    .expect("legacy output owner")
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .budget
+                    .expect("legacy admission budget");
+                // Queue residence consumes the original admission budget,
+                // including for adapter-owned lifecycle and logging methods.
+                if let Some(error) = Server::request_budget_error(&caller, budget) {
+                    current.owner.reservation.cancellation.cancel();
+                    if let Some(id) = request.id {
+                        output.enqueue(
+                            JsonRpcMessage::Response(JsonRpcResponse::error(
+                                Some(id),
+                                JsonRpcError {
+                                    code: error.code.into(),
+                                    message: error.message,
+                                    data: error.data,
+                                },
+                            )),
+                            Some(current.owner),
+                        );
+                    }
+                    continue;
+                }
+                *invocation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(current.clone());
+                let response = legacy_adapter_response_async(&mut adapter, binding, &request).await;
+                invocation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let failure = region_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(failure) = failure {
+                    let _ = adapter.close(binding);
+                    return Err(failure);
+                }
+                sync_live_legacy_runtime_from_adapter(&runtime, &adapter);
+                match response {
+                    Ok(Some(response)) => {
+                        output.enqueue(JsonRpcMessage::Response(response), Some(current.owner));
+                    }
+                    Ok(None) => {}
+                    // An invalid notification has no response. The exact
+                    // adapter preserves its lifecycle for the next frame.
+                    Err(error) if (-32602..=-32600).any(|code| error.code() == &code.into()) => {}
+                    Err(_) => {
+                        let _ = adapter.close(binding);
+                        return Err(server_run_error(
+                            "dispatch",
+                            "legacy_adapter",
+                            "Native legacy adapter dispatch failed",
+                        ));
+                    }
+                }
+            }
+            adapter.close(binding).map_err(|_| {
+                server_run_error(
+                    "shutdown",
+                    "legacy_adapter",
+                    "Native legacy adapter did not close",
+                )
+            })?;
+            Ok(())
+        });
+        Ok((
+            Self {
+                sender: Some(sender),
+                pending,
+                principal,
+            },
+            work,
+        ))
+    }
+
+    fn authenticate(
+        &self,
+        server: &Server,
+        cx: &Cx,
+        budget: Budget,
+        request: &mut JsonRpcRequest,
+    ) -> McpResult<AuthAdmissionReceipt> {
+        Server::enforce_request_budget(cx, budget)?;
+        let (request_ctx, _request_lease_guard) =
+            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
+                .with_budget_ceiling(budget)
+                .begin_request_scope()
+                .ok_or_else(|| {
+                    McpError::internal_error("request scope could not be established")
+                })?;
+        let (fingerprint, authenticated) = server.authenticate_request_without_commit(
+            &request_ctx,
+            AuthRequest {
+                method: &request.method,
+                params: request.params.as_ref(),
+                transport_authorization: None,
+                request_id: request_id_to_u64(request.id.as_ref()),
+            },
+        )?;
+        Server::enforce_request_context(&request_ctx)?;
+        bind_connection_principal(&self.principal, fingerprint)?;
+        auth::strip_recognized_access_credentials(&mut request.params);
+        Ok(AuthAdmissionReceipt {
+            method: request.method.clone(),
+            request_id: request.id.clone(),
+            sanitized_params: request.params.clone(),
+            fingerprint,
+            authenticated,
+        })
+    }
+
+    fn admit(
+        &self,
+        lifetime: &ConnectionLifetime,
+        cx: &Cx,
+        frame: ReceivedTransportFrame,
+    ) -> McpResult<()> {
+        let mut request = match frame.into_message() {
+            JsonRpcMessage::Response(response) => {
+                return match self.pending.route_response_with_disposition(&response) {
+                    bidirectional::PendingResponseDisposition::Unmatched => Err(server_run_error(
+                        "receive",
+                        "legacy_response",
+                        "Native legacy connection received an unowned response",
+                    )),
+                    bidirectional::PendingResponseDisposition::Delivered
+                    | bidirectional::PendingResponseDisposition::Rejected
+                    | bidirectional::PendingResponseDisposition::RetiredGeneric => Ok(()),
+                };
+            }
+            JsonRpcMessage::Request(request) => request,
+        };
+        if request.validate().is_err() {
+            if let Some(id) = request.id {
+                lifetime
+                    .output
+                    .enqueue(error_response(Some(id), -32600, "Invalid Request"), None);
+            }
+            return Ok(());
+        }
+        if !admit_legacy_envelope(&lifetime.output, &request) {
+            return Ok(());
+        }
+        if request.id.is_none() && request.method == "notifications/cancelled" {
+            if let Ok(cancellation) = lifetime.server.authenticate_cancelled_control_notification(
+                cx,
+                &self.principal,
+                ProtocolEra::Legacy2024,
+                &mut request,
+                None,
+            ) {
+                if lifetime
+                    .admission
+                    .cancel_reserved(Server::cancellation_wire_request_id(&cancellation))
+                    == DispatchCancellationDisposition::Accepted
+                {
+                    self.pending.cancel_cancelled();
+                    lifetime.output.discard_cancelled();
+                }
+            }
+            return Ok(());
+        }
+        // Reuse the bounded ID/count/byte reservation, including initialize's
+        // protection from peer cancellation, without invoking modern dispatch.
+        let mut reservation = match lifetime
+            .admission
+            .admit_modern_request(&request, Arc::new(AtomicBool::new(false)))
+        {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if let Some(id) = request.id {
+                    lifetime.output.enqueue(
+                        JsonRpcMessage::Response(JsonRpcResponse::error(Some(id), error)),
+                        None,
+                    );
+                }
+                return Ok(());
+            }
+        };
+        // Authentication retains one sanitized parameter document beside the
+        // queued request. All later clones share that receipt through Arc.
+        let receipt_bytes = reservation.serialized_bytes;
+        if !lifetime.admission.reserve_queued_bytes(receipt_bytes) {
+            if let Some(id) = request.id {
+                lifetime.output.enqueue(
+                    error_response(
+                        Some(id),
+                        RESOURCE_EXHAUSTED_ERROR_CODE,
+                        DISPATCH_QUEUE_CAPACITY_MESSAGE,
+                    ),
+                    None,
+                );
+            }
+            return Ok(());
+        }
+        reservation.serialized_bytes += receipt_bytes;
+        let budget = lifetime.server.create_request_budget(cx);
+        let owner = Arc::new(OutputOwner {
+            reservation,
+            log_level: None,
+            legacy: Some(Mutex::new(LegacyOutputState {
+                budget: Some(budget),
+                active: None,
+            })),
+        });
+        let authentication = match self.authenticate(&lifetime.server, cx, budget, &mut request) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(id) = request.id {
+                    let error = mask_peer_error(error, lifetime.server.mask_error_details);
+                    lifetime.output.enqueue(
+                        JsonRpcMessage::Response(JsonRpcResponse::error(
+                            Some(id),
+                            JsonRpcError {
+                                code: error.code.into(),
+                                message: error.message,
+                                data: error.data,
+                            },
+                        )),
+                        Some(owner),
+                    );
+                }
+                return Ok(());
+            }
+        };
+        let sender = self.sender.as_ref().ok_or_else(|| {
+            server_run_error("receive", "legacy_closed", "Native legacy input is closed")
+        })?;
+        sender
+            .try_send(LegacyQueuedRequest {
+                request,
+                invocation: LegacyInvocation {
+                    owner,
+                    authentication: Arc::new(authentication),
+                },
+            })
+            .map_err(|_| {
+                server_run_error(
+                    "receive",
+                    "legacy_capacity",
+                    "Native legacy dispatch queue could not accept an admitted frame",
+                )
+            })
+    }
+
+    fn finish_input(&mut self) {
+        // Dropping the only producer lets FIFO notifications and already
+        // admitted calls drain, then terminates the otherwise waiting worker.
+        self.sender.take();
+        self.pending.cancel_all();
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl Drop for LegacyIngress {
+    fn drop(&mut self) {
+        self.finish_input();
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+struct NativeLegacyHandler {
+    server: Arc<Server>,
+    cx: Cx,
+    session_id: u64,
+    principal: SessionPrincipalBinding,
+    runtime: LiveLegacy2024ConnectionRuntime,
+    pending: Arc<PendingRequests>,
+    output: Arc<OutputQueue>,
+    invocation: Arc<Mutex<Option<LegacyInvocation>>>,
+    region_failure: Arc<Mutex<Option<McpError>>>,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl NativeLegacyHandler {
+    fn fail_region(&self, kind: &'static str, message: &'static str) -> Legacy2024HandlerError {
+        *self
+            .region_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(server_run_error("dispatch", kind, message));
+        Legacy2024HandlerError::new(message)
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl Legacy2024Handler for NativeLegacyHandler {
+    fn handle_legacy_2024(
+        &mut self,
+        _method: &'static str,
+        _params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, Legacy2024HandlerError> {
+        Err(live_legacy_sync_dispatch_refused())
+    }
+
+    fn handle_legacy_2024_with_request_id_async<'a>(
+        &'a mut self,
+        request_id: &'a serde_json::Value,
+        method: &'static str,
+        params: Option<&'a serde_json::Value>,
+    ) -> BoxFuture<'a, Result<serde_json::Value, Legacy2024HandlerError>> {
+        Box::pin(async move {
+            let current = self
+                .invocation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| {
+                    Legacy2024HandlerError::new("Native legacy request admission is absent")
+                })?;
+            let request_id =
+                serde_json::from_value::<RequestId>(request_id.clone()).map_err(|_| {
+                    Legacy2024HandlerError::new("legacy adapter supplied an invalid request ID")
+                })?;
+            let request = JsonRpcRequest::new(method, params.cloned(), request_id);
+            let budget = current
+                .owner
+                .legacy
+                .as_ref()
+                .expect("legacy output owner")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .budget
+                .expect("legacy admission budget");
+            // The admission task retains a pending mint even if the owning
+            // connection is dropped; raw open_child_region lacks that custody.
+            let region = region::open(&self.cx, budget)
+                .map_err(|_| {
+                    self.fail_region("region_open", "Legacy request region admission failed")
+                })?
+                .await
+                .map_err(|_| {
+                    self.fail_region("region_open", "Legacy request region could not be opened")
+                })?;
+            let request_cx = region.cx().clone();
+            let mut runtime = self.runtime.clone();
+            runtime.notification_sender = {
+                let output = Arc::clone(&self.output);
+                let owner = Arc::clone(&current.owner);
+                Arc::new(move |notification| {
+                    output.enqueue(
+                        JsonRpcMessage::Request(notification),
+                        Some(Arc::clone(&owner)),
+                    );
+                })
+            };
+            runtime.request_sender = Some(RequestSender::new(Arc::clone(&self.pending), {
+                let output = Arc::clone(&self.output);
+                let owner = Arc::clone(&current.owner);
+                Arc::new(move |message| {
+                    // A dropped in-flight reverse request must still cancel
+                    // its peer waiter when its parent was cancelled. Admit
+                    // only this trusted, era-checked control without an owner;
+                    // application requests/logs/results keep ordinary custody.
+                    let cleanup = matches!(message, JsonRpcMessage::Request(notification)
+                        if CancellationWireMessage::decode(
+                            ProtocolEra::Legacy2024,
+                            CancellationSender::Server,
+                            notification,
+                        ).is_ok());
+                    if (!cleanup && owner.suppresses_message(message)) || !output.accepts_output() {
+                        return Err("Native legacy output is closed".to_owned());
+                    }
+                    if output.enqueue(
+                        message.clone(),
+                        if cleanup {
+                            None
+                        } else {
+                            Some(Arc::clone(&owner))
+                        },
+                    ) {
+                        Ok(())
+                    } else {
+                        Err("Native legacy output is closed".to_owned())
+                    }
+                })
+            }));
+            let cancellation = current.owner.reservation.cancellation();
+            let mut interrupted = false;
+            let dispatch = {
+                let mut cancelled = pin!(cancellation.cancelled());
+                let mut deadline = budget
+                    .deadline
+                    .map(|deadline| Box::pin(Sleep::new(deadline)));
+                let mut dispatch = pin!(self.server.dispatch_legacy_2024(
+                    &request_cx,
+                    self.session_id,
+                    &self.principal,
+                    Some(&runtime),
+                    Some(cancellation.clone()),
+                    &request,
+                    Some(current.authentication.as_ref()),
+                    None,
+                ));
+                poll_fn(|task| {
+                    let _caller = Cx::set_current(Some(request_cx.clone()));
+                    if self.cx.checkpoint().is_err()
+                        || cancellation.is_cancel_requested()
+                        || cancelled.as_mut().poll(task).is_ready()
+                    {
+                        cancellation.cancel();
+                        interrupted = true;
+                        return Poll::Ready(Err(McpError::request_cancelled()));
+                    }
+                    if deadline
+                        .as_mut()
+                        .is_some_and(|deadline| deadline.as_mut().poll(task).is_ready())
+                    {
+                        cancellation.cancel();
+                        interrupted = true;
+                        return Poll::Ready(Err(McpError::new(
+                            McpErrorCode::RequestCancelled,
+                            "Request timeout exceeded",
+                        )));
+                    }
+                    dispatch.as_mut().poll(task)
+                })
+                .await
+            };
+            // The dispatch future and its reverse-request guards were dropped
+            // above. Quiesce its child before handing any result to the adapter.
+            if cancellation.is_cancel_requested() {
+                self.output.discard_cancelled();
+            }
+            if interrupted || cancellation.is_cancel_requested() || self.cx.checkpoint().is_err() {
+                if region
+                    .cancel(asupersync::CancelReason::new(asupersync::CancelKind::User))
+                    .is_err()
+                {
+                    self.fail_region("region_cancel", "Legacy request region cancellation failed");
+                }
+            }
+            region.close().await.map_err(|_| {
+                self.fail_region("region_close", "Legacy request region did not close")
+            })?;
+            let LiveLegacy2024Dispatch {
+                result,
+                active_request,
+            } = dispatch.map_err(|error| {
+                legacy_handler_error_from_mcp(error, self.server.mask_error_details)
+            })?;
+            current
+                .owner
+                .legacy
+                .as_ref()
+                .expect("legacy output owner")
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active = Some(active_request);
+            result.map_err(|error| {
+                legacy_handler_error_from_mcp(error, self.server.mask_error_details)
+            })
+        })
+    }
+}
+
+enum ConnectionAdmission {
+    Continue(Option<RequestWork>),
+    #[cfg(feature = "legacy-2024-11-05")]
+    Close,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+enum NativeProtocol {
+    Modern,
+    Opening(StdioEraClassifier),
+    Legacy(LegacyIngress),
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl NativeProtocol {
+    fn new(policy: ProtocolPolicy) -> Self {
+        if policy == ProtocolPolicy::ModernOnly {
+            Self::Modern
+        } else {
+            Self::Opening(StdioEraClassifier::new(policy))
+        }
+    }
+
+    fn needs_opening(&self) -> bool {
+        matches!(self, Self::Opening(_))
+    }
+
+    fn finish_input(&mut self) {
+        if let Self::Legacy(legacy) = self {
+            legacy.finish_input();
+        }
+    }
+
+    fn has_modern_marker(request: &JsonRpcRequest) -> bool {
+        request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|metadata| {
+                metadata
+                    .keys()
+                    .any(|key| key.starts_with("io.modelcontextprotocol/"))
+            })
+    }
+
+    fn has_valid_modern_metadata(request: &JsonRpcRequest) -> bool {
+        let Some(metadata) = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+        else {
+            return false;
+        };
+        if serde_json::from_value::<fastmcp_protocol::FinalRequestMeta>(metadata.clone()).is_err() {
+            return false;
+        }
+        // FinalRequestMeta retains additional fields without validating their
+        // reserved values. Apply the common metadata admission as well, so a
+        // malformed log level, key, or trace field cannot select an era and
+        // keep a connection open after a terminal opening error. Version support
+        // remains a separate check after this structural admission.
+        let Ok(metadata) = serde_json::from_value::<OpenMetadata>(metadata.clone()) else {
+            return false;
+        };
+        fastmcp_protocol::common_types::TraceContext::try_from_metadata(&metadata).is_ok()
+    }
+
+    fn refuse_opening(
+        lifetime: &ConnectionLifetime,
+        request: &JsonRpcRequest,
+        malformed_metadata: bool,
+    ) {
+        if malformed_metadata {
+            if let Some(id) = &request.id {
+                lifetime.output.enqueue(
+                    error_response(
+                        Some(id.clone()),
+                        -32602,
+                        "Opening request requires complete valid modern metadata",
+                    ),
+                    None,
+                );
+            }
+        } else if let Some(response) =
+            era_admission_refusal(lifetime.server.protocol_policy, request)
+        {
+            lifetime
+                .output
+                .enqueue(JsonRpcMessage::Response(response), None);
+        }
+    }
+
+    fn prepare(
+        &mut self,
+        lifetime: &ConnectionLifetime,
+        cx: &Cx,
+        frame: ReceivedTransportFrame,
+    ) -> McpResult<ConnectionAdmission> {
+        if let Self::Opening(classifier) = self {
+            let JsonRpcMessage::Request(request) = frame.message() else {
+                return Ok(ConnectionAdmission::Close);
+            };
+            if request.id.is_none() {
+                return Ok(ConnectionAdmission::Close);
+            }
+            if request.validate().is_err() {
+                lifetime.output.enqueue(
+                    error_response(request.id.clone(), -32600, "Invalid Request"),
+                    None,
+                );
+                return Ok(ConnectionAdmission::Close);
+            }
+            let modern_marker = Self::has_modern_marker(request);
+            let legacy_initialize = request.method == "initialize" && !modern_marker;
+            if lifetime.server.protocol_policy == ProtocolPolicy::LegacyOnly && !legacy_initialize {
+                Self::refuse_opening(lifetime, request, false);
+                return Ok(ConnectionAdmission::Close);
+            }
+            if request.method == "initialize" && modern_marker {
+                Self::refuse_opening(lifetime, request, false);
+                return Ok(ConnectionAdmission::Close);
+            }
+            if legacy_initialize {
+                // The shared classifier identifies an initialize envelope;
+                // native Auto additionally requires a complete exact opening
+                // before installing its adapter or binding authentication.
+                if !admit_legacy_envelope(&lifetime.output, request) {
+                    return Ok(ConnectionAdmission::Close);
+                }
+                if request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("protocolVersion"))
+                    .and_then(serde_json::Value::as_str)
+                    != Some(LEGACY_PROTOCOL_VERSION)
+                {
+                    Self::refuse_opening(lifetime, request, false);
+                    return Ok(ConnectionAdmission::Close);
+                }
+            } else if !modern_marker || !Self::has_valid_modern_metadata(request) {
+                Self::refuse_opening(lifetime, request, modern_marker);
+                return Ok(ConnectionAdmission::Close);
+            }
+            let era = match classify_initial_stdio_envelope(classifier, frame.message()) {
+                Ok(era) => era,
+                Err(decision) if opening_rejection_selected_modern(&decision) => {
+                    ProtocolEra::Modern2026
+                }
+                Err(_) => {
+                    Self::refuse_opening(lifetime, request, false);
+                    return Ok(ConnectionAdmission::Close);
+                }
+            };
+            match era {
+                ProtocolEra::Modern2026 => *self = Self::Modern,
+                ProtocolEra::Legacy2024 => {
+                    let (legacy, work) = LegacyIngress::install(lifetime, cx)?;
+                    legacy.admit(lifetime, cx, frame)?;
+                    *self = Self::Legacy(legacy);
+                    return Ok(ConnectionAdmission::Continue(Some(work)));
+                }
+            }
+        }
+        match self {
+            Self::Modern => prepare_request(lifetime, cx, frame).map(ConnectionAdmission::Continue),
+            Self::Legacy(legacy) => {
+                if let JsonRpcMessage::Request(request) = frame.message()
+                    && Self::has_modern_marker(request)
+                {
+                    Self::refuse_opening(lifetime, request, false);
+                    return Ok(ConnectionAdmission::Close);
+                }
+                legacy.admit(lifetime, cx, frame)?;
+                Ok(ConnectionAdmission::Continue(None))
+            }
+            Self::Opening(_) => unreachable!("opening selected a protocol above"),
+        }
+    }
+}
+
 enum Event<R, W> {
     Read(R, Result<ReceivedTransportFrame, TransportError>),
     Written(W, Result<(), TransportError>, usize),
@@ -731,21 +1804,25 @@ impl ConnectionSchedule {
         let mut lane = self.next_lane;
         for _ in 0..3 {
             let event = match lane {
-                ConnectionLane::Ingress if !stopping => reading.as_mut().and_then(|reading| {
-                    match reading.as_mut().poll(task) {
-                        Poll::Ready((reader, result)) => Some(Event::Read(reader, result)),
-                        Poll::Pending => None,
-                    }
-                }),
+                ConnectionLane::Ingress if !stopping => {
+                    reading
+                        .as_mut()
+                        .and_then(|reading| match reading.as_mut().poll(task) {
+                            Poll::Ready((reader, result)) => Some(Event::Read(reader, result)),
+                            Poll::Pending => None,
+                        })
+                }
                 ConnectionLane::Requests => self.poll_request(task, requests),
-                ConnectionLane::Egress => writing.as_mut().and_then(|writing| {
-                    match writing.as_mut().poll(task) {
-                        Poll::Ready((writer, result, bytes)) => {
-                            Some(Event::Written(writer, result, bytes))
-                        }
-                        Poll::Pending => None,
-                    }
-                }),
+                ConnectionLane::Egress => {
+                    writing
+                        .as_mut()
+                        .and_then(|writing| match writing.as_mut().poll(task) {
+                            Poll::Ready((writer, result, bytes)) => {
+                                Some(Event::Written(writer, result, bytes))
+                            }
+                            Poll::Pending => None,
+                        })
+                }
                 ConnectionLane::Ingress => None,
             };
             if let Some(event) = event {
@@ -940,17 +2017,14 @@ mod schedule_tests {
             assert_eq!(lane, 1);
             drop(requests.swap_remove(index.unwrap()));
         }
-        assert!(schedule
-            .poll(&mut task, &mut reading, &mut writing, &mut requests, false)
-            .is_pending());
+        assert!(
+            schedule
+                .poll(&mut task, &mut reading, &mut writing, &mut requests, false)
+                .is_pending()
+        );
         requests.push(request_ready());
-        let (lane, index) = selected(schedule.poll(
-            &mut task,
-            &mut reading,
-            &mut writing,
-            &mut requests,
-            false,
-        ));
+        let (lane, index) =
+            selected(schedule.poll(&mut task, &mut reading, &mut writing, &mut requests, false));
         assert_eq!((lane, index), (1, Some(0)));
     }
 
@@ -964,13 +2038,7 @@ mod schedule_tests {
         let mut requests = vec![request_ready()];
         let mut task = Context::from_waker(Waker::noop());
         assert_eq!(
-            selected(schedule.poll(
-                &mut task,
-                &mut reading,
-                &mut writing,
-                &mut requests,
-                true,
-            )),
+            selected(schedule.poll(&mut task, &mut reading, &mut writing, &mut requests, true,)),
             (1, Some(0)),
         );
     }
@@ -1000,23 +2068,23 @@ mod schedule_tests {
         let slots: [WakerSlot; 4] = std::array::from_fn(|_| Arc::new(Mutex::new(None)));
         let mut reading: Option<ReadWork<()>> = Some(pending_with_waker(&slots[0]));
         let mut writing: Option<WriteWork<()>> = Some(pending_with_waker(&slots[1]));
-        let mut requests: Vec<RequestWork> = vec![
-            pending_with_waker(&slots[2]),
-            pending_with_waker(&slots[3]),
-        ];
+        let mut requests: Vec<RequestWork> =
+            vec![pending_with_waker(&slots[2]), pending_with_waker(&slots[3])];
         let old = Arc::new(WakeCount::default());
         let current = Arc::new(WakeCount::default());
         for counter in [&old, &current] {
             let waker = Waker::from(Arc::clone(counter));
-            assert!(schedule
-                .poll(
-                    &mut Context::from_waker(&waker),
-                    &mut reading,
-                    &mut writing,
-                    &mut requests,
-                    false,
-                )
-                .is_pending());
+            assert!(
+                schedule
+                    .poll(
+                        &mut Context::from_waker(&waker),
+                        &mut reading,
+                        &mut writing,
+                        &mut requests,
+                        false,
+                    )
+                    .is_pending()
+            );
             assert!(slots.iter().all(|slot| slot.lock().unwrap().is_some()));
         }
         for slot in &slots {
@@ -1048,18 +2116,26 @@ impl Server {
         }
     }
 
-    /// Serves a ModernOnly NDJSON connection on caller-owned asynchronous I/O.
+    /// Serves an NDJSON connection on caller-owned asynchronous I/O.
     ///
     /// Ingress, bounded concurrent requests, subscriptions, and backpressured
-    /// egress all progress on the caller's asupersync runtime. Every request
-    /// owns a child region; this function creates no runtime, thread, or
+    /// egress all progress on the caller's asupersync runtime. Every application
+    /// dispatch owns a child region; this function creates no runtime, thread, or
     /// blocking-pool job. Use native nonblocking pipe/socket handles: supplying
     /// an adapter that blocks in `poll_read` or `poll_write` does not make that
     /// adapter asynchronous. Own-process/child-process handle construction is
     /// the embedding's responsibility.
     ///
-    /// The builder must select [`ProtocolPolicy::ModernOnly`]. This binding is
-    /// fixed before input and does not perform a legacy probe or fallback.
+    /// [`ProtocolPolicy::ModernOnly`] fixes the final era before input. With
+    /// `legacy-2024-11-05`, the ordinary [`ProtocolPolicy::Auto`] builder selects
+    /// the era from one complete opening request, and [`ProtocolPolicy::LegacyOnly`]
+    /// accepts only exact MCP 2024-11-05 initialization. Invalid or ambiguous
+    /// opening traffic closes the connection after any role-correct refusal;
+    /// the selected era never changes. A well-formed unsupported modern version
+    /// selects modern and retains the ordinary per-request version refusal.
+    /// Exact-2024 lifecycle and application calls run in bounded FIFO order;
+    /// ingress continues delivering reverse replies and peer cancellation while
+    /// a legacy handler is suspended. The no-legacy profile requires ModernOnly.
     /// Per-request authentication, raw-parameter admission, middleware, Tasks,
     /// MRTR, and subscription dispatch use the same server implementation as
     /// the other modern entrypoints.
@@ -1067,7 +2143,7 @@ impl Server {
     /// caller's context, independent of the ordinary handler timeout. Client
     /// subscription idle and reconnection policy remains client-owned.
     ///
-    /// Cancellation suppresses every queued frame for its request. Cancelling
+    /// Peer cancellation suppresses every queued frame for its request. Cancelling
     /// an already partially written frame terminates the connection; a frame
     /// whose flush has completed is committed. Each write has a finite commit
     /// deadline and output retention shares the dispatch count/byte ceilings.
@@ -1094,11 +2170,12 @@ impl Server {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         if self.protocol_policy != ProtocolPolicy::ModernOnly {
             return Err(server_run_error(
                 "startup",
                 "protocol_policy",
-                "Async stdio requires ModernOnly policy",
+                "Async stdio legacy policies require the legacy-2024-11-05 feature",
             ));
         }
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
@@ -1315,7 +2392,20 @@ impl Server {
             output: Arc::new(OutputQueue::default()),
             binding,
         };
+        #[cfg(feature = "legacy-2024-11-05")]
+        let mut protocol = NativeProtocol::new(
+            if matches!(lifetime.binding.transport, InboundRequestTransport::Stdio) {
+                server.protocol_policy
+            } else {
+                // Memory and WebSocket retain their existing ModernOnly binding.
+                ProtocolPolicy::ModernOnly
+            },
+        );
         let mut reading = Some(receive(reader, cx.clone()));
+        // A terminal opening refusal must retain the receive half until its
+        // response drains: dropping native stdio's reader closes the shared
+        // transport terminal and would otherwise suppress the queued error.
+        let mut dormant_reader: Option<R> = None;
         let mut available_writer = Some(writer);
         let mut writing: Option<WriteWork<W>> = None;
         let mut requests: Vec<RequestWork> = Vec::new();
@@ -1379,13 +2469,9 @@ impl Server {
                         return Poll::Ready(Event::DrainExpired);
                     }
                 }
-                if let Poll::Ready(event) = schedule.poll(
-                    task,
-                    &mut reading,
-                    &mut writing,
-                    &mut requests,
-                    stopping,
-                ) {
+                if let Poll::Ready(event) =
+                    schedule.poll(task, &mut reading, &mut writing, &mut requests, stopping)
+                {
                     return Poll::Ready(event);
                 }
                 if !stopping && writing.is_none() && lifetime.output.has_frames() {
@@ -1399,18 +2485,41 @@ impl Server {
                 Event::Read(reader, result) => {
                     reading = None;
                     match result {
-                        Ok(frame) => match prepare_request(&lifetime, cx, frame) {
-                            Ok(work) => {
-                                if let Some(work) = work {
-                                    requests.push(work);
+                        Ok(frame) => {
+                            #[cfg(feature = "legacy-2024-11-05")]
+                            let admission = protocol.prepare(&lifetime, cx, frame);
+                            #[cfg(not(feature = "legacy-2024-11-05"))]
+                            let admission = prepare_request(&lifetime, cx, frame)
+                                .map(ConnectionAdmission::Continue);
+                            match admission {
+                                Ok(ConnectionAdmission::Continue(work)) => {
+                                    if let Some(work) = work {
+                                        requests.push(work);
+                                    }
+                                    reading = Some(receive(reader, cx.clone()));
                                 }
-                                reading = Some(receive(reader, cx.clone()));
+                                #[cfg(feature = "legacy-2024-11-05")]
+                                Ok(ConnectionAdmission::Close) => {
+                                    dormant_reader = Some(reader);
+                                    error.get_or_insert(server_run_error(
+                                        "receive",
+                                        "protocol_era",
+                                        "Native connection rejected protocol-era traffic",
+                                    ));
+                                    lifetime.admission.stop();
+                                    protocol.finish_input();
+                                    lifetime.output.discard_cancelled();
+                                    drain = Some(Box::pin(asupersync::time::sleep(
+                                        cx.now(),
+                                        DISPATCH_WORKER_SHUTDOWN_TIMEOUT,
+                                    )));
+                                }
+                                Err(failure) => {
+                                    error.get_or_insert(failure);
+                                    stop = true;
+                                }
                             }
-                            Err(failure) => {
-                                error.get_or_insert(failure);
-                                stop = true;
-                            }
-                        },
+                        }
                         Err(TransportError::Closed) => {
                             if matches!(
                                 lifetime.binding.transport,
@@ -1419,8 +2528,17 @@ impl Server {
                                 // Both are owned single connections with independent
                                 // receive/send halves. Input EOF must not discard
                                 // responses the peer is still waiting to receive.
-                                let _ = server.terminate_subscription_streams_for_shutdown();
-                                lifetime.admission.cancel_uncorrelated_modern_children();
+                                #[cfg(feature = "legacy-2024-11-05")]
+                                let modern = {
+                                    protocol.finish_input();
+                                    matches!(protocol, NativeProtocol::Modern)
+                                };
+                                #[cfg(not(feature = "legacy-2024-11-05"))]
+                                let modern = true;
+                                if modern {
+                                    let _ = server.terminate_subscription_streams_for_shutdown();
+                                    lifetime.admission.cancel_uncorrelated_modern_children();
+                                }
                                 drain = Some(Box::pin(asupersync::time::sleep(
                                     cx.now(),
                                     DISPATCH_WORKER_SHUTDOWN_TIMEOUT,
@@ -1433,24 +2551,50 @@ impl Server {
                             }
                         }
                         Err(TransportError::Cancelled) => stop = true,
-                        Err(failure) => match classify_receive_error(&failure) {
-                            ReceiveErrorDisposition::ReplyWithParseError => {
-                                lifetime
-                                    .output
-                                    .enqueue(error_response(None, -32700, "Parse error"), None);
-                                reading = Some(receive(reader, cx.clone()));
+                        Err(failure) => {
+                            #[cfg(feature = "legacy-2024-11-05")]
+                            let terminal_opening = protocol.needs_opening();
+                            #[cfg(not(feature = "legacy-2024-11-05"))]
+                            let terminal_opening = false;
+                            match classify_receive_error(&failure) {
+                                ReceiveErrorDisposition::ReplyWithParseError => {
+                                    lifetime
+                                        .output
+                                        .enqueue(error_response(None, -32700, "Parse error"), None);
+                                    if terminal_opening {
+                                        dormant_reader = Some(reader);
+                                    } else {
+                                        reading = Some(receive(reader, cx.clone()));
+                                    }
+                                }
+                                ReceiveErrorDisposition::ReplyWithInvalidRequest(id) => {
+                                    lifetime.output.enqueue(
+                                        error_response(id, -32600, "Invalid Request"),
+                                        None,
+                                    );
+                                    if terminal_opening {
+                                        dormant_reader = Some(reader);
+                                    } else {
+                                        reading = Some(receive(reader, cx.clone()));
+                                    }
+                                }
+                                ReceiveErrorDisposition::Terminate => {
+                                    error.get_or_insert(transport_run_error("receive", &failure));
+                                    stop = true;
+                                }
                             }
-                            ReceiveErrorDisposition::ReplyWithInvalidRequest(id) => {
-                                lifetime
-                                    .output
-                                    .enqueue(error_response(id, -32600, "Invalid Request"), None);
-                                reading = Some(receive(reader, cx.clone()));
+                            if terminal_opening && !stop {
+                                error.get_or_insert(server_run_error(
+                                    "receive",
+                                    "protocol_opening",
+                                    "Native connection opening frame was malformed",
+                                ));
+                                drain = Some(Box::pin(asupersync::time::sleep(
+                                    cx.now(),
+                                    DISPATCH_WORKER_SHUTDOWN_TIMEOUT,
+                                )));
                             }
-                            ReceiveErrorDisposition::Terminate => {
-                                error.get_or_insert(transport_run_error("receive", &failure));
-                                stop = true;
-                            }
-                        },
+                        }
                     }
                 }
                 Event::Written(writer, result, bytes) => {
@@ -1500,11 +2644,14 @@ impl Server {
             if stop && !stopping {
                 stopping = true;
                 lifetime.admission.stop();
+                #[cfg(feature = "legacy-2024-11-05")]
+                protocol.finish_input();
                 lifetime.connection.disconnect();
                 lifetime.output.stop();
                 reading = None;
                 writing = None;
                 available_writer = None;
+                drop(dormant_reader.take());
                 drain = None;
             }
             // A peer continuously supplying complete frames must not monopolize
@@ -1532,6 +2679,7 @@ impl Server {
                 }
             }
         }
+        drop(dormant_reader);
         drop(lifetime);
         (error.map_or(Ok(()), Err), request_regions_quiescent)
     }
@@ -1547,6 +2695,270 @@ mod tests {
     use fastmcp_protocol::{Content, Tool};
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Waker};
+
+    mod output_cancellation {
+        use super::*;
+        use std::task::Wake;
+
+        fn owner(admission: &Arc<DispatchQueueState>, id: i64) -> Arc<OutputOwner> {
+            let JsonRpcMessage::Request(request) = discover(id) else {
+                unreachable!()
+            };
+            Arc::new(OutputOwner {
+                reservation: admission
+                    .admit_modern_request(&request, Arc::new(AtomicBool::new(false)))
+                    .expect("one bounded request reservation"),
+                log_level: None,
+                #[cfg(feature = "legacy-2024-11-05")]
+                legacy: None,
+            })
+        }
+
+        fn response(id: i64) -> JsonRpcMessage {
+            JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(id),
+                serde_json::json!({"resultType": "complete"}),
+            ))
+        }
+
+        fn progress(value: usize) -> JsonRpcMessage {
+            JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/progress",
+                Some(serde_json::json!({"progressToken": 7, "progress": value})),
+            ))
+        }
+
+        fn retained(queue: &OutputQueue) -> (usize, usize, usize) {
+            let state = queue.state.lock().unwrap();
+            (
+                state.frames.len(),
+                state.retained_frames,
+                state.retained_bytes,
+            )
+        }
+
+        #[test]
+        fn cancellation_reclaims_capacity_behind_an_unrelated_blocked_write() {
+            for cancelled in [false, true] {
+                let admission = Arc::new(DispatchQueueState::default());
+                let pending = owner(&admission, 7);
+                let queue = OutputQueue::default();
+                queue.enqueue(response(1), None);
+                let writing = queue.pop().unwrap();
+                for value in 0..MAX_DISPATCH_QUEUE_DEPTH - 1 {
+                    queue.enqueue(progress(value), Some(Arc::clone(&pending)));
+                }
+                assert!(queue.failure().is_none());
+                assert_eq!(retained(&queue).1, MAX_DISPATCH_QUEUE_DEPTH);
+                if cancelled {
+                    pending.reservation.cancellation.cancel();
+                }
+                let reclaimed = queue.discard_cancelled();
+                if cancelled {
+                    assert_eq!(reclaimed, MAX_DISPATCH_QUEUE_DEPTH - 1);
+                    assert_eq!(retained(&queue), (0, 1, writing.bytes));
+                } else {
+                    assert_eq!(reclaimed, 0);
+                }
+                // Only the cancellation bit differs. No peer drain, output
+                // completion, or increased limit creates capacity here.
+                queue.enqueue(response(9), None);
+                assert_eq!(queue.failure().is_none(), cancelled);
+                if cancelled {
+                    let next = queue.pop().unwrap();
+                    assert!(matches!(next.message, JsonRpcMessage::Response(ref result)
+                        if result.id == Some(RequestId::Number(9))));
+                    queue.finish(next.bytes);
+                    assert_eq!(retained(&queue), (0, 1, writing.bytes));
+                } else {
+                    assert_eq!(queue.failure(), Some("output_capacity"));
+                }
+                queue.finish(writing.bytes);
+            }
+        }
+
+        #[test]
+        fn reclamation_preserves_live_and_ownerless_fifo_and_exact_byte_charges() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let cancelled = owner(&admission, 1);
+            let live = owner(&admission, 3);
+            let queue = OutputQueue::default();
+            queue.enqueue(progress(1), Some(Arc::clone(&cancelled)));
+            queue.enqueue(response(2), None);
+            queue.enqueue(response(3), Some(Arc::clone(&live)));
+            queue.enqueue(progress(4), Some(Arc::clone(&cancelled)));
+            queue.enqueue(response(5), None);
+            let expected_bytes = {
+                let state = queue.state.lock().unwrap();
+                state
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| matches!(*index, 1 | 2 | 4))
+                    .map(|(_, frame)| frame.bytes)
+                    .sum::<usize>()
+            };
+            cancelled.reservation.cancellation.cancel();
+            assert_eq!(queue.discard_cancelled(), 2);
+            assert_eq!(retained(&queue), (3, 3, expected_bytes));
+            assert!(!live.cancelled());
+            for id in [2, 3, 5] {
+                let frame = queue.pop().unwrap();
+                assert!(matches!(frame.message, JsonRpcMessage::Response(ref result)
+                    if result.id == Some(RequestId::Number(id))));
+                queue.finish(frame.bytes);
+            }
+            assert_eq!(retained(&queue), (0, 0, 0));
+            assert_eq!(queue.discard_cancelled(), 0);
+        }
+
+        #[test]
+        fn reclamation_does_not_release_or_reclassify_the_in_flight_frame() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let pending = owner(&admission, 7);
+            let queue = OutputQueue::default();
+            queue.enqueue(progress(1), Some(Arc::clone(&pending)));
+            queue.enqueue(progress(2), Some(Arc::clone(&pending)));
+            let writing = queue.pop().unwrap();
+            pending.reservation.cancellation.cancel();
+            assert_eq!(queue.discard_cancelled(), 1);
+            assert_eq!(retained(&queue), (0, 1, writing.bytes));
+            assert!(writing.owner.as_ref().unwrap().cancelled());
+            // The existing writer still owns cancellation/partial-write
+            // handling and must perform its one final capacity release.
+            queue.finish(writing.bytes);
+            assert_eq!(retained(&queue), (0, 0, 0));
+            assert_eq!(queue.discard_cancelled(), 0);
+        }
+
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn reclamation_drops_the_last_reservation_and_wakes_the_queue_observer() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let pending = owner(&admission, 7);
+            let weak = Arc::downgrade(&pending);
+            let queue = OutputQueue::default();
+            queue.enqueue(progress(1), Some(Arc::clone(&pending)));
+            pending.reservation.cancellation.cancel();
+            drop(pending);
+            assert!(weak.upgrade().is_some());
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task = Context::from_waker(&waker);
+            let mut changed = pin!(queue.changed.notified());
+            assert!(changed.as_mut().poll(&mut task).is_pending());
+            assert_eq!(queue.discard_cancelled(), 1);
+            assert!(weak.upgrade().is_none(), "queued ownership was retained");
+            assert_eq!(retained(&queue), (0, 0, 0));
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            assert!(changed.as_mut().poll(&mut task).is_ready());
+            // Retirement really releases admission, not merely its displayed
+            // byte count. The same ID can now acquire a fresh reservation.
+            let replacement = owner(&admission, 7);
+            assert!(!replacement.cancelled());
+        }
+
+        #[test]
+        fn reclamation_cannot_revive_a_terminal_output_failure() {
+            let admission = Arc::new(DispatchQueueState::default());
+            let pending = owner(&admission, 7);
+            let queue = OutputQueue::default();
+            for value in 0..=MAX_DISPATCH_QUEUE_DEPTH {
+                queue.enqueue(progress(value), Some(Arc::clone(&pending)));
+            }
+            assert_eq!(queue.failure(), Some("output_capacity"));
+            pending.reservation.cancellation.cancel();
+            assert_eq!(queue.discard_cancelled(), MAX_DISPATCH_QUEUE_DEPTH);
+            assert_eq!(retained(&queue), (0, 0, 0));
+            queue.enqueue(response(9), None);
+            assert_eq!(queue.failure(), Some("output_capacity"));
+            assert_eq!(retained(&queue), (0, 0, 0));
+        }
+
+        fn admitted(message: &JsonRpcMessage) -> ReceivedTransportFrame {
+            ReceivedTransportFrame::admit(serde_json::to_vec(message).unwrap().into_boxed_slice())
+                .unwrap()
+        }
+
+        #[test]
+        fn cancellation_ingress_reclaims_only_the_matching_request_and_preserves_siblings() {
+            let cx = Cx::for_testing();
+            let lifetime = ConnectionLifetime {
+                server: Arc::new(
+                    Server::new("output-cancel", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .build(),
+                ),
+                connection: ModernConnection::new(),
+                admission: Arc::new(DispatchQueueState::default()),
+                output: Arc::new(OutputQueue::default()),
+                binding: ConnectionBinding::stdio(),
+            };
+            // Authentication and reservation take place before any handler
+            // poll. Keep both real request futures owned while routing controls.
+            let first = prepare_request(&lifetime, &cx, admitted(&discover(41)))
+                .unwrap()
+                .unwrap();
+            let second = prepare_request(&lifetime, &cx, admitted(&discover(42)))
+                .unwrap()
+                .unwrap();
+            let find_owner = |id: i64| {
+                lifetime
+                    .output
+                    .state
+                    .lock()
+                    .unwrap()
+                    .candidates
+                    .values()
+                    .filter_map(Weak::upgrade)
+                    .find(|owner| {
+                        owner.reservation.request_id.as_ref() == Some(&RequestId::Number(id))
+                    })
+                    .expect("admitted request has an output owner")
+            };
+            let first_owner = find_owner(41);
+            let second_owner = find_owner(42);
+            lifetime
+                .output
+                .enqueue(response(41), Some(Arc::clone(&first_owner)));
+            lifetime
+                .output
+                .enqueue(response(42), Some(Arc::clone(&second_owner)));
+            assert_eq!(retained(&lifetime.output).0, 2);
+            assert!(
+                prepare_request(&lifetime, &cx, admitted(&cancel(999)))
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(retained(&lifetime.output).0, 2);
+            assert!(!first_owner.cancelled() && !second_owner.cancelled());
+            assert!(
+                prepare_request(&lifetime, &cx, admitted(&cancel(41)))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(first_owner.cancelled());
+            assert!(!second_owner.cancelled());
+            assert_eq!(retained(&lifetime.output).0, 1);
+            let survivor = lifetime.output.pop().unwrap();
+            assert!(
+                matches!(survivor.message, JsonRpcMessage::Response(ref result)
+                if result.id == Some(RequestId::Number(42)))
+            );
+            lifetime.output.finish(survivor.bytes);
+            assert_eq!(retained(&lifetime.output), (0, 0, 0));
+            drop((first, second));
+        }
+    }
 
     #[derive(Default)]
     struct Gate {
@@ -3171,6 +4583,997 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    mod dual_era {
+        use super::*;
+
+        type Serving = asupersync::runtime::TaskHandle<McpResult<()>>;
+
+        fn run_native<F, Fut>(test: F)
+        where
+            F: FnOnce(Cx) -> Fut,
+            Fut: Future<Output = ()>,
+        {
+            let runtime = RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().unwrap())
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                assert!(cx.blocking_pool_handle().is_none());
+                // A blocking bridge also blocks the runtime timer. This
+                // test-only watchdog turns that regression into a failure.
+                let watchdog_cx = cx.clone();
+                let (finished, completion) = std::sync::mpsc::sync_channel::<()>(1);
+                let watchdog = std::thread::spawn(move || {
+                    if matches!(
+                        completion.recv_timeout(Duration::from_secs(15)),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    ) {
+                        watchdog_cx.cancel_with(
+                            CancelKind::Deadline,
+                            Some("dual-era stdio test made no runtime progress"),
+                        );
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let result =
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(12), test(cx.clone()))
+                        .await;
+                let _ = finished.send(());
+                assert!(
+                    !watchdog.join().unwrap(),
+                    "stdio blocked its embedding runtime"
+                );
+                result.expect("native dual-era stdio operation exceeded its bound");
+            });
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        fn configured(policy: ProtocolPolicy, gate: &Arc<Gate>) -> ServerBuilder {
+            Server::new("native-dual-era-stdio", "1.0")
+                .protocol_policy(policy)
+                .unwrap()
+                .logging(LoggingConfig {
+                    level: LevelFilter::Info,
+                    ..LoggingConfig::default()
+                })
+                .tool(ProbeTool(Arc::clone(gate)))
+        }
+
+        fn start(cx: &Cx, service: Server, io: &Arc<IoProbe>) -> Serving {
+            let stream = Arc::clone(io);
+            cx.spawn(move |server_cx| async move {
+                service
+                    .serve_stdio_io(
+                        &server_cx,
+                        ProbeReader(Arc::clone(&stream)),
+                        ProbeWriter(stream),
+                    )
+                    .await
+            })
+            .unwrap()
+        }
+
+        fn legacy_request(id: i64, method: &str, params: serde_json::Value) -> JsonRpcMessage {
+            JsonRpcMessage::Request(JsonRpcRequest::new(method, Some(params), id))
+        }
+
+        fn initialize(id: i64) -> JsonRpcMessage {
+            legacy_request(
+                id,
+                "initialize",
+                serde_json::json!({
+                    "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                    "capabilities": {"roots": {}},
+                    "clientInfo": {"name": "native-test-peer", "version": "1.0"},
+                }),
+            )
+        }
+
+        fn initialized() -> JsonRpcMessage {
+            JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/initialized",
+                None,
+            ))
+        }
+
+        fn legacy_call(id: i64, hold: bool) -> JsonRpcMessage {
+            legacy_request(
+                id,
+                "tools/call",
+                serde_json::json!({"name": "async_probe", "arguments": {"hold": hold}}),
+            )
+        }
+
+        fn legacy_cancel(id: i64) -> JsonRpcMessage {
+            JsonRpcMessage::Request(JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({"requestId": id, "reason": "peer cancelled"})),
+            ))
+        }
+
+        async fn handshake(cx: &Cx, io: &IoProbe) {
+            io.feed(&encoded(&initialize(1)));
+            io.feed(&encoded(&initialized()));
+            until_io(cx, io, || io.response(1).is_some()).await;
+            let response = io.response(1).unwrap();
+            assert!(response.error.is_none(), "{response:?}");
+            assert_eq!(
+                response.result.unwrap()["protocolVersion"],
+                LEGACY_PROTOCOL_VERSION
+            );
+        }
+
+        async fn stop(cx: &Cx, io: &IoProbe, mut serving: Serving) {
+            io.eof();
+            serving.join(cx).await.unwrap().unwrap();
+            let state = io.0.lock().unwrap();
+            assert!(state.reader_dropped && state.writer_dropped);
+        }
+
+        fn assert_error(io: &IoProbe, id: i64, expected: i32) {
+            let response = io.response(id).unwrap();
+            assert!(response.result.is_none(), "{response:?}");
+            assert_eq!(response.error.unwrap().code.as_i32(), Some(expected));
+        }
+
+        fn assert_legacy_result(io: &IoProbe, id: i64, text: &str) {
+            let response = io.response(id).unwrap();
+            assert!(response.error.is_none(), "{response:?}");
+            let result = response.result.unwrap();
+            assert_eq!(result["content"][0]["text"], text);
+            assert!(result.get("resultType").is_none(), "{result}");
+        }
+
+        fn closed(io: &IoProbe) -> bool {
+            let state = io.0.lock().unwrap();
+            state.reader_dropped && state.writer_dropped
+        }
+
+        #[test]
+        fn auto_modern_discover_and_tool_use_no_blocking_pool() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let io = Arc::new(IoProbe::default());
+                io.allow(usize::MAX);
+                let serving = start(&cx, configured(ProtocolPolicy::Auto, &gate).build(), &io);
+                io.feed(&encoded(&discover(10)));
+                until_io(&cx, &io, || io.response(10).is_some()).await;
+                assert!(io.response(10).unwrap().error.is_none());
+                io.feed(&encoded(&call(11, false)));
+                until_io(&cx, &io, || io.response(11).is_some()).await;
+                let response = io.response(11).unwrap();
+                assert!(response.error.is_none());
+                assert_eq!(response.result.unwrap()["resultType"], "complete");
+                assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                stop(&cx, &io, serving).await;
+            });
+        }
+
+        #[test]
+        fn prebuffered_legacy_lifecycle_drains_ordered_results_after_eof() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    for message in [initialize(20), initialized(), legacy_call(21, false)] {
+                        io.feed(&encoded(&message));
+                    }
+                    io.eof();
+                    let mut serving = start(&cx, configured(policy, &gate).build(), &io);
+                    serving.join(&cx).await.unwrap().unwrap();
+                    let messages = io.messages();
+                    let [
+                        JsonRpcMessage::Response(first),
+                        JsonRpcMessage::Response(second),
+                    ] = messages.as_slice()
+                    else {
+                        panic!(
+                            "legacy lifecycle must emit exactly two ordered results: {messages:?}"
+                        );
+                    };
+                    assert_eq!(first.id, Some(RequestId::Number(20)));
+                    assert!(first.error.is_none());
+                    assert_eq!(
+                        first.result.as_ref().unwrap()["protocolVersion"],
+                        LEGACY_PROTOCOL_VERSION
+                    );
+                    assert_eq!(second.id, Some(RequestId::Number(21)));
+                    assert_legacy_result(&io, 21, "executed");
+                    assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                    assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                    assert!(closed(&io));
+                }
+            });
+        }
+
+        struct BadOpening {
+            name: &'static str,
+            bytes: Vec<u8>,
+            error: Option<(Option<i64>, i32)>,
+        }
+
+        fn bad_openings(policy: ProtocolPolicy) -> Vec<BadOpening> {
+            let JsonRpcMessage::Request(mut mixed) = initialize(30) else {
+                unreachable!()
+            };
+            mixed.params.as_mut().unwrap()["_meta"] = serde_json::json!({
+                fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+                fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+            });
+            let JsonRpcMessage::Request(mut wrong_version) = initialize(31) else {
+                unreachable!()
+            };
+            wrong_version.params.as_mut().unwrap()["protocolVersion"] =
+                serde_json::json!("2025-03-26");
+            let JsonRpcMessage::Request(mut malformed_meta) = initialize(32) else {
+                unreachable!()
+            };
+            malformed_meta.params.as_mut().unwrap()["_meta"] = serde_json::json!([]);
+            let JsonRpcMessage::Request(mut missing_capabilities) = discover(33) else {
+                unreachable!()
+            };
+            missing_capabilities.params.as_mut().unwrap()["_meta"] = serde_json::json!({
+                fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY: MODERN_PROTOCOL_VERSION,
+            });
+            let JsonRpcMessage::Request(mut invalid_log_level) = discover(36) else {
+                unreachable!()
+            };
+            invalid_log_level.params.as_mut().unwrap()["_meta"]["io.modelcontextprotocol/logLevel"] =
+                serde_json::json!(true);
+            let modern_error = if policy == ProtocolPolicy::LegacyOnly {
+                -32601
+            } else {
+                -32600
+            };
+            let mut cases = vec![
+                BadOpening {
+                    name: "malformed JSON",
+                    bytes: b"{\n".to_vec(),
+                    error: Some((None, -32700)),
+                },
+                BadOpening {
+                    name: "mixed initialize",
+                    bytes: encoded(&JsonRpcMessage::Request(mixed)),
+                    error: Some((Some(30), modern_error)),
+                },
+                BadOpening {
+                    name: "notification opener",
+                    bytes: encoded(&initialized()),
+                    error: None,
+                },
+                BadOpening {
+                    name: "response opener",
+                    bytes: encoded(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(-30),
+                        serde_json::json!({}),
+                    ))),
+                    error: None,
+                },
+                BadOpening {
+                    name: "wrong legacy version",
+                    bytes: encoded(&JsonRpcMessage::Request(wrong_version)),
+                    error: Some((Some(31), -32600)),
+                },
+                BadOpening {
+                    name: "non-object metadata",
+                    bytes: encoded(&JsonRpcMessage::Request(malformed_meta)),
+                    error: Some((Some(32), -32600)),
+                },
+                BadOpening {
+                    name: "incomplete modern metadata",
+                    bytes: encoded(&JsonRpcMessage::Request(missing_capabilities)),
+                    error: Some((
+                        Some(33),
+                        if policy == ProtocolPolicy::LegacyOnly {
+                            -32601
+                        } else {
+                            -32602
+                        },
+                    )),
+                },
+                BadOpening {
+                    name: "unmarked tool opener",
+                    bytes: encoded(&legacy_call(34, false)),
+                    error: Some((Some(34), -32600)),
+                },
+                BadOpening {
+                    name: "invalid modern logging metadata",
+                    bytes: encoded(&JsonRpcMessage::Request(invalid_log_level)),
+                    error: Some((
+                        Some(36),
+                        if policy == ProtocolPolicy::LegacyOnly {
+                            -32601
+                        } else {
+                            -32602
+                        },
+                    )),
+                },
+            ];
+            if policy == ProtocolPolicy::LegacyOnly {
+                cases.push(BadOpening {
+                    name: "modern discovery under LegacyOnly",
+                    bytes: encoded(&discover(35)),
+                    error: Some((Some(35), -32601)),
+                });
+            }
+            cases
+        }
+
+        async fn reject_bad_openings(cx: &Cx, policy: ProtocolPolicy) {
+            for case in bad_openings(policy) {
+                let gate = Arc::new(Gate::default());
+                let io = Arc::new(IoProbe::default());
+                io.feed(&case.bytes);
+                // Both valid eras are already buffered behind the bad opener.
+                // Neither may restart classification or reach an application.
+                for message in [
+                    initialize(40),
+                    initialized(),
+                    legacy_call(41, false),
+                    discover(42),
+                    call(43, false),
+                ] {
+                    io.feed(&encoded(&message));
+                }
+                let mut serving = start(cx, configured(policy, &gate).build(), &io);
+                if case.error.is_some() {
+                    until_io(cx, &io, || io.0.lock().unwrap().writes > 0).await;
+                    let state = io.0.lock().unwrap();
+                    assert!(state.outbound.is_empty(), "{}", case.name);
+                    assert!(
+                        !state.reader_dropped,
+                        "{}: reader must survive until the legal error flushes",
+                        case.name
+                    );
+                    assert!(!state.writer_dropped, "{}", case.name);
+                    drop(state);
+                    io.allow(usize::MAX);
+                }
+                until_io(cx, &io, || closed(&io)).await;
+                assert!(serving.join(cx).await.unwrap().is_err(), "{}", case.name);
+                let messages = io.messages();
+                match case.error {
+                    Some((id, code)) => {
+                        let [JsonRpcMessage::Response(response)] = messages.as_slice() else {
+                            panic!("{} must emit one legal refusal: {messages:?}", case.name);
+                        };
+                        assert_eq!(response.id, id.map(RequestId::Number), "{}", case.name);
+                        assert!(response.result.is_none(), "{}", case.name);
+                        assert_eq!(
+                            response.error.as_ref().unwrap().code.as_i32(),
+                            Some(code),
+                            "{}",
+                            case.name
+                        );
+                    }
+                    None => assert!(
+                        messages.is_empty(),
+                        "{} must close silently: {messages:?}",
+                        case.name
+                    ),
+                }
+                assert_eq!(gate.entered.load(Ordering::Acquire), 0, "{}", case.name);
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 0, "{}", case.name);
+            }
+        }
+
+        #[test]
+        fn auto_bad_openers_flush_one_legal_error_without_reclassification() {
+            run_native(|cx| async move { reject_bad_openings(&cx, ProtocolPolicy::Auto).await });
+        }
+
+        #[test]
+        fn legacy_only_bad_openers_flush_one_legal_error_without_reclassification() {
+            run_native(
+                |cx| async move { reject_bad_openings(&cx, ProtocolPolicy::LegacyOnly).await },
+            );
+        }
+
+        #[test]
+        fn unsupported_modern_opening_selects_modern_and_accepts_corrected_version() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let io = Arc::new(IoProbe::default());
+                io.allow(usize::MAX);
+                let serving = start(&cx, configured(ProtocolPolicy::Auto, &gate).build(), &io);
+                let JsonRpcMessage::Request(mut unsupported) = discover(50) else {
+                    unreachable!()
+                };
+                unsupported.params.as_mut().unwrap()["_meta"]
+                    [fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY] =
+                    serde_json::json!("2099-01-01");
+                io.feed(&encoded(&JsonRpcMessage::Request(unsupported)));
+                until_io(&cx, &io, || io.response(50).is_some()).await;
+                assert_error(&io, 50, -32022);
+                assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                io.feed(&encoded(&initialize(51)));
+                until_io(&cx, &io, || io.response(51).is_some()).await;
+                assert_error(&io, 51, -32601);
+                io.feed(&encoded(&call(52, false)));
+                until_io(&cx, &io, || io.response(52).is_some()).await;
+                let response = io.response(52).unwrap();
+                assert!(response.error.is_none());
+                assert_eq!(response.result.unwrap()["resultType"], "complete");
+                assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                stop(&cx, &io, serving).await;
+            });
+        }
+
+        #[test]
+        fn selected_modern_refuses_legacy_initialize_and_unmarked_tool_then_recovers() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let io = Arc::new(IoProbe::default());
+                io.allow(usize::MAX);
+                let serving = start(&cx, configured(ProtocolPolicy::Auto, &gate).build(), &io);
+                io.feed(&encoded(&discover(60)));
+                until_io(&cx, &io, || io.response(60).is_some()).await;
+                assert!(io.response(60).unwrap().error.is_none());
+                io.feed(&encoded(&initialize(61)));
+                io.feed(&encoded(&legacy_call(62, false)));
+                until_io(&cx, &io, || {
+                    io.response(61).is_some() && io.response(62).is_some()
+                })
+                .await;
+                assert_error(&io, 61, -32601);
+                assert_error(&io, 62, -32602);
+                assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                io.feed(&encoded(&call(63, false)));
+                until_io(&cx, &io, || io.response(63).is_some()).await;
+                assert!(io.response(63).unwrap().error.is_none());
+                assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                stop(&cx, &io, serving).await;
+            });
+        }
+
+        #[test]
+        fn selected_legacy_rejects_modern_metadata_before_and_after_initialized() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    for ready in [false, true] {
+                        let gate = Arc::new(Gate::default());
+                        let io = Arc::new(IoProbe::default());
+                        io.allow(usize::MAX);
+                        let mut serving = start(&cx, configured(policy, &gate).build(), &io);
+                        io.feed(&encoded(&initialize(1)));
+                        until_io(&cx, &io, || io.response(1).is_some()).await;
+                        assert!(io.response(1).unwrap().error.is_none());
+                        if ready {
+                            io.feed(&encoded(&initialized()));
+                            io.feed(&encoded(&legacy_request(69, "ping", serde_json::json!({}))));
+                            until_io(&cx, &io, || io.response(69).is_some()).await;
+                            assert!(io.response(69).unwrap().error.is_none());
+                        }
+                        io.feed(&encoded(&call(70, false)));
+                        io.feed(&encoded(&legacy_call(71, false)));
+                        until_io(&cx, &io, || closed(&io)).await;
+                        assert!(serving.join(&cx).await.unwrap().is_err());
+                        assert_error(
+                            &io,
+                            70,
+                            if policy == ProtocolPolicy::LegacyOnly {
+                                -32601
+                            } else {
+                                -32600
+                            },
+                        );
+                        assert!(io.response(71).is_none());
+                        assert_eq!(io.messages().len(), if ready { 3 } else { 2 });
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                    }
+                }
+            });
+        }
+
+        struct HandlerLifetime<'a>(&'a Gate);
+
+        impl<'a> HandlerLifetime<'a> {
+            fn enter(gate: &'a Gate) -> Self {
+                gate.entered.fetch_add(1, Ordering::AcqRel);
+                Self(gate)
+            }
+        }
+
+        impl Drop for HandlerLifetime<'_> {
+            fn drop(&mut self) {
+                self.0.dropped.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        struct RootsTool(Arc<Gate>);
+
+        impl ToolHandler for RootsTool {
+            fn definition(&self) -> Tool {
+                let mut definition = ProbeTool(Arc::clone(&self.0)).definition();
+                definition.name = "native_roots".to_owned();
+                definition.input_schema =
+                    serde_json::json!({"type": "object", "additionalProperties": false});
+                definition
+            }
+
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Async
+            }
+
+            fn call(&self, _: &McpContext, _: serde_json::Value) -> McpResult<Vec<Content>> {
+                panic!("native legacy roots must invoke the asynchronous handler")
+            }
+
+            fn call_async<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                _: serde_json::Value,
+            ) -> BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+                Box::pin(async move {
+                    let _lifetime = HandlerLifetime::enter(&self.0);
+                    assert!(ctx.can_list_roots());
+                    match ctx.list_roots().await {
+                        Ok(roots) => asupersync::Outcome::Ok(vec![Content::text(
+                            roots
+                                .into_iter()
+                                .map(|root| root.uri)
+                                .collect::<Vec<_>>()
+                                .join(","),
+                        )]),
+                        Err(error) => asupersync::Outcome::Err(error),
+                    }
+                })
+            }
+        }
+
+        struct LogTool(Arc<Gate>);
+
+        impl ToolHandler for LogTool {
+            fn definition(&self) -> Tool {
+                let mut definition = ProbeTool(Arc::clone(&self.0)).definition();
+                definition.name = "native_logs".to_owned();
+                definition
+            }
+
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Async
+            }
+
+            fn call(&self, _: &McpContext, _: serde_json::Value) -> McpResult<Vec<Content>> {
+                panic!("native legacy logging must invoke the asynchronous handler")
+            }
+
+            fn call_async<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                arguments: serde_json::Value,
+            ) -> BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+                Box::pin(async move {
+                    let _lifetime = HandlerLifetime::enter(&self.0);
+                    if arguments["hold"] == true {
+                        self.0
+                            .changed
+                            .wait_until(|| self.0.released.load(Ordering::Acquire))
+                            .await;
+                    }
+                    ctx.info("native legacy info");
+                    ctx.error("native legacy error");
+                    asupersync::Outcome::Ok(vec![Content::text("logged")])
+                })
+            }
+        }
+
+        fn roots_call(id: i64) -> JsonRpcMessage {
+            legacy_request(
+                id,
+                "tools/call",
+                serde_json::json!({"name": "native_roots", "arguments": {}}),
+            )
+        }
+
+        fn log_call(id: i64, hold: bool) -> JsonRpcMessage {
+            legacy_request(
+                id,
+                "tools/call",
+                serde_json::json!({"name": "native_logs", "arguments": {"hold": hold}}),
+            )
+        }
+
+        fn requests(io: &IoProbe, method: &str) -> Vec<JsonRpcRequest> {
+            io.messages()
+                .into_iter()
+                .filter_map(|message| match message {
+                    JsonRpcMessage::Request(request) if request.method == method => Some(request),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn log_payloads(io: &IoProbe) -> Vec<serde_json::Value> {
+            requests(io, "notifications/message")
+                .into_iter()
+                .map(|request| {
+                    assert!(request.id.is_none());
+                    let params = request.params.unwrap();
+                    assert!(
+                        params.get("_meta").is_none(),
+                        "legacy logs must not acquire final metadata"
+                    );
+                    params
+                })
+                .collect()
+        }
+
+        async fn set_log_floor(cx: &Cx, io: &IoProbe, level: &str) {
+            io.feed(&encoded(&legacy_request(
+                2,
+                "logging/setLevel",
+                serde_json::json!({"level": level}),
+            )));
+            until_io(cx, io, || io.response(2).is_some()).await;
+            assert!(io.response(2).unwrap().error.is_none());
+        }
+
+        fn ingress_fence(id: i64) -> JsonRpcMessage {
+            // Rejected by ingress, independently of the adapter's currently
+            // awaiting handler; its reply proves every preceding frame was read.
+            legacy_request(id, "native-test/unknown", serde_json::json!({}))
+        }
+
+        #[test]
+        fn legacy_reverse_roots_rejects_final_reply_then_accepts_corrected_same_id() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let roots = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let service = configured(policy, &gate)
+                        .tool(RootsTool(Arc::clone(&roots)))
+                        .build();
+                    let serving = start(&cx, service, &io);
+                    handshake(&cx, &io).await;
+                    io.feed(&encoded(&roots_call(80)));
+                    until_io(&cx, &io, || !requests(&io, "roots/list").is_empty()).await;
+                    let reverse = requests(&io, "roots/list").pop().unwrap();
+                    let Some(RequestId::Number(reverse_id)) = reverse.id else {
+                        panic!("legacy reverse roots requires a server-owned numeric ID");
+                    };
+                    assert!(reverse_id < 0);
+                    assert!(
+                        reverse
+                            .params
+                            .as_ref()
+                            .is_none_or(|params| params.get("_meta").is_none())
+                    );
+                    io.feed(&encoded(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(reverse_id),
+                        serde_json::json!({"roots": [{"uri": "file:///native/rejected"}], "resultType": "complete"}),
+                    ))));
+                    io.feed(&encoded(&ingress_fence(81)));
+                    until_io(&cx, &io, || io.response(81).is_some()).await;
+                    assert_error(&io, 81, -32601);
+                    assert!(io.response(80).is_none());
+                    assert_eq!(roots.entered.load(Ordering::Acquire), 1);
+                    assert_eq!(roots.dropped.load(Ordering::Acquire), 0);
+                    io.feed(&encoded(&JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(reverse_id),
+                        serde_json::json!({"roots": [{"uri": "file:///native/corrected", "name": "Corrected root"}]}),
+                    ))));
+                    until_io(&cx, &io, || io.response(80).is_some()).await;
+                    assert_legacy_result(&io, 80, "file:///native/corrected");
+                    assert_eq!(requests(&io, "roots/list").len(), 1);
+                    assert!(requests(&io, "notifications/cancelled").is_empty());
+                    assert_eq!(roots.dropped.load(Ordering::Acquire), 1);
+                    stop(&cx, &io, serving).await;
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_peer_cancel_drops_held_handler_and_preserves_sibling() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let serving = start(&cx, configured(policy, &gate).build(), &io);
+                    handshake(&cx, &io).await;
+                    io.feed(&encoded(&legacy_call(90, true)));
+                    until_io(&cx, &io, || gate.entered.load(Ordering::Acquire) == 1).await;
+                    io.feed(&encoded(&legacy_cancel(90)));
+                    io.feed(&encoded(&legacy_call(91, false)));
+                    until_io(&cx, &io, || io.response(91).is_some()).await;
+                    assert_legacy_result(&io, 91, "executed");
+                    assert!(io.response(90).is_none());
+                    assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                    gate.release();
+                    stop(&cx, &io, serving).await;
+                    assert!(
+                        io.response(90).is_none(),
+                        "cancelled handler emitted a late result"
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_logging_floor_retains_explicit_owner_with_two_admitted_requests() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    for floor in ["info", "error"] {
+                        let gate = Arc::new(Gate::default());
+                        let logs = Arc::new(Gate::default());
+                        let io = Arc::new(IoProbe::default());
+                        io.allow(usize::MAX);
+                        let service = configured(policy, &gate)
+                            .tool(LogTool(Arc::clone(&logs)))
+                            .build();
+                        let serving = start(&cx, service, &io);
+                        handshake(&cx, &io).await;
+                        set_log_floor(&cx, &io, floor).await;
+                        io.feed(&encoded(&log_call(100, true)));
+                        until_io(&cx, &io, || logs.entered.load(Ordering::Acquire) == 1).await;
+                        io.feed(&encoded(&legacy_call(101, false)));
+                        io.feed(&encoded(&ingress_fence(102)));
+                        until_io(&cx, &io, || io.response(102).is_some()).await;
+                        assert_error(&io, 102, -32601);
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                        assert!(log_payloads(&io).is_empty());
+                        // The second request has an admitted owner but cannot
+                        // execute until the first handler returns. Requiring
+                        // one unique modern log candidate would lose these logs.
+                        logs.release();
+                        until_io(&cx, &io, || {
+                            io.response(100).is_some() && io.response(101).is_some()
+                        })
+                        .await;
+                        assert_legacy_result(&io, 100, "logged");
+                        assert_legacy_result(&io, 101, "executed");
+                        let payloads = log_payloads(&io);
+                        let observed: Vec<_> = payloads
+                            .iter()
+                            .filter_map(|params| {
+                                let data = params["data"].as_str().unwrap();
+                                matches!(data, "native legacy info" | "native legacy error")
+                                    .then(|| (params["level"].as_str().unwrap(), data))
+                            })
+                            .collect();
+                        if floor == "info" {
+                            assert_eq!(
+                                observed,
+                                [
+                                    ("info", "native legacy info"),
+                                    ("error", "native legacy error")
+                                ]
+                            );
+                        } else {
+                            assert_eq!(observed, [("error", "native legacy error")]);
+                        }
+                        assert_eq!(logs.dropped.load(Ordering::Acquire), 1);
+                        assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                        stop(&cx, &io, serving).await;
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_backpressure_peer_cancel_suppresses_queued_logs_and_result() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let logs = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let service = configured(policy, &gate)
+                        .tool(LogTool(Arc::clone(&logs)))
+                        .build();
+                    let serving = start(&cx, service, &io);
+                    handshake(&cx, &io).await;
+                    set_log_floor(&cx, &io, "error").await;
+                    let writes = io.0.lock().unwrap().writes;
+                    io.allow(0);
+                    io.feed(&encoded(&legacy_request(
+                        110,
+                        "ping",
+                        serde_json::json!({}),
+                    )));
+                    until_io(&cx, &io, || io.0.lock().unwrap().writes > writes).await;
+                    io.feed(&encoded(&log_call(111, false)));
+                    until_io(&cx, &io, || logs.dropped.load(Ordering::Acquire) == 1).await;
+                    io.feed(&encoded(&legacy_cancel(111)));
+                    io.feed(&encoded(&legacy_call(112, false)));
+                    until_io(&cx, &io, || gate.dropped.load(Ordering::Acquire) == 1).await;
+                    io.allow(usize::MAX);
+                    until_io(&cx, &io, || io.response(112).is_some()).await;
+                    assert!(io.response(110).unwrap().error.is_none());
+                    assert!(io.response(111).is_none());
+                    assert!(log_payloads(&io).is_empty());
+                    assert_legacy_result(&io, 112, "executed");
+                    stop(&cx, &io, serving).await;
+                    assert!(io.response(111).is_none());
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_service_abort_drops_pending_handler_and_both_owned_io_halves() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let mut serving = start(&cx, configured(policy, &gate).build(), &io);
+                    handshake(&cx, &io).await;
+                    io.feed(&encoded(&legacy_call(120, true)));
+                    until_io(&cx, &io, || gate.entered.load(Ordering::Acquire) == 1).await;
+                    serving.abort();
+                    serving.join(&cx).await.unwrap().unwrap();
+                    assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                    let state = io.0.lock().unwrap();
+                    assert!(!state.eof, "service abort must not depend on peer EOF");
+                    assert!(state.reader_dropped && state.writer_dropped);
+                    drop(state);
+                    assert!(io.response(120).is_none());
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_parent_cancel_cleans_reverse_request_once_and_retires_late_reply() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let roots = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let service = configured(policy, &gate)
+                        .tool(RootsTool(Arc::clone(&roots)))
+                        .build();
+                    let serving = start(&cx, service, &io);
+                    handshake(&cx, &io).await;
+                    io.feed(&encoded(&roots_call(130)));
+                    until_io(&cx, &io, || !requests(&io, "roots/list").is_empty()).await;
+                    let reverse = requests(&io, "roots/list").pop().unwrap();
+                    let Some(RequestId::Number(reverse_id)) = reverse.id else {
+                        panic!("reverse request must have a numeric ID");
+                    };
+                    assert!(reverse_id < 0);
+                    io.feed(&encoded(&legacy_cancel(130)));
+                    io.feed(&encoded(&legacy_call(131, false)));
+                    until_io(&cx, &io, || io.response(131).is_some()).await;
+                    assert_legacy_result(&io, 131, "executed");
+                    assert_eq!(roots.dropped.load(Ordering::Acquire), 1);
+                    let cleanup = requests(&io, "notifications/cancelled");
+                    assert_eq!(cleanup.len(), 1);
+                    assert!(cleanup[0].id.is_none());
+                    assert_eq!(cleanup[0].params.as_ref().unwrap()["requestId"], reverse_id);
+                    assert!(cleanup[0].params.as_ref().unwrap().get("_meta").is_none());
+                    io.feed(&encoded(&JsonRpcMessage::Response(
+                        JsonRpcResponse::success(
+                            RequestId::Number(reverse_id),
+                            serde_json::json!({"roots": [{"uri": "file:///native/late"}]}),
+                        ),
+                    )));
+                    io.feed(&encoded(&legacy_cancel(130)));
+                    io.feed(&encoded(&legacy_call(132, false)));
+                    until_io(&cx, &io, || io.response(132).is_some()).await;
+                    assert_legacy_result(&io, 132, "executed");
+                    assert!(io.response(130).is_none());
+                    assert_eq!(requests(&io, "notifications/cancelled").len(), 1);
+                    assert_eq!(requests(&io, "roots/list").len(), 1);
+                    assert_eq!(gate.entered.load(Ordering::Acquire), 2);
+                    stop(&cx, &io, serving).await;
+                    assert!(io.response(130).is_none());
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_deadline_replaces_zero_byte_pending_result_and_suppresses_queued_logs() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let logs = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let service = configured(policy, &gate)
+                        .request_timeout(1)
+                        .tool(LogTool(Arc::clone(&logs)))
+                        .build();
+                    let serving = start(&cx, service, &io);
+                    handshake(&cx, &io).await;
+                    // A successful tool also generates a server info log.
+                    // The error floor keeps the first blocked frame a result,
+                    // while the second handler still queues its explicit error log.
+                    set_log_floor(&cx, &io, "error").await;
+                    let (committed_bytes, writes) = {
+                        let state = io.0.lock().unwrap();
+                        (state.outbound.len(), state.writes)
+                    };
+                    io.allow(0);
+                    io.feed(&encoded(&legacy_call(140, false)));
+                    until_io(&cx, &io, || {
+                        gate.dropped.load(Ordering::Acquire) == 1
+                            && io.0.lock().unwrap().writes > writes
+                    })
+                    .await;
+                    // The first completed result owns the pending write; the
+                    // second completed request queues logs and its own result.
+                    io.feed(&encoded(&log_call(141, false)));
+                    until_io(&cx, &io, || logs.dropped.load(Ordering::Acquire) == 1).await;
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(20)).await;
+                    let blocked_writes = io.0.lock().unwrap().writes;
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1150)).await;
+                    // No input or output capacity changed. A new send attempt
+                    // therefore proves the request deadline interrupted the
+                    // zero-byte write while it was still pending.
+                    until_io(&cx, &io, || io.0.lock().unwrap().writes > blocked_writes).await;
+                    assert_eq!(io.0.lock().unwrap().outbound.len(), committed_bytes);
+                    assert!(!closed(&io));
+                    io.allow(usize::MAX);
+                    until_io(&cx, &io, || {
+                        io.response(140).is_some() && io.response(141).is_some()
+                    })
+                    .await;
+                    for id in [140, 141] {
+                        let response = io.response(id).unwrap();
+                        assert!(response.result.is_none());
+                        let error = response.error.unwrap();
+                        assert_eq!(
+                            error.code.as_i32(),
+                            Some(i32::from(McpErrorCode::RequestCancelled))
+                        );
+                        assert_eq!(error.message, "Request timeout exceeded");
+                    }
+                    assert!(log_payloads(&io).is_empty());
+                    io.feed(&encoded(&legacy_call(142, false)));
+                    until_io(&cx, &io, || io.response(142).is_some()).await;
+                    assert_legacy_result(&io, 142, "executed");
+                    assert_eq!(gate.entered.load(Ordering::Acquire), 2);
+                    stop(&cx, &io, serving).await;
+                }
+            });
+        }
+
+        #[test]
+        fn legacy_deadline_after_three_result_bytes_closes_without_replacement() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let gate = Arc::new(Gate::default());
+                    let io = Arc::new(IoProbe::default());
+                    io.allow(usize::MAX);
+                    let service = configured(policy, &gate).request_timeout(1).build();
+                    let mut serving = start(&cx, service, &io);
+                    handshake(&cx, &io).await;
+                    let committed_bytes = io.0.lock().unwrap().outbound.len();
+                    io.allow(3);
+                    io.feed(&encoded(&legacy_call(150, false)));
+                    until_io(&cx, &io, || {
+                        io.0.lock().unwrap().outbound.len() == committed_bytes + 3
+                    })
+                    .await;
+                    assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                    // No more input and no writer wake: the request deadline
+                    // itself must interrupt this incomplete JSON-RPC frame.
+                    until_io(&cx, &io, || closed(&io)).await;
+                    assert!(serving.join(&cx).await.unwrap().is_err());
+                    io.allow(usize::MAX);
+                    let state = io.0.lock().unwrap();
+                    assert!(!state.eof);
+                    assert_eq!(state.outbound.len(), committed_bytes + 3);
+                    assert!(!state.outbound[committed_bytes..].contains(&b'\n'));
+                    assert!(state.reader_dropped && state.writer_dropped);
+                    drop(state);
+                    assert!(io.response(150).is_none());
+                }
+            });
+        }
+    }
+
     mod native_memory_tests {
         use super::*;
         use fastmcp_transport::memory::create_memory_transport_pair_with_capacity;
@@ -3199,7 +5602,9 @@ mod tests {
         fn connect(cx: &Cx, service: Server) -> (MemoryTransport, Serving) {
             let (peer, transport) = create_memory_transport_pair_with_capacity(1);
             let serving = cx
-                .spawn(move |serve_cx| async move { service.serve_memory(&serve_cx, transport).await })
+                .spawn(
+                    move |serve_cx| async move { service.serve_memory(&serve_cx, transport).await },
+                )
                 .unwrap();
             (peer, serving)
         }
@@ -3215,7 +5620,10 @@ mod tests {
         async fn stop(cx: &Cx, peer: MemoryTransport, mut serving: Serving) {
             let (mut input, output) = peer.into_split();
             drop(output);
-            assert!(matches!(input.recv_async(cx).await, Err(TransportError::Closed)));
+            assert!(matches!(
+                input.recv_async(cx).await,
+                Err(TransportError::Closed)
+            ));
             serving.join(cx).await.unwrap().unwrap();
         }
 
@@ -3273,7 +5681,10 @@ mod tests {
                 };
                 assert_eq!(result.id, Some(RequestId::Number(20)));
                 assert!(result.error.is_none());
-                assert!(matches!(input.recv_async(&cx).await, Err(TransportError::Closed)));
+                assert!(matches!(
+                    input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
                 serving.join(&cx).await.unwrap().unwrap();
                 assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
             });
@@ -3288,16 +5699,33 @@ mod tests {
                 let (mut peer, serving) = connect(&cx, service);
                 peer.send_async(
                     &cx,
-                    &request(30, SUBSCRIPTIONS_LISTEN, serde_json::json!({
-                        "notifications": {"toolsListChanged": true}
-                    })),
-                ).await.unwrap();
+                    &request(
+                        30,
+                        SUBSCRIPTIONS_LISTEN,
+                        serde_json::json!({
+                            "notifications": {"toolsListChanged": true}
+                        }),
+                    ),
+                )
+                .await
+                .unwrap();
                 let JsonRpcMessage::Request(ack) = peer.recv_async(&cx).await.unwrap() else {
                     panic!("subscription acknowledgement must precede completion");
                 };
-                assert_eq!(ack.method, fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED);
-                assert_eq!(ack.params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"], 30);
-                assert_eq!(subscriptions.publish(ServerNotification::ToolsListChanged(None)).unwrap(), 1);
+                assert_eq!(
+                    ack.method,
+                    fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED
+                );
+                assert_eq!(
+                    ack.params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    30
+                );
+                assert_eq!(
+                    subscriptions
+                        .publish(ServerNotification::ToolsListChanged(None))
+                        .unwrap(),
+                    1
+                );
                 let JsonRpcMessage::Request(event) = peer.recv_async(&cx).await.unwrap() else {
                     panic!("expected the live subscription event");
                 };
@@ -3318,23 +5746,43 @@ mod tests {
                 let (peer, transport) = create_memory_transport_pair_with_capacity(1);
                 let (mut peer_input, mut peer_output) = peer.into_split();
                 let (mut input, mut output) = transport.into_split();
-                ConnectionWriter::send(&mut output, &cx, &discover(40)).await.unwrap();
+                ConnectionWriter::send(&mut output, &cx, &discover(40))
+                    .await
+                    .unwrap();
                 let second = discover(41);
                 {
                     let mut sending = pin!(ConnectionWriter::send(&mut output, &cx, &second));
-                    assert!(sending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                    assert!(
+                        sending
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
                     peer_output.send_async(&cx, &cancel(41)).await.unwrap();
                     let frame = ConnectionReader::receive(&mut input, &cx).await.unwrap();
-                    assert!(matches!(frame.into_message(), JsonRpcMessage::Request(request) if request.method == "notifications/cancelled"));
+                    assert!(
+                        matches!(frame.into_message(), JsonRpcMessage::Request(request) if request.method == "notifications/cancelled")
+                    );
                     // Abandon the uncommitted frame while capacity is exhausted.
                 }
                 let first = peer_input.recv_async(&cx).await.unwrap();
-                assert_eq!(serde_json::to_value(first).unwrap(), serde_json::to_value(discover(40)).unwrap());
-                ConnectionWriter::send(&mut output, &cx, &discover(42)).await.unwrap();
+                assert_eq!(
+                    serde_json::to_value(first).unwrap(),
+                    serde_json::to_value(discover(40)).unwrap()
+                );
+                ConnectionWriter::send(&mut output, &cx, &discover(42))
+                    .await
+                    .unwrap();
                 let next = peer_input.recv_async(&cx).await.unwrap();
-                assert_eq!(serde_json::to_value(next).unwrap(), serde_json::to_value(discover(42)).unwrap());
+                assert_eq!(
+                    serde_json::to_value(next).unwrap(),
+                    serde_json::to_value(discover(42)).unwrap()
+                );
                 ConnectionWriter::close(&mut output, &cx).await.unwrap();
-                assert!(matches!(peer_input.recv_async(&cx).await, Err(TransportError::Closed)));
+                assert!(matches!(
+                    peer_input.recv_async(&cx).await,
+                    Err(TransportError::Closed)
+                ));
             });
         }
 
@@ -3344,7 +5792,8 @@ mod tests {
             let started = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&started);
             let service = Server::new("memory-driverless", "1")
-                .protocol_policy(ProtocolPolicy::ModernOnly).unwrap()
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .unwrap()
                 .tool(ProbeTool(Arc::clone(&gate)))
                 .on_startup(move || {
                     flag.store(true, Ordering::Release);
@@ -3354,7 +5803,10 @@ mod tests {
             let (_peer, transport) = create_memory_transport_pair_with_capacity(1);
             let cx = Cx::for_testing();
             let mut serving = pin!(service.serve_memory(&cx, transport));
-            let Poll::Ready(Err(error)) = serving.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            let Poll::Ready(Err(error)) = serving
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
                 panic!("driverless serving must fail before parking");
             };
             assert!(error.message.contains("timer driver"));

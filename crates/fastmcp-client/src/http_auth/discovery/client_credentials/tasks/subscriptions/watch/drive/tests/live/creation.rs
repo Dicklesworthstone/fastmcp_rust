@@ -113,10 +113,10 @@ fn result(case: Case) -> serde_json::Value {
         "ttlMs":null,"statusMessage":"PRIVATE-STATUS"});
     match case {
         Case::TaskInput => {
-            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}});
         }
         Case::Completed => {
-            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]});
         }
         Case::Failed => value["error"] = json!({"code":-32603,"message":"PRIVATE-ERROR"}),
         Case::ExpiredTask => value["ttlMs"] = json!(1),
@@ -192,8 +192,10 @@ fn run_creation(case: Case) {
                     event(&mut socket, json!({"jsonrpc":"2.0","method":"notifications/progress",
                         "params":{"progressToken":"creation-progress","progress":1}})).await;
                     event(&mut socket, envelope).await;
-                    // Do not emit EOF: the correlated terminal must release this
-                    // response instead of waiting for an unrelated later event.
+                    // Finish the HTTP body so the client can validate the finite
+                    // SSE tail before publishing the correlated terminal.
+                    socket.write_all(b"0\r\n\r\n").await.unwrap();
+                    socket.flush().await.unwrap();
                     closed(&mut socket).await;
                 } else { reply(&mut socket, envelope).await; }
             };

@@ -505,7 +505,7 @@ async fn acquire(
     token: &str,
     seconds: u64,
 ) {
-    let ((), result) = pair(peer.grant(token, seconds), client.credential(cx)).await;
+    let ((), result) = Box::pin(pair(peer.grant(token, seconds), client.credential(cx))).await;
     assert!(result.is_ok());
 }
 fn run(case: Case) {
@@ -548,7 +548,7 @@ fn run(case: Case) {
                     let clone = client.clone();
                     let server = async { peer.grant("access-one",300).await; };
                     let application = async {
-                        let (one,two) = pair(client.credential(&cx),clone.credential(&cx)).await;
+                        let (one,two) = Box::pin(pair(client.credential(&cx),clone.credential(&cx))).await;
                         for snapshot in [one.unwrap(),two.unwrap()] {
                             assert_eq!(snapshot.generation(),1);
                             assert_eq!(snapshot.scopes(),["read"]);
@@ -557,7 +557,7 @@ fn run(case: Case) {
                             assert!(!format!("{snapshot:?} {client:?}").contains("access-one"));
                         }
                     };
-                    pair(server,application).await;
+                    Box::pin(pair(server,application)).await;
                     let server = async {
                         peer.operation(1,"tools/list","access-one",LIST).await;
                         peer.operation(3,"tools/call","access-one",CALL).await;
@@ -575,11 +575,11 @@ fn run(case: Case) {
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),4);
                 }
                 Case::Renew => {
-                    acquire(&peer,&cx,&client,"access-one",1).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",1)).await;
                     let old = client.credential(&cx).await.unwrap();
                     Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
                     assert!(old.credential().authorization_for_target(client.resource()).is_none());
-                    let ((),fresh) = pair(peer.grant("access-two",300),client.credential(&cx)).await;
+                    let ((),fresh) = Box::pin(pair(peer.grant("access-two",300),client.credential(&cx))).await;
                     assert_eq!(fresh.unwrap().generation(),2);
                     let ((),response) = Box::pin(pair(peer.operation(1,"tools/list","access-two",LIST),
                         client.execute_core(&cx,core("tools/list"),RequestId::Number(1),RequestId::Number(2)))).await;
@@ -591,12 +591,12 @@ fn run(case: Case) {
                         let mut tls=peer.token_request().await;
                         json_reply(&mut tls,r#"{"access_token":"rejected-secret","token_type":"Bearer","scope":"admin","expires_in":300}"#).await;
                     };
-                    let ((),result)=pair(server,client.credential(&cx)).await;
+                    let ((),result)=Box::pin(pair(server,client.credential(&cx))).await;
                     let error=result.err().unwrap();
                     assert!(matches!(error,Error::ExpandedScope));
                     assert!(!format!("{error:?} {error}").contains("rejected-secret"));
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1); peer.quiet();
-                    let ((),result)=pair(peer.grant("admitted",300),client.credential(&cx)).await;
+                    let ((),result)=Box::pin(pair(peer.grant("admitted",300),client.credential(&cx))).await;
                     assert_eq!(result.unwrap().generation(),1,"failed grant cannot advance cached credential state");
                 }
                 Case::TokenRedirect|Case::LostGrant => {
@@ -607,12 +607,12 @@ fn run(case: Case) {
                             tls.flush().await.unwrap();
                         }
                     };
-                    let ((),result)=pair(server,client.credential(&cx)).await;
+                    let ((),result)=Box::pin(pair(server,client.credential(&cx))).await;
                     assert!(matches!((case,result.err().unwrap()),(Case::TokenRedirect,Error::TokenEndpointRejected)|(Case::LostGrant,Error::Transport)));
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                 }
                 Case::Negotiation => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     for (index,(from,to)) in [
                         ("\"io.modelcontextprotocol/oauth-client-credentials\":{}","\"io.modelcontextprotocol/oauth-client-credentials\":null"),
                         ("\"io.modelcontextprotocol/oauth-client-credentials\":{}","\"io.modelcontextprotocol/oauth-client-credentials\":{\"invented\":true}"),
@@ -628,7 +628,7 @@ fn run(case: Case) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                 }
                 Case::LostMutation|Case::DeniedMutation => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     let server=async {
                         peer.discovery(1,"access-one",DISCOVERY).await;
                         let mut tls=peer.rpc(2,"tools/call","access-one").await;
@@ -679,7 +679,7 @@ fn run(case: Case) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                 }
                 Case::Streaming|Case::CancelRead|Case::CloseRead|Case::DropRead|Case::ExpireRead => {
-                    acquire(&peer,&cx,&client,"access-one",if matches!(case,Case::ExpireRead) { 2 } else { 300 }).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",if matches!(case,Case::ExpireRead) { 2 } else { 300 })).await;
                     let cancel=McpRequestCancellation::new();
                     let (tx,mut rx)=oneshot::channel::<()>();
                     let server=async {
@@ -714,7 +714,7 @@ fn run(case: Case) {
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2);
                 }
                 Case::DropOwner => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     let snapshot=client.credential(&cx).await.unwrap();
                     let bearer=snapshot.credential().clone();
                     assert!(bearer.authorization_for_target(client.resource()).is_some());
@@ -724,7 +724,7 @@ fn run(case: Case) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1); peer.quiet(); return;
                 }
                 Case::InputRequired => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     let challenge=r#"{"resultType":"input_required","requestState":"opaque-state","x-exact":1.20e+4}"#;
                     let ((),response)=Box::pin(pair(peer.operation(1,"tools/call","access-one",challenge),
                         client.execute_core(&cx,core("tools/call"),RequestId::Number(1),RequestId::Number(2)))).await;
@@ -1084,8 +1084,8 @@ fn run_post(case: PostCase) {
                 PostCase::Lifecycle | PostCase::Encoding | PostCase::BothAdvertised => {
                     let seconds = if matches!(case, PostCase::Lifecycle) { 1 } else { 300 };
                     let clone = client.clone();
-                    let ((), (one, two)) = pair(post_grant(&peer, id, secret, "post-access", seconds),
-                        pair(client.credential(&cx), clone.credential(&cx))).await;
+                    let ((), (one, two)) = Box::pin(pair(post_grant(&peer, id, secret, "post-access", seconds),
+                        pair(client.credential(&cx), clone.credential(&cx)))).await;
                     let old = one.unwrap();
                     assert_eq!(old.generation(), 1);
                     assert_eq!(two.unwrap().generation(), 1, "concurrent consumers share the same grant");
@@ -1097,7 +1097,7 @@ fn run_post(case: PostCase) {
                     if matches!(case, PostCase::Lifecycle) {
                         Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;
                         assert!(old.credential().authorization_for_target(client.resource()).is_none());
-                        let ((), fresh) = pair(post_grant(&peer, id, secret, "post-renewed", 300), client.credential(&cx)).await;
+                        let ((), fresh) = Box::pin(pair(post_grant(&peer, id, secret, "post-renewed", 300), client.credential(&cx))).await;
                         assert_eq!(fresh.unwrap().generation(), 2);
                         let ((), response) = Box::pin(pair(peer.operation(3, "tools/call", "post-renewed", CALL),
                             client.execute_core(&cx, core("tools/call"), RequestId::Number(3), RequestId::Number(4)))).await;
@@ -1124,7 +1124,7 @@ fn run_post(case: PostCase) {
                             _ => {},
                         }
                     };
-                    let ((), result) = pair(server, client.credential(&cx)).await;
+                    let ((), result) = Box::pin(pair(server, client.credential(&cx))).await;
                     let error = result.err().unwrap();
                     assert!(!format!("{error:?} {error}").contains(secret));
                     match case {
@@ -1135,7 +1135,7 @@ fn run_post(case: PostCase) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
                     peer.quiet(); // Even when Basic was advertised, no fallback is sent.
                     if matches!(case, PostCase::InvalidToken) {
-                        let ((), fresh) = pair(post_grant(&peer, id, secret, "corrected", 300), client.credential(&cx)).await;
+                        let ((), fresh) = Box::pin(pair(post_grant(&peer, id, secret, "corrected", 300), client.credential(&cx))).await;
                         assert_eq!(fresh.unwrap().generation(), 1, "rejected response must not install a token");
                         assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
                     }

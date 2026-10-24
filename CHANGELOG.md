@@ -6,6 +6,386 @@ Format: version timeline, organized by landed capabilities. Commit links point t
 
 ---
 
+## [v0.13.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.13.0) -- 2026-10-12 (GitHub Release)
+
+151 commits since v0.12.0. Pre-1.0 minor release: official Tasks through
+managed OAuth, request-owned bounded batches in core, bounded legacy SSE
+stream lifetimes, and fixes for the v0.12.0 known issues #79, #84 and #85.
+
+### Breaking changes
+
+Source-incompatible (fastmcp-client, re-exported by fastmcp-rust). None of
+these enums is `#[non_exhaustive]`, so an exhaustive `match` needs new arms:
+
+- `ModernHttpExecutorError::CredentialUnavailable` and
+  `ExecutionTerminalReason::CredentialUnavailable`
+  ([60d982c1](https://github.com/Dicklesworthstone/fastmcp_rust/commit/60d982c1)).
+- `LegacySseHttpClientError::SseStreamLifetimeExpired` and
+  `LegacySseHttpClientError::SseIdleLifetimeExceeded`
+  ([c81278e0](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c81278e0)).
+
+Behavior changes a caller may have to react to:
+
+- **Proxy identity.** A transparent gateway leg now sends the inbound caller's
+  `clientInfo` upstream in place of the proxy's own, and replaces the proxy's
+  configured `sampling`, `elicitation` and `roots` capabilities with the
+  caller's, including when the caller has none. In v0.12.0 downstream metadata
+  could not replace either. An upstream that keys policy on the gateway's
+  identity now sees an identity the caller asserts. Custom `ProxyAsyncRequest`
+  backends keep their own identity
+  ([a70b0eb9](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a70b0eb9),
+  [318e29fb](https://github.com/Dicklesworthstone/fastmcp_rust/commit/318e29fb)).
+- **Lapsed credentials.** A modern HTTP request whose bearer credential has
+  expired or been revoked is refused with `CredentialUnavailable` before a
+  socket is opened. Authenticated dispatch never falls back to an anonymous
+  POST
+  ([60d982c1](https://github.com/Dicklesworthstone/fastmcp_rust/commit/60d982c1)).
+- **Deadlines.** A managed tool call reports `ManagedCoreError::TimedOut`, not
+  `Cancelled`, when the caller's deadline expires
+  ([39902ab7](https://github.com/Dicklesworthstone/fastmcp_rust/commit/39902ab7)).
+- **Request executor.** A finite caller poll quota now bounds a whole
+  `execute`/`drive`/`wait` call. A pending execution whose originating `Cx`
+  stopped ends as caller-cancelled even when the connection failed. A stale
+  handle is refused, and subscription accessors reject another executor's
+  handle
+  ([3665b545](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3665b545),
+  [ef35b723](https://github.com/Dicklesworthstone/fastmcp_rust/commit/ef35b723),
+  [ffd18d3a](https://github.com/Dicklesworthstone/fastmcp_rust/commit/ffd18d3a)).
+- **Legacy SSE.** A legacy stream now ends after its absolute lifetime, or
+  after its idle lifetime while a request is outstanding (see below).
+- **Async stdio.** The transport fails with `ConnectionAborted` once a source
+  reports more than 64 `Interrupted` results in one wait. Stdio I/O is polled
+  under the ambient capability ceiling, so a native-pipe write in an
+  I/O-denied scope is refused
+  ([2962bc06](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2962bc06)).
+- **HTTP shutdown.** `BoundHttpServer::serve` no longer finalizes while
+  connection children are live. `on_shutdown` runs once, when the caller
+  settles the returned `HttpNonquiescentShutdown`
+  ([6fbb78df](https://github.com/Dicklesworthstone/fastmcp_rust/commit/6fbb78df)).
+- **Capability ceilings.** `race`, `quorum`, `first_ok` and their timed
+  variants intersect the ambient capability ceiling, and async-stdio request
+  regions are refused when the ambient scope denies spawn
+  ([ce01b570](https://github.com/Dicklesworthstone/fastmcp_rust/commit/ce01b570),
+  [6678cd75](https://github.com/Dicklesworthstone/fastmcp_rust/commit/6678cd75)).
+- **Filesystem listings.** Entries gain a `size` member, which a strict
+  parser or a tight byte budget will notice
+  ([af6c112c](https://github.com/Dicklesworthstone/fastmcp_rust/commit/af6c112c)).
+- **JSON Schema.** `multipleOf` results change where the old arithmetic was
+  wrong
+  ([5e468911](https://github.com/Dicklesworthstone/fastmcp_rust/commit/5e468911)).
+
+### Official Tasks through managed OAuth (fastmcp-client, `tasks` feature)
+
+- `ManagedHttpClient::with_tasks()` opts a managed client in to official
+  Tasks: tool outcomes that keep the Task, complete and input-required
+  branches distinct, plus get, update and cancel verbs, each with an
+  independent-cancellation variant. Every call runs inside the existing
+  credential, expiry, renewal and deadline guards, and nothing is replayed
+  ([cdd5c823](https://github.com/Dicklesworthstone/fastmcp_rust/commit/cdd5c823)).
+- `wait_task_final` polls one task inside a single managed deadline and
+  credential lifetime, honouring the local minimum interval and the server's
+  hint. It returns at once on a terminal or input-required state, and at the
+  poll limit returns the latest `Working` snapshot
+  ([6124fe2f](https://github.com/Dicklesworthstone/fastmcp_rust/commit/6124fe2f)).
+- `listen_task_events` delivers the acknowledgement and each task
+  notification from one authenticated `subscriptions/listen` POST as they
+  arrive, bounded by task IDs, notification count and aggregate payload bytes.
+  An observer's local stop is distinct from the peer's terminal result
+  ([41d007ce](https://github.com/Dicklesworthstone/fastmcp_rust/commit/41d007ce)).
+  As first committed, this did not compile with the `tasks` feature, which
+  the `fastmcp-rust` facade enables by default; the terminal result is now
+  charged through the result encoder
+  ([2be3e908](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2be3e908)).
+
+### Bounded batches (fastmcp-core)
+
+- `McpContext::try_join_all_bounded` runs request-owned work with ordered
+  results, at most 64 active operations and a 4096-input ceiling, and retires
+  active and unstarted work after the first error. It polls inline: no spawned
+  tasks and no private runtime
+  ([10e9b2ea](https://github.com/Dicklesworthstone/fastmcp_rust/commit/10e9b2ea)).
+- `McpContext::call_tools_bounded` and `read_resources_bounded` compose
+  parallel tool calls and resource reads on that scheduler. Protocol errors
+  fail fast; a tool-level `is_error` payload stays an ordinary result
+  ([85e4845c](https://github.com/Dicklesworthstone/fastmcp_rust/commit/85e4845c)).
+
+### Legacy 2024-11-05 SSE stream lifetimes (fastmcp-client)
+
+- Each legacy SSE stream generation now has an absolute lifetime (15 minutes
+  by default, 2 hours at most) and a guarded idle lifetime (60 seconds by
+  default, 10 minutes at most). The idle clock runs only while a request sent
+  on that generation awaits its response, so a client that is only listening
+  is never cut. Expiry returns `SseStreamLifetimeExpired` or
+  `SseIdleLifetimeExceeded`, and the caller reconnects. Both are configurable
+  per client (`set_stream_lifetime`, `set_idle_lifetime`)
+  ([c81278e0](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c81278e0),
+  [eab932d1](https://github.com/Dicklesworthstone/fastmcp_rust/commit/eab932d1)).
+
+### Proxy
+
+- Transparent gateway legs project the inbound caller's identity and its
+  reverse-direction capabilities (sampling, elicitation, roots) onto upstream
+  modern requests, including the detached HTTP legs, so an upstream server
+  that calls back through the proxy sees the caller that will answer
+  ([a70b0eb9](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a70b0eb9),
+  [c725702c](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c725702c),
+  [7f2bc0b8](https://github.com/Dicklesworthstone/fastmcp_rust/commit/7f2bc0b8)).
+  See the proxy identity note under Breaking changes.
+
+### Fixed
+
+- Async stdio: a source that keeps reporting a cooperative stop
+  (`Interrupted`) without completing I/O is now an error after 64 retries
+  instead of spinning forever. This is the native-pipe spin from the v0.12.0
+  known issues
+  ([#84](https://github.com/Dicklesworthstone/fastmcp_rust/issues/84),
+  [a791f1a3](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a791f1a3),
+  [2962bc06](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2962bc06)).
+  On Unix the facade also re-exports the native pipe handles.
+- Client: a managed session closed from a reverse handler can no longer issue
+  one more request
+  ([#85](https://github.com/Dicklesworthstone/fastmcp_rust/issues/85),
+  [60d982c1](https://github.com/Dicklesworthstone/fastmcp_rust/commit/60d982c1)),
+  and `await_validity` observes the caller's deadline
+  ([39902ab7](https://github.com/Dicklesworthstone/fastmcp_rust/commit/39902ab7)).
+- Client: the deferred-control maintenance test from
+  [#79](https://github.com/Dicklesworthstone/fastmcp_rust/issues/79) runs and
+  passes now that the executor enforces a finite poll budget
+  ([3665b545](https://github.com/Dicklesworthstone/fastmcp_rust/commit/3665b545)).
+  Rejected credential jobs stay off the async poller
+  ([df7a8328](https://github.com/Dicklesworthstone/fastmcp_rust/commit/df7a8328)).
+- Server: the WebSocket upgrade Origin check uses the listener's own
+  `handler_config`, so an origin listed in `cors_origins` is admitted on the
+  upgrade as it already was on the HTTP routes. Loopback origins are still
+  admitted and anything else is still refused with 400
+  ([#81](https://github.com/Dicklesworthstone/fastmcp_rust/issues/81),
+  [82164f7e](https://github.com/Dicklesworthstone/fastmcp_rust/commit/82164f7e)).
+- Server: blocking async waits are readiness-driven and charge the request's
+  poll budget
+  ([10034b71](https://github.com/Dicklesworthstone/fastmcp_rust/commit/10034b71),
+  [b880d87a](https://github.com/Dicklesworthstone/fastmcp_rust/commit/b880d87a)),
+  and request regions keep the caller's capability ceiling
+  ([162a241d](https://github.com/Dicklesworthstone/fastmcp_rust/commit/162a241d)).
+- JSON Schema validation: `multipleOf` divisibility is exact for
+  arbitrary-precision numbers, and large `uniqueItems` arrays are indexed by
+  semantic fingerprints with every collision confirmed by exact equality
+  ([5e468911](https://github.com/Dicklesworthstone/fastmcp_rust/commit/5e468911)).
+- Tests: the two native-pipe tests that failed in the v0.12.0 gate
+  (`native_pipe_registers_only_with_its_bound_runtime_under_foreign_ambient_context`,
+  `native_pipe_readiness_updates_waker_and_preserves_data_through_eof`) pass
+  after the readiness-wait repair in the test harness
+  ([4a3521af](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4a3521af),
+  [2fff4ced](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2fff4ced)).
+  The scripted peer behind `leg_http_01_b_planted_negative` tolerates the
+  client closing first
+  ([62c1f088](https://github.com/Dicklesworthstone/fastmcp_rust/commit/62c1f088)).
+  Three expectations that had never run or had gone stale were corrected: two
+  in the managed Tasks tests and the WebSocket discovery-failure test
+  ([c00b2b4c](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c00b2b4c),
+  [a1939ec5](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a1939ec5),
+  [c6fda86f](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c6fda86f)).
+- `cargo fmt --all --check` and `clippy --workspace --all-targets -D warnings`
+  are clean again; both were red on `main` before this release
+  ([a8014c7f](https://github.com/Dicklesworthstone/fastmcp_rust/commit/a8014c7f),
+  [c00b2b4c](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c00b2b4c),
+  [82450479](https://github.com/Dicklesworthstone/fastmcp_rust/commit/82450479)).
+
+### Documentation and tooling
+
+- `HttpServerConfig::request_read_timeout` is documented as one budget for the
+  request head and body together, not an idle timeout (#81).
+- The conformance example serves the list-mutation triggers through the public
+  catalog API
+  ([1c2dc896](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1c2dc896)),
+  and the README records the measured official-conformance standing and a
+  census of inert feature flags
+  ([99e82d6f](https://github.com/Dicklesworthstone/fastmcp_rust/commit/99e82d6f),
+  [d6025fd4](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d6025fd4)).
+- `scripts/verify_batch.sh` exits nonzero when its receipt is `INVALID`
+  ([#86](https://github.com/Dicklesworthstone/fastmcp_rust/issues/86),
+  [376f0618](https://github.com/Dicklesworthstone/fastmcp_rust/commit/376f0618)).
+
+### Dependencies
+
+- `sha2` 0.11.1, `toml` 1.1.8, `trybuild` 1.0.122, `syn` 3.0.9, and 11
+  transitive lockfile updates
+  ([2af189b8](https://github.com/Dicklesworthstone/fastmcp_rust/commit/2af189b8)).
+  `serde_json` and `zeroize` stay at `=1.0.151` and `=1.9.0`: the FND-01
+  dependency policy binds both by exact version. `asupersync =0.5.0` and
+  `rich_rust =0.2.3` are unchanged; asupersync 0.6.0 was not on crates.io when
+  this release was cut. See `UPGRADE_LOG.md`.
+
+### Known issues
+
+- Repository meta-gates in the `fastmcp-rust` facade crate remain red, the
+  same 20 tests as in v0.12.0: FND-01 evidence binding
+  (`fnd_01_a_evidence_binding`), FND-04-B plan qualification
+  (`fnd_04_runtime_conformance`) and REL-QUAR-00-A
+  (`rel_quar_00_a_contract`). They check repository evidence, not runtime
+  behavior; the other 426 facade tests pass.
+- With `--all-features`, six `fastmcp-server` library tests fail: five in
+  `builder::tests::proxy_registration_tests` and
+  `live_websocket_auto_accepts_fresh_eras_and_fences_cross_era_traffic`
+  (bd-sdf4b). They cover the opt-in `proxy` and `websocket` features (the
+  WebSocket one also fails with `--features websocket` alone). The
+  default-feature suite is green.
+- With `--all-features`, three `fastmcp-client` `oauth_interaction`
+  host-execution tests overflow their child thread's stack in a debug build
+  (bd-tls7a).
+- Combinators and bounded batches each add two ambient-context frames while
+  they poll, where v0.12.0 added one. asupersync 0.5.0 panics at a context
+  stack depth of 32, so about 15 synchronously nested combinator levels is
+  now the limit.
+- The xtask test `reconcile_committed_exclusions_against_operator_config`
+  reads the rch operator config of whatever host it runs on, so it fails on a
+  host that has its own config and passes where there is none.
+- [#81](https://github.com/Dicklesworthstone/fastmcp_rust/issues/81): the
+  loopback Origin admission still has no opt-out.
+  [#87](https://github.com/Dicklesworthstone/fastmcp_rust/issues/87)
+  (qualification helpers bypass RCH) and
+  [#88](https://github.com/Dicklesworthstone/fastmcp_rust/issues/88)
+  (optional `fastmcp-console`) are open.
+
+## [v0.12.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.12.0) -- 2026-10-07 (GitHub Release)
+
+154 commits since v0.11.0. Pre-1.0 minor release: new native pipe/stdio and
+OAuth surfaces, plus source-incompatible fastmcp-client changes (below).
+
+### Breaking changes (fastmcp-client, re-exported by fastmcp-rust)
+
+- **Optional server identity on modern connections**
+  ([25519c88](https://github.com/Dicklesworthstone/fastmcp_rust/commit/25519c88)).
+  A modern (2026-07-28) `server/discover` result that carries no server
+  identity is accepted instead of refusing the connection:
+  - `ClientSession` holds `Option<ServerInfo>`, and `ClientSession::try_new`
+    takes one.
+  - `Client::server_info()` and `HttpClient::server_info()` return
+    `Option<&ServerInfo>`.
+  - `HttpClientError::ModernDiscoveryMissingServerInfo` is removed.
+- **Modern HTTP responses may carry `Mcp-Session-Id`**
+  ([d8aa4d41](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d8aa4d41)).
+  The modern stateless HTTP client now ignores a response `Mcp-Session-Id`
+  header (official conformance servers send one) instead of refusing the
+  response, and `ModernHttpExecutorError::ForbiddenResponseSessionHeader` is
+  removed. The client still never sends the header. Legacy 2024-11-05 SSE
+  responses keep refusing it.
+
+Neither error enum is `#[non_exhaustive]`, so an exhaustive `match` on it needs
+updating.
+
+### Native pipe and process-stdio transport
+
+- Caller-owned, reactor-driven Unix pipe I/O for `AsyncStdioTransport` and
+  `serve_stdio_io`: no helper threads, cancellation and caller deadlines
+  observed, blocking descriptors refused without changing shared flags
+  ([199b1369](https://github.com/Dicklesworthstone/fastmcp_rust/commit/199b1369)).
+- `NativePipeReader::from_stdin` / `NativePipeWriter::from_stdout` claim the
+  real process stdio, excluding competing native owners and restoring the
+  original descriptor flags on release
+  ([fcbd7c21](https://github.com/Dicklesworthstone/fastmcp_rust/commit/fcbd7c21)),
+  with a native stdio example executable and a subprocess smoke driver
+  ([cc453797](https://github.com/Dicklesworthstone/fastmcp_rust/commit/cc453797)).
+- Bounded memory transports are served on the native request runtime
+  ([0a116a20](https://github.com/Dicklesworthstone/fastmcp_rust/commit/0a116a20)).
+- An ambient capability restriction is no longer laundered through the native
+  pipe constructors (2 of 3 cases fixed,
+  [e36eb6dc](https://github.com/Dicklesworthstone/fastmcp_rust/commit/e36eb6dc);
+  see Known issues).
+
+### OAuth and managed HTTP clients
+
+- Native Client ID Metadata Document (CIMD) discovery and login
+  ([d26372d2](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d26372d2)),
+  and a fixed registration order: issuer-bound preregistered ID, then an
+  admitted CIMD document, then explicitly authorized one-shot DCR
+  ([1d6bfa8b](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1d6bfa8b)).
+- A bounded HTTPS redirect authorization driver for one pre-authorized front
+  channel and its exact loopback callback; no cookies, retries or general
+  redirect following
+  ([d01b675e](https://github.com/Dicklesworthstone/fastmcp_rust/commit/d01b675e)).
+- `http_auth::http_client::ManagedHttpClient`: catalogs, tools, resources and
+  prompts acquire each call's credential through the shared single-flight
+  managed OAuth renewal, rebuild connection state on credential-generation
+  changes, and never replay a failed MCP request
+  ([4d4db054](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4d4db054),
+  [1e27506d](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1e27506d)).
+- Reviewed `Mcp-Param-*` header plans: bounded repair with MRTR, and loopback
+  `http` admitted for them
+  ([1f91f2d2](https://github.com/Dicklesworthstone/fastmcp_rust/commit/1f91f2d2),
+  [4642a9a0](https://github.com/Dicklesworthstone/fastmcp_rust/commit/4642a9a0)).
+- The official-conformance runner gained a client mode
+  ([065fbe75](https://github.com/Dicklesworthstone/fastmcp_rust/commit/065fbe75)).
+
+### Cancellation
+
+- `McpRequestCancellation::cancel_by_peer` / `is_peer_cancel_requested`
+  distinguish a peer's `notifications/cancelled` from deadlines and shutdown,
+  and the server no longer answers a request the peer cancelled
+  ([0fa93022](https://github.com/Dicklesworthstone/fastmcp_rust/commit/0fa93022),
+  [6afb8d18](https://github.com/Dicklesworthstone/fastmcp_rust/commit/6afb8d18),
+  [55bee3f1](https://github.com/Dicklesworthstone/fastmcp_rust/commit/55bee3f1)).
+
+### Fixed
+
+- Server: cancelled queued output is reclaimed instead of holding frame/byte
+  charges behind backpressure
+  ([282f3a71](https://github.com/Dicklesworthstone/fastmcp_rust/commit/282f3a71));
+  continuously ready requests can no longer starve the native output writer
+  ([c2196ea8](https://github.com/Dicklesworthstone/fastmcp_rust/commit/c2196ea8));
+  request-region admission is retained across a connection drop, so an
+  abandoned connection cannot leave an unclaimed child region open
+  ([b5b87ba4](https://github.com/Dicklesworthstone/fastmcp_rust/commit/b5b87ba4)).
+- Client: tool callbacks are bounded by the caller's deadline and
+  capabilities, schema-bound operations wake on caller cancellation, memory
+  transport operations wake at caller deadlines, and managed catalog cursors
+  are bound to the connection and catalog that issued them.
+- Memory transport: a pending operation whose `Cx` has a deadline but no
+  timer driver now fails at once with an I/O error instead of waiting forever
+  (runtimes built normally always have a timer).
+- CLI (macOS/BSD `fastmcp install`, #81): a symlinked config is refused, as on
+  Linux, instead of being replaced by a regular file, and a refused or failed
+  publication no longer leaves a `.fastmcp-backup.*` link behind.
+- `clippy --workspace --all-targets -D warnings` is clean again (large-future
+  boxing, mechanical lints), and required-features are declared for
+  feature-gated test targets.
+
+### Dependencies
+
+- Lockfile refresh (80 transitive packages); see `UPGRADE_LOG.md`. Direct
+  pins are unchanged: `zeroize` stays `=1.9.0` because the FND-01 declaration
+  ratchet freezes it, and `asupersync =0.5.0` / `rich_rust =0.2.3` are
+  constellation pins.
+
+### Known issues
+
+- One native-pipe capability case remains open (bd-8n2is): an independent
+  registration defect behind
+  `native_pipe_registers_only_with_its_bound_runtime_under_foreign_ambient_context`.
+- Opt-in native pipes: a pipe whose own `Cx` is cancelled or past its deadline
+  keeps returning `Interrupted`, which the stdio transport retries while its
+  serving `Cx` is live, so the task spins
+  ([#84](https://github.com/Dicklesworthstone/fastmcp_rust/issues/84)). Bind a
+  native pipe to the same `Cx` that serves it.
+- Three new `fastmcp-client` tests fail deterministically, all on opt-in
+  surfaces new in this release
+  ([#85](https://github.com/Dicklesworthstone/fastmcp_rust/issues/85)):
+  - `ManagedHttpClient` makes one more request after the shared session is
+    closed from a reverse handler.
+  - `await_validity` misses the caller's deadline in two clock-driven tests.
+- A second native-pipe test,
+  `native_pipe_readiness_updates_waker_and_preserves_data_through_eof`, failed
+  in the release gate alongside the bd-8n2is case.
+- Repository meta-gates in the `fastmcp-rust` facade crate remain red: FND-01
+  evidence binding and FND-04-B plan qualification (as in v0.11.0), and
+  REL-QUAR-00-A, whose frozen workflow identity predates the 2026-10-05 action
+  pin bumps and needs a deliberate re-freeze. These check repository evidence,
+  not runtime behavior.
+- The client deferred-control maintenance-budget test stays ignored (#79).
+- `fastmcp-server` test targets do not build from a cold worker inside a
+  30-minute budget (bd-8d61j); they were run from a warmed build.
+- Remaining #81 follow-ups (loopback Origin opt-out, WebSocket `cors_origins`,
+  `request_read_timeout` scope) are open.
+
 ## [v0.11.0](https://github.com/Dicklesworthstone/fastmcp_rust/releases/tag/v0.11.0) -- 2026-10-04 (GitHub Release)
 
 ### Auto protocol fallback (#80)

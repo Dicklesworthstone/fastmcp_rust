@@ -1,0 +1,55 @@
+# The only target in this repository that has a published consumer's extern
+# prelude. Compiling it IS the assertion; there is nothing here to run.
+#
+# WHY IT IS ITS OWN WORKSPACE RATHER THAN A MEMBER, which is a Cargo rule and
+# not a preference. Cargo makes a package's own [dependencies] available to
+# every target in that package, integration tests in tests/ included. The
+# facade package depends on the component crates it re-exports from, so a test
+# under crates/fastmcp/tests/ resolves a component path EVEN WHEN THE FACADE
+# RE-EXPORTS NOTHING OF IT. A consumer whose manifest names only `fastmcp-rust`
+# cannot. That blind spot is why `#[prompt]` and `#[resource]` could not expand
+# for any real consumer until 2026-10-19 while seventeen in-workspace
+# `#[prompt]` tests passed throughout.
+#
+# Standing outside the members list also keeps Cargo feature unification from
+# leaking another member's facade features into this build, so a green here is
+# bound to the feature set named on the command line and to nothing else. That
+# matters: the `ProgressParams` gap fixed on the same day was reachable under
+# one feature and unreachable under another, and a unified build would have
+# hidden it exactly as the dependency hid the macro gap.
+#
+# THE ONE RULE: this manifest declares exactly one dependency. src/lib.rs scans
+# this file at compile time and refuses if any other crate of this workspace is
+# named here, so a later agent cannot repair a closure failure by adding the
+# component crate that failed to resolve -- which would retire the instrument
+# instead of fixing the facade.
+
+[package]
+name = "consumer-closure-probe"
+version = "0.13.0"
+edition = "2024"
+rust-version = "1.100"
+publish = false
+description = "Compile-time proof that the published facade is sufficient for the APIs it advertises"
+
+[workspace]
+resolver = "3"
+
+[features]
+# OFF by default, and the default build must stay green. Checking with this
+# feature on MUST FAIL: that failure is the only evidence this crate can detect
+# a closure defect at all, and an instrument that has never failed is not known
+# to work. src/lib.rs says what each negative proves.
+planted-negative = []
+
+# The two shipped JWT resource verifiers, reached the way a consumer must reach
+# them: through the facade alone. The forward below names `fastmcp-rust` and
+# could not name the component crate that implements them -- the guards in
+# src/lib.rs scan this file's raw bytes, comments included, and reject every
+# component spelling. So this feature cannot resolve at all unless the FACADE
+# declares its own forwarding equation. That is the point: the equation was
+# missing, and this stanza fails to resolve against any facade lacking it.
+jwt-provider-reachable = ["fastmcp-rust/jwt-resource-auth"]
+
+[dependencies]
+fastmcp-rust = { path = "../crates/fastmcp" }

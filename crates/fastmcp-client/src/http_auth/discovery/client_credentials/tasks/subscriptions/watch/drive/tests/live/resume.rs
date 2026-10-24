@@ -90,10 +90,10 @@ fn resume_task(id: &str, status: &str, second: u8) -> serde_json::Value {
         "ttlMs":null, "statusMessage":"PRIVATE-STATUS"});
     match status {
         "input_required" => {
-            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}});
         }
         "completed" => {
-            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]});
         }
         "failed" => value["error"] = json!({"code":-32603,"message":"PRIVATE-ERROR"}),
         _ => {}

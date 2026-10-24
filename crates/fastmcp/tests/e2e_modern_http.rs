@@ -2042,8 +2042,13 @@ impl HttpServerFixture {
         Self::spawn_with_policy_and_middleware(protocol_policy, None)
     }
 
-    fn spawn_modern_with_page_size(page_size: usize) -> Self {
-        spawn_modern_facade_http_server(false, Some(page_size), false)
+    fn spawn_modern_with_page_size(page_size: usize, requests: Arc<AtomicUsize>) -> Self {
+        spawn_modern_facade_http_server_with_middleware(
+            false,
+            Some(page_size),
+            false,
+            Some(Arc::new(McpConfigHttpRequestCounter { requests })),
+        )
     }
 
     fn spawn_with_policy_and_middleware(
@@ -2188,6 +2193,15 @@ impl HttpServerFixture {
         self.handler_calls.snapshot()
     }
 
+    fn retains_shutdown_ownership(&self) -> bool {
+        self.join.is_some()
+            || self.nonquiescent.is_some()
+            || matches!(
+                self.shutdown_completion.as_ref(),
+                Some(Ok(HttpServerShutdown::Nonquiescent(_)))
+            )
+    }
+
     fn settle(&mut self) -> Result<(), String> {
         if let Some(shutdown) = self.nonquiescent.as_mut() {
             return match runtime_block_on(shutdown.settle_for(HTTP_SERVER_TEARDOWN_BOUND)) {
@@ -2244,6 +2258,20 @@ fn spawn_modern_facade_http_server(
     page_size: Option<usize>,
     with_resource: bool,
 ) -> HttpServerFixture {
+    spawn_modern_facade_http_server_with_middleware(
+        with_native_bearer_auth,
+        page_size,
+        with_resource,
+        None,
+    )
+}
+
+fn spawn_modern_facade_http_server_with_middleware(
+    with_native_bearer_auth: bool,
+    page_size: Option<usize>,
+    with_resource: bool,
+    middleware: Option<Arc<dyn Middleware>>,
+) -> HttpServerFixture {
     let handler_calls = Arc::new(PublicHttpHandlerCallCounters::default());
     let tool_calls = Arc::clone(&handler_calls);
     let resource_calls = Arc::clone(&handler_calls);
@@ -2292,7 +2320,7 @@ fn spawn_modern_facade_http_server(
                 let _ = resource_calls;
                 builder
             };
-            let server = builder
+            let builder = builder
                 .prompt(CountingPublicHttpInstruction {
                     counters: prompt_calls,
                 })
@@ -2301,8 +2329,11 @@ fn spawn_modern_facade_http_server(
                     CountingPublicHttpCompletion {
                         counters: completion_calls,
                     },
-                )
-                .build();
+                );
+            let server = match middleware {
+                Some(middleware) => builder.middleware(middleware).build(),
+                None => builder.build(),
+            };
             let bound = match server.bind_http(&cx, "127.0.0.1:0").await {
                 Ok(bound) => bound,
                 Err(error) => {
@@ -2466,15 +2497,23 @@ fn spawn_modern_mounted_http_server() -> HttpServerFixture {
 
 impl Drop for HttpServerFixture {
     fn drop(&mut self) {
-        if self.join.is_none() && self.nonquiescent.is_none() {
+        if !self.retains_shutdown_ownership() {
             return;
         }
         if let Err(error) = self.settle() {
             eprintln!("public HTTP server fixture drop failed: {error}");
-            // A `JoinHandle` dropped after a failed bounded settlement detaches
-            // a live server. Aborting is fail-closed in both normal and panic
-            // unwinding paths, after shutdown has already been requested.
-            std::process::abort();
+            // A failed join can leave child ownership in the buffered report
+            // even after consuming the thread handle. Never discard either
+            // form of retained ownership after bounded settlement fails.
+            if self.retains_shutdown_ownership() {
+                std::process::abort();
+            }
+            // The owner has exited and been joined. Keep its teardown error
+            // visible without replacing an existing panic with a double panic.
+            if thread::panicking() {
+                return;
+            }
+            panic!("public HTTP server fixture drop failed: {error}");
         }
     }
 }
@@ -2847,6 +2886,158 @@ fn e2e_http_startup_guard_preserves_planted_startup_error() {
             .downcast::<&str>()
             .expect("the original startup diagnostic is retained"),
         "original startup diagnostic"
+    );
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum HttpFixtureDropCase {
+    Quiescent,
+    ReportedFailure,
+    Unwinding,
+    LiveOwner,
+}
+
+/// Isolate intentional aborts so a broken destructor cannot erase the other
+/// test results. These cases prove fixture ownership, not HTTP behavior.
+#[cfg(unix)]
+fn http_fixture_drop_case(name: &str, case: HttpFixtureDropCase) {
+    const CHILD: &str = "FASTMCP_E2E_HTTP_FIXTURE_DROP_CASE";
+    if let Ok(selected) = std::env::var(CHILD) {
+        assert_eq!(selected, name, "the child runs exactly its selected case");
+        let (finished_tx, finished) = mpsc::sync_channel(1);
+        let (release, blocked) = mpsc::sync_channel::<()>(0);
+        let exited = Arc::new(AtomicBool::new(false));
+        let owner_exited = Arc::clone(&exited);
+        let completion = if matches!(case, HttpFixtureDropCase::Quiescent) {
+            Ok(HttpServerShutdown::Quiescent)
+        } else {
+            Err("planted joined-owner teardown failure".to_owned())
+        };
+        let join = thread::spawn(move || {
+            finished_tx.send(completion).expect("report shutdown");
+            if matches!(case, HttpFixtureDropCase::LiveOwner) {
+                blocked
+                    .recv()
+                    .expect("retain the live owner until process exit");
+            }
+            owner_exited.store(true, Ordering::SeqCst);
+        });
+        let fixture = HttpServerFixture {
+            address: "127.0.0.1:0".parse().expect("unused fixture address"),
+            server_cx: Cx::for_request(),
+            finished,
+            shutdown_completion: None,
+            join: Some(join),
+            nonquiescent: None,
+            handler_calls: Arc::new(PublicHttpHandlerCallCounters::default()),
+        };
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _fixture = fixture;
+            if matches!(case, HttpFixtureDropCase::Unwinding) {
+                panic!("original owning test failure");
+            }
+        }));
+        // Keep the sender alive across Drop so the negative cannot accidentally
+        // release its owner when the receiver observes disconnection.
+        drop(release);
+        match case {
+            HttpFixtureDropCase::Quiescent => {
+                assert!(outcome.is_ok(), "a quiescent owner drops successfully");
+            }
+            HttpFixtureDropCase::ReportedFailure => {
+                let payload = outcome.expect_err("a joined shutdown failure still fails the test");
+                let message = payload
+                    .downcast_ref::<String>()
+                    .expect("shutdown diagnostic");
+                assert_eq!(
+                    message,
+                    "public HTTP server fixture drop failed: public HTTP server teardown failed: planted joined-owner teardown failure"
+                );
+            }
+            HttpFixtureDropCase::Unwinding => {
+                let payload = outcome.expect_err("the original failure must propagate");
+                assert_eq!(
+                    payload.downcast_ref::<&str>(),
+                    Some(&"original owning test failure")
+                );
+            }
+            HttpFixtureDropCase::LiveOwner => {
+                panic!("dropping a retained live owner must abort, not detach or unwind");
+            }
+        }
+        assert!(
+            exited.load(Ordering::SeqCst),
+            "the owner exited before Drop returned"
+        );
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary path"))
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("launch fixture-drop child");
+    let deadline = Instant::now() + HTTP_SERVER_TEARDOWN_BOUND * 4;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll fixture-drop child") {
+            if matches!(case, HttpFixtureDropCase::LiveOwner) {
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(
+                    status.signal(),
+                    Some(6),
+                    "the retained owner requires SIGABRT"
+                );
+            } else {
+                assert!(
+                    status.success(),
+                    "fixture-drop child {name} failed: {status}"
+                );
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fixture-drop child {name} exceeded its bounded lifetime");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_quiescent_owner_still_succeeds() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_quiescent_owner_still_succeeds",
+        HttpFixtureDropCase::Quiescent,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_reported_failure_is_a_recoverable_panic() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_reported_failure_is_a_recoverable_panic",
+        HttpFixtureDropCase::ReportedFailure,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_preserves_an_existing_panic_after_join() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_preserves_an_existing_panic_after_join",
+        HttpFixtureDropCase::Unwinding,
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_http_fixture_drop_live_owner_still_aborts() {
+    http_fixture_drop_case(
+        "e2e_http_fixture_drop_live_owner_still_aborts",
+        HttpFixtureDropCase::LiveOwner,
     );
 }
 
@@ -8248,6 +8439,11 @@ fn e2e_modern_facade_final_cache_enabled_hits_near_negative() {
 
 #[test]
 fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_closed() {
+    use fastmcp_rust::{
+        CachePartitionKey, FinalCacheInsert, FinalCacheKey, FinalCacheLookup, FinalCacheMiss,
+        FinalCacheResultSet, FinalResultCache,
+    };
+
     fn tools_page(result: CoreResult) -> fastmcp_rust::FinalListToolsResult {
         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
             panic!("tools/list must retain its exact final result vocabulary");
@@ -8259,8 +8455,27 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         serde_json::to_value(page).expect("a typed final tools page retains an exact JSON identity")
     }
 
+    fn cache_key(partition: &str) -> FinalCacheKey {
+        FinalCacheKey::new(
+            "live-catalog-endpoint",
+            modern::PROTOCOL_VERSION,
+            "{}",
+            "{}",
+            "tools/list",
+            r#"{"includeTags":["cursor"]}"#,
+            None,
+            1,
+            1,
+            1,
+            1,
+            CachePartitionKey::new(partition),
+            FinalCacheResultSet::Tools,
+        )
+    }
+
     let cx = Cx::for_request();
-    let server = HttpServerFixture::spawn_modern_with_page_size(1);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server = HttpServerFixture::spawn_modern_with_page_size(1, Arc::clone(&requests));
 
     let admitted_client = runtime_block_on_bounded(
         &cx,
@@ -8295,28 +8510,25 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
     )
     .expect("the public HTTP client completes live modern discovery");
 
-    let first = tools_page(
-        runtime_block_on_bounded(
-            &cx,
-            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
-        )
-        .expect("the filtered first public tools page is admitted"),
-    );
+    let before_first = requests.load(Ordering::SeqCst);
+    let fetched = runtime_block_on_bounded(
+        &cx,
+        client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+    )
+    .expect("the filtered first public tools page is admitted");
+    let first = tools_page(fetched.clone());
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 1);
     assert_eq!(
         first.tools.len(),
         1,
         "page size creates a real continuation"
     );
-    assert_eq!(
-        first.ttl_ms,
-        CacheTtl::milliseconds(5 * 60 * 1_000),
-        "the typed first page retains its exact final ttlMs"
+    let first_ttl = first.ttl_ms.try_as_millis().unwrap();
+    assert!(
+        (1..=300_000).contains(&first_ttl),
+        "pagination advertises a positive TTL bounded by its sealed five-minute lifetime"
     );
-    assert_eq!(
-        first.cache_scope,
-        CacheScope::Private,
-        "the typed first page retains its exact final cacheScope"
-    );
+    assert_eq!(first.cache_scope, CacheScope::Private);
     let first_identity = typed_page_identity(&first);
     let cursor = first
         .next_cursor
@@ -8324,25 +8536,24 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         .expect("the first filtered page carries an opaque cursor");
     assert_eq!(client.final_result_cache_stats().fills, 1);
     assert_eq!(client.final_result_cache_stats().hits, 0);
+    assert_eq!(client.final_result_cache_stats().misses, 1);
 
     let replay = tools_page(
         runtime_block_on_bounded(
             &cx,
             client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
         )
-        .expect("the identical public list request uses its local final cache"),
+        .expect("an identical public list request reuses the cached page"),
     );
     assert_eq!(
         typed_page_identity(&replay),
         first_identity,
-        "the cache replay retains the complete typed first-page identity"
+        "a cache hit retains the exact page, TTL and opaque cursor bytes"
     );
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 1);
     assert_eq!(client.final_result_cache_stats().fills, 1);
-    assert_eq!(
-        client.final_result_cache_stats().hits,
-        1,
-        "an identical final request is a public cache hit"
-    );
+    assert_eq!(client.final_result_cache_stats().hits, 1);
+    assert_eq!(client.final_result_cache_stats().misses, 1);
 
     let second = tools_page(
         runtime_block_on_bounded(
@@ -8355,31 +8566,122 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
         )
         .expect("the exact cursor/query continuation reaches the second live page"),
     );
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 2);
     assert_eq!(second.tools.len(), 1);
-    assert_eq!(
-        second.tools[0].name, PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME,
-        "the sole valid continuation retains the exact cursor-secondary tool identity"
-    );
+    assert_eq!(second.tools[0].name, PUBLIC_HTTP_CURSOR_SECONDARY_TOOL_NAME);
     assert!(second.next_cursor.is_none());
-    assert_eq!(
-        second.ttl_ms,
-        CacheTtl::milliseconds(5 * 60 * 1_000),
-        "the typed continuation page retains its exact final ttlMs"
+    assert!((1..=first_ttl).contains(&second.ttl_ms.try_as_millis().unwrap()));
+    assert_eq!(second.cache_scope, CacheScope::Private);
+    let second_identity = typed_page_identity(&second);
+    assert_ne!(second_identity, first_identity);
+
+    let second_replay = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(
+                &cx,
+                "tools/list",
+                json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
+            ),
+        )
+        .expect("a continuation page has its own reusable cache identity"),
     );
-    assert_eq!(
-        second.cache_scope,
-        CacheScope::Private,
-        "the typed continuation page retains its exact final cacheScope"
+    assert_eq!(typed_page_identity(&second_replay), second_identity);
+    assert_eq!(requests.load(Ordering::SeqCst), before_first + 2);
+    assert_eq!(client.final_result_cache_stats().fills, 2);
+    assert_eq!(client.final_result_cache_stats().hits, 2);
+    assert_eq!(client.final_result_cache_stats().misses, 2);
+
+    // Each negative changes exactly one request identity dimension.
+    for (method, params) in [
+        (
+            "tools/list",
+            json!({ "cursor": cursor.clone(), "includeTags": ["other"] }),
+        ),
+        (
+            "resources/list",
+            json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
+        ),
+        (
+            "tools/list",
+            json!({ "cursor": "", "includeTags": ["cursor"] }),
+        ),
+    ] {
+        let error = runtime_block_on_bounded(&cx, client.request_final_core(&cx, method, params))
+            .expect_err("query, catalog and explicit-empty cursor identities cannot reuse a page");
+        assert!(matches!(
+            error,
+            fastmcp_rust::HttpClientError::CoreResult(error)
+                if error.code == McpErrorCode::InvalidParams
+        ));
+    }
+
+    let before_unchanged_retry = client.final_result_cache_stats();
+    let before_unchanged_requests = requests.load(Ordering::SeqCst);
+    let unchanged_retry = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("rejected cursor variations preserve the original cached page"),
     );
-    assert_ne!(
-        typed_page_identity(&second),
+    // The counters are in the message because this assertion has been failing
+    // and the bare form cannot say WHY. `invalidate_result_set` is the only
+    // path that can remove this entry, and `FinalCacheStats` separates it from
+    // the alternatives in one line: `invalidations` for that path, `evictions`
+    // for a bounded-cache eviction, `stale` for TTL expiry. Capacity and expiry
+    // are both excluded by the defaults (128 entries, 128 MiB) against two
+    // retained pages, and by the TTL still having minutes left.
+    //
+    // An earlier revision of this comment said `invalidate_result_set` is
+    // "reachable only from `invalidate_notification`". That was wrong and it
+    // pointed at the wrong suspect: cache.rs had been read end to end without
+    // reading its CALLERS. It has five call sites in fastmcp-client, and the
+    // one that fired here was on the REFUSAL path of
+    // `request_final_core_with_cache_policy` -- an `InvalidParams` response to
+    // a request carrying any cursor string invalidated the entire result set.
+    // Two of the three negatives above are `tools/list` with a cursor present
+    // (the third's `""` satisfied the same `as_str().is_some()` guard), so
+    // each one alone retired every Tools page.
+    //
+    // PAST TENSE ON PURPOSE: e79019db removed that branch. The diagnosis
+    // predicted `invalidations == 3` here and that prediction described the
+    // UNFIXED code; the expectation now is that nothing on the refusal path
+    // moves the counter, which the single-rejection negative below asserts
+    // directly. `evictions > 0` would still refute the whole reading and send
+    // the search back to capacity. bd-gt6za.
+    assert_eq!(
+        typed_page_identity(&unchanged_retry),
         first_identity,
-        "the continuation must retain a complete typed page identity distinct from page one"
+        "rejected cursor variations must leave the original cached page \
+         byte-identical; cache counters at this point were {:?}",
+        client.final_result_cache_stats()
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), before_unchanged_requests);
+    assert_eq!(
+        client.final_result_cache_stats().fills,
+        before_unchanged_retry.fills
+    );
+    assert_eq!(
+        client.final_result_cache_stats().hits,
+        before_unchanged_retry.hits + 1
+    );
+    assert_eq!(
+        client.final_result_cache_stats().misses,
+        before_unchanged_retry.misses
     );
 
-    // RH-5: only the query changes. The retained cursor must not cross into a
-    // different filtered catalog, and the prior cached first page stays live.
-    let query_rejection = runtime_block_on_bounded(
+    // THE PLANTED NEGATIVE FOR THE SAME PROPERTY, differing from the positive
+    // above in exactly one dimension: ONE rejected variation instead of three.
+    // That dimension is what separates the two mechanisms this defect could
+    // have had. A bounded-cache eviction needs enough retained entries to
+    // displace this one, so it would survive a single rejection; a refusal path
+    // that invalidates by RESULT SET destroys the page on the first one. Before
+    // the fix in `request_final_core_with_cache_policy` a single rejection was
+    // already sufficient, so this is a real negative rather than a restatement
+    // of the positive. bd-gt6za.
+    let before_single = client.final_result_cache_stats();
+    let single_error = runtime_block_on_bounded(
         &cx,
         client.request_final_core(
             &cx,
@@ -8387,69 +8689,133 @@ fn e2e_public_http_final_cursor_query_kind_and_cache_identity_are_live_and_fail_
             json!({ "cursor": cursor.clone(), "includeTags": ["other"] }),
         ),
     )
-    .expect_err("changing only includeTags rejects the cursor before page projection");
+    .expect_err("one query-identity cursor variation is still refused");
     assert!(matches!(
-        query_rejection,
+        single_error,
         fastmcp_rust::HttpClientError::CoreResult(error)
             if error.code == McpErrorCode::InvalidParams
     ));
-
-    // RH-5: only the catalog method changes. A tools cursor cannot select a
-    // resources page, and this rejection must not flush the cached tools page.
-    let kind_rejection = runtime_block_on_bounded(
-        &cx,
-        client.request_final_core(
-            &cx,
-            "resources/list",
-            json!({ "cursor": cursor.clone(), "includeTags": ["cursor"] }),
-        ),
-    )
-    .expect_err("changing only the catalog kind rejects the tools cursor");
-    assert!(matches!(
-        kind_rejection,
-        fastmcp_rust::HttpClientError::CoreResult(error)
-            if error.code == McpErrorCode::InvalidParams
-    ));
-
-    // RH-5: only wire presence changes from an absent cursor to the explicitly
-    // present empty cursor. The cache must not replay the absent-cursor page.
-    let empty_cursor_rejection = runtime_block_on_bounded(
-        &cx,
-        client.request_final_core(
-            &cx,
-            "tools/list",
-            json!({ "cursor": "", "includeTags": ["cursor"] }),
-        ),
-    )
-    .expect_err("an explicit empty cursor is not the absent-cursor cache identity");
-    assert!(matches!(
-        empty_cursor_rejection,
-        fastmcp_rust::HttpClientError::CoreResult(error)
-            if error.code == McpErrorCode::InvalidParams
-    ));
-
-    let before_unchanged_retry = client.final_result_cache_stats();
-    let unchanged_retry = tools_page(
+    assert_eq!(
+        client.final_result_cache_stats().invalidations,
+        before_single.invalidations,
+        "a refused request must not invalidate a result set; counters were {:?}",
+        client.final_result_cache_stats()
+    );
+    // Baselined AFTER the refusal on purpose. Whether a refused request is
+    // itself counted at the wire is this fixture's business, not this
+    // assertion's; what must hold is that the RETRY reaches no wire at all.
+    let after_single_refusal_requests = requests.load(Ordering::SeqCst);
+    let single_retry = tools_page(
         runtime_block_on_bounded(
             &cx,
             client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
         )
-        .expect("cursor rejections leave the already-cached first page unchanged"),
+        .expect("one rejected cursor variation preserves the original cached page"),
     );
     assert_eq!(
-        typed_page_identity(&unchanged_retry),
+        typed_page_identity(&single_retry),
         first_identity,
-        "cursor rejections leave the complete cached typed first-page identity unchanged"
+        "a SINGLE rejected cursor variation must leave the original cached page \
+         byte-identical; cache counters at this point were {:?}",
+        client.final_result_cache_stats()
     );
     assert_eq!(
-        client.final_result_cache_stats().fills,
-        before_unchanged_retry.fills,
-        "rejected cursor variations cannot overwrite the admitted cached page"
+        requests.load(Ordering::SeqCst),
+        after_single_refusal_requests
     );
+    assert_eq!(client.final_result_cache_stats().fills, before_single.fills);
     assert_eq!(
         client.final_result_cache_stats().hits,
-        before_unchanged_retry.hits + 1,
-        "the unchanged original request still resolves from its prior cache entry"
+        before_single.hits + 1
+    );
+    assert_eq!(
+        client.final_result_cache_stats().evictions,
+        before_single.evictions
+    );
+    // The refused request still performs a lookup under its OWN distinct
+    // identity, and counting that miss is correct: what must not move is the
+    // stored page and the invalidation/eviction counters above.
+    assert_eq!(
+        client.final_result_cache_stats().misses,
+        before_single.misses + 1
+    );
+
+    // Clearing a real populated client cache forces one new wire request and
+    // a newly sealed first cursor while preserving the catalog's content.
+    //
+    // Baselined immediately below rather than against `before_unchanged_requests`.
+    // The property asserted is unchanged -- the clear costs EXACTLY ONE wire
+    // request -- but the old form also silently depended on nothing between
+    // that far-away baseline and here reaching the wire, which stopped being
+    // true when the single-rejection negative above was added.
+    let before_clear_requests = requests.load(Ordering::SeqCst);
+    client.clear_final_result_cache();
+    let refreshed = tools_page(
+        runtime_block_on_bounded(
+            &cx,
+            client.request_final_core(&cx, "tools/list", json!({ "includeTags": ["cursor"] })),
+        )
+        .expect("explicit cache invalidation fetches a fresh paginated catalog"),
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), before_clear_requests + 1);
+    assert_eq!(
+        serde_json::to_value(&refreshed.tools).unwrap(),
+        serde_json::to_value(&first.tools).unwrap()
+    );
+    assert_eq!(refreshed.cache_scope, CacheScope::Private);
+    assert!((1..=300_000).contains(&refreshed.ttl_ms.try_as_millis().unwrap()));
+    assert_ne!(refreshed.next_cursor.as_deref(), Some(cursor.as_str()));
+    assert_eq!(
+        client.final_result_cache_stats().fills,
+        before_unchanged_retry.fills + 1
+    );
+
+    // Use this actual server-produced page with the public monotonic cache
+    // API. Only time differs across the positive and exact-expiry negative;
+    // a preceding hit must not extend the original receipt-based TTL.
+    let receipt = Instant::now();
+    let expiry = receipt + Duration::from_millis(first_ttl);
+    let key = cache_key("owner-a");
+    let mut expiry_cache = FinalResultCache::new(4);
+    let generation = expiry_cache.begin_fetch(key.result_set());
+    assert_eq!(
+        expiry_cache.insert_if_current_at(key.clone(), generation, fetched.clone(), receipt),
+        FinalCacheInsert::Stored
+    );
+    assert!(matches!(
+        expiry_cache.lookup_at(&cache_key("owner-b"), receipt),
+        FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+    ));
+    let FinalCacheLookup::Fresh(before_expiry) =
+        expiry_cache.lookup_at(&key, expiry - Duration::from_nanos(1))
+    else {
+        panic!("the exact caller's stored page must remain fresh before expiry");
+    };
+    assert_eq!(
+        typed_page_identity(&tools_page(before_expiry)),
+        first_identity
+    );
+    assert!(matches!(
+        expiry_cache.lookup_at(&key, expiry),
+        FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+    ));
+    assert_eq!(expiry_cache.stats().stale, 1);
+
+    let mut invalidation_cache = FinalResultCache::new(4);
+    let generation = invalidation_cache.begin_fetch(key.result_set());
+    assert_eq!(
+        invalidation_cache.insert_if_current_at(key.clone(), generation, fetched.clone(), receipt),
+        FinalCacheInsert::Stored
+    );
+    invalidation_cache.invalidate_result_set(&FinalCacheResultSet::Tools);
+    assert!(matches!(
+        invalidation_cache.lookup_at(&key, receipt),
+        FinalCacheLookup::Miss(FinalCacheMiss::Absent)
+    ));
+    assert_eq!(
+        invalidation_cache.insert_if_current_at(key, generation, fetched, receipt),
+        FinalCacheInsert::InvalidatedDuringFetch,
+        "an old fetch cannot resurrect an invalidated cursor page"
     );
 
     drop(client);
@@ -15214,6 +15580,165 @@ fn e2e_public_http_as_proxy_adopts_upstream_implementation() {
     drop(client);
     gateway.shutdown();
     identified_upstream.shutdown();
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+#[test]
+fn e2e_public_http_as_proxy_tasks_identity_json() {
+    as_proxy_owner_isolated("e2e_public_http_as_proxy_tasks_identity_json", || {
+        assert_http_proxy_tasks_identity(false);
+    });
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+#[test]
+fn e2e_public_http_as_proxy_tasks_identity_sse() {
+    as_proxy_owner_isolated("e2e_public_http_as_proxy_tasks_identity_sse", || {
+        assert_http_proxy_tasks_identity(true);
+    });
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+struct PublicHttpTasksClientIdentity;
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+impl ToolHandler for PublicHttpTasksClientIdentity {
+    fn definition(&self) -> Tool {
+        PublicHttpClientIdentity.definition()
+    }
+
+    fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+        if !ctx.client_supports_tasks() {
+            return Err(McpError::invalid_request(
+                "identity probe requires Tasks on the upstream request",
+            ));
+        }
+        PublicHttpClientIdentity.call(ctx, arguments)
+    }
+}
+
+#[cfg(all(
+    unix,
+    feature = "proxy",
+    feature = "tasks",
+    feature = "native-tls-roots"
+))]
+fn assert_http_proxy_tasks_identity(streamed: bool) {
+    let cx = Cx::for_request();
+    let upstream = spawn_legacy_http_server("modern Tasks client identity", || {
+        let task_runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000))
+                .expect("the identity upstream uses the existing Tasks timing policy"),
+            Arc::new(|_| {}),
+        );
+        ServerBuilder::new("facade-http-task-identity", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("ModernOnly is available")
+            .tool(PublicHttpTaskTool)
+            .tool(PublicHttpTasksClientIdentity)
+            .final_tasks(task_runtime)
+            .expect("the identity upstream installs the official Tasks extension")
+            .task_supervisor(Arc::new(PublicHttpHoldingTaskSupervisor))
+            .build()
+    });
+    let gateway =
+        AsProxyOwnerGateway::fronting(spawn_modern_http_task_proxy_gateway(upstream.address()));
+    let prefixed = format!("ext/{PUBLIC_HTTP_CLIENT_IDENTITY_TOOL_NAME}");
+    let mut identified = runtime_block_on_bounded(
+        &cx,
+        gateway
+            .owner("e2e-as-proxy-tasks-identity")
+            .title("Caller Title")
+            .connect_http_with_cx(&cx, gateway.target()),
+    )
+    .expect("the identified caller connects as the authenticated Tasks owner");
+    let mut bare = runtime_block_on_bounded(
+        &cx,
+        gateway
+            .owner("e2e-as-proxy-tasks-identity-bare")
+            .connect_http_with_cx(&cx, gateway.target()),
+    )
+    .expect("the bare caller connects as the same authenticated Tasks owner");
+
+    for client in [&identified, &bare] {
+        let capabilities = serde_json::to_value(client.server_discovery().capabilities())
+            .expect("discovery capabilities serialize");
+        assert_eq!(
+            capabilities.pointer("/extensions/io.modelcontextprotocol~1tasks"),
+            Some(&json!({})),
+            "the gateway must have installed the upstream's real Tasks relay"
+        );
+    }
+
+    // The authenticated owner and Tasks outcome API elect the detached Tasks
+    // request, not the core request. Alternate callers on the same gateway to
+    // reject a connection-wide identity overlay and leaking a previous title.
+    for (round, has_title) in [true, false, true].into_iter().enumerate() {
+        let client = if has_title {
+            &mut identified
+        } else {
+            &mut bare
+        };
+        let request_id = RequestId::Number(10 + i64::try_from(round).unwrap());
+        let outcome = if streamed {
+            runtime_block_on_bounded(
+                &cx,
+                client.call_tool_outcome_with_progress_marker(
+                    &cx,
+                    request_id,
+                    &prefixed,
+                    json!({}),
+                    modern::ProgressMarker::from("tasks-identity-stream"),
+                    1 << 20,
+                ),
+            )
+        } else {
+            runtime_block_on_bounded(
+                &cx,
+                client.call_tool_outcome(&cx, request_id, &prefixed, json!({}), 1 << 20),
+            )
+        }
+        .expect("the Tasks-negotiated proxy call reaches the live identity handler");
+        let FinalToolCallOutcome::Complete(result) = outcome else {
+            panic!("the identity tool completes without creating a Task: {outcome:?}");
+        };
+        let expected = if has_title {
+            "name=e2e-as-proxy-tasks-identity|title=Caller Title"
+        } else {
+            "name=e2e-as-proxy-tasks-identity-bare|title=none"
+        };
+        assert!(!result.payload.is_error);
+        assert_eq!(result.payload.content.len(), 1);
+        assert!(
+            matches!(&result.payload.content[0], ContentBlock::Text { text, .. } if text == expected),
+            "each Tasks request must carry its own inbound identity: {result:?}"
+        );
+    }
+
+    drop(identified);
+    drop(bare);
+    gateway.shutdown();
+    upstream.shutdown();
 }
 
 #[cfg(all(feature = "proxy", feature = "tasks"))]

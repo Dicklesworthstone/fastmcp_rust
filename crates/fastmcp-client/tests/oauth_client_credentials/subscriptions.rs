@@ -222,13 +222,13 @@ fn run_subscription(case: SubCase) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
                     peer.quiet();
-                    acquire(&peer, &cx, &client, "access-one", 300).await;
+                    Box::pin(acquire(&peer, &cx, &client, "access-one", 300)).await;
                     healthy_listen(&peer, &tasks, &cx, 3, "access-one", 1).await;
                     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
                     return;
                 }
                 let lifetime = if matches!(case, SubCase::Expiry | SubCase::Renewal) { 3 } else { 300 };
-                acquire(&peer, &cx, &client, "access-one", lifetime).await;
+                Box::pin(acquire(&peer, &cx, &client, "access-one", lifetime)).await;
                 match case {
                     SubCase::Live => {
                         let (tx, mut rx) = oneshot::channel::<()>();

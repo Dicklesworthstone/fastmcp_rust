@@ -25,14 +25,15 @@
 use std::future::{Future, poll_fn};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::task::Poll;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::TcpListener as AsyncTcpListener;
-use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+use asupersync::runtime::{Runtime, RuntimeBuilder, reactor::create_reactor};
+use asupersync::time::{TimerDriverHandle, VirtualClock};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptorBuilder};
 use asupersync::{CancelKind, Cx};
 use fastmcp_client::http_auth::BoundBearerCredential;
@@ -197,19 +198,42 @@ fn begin_sse(stream: &mut TcpStream) {
     stream.flush().expect("flush SSE head");
 }
 
+/// Accepts a body write that lost a race with the client closing its end.
+///
+/// Once the response head is out, the client may leave at any byte: it closes
+/// as soon as it reaches a typed refusal or has read the last message a case
+/// asks for, while this peer is still writing the rest of its script. That
+/// close is the behavior under test, not a fixture fault, so a peer-closed
+/// error ends the write quietly. Every other I/O error still panics, and what
+/// the client observed is asserted on the client side.
+fn unless_client_left(written: std::io::Result<()>, what: &str) {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+
+    if let Err(error) = written {
+        assert!(
+            matches!(
+                error.kind(),
+                BrokenPipe | ConnectionReset | ConnectionAborted
+            ),
+            "{what}: {error}"
+        );
+    }
+}
+
 /// Writes one chunk. A zero-length chunk would terminate the body, so it is
 /// refused rather than silently ending the stream.
 fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) {
     assert!(!bytes.is_empty(), "a zero-length chunk would end the body");
-    write!(stream, "{:x}\r\n", bytes.len()).expect("write chunk length");
-    stream.write_all(bytes).expect("write chunk payload");
-    write!(stream, "\r\n").expect("write chunk terminator");
-    stream.flush().expect("flush chunk");
+    let written = write!(stream, "{:x}\r\n", bytes.len())
+        .and_then(|()| stream.write_all(bytes))
+        .and_then(|()| write!(stream, "\r\n"))
+        .and_then(|()| stream.flush());
+    unless_client_left(written, "write chunk");
 }
 
 fn end_sse(stream: &mut TcpStream) {
-    write!(stream, "0\r\n\r\n").expect("write terminating chunk");
-    stream.flush().expect("flush terminator");
+    let written = write!(stream, "0\r\n\r\n").and_then(|()| stream.flush());
+    unless_client_left(written, "write terminating chunk");
 }
 
 fn endpoint_event(message_target: &str) -> Vec<u8> {
@@ -534,6 +558,9 @@ enum Step {
     End,
     /// Waits for the client to close the most recently held stream.
     ExpectHeldClosed,
+    /// Waits until the test signals, so a later write lands at a chosen
+    /// virtual time.
+    Await(mpsc::Receiver<()>),
 }
 
 /// Everything a scripted peer received.
@@ -777,6 +804,11 @@ impl Peer {
                         let mut byte = [0_u8; 1];
                         log.held_closed_by_client = Some(matches!(stream.read(&mut byte), Ok(0)));
                     }
+                    Step::Await(signal) => {
+                        signal
+                            .recv_timeout(Duration::from_secs(20))
+                            .expect("the test signals the peer");
+                    }
                 }
             }
             while let Some(mut stray) = accept_within(&listener, Duration::from_millis(400)) {
@@ -846,6 +878,32 @@ fn assert_refused_at_open_or_first_read(peer: &Peer, marker: &str) {
         assert_eq!(after, "Err(StreamGenerationEnded)", "{marker}");
         assert_eq!(generation, 1, "{marker}");
     }
+}
+
+/// A runtime whose timers run on `clock`, which moves only when the test
+/// advances it; sockets stay real.
+fn virtual_runtime(clock: &Arc<VirtualClock>) -> Runtime {
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().expect("create the reactor"))
+        .with_timer_driver(TimerDriverHandle::with_virtual_clock(Arc::clone(clock)))
+        .build()
+        .expect("the test owns its virtual-time runtime")
+}
+
+/// Advances `clock` once the future paired with this one is already waiting.
+async fn advance_after_yield(clock: &VirtualClock, nanos: u64) {
+    let mut yielded = false;
+    poll_fn(|task| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            task.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
+    clock.advance(nanos);
 }
 
 /// A client request the peer can recognise in the POST body.
@@ -1391,6 +1449,201 @@ fn leg_http_01_b_positive() {
     assert!(log.posts.is_empty(), "nothing is POSTed after close");
     assert_eq!(log.gets(), 1, "a closed client never reconnects");
     log.assert_legacy_hygiene("row 11");
+
+    // ---- absolute lifetime per stream generation -------------------------
+    //
+    // Virtual time moves only when the test advances it, so the bound is
+    // exact. Generation 1 still delivers one nanosecond before its lifetime
+    // and ends at it; its POST target is then gone, and a reconnect opens
+    // generation 2 with a fresh lifetime. That generation then ends by itself
+    // while a read already waits on the quiet stream.
+    let absolute = limits
+        .iter()
+        .find(|limit| limit.name() == "absolute-lifetime")
+        .expect("the manifest declares the absolute-lifetime floor");
+    let lifetime = Duration::from_secs(absolute.guarded());
+    let ceiling = Duration::from_secs(absolute.hard());
+    let lifetime_nanos = u64::try_from(lifetime.as_nanos()).expect("the lifetime fits u64 nanos");
+    let clock = Arc::new(VirtualClock::new());
+    let (signal, signalled) = mpsc::channel::<()>();
+    let generations = Peer::serve(move |message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(&format!("{message}?session=1"))],
+                end: false,
+            },
+            Step::Await(signalled),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#)),
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![
+                    endpoint_event(&format!("{message}?session=2")),
+                    message_event(r#"{"jsonrpc":"2.0","id":4,"result":{}}"#),
+                ],
+                end: false,
+            },
+        ]
+    });
+    let observed = virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut legacy = open_legacy(&cx, &generations)
+            .await
+            .expect("generation 1 opens");
+        let mut observed = vec![format!("{:?}", legacy.stream_lifetime())];
+        clock.advance(lifetime_nanos - 1);
+        signal.send(()).expect("the peer awaits the signal");
+        observed.push(format!("{:?}", legacy.next_message(&cx).await));
+        clock.advance(1);
+        observed.push(format!("{:?}", legacy.next_message(&cx).await));
+        observed.push(format!("{:?}", legacy.send(&cx, &ping(5)).await));
+        legacy
+            .reconnect(&cx)
+            .await
+            .expect("a new generation opens with a fresh lifetime");
+        observed.push(format!("{:?}", legacy.next_message(&cx).await));
+        let (quiet, ()) = Box::pin(pair(
+            legacy.next_message(&cx),
+            advance_after_yield(&clock, lifetime_nanos),
+        ))
+        .await;
+        observed.push(format!("{quiet:?}"));
+        observed.push(format!(
+            "{:?} {:?}",
+            legacy.set_stream_lifetime(ceiling),
+            legacy.stream_lifetime()
+        ));
+        observed
+    }));
+    assert_eq!(
+        observed[0],
+        format!("{lifetime:?}"),
+        "the default lifetime is the guarded floor"
+    );
+    assert!(
+        observed[1].starts_with("Ok(Some(Response(") && observed[1].contains("Number(3)"),
+        "one nanosecond before its lifetime the generation still delivers, observed {}",
+        observed[1]
+    );
+    assert_eq!(observed[2], "Err(SseStreamLifetimeExpired)");
+    assert_eq!(
+        observed[3], "Err(StreamGenerationEnded)",
+        "the ended generation's POST target is gone"
+    );
+    assert!(
+        observed[4].starts_with("Ok(Some(Response(") && observed[4].contains("Number(4)"),
+        "the new generation delivers, observed {}",
+        observed[4]
+    );
+    assert_eq!(
+        observed[5], "Err(SseStreamLifetimeExpired)",
+        "a quiet generation ends at its lifetime while a read waits"
+    );
+    assert_eq!(
+        observed[6],
+        format!("Ok(()) {ceiling:?}"),
+        "the lifetime is configurable up to its hard ceiling"
+    );
+    let log = generations.finish();
+    assert_eq!(log.gets(), 2, "one GET per generation");
+    assert!(log.posts.is_empty(), "no POST to an ended generation");
+    log.assert_legacy_hygiene("absolute lifetime");
+
+    // ---- guarded idle lifetime -------------------------------------------
+    //
+    // The idle clock is guarded: it runs only while a request POSTed on this
+    // generation still awaits its response, and any bytes from the peer
+    // restart it. So a stream one nanosecond short of the idle lifetime still
+    // delivers its response, and a stream with nothing outstanding survives
+    // the idle lifetime twice over. Both reads are already waiting when the
+    // clock moves, which is where a wrongly-armed idle clock would cut them.
+    let idle = limits
+        .iter()
+        .find(|limit| limit.name() == "guarded-idle-lifetime")
+        .expect("the manifest declares the guarded-idle-lifetime floor");
+    let idle_lifetime = Duration::from_secs(idle.guarded());
+    let idle_ceiling = Duration::from_secs(idle.hard());
+    let idle_nanos = u64::try_from(idle_lifetime.as_nanos()).expect("the lifetime fits u64 nanos");
+    let clock = Arc::new(VirtualClock::new());
+    let (answer, awaited) = mpsc::channel::<()>();
+    let (quiet_answer, quiet_awaited) = mpsc::channel::<()>();
+    let guarded = Peer::serve(move |message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message)],
+                end: false,
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+            Step::Await(awaited),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":11,"result":{}}"#)),
+            Step::Await(quiet_awaited),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":12,"result":{}}"#)),
+        ]
+    });
+    let observed = virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut legacy = open_legacy(&cx, &guarded).await.expect("the lane opens");
+        let mut observed = vec![format!("{:?}", legacy.idle_lifetime())];
+        legacy
+            .send(&cx, &ping(11))
+            .await
+            .expect("the advertised POST target accepts the request");
+        // One request outstanding, one nanosecond short of the idle lifetime.
+        let (delivered, ()) = Box::pin(pair(legacy.next_message(&cx), async {
+            advance_after_yield(&clock, idle_nanos - 1).await;
+            answer.send(()).expect("the peer awaits the answer signal");
+        }))
+        .await;
+        observed.push(format!("{delivered:?}"));
+        // Nothing outstanding: the guarded clock is not armed at all, so twice
+        // the idle lifetime passes and the stream is still there to deliver.
+        // The second answer is deliberately unsolicited, because a stream the
+        // caller is only listening on is exactly the case that must survive.
+        let (survived, ()) = Box::pin(pair(legacy.next_message(&cx), async {
+            advance_after_yield(&clock, idle_nanos * 2).await;
+            quiet_answer
+                .send(())
+                .expect("the peer awaits the quiet signal");
+        }))
+        .await;
+        observed.push(format!("{survived:?}"));
+        observed.push(format!(
+            "{:?} {:?}",
+            legacy.set_idle_lifetime(idle_ceiling),
+            legacy.idle_lifetime()
+        ));
+        observed
+    }));
+    assert_eq!(
+        observed[0],
+        format!("{idle_lifetime:?}"),
+        "the default idle lifetime is the guarded floor"
+    );
+    assert!(
+        observed[1].starts_with("Ok(Some(Response(") && observed[1].contains("Number(11)"),
+        "one nanosecond short of the idle lifetime the response still arrives, observed {}",
+        observed[1]
+    );
+    assert!(
+        observed[2].starts_with("Ok(Some(Response(") && observed[2].contains("Number(12)"),
+        "a stream with nothing outstanding is never cut by the idle clock, observed {}",
+        observed[2]
+    );
+    assert_eq!(
+        observed[3],
+        format!("Ok(()) {idle_ceiling:?}"),
+        "the idle lifetime is configurable up to its hard ceiling"
+    );
+    let log = guarded.finish();
+    assert_eq!(log.gets(), 1, "the guarded lane never reconnects");
+    assert_eq!(log.posts.len(), 1, "exactly the one request that was sent");
+    log.assert_legacy_hygiene("guarded idle lifetime");
 }
 
 #[test]
@@ -1672,7 +1925,7 @@ fn leg_http_01_b_planted_negative() {
         });
         let observed = runtime_block_on(async {
             let cx = Cx::for_request();
-            let legacy = open_legacy(&cx, &peer).await.expect("the lane opens");
+            let mut legacy = open_legacy(&cx, &peer).await.expect("the lane opens");
             (
                 format!("{:?}", legacy.send(&cx, &ping(1)).await),
                 legacy.stream_generation(),
@@ -1747,4 +2000,136 @@ fn leg_http_01_b_planted_negative() {
     );
     assert!(log.posts.is_empty());
     log.assert_legacy_hygiene("reconnect bound + 1");
+
+    // ---- absolute lifetime: the same read at the lifetime itself ---------
+    //
+    // The positive's generation-1 read with one variable changed: the
+    // message arrives at exactly the lifetime instead of one nanosecond
+    // before it, so it is never read. Configuring one nanosecond over the
+    // hard ceiling, or zero, is refused and leaves the lifetime unchanged.
+    let absolute = limits
+        .iter()
+        .find(|limit| limit.name() == "absolute-lifetime")
+        .expect("the manifest declares the absolute-lifetime floor");
+    let lifetime = Duration::from_secs(absolute.guarded());
+    let ceiling = Duration::from_secs(absolute.hard());
+    let lifetime_nanos = u64::try_from(lifetime.as_nanos()).expect("the lifetime fits u64 nanos");
+    let clock = Arc::new(VirtualClock::new());
+    let (signal, signalled) = mpsc::channel::<()>();
+    let peer = Peer::serve(move |message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message)],
+                end: false,
+            },
+            Step::Await(signalled),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#)),
+        ]
+    });
+    let observed = virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut legacy = open_legacy(&cx, &peer).await.expect("the lane opens");
+        let over_ceiling = format!(
+            "{:?}",
+            legacy.set_stream_lifetime(ceiling + Duration::from_nanos(1))
+        );
+        let zero = format!("{:?}", legacy.set_stream_lifetime(Duration::ZERO));
+        let unchanged = legacy.stream_lifetime();
+        clock.advance(lifetime_nanos);
+        signal.send(()).expect("the peer awaits the signal");
+        (
+            over_ceiling,
+            zero,
+            unchanged,
+            format!("{:?}", legacy.next_message(&cx).await),
+            format!("{:?}", legacy.send(&cx, &ping(5)).await),
+            legacy.stream_generation(),
+        )
+    }));
+    assert_eq!(observed.0, "Err(InvalidStreamLifetime)");
+    assert_eq!(observed.1, "Err(InvalidStreamLifetime)");
+    assert_eq!(observed.2, lifetime, "a refused setting changes nothing");
+    assert_eq!(observed.3, "Err(SseStreamLifetimeExpired)");
+    assert_eq!(observed.4, "Err(StreamGenerationEnded)");
+    assert_eq!(observed.5, 1, "no new generation is opened implicitly");
+    let log = peer.finish();
+    assert!(log.posts.is_empty());
+    log.assert_legacy_hygiene("absolute lifetime + 1 ns");
+
+    // ---- guarded idle lifetime: the same read at the lifetime itself ------
+    //
+    // The positive's outstanding-request read with one variable changed: the
+    // clock reaches the idle lifetime exactly instead of one nanosecond short
+    // of it, and this peer never answers. The refusal names the idle lifetime,
+    // the generation's POST target is gone, and no new generation opens. The
+    // positive's other read, with nothing outstanding, survives twice this
+    // span on an equally silent stream: the difference is the guard, not the
+    // clock. One nanosecond over the hard ceiling, or zero, is refused and
+    // leaves the lifetime unchanged.
+    let idle = limits
+        .iter()
+        .find(|limit| limit.name() == "guarded-idle-lifetime")
+        .expect("the manifest declares the guarded-idle-lifetime floor");
+    let idle_lifetime = Duration::from_secs(idle.guarded());
+    let idle_ceiling = Duration::from_secs(idle.hard());
+    let idle_nanos = u64::try_from(idle_lifetime.as_nanos()).expect("the lifetime fits u64 nanos");
+    let clock = Arc::new(VirtualClock::new());
+    let peer = Peer::serve(|message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message)],
+                end: false,
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+        ]
+    });
+    let observed = virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut legacy = open_legacy(&cx, &peer).await.expect("the lane opens");
+        let over_ceiling = format!(
+            "{:?}",
+            legacy.set_idle_lifetime(idle_ceiling + Duration::from_nanos(1))
+        );
+        let zero = format!("{:?}", legacy.set_idle_lifetime(Duration::ZERO));
+        let unchanged = legacy.idle_lifetime();
+        legacy
+            .send(&cx, &ping(11))
+            .await
+            .expect("the advertised POST target accepts the request");
+        clock.advance(idle_nanos);
+        (
+            over_ceiling,
+            zero,
+            unchanged,
+            format!("{:?}", legacy.next_message(&cx).await),
+            format!("{:?}", legacy.send(&cx, &ping(12)).await),
+            legacy.stream_generation(),
+        )
+    }));
+    assert_eq!(observed.0, "Err(InvalidIdleLifetime)");
+    assert_eq!(observed.1, "Err(InvalidIdleLifetime)");
+    assert_eq!(
+        observed.2, idle_lifetime,
+        "a refused setting changes nothing"
+    );
+    assert_eq!(observed.3, "Err(SseIdleLifetimeExceeded)");
+    assert_eq!(
+        observed.4, "Err(StreamGenerationEnded)",
+        "the cut generation's POST target is gone"
+    );
+    assert_eq!(observed.5, 1, "no new generation is opened implicitly");
+    let log = peer.finish();
+    assert_eq!(
+        log.posts.len(),
+        1,
+        "only the request that armed the guarded clock"
+    );
+    log.assert_legacy_hygiene("guarded idle lifetime at the bound");
 }

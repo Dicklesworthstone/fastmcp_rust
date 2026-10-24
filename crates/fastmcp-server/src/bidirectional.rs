@@ -262,6 +262,9 @@ impl PendingIdDomain {
 pub(crate) enum PendingResponseDisposition {
     /// The response reached its live pending request.
     Delivered,
+    /// The response violates its live request's protocol era. The waiter is
+    /// retained so a subsequent valid reply can still complete the request.
+    Rejected,
     /// The response belongs to an issued exact-legacy negative ID that has
     /// already left the pending set.
     RetiredGeneric,
@@ -279,6 +282,7 @@ struct PendingState {
 #[derive(Debug)]
 struct PendingRequest {
     sender: ResponseSender,
+    response_era: Option<ProtocolEra>,
     #[cfg(feature = "legacy-2024-11-05")]
     request_cancellation: Option<McpRequestCancellation>,
 }
@@ -374,10 +378,20 @@ impl PendingRequests {
         self.lock_state().requests.len()
     }
 
-    /// Atomically allocates a collision-free ID and registers its response
-    /// channel. Allocation scans at most `max_in_flight + 1` candidates.
+    #[cfg(test)]
     fn register_with_cancellation(
         &self,
+        request_cancellation: Option<McpRequestCancellation>,
+    ) -> McpResult<(RequestId, ResponseReceiver)> {
+        self.register_for_era(None, request_cancellation)
+    }
+
+    /// Atomically allocates a collision-free ID and registers its response
+    /// channel and optional negotiated era. Allocation scans at most
+    /// `max_in_flight + 1` candidates.
+    fn register_for_era(
+        &self,
+        response_era: Option<ProtocolEra>,
         request_cancellation: Option<McpRequestCancellation>,
     ) -> McpResult<(RequestId, ResponseReceiver)> {
         // Only the exact-legacy pump sweeps waiters by owner cancellation
@@ -406,6 +420,7 @@ impl PendingRequests {
                 let (sender, receiver) = oneshot::channel();
                 entry.insert(PendingRequest {
                     sender,
+                    response_era,
                     #[cfg(feature = "legacy-2024-11-05")]
                     request_cancellation,
                 });
@@ -427,8 +442,9 @@ impl PendingRequests {
         )
     }
 
-    /// Routes a response and reports whether it was delivered, retired from
-    /// the exact-legacy negative ID suffix, or unmatched.
+    /// Routes a response and reports whether it was delivered, rejected for
+    /// its live request's era, retired from the exact-legacy negative ID
+    /// suffix, or unmatched.
     pub(crate) fn route_response_with_disposition(
         &self,
         response: &JsonRpcResponse,
@@ -442,6 +458,25 @@ impl PendingRequests {
 
         let (pending, retired_generic) = {
             let mut state = self.lock_state();
+            if state
+                .requests
+                .get(&key)
+                .is_some_and(|pending| pending.response_era == Some(ProtocolEra::Legacy2024))
+            {
+                // Keep potentially large response serialization and decoding
+                // outside the tracker lock. Issued IDs are never reused, so
+                // only this same waiter or its retirement can be observed
+                // when the lock is reacquired.
+                drop(state);
+                let admitted = serde_json::to_value(response).is_ok_and(|value| {
+                    fastmcp_protocol::methods::decode_legacy_2024_11_05_envelope_classified(value)
+                        .is_ok()
+                });
+                state = self.lock_state();
+                if !admitted && state.requests.contains_key(&key) {
+                    return PendingResponseDisposition::Rejected;
+                }
+            }
             let pending = state.requests.remove(&key);
             #[cfg(feature = "legacy-2024-11-05")]
             let retired_generic = pending.is_none()
@@ -455,7 +490,7 @@ impl PendingRequests {
         };
 
         if let Some(pending) = pending {
-            // Validate every response invariant before consuming the waiter.
+            // Validate generic response invariants before delivering the result.
             // This also rejects manually-constructed values that bypass serde's guards.
             let validated = ValidatedResponse::from_response(response);
             let outcome = validated.into_pending_response();
@@ -648,7 +683,7 @@ pub struct RequestSender {
     pending: Arc<PendingRequests>,
     /// Transport send callback.
     send_fn: TransportSendFn,
-    /// Exact protocol era that governs reverse-request cleanup controls.
+    /// Exact protocol era that governs reverse replies and cleanup controls.
     era: ProtocolEra,
     /// Request-local cancellation domain installed by server dispatch.
     request_cancellation: Option<McpRequestCancellation>,
@@ -667,6 +702,10 @@ impl RequestSender {
     /// Dropped reverse requests emit `notifications/cancelled` only for exact
     /// MCP 2024-11-05. MCP 2026-07-28 retains local cleanup but emits no
     /// server cancellation notification.
+    ///
+    /// Exact-2024 replies must pass that era's envelope decoder before they
+    /// can complete a request. Rejected replies leave the request pending so
+    /// the peer can still supply a valid response with the same ID.
     pub fn new_for_era(
         era: ProtocolEra,
         pending: Arc<PendingRequests>,
@@ -718,7 +757,7 @@ impl RequestSender {
 
         let (id, mut receiver) = self
             .pending
-            .register_with_cancellation(self.request_cancellation.clone())?;
+            .register_for_era(Some(self.era), self.request_cancellation.clone())?;
         let mut guard = PendingRequestGuard {
             pending: Arc::clone(&self.pending),
             send_fn: Arc::clone(&self.send_fn),
@@ -1211,9 +1250,16 @@ impl MrtrInputRequest {
         }
     }
 
-    /// Creates one final-era elicitation descriptor without translating it
-    /// through the exact-2024 request shape.
-    fn final_elicitation(
+    /// Creates a modern form or URL elicitation descriptor.
+    ///
+    /// Uses the same admitted descriptor as modern client resolvers without
+    /// adding legacy elicitation identity or inherited request metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an internal error if serialization fails, including a mode
+    /// discriminator that disagrees with the descriptor's variant.
+    pub fn final_elicitation(
         params: fastmcp_protocol::FinalEmbeddedElicitationParams,
     ) -> McpResult<Self> {
         serde_json::to_value(&params)
@@ -1438,13 +1484,16 @@ impl MrtrInputResponse {
         Self::with_value(MrtrInputKind::Sampling, value)
     }
 
-    /// Creates a roots response value.
+    /// Creates a final roots response value.
+    ///
+    /// Uses the same embedded payload as modern client resolvers, so creating
+    /// or resuming an MRTR exchange does not require the legacy protocol API.
     ///
     /// # Errors
     ///
     /// Returns an internal error only if its protocol value cannot be
     /// represented as JSON.
-    pub fn roots(value: fastmcp_protocol::ListRootsResult) -> McpResult<Self> {
+    pub fn roots(value: fastmcp_protocol::FinalEmbeddedRootsListResult) -> McpResult<Self> {
         Self::with_value(MrtrInputKind::Roots, value)
     }
 
@@ -1478,7 +1527,7 @@ impl MrtrInputResponse {
     }
 
     /// Returns this value as the roots result it was admitted as.
-    pub fn roots_result(&self) -> McpResult<fastmcp_protocol::ListRootsResult> {
+    pub fn roots_result(&self) -> McpResult<fastmcp_protocol::FinalEmbeddedRootsListResult> {
         if self.kind != MrtrInputKind::Roots {
             return Err(McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR));
         }
@@ -1505,10 +1554,18 @@ impl MrtrInputResponse {
                 serde_json::from_value(value)
                     .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
             )?,
-            MrtrInputKind::Roots => Self::roots(
-                serde_json::from_value(value)
-                    .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
-            )?,
+            MrtrInputKind::Roots => {
+                // Select roots before constructing the closed Task-input
+                // payload: MRTR admits inert peer siblings on this object.
+                let roots = value
+                    .get("roots")
+                    .cloned()
+                    .ok_or_else(|| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?;
+                Self::roots(fastmcp_protocol::FinalEmbeddedRootsListResult {
+                    roots: serde_json::from_value(roots)
+                        .map_err(|_| McpError::invalid_params(MRTR_RESPONSE_KIND_ERROR))?,
+                })?
+            }
         };
         Ok(response)
     }
@@ -1776,6 +1833,19 @@ pub enum MrtrRetry {
 pub struct MrtrCompletedInputs {
     responses: MrtrInputResponses,
     handler_request_state: Option<MrtrRequestState>,
+    continuation: MrtrContinuationBudget,
+}
+
+/// Authority retained after one input map completes, while its handler may
+/// still ask for another round of the same logical operation. This is private
+/// to the registry and never serialized or exposed to application handlers.
+#[derive(Clone)]
+struct MrtrContinuationBudget {
+    owner_cancellation: McpRequestCancellation,
+    expires_at: Instant,
+    round: u8,
+    total_input_requests: usize,
+    binding: Option<MrtrExchangeBinding>,
 }
 
 impl std::fmt::Debug for MrtrCompletedInputs {
@@ -1826,7 +1896,10 @@ impl MrtrCompletedInputs {
     }
 
     /// Returns one framework-admitted roots response by its issued key.
-    pub fn roots(&self, key: &str) -> McpResult<Option<fastmcp_protocol::ListRootsResult>> {
+    pub fn roots(
+        &self,
+        key: &str,
+    ) -> McpResult<Option<fastmcp_protocol::FinalEmbeddedRootsListResult>> {
         self.responses
             .get(key)
             .map(MrtrInputResponse::roots_result)
@@ -1966,6 +2039,7 @@ impl MrtrExchangeRegistry {
             None,
             input_requests,
             None,
+            None,
             Instant::now(),
         )
     }
@@ -1985,6 +2059,28 @@ impl MrtrExchangeRegistry {
             Some(binding),
             input_requests,
             handler_request_state,
+            None,
+            Instant::now(),
+        )
+    }
+
+    /// Issues the next handler-requested round of an already admitted logical
+    /// exchange. Finishing the previous input map does not renew its lifetime
+    /// or reset the cumulative round and input-request budgets.
+    pub(crate) fn issue_successor_bound(
+        &self,
+        owner_cancellation: McpRequestCancellation,
+        binding: MrtrExchangeBinding,
+        input_requests: MrtrInputRequests,
+        handler_request_state: Option<String>,
+        completed: &MrtrCompletedInputs,
+    ) -> McpResult<MrtrInputRequired> {
+        self.issue_at(
+            owner_cancellation,
+            Some(binding),
+            input_requests,
+            handler_request_state,
+            Some(completed),
             Instant::now(),
         )
     }
@@ -2226,6 +2322,7 @@ impl MrtrExchangeRegistry {
         binding: Option<MrtrExchangeBinding>,
         input_requests: MrtrInputRequests,
         handler_request_state: Option<String>,
+        completed: Option<&MrtrCompletedInputs>,
         now: Instant,
     ) -> McpResult<MrtrInputRequired> {
         // This registry retains private, one-use state even for stateless
@@ -2249,9 +2346,41 @@ impl MrtrExchangeRegistry {
             return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
         }
 
-        let expires_at = now
-            .checked_add(self.request_state_ttl)
-            .ok_or_else(|| McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR))?;
+        let (owner_cancellation, expires_at, round, total_input_requests) =
+            if let Some(completed) = completed {
+                let previous = &completed.continuation;
+                if previous.binding != binding {
+                    return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+                }
+                if previous.owner_cancellation.is_cancel_requested() {
+                    return Err(McpError::request_cancelled());
+                }
+                if now >= previous.expires_at {
+                    return Err(McpError::invalid_params(MRTR_REQUEST_STATE_ERROR));
+                }
+                let round = previous
+                    .round
+                    .checked_add(1)
+                    .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+                let total = previous
+                    .total_input_requests
+                    .checked_add(input_requests.len())
+                    .ok_or_else(|| McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR))?;
+                if round > self.max_rounds || total > self.max_total_input_requests {
+                    return Err(McpError::invalid_params(MRTR_ROUND_LIMIT_ERROR));
+                }
+                (
+                    previous.owner_cancellation.clone(),
+                    previous.expires_at,
+                    round,
+                    total,
+                )
+            } else {
+                let expires_at = now.checked_add(self.request_state_ttl).ok_or_else(|| {
+                    McpError::internal_error(MRTR_REQUEST_STATE_UNAVAILABLE_ERROR)
+                })?;
+                (owner_cancellation, expires_at, 1, input_requests.len())
+            };
         let mut state = self.lock_state();
         Self::purge_stale(&mut state, now);
         if state.stateless_closed
@@ -2273,8 +2402,8 @@ impl MrtrExchangeRegistry {
             MrtrExchange {
                 owner_cancellation,
                 expires_at,
-                round: 1,
-                total_input_requests: input_requests.as_ref().map_or(0, MrtrInputRequests::len),
+                round,
+                total_input_requests,
                 expected,
                 requests: input_requests.clone().unwrap_or_default(),
                 responses: MrtrInputResponses::default(),
@@ -2363,6 +2492,13 @@ impl MrtrExchangeRegistry {
             return Ok(MrtrRetry::Complete(MrtrCompletedInputs {
                 responses: accepted_responses,
                 handler_request_state: exchange.handler_request_state,
+                continuation: MrtrContinuationBudget {
+                    owner_cancellation: exchange.owner_cancellation,
+                    expires_at: exchange.expires_at,
+                    round: exchange.round,
+                    total_input_requests: exchange.total_input_requests,
+                    binding: exchange.binding,
+                },
             }));
         }
 
@@ -2672,8 +2808,10 @@ mod tests {
     }
 
     fn mrtr_roots_response() -> MrtrInputResponse {
-        MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-            .expect("roots response must serialize")
+        MrtrInputResponse::roots(fastmcp_protocol::FinalEmbeddedRootsListResult {
+            roots: Vec::new(),
+        })
+        .expect("roots response must serialize")
     }
 
     fn final_form_elicitation_params() -> fastmcp_protocol::FinalEmbeddedElicitationParams {
@@ -2732,6 +2870,149 @@ mod tests {
             "model": "test-model",
         }))
         .expect("final sampling result with tool use must admit")
+    }
+
+    fn modern_roots_exchange() -> (MrtrExchangeRegistry, String) {
+        let registry = MrtrExchangeRegistry::new();
+        let requests =
+            MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap();
+        let issued = registry
+            .issue(McpRequestCancellation::new(), requests)
+            .unwrap();
+        let state = mrtr_state_from_wire(&issued);
+        (registry, state)
+    }
+
+    #[test]
+    fn mrtr_modern_roots_payload_round_trip() {
+        let (registry, state) = modern_roots_exchange();
+        let roots = fastmcp_protocol::FinalEmbeddedRootsListResult {
+            roots: vec![
+                fastmcp_protocol::Root::new("file:///workspace/project%20one"),
+                fastmcp_protocol::Root::with_name("file:///workspace/project%20one", ""),
+                fastmcp_protocol::Root::with_name("file:///workspace/project%20one", "Project one"),
+            ],
+        };
+        let response = MrtrInputResponse::roots(roots.clone()).unwrap();
+        assert_eq!(response.roots_result().unwrap(), roots);
+        let responses = MrtrInputResponses::new([("roots".to_owned(), response)]).unwrap();
+        let MrtrRetry::Complete(completed) = registry.accept(&state, responses).unwrap() else {
+            panic!("the final roots payload must complete the exchange");
+        };
+        let resumed: fastmcp_protocol::FinalEmbeddedRootsListResult =
+            completed.roots("roots").unwrap().unwrap();
+        assert_eq!(resumed, roots);
+        assert!(completed.roots("absent").unwrap().is_none());
+        assert_eq!(registry.active_len(), 0);
+        assert!(
+            registry
+                .accept(&state, MrtrInputResponses::default())
+                .is_err(),
+            "completed roots input cannot replay its one-use request state"
+        );
+    }
+
+    #[test]
+    fn mrtr_modern_roots_wrong_kind_preserves_pending_exchange() {
+        let (registry, state) = modern_roots_exchange();
+        let before = format!("{:?}", registry.lock_state().exchanges.get(&state));
+        let wrong =
+            MrtrInputResponse::elicitation(fastmcp_protocol::ElicitResult::decline()).unwrap();
+        assert_eq!(
+            wrong.roots_result().unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        let responses = MrtrInputResponses::new([("roots".to_owned(), wrong)]).unwrap();
+        assert_eq!(
+            registry.accept(&state, responses).unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        assert_eq!(
+            format!("{:?}", registry.lock_state().exchanges.get(&state)),
+            before,
+            "kind rejection must leave the pending roots exchange unchanged"
+        );
+
+        let invalid = BTreeMap::from([(
+            "roots".to_owned(),
+            serde_json::json!({"roots": [{"uri": "file:///workspace", "name": null}]}),
+        )]);
+        assert_eq!(
+            registry.accept_wire(&state, &invalid).unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        assert_eq!(
+            format!("{:?}", registry.lock_state().exchanges.get(&state)),
+            before,
+            "a present null name must not consume or modify the pending exchange"
+        );
+        assert_eq!(registry.active_len(), 1);
+
+        let responses =
+            MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())]).unwrap();
+        let MrtrRetry::Complete(completed) = registry.accept(&state, responses).unwrap() else {
+            panic!("the original state must still accept a corrected roots response");
+        };
+        assert!(completed.roots("roots").unwrap().unwrap().roots.is_empty());
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
+    fn mrtr_modern_roots_wire_siblings_remain_inert() {
+        let response = MrtrInputResponse::from_wire(
+            MrtrInputKind::Roots,
+            serde_json::json!({
+                "roots": [{"uri": "file:///workspace", "name": ""}],
+                "unknown": {"roots": [{"uri": "file:///unselected"}]},
+                "_meta": {"vendor.example/display": true},
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({"roots": [{"uri": "file:///workspace", "name": ""}]})
+        );
+        let roots: fastmcp_protocol::FinalEmbeddedRootsListResult =
+            response.roots_result().unwrap();
+        assert_eq!(roots.roots.len(), 1);
+        assert_eq!(roots.roots[0].uri, "file:///workspace");
+        assert_eq!(roots.roots[0].name.as_deref(), Some(""));
+        for invalid in [
+            serde_json::json!({"unknown": {"roots": []}}),
+            serde_json::json!({"roots": null}),
+            serde_json::json!({"roots": {}}),
+        ] {
+            assert_eq!(
+                MrtrInputResponse::from_wire(MrtrInputKind::Roots, invalid)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_final_elicitation_constructor_preserves_mode_and_rejects_mismatch() {
+        for mut params in [
+            final_form_elicitation_params(),
+            final_url_elicitation_params(),
+        ] {
+            let expected = serde_json::to_value(&params).unwrap();
+            let request = MrtrInputRequest::final_elicitation(params.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap(),
+                serde_json::json!({"method": "elicitation/create", "params": expected})
+            );
+            match &mut params {
+                fastmcp_protocol::FinalEmbeddedElicitationParams::Form(form) => {
+                    form.mode = fastmcp_protocol::ElicitMode::Url;
+                }
+                fastmcp_protocol::FinalEmbeddedElicitationParams::Url(url) => {
+                    url.mode = fastmcp_protocol::ElicitMode::Form;
+                }
+            }
+            assert!(MrtrInputRequest::final_elicitation(params).is_err());
+        }
     }
 
     #[test]
@@ -3807,6 +4088,316 @@ mod tests {
     }
 
     #[test]
+    fn mrtr_completed_rounds_share_partial_retry_and_total_input_limits() {
+        for (max_rounds, max_total_inputs) in [(3, 8), (8, 4)] {
+            let registry = MrtrExchangeRegistry::with_limits(
+                4,
+                max_rounds,
+                2,
+                max_total_inputs,
+                Duration::from_secs(60),
+            )
+            .expect("independent round and cumulative-input limits admit");
+            let binding = MrtrExchangeBinding::new(
+                "tools/call",
+                "multi-round".to_owned(),
+                [1; 32],
+                [2; 32],
+                None,
+                [3; 32],
+            );
+            let requests = |keys: &[&str]| {
+                MrtrInputRequests::new(
+                    keys.iter()
+                        .map(|key| ((*key).to_owned(), MrtrInputRequest::roots())),
+                )
+                .expect("unique roots requests")
+            };
+            let responses = |key: &str| {
+                BTreeMap::from([(
+                    key.to_owned(),
+                    serde_json::to_value(mrtr_roots_response()).unwrap(),
+                )])
+            };
+            let initial = registry
+                .issue_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    requests(&["first", "second"]),
+                    None,
+                )
+                .expect("the first round admits two inputs");
+            let initial_state = mrtr_state_from_wire(&initial);
+            let MrtrRetry::InputRequired(partial) = registry
+                .accept_wire_bound(&initial_state, &binding, &responses("first"))
+                .expect("one response reissues only the missing input")
+            else {
+                panic!("the second input remains outstanding");
+            };
+            assert_eq!(partial.input_requests().unwrap().len(), 1);
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(
+                    &mrtr_state_from_wire(&partial),
+                    &binding,
+                    &responses("second"),
+                )
+                .expect("the partial retry finishes the first handler stage")
+            else {
+                panic!("both responses complete the stage");
+            };
+            assert!(completed.roots("first").unwrap().is_some());
+            assert!(completed.roots("second").unwrap().is_some());
+            let next = registry
+                .issue_successor_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    requests(&["third"]),
+                    Some("next-handler-stage".to_owned()),
+                    &completed,
+                )
+                .expect("a completed stage may request another bounded round");
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(&mrtr_state_from_wire(&next), &binding, &responses("third"))
+                .expect("the next handler stage accepts its own response")
+            else {
+                panic!("the one requested response completes the stage");
+            };
+            assert!(completed.roots("third").unwrap().is_some());
+            assert_eq!(
+                completed.handler_request_state(),
+                Some("next-handler-stage")
+            );
+            let error = registry
+                .issue_successor_bound(
+                    McpRequestCancellation::new(),
+                    binding.clone(),
+                    requests(&["fourth"]),
+                    None,
+                    &completed,
+                )
+                .expect_err(
+                    "either the fourth round or fifth cumulative input exceeds its own limit",
+                );
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, MRTR_ROUND_LIMIT_ERROR);
+            assert_eq!(registry.active_len(), 0);
+            assert!(
+                registry
+                    .accept_wire_bound(&initial_state, &binding, &responses("first"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_completed_round_successor_keeps_the_original_expiry() {
+        for (successor_ms, response_ms, accepted) in [(9, 9, true), (9, 10, false), (10, 10, false)]
+        {
+            let registry = MrtrExchangeRegistry::with_limits(4, 3, 1, 3, Duration::from_millis(10))
+                .expect("bounded clock fixture");
+            let binding = MrtrExchangeBinding::new(
+                "resources/read",
+                "file:///multi-round".to_owned(),
+                [1; 32],
+                [2; 32],
+                None,
+                [3; 32],
+            );
+            let requests = || {
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap()
+            };
+            let responses =
+                || MrtrInputResponses::new([("roots".to_owned(), mrtr_roots_response())]).unwrap();
+            let started = Instant::now();
+            let initial = registry
+                .issue_at(
+                    McpRequestCancellation::new(),
+                    Some(binding.clone()),
+                    requests(),
+                    None,
+                    None,
+                    started,
+                )
+                .expect("initial round starts at the injected clock");
+            let MrtrRetry::Complete(completed) = registry
+                .accept_at(
+                    &mrtr_state_from_wire(&initial),
+                    Some(&binding),
+                    responses(),
+                    false,
+                    started + Duration::from_millis(1),
+                )
+                .expect("initial input arrives before expiry")
+            else {
+                panic!("the initial input completes its stage");
+            };
+            let successor = registry.issue_at(
+                McpRequestCancellation::new(),
+                Some(binding.clone()),
+                requests(),
+                None,
+                Some(&completed),
+                started + Duration::from_millis(successor_ms),
+            );
+            if successor_ms == 10 {
+                let error =
+                    successor.expect_err("a handler cannot renew an expired logical exchange");
+                assert_eq!(error.message, MRTR_REQUEST_STATE_ERROR);
+            } else {
+                let successor =
+                    successor.expect("a successor before the original deadline is allowed");
+                let result = registry.accept_at(
+                    &mrtr_state_from_wire(&successor),
+                    Some(&binding),
+                    responses(),
+                    false,
+                    started + Duration::from_millis(response_ms),
+                );
+                if accepted {
+                    assert!(matches!(result, Ok(MrtrRetry::Complete(_))));
+                } else {
+                    let error = result.expect_err("the successor expires at the original deadline");
+                    assert_eq!(error.message, MRTR_REQUEST_STATE_ERROR);
+                }
+            }
+            assert_eq!(
+                registry.active_len(),
+                0,
+                "completion and expiry both release the record"
+            );
+        }
+    }
+
+    #[test]
+    fn mrtr_completed_round_successor_preserves_binding_and_cancellation() {
+        for failure in [
+            "binding",
+            "original-owner",
+            "current-owner",
+            "later-original-owner",
+        ] {
+            let registry = MrtrExchangeRegistry::new();
+            let binding = MrtrExchangeBinding::new(
+                "prompts/get",
+                "multi-round".to_owned(),
+                [1; 32],
+                [2; 32],
+                None,
+                [3; 32],
+            );
+            let requests = || {
+                MrtrInputRequests::new([("roots".to_owned(), MrtrInputRequest::roots())]).unwrap()
+            };
+            let responses = BTreeMap::from([(
+                "roots".to_owned(),
+                serde_json::to_value(mrtr_roots_response()).unwrap(),
+            )]);
+            let original_owner = McpRequestCancellation::new();
+            let initial = registry
+                .issue_bound(original_owner.clone(), binding.clone(), requests(), None)
+                .expect("the original owner may issue a round");
+            let MrtrRetry::Complete(completed) = registry
+                .accept_wire_bound(&mrtr_state_from_wire(&initial), &binding, &responses)
+                .expect("the first stage completes")
+            else {
+                panic!("the requested input completes the stage");
+            };
+            let current_owner = McpRequestCancellation::new();
+            let mut successor_binding = binding.clone();
+            match failure {
+                "binding" => successor_binding.target = "other-prompt".to_owned(),
+                "original-owner" => {
+                    assert!(original_owner.cancel());
+                }
+                "current-owner" => {
+                    assert!(current_owner.cancel());
+                }
+                _ => {}
+            }
+            let next = registry.issue_successor_bound(
+                current_owner,
+                successor_binding,
+                requests(),
+                None,
+                &completed,
+            );
+            let error = if failure == "later-original-owner" {
+                let next = next.expect("an uncancelled owner may issue its successor");
+                assert!(original_owner.cancel());
+                registry
+                    .accept_wire_bound(&mrtr_state_from_wire(&next), &binding, &responses)
+                    .expect_err("the successor remains owned by the original cancellation token")
+            } else {
+                next.expect_err("changed binding or cancelled ownership cannot renew an exchange")
+            };
+            assert_eq!(
+                error.code,
+                if failure == "binding" {
+                    McpErrorCode::InvalidParams
+                } else {
+                    McpErrorCode::RequestCancelled
+                }
+            );
+            assert_eq!(registry.active_len(), 0);
+        }
+    }
+
+    #[test]
+    fn mrtr_completed_state_only_rounds_remain_bounded() {
+        let registry =
+            MrtrExchangeRegistry::with_limits(4, 2, 1, 2, Duration::from_secs(60)).unwrap();
+        let binding = MrtrExchangeBinding::new(
+            "tools/call",
+            "state-only".to_owned(),
+            [1; 32],
+            [2; 32],
+            None,
+            [3; 32],
+        );
+        let initial = registry
+            .issue_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::default(),
+                None,
+            )
+            .expect("state-only first round issues");
+        let MrtrRetry::Complete(completed) = registry
+            .accept_state_only_bound(&mrtr_state_from_wire(&initial), &binding)
+            .expect("absence of inputResponses resumes the first stage")
+        else {
+            panic!("state-only retry completes");
+        };
+        let next = registry
+            .issue_successor_bound(
+                McpRequestCancellation::new(),
+                binding.clone(),
+                MrtrInputRequests::default(),
+                None,
+                &completed,
+            )
+            .expect("the second state-only stage remains usable");
+        assert!(next.input_requests().is_none());
+        let MrtrRetry::Complete(completed) = registry
+            .accept_state_only_bound(&mrtr_state_from_wire(&next), &binding)
+            .expect("the second state-only stage completes")
+        else {
+            panic!("state-only retry completes");
+        };
+        let error = registry
+            .issue_successor_bound(
+                McpRequestCancellation::new(),
+                binding,
+                MrtrInputRequests::default(),
+                None,
+                &completed,
+            )
+            .expect_err("state-only results cannot evade the logical round limit");
+        assert_eq!(error.message, MRTR_ROUND_LIMIT_ERROR);
+        assert_eq!(registry.active_len(), 0);
+    }
+
+    #[test]
     fn stateless_elicitation_state_only_retry_observes_cancellation_and_expiry_first() {
         let binding = MrtrExchangeBinding::stateless(
             "tools/call",
@@ -3856,6 +4447,7 @@ mod tests {
                 McpRequestCancellation::new(),
                 Some(binding.clone()),
                 input_requests(),
+                None,
                 None,
                 issued_at,
             )
@@ -5199,6 +5791,169 @@ mod tests {
         );
     }
 
+    #[test]
+    fn legacy_reverse_reply_admission_preserves_waiter_for_corrected_roots_result() {
+        #[cfg(feature = "legacy-2024-11-05")]
+        let pending = Arc::new(PendingRequests::with_max_in_flight_for_exact_legacy(1).unwrap());
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let pending = Arc::new(PendingRequests::with_max_in_flight(1).unwrap());
+        let sent_id = Arc::new(Mutex::new(None));
+        let sent_id_for_send = Arc::clone(&sent_id);
+        let cancellation = McpRequestCancellation::new();
+        let sender = RequestSender::new(
+            Arc::clone(&pending),
+            Arc::new(move |message| {
+                if let JsonRpcMessage::Request(request) = message
+                    && request.id.is_some()
+                {
+                    *sent_id_for_send.lock().unwrap() = request.id.clone();
+                }
+                Ok(())
+            }),
+        )
+        .for_request(cancellation.clone());
+        let cx = Cx::for_testing();
+        let mut future = Box::pin(sender.send_request::<fastmcp_protocol::ListRootsResult>(
+            &cx,
+            "roots/list",
+            serde_json::json!({}),
+        ));
+        let waker = std::task::Waker::noop();
+        let mut task_cx = std::task::Context::from_waker(waker);
+        assert!(future.as_mut().poll(&mut task_cx).is_pending());
+        let id = sent_id.lock().unwrap().clone().expect("reverse request ID");
+
+        let mut rejected_results = vec![
+            serde_json::json!({"roots": [], "resultType": "complete"}),
+            serde_json::json!(null),
+        ];
+        for member in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+            "io.modelcontextprotocol/clientInfo",
+            "io.modelcontextprotocol/logLevel",
+            "io.modelcontextprotocol/serverInfo",
+            "io.modelcontextprotocol/subscriptionId",
+        ] {
+            rejected_results.push(serde_json::json!({
+                "roots": [],
+                "_meta": {(member): null},
+            }));
+        }
+        for result in rejected_results {
+            let response = JsonRpcResponse::success(id.clone(), result);
+            assert_eq!(
+                pending.route_response_with_disposition(&response),
+                PendingResponseDisposition::Rejected,
+                "cross-era or non-object reply must not complete roots/list: {response:?}"
+            );
+            assert_eq!(pending.in_flight_len(), 1);
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+            assert!(!cancellation.is_terminal());
+        }
+        assert_eq!(
+            pending
+                .register_with_cancellation(None)
+                .unwrap_err()
+                .message,
+            IN_FLIGHT_LIMIT_ERROR,
+            "rejected replies must retain the original request's capacity reservation"
+        );
+
+        let corrected = JsonRpcResponse::success(
+            id.clone(),
+            serde_json::json!({
+                "roots": [{"uri": "file:///workspace", "name": "Workspace"}],
+                "_meta": {
+                    "vendor.example/trace": {
+                        "resultType": "complete",
+                        "io.modelcontextprotocol/protocolVersion": "application data"
+                    }
+                },
+            }),
+        );
+        assert_eq!(
+            pending.route_response_with_disposition(&corrected),
+            PendingResponseDisposition::Delivered,
+            "ordinary vendor metadata must remain valid in an exact-2024 reply"
+        );
+        let result = block_on(future).expect("corrected reply completes the original request");
+        assert_eq!(result.roots.len(), 1);
+        assert_eq!(result.roots[0].uri, "file:///workspace");
+        assert_eq!(result.roots[0].name.as_deref(), Some("Workspace"));
+        assert_eq!(pending.in_flight_len(), 0);
+
+        let late = JsonRpcResponse::success(
+            id,
+            serde_json::json!({"roots": [], "resultType": "complete"}),
+        );
+        #[cfg(feature = "legacy-2024-11-05")]
+        assert_eq!(
+            pending.route_response_with_disposition(&late),
+            PendingResponseDisposition::RetiredGeneric
+        );
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        assert_eq!(
+            pending.route_response_with_disposition(&late),
+            PendingResponseDisposition::Unmatched
+        );
+    }
+
+    #[test]
+    fn modern_reverse_reply_admission_keeps_final_result_markers() {
+        let pending = Arc::new(PendingRequests::new());
+        let pending_for_send = Arc::clone(&pending);
+        let expected = serde_json::json!({
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "test", "version": "1"}},
+            "answer": 42,
+        });
+        let reply = expected.clone();
+        let sender = RequestSender::new_for_era(
+            ProtocolEra::Modern2026,
+            Arc::clone(&pending),
+            Arc::new(move |message| {
+                if let JsonRpcMessage::Request(request) = message {
+                    let response = JsonRpcResponse::success(
+                        request.id.clone().expect("reverse request ID"),
+                        reply.clone(),
+                    );
+                    assert_eq!(
+                        pending_for_send.route_response_with_disposition(&response),
+                        PendingResponseDisposition::Delivered
+                    );
+                }
+                Ok(())
+            }),
+        );
+        let cx = Cx::for_testing();
+        let result = block_on(sender.send_request::<serde_json::Value>(
+            &cx,
+            "test/modern",
+            serde_json::json!({}),
+        ))
+        .expect("an explicitly modern request must not inherit exact-2024 reply rules");
+        assert_eq!(result, expected);
+        assert_eq!(pending.in_flight_len(), 0);
+    }
+
+    #[test]
+    fn unbound_pending_response_keeps_generic_json_rpc_admission() {
+        let pending = PendingRequests::new();
+        let (id, receiver) = pending.register_with_cancellation(None).unwrap();
+        let expected = serde_json::json!({
+            "resultType": "complete",
+            "_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"},
+        });
+        assert_eq!(
+            pending
+                .route_response_with_disposition(&JsonRpcResponse::success(id, expected.clone())),
+            PendingResponseDisposition::Delivered
+        );
+        assert_eq!(receive_pending(receiver).unwrap(), expected);
+        assert_eq!(pending.in_flight_len(), 0);
+    }
+
     fn dropped_reverse_request_outbound(era: ProtocolEra) -> Vec<JsonRpcMessage> {
         let pending = Arc::new(PendingRequests::new());
         let pending_clone = Arc::clone(&pending);
@@ -5328,9 +6083,8 @@ mod tests {
         let send_fn: TransportSendFn = Arc::new(move |msg| {
             if let JsonRpcMessage::Request(req) = msg {
                 let id = req.id.clone().unwrap();
-                // Return a string value, which won't deserialize to Vec<String>
-                let response =
-                    JsonRpcResponse::success(id, serde_json::json!("not a vec of strings"));
+                // A valid legacy result object still cannot deserialize to Vec<String>.
+                let response = JsonRpcResponse::success(id, serde_json::json!({"answer": 42}));
                 pending_clone.route_response(&response);
             }
             Ok(())
@@ -6109,7 +6863,7 @@ mod tests {
         let send_fn: TransportSendFn = Arc::new(move |msg| {
             if let JsonRpcMessage::Request(req) = msg {
                 let id = req.id.clone().unwrap();
-                let response = JsonRpcResponse::success(id, serde_json::json!(null));
+                let response = JsonRpcResponse::success(id, serde_json::json!({}));
                 pending_clone.route_response(&response);
             }
             Ok(())

@@ -1020,6 +1020,11 @@ mod tests {
                     session,
                     metadata,
                     limits: ManagedTasksLimits::default(),
+                    // Matches `ManagedTasksClient::new`, which also starts at
+                    // `None`: this fixture exercises interaction progress, not
+                    // the reviewed-header plan, and a review cannot be replaced
+                    // on a client once set.
+                    reviewed_tool_headers: None,
                 },
                 credential: Some(credential),
                 call: None,

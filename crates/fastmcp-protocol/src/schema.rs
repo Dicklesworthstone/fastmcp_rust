@@ -27,6 +27,8 @@ use std::{
     marker::PhantomData,
 };
 
+mod unique_items;
+
 /// The sole JSON Schema dialect accepted by the final core schema-admission
 /// boundary.
 pub const FINAL_JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
@@ -112,6 +114,12 @@ pub const MAX_SCHEMA_ASSERTION_STRING_BYTES: usize = 4 * 1024;
 
 /// Maximum validation errors retained for one public `validate` call.
 pub const MAX_VALIDATION_ERRORS: usize = 64;
+
+/// Maximum encoded UTF-8 bytes retained in a public schema diagnostic path.
+pub const MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES: usize = 1024;
+
+/// Maximum source bytes retained from one untrusted diagnostic path segment.
+pub const MAX_SCHEMA_DIAGNOSTIC_SEGMENT_BYTES: usize = 64;
 
 /// Maximum decimal digits retained by one exact numeric comparison.
 ///
@@ -732,10 +740,29 @@ impl<T> DispatchSchema for &&SchemaTypeDispatch<T> {
 /// Error returned when JSON Schema validation fails.
 #[derive(Debug, Clone)]
 pub struct ValidationError {
-    /// Path to the invalid value (e.g., `root.foo.bar` or `root[0]`).
+    /// Bounded path to the invalid value (e.g., `root.foo.bar` or `root[0]`).
+    /// Untrusted member names are escaped as data; `...` marks truncation.
     pub path: String,
-    /// Description of what went wrong.
+    /// Reviewed static description, without schema or instance values.
     pub message: String,
+}
+
+impl ValidationError {
+    /// Stable refusal category independent of diagnostic text and peer data.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        if self.message.contains("limit exceeded") || self.message.contains("exceeds") {
+            "SchemaResourceLimit"
+        } else if self.message.contains("schema reference") {
+            "UnresolvedSchemaReference"
+        } else if self.message.starts_with("invalid ")
+            || self.message.starts_with("schema numeric keyword")
+        {
+            "InvalidSchema"
+        } else {
+            "InvalidSchemaInstance"
+        }
+    }
 }
 
 impl fmt::Display for ValidationError {
@@ -759,7 +786,7 @@ pub struct SchemaAdmissionError {
 impl SchemaAdmissionError {
     fn new(path: impl Into<String>, reason: &'static str) -> Self {
         Self {
-            path: path.into(),
+            path: bounded_diagnostic_path(&path.into(), "$"),
             reason,
         }
     }
@@ -775,6 +802,20 @@ impl SchemaAdmissionError {
     pub const fn reason(&self) -> &'static str {
         self.reason
     }
+
+    /// Stable category without retaining the rejected schema or reference.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        if self.reason == "unsupported schema dialect" {
+            "UnsupportedSchemaDialect"
+        } else if self.reason.contains("limit") || self.reason.contains("exceeds") {
+            "SchemaResourceLimit"
+        } else if self.reason.contains("unresolved") {
+            "UnresolvedSchemaReference"
+        } else {
+            "InvalidSchema"
+        }
+    }
 }
 
 impl fmt::Display for SchemaAdmissionError {
@@ -789,9 +830,17 @@ impl std::error::Error for SchemaAdmissionError {}
 ///
 /// Construction is intentionally restricted to [`admit_final_schema`] so a
 /// caller cannot present malformed schema syntax as a validated schema.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdmittedSchema {
     schema: Value,
+}
+
+impl fmt::Debug for AdmittedSchema {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdmittedSchema")
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdmittedSchema {
@@ -804,6 +853,16 @@ impl AdmittedSchema {
     /// Validates an instance using this admitted schema.
     pub fn validate(&self, value: &Value) -> ValidationResult {
         validate_admitted_final_schema(&self.schema, value)
+    }
+
+    /// Validates an instance with the admitted vocabulary in strict mode.
+    ///
+    /// Object schemas without an explicit `additionalProperties` policy reject
+    /// additional properties. References, evaluated annotations, and numeric
+    /// semantics retain the same behavior as [`Self::validate`].
+    pub fn validate_strict(&self, value: &Value) -> ValidationResult {
+        let strict_schema = make_strict_schema(&self.schema);
+        validate_admitted_final_schema(&strict_schema, value)
     }
 }
 
@@ -1025,7 +1084,7 @@ fn validate_final_form_property_schema(
     name: &str,
     property: &Value,
 ) -> Result<(), SchemaAdmissionError> {
-    let path = format!("$.properties.{name}");
+    let path = diagnostic_child_path("$.properties", name);
     let property = property.as_object().ok_or_else(|| {
         SchemaAdmissionError::new(&path, "final form property schema must be an object")
     })?;
@@ -1262,7 +1321,7 @@ fn validate_final_schema_node(
                 validate_final_schema_node(
                     subschema,
                     root_schema,
-                    &format!("{path}.{keyword}.{name}"),
+                    &diagnostic_schema_member_path(path, keyword, name),
                     false,
                     unknown_annotations,
                     depth + 1,
@@ -1414,7 +1473,7 @@ fn validate_supported_schema_keywords(
         if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str()))
         {
             return Err(SchemaAdmissionError::new(
-                format!("{path}.{keyword}"),
+                diagnostic_child_path(path, keyword),
                 "unsupported Draft 2020-12 vocabulary keyword",
             ));
         }
@@ -1547,19 +1606,19 @@ fn validate_meta_schema_vocabulary(
         }
         let required = required.as_bool().ok_or_else(|| {
             SchemaAdmissionError::new(
-                format!("{path}.$vocabulary.{vocabulary}"),
+                diagnostic_child_path(&format!("{path}.$vocabulary"), vocabulary),
                 "meta-schema $vocabulary values must be booleans",
             )
         })?;
         if required && vocabulary == FORMAT_ASSERTION_VOCABULARY_URI {
             return Err(SchemaAdmissionError::new(
-                format!("{path}.$vocabulary.{vocabulary}"),
+                diagnostic_child_path(&format!("{path}.$vocabulary"), vocabulary),
                 "format assertion vocabulary is not supported",
             ));
         }
         if required && !is_supported_vocabulary_uri(vocabulary) {
             return Err(SchemaAdmissionError::new(
-                format!("{path}.$vocabulary.{vocabulary}"),
+                diagnostic_child_path(&format!("{path}.$vocabulary"), vocabulary),
                 "required schema vocabulary is not supported",
             ));
         }
@@ -1794,7 +1853,7 @@ fn validate_unique_local_anchors(
             for (name, subschema) in subschemas {
                 validate_unique_local_anchor_child(
                     subschema,
-                    &format!("{path}.{keyword}.{name}"),
+                    &diagnostic_schema_member_path(path, keyword, name),
                     depth + 1,
                     anchors,
                 )?;
@@ -1902,7 +1961,7 @@ fn validate_unique_local_resource_ids(
             for (name, subschema) in subschemas {
                 validate_unique_local_resource_ids(
                     subschema,
-                    &format!("{path}.{keyword}.{name}"),
+                    &diagnostic_schema_member_path(path, keyword, name),
                     depth + 1,
                     current_base,
                     identifiers,
@@ -2215,13 +2274,8 @@ fn validate_exact_equality_value(
             SchemaAdmissionError::new(path, "schema assertion string exceeds byte limit"),
         ),
         Value::Array(values) => {
-            for (index, value) in values.iter().enumerate() {
-                validate_exact_equality_value(
-                    value,
-                    &format!("{path}[{index}]"),
-                    depth + 1,
-                    node_count,
-                )?;
+            for value in values {
+                validate_exact_equality_value(value, path, depth + 1, node_count)?;
             }
             Ok(())
         }
@@ -2233,12 +2287,7 @@ fn validate_exact_equality_value(
                         "schema assertion string exceeds byte limit",
                     ));
                 }
-                validate_exact_equality_value(
-                    value,
-                    &format!("{path}.{name}"),
-                    depth + 1,
-                    node_count,
-                )?;
+                validate_exact_equality_value(value, path, depth + 1, node_count)?;
             }
             Ok(())
         }
@@ -2376,6 +2425,11 @@ fn validate_with_schema_features(
     {
         push_error(&mut errors, "root", "pattern input byte limit exceeded");
     }
+    if let Some(message) = context.recursion_limit_exceeded
+        && !errors.iter().any(|error| error.message == message)
+    {
+        push_error(&mut errors, "root", message);
+    }
 
     if errors.is_empty() {
         Ok(())
@@ -2500,10 +2554,11 @@ struct ValidationContext<'a> {
     root_schema: &'a Value,
     schema_depth: usize,
     reference_depth: usize,
-    dynamic_anchors: Vec<(String, Value)>,
+    dynamic_scope: Vec<&'a serde_json::Map<String, Value>>,
     remaining_work: usize,
     work_exhausted: bool,
     pattern_input_exceeded: bool,
+    recursion_limit_exceeded: Option<&'static str>,
     enforce_unevaluated_properties: bool,
 }
 
@@ -2513,10 +2568,11 @@ impl<'a> ValidationContext<'a> {
             root_schema,
             schema_depth: 0,
             reference_depth: 0,
-            dynamic_anchors: Vec::new(),
+            dynamic_scope: Vec::new(),
             remaining_work: MAX_SCHEMA_VALIDATION_WORK,
             work_exhausted: false,
             pattern_input_exceeded: false,
+            recursion_limit_exceeded: None,
             enforce_unevaluated_properties,
         }
     }
@@ -2531,7 +2587,12 @@ impl<'a> ValidationContext<'a> {
     }
 
     fn enter_schema(&mut self) -> bool {
-        if self.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH || !self.consume_work() {
+        if self.schema_depth >= MAX_SCHEMA_VALIDATION_DEPTH {
+            self.recursion_limit_exceeded
+                .get_or_insert("schema validation nesting limit exceeded");
+            return false;
+        }
+        if !self.consume_work() {
             return false;
         }
         self.schema_depth += 1;
@@ -2544,6 +2605,8 @@ impl<'a> ValidationContext<'a> {
 
     fn enter_reference(&mut self) -> bool {
         if self.reference_depth >= MAX_LOCAL_REFERENCE_DEPTH {
+            self.recursion_limit_exceeded
+                .get_or_insert("local schema reference depth limit exceeded");
             return false;
         }
         self.reference_depth += 1;
@@ -2554,20 +2617,43 @@ impl<'a> ValidationContext<'a> {
         self.reference_depth -= 1;
     }
 
-    fn push_dynamic_anchor(&mut self, name: &str, schema: &Value) {
-        self.dynamic_anchors.push((name.to_owned(), schema.clone()));
+    fn push_dynamic_scope(&mut self, schema: &'a serde_json::Map<String, Value>) {
+        self.dynamic_scope.push(schema);
     }
 
-    fn pop_dynamic_anchor(&mut self) {
-        let _ = self.dynamic_anchors.pop();
+    fn pop_dynamic_scope(&mut self) {
+        let _ = self.dynamic_scope.pop();
     }
 
-    fn dynamic_anchor_target(&self, name: &str) -> Option<Value> {
-        self.dynamic_anchors
-            .iter()
-            .rev()
-            .find(|(candidate, _)| candidate == name)
-            .map(|(_, schema)| schema.clone())
+    fn dynamic_anchor_target(&mut self, name: &str) -> Result<Option<&'a Value>, &'static str> {
+        let root_schema = self.root_schema;
+        let mut previous_resource: Option<&Value> = None;
+        // Draft 2020-12 Core 8.2.3.2 selects the outermost resource, not the
+        // nearest visited anchor. An anchor under that resource's $defs also
+        // participates even when its schema has not itself been evaluated.
+        for index in 0..self.dynamic_scope.len() {
+            let source = self.dynamic_scope[index];
+            let mut charge = || {
+                if self.consume_work() {
+                    Ok(())
+                } else {
+                    Err("schema validation work limit exceeded")
+                }
+            };
+            let scope = find_schema_resource_scope(root_schema, source, &mut charge)?
+                .ok_or("unresolved local schema reference")?;
+            if previous_resource.is_some_and(|previous| std::ptr::eq(previous, scope.resource)) {
+                continue;
+            }
+            previous_resource = Some(scope.resource);
+            if let Some(target) =
+                find_resource_anchor_with_charge(scope.resource, name, &mut charge)?
+                && target.get("$dynamicAnchor").and_then(Value::as_str) == Some(name)
+            {
+                return Ok(Some(target));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -2685,7 +2771,7 @@ fn validate_instance_bounds(
                 }
                 if !validate_instance_bounds(
                     member,
-                    &format!("{path}.{name}"),
+                    &diagnostic_child_path(path, name),
                     depth + 1,
                     node_count,
                     string_work,
@@ -2700,22 +2786,85 @@ fn validate_instance_bounds(
     true
 }
 
-fn push_error(errors: &mut Vec<ValidationError>, path: &str, message: impl Into<String>) {
+// Paths are assembled from trusted syntax and escaped member segments. Keep
+// complete segments, including complete UTF-16 escape pairs, when bounding them.
+fn bounded_diagnostic_path(path: &str, root: &'static str) -> String {
+    if path.len() <= MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES {
+        path.to_owned()
+    } else {
+        format!("{root}...")
+    }
+}
+
+fn escaped_diagnostic_character(character: char) -> String {
+    if character.is_ascii_alphanumeric()
+        || matches!(character, '_' | '-' | '.' | '/' | ':' | '$' | '~')
+    {
+        return character.to_string();
+    }
+    let mut utf16 = [0; 2];
+    character
+        .encode_utf16(&mut utf16)
+        .iter()
+        .map(|unit| format!("\\u{unit:04x}"))
+        .collect()
+}
+
+fn diagnostic_child_path(parent: &str, name: &str) -> String {
+    let root = if parent.starts_with('$') { "$" } else { "root" };
+    if parent.ends_with("...") {
+        return bounded_diagnostic_path(parent, root);
+    }
+    let plain = !name.is_empty()
+        && name.len() <= MAX_SCHEMA_DIAGNOSTIC_SEGMENT_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+    let suffix = if plain {
+        format!(".{name}")
+    } else {
+        let mut escaped = String::new();
+        for (offset, character) in name.char_indices() {
+            if offset + character.len_utf8() > MAX_SCHEMA_DIAGNOSTIC_SEGMENT_BYTES {
+                escaped.push_str("...");
+                break;
+            }
+            escaped.push_str(&escaped_diagnostic_character(character));
+        }
+        format!("[\"{escaped}\"]")
+    };
+    if parent.len() + suffix.len() > MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES - 3 {
+        return bounded_diagnostic_path(&format!("{parent}..."), root);
+    }
+    format!("{parent}{suffix}")
+}
+
+fn diagnostic_schema_member_path(parent: &str, keyword: &str, name: &str) -> String {
+    let keyword_path = format!("{parent}.{keyword}");
+    if keyword == "patternProperties" {
+        // Pattern-map keys contain the regex source, not safe field labels.
+        bounded_diagnostic_path(&keyword_path, "$")
+    } else {
+        diagnostic_child_path(&keyword_path, name)
+    }
+}
+
+fn push_error(errors: &mut Vec<ValidationError>, path: &str, message: &'static str) {
     if errors.len() < MAX_VALIDATION_ERRORS {
         errors.push(ValidationError {
-            path: path.to_owned(),
-            message: message.into(),
+            path: bounded_diagnostic_path(path, "root"),
+            message: message.to_owned(),
         });
     }
 }
 
 /// Internal recursive validation function.
-fn validate_internal(
-    schema: &Value,
+fn validate_internal<'a>(
+    schema: &'a Value,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.enter_schema() {
         let reason = if context.remaining_work == 0 {
@@ -2745,35 +2894,28 @@ fn validate_internal(
     // Check type constraint
     if let Some(type_val) = schema_obj.get("type") {
         if !validate_type(type_val, value, context.enforce_unevaluated_properties) {
-            let expected = type_val
-                .as_str()
-                .map(String::from)
-                .or_else(|| type_val.as_array().map(|arr| format!("{arr:?}")))
-                .unwrap_or_else(|| "unknown".to_string());
-            push_error(
-                errors,
-                path,
-                format!(
-                    "expected type {expected}, got {}",
-                    json_type_name_with_final_semantics(
-                        value,
-                        context.enforce_unevaluated_properties
-                    )
-                ),
-            );
+            let message = match json_type_name_with_final_semantics(
+                value,
+                context.enforce_unevaluated_properties,
+            ) {
+                "null" => "null does not match the expected type",
+                "boolean" => "boolean does not match the expected type",
+                "integer" => "integer does not match the expected type",
+                "number" => "number does not match the expected type",
+                "string" => "string does not match the expected type",
+                "array" => "array does not match the expected type",
+                _ => "object does not match the expected type",
+            };
+            push_error(errors, path, message);
             context.leave_schema();
             return; // Type mismatch, skip further validation
         }
     }
 
-    let has_dynamic_anchor = context.enforce_unevaluated_properties
-        && schema_obj
-            .get("$dynamicAnchor")
-            .and_then(Value::as_str)
-            .map(|name| {
-                context.push_dynamic_anchor(name, schema);
-            })
-            .is_some();
+    let tracks_dynamic_scope = context.enforce_unevaluated_properties;
+    if tracks_dynamic_scope {
+        context.push_dynamic_scope(schema_obj);
+    }
 
     validate_local_reference(schema_obj, value, path, errors, context);
     validate_dynamic_reference(schema_obj, value, path, errors, context);
@@ -2794,7 +2936,7 @@ fn validate_internal(
                 }
             }
             if !matches && !context.work_exhausted {
-                push_error(errors, path, format!("value must be one of: {enum_arr:?}"));
+                push_error(errors, path, "value does not match any enum candidate");
             }
         }
     }
@@ -2803,7 +2945,7 @@ fn validate_internal(
     if let Some(const_val) = schema_obj.get("const") {
         let matches = json_schema_equal_with_work(value, const_val, path, errors, context);
         if matches == Some(false) {
-            push_error(errors, path, format!("value must equal {const_val}"));
+            push_error(errors, path, "value does not match the const constraint");
         }
     }
 
@@ -2830,8 +2972,8 @@ fn validate_internal(
         }
         _ => {}
     }
-    if has_dynamic_anchor {
-        context.pop_dynamic_anchor();
+    if tracks_dynamic_scope {
+        context.pop_dynamic_scope();
     }
     context.leave_schema();
 }
@@ -2881,17 +3023,8 @@ fn validate_dynamic_reference(
         return;
     }
     let root_schema = context.root_schema;
-    match resolve_local_reference_with_work(root_schema, schema, reference, context) {
-        Ok(target) => {
-            let dynamic_anchor = target
-                .as_object()
-                .and_then(|object| object.get("$dynamicAnchor"))
-                .and_then(Value::as_str);
-            let selected = dynamic_anchor
-                .and_then(|name| context.dynamic_anchor_target(name))
-                .unwrap_or_else(|| target.clone());
-            validate_internal(&selected, value, path, errors, context);
-        }
+    match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
+        Ok(target) => validate_internal(target, value, path, errors, context),
         Err(message) => push_error(errors, path, message),
     }
     context.leave_reference();
@@ -2900,6 +3033,28 @@ fn validate_dynamic_reference(
 struct SchemaResourceScope<'a> {
     resource: &'a Value,
     base: Option<String>,
+}
+
+fn resolve_dynamic_reference_with_work<'a>(
+    root_schema: &'a Value,
+    source: &serde_json::Map<String, Value>,
+    reference: &str,
+    context: &mut ValidationContext<'a>,
+) -> Result<&'a Value, &'static str> {
+    let target = resolve_local_reference_with_work(root_schema, source, reference, context)?;
+    // Only a plain-name fragment defined by $dynamicAnchor activates dynamic
+    // scope. A JSON Pointer to the very same schema remains a static reference.
+    let dynamic_anchor = split_uri_reference_fragment(reference)
+        .1
+        .and_then(decode_uri_fragment)
+        .filter(|fragment| !fragment.is_empty() && !fragment.starts_with('/'))
+        .filter(|fragment| {
+            target.get("$dynamicAnchor").and_then(Value::as_str) == Some(fragment.as_str())
+        });
+    match dynamic_anchor {
+        Some(name) => Ok(context.dynamic_anchor_target(&name)?.unwrap_or(target)),
+        None => Ok(target),
+    }
 }
 
 fn resolve_local_reference<'a>(
@@ -3567,12 +3722,12 @@ fn unescape_json_pointer_segment(segment: &str) -> Option<String> {
     Some(decoded)
 }
 
-fn validate_composition(
-    schema: &serde_json::Map<String, Value>,
+fn validate_composition<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     validate_all_of(schema, value, path, errors, context);
     validate_any_of(schema, value, path, errors, context);
@@ -3589,22 +3744,18 @@ fn bounded_subschemas<'a>(
 ) -> Option<&'a [Value]> {
     let subschemas = schema.get(keyword)?.as_array()?;
     if subschemas.len() > MAX_COMPOSITION_BRANCHES {
-        push_error(
-            errors,
-            path,
-            format!("{keyword} exceeds composition branch limit"),
-        );
+        push_error(errors, path, "composition branch limit exceeded");
         return None;
     }
     Some(subschemas)
 }
 
-fn validate_all_of(
-    schema: &serde_json::Map<String, Value>,
+fn validate_all_of<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if let Some(subschemas) = bounded_subschemas(schema, "allOf", path, errors) {
         for subschema in subschemas {
@@ -3613,12 +3764,12 @@ fn validate_all_of(
     }
 }
 
-fn validate_any_of(
-    schema: &serde_json::Map<String, Value>,
+fn validate_any_of<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, "anyOf", path, errors) else {
         return;
@@ -3635,12 +3786,12 @@ fn validate_any_of(
     }
 }
 
-fn validate_one_of(
-    schema: &serde_json::Map<String, Value>,
+fn validate_one_of<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, "oneOf", path, errors) else {
         return;
@@ -3656,12 +3807,12 @@ fn validate_one_of(
     }
 }
 
-fn validate_not(
-    schema: &serde_json::Map<String, Value>,
+fn validate_not<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if let Some(subschema) = schema.get("not") {
         if branch_is_valid(subschema, value, path, context) {
@@ -3670,12 +3821,12 @@ fn validate_not(
     }
 }
 
-fn validate_conditional(
-    schema: &serde_json::Map<String, Value>,
+fn validate_conditional<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(condition) = schema.get("if") else {
         return;
@@ -3690,11 +3841,11 @@ fn validate_conditional(
     }
 }
 
-fn branch_is_valid(
-    schema: &Value,
+fn branch_is_valid<'a>(
+    schema: &'a Value,
     value: &Value,
     path: &str,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) -> bool {
     if context.enforce_unevaluated_properties && !context.consume_work() {
         return false;
@@ -3762,13 +3913,13 @@ fn json_type_name_with_final_semantics(value: &Value, final_semantics: bool) -> 
 }
 
 /// Validates object-specific constraints.
-fn validate_object(
-    schema: &serde_json::Map<String, Value>,
+fn validate_object<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     // Check required fields
     if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
@@ -3778,7 +3929,11 @@ fn validate_object(
             }
             if let Some(req_name) = req.as_str() {
                 if !obj.contains_key(req_name) {
-                    push_error(errors, path, format!("missing required field: {req_name}"));
+                    push_error(
+                        errors,
+                        &diagnostic_child_path(path, req_name),
+                        "missing required field",
+                    );
                 }
             }
         }
@@ -3791,7 +3946,7 @@ fn validate_object(
     }
 
     for (key, value) in obj {
-        let property_path = format!("{path}.{key}");
+        let property_path = diagnostic_child_path(path, key);
         if let Some(property_schema) = properties.and_then(|properties| properties.get(key)) {
             validate_internal(property_schema, value, &property_path, errors, context);
         }
@@ -3809,7 +3964,7 @@ fn validate_object(
 
     if let Some(property_name_schema) = schema.get("propertyNames") {
         for key in obj.keys() {
-            let property_path = format!("{path}.{key}");
+            let property_path = diagnostic_child_path(path, key);
             validate_internal(
                 property_name_schema,
                 &Value::String(key.clone()),
@@ -3844,12 +3999,12 @@ fn validate_object(
                     Value::Bool(false) => {
                         push_error(
                             errors,
-                            path,
-                            format!("additional property not allowed: {key}"),
+                            &diagnostic_child_path(path, key),
+                            "additional property not allowed",
                         );
                     }
                     Value::Object(_) => {
-                        let prop_path = format!("{path}.{key}");
+                        let prop_path = diagnostic_child_path(path, key);
                         validate_internal(additional, value, &prop_path, errors, context);
                     }
                     _ => {}
@@ -3871,7 +4026,7 @@ fn validate_object(
         push_error(
             errors,
             path,
-            format!("object must have at least {min} properties"),
+            "object has fewer properties than minProperties",
         );
     }
     if let Some(max) = schema.get("maxProperties")
@@ -3881,20 +4036,20 @@ fn validate_object(
         push_error(
             errors,
             path,
-            format!("object must have at most {max} properties"),
+            "object has more properties than maxProperties",
         );
     }
 }
 
 /// Applies the Draft 2020-12 `unevaluatedProperties` keyword after every
 /// sibling applicator has had an opportunity to evaluate object members.
-fn validate_unevaluated_properties(
-    schema: &serde_json::Map<String, Value>,
+fn validate_unevaluated_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(unevaluated_schema) = schema.get("unevaluatedProperties") else {
         return;
@@ -3920,7 +4075,7 @@ fn validate_unevaluated_properties(
             validate_internal(
                 unevaluated_schema,
                 member,
-                &format!("{path}.{key}"),
+                &diagnostic_child_path(path, key),
                 errors,
                 context,
             );
@@ -3933,15 +4088,39 @@ fn validate_unevaluated_properties(
 /// `unevaluatedProperties` consumes all remaining members when it belongs to
 /// a successful nested applicator. The outer invocation leaves its own keyword
 /// out of the annotation set so that it can validate those remaining members.
-fn mark_evaluated_object_properties(
-    schema: &serde_json::Map<String, Value>,
+fn mark_evaluated_object_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     include_unevaluated_properties: bool,
     evaluated: &mut std::collections::HashSet<String>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
+) {
+    context.push_dynamic_scope(schema);
+    mark_evaluated_object_properties_inner(
+        schema,
+        value,
+        obj,
+        path,
+        include_unevaluated_properties,
+        evaluated,
+        errors,
+        context,
+    );
+    context.pop_dynamic_scope();
+}
+
+fn mark_evaluated_object_properties_inner<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    value: &Value,
+    obj: &serde_json::Map<String, Value>,
+    path: &str,
+    include_unevaluated_properties: bool,
+    evaluated: &mut std::collections::HashSet<String>,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.consume_work() {
         push_error(errors, path, "schema validation work limit exceeded");
@@ -4007,23 +4186,16 @@ fn mark_evaluated_object_properties(
             push_error(errors, path, "local schema reference depth limit exceeded");
         } else {
             let root_schema = context.root_schema;
-            let target =
-                resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
-            if let Some(target) = target {
-                let dynamic_anchor = target
-                    .as_object()
-                    .and_then(|object| object.get("$dynamicAnchor"))
-                    .and_then(Value::as_str);
-                let selected = dynamic_anchor
-                    .and_then(|name| context.dynamic_anchor_target(name))
-                    .unwrap_or_else(|| target.clone());
-                if branch_is_valid(&selected, value, path, context)
-                    && let Some(selected) = selected.as_object()
-                {
-                    mark_evaluated_object_properties(
-                        selected, value, obj, path, true, evaluated, errors, context,
-                    );
+            match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
+                Ok(target) if branch_is_valid(target, value, path, context) => {
+                    if let Some(target) = target.as_object() {
+                        mark_evaluated_object_properties(
+                            target, value, obj, path, true, evaluated, errors, context,
+                        );
+                    }
                 }
+                Ok(_) => {}
+                Err(message) => push_error(errors, path, message),
             }
             context.leave_reference();
         }
@@ -4091,15 +4263,15 @@ fn mark_evaluated_object_properties(
 }
 
 /// Merges annotations from every successful `allOf` or `anyOf` branch.
-fn mark_composition_evaluated_properties(
-    schema: &serde_json::Map<String, Value>,
+fn mark_composition_evaluated_properties<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     keyword: &str,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     evaluated: &mut std::collections::HashSet<String>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, keyword, path, errors) else {
         return;
@@ -4147,13 +4319,13 @@ fn compile_pattern_properties<'a>(
     patterns
 }
 
-fn validate_dependencies(
-    schema: &serde_json::Map<String, Value>,
+fn validate_dependencies<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     value: &Value,
     obj: &serde_json::Map<String, Value>,
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object) {
         for (trigger, required) in dependent_required {
@@ -4172,8 +4344,8 @@ fn validate_dependencies(
                         if !obj.contains_key(required_property) {
                             push_error(
                                 errors,
-                                path,
-                                format!("property {trigger} requires property {required_property}"),
+                                &diagnostic_child_path(path, required_property),
+                                "missing dependentRequired property",
                             );
                         }
                     }
@@ -4192,12 +4364,12 @@ fn validate_dependencies(
 }
 
 /// Validates array-specific constraints.
-fn validate_array(
-    schema: &serde_json::Map<String, Value>,
+fn validate_array<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     // Validate prefixItems (tuple validation)
     let mut prefix_len = 0;
@@ -4239,17 +4411,13 @@ fn validate_array(
         && count_compare_to_schema_bound(arr.len(), min, context.enforce_unevaluated_properties)
             == Some(Ordering::Less)
     {
-        push_error(
-            errors,
-            path,
-            format!("array must have at least {min} items"),
-        );
+        push_error(errors, path, "array has fewer items than minItems");
     }
     if let Some(max) = schema.get("maxItems")
         && count_compare_to_schema_bound(arr.len(), max, context.enforce_unevaluated_properties)
             == Some(Ordering::Greater)
     {
-        push_error(errors, path, format!("array must have at most {max} items"));
+        push_error(errors, path, "array has more items than maxItems");
     }
 
     // Check uniqueItems
@@ -4258,11 +4426,13 @@ fn validate_array(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        if context.enforce_unevaluated_properties {
-            // Final JSON Schema equality treats numerically equal spellings
-            // (for example `1` and `1.0`) as one value. Charge every pairwise
-            // comparison because recursive structural equality is not constant
-            // time and must remain within the final validation work budget.
+        if context.enforce_unevaluated_properties && arr.len() > unique_items::PAIRWISE_LIMIT {
+            if !unique_items::validate(arr, path, errors, context) {
+                return;
+            }
+        } else if context.enforce_unevaluated_properties {
+            // Small arrays avoid an index allocation and retain their existing
+            // pairwise work accounting. Final equality compares numbers exactly.
             for (index, item) in arr.iter().enumerate() {
                 for previous in &arr[..index] {
                     if !consume_validation_work(context, path, errors) {
@@ -4321,13 +4491,10 @@ fn validate_array(
             (matches as u64) < minimum
         };
         if below_minimum {
-            let minimum = schema
-                .get("minContains")
-                .map_or_else(|| "1".to_owned(), |minimum| minimum.to_string());
             push_error(
                 errors,
                 path,
-                format!("array must contain at least {minimum} matching items"),
+                "array has fewer matching items than minContains",
             );
         }
         if let Some(maximum) = schema.get("maxContains")
@@ -4340,7 +4507,7 @@ fn validate_array(
             push_error(
                 errors,
                 path,
-                format!("array must contain at most {maximum} matching items"),
+                "array has more matching items than maxContains",
             );
         }
     }
@@ -4352,12 +4519,12 @@ fn validate_array(
 
 /// Applies Draft 2020-12 `unevaluatedItems` after sibling applicators have
 /// contributed their successful item annotations.
-fn validate_unevaluated_items(
-    schema: &serde_json::Map<String, Value>,
+fn validate_unevaluated_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(unevaluated_schema) = schema.get("unevaluatedItems") else {
         return;
@@ -4381,14 +4548,36 @@ fn validate_unevaluated_items(
     }
 }
 
-fn mark_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     arr: &[Value],
     path: &str,
     include_unevaluated_items: bool,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
+) {
+    context.push_dynamic_scope(schema);
+    mark_evaluated_array_items_inner(
+        schema,
+        arr,
+        path,
+        include_unevaluated_items,
+        evaluated,
+        errors,
+        context,
+    );
+    context.pop_dynamic_scope();
+}
+
+fn mark_evaluated_array_items_inner<'a>(
+    schema: &'a serde_json::Map<String, Value>,
+    arr: &[Value],
+    path: &str,
+    include_unevaluated_items: bool,
+    evaluated: &mut HashSet<usize>,
+    errors: &mut Vec<ValidationError>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !consume_validation_work(context, path, errors) {
         return;
@@ -4502,14 +4691,14 @@ fn mark_evaluated_array_items(
     }
 }
 
-fn mark_reference_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_reference_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     reference: &str,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.enter_reference() {
         push_error(errors, path, "local schema reference depth limit exceeded");
@@ -4526,46 +4715,40 @@ fn mark_reference_evaluated_array_items(
     context.leave_reference();
 }
 
-fn mark_dynamic_reference_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_dynamic_reference_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     reference: &str,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     if !context.enter_reference() {
         push_error(errors, path, "local schema reference depth limit exceeded");
         return;
     }
     let root_schema = context.root_schema;
-    let target = resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
-    if let Some(target) = target {
-        let dynamic_anchor = target
-            .as_object()
-            .and_then(|object| object.get("$dynamicAnchor"))
-            .and_then(Value::as_str);
-        let selected = dynamic_anchor
-            .and_then(|name| context.dynamic_anchor_target(name))
-            .unwrap_or_else(|| target.clone());
-        if branch_is_valid(&selected, &Value::Array(arr.to_vec()), path, context)
-            && let Some(selected) = selected.as_object()
-        {
-            mark_evaluated_array_items(selected, arr, path, true, evaluated, errors, context);
+    match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
+        Ok(target) if branch_is_valid(target, &Value::Array(arr.to_vec()), path, context) => {
+            if let Some(target) = target.as_object() {
+                mark_evaluated_array_items(target, arr, path, true, evaluated, errors, context);
+            }
         }
+        Ok(_) => {}
+        Err(message) => push_error(errors, path, message),
     }
     context.leave_reference();
 }
 
-fn mark_composition_evaluated_array_items(
-    schema: &serde_json::Map<String, Value>,
+fn mark_composition_evaluated_array_items<'a>(
+    schema: &'a serde_json::Map<String, Value>,
     keyword: &str,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
     errors: &mut Vec<ValidationError>,
-    context: &mut ValidationContext<'_>,
+    context: &mut ValidationContext<'a>,
 ) {
     let Some(subschemas) = bounded_subschemas(schema, keyword, path, errors) else {
         return;
@@ -4602,21 +4785,13 @@ fn validate_string(
             && count_compare_to_schema_bound(len, min, context.enforce_unevaluated_properties)
                 == Some(Ordering::Less)
         {
-            push_error(
-                errors,
-                path,
-                format!("string must be at least {min} characters"),
-            );
+            push_error(errors, path, "string has fewer characters than minLength");
         }
         if let Some(max) = schema.get("maxLength")
             && count_compare_to_schema_bound(len, max, context.enforce_unevaluated_properties)
                 == Some(Ordering::Greater)
         {
-            push_error(
-                errors,
-                path,
-                format!("string must be at most {max} characters"),
-            );
+            push_error(errors, path, "string has more characters than maxLength");
         }
     }
 
@@ -4631,20 +4806,12 @@ fn validate_string(
                     return;
                 };
                 if !matches {
-                    push_error(
-                        errors,
-                        path,
-                        format!("string does not match pattern {pattern:?}"),
-                    );
+                    push_error(errors, path, "string does not match pattern");
                 }
             }
-            Err(e) => {
+            Err(_) => {
                 // Invalid schema: treat as a validation error rather than silently skipping.
-                push_error(
-                    errors,
-                    path,
-                    format!("invalid schema pattern {pattern:?}: {e}"),
-                );
+                push_error(errors, path, "invalid schema pattern");
             }
         }
     }
@@ -4910,8 +5077,12 @@ fn subtract_decimal_integers(left: &mut String, right: &str) {
     let mut borrow = 0_i16;
     for offset in 0..digits.len() {
         let left_index = digits.len() - 1 - offset;
+        // A missing high-order subtrahend digit is zero. Saturating the
+        // index repeats its leading digit instead and corrupts the remainder.
         let right_digit = right
-            .get(right.len().saturating_sub(offset + 1))
+            .len()
+            .checked_sub(offset + 1)
+            .and_then(|index| right.get(index))
             .map_or(0, |digit| i16::from(*digit - b'0'));
         let mut digit = i16::from(digits[left_index] - b'0') - right_digit - borrow;
         if digit < 0 {
@@ -5037,12 +5208,12 @@ fn validate_number(
     // Check minimum/maximum
     if let Some(min) = schema.get("minimum").and_then(serde_json::Value::as_f64) {
         if val < min {
-            push_error(errors, path, format!("value must be >= {min}"));
+            push_error(errors, path, "value is below minimum");
         }
     }
     if let Some(max) = schema.get("maximum").and_then(serde_json::Value::as_f64) {
         if val > max {
-            push_error(errors, path, format!("value must be <= {max}"));
+            push_error(errors, path, "value is above maximum");
         }
     }
 
@@ -5052,7 +5223,7 @@ fn validate_number(
         .and_then(serde_json::Value::as_f64)
     {
         if val <= min {
-            push_error(errors, path, format!("value must be > {min}"));
+            push_error(errors, path, "value does not satisfy exclusiveMinimum");
         }
     }
     if let Some(max) = schema
@@ -5060,18 +5231,14 @@ fn validate_number(
         .and_then(serde_json::Value::as_f64)
     {
         if val >= max {
-            push_error(errors, path, format!("value must be < {max}"));
+            push_error(errors, path, "value does not satisfy exclusiveMaximum");
         }
     }
 
     // Check multipleOf
     if let Some(multiple) = schema.get("multipleOf").and_then(serde_json::Value::as_f64) {
         if multiple != 0.0 && (val % multiple).abs() > f64::EPSILON {
-            push_error(
-                errors,
-                path,
-                format!("value must be a multiple of {multiple}"),
-            );
+            push_error(errors, path, "value is not a multipleOf the schema divisor");
         }
     }
 }
@@ -5091,16 +5258,21 @@ fn validate_exact_number(
         );
         return;
     };
-    for (keyword, allowed) in [
-        ("minimum", ">="),
-        ("maximum", "<="),
-        ("exclusiveMinimum", ">"),
-        ("exclusiveMaximum", "<"),
+    for (keyword, message) in [
+        ("minimum", "value is below minimum"),
+        ("maximum", "value is above maximum"),
+        (
+            "exclusiveMinimum",
+            "value does not satisfy exclusiveMinimum",
+        ),
+        (
+            "exclusiveMaximum",
+            "value does not satisfy exclusiveMaximum",
+        ),
     ] {
         let Some(bound_value) = schema.get(keyword) else {
             continue;
         };
-        let bound_description = bound_value.to_string();
         let Some(bound) = ExactDecimal::from_value(bound_value) else {
             push_error(
                 errors,
@@ -5118,11 +5290,7 @@ fn validate_exact_number(
             _ => unreachable!("the numeric keyword set is fixed"),
         };
         if invalid {
-            push_error(
-                errors,
-                path,
-                format!("value must be {allowed} {bound_description}"),
-            );
+            push_error(errors, path, message);
         }
     }
     if let Some(multiple) = schema.get("multipleOf").and_then(ExactDecimal::from_value) {
@@ -5622,7 +5790,7 @@ mod tests {
         assert_eq!(errors[0].path, "root.items");
         assert_eq!(
             errors[0].message,
-            "array must contain at least 2 matching items"
+            "array has fewer matching items than minContains"
         );
         assert_eq!(schema, schema_before);
     }
@@ -5680,8 +5848,8 @@ mod tests {
             validate_final_core_result(&schema, &with_legacy_field, FinalCoreResultType::Complete)
                 .expect_err("adding only a legacy result field must reject");
         assert!(unknown_field_errors.iter().any(|error| {
-            error.path == "root"
-                && error.message == "additional property not allowed: protocolVersion"
+            error.path == "root.protocolVersion"
+                && error.message == "additional property not allowed"
         }));
         assert_eq!(
             accepted,
@@ -5765,7 +5933,7 @@ mod tests {
             "changing only the local-reference value violates the selected then branch",
         );
         assert!(errors.iter().any(|error| {
-            error.path == "root.entries[0].value" && error.message == "value must be >= 1"
+            error.path == "root.entries[0].value" && error.message == "value is below minimum"
         }));
         assert_eq!(
             accepted,
@@ -5901,6 +6069,224 @@ mod tests {
     }
 
     #[test]
+    fn admitted_dynamic_reference_preserves_recursive_lexical_identity() {
+        let source = json!({
+            "$defs": {
+                "label": {"type": "string", "minLength": 1},
+                "node": {
+                    "$dynamicAnchor": "node",
+                    "type": "object",
+                    "properties": {
+                        "label": {"$ref": "#/$defs/label"},
+                        "child": {"$dynamicRef": "#node"}
+                    },
+                    "required": ["label"],
+                    "additionalProperties": false
+                }
+            },
+            "$ref": "#node"
+        });
+        let schema = admit_final_schema(source.clone()).expect("recursive schemas admit");
+        let accepted = json!({
+            "label": "first",
+            "child": {"label": "second", "child": {"label": "third"}}
+        });
+        schema
+            .validate(&accepted)
+            .expect("every recursive level retains its original lexical reference scope");
+        let mut planted = accepted.clone();
+        planted["child"]["child"]["label"] = json!(7);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("the same referenced label constraint applies at the deepest level");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.path == "root.child.child.label")
+        );
+        assert_eq!(schema.schema(), &source);
+        assert_eq!(accepted["child"]["child"]["label"], json!("third"));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_uses_outermost_resource_override() {
+        let schema = admit_final_schema(json!({
+            "$id": "https://schemas.example.test/strict",
+            "$dynamicAnchor": "node",
+            "$ref": "tree",
+            "properties": {"strict": {"const": true}},
+            "required": ["strict"],
+            "$defs": {"tree": {
+                "$id": "tree",
+                "$dynamicAnchor": "node",
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"},
+                    "child": {"$dynamicRef": "#node"}
+                },
+                "required": ["value"]
+            }}
+        }))
+        .expect("independent resources may extend the same dynamic anchor");
+        let accepted = json!({
+            "value": 1, "strict": true,
+            "child": {"value": 2, "strict": true}
+        });
+        schema
+            .validate(&accepted)
+            .expect("the outer resource's constraints apply to recursive children");
+        let mut planted = accepted.clone();
+        planted["child"]["strict"] = json!(false);
+        let errors = schema
+            .validate(&planted)
+            .expect_err("the inner tree cannot bypass an outer recursive constraint");
+        assert!(errors.iter().any(|error| error.path == "root.child.strict"));
+        assert_eq!(accepted["child"]["strict"], json!(true));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_finds_unvisited_resource_anchor() {
+        let schema = admit_final_schema(json!({
+            "$id": "https://schemas.example.test/outer",
+            "properties": {"entry": {"$ref": "inner"}},
+            "$defs": {
+                "outerConstraint": {
+                    "$dynamicAnchor": "value",
+                    "type": "string", "minLength": 3
+                },
+                "inner": {
+                    "$id": "inner",
+                    "properties": {"value": {"$dynamicRef": "#value"}},
+                    "$defs": {"defaultConstraint": {
+                        "$dynamicAnchor": "value", "type": "string"
+                    }}
+                }
+            }
+        }))
+        .expect("anchors under $defs belong to their containing resource");
+        let accepted = json!({"entry": {"value": "ready"}});
+        schema
+            .validate(&accepted)
+            .expect("the extended value satisfies both constraints");
+        let mut planted = accepted.clone();
+        planted["entry"]["value"] = json!("x");
+        let errors = schema
+            .validate(&planted)
+            .expect_err("an outer anchor participates before its schema is directly visited");
+        assert!(errors.iter().any(|error| error.path == "root.entry.value"));
+        assert_eq!(accepted["entry"]["value"], json!("ready"));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_pointer_target_remains_static() {
+        let source = json!({
+            "$id": "https://schemas.example.test/outer",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "properties": {"value": {"$dynamicRef": "inner#/$defs/node"}},
+            "$defs": {"inner": {
+                "$id": "inner",
+                "$defs": {"node": {"$dynamicAnchor": "node", "type": "string"}}
+            }}
+        });
+        let schema =
+            admit_final_schema(source.clone()).expect("a pointer may name an anchor schema");
+        let accepted = json!({"value": "ready"});
+        schema
+            .validate(&accepted)
+            .expect("a pointer reference does not activate the containing object's override");
+        assert!(schema.validate(&json!({"value": 1})).is_err());
+
+        let mut dynamic = source;
+        dynamic["properties"]["value"]["$dynamicRef"] = json!("inner#node");
+        let schema = admit_final_schema(dynamic).expect("the plain-name anchor also admits");
+        let errors = schema
+            .validate(&accepted)
+            .expect_err("changing only the URI fragment activates the outer object constraint");
+        assert!(errors.iter().any(|error| error.path == "root.value"));
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_annotations_preserve_object_and_array_evaluation() {
+        for (constraints, accepted, planted, expected_path, unevaluated_keyword) in [
+            (
+                json!({"properties": {"answer": {"type": "integer"}}}),
+                json!({"answer": 42}),
+                json!({"answer": 42, "extra": true}),
+                "root.extra",
+                "unevaluatedProperties",
+            ),
+            (
+                json!({"prefixItems": [{"type": "integer"}]}),
+                json!([42]),
+                json!([42, true]),
+                "root[1]",
+                "unevaluatedItems",
+            ),
+        ] {
+            let schema = admit_final_schema(json!({
+                "$defs": {
+                    "selected": {"$dynamicAnchor": "shape", "$ref": "#/$defs/constraints"},
+                    "constraints": constraints
+                },
+                "$dynamicRef": "#shape",
+                unevaluated_keyword: false
+            }))
+            .expect("dynamic references and their lexical references remain admitted");
+            schema
+                .validate(&accepted)
+                .expect("annotations survive dynamic reference and lexical reference traversal");
+            let errors = schema
+                .validate(&planted)
+                .expect_err("one additional unevaluated member remains rejected");
+            assert!(errors.iter().any(|error| error.path == expected_path));
+        }
+    }
+
+    #[test]
+    fn admitted_dynamic_reference_cycle_and_lookup_limits_fail_closed() {
+        let terminating = json!({
+            "$defs": {"node": {"$dynamicAnchor": "node", "type": "object"}},
+            "not": {"$dynamicRef": "#node"}
+        });
+        admit_final_schema(terminating.clone())
+            .expect("the terminating reference admits")
+            .validate(&Value::Null)
+            .expect("a real type mismatch may satisfy not");
+        let mut cycle = terminating;
+        cycle["$defs"]["node"] = json!({"$dynamicAnchor": "node", "$dynamicRef": "#node"});
+        let errors = admit_final_schema(cycle)
+            .expect("admission permits bounded recursive references")
+            .validate(&Value::Null)
+            .expect_err("a recursion limit is never a successful not-branch mismatch");
+        assert!(errors.iter().any(|error| {
+            error.message == "local schema reference depth limit exceeded"
+                || error.message == "schema validation nesting limit exceeded"
+                || error.message == "schema validation work limit exceeded"
+        }));
+
+        let root = json!({"$defs": {"node": {"$dynamicAnchor": "node", "type": "integer"}}});
+        let source = root.as_object().expect("the schema is an object");
+        let mut exact = ValidationContext::new(&root, true);
+        exact.push_dynamic_scope(source);
+        exact.remaining_work = 3;
+        let target = exact
+            .dynamic_anchor_target("node")
+            .expect("one scope visit and two anchor visits fit the exact budget")
+            .expect("the configured anchor exists");
+        assert!(std::ptr::eq(target, &root["$defs"]["node"]));
+        assert_eq!(exact.remaining_work, 0);
+        let mut exhausted = ValidationContext::new(&root, true);
+        exhausted.push_dynamic_scope(source);
+        exhausted.remaining_work = 2;
+        assert_eq!(
+            exhausted.dynamic_anchor_target("node").unwrap_err(),
+            "schema validation work limit exceeded"
+        );
+        assert!(exhausted.work_exhausted);
+    }
+
+    #[test]
     fn admitted_unevaluated_items_positive() {
         let schema = admit_final_schema(json!({
             "$schema": FINAL_JSON_SCHEMA_DIALECT,
@@ -6023,8 +6409,7 @@ mod tests {
             .validate(&accepted)
             .expect_err("changing only minLength to the exact large bound must reject");
         assert!(errors.iter().any(|error| {
-            error.path == "root"
-                && error.message == format!("string must be at least {BOUND} characters")
+            error.path == "root" && error.message == "string has fewer characters than minLength"
         }));
         assert_eq!(accepted_schema["minLength"], json!(1));
         assert_eq!(
@@ -6078,8 +6463,7 @@ mod tests {
             .validate(&accepted)
             .expect_err("changing only minItems to the exact large bound must reject");
         assert!(errors.iter().any(|error| {
-            error.path == "root"
-                && error.message == format!("array must have at least {BOUND} items")
+            error.path == "root" && error.message == "array has fewer items than minItems"
         }));
         assert_eq!(accepted_schema["minItems"], json!(1));
         assert_eq!(
@@ -6112,8 +6496,7 @@ mod tests {
             .validate(&instance)
             .expect_err("the same final count remains mathematically enforced");
         assert!(errors.iter().any(|error| {
-            error.path == "root"
-                && error.message == format!("array must have at least {BOUND} items")
+            error.path == "root" && error.message == "array has fewer items than minItems"
         }));
         assert_eq!(accepted_schema["minItems"], json!(1));
         assert_eq!(
@@ -6168,7 +6551,7 @@ mod tests {
             .expect_err("changing only minProperties to the exact large bound must reject");
         assert!(errors.iter().any(|error| {
             error.path == "root"
-                && error.message == format!("object must have at least {BOUND} properties")
+                && error.message == "object has fewer properties than minProperties"
         }));
         assert_eq!(accepted_schema["minProperties"], json!(1));
         assert_eq!(
@@ -6223,7 +6606,7 @@ mod tests {
             .expect_err("changing only minContains to the exact large bound must reject");
         assert!(errors.iter().any(|error| {
             error.path == "root"
-                && error.message == format!("array must contain at least {BOUND} matching items")
+                && error.message == "array has fewer matching items than minContains"
         }));
         assert_eq!(accepted_schema["minContains"], json!(1));
         assert_eq!(
@@ -7005,7 +7388,7 @@ mod tests {
         let error = admit_final_schema(schema).expect_err(
             "only a selected meta-schema vocabulary can reject an unsupported requirement",
         );
-        assert_eq!(error.path(), "$.$vocabulary.urn:example:unsupported");
+        assert_eq!(error.path(), "$.$vocabulary[\"urn:example:unsupported\"]");
         assert_eq!(
             error.reason(),
             "required schema vocabulary is not supported"
@@ -7881,7 +8264,7 @@ mod tests {
             .expect_err("enabling only format assertion must fail closed without full support");
         assert_eq!(
             error.path(),
-            "$.$vocabulary.https://json-schema.org/draft/2020-12/vocab/format-assertion"
+            "$.$vocabulary[\"https://json-schema.org/draft/2020-12/vocab/format-assertion\"]"
         );
         assert_eq!(
             error.reason(),
@@ -8120,7 +8503,7 @@ mod tests {
             .expect_err("one less allowed Unicode character must reject the same large output");
         assert_eq!(
             errors[0].message,
-            "string must be at most 1048575 characters"
+            "string has more characters than maxLength"
         );
         assert_eq!(instance.as_str().unwrap().len(), 4 * 1024 * 1024);
 
@@ -9174,6 +9557,65 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn admitted_strict_validation_preserves_numeric_semantics_and_object_policy() {
+        let schema = admit_final_schema(json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"]
+        }))
+        .expect("the object schema is admitted");
+
+        assert!(schema.validate_strict(&json!({"count": 1.0})).is_ok());
+        assert!(schema.validate_strict(&json!({"count": 1.5})).is_err());
+        assert!(
+            schema
+                .validate(&json!({"count": 1.0, "extra": true}))
+                .is_ok()
+        );
+        assert!(
+            schema
+                .validate_strict(&json!({"count": 1.0, "extra": true}))
+                .is_err()
+        );
+
+        let explicit_policy = admit_final_schema(json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "additionalProperties": true
+        }))
+        .expect("the explicit additional-property policy is admitted");
+        assert!(
+            explicit_policy
+                .validate_strict(&json!({"count": 1.0, "extra": true}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn admitted_strict_validation_preserves_unevaluated_items() {
+        let schema = admit_final_schema(json!({
+            "type": "object",
+            "properties": {
+                "values": {
+                    "type": "array",
+                    "prefixItems": [{"type": "integer"}],
+                    "unevaluatedItems": false
+                }
+            },
+            "required": ["values"]
+        }))
+        .expect("the evaluated array schema is admitted");
+
+        assert!(schema.validate_strict(&json!({"values": [1.0]})).is_ok());
+        assert!(
+            schema
+                .validate_strict(&json!({"values": [1.0, 2]}))
+                .is_err()
+        );
+        assert!(schema.validate_strict(&json!({"values": ["one"]})).is_err());
+    }
+
+    #[test]
     fn test_validate_strict_rejects_extra_properties() {
         let schema = json!({
             "type": "object",
@@ -9347,6 +9789,262 @@ mod tests {
     // =========================================================================
     // Additional coverage tests (bd-qpwf)
     // =========================================================================
+
+    #[test]
+    fn schema_diagnostics_redact_schema_and_instance_literals() {
+        const SCHEMA_SECRET: &str = "schema-secret-canary-7c5f";
+        const INSTANCE_SECRET: &str = "instance-secret-canary-8a6e";
+        const PATTERN_SECRET: &str = "^pattern-secret-canary-9b7d$";
+        let fixtures = [
+            (
+                json!({"type": "string", "enum": [SCHEMA_SECRET]}),
+                json!(SCHEMA_SECRET),
+                json!(INSTANCE_SECRET),
+            ),
+            (
+                json!({"const": {"credential": SCHEMA_SECRET}}),
+                json!({"credential": SCHEMA_SECRET}),
+                json!({"credential": INSTANCE_SECRET}),
+            ),
+            (
+                json!({"type": "string", "pattern": PATTERN_SECRET}),
+                json!("pattern-secret-canary-9b7d"),
+                json!(INSTANCE_SECRET),
+            ),
+            (
+                json!({"allOf": [{"enum": [SCHEMA_SECRET]}, {"const": SCHEMA_SECRET}]}),
+                json!(SCHEMA_SECRET),
+                json!(INSTANCE_SECRET),
+            ),
+            (
+                json!({"minimum": 9_187_463_920_u64}),
+                json!(9_187_463_920_u64),
+                json!(9_187_463_919_u64),
+            ),
+        ];
+
+        for (schema, accepted, rejected) in fixtures {
+            validate(&schema, &accepted).expect("valid input still passes raw validation");
+            let admitted = admit_final_schema(schema.clone()).expect("fixture schema admits");
+            admitted
+                .validate(&accepted)
+                .expect("the same valid input passes admitted validation");
+            for errors in [
+                validate(&schema, &rejected).expect_err("only the instance changed"),
+                admitted
+                    .validate(&rejected)
+                    .expect_err("the same instance is invalid"),
+            ] {
+                assert!(!errors.is_empty());
+                for error in errors {
+                    let rendered = format!("{error} {error:?}");
+                    for secret in [
+                        SCHEMA_SECRET,
+                        INSTANCE_SECRET,
+                        PATTERN_SECRET,
+                        "9187463920",
+                        "9187463919",
+                    ] {
+                        assert!(
+                            !rendered.contains(secret),
+                            "diagnostics must omit literal data"
+                        );
+                    }
+                    assert_eq!(error.code(), "InvalidSchemaInstance");
+                    assert!(error.message.len() < 128);
+                }
+            }
+        }
+
+        let malformed_pattern = json!({"pattern": "(pattern-secret-canary-9b7d"});
+        let errors = validate(&malformed_pattern, &json!(INSTANCE_SECRET))
+            .expect_err("a malformed regex still refuses");
+        assert_eq!(errors[0].code(), "InvalidSchema");
+        assert_eq!(errors[0].message, "invalid schema pattern");
+        assert!(!format!("{errors:?}").contains("pattern-secret-canary"));
+
+        let unresolved = json!({"$ref": "#/private-reference-secret-canary"});
+        let errors = validate(&unresolved, &json!(INSTANCE_SECRET))
+            .expect_err("unresolved references still refuse");
+        assert_eq!(errors[0].code(), "UnresolvedSchemaReference");
+        assert!(!format!("{errors:?}").contains("private-reference-secret-canary"));
+    }
+
+    #[test]
+    fn schema_diagnostics_escape_and_bound_hostile_paths() {
+        let name = "[red]\u{1b}[31m<value>&\n/雪\"\\.x";
+        let schema = json!({"properties": {(name): {"type": "string"}}});
+        validate(&schema, &json!({(name): "accepted"})).expect("the original field accepts");
+        let errors = validate(&schema, &json!({(name): 7}))
+            .expect_err("changing only the field's type refuses");
+        let path = &errors[0].path;
+        assert!(path.starts_with("root[\""));
+        assert!(path.ends_with("\"]"));
+        let decoded: String = serde_json::from_str(&path[5..path.len() - 1])
+            .expect("quoted path segments retain complete JSON escapes");
+        assert_eq!(decoded, name);
+        for forbidden in ['\u{1b}', '\n', '<', '>', '&', '雪'] {
+            assert!(!path.contains(forbidden));
+        }
+        assert!(!path.contains("[red]"));
+
+        let huge_name = "long-field-".repeat(500);
+        let schema = json!({"properties": {(huge_name.clone()): false}});
+        validate(&schema, &json!({})).expect("the absent optional property still accepts");
+        let errors = validate(&schema, &json!({(huge_name.clone()): null}))
+            .expect_err("adding the forbidden property rejects");
+        assert!(errors[0].path.len() <= MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES);
+        assert!(errors[0].path.contains("..."));
+        assert!(!errors[0].path.contains(&huge_name));
+
+        let nested_name = "<field>".repeat(8);
+        let mut nested = json!(false);
+        let mut instance = json!(null);
+        for _ in 0..30 {
+            nested = json!({"properties": {(nested_name.clone()): nested}});
+            instance = json!({(nested_name.clone()): instance});
+        }
+        let errors = validate(&nested, &instance).expect_err("deep invalid input stays invalid");
+        assert!(errors[0].path.len() <= MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES);
+        assert!(errors[0].path.ends_with("..."));
+        assert!(!errors[0].path.contains('<'));
+    }
+
+    #[test]
+    fn schema_diagnostics_remain_bounded_across_many_failures() {
+        let schema = json!({"type": "array", "items": {"const": "schema-secret-canary"}});
+        validate(&schema, &json!(["schema-secret-canary"])).expect("the matching array accepts");
+        let rejected = json!(vec!["instance-secret-canary"; MAX_VALIDATION_ERRORS + 10]);
+        let errors = validate(&schema, &rejected).expect_err("all mismatched items reject");
+        assert_eq!(errors.len(), MAX_VALIDATION_ERRORS);
+        for error in &errors {
+            assert!(error.path.len() <= MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES);
+            assert!(error.message.len() < 128);
+            assert_eq!(error.code(), "InvalidSchemaInstance");
+        }
+        let rendered = format!("{errors:?}");
+        assert!(!rendered.contains("schema-secret-canary"));
+        assert!(!rendered.contains("instance-secret-canary"));
+        assert!(rendered.len() < MAX_VALIDATION_ERRORS * (MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES + 256));
+    }
+
+    #[test]
+    fn schema_diagnostics_preserve_unicode_escape_boundaries() {
+        let fixtures = [
+            ("é".repeat(32), "é".repeat(32)),
+            ("é".repeat(33), format!("{}...", "é".repeat(32))),
+            (
+                format!("{}💡", "a".repeat(60)),
+                format!("{}💡", "a".repeat(60)),
+            ),
+            (
+                format!("{}💡x", "a".repeat(60)),
+                format!("{}💡...", "a".repeat(60)),
+            ),
+            (
+                format!("{}💡", "a".repeat(63)),
+                format!("{}...", "a".repeat(63)),
+            ),
+        ];
+        for (name, expected) in fixtures {
+            let schema = json!({"properties": {(name.clone()): {"type": "string"}}});
+            let admitted = admit_final_schema(schema.clone()).expect("Unicode field names admit");
+            let accepted = json!({(name.clone()): "accepted"});
+            validate(&schema, &accepted).expect("the original field accepts");
+            admitted
+                .validate(&accepted)
+                .expect("admitted validation also accepts");
+            let rejected = json!({(name.clone()): false});
+            for errors in [
+                validate(&schema, &rejected).expect_err("only the field type changed"),
+                admitted
+                    .validate(&rejected)
+                    .expect_err("admitted validation also refuses"),
+            ] {
+                let quoted = errors[0]
+                    .path
+                    .strip_prefix("root[")
+                    .unwrap()
+                    .strip_suffix(']')
+                    .unwrap();
+                let decoded: String = serde_json::from_str(quoted)
+                    .expect("truncation preserves complete UTF-8 characters and surrogate pairs");
+                assert_eq!(decoded, expected);
+                assert!(errors[0].path.len() <= MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES);
+            }
+            let error = admit_final_schema(json!({"properties": {(name): 42}}))
+                .expect_err("changing only the property's schema refuses admission");
+            let quoted = error
+                .path()
+                .strip_prefix("$.properties[")
+                .unwrap()
+                .strip_suffix(']')
+                .unwrap();
+            let decoded: String = serde_json::from_str(quoted)
+                .expect("admission retains the same complete escaped segment");
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn schema_admission_diagnostics_redact_pattern_and_literal_locations() {
+        const PATTERN_SECRET: &str = "^admission-pattern-secret-canary$";
+        let schema = json!({"patternProperties": {(PATTERN_SECRET): {"type": "string"}}});
+        admit_final_schema(schema)
+            .expect("the pattern rule admits")
+            .validate(&json!({"admission-pattern-secret-canary": "accepted"}))
+            .expect("the pattern rule still validates matching fields");
+        let error =
+            admit_final_schema(json!({"patternProperties": {(PATTERN_SECRET): {"type": 42}}}))
+                .expect_err("changing only the rule's type declaration refuses");
+        assert_eq!(error.path(), "$.patternProperties.type");
+        assert!(!format!("{error} {error:?}").contains("admission-pattern-secret-canary"));
+
+        const LITERAL_KEY: &str = "literal-object-key-secret-canary";
+        for keyword in ["const", "enum"] {
+            let accepted = json!({(LITERAL_KEY): "accepted"});
+            let rejected =
+                json!({(LITERAL_KEY): "x".repeat(MAX_SCHEMA_ASSERTION_STRING_BYTES + 1)});
+            let (accepted, rejected, expected_path) = if keyword == "enum" {
+                (json!([accepted]), json!([rejected]), "$.enum[0]")
+            } else {
+                (accepted, rejected, "$.const")
+            };
+            admit_final_schema(json!({(keyword): accepted})).expect("the bounded literal admits");
+            let error = admit_final_schema(json!({(keyword): rejected}))
+                .expect_err("an oversized string inside the literal refuses");
+            assert_eq!(error.path(), expected_path);
+            assert_eq!(error.code(), "SchemaResourceLimit");
+            assert!(!format!("{error} {error:?}").contains(LITERAL_KEY));
+        }
+    }
+
+    #[test]
+    fn schema_admission_debug_redacts_retained_schema() {
+        let schema = admit_final_schema(json!({"const": "retained-schema-secret-canary"}))
+            .expect("the bounded const schema admits");
+        assert_eq!(schema.schema()["const"], "retained-schema-secret-canary");
+        assert_eq!(format!("{schema:?}"), "AdmittedSchema { .. }");
+        let form = AdmittedFinalFormSchema::admit(json!({
+            "type": "object",
+            "properties": {"choice": {"type": "string", "enum": ["form-secret-canary"]}}
+        }))
+        .expect("the bounded form admits");
+        assert!(!format!("{form:?}").contains("form-secret-canary"));
+
+        let name = "[red]\u{1b}<admission>\n".repeat(200);
+        let error = admit_final_schema(json!({"properties": {(name.clone()): 42}}))
+            .expect_err("a non-schema property value refuses");
+        assert_eq!(error.code(), "InvalidSchema");
+        assert!(error.path().len() <= MAX_SCHEMA_DIAGNOSTIC_PATH_BYTES);
+        assert!(error.path().contains("..."));
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains(&name));
+        assert!(!rendered.contains("[red]"));
+        assert!(!rendered.contains('<'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\n'));
+    }
 
     #[test]
     fn validation_error_display_and_error_trait() {

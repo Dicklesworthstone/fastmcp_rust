@@ -29,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: nightly-2026-08-25
           components: rustfmt, clippy
@@ -59,7 +59,7 @@ jobs:
           cargo test --locked --workspace --doc --all-features
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283
         with:
           tool: cargo-audit@0.22.2
           checksum: true
@@ -124,7 +124,7 @@ jobs:
           persist-credentials: false
 
       # FND-01: pin the exact dated nightly from rust-toolchain.toml (not floating "nightly").
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: nightly-2026-08-25
           targets: ${{ matrix.target }}
@@ -162,7 +162,7 @@ jobs:
           Pop-Location
 
       # Short-lived repository Actions diagnostic only; no release job consumes it.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: quarantine-diagnostic-${{ matrix.asset }}
           path: dist/*

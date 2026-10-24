@@ -213,7 +213,8 @@ impl NativeClientRegistration {
             .discovery
             .discover_issuer_document(cx, deadline)
             .await?;
-        self.register_from_discovery(cx, deadline, issuer, &body).await
+        self.register_from_discovery(cx, deadline, issuer, &body)
+            .await
     }
 
     fn registration_endpoint(

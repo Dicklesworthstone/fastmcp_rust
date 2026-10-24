@@ -26,8 +26,16 @@ use std::time::Instant;
 
 use fastmcp_core::{AccessToken, McpRequestCancellation};
 
+mod caller;
+
+/// Explicit device-code sign-in for headless native public clients.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod device;
 /// Protected-resource and issuer discovery for preregistered native clients.
 pub mod discovery;
+/// Explicit DPoP proof, credential, and nonce handling for caller-owned HTTPS I/O.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod dpop;
 /// Jointly-polled, caller-owned browser driving for native authorization.
 pub mod driver;
 /// High-level HTTP calls with shared OAuth renewal and generation-local caches.
@@ -47,6 +55,23 @@ pub mod secure_file;
 pub mod tool;
 
 pub use fastmcp_core::CanonicalHttpUrl;
+/// Re-exported for the same reason as [`CanonicalHttpUrl`] above: this
+/// module's own public signatures demand it and nothing else makes it
+/// nameable from the published root.
+///
+/// `OAuthCredentialStore::open` and 30 sibling signatures in
+/// [`oauth::persistence`] take an `&PartitionAuthorization`. It is declared in
+/// `fastmcp_core::partition`, which the `fastmcp-rust` facade does not
+/// forward, so a facade user could path to the credential-persistence API and
+/// had no way to name its partition argument. Its only constructor is the
+/// associated `PartitionAuthorization::from_verified_facts`, and it has no
+/// `Default`, so inference cannot substitute.
+///
+/// The three sibling types that same signature demands need nothing:
+/// `OAuthClient` and `SecureAtomicFile` are declared inside this module's own
+/// tree and are already pathable, and `SealedAdmissionKeyError` is already
+/// forwarded by the facade.
+pub use fastmcp_core::partition::PartitionAuthorization;
 
 /// Typed refusals raised when constructing a credential binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,7 +318,7 @@ mod tests {
     fn refuses_empty_and_header_hostile_tokens() {
         let resource = url("https://mcp.example/api");
         assert_eq!(
-            BoundBearerCredential::bind(resource.clone(), "").err(),
+            BoundBearerCredential::bind(url("https://mcp.example/api"), "").err(),
             Some(BearerBindingError::EmptyToken)
         );
         assert_eq!(

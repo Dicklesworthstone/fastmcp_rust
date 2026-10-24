@@ -108,7 +108,8 @@ fn failed_grant_does_not_turn_joined_callers_into_issuer_retries() {
                 assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
                 peer.quiet();
                 let body = ordinary_token().to_string();
-                let ((), result) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+                let ((), result) =
+                    Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
                 assert_eq!(
                     result.unwrap().generation(),
                     1,
@@ -181,7 +182,8 @@ fn abandoned_leader_wakes_every_joiner_and_cannot_be_replaced_by_a_later_success
             // Deliberately finish a later explicit grant before observing the
             // original followers. They cannot adopt its result or re-elect.
             let body = ordinary_token().to_string();
-            let ((), fresh) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+            let ((), fresh) =
+                Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
             assert_eq!(fresh.unwrap().generation(), 1);
             for follower in followers {
                 assert!(matches!(
@@ -255,7 +257,7 @@ fn cancelled_and_dropped_joiners_release_capacity_without_stopping_the_leader() 
                 }
                 assert_eq!(admitted.generation(), 1);
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
             assert_eq!(client.credential(&cx).await.unwrap().generation(), 1);
             core_succeeds(&peer, &cx, &client, "admitted-access").await;
@@ -275,7 +277,7 @@ fn shared_renewal_handoffs_keep_the_new_generation_after_old_revocation() {
             let mut first = ordinary_token();
             first["expires_in"] = json!(1);
             let body = first.to_string();
-            let ((), old) = pair(reply(&peer, post, &body), client.credential(&cx)).await;
+            let ((), old) = Box::pin(pair(reply(&peer, post, &body), client.credential(&cx))).await;
             let old = old.unwrap();
             let old_expiry = old.expires_at();
             asupersync::time::sleep(
@@ -396,7 +398,7 @@ fn separately_discovered_clients_do_not_share_a_failed_flight_or_token() {
                 first.close();
                 assert!(!independent.credential().is_revoked());
             };
-            pair(server, application).await;
+            Box::pin(pair(server, application)).await;
             assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
             assert_eq!(peer.gets.load(Ordering::SeqCst), 4);
             core_succeeds(&peer, &cx, &second, "admitted-access").await;

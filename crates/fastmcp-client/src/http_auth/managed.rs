@@ -24,6 +24,7 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 
+use super::caller::with_caller;
 use super::oauth::{OAuthClient, OAuthCredentials, OAuthError};
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 use crate::http_executor::{
@@ -37,6 +38,8 @@ use crate::http_executor::ModernHttpExecutor;
 
 // Shared dispatch/body guard for the original token's local revocation.
 mod credential_lifetime;
+// Refresh admission must retain the old token's revocation signal until handoff.
+mod renewal;
 
 /// High-level HTTP calls retaining shared OAuth renewal and credential lifetime.
 pub mod client;
@@ -441,25 +444,7 @@ impl ManagedOAuthSession {
                 if !state.credentials.has_refresh_token() {
                     return Err(OAuthSessionError::LoginRequired);
                 }
-                let generation = state
-                    .generation
-                    .checked_add(1)
-                    .ok_or(OAuthSessionError::GenerationExhausted)?;
-                state.renewal_failed = true;
-                self.inner
-                    .client
-                    .refresh(cx, &mut state.credentials)
-                    .await
-                    .map_err(OAuthSessionError::OAuth)?;
-                self.check(cx, cancellation)?;
-                state.renew_after = renewal_time(
-                    Instant::now(),
-                    state.credentials.expires_at(),
-                    state.credentials.has_refresh_token(),
-                    self.inner.policy.refresh_leeway,
-                );
-                state.generation = generation;
-                state.renewal_failed = false;
+                renewal::refresh(self, cx, cancellation, state).await?;
             }
             if Instant::now() >= state.credentials.expires_at() {
                 return Err(OAuthSessionError::LoginRequired);
@@ -576,13 +561,9 @@ impl ManagedOAuthSession {
                 OAuthSessionError::TimedOut
             }
         };
-        // Fail closed when the caller's runtime has no timer driver. The sleep
-        // below resolves its driver from the ambient `Cx` that every poll below
-        // installs, so a missing driver must surface as a typed error here
-        // rather than as a future that is never woken.
-        if cx.timer_driver().is_none() {
-            return Err(OAuthSessionError::RuntimeTimerUnavailable);
-        }
+        // A driver is not authority to use it. Preserve the surrounding
+        // effect ceiling during admission and again on each pending poll.
+        with_caller(cx, || require_timer(cx))?;
         let mut sleep = std::pin::pin!(Sleep::new(deadline));
         let mut closed = std::pin::pin!(self.inner.closed.cancelled());
         let mut cancelled = std::pin::pin!(cancellation.cancelled());
@@ -590,31 +571,33 @@ impl ManagedOAuthSession {
         let mut ambient_cancelled = std::pin::pin!(receiver.recv(cx));
         let mut future = std::pin::pin!(future);
         poll_fn(|task| {
-            self.check(cx, cancellation)?;
-            if credential_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
-                return Poll::Ready(Err(OAuthSessionError::LoginRequired));
-            }
-            let _caller = Cx::set_current(Some(cx.clone()));
-            if closed.as_mut().poll(task).is_ready() {
-                return Poll::Ready(Err(OAuthSessionError::Closed));
-            }
-            if cancelled.as_mut().poll(task).is_ready()
-                || ambient_cancelled.as_mut().poll(task).is_ready()
-            {
-                return Poll::Ready(Err(OAuthSessionError::Cancelled));
-            }
-            if cx.now() >= deadline || sleep.as_mut().poll(task).is_ready() {
-                return Poll::Ready(Err(elapsed()));
-            }
-            let result = future.as_mut().poll(task);
-            self.check(cx, cancellation)?;
-            if credential_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
-                return Poll::Ready(Err(OAuthSessionError::LoginRequired));
-            }
-            if cx.now() >= deadline {
-                return Poll::Ready(Err(elapsed()));
-            }
-            result
+            with_caller(cx, || {
+                self.check(cx, cancellation)?;
+                if credential_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
+                    return Poll::Ready(Err(OAuthSessionError::LoginRequired));
+                }
+                require_timer(cx)?;
+                if closed.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(OAuthSessionError::Closed));
+                }
+                if cancelled.as_mut().poll(task).is_ready()
+                    || ambient_cancelled.as_mut().poll(task).is_ready()
+                {
+                    return Poll::Ready(Err(OAuthSessionError::Cancelled));
+                }
+                if cx.now() >= deadline || sleep.as_mut().poll(task).is_ready() {
+                    return Poll::Ready(Err(elapsed()));
+                }
+                let result = future.as_mut().poll(task);
+                self.check(cx, cancellation)?;
+                if credential_expiry.is_some_and(|expiry| Instant::now() >= expiry) {
+                    return Poll::Ready(Err(OAuthSessionError::LoginRequired));
+                }
+                if cx.now() >= deadline {
+                    return Poll::Ready(Err(elapsed()));
+                }
+                result
+            })
         })
         .await
     }
@@ -791,17 +774,30 @@ fn admit_target(resource: &CanonicalHttpUrl, target: &str) -> Result<(), OAuthSe
     Ok(())
 }
 
-fn unbounded_deadline_after(cx: &Cx, duration: Duration) -> Result<Time, OAuthSessionError> {
-    if cx.timer_driver().is_none() {
+// Called within with_caller, never under a replacement ambient runtime.
+// Acquisition may return cached credentials without I/O, so require only
+// time here; downstream effects must still honor the other four ceilings.
+fn require_timer(cx: &Cx) -> Result<(), OAuthSessionError> {
+    if cx.timer_driver().is_none()
+        || !Cx::current().is_some_and(|active| active.capabilities().time)
+    {
         return Err(OAuthSessionError::RuntimeTimerUnavailable);
     }
-    let nanos = u64::try_from(duration.as_nanos()).map_err(|_| OAuthSessionError::InvalidPolicy)?;
-    let nanos = cx
-        .now()
-        .as_nanos()
-        .checked_add(nanos)
-        .ok_or(OAuthSessionError::InvalidPolicy)?;
-    Ok(Time::from_nanos(nanos))
+    Ok(())
+}
+
+fn unbounded_deadline_after(cx: &Cx, duration: Duration) -> Result<Time, OAuthSessionError> {
+    with_caller(cx, || {
+        require_timer(cx)?;
+        let nanos =
+            u64::try_from(duration.as_nanos()).map_err(|_| OAuthSessionError::InvalidPolicy)?;
+        let nanos = cx
+            .now()
+            .as_nanos()
+            .checked_add(nanos)
+            .ok_or(OAuthSessionError::InvalidPolicy)?;
+        Ok(Time::from_nanos(nanos))
+    })
 }
 
 fn deadline_after(cx: &Cx, duration: Duration) -> Result<Time, OAuthSessionError> {
@@ -877,6 +873,7 @@ impl Drop for SessionGuard<'_> {
 mod tests {
     use super::*;
 
+    mod authority;
     mod sse_completion;
 
     #[test]
@@ -1205,7 +1202,7 @@ mod tests {
                         Duration::from_secs(30)
                     };
                     let response =
-                        open_response(&cx, &listener, &session, &cancellation, lifetime).await;
+                        open_response(&cx, &listener,&session, &cancellation, lifetime).await;
                     let mut reading = Box::pin(response.read_to_end(&cx, 4096));
                     poll_pending(reading.as_mut()).await;
                     match action {

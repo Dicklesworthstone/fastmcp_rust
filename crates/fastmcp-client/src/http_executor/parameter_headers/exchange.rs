@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use super::{ReviewedToolHeaders, ToolHeaderDispatchError};
 use crate::{
     ClientHttpConnectionError, FinalCacheResultSet, HttpClient, HttpClientError,
-    MAX_MRTR_CONTINUATION_ROUNDS, ModernHttpClientError, mrtr_input_required_for_method,
-    mrtr_retry_parameters,
+    MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES, ModernHttpClientError,
+    mrtr_input_required_for_method, mrtr_retry_parameters,
 };
 
 const MAX_REVIEWED_HEADER_REFRESH_PAGES: usize = 64;
@@ -75,6 +75,8 @@ impl HttpClient {
     ///
     /// The client's absolute timeout bounds the whole exchange, including
     /// catalog refresh and reverse handlers, rather than restarting each round.
+    /// The cumulative input-response bound also survives catalog refresh. A
+    /// round that exceeds it is rejected before invoking any of its handlers.
     pub async fn call_tool_with_reviewed_headers(
         &mut self,
         cx: &Cx,
@@ -160,6 +162,7 @@ impl HttpClient {
         let mut refreshed = None;
         let mut repair_used = false;
         let mut rounds = 0;
+        let mut remaining_input_responses = MAX_MRTR_TOTAL_INPUT_RESPONSES;
         loop {
             checkpoint(cx, cancellation)?;
             let result = self
@@ -197,6 +200,18 @@ impl HttpClient {
                 );
             }
             rounds += 1;
+            // Automatic continuation resolves every requested input or sends
+            // no retry. Charge the whole round before invoking any resolver,
+            // including after a schema repair, so an over-budget peer cannot
+            // trigger callback effects and then be refused only at send time.
+            let requested_inputs = input_required
+                .input_requests()
+                .map_or(0, |requests| requests.members().len());
+            remaining_input_responses = remaining_input_responses
+                .checked_sub(requested_inputs)
+                .ok_or_else(|| {
+                    McpError::invalid_params("MRTR total input-response limit exceeded")
+                })?;
             let responses = handlers
                 .respond_to_input_required_async(cx, input_required, || {
                     if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
@@ -376,6 +391,19 @@ mod tests {
             json!({
                 "resultType":"input_required", "requestState":"opaque-state",
                 "inputRequests":{"roots":{"method":"roots/list"}}
+            }),
+        )
+    }
+
+    fn input_required_with_roots(prefix: &str, count: usize) -> Reply {
+        let inputs: serde_json::Map<_, _> = (0..count)
+            .map(|index| (format!("{prefix}-{index}"), json!({"method":"roots/list"})))
+            .collect();
+        result(
+            "tools/call",
+            json!({
+                "resultType":"input_required", "requestState":"opaque-state",
+                "inputRequests":inputs
             }),
         )
     }
@@ -698,6 +726,105 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn cumulative_input_budget_exchange(repair: bool, over_limit: bool) {
+        let first_count = MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+        let second_count = MAX_MRTR_TOTAL_INPUT_RESPONSES - first_count + usize::from(over_limit);
+        let mut replies = vec![input_required_with_roots("first", first_count)];
+        if repair {
+            replies.push(mismatch());
+            replies.push(catalog());
+        }
+        replies.push(input_required_with_roots("second", second_count));
+        if !over_limit {
+            replies.push(complete());
+        }
+        let (outcome, captured, callbacks) = exercise(replies, true, false, false);
+        if over_limit {
+            assert!(matches!(
+                outcome,
+                Err(HttpClientError::CoreResult(error))
+                    if error.code == McpErrorCode::InvalidParams
+                        && error.message == "MRTR total input-response limit exceeded"
+            ));
+            assert_eq!(
+                callbacks, first_count,
+                "an over-budget round cannot invoke any reverse handler"
+            );
+        } else {
+            assert!(matches!(
+                outcome,
+                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+            ));
+            assert_eq!(callbacks, MAX_MRTR_TOTAL_INPUT_RESPONSES);
+        }
+        let calls: Vec<_> = captured
+            .iter()
+            .filter(|request| request.body["method"] == "tools/call")
+            .collect();
+        assert_eq!(
+            calls.len(),
+            2 + usize::from(repair) + usize::from(!over_limit),
+            "an over-budget round cannot commit a continuation request"
+        );
+        assert_eq!(captured.len(), calls.len() + 1 + usize::from(repair));
+        assert!(calls[0].body["params"].get("inputResponses").is_none());
+        for call in calls.iter().skip(1) {
+            assert_eq!(
+                call.body["params"]["arguments"],
+                json!({"region":"east","bodyOnly":"private"})
+            );
+            assert_eq!(call.body["params"]["requestState"], "opaque-state");
+        }
+        let first_responses = calls[1].body["params"]["inputResponses"]
+            .as_object()
+            .unwrap();
+        assert_eq!(first_responses.len(), first_count);
+        assert!(first_responses.keys().all(|key| key.starts_with("first-")));
+        if repair {
+            assert_eq!(
+                calls[2].body["params"]["inputResponses"],
+                calls[1].body["params"]["inputResponses"],
+                "schema repair preserves the existing round's responses"
+            );
+            assert_eq!(
+                mirrored(calls[2], "Mcp-Param-Region").as_deref(),
+                Some("east")
+            );
+        }
+        if !over_limit {
+            let last_responses = calls.last().unwrap().body["params"]["inputResponses"]
+                .as_object()
+                .unwrap();
+            assert_eq!(last_responses.len(), second_count);
+            assert!(last_responses.keys().all(|key| key.starts_with("second-")));
+        }
+        let ids: HashSet<_> = captured
+            .iter()
+            .map(|request| request.body["id"].to_string())
+            .collect();
+        assert_eq!(ids.len(), captured.len());
+    }
+
+    #[test]
+    fn live_loopback_cumulative_input_bound_accepts_exact_limit() {
+        cumulative_input_budget_exchange(false, false);
+    }
+
+    #[test]
+    fn live_loopback_cumulative_input_bound_rejects_before_callbacks_and_retry() {
+        cumulative_input_budget_exchange(false, true);
+    }
+
+    #[test]
+    fn live_loopback_schema_repair_preserves_exact_cumulative_input_limit() {
+        cumulative_input_budget_exchange(true, false);
+    }
+
+    #[test]
+    fn live_loopback_schema_repair_cannot_reset_cumulative_input_limit() {
+        cumulative_input_budget_exchange(true, true);
     }
 
     #[test]

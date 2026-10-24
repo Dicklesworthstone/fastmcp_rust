@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "tasks")]
 use crate::FinalTaskRuntime;
@@ -893,6 +893,24 @@ struct FinalToolSchemas {
     input: Option<AdmittedSchema>,
     output: Option<AdmittedSchema>,
     errors: Option<FinalToolErrorStructuredContent>,
+}
+
+impl FinalToolSchemas {
+    fn validate_complete_output(&self, result: &FinalCallToolResult) -> McpResult<()> {
+        if let Some(schema) = &self.output {
+            let structured_content = result.structured_content.as_ref().ok_or_else(|| {
+                McpError::internal_error(
+                    "tool output is missing structuredContent required by the declared output schema",
+                )
+            })?;
+            if schema.validate(structured_content).is_err() {
+                return Err(McpError::internal_error(
+                    "tool output does not match the declared output schema",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -2347,7 +2365,7 @@ impl Router {
         cursor: &str,
         binding: &EnvelopeBinding,
         catalog_length: usize,
-    ) -> McpResult<usize> {
+    ) -> McpResult<(usize, Instant)> {
         if cursor.len() > MAX_CURSOR_BYTES {
             return Err(invalid_modern_catalog_cursor());
         }
@@ -2375,7 +2393,7 @@ impl Router {
         if offset == 0 || offset >= catalog_length {
             return Err(invalid_modern_catalog_cursor());
         }
-        Ok(offset)
+        Ok((offset, opened.expires_at()))
     }
 
     fn encode_modern_catalog_cursor(
@@ -2383,6 +2401,7 @@ impl Router {
         request_ctx: &McpContext,
         binding: &EnvelopeBinding,
         offset: usize,
+        expires_at: Instant,
     ) -> McpResult<String> {
         let offset = u64::try_from(offset).map_err(|_| invalid_modern_catalog_cursor())?;
         let mut owner = self
@@ -2408,12 +2427,7 @@ impl Router {
         let envelope = owner
             .as_mut()
             .ok_or_else(invalid_modern_catalog_cursor)?
-            .seal(
-                request_ctx.cx(),
-                binding,
-                &offset.to_be_bytes(),
-                MODERN_CATALOG_CURSOR_LIFETIME,
-            )
+            .seal_until(request_ctx.cx(), binding, &offset.to_be_bytes(), expires_at)
             .map_err(catalog_cursor_issuance_error)?;
         let cursor = format!(
             "{MODERN_CATALOG_CURSOR_PREFIX}{}",
@@ -2432,35 +2446,45 @@ impl Router {
         cursor: Option<&str>,
         catalog: FinalCatalogKind,
         query: &FinalCatalogQuery,
-    ) -> McpResult<(Vec<T>, Option<String>)> {
+    ) -> McpResult<(Vec<T>, Option<String>, Option<Instant>)> {
         let Some(page_size) = self.list_page_size else {
             return if cursor.is_none() {
-                Ok((items, None))
+                Ok((items, None, None))
             } else {
                 Err(invalid_modern_catalog_cursor())
             };
         };
+        let initial_expiry = Instant::now()
+            .checked_add(MODERN_CATALOG_CURSOR_LIFETIME)
+            .ok_or_else(|| McpError::internal_error("catalog cursor lifetime is out of range"))?;
         if cursor.is_none() && items.len() <= page_size {
-            return Ok((items, None));
+            return Ok((items, None, Some(initial_expiry)));
         }
         let binding = self.final_catalog_binding(request_ctx, catalog, query)?;
-        let offset = cursor
+        let (offset, expires_at) = cursor
             .map(|cursor| {
                 self.decode_modern_catalog_cursor(request_ctx, cursor, &binding, items.len())
             })
             .transpose()?
-            .unwrap_or(0);
+            .unwrap_or((0, initial_expiry));
         let end = offset
             .checked_add(page_size)
             .ok_or_else(invalid_modern_catalog_cursor)?
             .min(items.len());
+        // Re-sealing a later page uses the authenticated original deadline.
+        // Following or replaying a cursor can never start a fresh lifetime.
         let next_cursor = (end < items.len())
-            .then(|| self.encode_modern_catalog_cursor(request_ctx, &binding, end))
+            .then(|| self.encode_modern_catalog_cursor(request_ctx, &binding, end, expires_at))
             .transpose()?;
-        Ok((items[offset..end].to_vec(), next_cursor))
+        Ok((items[offset..end].to_vec(), next_cursor, Some(expires_at)))
     }
 
-    fn final_catalog_cache_hints(&self, catalog: FinalCatalogKind) -> FinalCacheHintPolicy {
+    fn final_catalog_cache_hints(
+        &self,
+        catalog: FinalCatalogKind,
+        cursor_expires_at: Option<Instant>,
+        now: Instant,
+    ) -> FinalCacheHintPolicy {
         let mut hints = self.final_cache_hints.clone();
         #[cfg(feature = "proxy")]
         {
@@ -2475,9 +2499,8 @@ impl Router {
                 // downstream client lists it. Intersect its remaining age-
                 // adjusted lifetime with the current application policy.
                 let local_ttl = hints.list_ttl_ms.try_as_millis().unwrap_or(0);
-                hints.list_ttl_ms = CacheTtl::milliseconds(
-                    local_ttl.min(upstream.remaining_ttl_ms(std::time::Instant::now())),
-                );
+                hints.list_ttl_ms =
+                    CacheTtl::milliseconds(local_ttl.min(upstream.remaining_ttl_ms(now)));
                 if upstream.cache_scope == CacheScope::Private {
                     hints.scope = CacheScope::Private;
                 }
@@ -2486,12 +2509,18 @@ impl Router {
         #[cfg(not(feature = "proxy"))]
         let _ = catalog;
         if self.list_page_size.is_some() {
-            // A cached copy cannot renew an expiring cursor's lifetime. Until
-            // every cache propagates exact age/remaining validity, return the
-            // same no-cache policy on all pages of a paginated catalog.
-            hints.list_ttl_ms = CacheTtl::milliseconds(0);
-            // The cursor itself is caller-bound even when its catalog rows
-            // are public. Its response cannot acquire shared-cache scope.
+            // The cursor chain retains its first authenticated deadline. Floor
+            // its remaining validity to whole milliseconds, intersecting both
+            // application policy and any upstream snapshot lifetime. A cached
+            // page never authorizes renewing the cursor or its server expiry.
+            let remaining_ms = cursor_expires_at
+                .map(|deadline| deadline.saturating_duration_since(now).as_millis())
+                .and_then(|milliseconds| u64::try_from(milliseconds).ok())
+                .unwrap_or(0);
+            let local_ttl = hints.list_ttl_ms.try_as_millis().unwrap_or(0);
+            hints.list_ttl_ms = CacheTtl::milliseconds(local_ttl.min(remaining_ms));
+            // Keep every page private, including the cursorless final page:
+            // its request may itself contain a caller-bound cursor.
             hints.scope = CacheScope::Private;
         }
         hints
@@ -3920,6 +3949,47 @@ impl Router {
             .map(|entry| &entry.template)
     }
 
+    /// Catalog receipts cannot override the handler retained by duplicate
+    /// policy or composition. Resolve modern visibility and its actual origin.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn proxy_resource_owned_by(
+        &self,
+        uri: &str,
+        client: &crate::proxy::ProxyClient,
+    ) -> bool {
+        self.resolve_resource_for_era(uri, Some(ProtocolEra::Modern2026))
+            .and_then(|resolved| resolved.handler.proxy_catalog_client())
+            .is_some_and(|owner| owner.same_upstream_route(client))
+    }
+
+    /// Returns only final component families with a surviving handler from
+    /// this origin. Ignored or locally replaced registrations confer no relay.
+    #[cfg(feature = "proxy")]
+    pub(crate) fn proxy_catalog_membership(
+        &self,
+        client: &crate::proxy::ProxyClient,
+    ) -> (bool, bool, bool) {
+        let owns = |owner: Option<&crate::proxy::ProxyClient>| {
+            owner.is_some_and(|owner| owner.same_upstream_route(client))
+        };
+        let tools = self.tools.values().any(|entry| {
+            entry.final_registration.is_some() && owns(entry.handler.proxy_catalog_client())
+        });
+        let resources = self.resources.iter().any(|(uri, handler)| {
+            self.final_resources.contains_key(uri) && owns(handler.proxy_catalog_client())
+        }) || self.resource_templates.values().any(|entry| {
+            entry.final_definition.is_some()
+                && entry
+                    .handler
+                    .as_ref()
+                    .is_some_and(|handler| owns(handler.proxy_catalog_client()))
+        });
+        let prompts = self.prompts.iter().any(|(name, handler)| {
+            self.final_prompts.contains_key(name) && owns(handler.proxy_catalog_client())
+        });
+        (tools, resources, prompts)
+    }
+
     /// Returns true if a resource exists for the given URI (static or template match).
     #[must_use]
     pub fn resource_exists(&self, uri: &str) -> bool {
@@ -5000,18 +5070,30 @@ impl Router {
         continuation_cancellation: fastmcp_core::McpRequestCancellation,
         binding: MrtrExchangeBinding,
         handler_result: InputRequiredResult,
+        resume_inputs: Option<&MrtrCompletedInputs>,
     ) -> McpResult<serde_json::Value> {
         // The handler may describe the input it needs, but it never controls
         // downstream requestState. Retain its state privately for this exact
         // conversation; only admitted resume inputs can return it to a proxy.
         // Open result siblings are not forwarded across this boundary.
         let input_requests = handler_mrtr_input_requests(request_ctx, &handler_result)?;
-        let required = self.mrtr_exchanges.issue_bound(
-            continuation_cancellation,
-            binding,
-            input_requests,
-            handler_result.request_state().map(str::to_owned),
-        )?;
+        let handler_state = handler_result.request_state().map(str::to_owned);
+        let required = if let Some(completed) = resume_inputs {
+            self.mrtr_exchanges.issue_successor_bound(
+                continuation_cancellation,
+                binding,
+                input_requests,
+                handler_state,
+                completed,
+            )
+        } else {
+            self.mrtr_exchanges.issue_bound(
+                continuation_cancellation,
+                binding,
+                input_requests,
+                handler_state,
+            )
+        }?;
         encode_mrtr_input_required_result(required)
     }
 
@@ -5103,6 +5185,7 @@ impl Router {
                     continuation_cancellation.clone(),
                     binding,
                     result,
+                    resume_inputs.as_ref(),
                 )
             }
             #[cfg(feature = "tasks")]
@@ -5177,6 +5260,7 @@ impl Router {
                     continuation_cancellation.clone(),
                     binding,
                     result,
+                    resume_inputs.as_ref(),
                 )
             }
         }
@@ -5221,6 +5305,7 @@ impl Router {
                     continuation_cancellation.clone(),
                     binding,
                     result,
+                    resume_inputs.as_ref(),
                 )
             }
         }
@@ -5304,7 +5389,7 @@ impl Router {
         })
         .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "tool_definition"))?;
 
-        let (tools, next_cursor) = self.page_modern_catalog(
+        let (tools, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             tools,
             params.cursor.as_deref(),
@@ -5315,7 +5400,11 @@ impl Router {
         self.project_final_tools_list(
             request_ctx,
             result,
-            self.final_catalog_cache_hints(FinalCatalogKind::Tools),
+            self.final_catalog_cache_hints(
+                FinalCatalogKind::Tools,
+                cursor_expires_at,
+                Instant::now(),
+            ),
         )
     }
 
@@ -5379,14 +5468,18 @@ impl Router {
                 Ok(entry.definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resources, next_cursor) = self.page_modern_catalog(
+        let (resources, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             resources,
             params.cursor.as_deref(),
             FinalCatalogKind::Resources,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Resources);
+        let hints = self.final_catalog_cache_hints(
+            FinalCatalogKind::Resources,
+            cursor_expires_at,
+            Instant::now(),
+        );
         Ok(FinalListResourcesResult {
             resources,
             next_cursor,
@@ -5423,14 +5516,18 @@ impl Router {
                 Ok(definition.clone())
             })
             .collect::<McpResult<Vec<_>>>()?;
-        let (resource_templates, next_cursor) = self.page_modern_catalog(
+        let (resource_templates, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             resource_templates,
             params.cursor.as_deref(),
             FinalCatalogKind::ResourceTemplates,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints(FinalCatalogKind::ResourceTemplates);
+        let hints = self.final_catalog_cache_hints(
+            FinalCatalogKind::ResourceTemplates,
+            cursor_expires_at,
+            Instant::now(),
+        );
         Ok(FinalListResourceTemplatesResult {
             resource_templates,
             next_cursor,
@@ -5462,14 +5559,18 @@ impl Router {
             })
             .map(|(_, entry)| entry.definition.clone())
             .collect();
-        let (prompts, next_cursor) = self.page_modern_catalog(
+        let (prompts, next_cursor, cursor_expires_at) = self.page_modern_catalog(
             request_ctx,
             prompts,
             params.cursor.as_deref(),
             FinalCatalogKind::Prompts,
             &query,
         )?;
-        let hints = self.final_catalog_cache_hints(FinalCatalogKind::Prompts);
+        let hints = self.final_catalog_cache_hints(
+            FinalCatalogKind::Prompts,
+            cursor_expires_at,
+            Instant::now(),
+        );
         Ok(FinalListPromptsResult {
             prompts,
             next_cursor,
@@ -5701,7 +5802,6 @@ impl Router {
             ));
         }
         let input_schema = final_registration.schemas.input.as_ref();
-        let output_schema = final_registration.schemas.output.as_ref();
         // FinalArguments deserialization rejects an explicit null before this
         // point, so `arguments` is here always Absent or a typed value.
         #[cfg(feature = "tasks")]
@@ -5730,7 +5830,7 @@ impl Router {
         let input_validation_failed = match input_schema {
             Some(schema) => {
                 let validation = if self.strict_input_validation {
-                    validate_strict(schema.schema(), &arguments)
+                    schema.validate_strict(&arguments)
                 } else {
                     schema.validate(&arguments)
                 };
@@ -5803,22 +5903,9 @@ impl Router {
             Outcome::Ok(result) => {
                 match &result {
                     FinalToolOutcome::Complete(result) => {
-                        if let Some(output_schema) = output_schema {
-                            let structured_content = result
-                                .payload
-                                .structured_content
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    McpError::internal_error(
-                                        "tool output is missing structuredContent required by the declared output schema",
-                                    )
-                                })?;
-                            if output_schema.validate(structured_content).is_err() {
-                                return Err(McpError::internal_error(
-                                    "tool output does not match the declared output schema",
-                                ));
-                            }
-                        }
+                        final_registration
+                            .schemas
+                            .validate_complete_output(&result.payload)?;
                     }
                     #[cfg(feature = "tasks")]
                     FinalToolOutcome::CreateTask { .. } if !declares_final_tasks => {
@@ -7995,7 +8082,15 @@ impl Router {
 
     /// Consumes the router and returns its internal handlers.
     ///
-    /// This is used internally for mounting operations.
+    /// CURRENTLY UNCALLED, which is what the `allow(dead_code)` records. The
+    /// doc line here used to claim "this is used internally for mounting
+    /// operations"; that consumer no longer exists. Mounting is done by the
+    /// `mount_*_from` helpers above (`mount_prompts_from` at :7897,
+    /// `mount_resource_templates_from` at :7601 and their siblings), which move
+    /// entries into `self` under the mounted name and maintain `prompt_order`
+    /// directly rather than destructuring the source router into maps. Left in
+    /// place rather than removed, but do not read the attribute as "nothing
+    /// calls it yet": nothing calls it any more.
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn into_parts(
@@ -8870,7 +8965,7 @@ impl RouterToolCaller {
         let input_validation_failed = match input_schema {
             Some(schema) => {
                 let validation = if router.strict_input_validation {
-                    validate_strict(schema.schema(), &args)
+                    schema.validate_strict(&args)
                 } else {
                     schema.validate(&args)
                 };
@@ -8882,9 +8977,14 @@ impl RouterToolCaller {
             None => false,
         };
         if input_validation_failed {
-            return Ok(ToolCallResult::error(
-                "Tool arguments do not match the declared input schema.",
-            ));
+            let mut result =
+                ToolCallResult::error("Tool arguments do not match the declared input schema.");
+            result.structured_content = final_registration
+                .schemas
+                .errors
+                .as_ref()
+                .map(|errors| errors.input_validation.clone());
+            return Ok(result);
         }
         let handler_timeout =
             read_handler_timeout(parent_ctx.cx(), "tool_timeout", || handler.timeout())?;
@@ -8917,15 +9017,21 @@ impl RouterToolCaller {
         .await?;
         match outcome {
             Outcome::Ok(result) => match result {
-                FinalToolOutcome::Complete(complete) => Ok(ToolCallResult {
-                    content: complete
-                        .payload
-                        .content
-                        .into_iter()
-                        .map(nested_tool_content_from_final)
-                        .collect(),
-                    is_error: complete.payload.is_error,
-                }),
+                FinalToolOutcome::Complete(complete) => {
+                    final_registration
+                        .schemas
+                        .validate_complete_output(&complete.payload)?;
+                    Ok(ToolCallResult {
+                        content: complete
+                            .payload
+                            .content
+                            .into_iter()
+                            .map(nested_tool_content_from_final)
+                            .collect(),
+                        structured_content: complete.payload.structured_content,
+                        is_error: complete.payload.is_error,
+                    })
+                }
                 FinalToolOutcome::InputRequired(_) => Err(McpError::internal_error(
                     "nested tool call cannot complete an input_required outcome",
                 )),
@@ -8939,7 +9045,13 @@ impl RouterToolCaller {
                 if is_framework_terminal_final_tool_error(&error) {
                     return Err(error);
                 }
-                Ok(ToolCallResult::error(error.message))
+                let mut result = ToolCallResult::error(error.message);
+                result.structured_content = final_registration
+                    .schemas
+                    .errors
+                    .as_ref()
+                    .map(|errors| errors.handler.clone());
+                Ok(result)
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(parent_ctx.cx(), "tool")),
@@ -10060,6 +10172,55 @@ mod router_tests {
             is_error: false,
             structured_content: Some(serde_json::json!({"weather":"clear"})),
         })
+    }
+
+    struct NestedStructuredTool {
+        output_schema: Option<serde_json::Value>,
+        structured_content: Option<serde_json::Value>,
+        is_error: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ToolHandler for NestedStructuredTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "nested-structured".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: self.output_schema.clone(),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Content::text(r#"{"legacy":true}"#)])
+        }
+
+        fn final_tool_error_structured_content(
+            &self,
+            _kind: ToolErrorKind,
+        ) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"valid": true}))
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            _args: serde_json::Value,
+        ) -> McpResult<FinalToolOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                FinalCallToolResult {
+                    content: vec![ContentBlock::text(r#"{"fallback":true}"#)],
+                    is_error: self.is_error,
+                    structured_content: self.structured_content.clone(),
+                },
+            )))
+        }
     }
 
     struct SchemaBoundaryTool {
@@ -11206,8 +11367,10 @@ mod router_tests {
 
     fn router_roots_response_wire() -> serde_json::Value {
         serde_json::to_value(
-            MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                .expect("roots response serializes"),
+            MrtrInputResponse::roots(fastmcp_protocol::FinalEmbeddedRootsListResult {
+                roots: Vec::new(),
+            })
+            .expect("roots response serializes"),
         )
         .expect("roots response converts to a wire value")
     }
@@ -16035,7 +16198,8 @@ mod router_tests {
         assert_eq!(
             router
                 .decode_modern_catalog_cursor(&request_ctx, cursor, &binding, 2)
-                .expect("cursor is router-generated for this exact final catalog revision"),
+                .expect("cursor is router-generated for this exact final catalog revision")
+                .0,
             1,
             "the cursor advances across admitted entries"
         );
@@ -16072,9 +16236,166 @@ mod router_tests {
     }
 
     #[test]
+    fn modern_catalog_cache_retains_one_deadline_across_the_complete_cursor_chain() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        for name in ["expiry-a", "expiry-b", "expiry-c"] {
+            router.add_tool(NamedTool::new(name)).unwrap();
+        }
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let query = FinalCatalogQuery::from_tag_filters(None, None);
+        let binding = router
+            .final_catalog_binding(&ctx, FinalCatalogKind::Tools, &query)
+            .unwrap();
+        let first = block_on(
+            router.dispatch_stateless(&ctx, &final_tools_list_request(None, None, None, 1_i64)),
+        )
+        .unwrap();
+        let first_cursor = first["nextCursor"].as_str().unwrap();
+        let (first_offset, original_expiry) = router
+            .decode_modern_catalog_cursor(&ctx, first_cursor, &binding, 3)
+            .unwrap();
+        assert_eq!(first_offset, 1);
+        let first_ttl = first["ttlMs"].as_u64().unwrap();
+        assert!((1..=300_000).contains(&first_ttl));
+        assert_eq!(first["cacheScope"], "private");
+
+        let second = block_on(router.dispatch_stateless(
+            &ctx,
+            &final_tools_list_request(Some(first_cursor), None, None, 2_i64),
+        ))
+        .unwrap();
+        let second_cursor = second["nextCursor"].as_str().unwrap();
+        let (second_offset, continued_expiry) = router
+            .decode_modern_catalog_cursor(&ctx, second_cursor, &binding, 3)
+            .unwrap();
+        assert_eq!(second_offset, 2);
+        assert_eq!(
+            continued_expiry, original_expiry,
+            "a fresh continuation envelope must retain the first cursor's exact expiry"
+        );
+        assert_ne!(first_cursor, second_cursor);
+        let second_ttl = second["ttlMs"].as_u64().unwrap();
+        assert!((1..=first_ttl).contains(&second_ttl));
+        assert_eq!(second["cacheScope"], "private");
+
+        let last = block_on(router.dispatch_stateless(
+            &ctx,
+            &final_tools_list_request(Some(second_cursor), None, None, 3_i64),
+        ))
+        .unwrap();
+        assert_eq!(last["tools"][0]["name"], "expiry-c");
+        assert!(last.get("nextCursor").is_none());
+        assert!((1..=second_ttl).contains(&last["ttlMs"].as_u64().unwrap()));
+        assert_eq!(last["cacheScope"], "private");
+
+        // Only monotonic time changes for the exact authenticated deadline.
+        // TTL projection reaches zero at expiry and never rounds a fraction
+        // of a millisecond upward.
+        for (before_expiry, expected_ms) in [
+            (Duration::from_millis(1_501), 1_501),
+            (Duration::from_micros(1_999), 1),
+            (Duration::from_micros(999), 0),
+            (Duration::ZERO, 0),
+        ] {
+            let hints = router.final_catalog_cache_hints(
+                FinalCatalogKind::Tools,
+                Some(original_expiry),
+                original_expiry - before_expiry,
+            );
+            assert_eq!(hints.list_ttl_ms, CacheTtl::milliseconds(expected_ms));
+            assert_eq!(hints.scope, CacheScope::Private);
+        }
+        let expired = router.final_catalog_cache_hints(
+            FinalCatalogKind::Tools,
+            Some(original_expiry),
+            original_expiry + Duration::from_millis(1),
+        );
+        assert_eq!(expired.list_ttl_ms, CacheTtl::milliseconds(0));
+    }
+
+    #[test]
+    fn modern_catalog_cache_intersects_policy_and_keeps_all_paginated_pages_private() {
+        let mut router = Router::new();
+        let now = Instant::now();
+        let expiry = now + Duration::from_secs(30);
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(700),
+            CacheTtl::milliseconds(900),
+            CacheScope::Public,
+        );
+        let unpaginated = router.final_catalog_cache_hints(FinalCatalogKind::Tools, None, now);
+        assert_eq!(unpaginated.list_ttl_ms, CacheTtl::milliseconds(700));
+        assert_eq!(unpaginated.scope, CacheScope::Public);
+
+        router.set_list_page_size(Some(1));
+        for kind in [
+            FinalCatalogKind::Tools,
+            FinalCatalogKind::Resources,
+            FinalCatalogKind::ResourceTemplates,
+            FinalCatalogKind::Prompts,
+        ] {
+            let hints = router.final_catalog_cache_hints(kind, Some(expiry), now);
+            assert_eq!(hints.list_ttl_ms, CacheTtl::milliseconds(700));
+            assert_eq!(hints.scope, CacheScope::Private);
+            let absent = router.final_catalog_cache_hints(kind, None, now);
+            assert_eq!(absent.list_ttl_ms, CacheTtl::milliseconds(0));
+            assert_eq!(absent.scope, CacheScope::Private);
+        }
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(0),
+            CacheTtl::milliseconds(900),
+            CacheScope::Public,
+        );
+        let disabled = router.final_catalog_cache_hints(FinalCatalogKind::Tools, Some(expiry), now);
+        assert_eq!(disabled.list_ttl_ms, CacheTtl::milliseconds(0));
+        assert_eq!(disabled.scope, CacheScope::Private);
+    }
+
+    #[cfg(feature = "proxy")]
+    #[test]
+    fn modern_catalog_cache_cannot_renew_an_upstream_snapshot() {
+        let mut router = Router::new();
+        router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(60_000),
+            CacheTtl::milliseconds(60_000),
+            CacheScope::Public,
+        );
+        let upstream =
+            ProxyCatalogCacheHint::new(CacheTtl::milliseconds(2_500), CacheScope::Public);
+        router.proxy_catalog_cache_hints[0] = Some(upstream);
+        let now = Instant::now();
+        let expiry = now + MODERN_CATALOG_CURSOR_LIFETIME;
+        let upstream_remaining = router.proxy_catalog_cache_hints[0]
+            .as_ref()
+            .unwrap()
+            .remaining_ttl_ms(now);
+        let fresh = router.final_catalog_cache_hints(FinalCatalogKind::Tools, Some(expiry), now);
+        assert_eq!(
+            fresh.list_ttl_ms,
+            CacheTtl::milliseconds(upstream_remaining)
+        );
+        assert!(upstream_remaining > 0);
+        assert_eq!(fresh.scope, CacheScope::Private);
+        let stale = router.final_catalog_cache_hints(
+            FinalCatalogKind::Tools,
+            Some(expiry),
+            now + Duration::from_secs(3),
+        );
+        assert_eq!(stale.list_ttl_ms, CacheTtl::milliseconds(0));
+        assert_eq!(stale.scope, CacheScope::Private);
+    }
+
+    #[test]
     fn modern_catalog_cursors_authenticate_every_byte_and_preserve_valid_replays() {
         let mut router = Router::new();
         router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(60_000),
+            CacheTtl::milliseconds(60_000),
+            CacheScope::Private,
+        );
         router.add_tool(NamedTool::new("cursor-a")).unwrap();
         router.add_tool(NamedTool::new("cursor-b")).unwrap();
         let cx = Cx::for_testing();
@@ -16083,7 +16404,8 @@ mod router_tests {
         let first = block_on(router.dispatch_stateless(&ctx, &request)).unwrap();
         let cursor = first["nextCursor"].as_str().unwrap();
         assert!(cursor.len() <= MAX_CURSOR_BYTES);
-        assert_eq!(first["ttlMs"], 0);
+        assert_eq!(first["ttlMs"], 60_000);
+        assert_eq!(first["cacheScope"], "private");
         let wire = URL_SAFE_NO_PAD
             .decode(cursor.strip_prefix(MODERN_CATALOG_CURSOR_PREFIX).unwrap())
             .unwrap();
@@ -16092,7 +16414,8 @@ mod router_tests {
         let expected = block_on(router.dispatch_stateless(&ctx, &retry)).unwrap();
         assert_eq!(expected["tools"][0]["name"], "cursor-b");
         assert!(expected.get("nextCursor").is_none());
-        assert_eq!(expected["ttlMs"], 0);
+        assert_eq!(expected["ttlMs"], 60_000);
+        assert_eq!(expected["cacheScope"], "private");
         for byte in 0..wire.len() {
             let mut changed = wire.clone();
             changed[byte] ^= 1;
@@ -16141,6 +16464,11 @@ mod router_tests {
     fn modern_catalog_cursor_binds_verified_owner_grants_and_claims() {
         let mut router = Router::new();
         router.set_list_page_size(Some(1));
+        router.set_final_cache_hint_policy(
+            CacheTtl::milliseconds(60_000),
+            CacheTtl::milliseconds(60_000),
+            CacheScope::Private,
+        );
         router.add_tool(NamedTool::new("owned-a")).unwrap();
         router.add_tool(NamedTool::new("owned-b")).unwrap();
         let cx = Cx::for_testing();
@@ -16196,6 +16524,11 @@ mod router_tests {
         fn catalog() -> Router {
             let mut router = Router::new();
             router.set_list_page_size(Some(1));
+            router.set_final_cache_hint_policy(
+                CacheTtl::milliseconds(60_000),
+                CacheTtl::milliseconds(60_000),
+                CacheScope::Private,
+            );
             router.add_tool(NamedTool::new("instance-a")).unwrap();
             router.add_tool(NamedTool::new("instance-b")).unwrap();
             router.add_resource(NamedResource::new("file:///instance-a"));
@@ -16285,7 +16618,9 @@ mod router_tests {
             let first = block_on(router.dispatch_stateless(&explicit_anonymous, &first_request))
                 .expect("all four modern catalogs page through the explicit anonymous provider");
             assert_eq!(first[field].as_array().map(Vec::len), Some(1));
-            assert_eq!(first["ttlMs"], 0);
+            let first_ttl = first["ttlMs"].as_u64().unwrap();
+            assert!((1..=300_000).contains(&first_ttl));
+            assert_eq!(first["cacheScope"], "private");
             let mut retry =
                 final_tools_list_request(first["nextCursor"].as_str(), None, None, 41_i64);
             retry.method = method.to_owned();
@@ -16294,7 +16629,8 @@ mod router_tests {
             );
             assert_eq!(second[field][0][identity], expected);
             assert!(second.get("nextCursor").is_none());
-            assert_eq!(second["ttlMs"], 0);
+            assert!((1..=first_ttl).contains(&second["ttlMs"].as_u64().unwrap()));
+            assert_eq!(second["cacheScope"], "private");
             let mut changed_query = retry;
             changed_query.params.as_mut().unwrap()["includeTags"] =
                 serde_json::json!(["different"]);
@@ -16349,7 +16685,8 @@ mod router_tests {
             router.dispatch_stateless(&origin, &final_tools_list_request(None, None, None, 50_i64)),
         )
         .expect("subject-only static-token configuration retains working modern pagination");
-        assert_eq!(first["ttlMs"], 0);
+        let first_ttl = first["ttlMs"].as_u64().unwrap();
+        assert!((1..=300_000).contains(&first_ttl));
         assert_eq!(first["cacheScope"], "private");
         let retry = final_tools_list_request(first["nextCursor"].as_str(), None, None, 51_i64);
         let fresh_auth = authenticate("Bearer catalog-token-one", 51);
@@ -16357,7 +16694,7 @@ mod router_tests {
             .expect("reverification of the same token preserves its cursor binding");
         assert_eq!(expected["tools"][0]["name"], "token-tool-b");
         assert!(expected.get("nextCursor").is_none());
-        assert_eq!(expected["ttlMs"], 0);
+        assert!((1..=first_ttl).contains(&expected["ttlMs"].as_u64().unwrap()));
         assert_eq!(expected["cacheScope"], "private");
 
         let other_auth = authenticate("Bearer catalog-token-two", 52);
@@ -16366,10 +16703,13 @@ mod router_tests {
         );
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(error.message, INVALID_MODERN_CATALOG_CURSOR);
+        let replay = block_on(router.dispatch_stateless(&fresh_auth, &retry)).unwrap();
+        assert!(replay["ttlMs"].as_u64().unwrap() <= expected["ttlMs"].as_u64().unwrap());
+        let mut aged_expected = expected;
+        aged_expected["ttlMs"] = replay["ttlMs"].clone();
         assert_eq!(
-            block_on(router.dispatch_stateless(&fresh_auth, &retry)).unwrap(),
-            expected,
-            "the rejected credential leaves the verified owner's cursor usable"
+            replay, aged_expected,
+            "the rejected credential preserves every page field while its original TTL ages"
         );
     }
 
@@ -19963,6 +20303,395 @@ mod router_tests {
     }
 
     #[test]
+    fn nested_tool_results_preserve_structured_values_and_typed_consumption() {
+        for expected in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!(false)),
+            Some(serde_json::json!(0)),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!([1, "two"])),
+            Some(serde_json::json!({"value": 7})),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router
+                .add_tool(NestedStructuredTool {
+                    output_schema: None,
+                    structured_content: expected.clone(),
+                    is_error: false,
+                    calls: Arc::clone(&calls),
+                })
+                .expect("arbitrary structured results are allowed without an output schema");
+            let router = Arc::new(router);
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let ctx = request_context(&cx, 144, Budget::INFINITE, &state)
+                .with_final_request_surface(true)
+                .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::clone(&router), state)));
+
+            let result = block_on(ctx.call_tool("nested-structured", serde_json::json!({})))
+                .expect("nested modern calls retain structured content");
+            assert_eq!(result.structured_content, expected);
+            assert!(!result.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let typed: serde_json::Value =
+                block_on(ctx.call_tool_json("nested-structured", serde_json::json!({})))
+                    .expect("typed nested calls use structured content before text");
+            assert_eq!(
+                typed,
+                expected
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({"fallback": true}))
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            if expected == Some(serde_json::Value::Null) {
+                let error = block_on(ctx.call_tool_json::<HashMap<String, bool>>(
+                    "nested-structured",
+                    serde_json::json!({}),
+                ))
+                .expect_err("present null cannot fall back to otherwise-decodable object text");
+                assert_eq!(error.code, McpErrorCode::InternalError);
+            }
+
+            let legacy = ctx.clone().with_final_request_surface(false);
+            let result = block_on(legacy.call_tool("nested-structured", serde_json::json!({})))
+                .expect("the legacy handler remains available");
+            assert!(result.structured_content.is_none());
+            let typed: serde_json::Value =
+                block_on(legacy.call_tool_json("nested-structured", serde_json::json!({})))
+                    .expect("legacy typed calls retain their text fallback");
+            assert_eq!(typed, serde_json::json!({"legacy": true}));
+        }
+    }
+
+    #[test]
+    fn nested_tool_outputs_enforce_schema_for_success_and_error_results() {
+        for is_error in [false, true] {
+            for (structured_content, accepted) in [
+                (Some(serde_json::json!({"valid": true})), true),
+                (Some(serde_json::json!({"valid": "wrong type"})), false),
+                (Some(serde_json::Value::Null), false),
+                (None, false),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut router = Router::new();
+                router
+                    .add_tool(NestedStructuredTool {
+                        output_schema: Some(serde_json::json!({
+                            "type": "object",
+                            "properties": {"valid": {"type": "boolean"}},
+                            "required": ["valid"]
+                        })),
+                        structured_content: structured_content.clone(),
+                        is_error,
+                        calls: Arc::clone(&calls),
+                    })
+                    .expect("the tool and both error mappings are admitted");
+                let router = Arc::new(router);
+                let cx = Cx::for_testing();
+                let state = SessionState::new();
+                let ctx = request_context(&cx, 145, Budget::INFINITE, &state)
+                    .with_final_request_surface(true)
+                    .with_tool_caller(Arc::new(RouterToolCaller::new(router, state)));
+
+                let result = block_on(ctx.call_tool("nested-structured", serde_json::json!({})));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                if accepted {
+                    let result = result.expect("conforming complete output is preserved");
+                    assert_eq!(result.structured_content, structured_content);
+                    assert_eq!(result.is_error, is_error);
+                } else {
+                    let error = result.expect_err("invalid declared output never reaches a caller");
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert!(error.message.contains("declared output schema"));
+                    assert!(!error.message.contains("wrong type"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_tool_errors_preserve_admitted_structured_error_mappings() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router
+            .add_tool(ErrorMappedTool {
+                mode: ErrorMapperMode::Complete,
+                calls: Arc::clone(&calls),
+            })
+            .expect("both error mapper branches satisfy outputSchema");
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let ctx = request_context(&cx, 146, Budget::INFINITE, &state)
+            .with_final_request_surface(true)
+            .with_tool_caller(Arc::new(RouterToolCaller::new(Arc::new(router), state)));
+
+        let input_error =
+            block_on(ctx.call_tool("error-mapped-tool", serde_json::json!({"value": 7})))
+                .expect("input rejection remains a tool-level error");
+        assert!(input_error.is_error);
+        assert_eq!(
+            input_error.structured_content,
+            Some(serde_json::json!({"error": "input-validation"}))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let handler_error = block_on(ctx.call_tool(
+            "error-mapped-tool",
+            serde_json::json!({"value": "accepted"}),
+        ))
+        .expect("ordinary handler failure remains a tool-level error");
+        assert!(handler_error.is_error);
+        assert_eq!(
+            handler_error.structured_content,
+            Some(serde_json::json!({"error": "handler"}))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let typed = block_on(ctx.call_tool_json::<serde_json::Value>(
+            "error-mapped-tool",
+            serde_json::json!({"value": "accepted"}),
+        ));
+        assert!(
+            typed.is_err(),
+            "a structured error is never typed successful data"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn final_tool_dispatch_validates_recursive_dynamic_schemas_with_strict_mode() {
+        struct RecursiveTool {
+            schema: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for RecursiveTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "recursive-tree".to_owned(),
+                    description: None,
+                    input_schema: self.schema.clone(),
+                    output_schema: Some(self.schema.clone()),
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Content::text("validated recursive tree")])
+            }
+
+            fn final_tool_error_structured_content(
+                &self,
+                _kind: ToolErrorKind,
+            ) -> Option<serde_json::Value> {
+                Some(serde_json::json!({"label": "validation error"}))
+            }
+
+            fn call_final_outcome(
+                &self,
+                _ctx: &McpContext,
+                args: serde_json::Value,
+            ) -> McpResult<FinalToolOutcome> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(FinalToolOutcome::Complete(final_tool_complete_result(
+                    FinalCallToolResult {
+                        content: vec![ContentBlock::text("validated recursive tree")],
+                        is_error: false,
+                        structured_content: Some(args),
+                    },
+                )))
+            }
+        }
+
+        let schema = serde_json::json!({
+            "$id": "https://example.test/recursive-tool-tree",
+            "$dynamicAnchor": "node",
+            "type": "object",
+            "$defs": {"label": {"type": "string"}},
+            "properties": {
+                "label": {"$ref": "#/$defs/label"},
+                "children": {
+                    "type": "array",
+                    "items": {"$dynamicRef": "#node"}
+                }
+            },
+            "required": ["label"],
+            "unevaluatedProperties": false
+        });
+        let accepted = serde_json::json!({
+            "label": "root",
+            "children": [{"label": "child", "children": [{"label": "leaf"}]}]
+        });
+        let mut rejected = accepted.clone();
+        rejected["children"][0]["children"][0]["label"] = serde_json::json!(7);
+        for strict in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router.set_strict_input_validation(strict);
+            router
+                .add_tool(RecursiveTool {
+                    schema: schema.clone(),
+                    calls: Arc::clone(&calls),
+                })
+                .expect("recursive input and output schemas are admitted together");
+            let router = Arc::new(router);
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 148, Budget::INFINITE, &state);
+
+            let modern = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("recursive-tree", accepted.clone(), 148_i64),
+            ))
+            .expect("deep recursive arguments and structured output validate");
+            assert_eq!(modern["resultType"], "complete");
+            assert!(modern.get("isError").is_none());
+            assert_eq!(modern["structuredContent"], accepted);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let invalid_modern = block_on(router.dispatch_stateless(
+                &request_ctx,
+                &final_tools_call_request("recursive-tree", rejected.clone(), 149_i64),
+            ))
+            .expect("a recursive input violation produces a bounded tool error");
+            assert_eq!(invalid_modern["isError"], true);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let caller = RouterToolCaller::new(Arc::clone(&router), state);
+            let nested_ctx = request_ctx.clone().with_final_request_surface(true);
+            let nested =
+                block_on(caller.call_tool(&nested_ctx, "recursive-tree", accepted.clone(), 1))
+                    .expect("nested dispatch accepts the same recursive input");
+            assert!(!nested.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            let refused =
+                block_on(caller.call_tool(&nested_ctx, "recursive-tree", rejected.clone(), 1))
+                    .expect("modern validation returns a tool error");
+            assert!(refused.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn legacy_tool_validation_errors_redact_schema_and_instance_literals() {
+        const SCHEMA_CANARY: &str = "rpc-schema-secret-canary";
+        const INSTANCE_CANARY: &str = "rpc-instance-secret-canary";
+
+        struct SensitiveSchemaTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for SensitiveSchemaTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "sensitive-schema".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "token": {
+                                "type": "string",
+                                "enum": [SCHEMA_CANARY],
+                                "const": SCHEMA_CANARY,
+                                "pattern": format!("^{SCHEMA_CANARY}$")
+                            }
+                        },
+                        "required": ["token"]
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Content::text("validated")])
+            }
+        }
+
+        for strict in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut router = Router::new();
+            router.set_strict_input_validation(strict);
+            router
+                .add_tool(SensitiveSchemaTool {
+                    calls: Arc::clone(&calls),
+                })
+                .expect("a schema containing literal values still admits");
+            let router = Arc::new(router);
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let request_ctx = request_context(&cx, 146, Budget::INFINITE, &state);
+            let accepted = serde_json::json!({"token": SCHEMA_CANARY});
+            let rejected = serde_json::json!({"token": INSTANCE_CANARY});
+
+            let valid = block_on(router.handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "sensitive-schema".to_owned(),
+                    arguments: Some(accepted.clone()),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            ))
+            .expect("matching input still reaches the handler");
+            assert!(!valid.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let direct = block_on(router.handle_tools_call(
+                &request_ctx,
+                CallToolParams {
+                    name: "sensitive-schema".to_owned(),
+                    arguments: Some(rejected.clone()),
+                    meta: None,
+                },
+                state.clone(),
+                None,
+                None,
+            ))
+            .expect_err("invalid input fails before handler execution");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let caller = RouterToolCaller::new(Arc::clone(&router), state);
+            let nested = block_on(caller.call_tool(&request_ctx, "sensitive-schema", accepted, 1))
+                .expect("matching nested input still reaches the handler");
+            assert!(!nested.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            let nested = block_on(caller.call_tool(&request_ctx, "sensitive-schema", rejected, 1))
+                .expect_err("invalid nested input fails before handler execution");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+            for error in [direct, nested] {
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert!(error.message.contains("root.token"));
+                for constraint in ["enum", "const", "pattern"] {
+                    assert!(error.message.contains(constraint));
+                }
+                let wire = serde_json::to_string(&error).expect("the JSON-RPC error serializes");
+                let debug = format!("{error:?}");
+                for rendered in [&wire, &debug] {
+                    assert!(!rendered.contains(SCHEMA_CANARY));
+                    assert!(!rendered.contains(INSTANCE_CANARY));
+                    assert!(rendered.len() < 1024);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn final_tools_call_input_schema_failure_is_bounded_tool_error_without_handler_call() {
         let final_calls = Arc::new(AtomicUsize::new(0));
         let legacy_calls = Arc::new(AtomicUsize::new(0));
@@ -22455,6 +23184,299 @@ mod router_tests {
         assert_eq!(completed["content"][0]["text"], "state-only resumed");
         assert_eq!(initial_calls.load(Ordering::SeqCst), 1);
         assert_eq!(resumed_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn modern_mrtr_tool_completes_after_two_input_rounds_with_new_request_ids() {
+        struct TwoRoundMrtrTool {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for TwoRoundMrtrTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "two-round-mrtr-tool".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                Ok(vec![Content::text("legacy result")])
+            }
+
+            fn declares_final_mrtr(&self) -> bool {
+                true
+            }
+
+            fn call_final_outcome_async_resuming_in_request<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                _request_cx: &'a Cx,
+                _arguments: serde_json::Value,
+                resume_inputs: Option<&'a MrtrCompletedInputs>,
+            ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    let Some(inputs) = resume_inputs else {
+                        return Outcome::Ok(FinalToolOutcome::InputRequired(
+                            input_required_result("first-handler-stage"),
+                        ));
+                    };
+                    let roots = match inputs.roots("roots") {
+                        Ok(Some(roots)) => roots,
+                        Ok(None) => {
+                            return Outcome::Err(McpError::internal_error(
+                                "MRTR roots input was lost",
+                            ));
+                        }
+                        Err(error) => return Outcome::Err(error),
+                    };
+                    match roots.roots.first().map(|root| root.uri.as_str()) {
+                        Some("file:///first") => Outcome::Ok(FinalToolOutcome::InputRequired(
+                            input_required_result("second-handler-stage"),
+                        )),
+                        Some("file:///second") => Outcome::Ok(FinalToolOutcome::Complete(
+                            final_tool_complete_result(FinalCallToolResult {
+                                content: vec![ContentBlock::text("file:///second")],
+                                is_error: false,
+                                structured_content: None,
+                            }),
+                        )),
+                        _ => Outcome::Err(McpError::invalid_params("unexpected MRTR roots input")),
+                    }
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.mrtr_exchanges = Arc::new(
+            MrtrExchangeRegistry::with_limits(4, 2, 1, 2, std::time::Duration::from_secs(60))
+                .expect("two input rounds fit the configured budget"),
+        );
+        router
+            .add_tool(TwoRoundMrtrTool {
+                calls: Arc::clone(&calls),
+            })
+            .expect("two-round tool registers");
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let dispatch = |request: &JsonRpcRequest, request_id: u64| {
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                request_id,
+                InboundRequestTransport::Memory,
+                &connection,
+            );
+            let request_ctx = inbound
+                .request_context()
+                .with_client_capabilities(ClientCapabilityInfo::new().with_roots(false));
+            let cancellation = inbound
+                .mrtr_continuation_cancellation()
+                .expect("the retained connection owns continuation cancellation");
+            let raw_params = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+            block_on(
+                router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    &request_ctx,
+                    request,
+                    Some(&raw_params),
+                    &cancellation,
+                ),
+            )
+        };
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {"roots": {}},
+        });
+        let initial = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata.clone(),
+                "name": "two-round-mrtr-tool",
+                "arguments": {},
+            })),
+            2600_i64,
+        );
+        let initial_result = dispatch(&initial, 2600).expect("the first input round is issued");
+        assert_eq!(initial_result["resultType"], "input_required");
+        let mut state = initial_result["requestState"].as_str().unwrap().to_owned();
+        let original_state = state.clone();
+        for (index, uri) in ["file:///first", "file:///second"].into_iter().enumerate() {
+            let request_id = 2601 + index as u64;
+            let retry = JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "_meta": metadata.clone(),
+                    "name": "two-round-mrtr-tool",
+                    "arguments": {},
+                    "inputResponses": {"roots": {"roots": [{"uri": uri}]}},
+                    "requestState": state.clone(),
+                })),
+                request_id as i64,
+            );
+            let result = dispatch(&retry, request_id).expect("the bounded handler round succeeds");
+            if index == 0 {
+                assert_eq!(result["resultType"], "input_required");
+                let next_state = result["requestState"].as_str().unwrap().to_owned();
+                assert_ne!(next_state, state);
+                state = next_state;
+                assert_eq!(router.mrtr_exchanges.active_len(), 1);
+            } else {
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(result["content"][0]["text"], "file:///second");
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(router.mrtr_exchanges.active_len(), 0);
+        let replay = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "_meta": metadata,
+                "name": "two-round-mrtr-tool",
+                "arguments": {},
+                "inputResponses": {"roots": router_roots_response_wire()},
+                "requestState": original_state,
+            })),
+            2603_i64,
+        );
+        assert_eq!(
+            dispatch(&replay, 2603)
+                .expect_err("completed round states remain one-use")
+                .code,
+            McpErrorCode::InvalidParams,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn modern_mrtr_completed_round_limits_apply_to_tools_resources_and_prompts() {
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let resource_calls = Arc::new(AtomicUsize::new(0));
+        let prompt_calls = Arc::new(AtomicUsize::new(0));
+        let mut router = Router::new();
+        router.mrtr_exchanges = Arc::new(
+            MrtrExchangeRegistry::with_limits(4, 2, 1, 2, std::time::Duration::from_secs(60))
+                .expect("two rounds fit the configured logical exchange budget"),
+        );
+        router
+            .add_tool(InputRequiredTool {
+                legacy_calls: Arc::new(AtomicUsize::new(0)),
+                final_calls: Arc::clone(&tool_calls),
+            })
+            .expect("MRTR tool registers");
+        router.add_resource(InputRequiredResource {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&resource_calls),
+        });
+        router.add_prompt(InputRequiredPrompt {
+            legacy_calls: Arc::new(AtomicUsize::new(0)),
+            final_calls: Arc::clone(&prompt_calls),
+        });
+
+        let cx = Cx::for_testing();
+        let connection = ModernConnection::new();
+        let dispatch = |request: &JsonRpcRequest, request_id: u64| {
+            let inbound = InboundRequestContext::with_modern_connection(
+                cx.clone(),
+                request_id,
+                InboundRequestTransport::Memory,
+                &connection,
+            );
+            let request_ctx = inbound
+                .request_context()
+                .with_client_capabilities(ClientCapabilityInfo::new().with_roots(false));
+            let cancellation = inbound
+                .mrtr_continuation_cancellation()
+                .expect("the retained connection owns continuation cancellation");
+            let raw_params = serde_json::to_string(request.params.as_ref().unwrap()).unwrap();
+            block_on(
+                router.dispatch_stateless_with_continuation_cancellation_and_raw_params(
+                    &request_ctx,
+                    request,
+                    Some(&raw_params),
+                    &cancellation,
+                ),
+            )
+        };
+        let metadata = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {"roots": {}},
+        });
+        for (index, (method, mut params, calls)) in [
+            (
+                "tools/call",
+                serde_json::json!({"name": "input-required-tool", "arguments": {}}),
+                tool_calls,
+            ),
+            (
+                "resources/read",
+                serde_json::json!({"uri": "file:///input-required-resource"}),
+                resource_calls,
+            ),
+            (
+                "prompts/get",
+                serde_json::json!({"name": "input-required-prompt"}),
+                prompt_calls,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            params["_meta"] = metadata.clone();
+            let initial_id = 2700 + index as u64 * 10;
+            let initial = JsonRpcRequest::new(method, Some(params.clone()), initial_id as i64);
+            let first = dispatch(&initial, initial_id).expect("the initial handler round succeeds");
+            assert_eq!(first["resultType"], "input_required");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(router.mrtr_exchanges.active_len(), 1);
+            let retry_params = |state: &str| {
+                let mut params = params.clone();
+                params["requestState"] = serde_json::Value::String(state.to_owned());
+                params["inputResponses"] =
+                    serde_json::json!({"roots": router_roots_response_wire()});
+                params
+            };
+            let first_retry = JsonRpcRequest::new(
+                method,
+                Some(retry_params(first["requestState"].as_str().unwrap())),
+                (initial_id + 1) as i64,
+            );
+            let second = dispatch(&first_retry, initial_id + 1)
+                .expect("a completed input map may start its second bounded handler round");
+            assert_eq!(second["resultType"], "input_required");
+            assert_ne!(first["requestState"], second["requestState"]);
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(router.mrtr_exchanges.active_len(), 1);
+
+            let second_retry = JsonRpcRequest::new(
+                method,
+                Some(retry_params(second["requestState"].as_str().unwrap())),
+                (initial_id + 2) as i64,
+            );
+            let error = dispatch(&second_retry, initial_id + 2)
+                .expect_err("completing an input map cannot reset the logical exchange limit");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "MRTR exchange limit reached");
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(router.mrtr_exchanges.active_len(), 0);
+
+            let replay =
+                JsonRpcRequest::new(method, second_retry.params.clone(), (initial_id + 3) as i64);
+            assert_eq!(
+                dispatch(&replay, initial_id + 3)
+                    .expect_err("a refused successor does not restore its consumed predecessor")
+                    .code,
+                McpErrorCode::InvalidParams,
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            assert_eq!(router.mrtr_exchanges.active_len(), 0);
+        }
     }
 
     #[test]

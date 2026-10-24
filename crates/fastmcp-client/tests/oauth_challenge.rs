@@ -286,6 +286,8 @@ impl Peer {
         .unwrap()
         .with_extra_root_certificate(root())
         .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap()
     }
     async fn request(&self, expected_start: &str) -> (TlsStream<TcpStream>, Value, Vec<u8>) {
         let (socket, _) = self.listener.accept().await.unwrap();
@@ -684,13 +686,13 @@ fn run(case: Case) {
                     .await;
                     match case {
                         Case::Ambiguous => {
-                            assert!(matches!(result, Err(Error::AmbiguousBearerChallenge)))
+                            assert!(matches!(result, Err(Error::AmbiguousBearerChallenge)));
                         }
                         Case::DuplicateHint => {
-                            assert!(matches!(result, Err(Error::AmbiguousMetadataLocation)))
+                            assert!(matches!(result, Err(Error::AmbiguousMetadataLocation)));
                         }
                         Case::BodyOnly => {
-                            assert!(matches!(result, Err(Error::MissingBearerChallenge)))
+                            assert!(matches!(result, Err(Error::MissingBearerChallenge)));
                         }
                         _ => assert!(matches!(
                             result,

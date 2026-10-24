@@ -598,7 +598,7 @@ async fn lose(
         );
         assert!(pending.is_recovery_pending());
     };
-    let (reply, ()) = pair(peer.dispatch(cx, delivery), application).await;
+    let (reply, ()) = Box::pin(pair(peer.dispatch(cx, delivery), application)).await;
     peer.quiet();
     reply
 }
@@ -736,7 +736,7 @@ async fn scenario(cx: Cx, case: Case) {
         2,
     )
     .unwrap();
-    let (initial, operation) = pair(
+    let (initial, operation) = Box::pin(pair(
         peer.dispatch(&cx, Delivery::Complete),
         session.start_core_interaction_with_cancellation(
             &cx,
@@ -745,7 +745,7 @@ async fn scenario(cx: Cx, case: Case) {
             RequestId::Number(1),
             limits,
         ),
-    )
+    ))
     .await;
     let mut operation: ManagedInteraction = operation.unwrap();
     assert!(matches!(
@@ -804,11 +804,11 @@ async fn scenario(cx: Cx, case: Case) {
             drop(read);
             assert!(pending.is_recovery_pending());
         };
-        pair(peer.dispatch(&cx, Delivery::StallBody), application)
+        Box::pin(pair(peer.dispatch(&cx, Delivery::StallBody), application))
             .await
             .0
     } else {
-        lose(
+        Box::pin(lose(
             &peer,
             &cx,
             &mut pending,
@@ -819,7 +819,7 @@ async fn scenario(cx: Cx, case: Case) {
                 Delivery::LoseHead
             },
             false,
-        )
+        ))
         .await
     };
     assert!(
@@ -861,7 +861,8 @@ async fn scenario(cx: Cx, case: Case) {
             peer.quiet();
         }
         Case::Attempts => {
-            let second = lose(&peer, &cx, &mut pending, 3, Delivery::LoseHead, true).await;
+            let second =
+                Box::pin(lose(&peer, &cx, &mut pending, 3, Delivery::LoseHead, true)).await;
             assert_eq!(second["result"], lost["result"]);
             assert!(matches!(
                 pending.recover(&cx, RequestId::Number(4)).await,
@@ -871,11 +872,12 @@ async fn scenario(cx: Cx, case: Case) {
             peer.quiet();
         }
         _ => {
-            let (replayed, result) = pair(peer.dispatch(&cx, Delivery::Complete), async {
-                pending.recover(&cx, RequestId::Number(3)).await.unwrap();
-                pending.next_event(&cx).await
-            })
-            .await;
+            let (replayed, result) =
+                Box::pin(pair(peer.dispatch(&cx, Delivery::Complete), async {
+                    pending.recover(&cx, RequestId::Number(3)).await.unwrap();
+                    pending.next_event(&cx).await
+                }))
+                .await;
             assert_eq!(replayed["id"], 3);
             if matches!(case, Case::NoJournal) {
                 assert!(replayed.get("error").is_some());
@@ -905,11 +907,12 @@ async fn scenario(cx: Cx, case: Case) {
                             contract,
                         )
                         .unwrap();
-                    let (final_wire, event) = pair(peer.dispatch(&cx, Delivery::Complete), async {
-                        pending.send(&cx, RequestId::Number(4)).await.unwrap();
-                        pending.next_event(&cx).await.unwrap()
-                    })
-                    .await;
+                    let (final_wire, event) =
+                        Box::pin(pair(peer.dispatch(&cx, Delivery::Complete), async {
+                            pending.send(&cx, RequestId::Number(4)).await.unwrap();
+                            pending.next_event(&cx).await.unwrap()
+                        }))
+                        .await;
                     assert!(matches!(event, ManagedInteractionEvent::Complete(_)));
                     assert_eq!(pending.into_interaction().unwrap().continuation_count(), 2);
                     assert_eq!(

@@ -35,10 +35,10 @@ where
                         )
                         .await;
                         let client = client.unwrap();
-                        let ((), token) = pair(
+                        let ((), token) = Box::pin(pair(
                             post_grant(&peer, "service-client", "service-secret", TOKEN, 300),
                             client.credential(&cx),
-                        )
+                        ))
                         .await;
                         assert_eq!(token.unwrap().generation(), 1);
                         client
@@ -46,7 +46,7 @@ where
                         let ((), client) =
                             pair(peer.metadata(Case::Complete), plan.discover(&cx)).await;
                         let client = client.unwrap();
-                        acquire(&peer, &cx, &client, TOKEN, 300).await;
+                        Box::pin(acquire(&peer, &cx, &client, TOKEN, 300)).await;
                         client
                     };
                     scenario(cx, peer, client).await;

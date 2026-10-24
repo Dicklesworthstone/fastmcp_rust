@@ -347,8 +347,8 @@ done
     )
 }
 
-/// Human and machine output of one command share these display guarantees:
-/// no raw control, bidi override, injected line, or credential reaches it.
+/// Terminal-rendered output must not contain raw controls, bidi overrides,
+/// injected lines, or credentials. Exact inspect JSON is checked separately.
 fn assert_display_safe(captured: &Captured) {
     for (stream, text) in [("stdout", captured.stdout()), ("stderr", captured.stderr())] {
         assert!(!text.contains('\u{1b}'), "raw ESC on {stream}: {text:?}");
@@ -424,7 +424,7 @@ fn cli_core_01_b_positive() {
     let binary = shipped_no_legacy_fastmcp();
 
     // Machine inspect: one schema-stable document, ModernOnly observables,
-    // discovery as the first wire action, sanitized and redacted peer text.
+    // discovery as the first wire action, exact strings and explicit redaction.
     let subject = Subject::new(Peer::Serving);
     let [(_, inspect_args), _] = machine_commands(&subject, "modern-only");
     let inspect = run_captured(binary, &inspect_args);
@@ -438,10 +438,41 @@ fn cli_core_01_b_positive() {
         report["protocol"],
         json!({"era": "modern-2026", "policy": "modern-only", "version": "2026-07-28"})
     );
+    assert_eq!(report["schema"], json!("fastmcp.cli.inspect/v1"));
+    assert_eq!(
+        report["server"]["name"],
+        json!(format!(
+            "{}\u{1b}[31m\u{202e}\n{INJECTED_LINE}",
+            subject.name
+        ))
+    );
     assert_eq!(report["tools"][0]["name"], json!(subject.name));
-    assert_eq!(report["sanitized"], json!(true), "{report}");
+    assert_eq!(report["tools"][0]["inputSchema"], json!({"type": "object"}));
+    assert_eq!(
+        report["tools"][0]["inputSchemaStatus"]["complete"],
+        json!(true)
+    );
+    assert_eq!(report["sanitized"], json!(false), "{report}");
     assert_eq!(report["redacted"], json!(true), "{report}");
-    assert_display_safe(&inspect);
+    // JSON escaping preserves controls in the decoded value without placing
+    // raw ESC or a peer-injected physical line in the machine document.
+    for text in [inspect.stdout(), inspect.stderr()] {
+        assert!(!text.contains('\u{1b}'), "raw ESC: {text:?}");
+        assert!(
+            !text.contains(SECRET),
+            "credential reached output: {text:?}"
+        );
+        assert!(
+            !text.contains("\"jsonrpc\""),
+            "protocol frame leaked: {text:?}"
+        );
+        assert!(
+            !text
+                .lines()
+                .any(|line| line.trim_start().starts_with(INJECTED_LINE))
+        );
+    }
+    assert!(!inspect.stderr().contains('\u{202e}'));
     assert_eq!(subject.first_request()["method"], json!("server/discover"));
     subject.assert_peer_gone();
 

@@ -39,9 +39,9 @@ use crate::proxy::ProxyFinalCatalog;
 use crate::proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
 use crate::proxy::{
-    ProxyCompletionHandler, ProxyPromptCatalog, ProxyPromptHandler, ProxyResourceCatalog,
-    ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyToolHandler,
-    ProxyTypedCatalog,
+    ProxyCatalogRelay, ProxyCompletionHandler, ProxyPromptCatalog, ProxyPromptHandler,
+    ProxyResourceCatalog, ProxyResourceHandler, ProxyResourceTemplateCatalog, ProxyToolCatalog,
+    ProxyToolHandler, ProxyTypedCatalog,
 };
 #[cfg(all(test, feature = "tasks"))]
 use crate::tasks::SharedTaskManager;
@@ -299,6 +299,9 @@ pub struct ServerBuilder {
     /// cannot disambiguate two independent upstream task-ID namespaces.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
+    /// Core subscription routes are available without the Tasks extension.
+    #[cfg(feature = "proxy")]
+    catalog_relay: Option<Arc<ProxyCatalogRelay>>,
     /// Registrations refused so far. A nonempty list fails the build.
     refused_registrations: Vec<RefusedRegistration>,
 }
@@ -425,6 +428,8 @@ impl ServerBuilder {
             max_concurrent_task_handoffs: DEFAULT_CONCURRENT_TASK_HANDOFFS,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay: None,
+            #[cfg(feature = "proxy")]
+            catalog_relay: None,
             refused_registrations: Vec::new(),
         }
     }
@@ -1336,6 +1341,43 @@ impl ServerBuilder {
         }
     }
 
+    #[cfg(feature = "proxy")]
+    fn install_proxy_catalog_relay(
+        &mut self,
+        relay: Option<Arc<ProxyCatalogRelay>>,
+    ) -> fastmcp_core::McpResult<()> {
+        if let Some(relay) = relay {
+            self.catalog_relay = Some(match self.catalog_relay.as_ref() {
+                Some(existing) => Arc::new(existing.merge(&relay)?),
+                None => relay,
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "proxy")]
+    fn install_mounted_catalog_relay(
+        &mut self,
+        relay: Option<Arc<ProxyCatalogRelay>>,
+        result: &crate::MountResult,
+        resource_prefix: Option<&str>,
+        mount_prefix: Option<&str>,
+    ) {
+        if result.is_success()
+            && let Some(relay) = relay
+        {
+            let relay = relay.mounted(
+                result.tools > 0,
+                result.resources > 0 || result.resource_templates > 0,
+                result.prompts > 0,
+                resource_prefix,
+            );
+            if let Err(error) = self.install_proxy_catalog_relay(Some(Arc::new(relay))) {
+                self.refuse_mount(mount_prefix, error.to_string());
+            }
+        }
+    }
+
     /// Installs modern Tasks discovery and dispatch once, then adds later
     /// upstream routes to that broker. Exact-2024 supplies no Tasks relay.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -1384,6 +1426,7 @@ impl ServerBuilder {
     ) -> fastmcp_core::McpResult<Self> {
         client.admit_catalog(&catalog)?;
         let catalog_era = catalog.era()?;
+        self.install_proxy_catalog_relay(client.catalog_relay(&catalog)?)?;
         let completion_supported = match client.supports_completion() {
             Ok(supported) => supported,
             Err(error) => {
@@ -1786,6 +1829,7 @@ impl ServerBuilder {
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
         self.adopt_upstream_proxy_implementation(&proxy_client)?;
+        self.install_proxy_catalog_relay(proxy_client.typed_catalog_relay(&catalog)?)?;
         let completion_supported = proxy_client.supports_completion()?;
         #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
@@ -2138,6 +2182,7 @@ impl ServerBuilder {
         proxy_client.admit_typed_catalog(&catalog)?;
         self.adopt_upstream_proxy_instructions(&proxy_client)?;
         self.adopt_upstream_proxy_implementation(&proxy_client)?;
+        self.install_proxy_catalog_relay(proxy_client.typed_catalog_relay(&catalog)?)?;
         #[cfg(feature = "tasks")]
         let catalog_era = catalog.era()?;
         #[cfg(not(feature = "tasks"))]
@@ -2369,10 +2414,15 @@ impl ServerBuilder {
         let has_resources = server.has_resources();
         let has_prompts = server.has_prompts();
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result = self
             .router
             .mount_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, prefix, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2420,10 +2470,15 @@ impl ServerBuilder {
         let has_resources = server.has_resources();
         let has_prompts = server.has_prompts();
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_namespaced_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, None, prefix);
 
         for warning in &result.warnings {
             log::warn!(target: "fastmcp_rust::mount", "{}", warning);
@@ -2476,10 +2531,15 @@ impl ServerBuilder {
             return self;
         }
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_tools_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, None, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2526,10 +2586,15 @@ impl ServerBuilder {
             return self;
         }
 
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_resources_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, prefix, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2572,10 +2637,15 @@ impl ServerBuilder {
     /// Duplicate handling follows [`on_duplicate`](Self::on_duplicate).
     #[must_use]
     pub fn mount_prompts(mut self, server: crate::Server, prefix: Option<&str>) -> Self {
+        #[cfg(feature = "proxy")]
+        let catalog_relay = server.catalog_relay.clone();
         let source_router = server.into_router();
         let result =
             self.router
                 .mount_prompts_with_behavior(source_router, prefix, self.on_duplicate);
+
+        #[cfg(feature = "proxy")]
+        self.install_mounted_catalog_relay(catalog_relay, &result, None, prefix);
 
         // Log warnings if any
         for warning in &result.warnings {
@@ -2964,6 +3034,8 @@ impl ServerBuilder {
             self.console_config.should_use_rich(),
         );
         let final_subscriptions = Arc::new(FinalSubscriptionRegistry::default());
+        #[cfg(feature = "proxy")]
+        let catalog_relay = self.catalog_relay.clone();
         #[cfg(feature = "tasks")]
         let final_task_runtime = self.final_task_runtime.clone();
         #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -3077,6 +3149,8 @@ impl ServerBuilder {
             task_service_host,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             final_task_relay,
+            #[cfg(feature = "proxy")]
+            catalog_relay,
             final_subscriptions,
         }
     }
@@ -6419,7 +6493,11 @@ mod tests {
                 706,
                 JsonRpcRequest::new("tools/call", Some(missing_capability), 706_i64),
             );
-            assert!(rejected.error.is_some());
+            assert!(
+                rejected.error.is_some(),
+                "the capability-stripped tools/call must be refused; it was admitted with result: {:?}",
+                rejected.result
+            );
             assert_eq!(
                 calls
                     .lock()
@@ -6727,9 +6805,18 @@ mod tests {
                 &notification_sender,
                 &request_sender,
             ))
-            .expect("the public exact-2024 completion path returns a response")
-            .result
-            .expect("the exact-2024 completion response has a result payload");
+            .expect("the public exact-2024 completion path returns a response");
+            // Report the error instead of discarding it. `.result.expect(..)`
+            // panics with only its own message when the dispatch answered with
+            // an error, which is exactly the case that needs diagnosing and
+            // the one case where the cause is already in hand.
+            let legacy = match legacy.result {
+                Some(result) => result,
+                None => panic!(
+                    "the exact-2024 completion response has a result payload, got error: {:?}",
+                    legacy.error
+                ),
+            };
             assert_eq!(
                 legacy["completion"]["values"],
                 serde_json::json!(["legacy-staging"])
@@ -7063,9 +7150,16 @@ mod tests {
             let completion = fastmcp_core::block_on(
                 server.dispatch_stateless(&completion_inbound, &final_completion_request(830)),
             )
-            .expect("the replaced target forwards through the public final completion route")
-            .result
-            .expect("the replaced target completion has a result payload");
+            .expect("the replaced target forwards through the public final completion route");
+            // Same reason as the exact-2024 site above: surface the error
+            // rather than panicking with a message that cannot name the cause.
+            let completion = match completion.result {
+                Some(result) => result,
+                None => panic!(
+                    "the replaced target completion has a result payload, got error: {:?}",
+                    completion.error
+                ),
+            };
             assert_eq!(
                 completion["completion"]["values"],
                 serde_json::json!(["final-staging"])
@@ -7412,7 +7506,7 @@ mod tests {
         }
 
         #[test]
-        fn public_legacy_and_stateless_ping_answer_empty_object_without_entering_the_final_request_union()
+        fn public_legacy_ping_is_served_while_the_removed_modern_ping_is_refused_outside_the_final_request_union()
          {
             let server = ServerBuilder::new("srv", "1.0").build();
             let mut legacy_session =
@@ -7468,7 +7562,12 @@ mod tests {
                 &request_sender,
             ))
             .expect("the exact-2024 public dispatch path responds to ping");
-            assert_eq!(legacy.result, Some(serde_json::json!({})));
+            assert_eq!(
+                legacy.result,
+                Some(serde_json::json!({})),
+                "the exact-2024 ping answers an empty object; error was {:?}",
+                legacy.error
+            );
             assert!(legacy.error.is_none());
 
             let inbound = crate::InboundRequestContext::new(
@@ -7476,10 +7575,32 @@ mod tests {
                 714,
                 crate::InboundRequestTransport::Memory,
             );
-            let answered = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &final_ping))
-                .expect("stateless modern ping is a connection health-check");
-            assert_eq!(answered.result, Some(serde_json::json!({})));
-            assert!(answered.error.is_none());
+            // This half used to assert that the modern-marked ping ALSO
+            // answers an empty object, which contradicted the two assertions
+            // at the end of this same test: `ping` must stay outside
+            // `FINAL_2026_07_28_METHODS`, and `CoreRequest::decode` must
+            // refuse it for `Modern2026` as an unsupported method. The frozen
+            // plan settles it in the same direction -- its protocol
+            // comparison table reads `| Ping | Removed | Present |
+            // Legacy-only |` and the text twice calls core ping "the removed
+            // MCP core method" -- so the removal is the contract and the
+            // empty-object expectation was the stale side. The row is
+            // inverted rather than dropped, which keeps this test's real
+            // subject intact: the two eras disagree about one method while
+            // sharing a server, and the legacy half above still proves the
+            // served direction.
+            let refused = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &final_ping))
+                .expect("a ping carrying an id must produce a JSON-RPC response");
+            let refusal = refused
+                .error
+                .as_ref()
+                .unwrap_or_else(|| panic!("the modern era removed ping: {refused:?}"));
+            assert_eq!(
+                refusal.code,
+                fastmcp_protocol::JsonInteger::from(-32601),
+                "a modern ping is an unknown method, not a health-check: {refusal:?}"
+            );
+            assert!(refused.result.is_none());
             assert_eq!(
                 legacy_session.state().len(),
                 state_before,

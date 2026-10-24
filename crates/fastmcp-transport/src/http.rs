@@ -2864,11 +2864,18 @@ fn is_loopback_origin(origin: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
-/// Request-admission Origin policy: an explicitly allowed CORS origin or a
-/// loopback origin. CORS *response* headers stay restricted to the explicit
-/// allowlist ([`is_origin_allowed`]).
+/// Request-admission Origin policy.
+///
+/// An explicit `cors_origins` list is an operator boundary, not merely a CORS
+/// response-header hint: once nonempty, only an exact listed origin is admitted
+/// and `allow_cors` must also be enabled. With no explicit list, loopback
+/// origins retain the local-development convenience default. CORS *response*
+/// headers remain restricted to the explicit allowlist ([`is_origin_allowed`]).
 fn is_origin_admitted(config: &HttpHandlerConfig, origin: &str) -> bool {
-    is_loopback_origin(origin) || is_origin_allowed(config, origin)
+    if !config.cors_origins.is_empty() {
+        return is_origin_allowed(config, origin);
+    }
+    is_loopback_origin(origin)
 }
 
 fn validate_mcp_request_policy(
@@ -10156,6 +10163,28 @@ Content-Length: {}\r\n\
         assert!(configured.admits_origin("https://trusted.example"));
         assert!(is_origin_allowed(&configured, "https://trusted.example"));
         assert!(!configured.admits_origin("https://untrusted.example"));
+        assert!(
+            !configured.admits_origin("http://localhost:6274"),
+            "an explicit allowlist disables the implicit loopback exception"
+        );
+
+        let explicit_loopback = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["http://localhost:6274".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        assert!(explicit_loopback.admits_origin("http://localhost:6274"));
+        assert!(is_origin_allowed(
+            &explicit_loopback,
+            "http://localhost:6274"
+        ));
+
+        let listed_but_cors_disabled = HttpHandlerConfig {
+            allow_cors: false,
+            cors_origins: vec!["http://localhost:6274".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        assert!(!listed_but_cors_disabled.admits_origin("http://localhost:6274"));
     }
 
     #[test]

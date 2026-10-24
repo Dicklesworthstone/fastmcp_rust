@@ -403,7 +403,7 @@ impl ManagedTaskCancelHandle {
                         }
                     };
                     if !matches!(
-                        call.next_event(cx).await?,
+                        call.next_terminal(cx).await?,
                         Some(ManagedTaskEvent::Cancelled(_))
                     ) {
                         return Err(ManagedTasksError::InvalidResponse);

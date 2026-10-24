@@ -35,10 +35,10 @@ fn controls(status: &str, sequence: u8) -> Value {
         "ttlMs":null, "statusMessage":"PRIVATE-STATUS"});
     match status {
         "input_required" => {
-            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}})
+            value["inputRequests"] = json!({"PRIVATE-INPUT":{"method":"roots/list"}});
         }
         "completed" => {
-            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]})
+            value["result"] = json!({"content":[{"type":"text","text":"PRIVATE-RESULT"}]});
         }
         _ => {}
     }

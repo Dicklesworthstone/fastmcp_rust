@@ -134,6 +134,23 @@
 //! # let _ = block_on(async {});
 //! ```
 //!
+//! The crate ROOT omits the implementation module too. This spelling is listed
+//! because the four above did not cover it and it is the one that regressed:
+//! `f6a57876` forwarded `fastmcp_core::runtime` at the root to make
+//! `CredentialIoLane::new` callable, which published the bridge through a path
+//! no case here denied. The identity types that forward needed are now named
+//! individually at the root, so the module itself is gone again:
+//!
+//! ```compile_fail
+//! use fastmcp_rust::runtime::block_on;
+//! # let _ = block_on(async {});
+//! ```
+//!
+//! ```compile_fail
+//! use fastmcp_rust::runtime::poll_on_cx;
+//! # let _ = poll_on_cx;
+//! ```
+//!
 //! The doc-hidden macro support route is also deliberately curated. It is not
 //! a runtime construction API for downstream consumers:
 //!
@@ -182,9 +199,20 @@ pub mod __private {
     /// surfaces.
     pub mod server {
         pub use fastmcp_server::bidirectional;
+        // All three `promote_legacy_*` helpers belong here because all three
+        // handler macros expand to one. Only the tool helper was listed, and
+        // the omission could not surface inside this workspace: Cargo gives an
+        // integration target the package's own `[dependencies]`, and
+        // `fastmcp-server` is one, so a facade test resolves the missing names
+        // through the dependency and compiles. A consumer whose only
+        // dependency is `fastmcp-rust` has no `fastmcp_server` in its extern
+        // prelude, so `#[prompt]` and `#[resource]` failed to expand for the
+        // one audience this module exists to serve. Same structural blind spot
+        // that `tests/public_reexport_closure.rs` was written for.
         pub use fastmcp_server::{
             BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, FinalToolOutcome,
             PromptHandler, ResourceHandler, ToolErrorKind, ToolExecutionMode, ToolHandler,
+            promote_legacy_prompt_messages, promote_legacy_resource_contents,
             promote_legacy_tool_content,
         };
     }
@@ -258,7 +286,7 @@ pub mod client {
         ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+        CollectedCatalog, CompletionContext, CompletionParams, CompletionReference,
         DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason,
         ExecutionTerminalRecord, ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert,
         FinalCacheKey, FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
@@ -507,6 +535,41 @@ pub use fastmcp_core::{crypto, uri};
 // Re-export logging module
 pub use fastmcp_core::logging;
 
+// `partition` and `runtime` are forwarded because this facade ALREADY forwards
+// `fastmcp_client::http_auth`, and public signatures inside that tree demand
+// types declared in these two modules:
+//   `http_auth::oauth::persistence::OAuthRefreshStore::open` takes
+//     `&CredentialStoreKey` (and `CredentialStoreKey::derive` in turn needs
+//     `PartitionDescriptor` and returns `SealedAdmissionKeyError`),
+//   `http_auth::managed::tasks::watch::checkpoint::resume` takes
+//     `&DurableOwnerKey`, and
+//   `http_auth::secure_file::slot::coordinator::asynchronous::CredentialIoLane::new`
+//     takes `&ProcessGenerationGuard`.
+// Every one of those is obtainable ONLY through an associated function
+// (`derive`, `install`), never returned by a reachable method, so a caller has
+// to be able to WRITE the name. Without this a consumer could reach those
+// constructors through the facade but not call them without adding a direct
+// dependency on `fastmcp-core` — the same defect `PartitionAuthorization`
+// already had, fixed one parameter at a time until this closed the family.
+//
+// `partition` is forwarded as a module; the process-generation types are
+// forwarded BY NAME. `f6a57876` forwarded `runtime` as a module too, by
+// analogy with the `{combinator, crypto, limits, logging, uri}` forward above,
+// and that analogy does not hold: FND-01's facade route pattern carries
+// `forbid=runtime|block_on|...` as literal text, the sibling mutant test
+// rejects `pub use fastmcp_core::runtime;` by name, and the verifier resolves
+// every `fastmcp_core::runtime::X` to the member `runtime`, so no path through
+// that module can satisfy the rule. Forwarding the module also published
+// `block_on`, `poll_on_cx` and `enter_blocking_lane` — the blocking runtime
+// bridge the curated `core` namespace above exists to withhold, in a project
+// whose contract is that the consumer owns the runtime. These seven names are
+// the identity half and carry no runtime authority.
+pub use fastmcp_core::partition;
+pub use fastmcp_core::{
+    ExternalEpoch, ProcessBoundToken, ProcessGeneration, ProcessGenerationError,
+    ProcessGenerationGuard, SNAPSHOT_CLONE_IS_DETECTABLE, SnapshotCloneStance,
+};
+
 // Re-export protocol types shared by both eras. Exact legacy initialization
 // types live in `legacy_2024`; modern discovery types live in `modern`.
 pub use fastmcp_protocol::{
@@ -536,7 +599,8 @@ pub use fastmcp_protocol::{
     McpAppsInitializeParams, McpAppsInitializeResult, McpAppsListParams,
     McpAppsLogMessageNotification, McpAppsMessageParams, McpAppsMessageRole, McpAppsOpenLinkParams,
     McpAppsOperationResult, McpAppsPingParams, McpAppsProgressNotification,
-    McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsSandboxSignal,
+    McpAppsResourceReadParams, McpAppsResourceTeardownParams, McpAppsRoutedMethod,
+    McpAppsSamplingCapability, McpAppsSamplingParams, McpAppsSamplingResult, McpAppsSandboxSignal,
     McpAppsToolCallParams, McpAppsUpdateModelContextParams, McpAppsViewCapabilities,
     McpAppsViewNotification, McpAppsViewRequest, McpAppsViewResponse, McpAppsViewToHost,
 };
@@ -577,10 +641,10 @@ pub use fastmcp_protocol::{
     CacheScope, CacheTtl, CacheTtlConversionError, CacheableResult, CancellationSender,
     CancellationWireCodecError, CancellationWireMessage, ClientNotification, CompleteResult,
     CompleteResultPayload, CoreDispatchError, CoreRequest, CoreResult,
-    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonMember, ExactJsonObject, ExactJsonValue,
-    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY,
-    FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY, FinalArguments,
-    FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
+    CoreResultDiscriminatorPolicy, DecodedResult, ElicitRequestParams, ElicitResult,
+    ExactJsonMember, ExactJsonObject, ExactJsonValue, FINAL_CLIENT_CAPABILITIES_META_KEY,
+    FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION_META_KEY, FINAL_SERVER_INFO_META_KEY,
+    FinalArguments, FinalCallToolParams, FinalCallToolResult, FinalCancelledNotificationParams,
     FinalCompletionArgument, FinalCompletionContext, FinalCompletionParams,
     FinalCompletionReference, FinalCompletionResult, FinalCompletionValues, FinalCoreRequest,
     FinalCoreResult, FinalCreateMessageInputRequiredResult, FinalCreateMessageParams,
@@ -784,8 +848,46 @@ pub use fastmcp_transport::websocket::{
 };
 pub use fastmcp_transport::{event_store, http, memory};
 
+/// Caller-owned, reactor-driven Unix process stdio for `serve_stdio_io`.
+///
+/// `serve_stdio_io` requires endpoints that are *already* nonblocking.
+/// `AsyncStdin` and `AsyncStdout`, re-exported above, satisfy its `AsyncRead`
+/// and `AsyncWrite` bounds but perform blocking I/O internally, so passing
+/// them compiles and then blocks the serving runtime. These are the pair that
+/// does not: `NativePipeReader::from_stdin` and `NativePipeWriter::from_stdout`
+/// register with the caller's reactor and observe its cancellation and
+/// deadline, with no helper thread and no blocking pool.
+///
+/// Bind them to the same `Cx` that serves the transport. A pipe whose own
+/// context is cancelled or past its deadline reports a cooperative stop on
+/// every poll, which the transport now ends with a diagnostic rather than
+/// retrying without bound.
+///
+/// `crates/fastmcp-server/examples/native_stdio.rs` is the worked example.
+#[cfg(unix)]
+pub use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pipe};
+
 // Re-export server types
-// FND-01: JWT verifier is not a facade feature (FACADE-NO-JSONWEBTOKEN).
+//
+// FND-01 scope, stated exactly, because the previous one-line gloss here read
+// as a blanket ban and was the reason the shipped resource verifiers stayed
+// unreachable for a consumer. What the policy actually forbids, by its own
+// implemented rules rather than by prose:
+//   FACADE-NO-JSONWEBTOKEN   the external token crate, absent from every
+//                            dependency table of this manifest
+//   FACADE-NO-JWT-FEATURE    a [features] key named exactly `jwt`, and any
+//                            forwarding component equal to `jwt` after
+//                            splitting on `/`, `:` and `?`
+//   NO-JWT-ENCODING-KEY      local signing keys, zero `ident` matches in
+//                            crates/**/*.rs
+//   NO-JWT-VERIFIER-SURFACE  the removed verifier type's own identifier, zero
+//                            matches; the shipped type is deliberately named
+//                            differently
+// So the removed surface is the externally-backed, locally-SIGNING one. The
+// `jwt-resource-auth` feature is verification-only over in-workspace JOSE, is
+// what `fastmcp-server` and `fastmcp-cli` have both carried since 2026-10-14,
+// and trips none of those four rules. `providers` below re-exports its types
+// unconditionally, so the feature equation in Cargo.toml is the whole wiring.
 pub use fastmcp_server::{
     AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
     BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
@@ -811,20 +913,44 @@ pub use fastmcp_server::{
 #[cfg(feature = "tasks")]
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
+    FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
+    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
     InMemoryFinalTaskStore,
 };
 
 /// Proxy APIs are available only with the proxy profile.
+///
+/// `ProxyLegacyPeerNotifications` is listed because `ProxyBackend` above is a
+/// trait an external backend implements, and this is the return type of its
+/// defaulted `take_legacy_peer_notifications`. Its three fields are public and
+/// their types are `LoggingLevel` (already at this root), `serde_json::Value`
+/// and `ProgressParams`, so a backend can now both name and build one.
+///
+/// `ProgressParams` is re-exported here rather than left alone because it was
+/// reachable ONLY through `legacy_2024`, which is gated on
+/// `feature = "legacy-2024-11-05"`. A consumer enabling `proxy` alone could
+/// therefore name `ProxyLegacyPeerNotifications` and never construct it: a gap
+/// that CROSSES profiles, where the API of one feature demands a type only a
+/// different feature publishes. A static name check cannot see this and did
+/// not; `cargo check` on the consumer-position test did, with
+/// `error[E0432]: unresolved import fastmcp_rust::ProgressParams`. Gating it on
+/// `proxy` keeps it available exactly where the API that demands it is.
+///
+/// The two other types in `ProxyBackend`'s signatures stay unexported on purpose:
+/// `PreparedIncrementalHttpListen` has no public constructor and its own doc
+/// says stdio backends return `None`, so it is a sealed witness rather than a
+/// closure gap.
+#[cfg(feature = "proxy")]
+pub use fastmcp_protocol::ProgressParams;
 #[cfg(feature = "proxy")]
 pub use fastmcp_server::{
     FinalProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog, ProxyCatalogCacheHint,
-    ProxyClient, ProxyFinalCatalog, ProxyPromptCatalog, ProxyResourceCatalog,
-    ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog, ProxyUpstreamAdapter,
-    ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
+    ProxyClient, ProxyFinalCatalog, ProxyLegacyPeerNotifications, ProxyPromptCatalog,
+    ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog, ProxyTypedCatalog,
+    ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
 
 /// Final Tasks proxy-listener APIs require both extensions.
@@ -864,7 +990,36 @@ pub use fastmcp_server::providers;
 pub use fastmcp_server::rate_limiting::{
     RateLimitingMiddleware, SlidingWindowRateLimitingMiddleware,
 };
+
+// The SERVER half of the client's continuation-replay contract, which this
+// facade was already shipping without it.
+//
+// `http_auth::rpc::interaction::recovery::ContinuationReplayContract` is
+// reachable here, because `http_auth` is forwarded below as a module and the
+// chain to it is public the whole way. Its own doc states the dependency: "The
+// native server's `ContinuationReplayMiddleware` supplies that contract when
+// correctly placed around native MRTR dispatch", and it warns that
+// "misconfiguration can repeat remote effects. No wire flag or idempotent
+// annotation is accepted as a substitute." So a facade-only consumer could
+// DECLARE a trusted replay deployment and had no way to build the journal that
+// makes the declaration true, even though `fastmcp-server` has re-exported
+// these three at its own root all along. Every other middleware family here --
+// caching, both rate limiters, transforms -- was already forwarded; this one
+// was the only omission.
+//
+// Three names are the whole closure. Both constructors take `&Cx`,
+// `&ProcessGenerationGuard`, `SnapshotCloneStance`, `ContinuationReplayLimits`
+// and an authorize closure over `McpContext`/`JsonRpcRequest`; the authority
+// takes `ContinuationPartitionKey` (reached through the forwarded `partition`
+// module), `PartitionAuthorization` (through `http_auth`) and
+// `McpRequestCancellation`. All of those were already nameable EXCEPT the two
+// runtime identity types, which only became reachable without tripping
+// FND-01's `forbid=runtime` rule in the repair that removed the whole-module
+// forward. Until then this gap was blocked twice over.
 pub use fastmcp_server::transform::{ArgTransform, TransformedTool, TransformedToolBuilder};
+pub use fastmcp_server::{
+    ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
+};
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
 // Re-export client types
@@ -873,7 +1028,7 @@ pub use fastmcp_client::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
     ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
     ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-    CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference,
+    CollectedCatalog, CompletionContext, CompletionParams, CompletionReference,
     DEFAULT_FINAL_CACHE_CAPACITY, DEFAULT_FINAL_CACHE_MAX_BYTES, ExecutionTerminalReason,
     ExecutionTerminalRecord, ExecutionTerminalState, FinalCacheGeneration, FinalCacheInsert,
     FinalCacheKey, FinalCacheLookup, FinalCacheMiss, FinalCacheResultSet, FinalCacheStats,
@@ -907,6 +1062,28 @@ pub use fastmcp_client::{
     McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
     mcp_apps_in_memory_wire_pair,
 };
+// `mcp_apps_bridge` is forwarded because the list immediately above already
+// hands consumers two traits an embedder IMPLEMENTS -- `McpAppsWireHostPolicy`
+// and `McpAppsWireHostEffects` -- plus `McpAppsHostRequestOutcome`, while the
+// types their signatures demand are declared only here:
+//   `McpAppsWireHostPolicy::initialize` takes `&McpAppsPinnedInitializeParams`
+//     and returns `McpAppsPinnedInitializeResult`,
+//   `::progress` takes `&McpAppsProgressControlParams`,
+//   `::cancelled` takes `&McpAppsCancelledControlParams`,
+//   both of those take `&McpAppsJsonRpcRequestId`, as do the identical pair on
+//     `McpAppsWireHostEffects`, and
+//   `McpAppsHostRequestOutcome::PeerError` carries `McpAppsJsonRpcError`.
+// A trait impl must RESTATE its parameter and return types verbatim, so the
+// exemption that covers a plain `pub fn` parameter -- "the value is obtainable
+// from an accessor" -- cannot apply here: `McpAppsJsonRpcRequestId::allocate`
+// yields a value, never the name. Every affected method is defaulted, so the
+// traits were implementable; what was unreachable was OVERRIDING the progress,
+// cancellation and initialize hooks that are the extension point's whole
+// purpose, without adding a direct dependency on `fastmcp-protocol`. Gated to
+// match the declaring module, which is `#[cfg(feature = "apps")]` at
+// crates/fastmcp-protocol/src/lib.rs:51.
+#[cfg(feature = "apps")]
+pub use fastmcp_protocol::mcp_apps_bridge;
 
 /// Exact-2024 HTTP request staging is available only with its adapter profile.
 #[cfg(feature = "legacy-2024-11-05")]
@@ -963,7 +1140,7 @@ pub mod auto {
         Client, ClientHttpConnection, ClientHttpConnectionError, ClientHttpNegotiation,
         ClientHttpNegotiationDecision, ClientHttpNegotiationError, ClientHttpNegotiationState,
         ClientHttpResponse, ClientProtocolPlan, ClientProtocolPlanError, ClientSession,
-        CollectedHttpCatalog, CompletionContext, CompletionParams, CompletionReference, HttpClient,
+        CollectedCatalog, CompletionContext, CompletionParams, CompletionReference, HttpClient,
         HttpClientError, HttpSubscriptionListener, MAX_HTTP_EXECUTION_REQUEST_BYTES,
         MAX_HTTP_IN_FLIGHT_EXECUTIONS, MAX_HTTP_RETAINED_EXECUTION_BYTES, MrtrInputResponses,
         Request, RequestExecution, RequestExecutor, ReverseRequest, ReverseRequestCancellation,
@@ -2504,6 +2681,22 @@ pub mod auto {
             self.inner.serve_websocket(cx, addr).await
         }
 
+        /// Serves Auto-selected MCP over caller-owned asynchronous NDJSON I/O.
+        ///
+        /// The opening request selects modern or exact MCP 2024-11-05 once;
+        /// the protocol era remains fixed for the connection. Ingress, request
+        /// execution, and egress share the caller's runtime. This returning
+        /// lifecycle creates no nested runtime, thread, or detached receive pump.
+        /// The reader and writer must already be nonblocking async endpoints.
+        /// Synchronous tools require a caller-configured blocking facility.
+        pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.serve_stdio_io(cx, reader, writer).await
+        }
+
         /// Runs this Auto server over stdio on the supplied caller-owned context.
         ///
         /// The facade does not create a runtime or detach the stdio pump; the
@@ -2930,8 +3123,9 @@ pub mod modern {
         McpAppsMetadataError, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
         McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
         McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
-        McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult,
-        McpAppsToolVisibility, McpAppsViewLifecycle, project_final_core_tools_call_result,
+        McpAppsResultProjectionError, McpAppsSamplingCapability, McpAppsSamplingParams,
+        McpAppsSamplingResult, McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility,
+        McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_server::providers::McpAppsUiResource;
@@ -7218,9 +7412,11 @@ pub mod modern {
 
         /// Serves final MCP over caller-owned asynchronous NDJSON I/O.
         ///
-        /// Request execution, ingress and egress share the supplied runtime.
-        /// This returning lifecycle leaves process ownership with the caller;
-        /// the reader and writer must already be nonblocking async endpoints.
+        /// The modern protocol era is fixed before input. Ingress, request
+        /// execution, and egress share the caller's runtime. This returning
+        /// lifecycle creates no nested runtime, thread, or detached receive pump.
+        /// The reader and writer must already be nonblocking async endpoints.
+        /// Synchronous tools require a caller-configured blocking facility.
         pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
         where
             R: asupersync::io::AsyncRead + Unpin + Send + 'static,
@@ -7970,6 +8166,21 @@ pub mod legacy_2024 {
         #[must_use]
         pub const fn protocol_policy(&self) -> ProtocolPolicy {
             ProtocolPolicy::LegacyOnly
+        }
+
+        /// Serves exact MCP 2024-11-05 over caller-owned asynchronous NDJSON I/O.
+        ///
+        /// The legacy protocol era is fixed before input. Ingress, request
+        /// execution, and egress share the caller's runtime. This returning
+        /// lifecycle creates no nested runtime, thread, or detached receive pump.
+        /// The reader and writer must already be nonblocking async endpoints.
+        /// Synchronous tools require a caller-configured blocking facility.
+        pub async fn serve_stdio_io<R, W>(self, cx: &Cx, reader: R, writer: W) -> McpResult<()>
+        where
+            R: asupersync::io::AsyncRead + Unpin + Send + 'static,
+            W: asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            self.inner.serve_stdio_io(cx, reader, writer).await
         }
 
         /// Runs this exact-2024 server over stdio on the supplied caller-owned context.
@@ -10639,7 +10850,7 @@ pub mod prelude {
         ClientRoot,
         ClientSession,
         ClientTransportRecvHalf,
-        CollectedHttpCatalog,
+        CollectedCatalog,
         CompleteResult,
         CompletionContext,
         CompletionHandler,

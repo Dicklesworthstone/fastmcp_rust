@@ -1,8 +1,51 @@
 # Dependency Upgrade Log
 
-**Date:** 2026-09-15 | **Project:** fastmcp_rust | **Language:** Rust
+**Date:** 2026-10-12 | **Project:** fastmcp_rust | **Language:** Rust
 
-## Current upgrade run
+## Current upgrade run (v0.13.0 release)
+
+A currency sweep of the 30 exact direct registry pins in the root manifest and
+the nine in member manifests against the crates.io API found six behind latest
+stable. Four moved and two are held by the FND-01 dependency policy. `asupersync =0.5.0` and
+`rich_rust =0.2.3` are constellation pins and were the latest published
+versions at the sweep (asupersync 0.6.0 was not on crates.io).
+
+`evidence/fnd-01/dependency-verification.toml` binds eleven root pins by exact
+version (asupersync, flate2, getrandom, hmac, proc-macro2, ring, semver,
+serde_json, sha2, url, zeroize). `fnd_01_policy_declarations_have_not_drifted_further`
+refuses a new mismatch on any of them, and accepts a different value only for a
+key already in its `KNOWN_DRIFTS` baseline (asupersync, flate2, hmac, sha2).
+
+| Dependency | Current | Target | Status |
+|---|---|---|---|
+| sha2 | 0.11.0 | 0.11.1 | Moved. Policy-bound, but `dependency.sha2` is already a baselined drift (policy `=0.10.9`), so the ratchet accepts it |
+| toml | 1.1.6 | 1.1.8 | Moved. Not policy-bound |
+| trybuild | 1.0.121 | 1.0.122 | Moved. Dev-dependency, not policy-bound |
+| syn | 3.0.6 | 3.0.9 | Moved (`crates/fastmcp-macros`). Proc-macro build dependency only; the ratchet reads the root manifest and does not bind it |
+| serde_json | 1.0.151 | 1.0.154 | Held at =1.0.151: policy-bound and not a baselined drift, so the bump would be NEW FND-01 declaration drift. Needs the policy re-measured (bd-dmnn6) |
+| zeroize | 1.9.0 | 1.9.1 | Held at =1.9.0 for the same reason (measured in the v0.12.0 run below) |
+| lockfile | - | - | `cargo update` within the requirements above: 11 transitive packages advanced (cc 1.8.0, smallvec 1.16.3, zerocopy and zerocopy-derive 0.8.62, unicode-ident 1.0.27, litrs 1.0.1, serde_spanned 1.1.2, toml_datetime 1.1.2, toml_edit 0.25.17, toml_parser 1.1.5, toml_writer 1.1.3) |
+
+Verification: `cargo test --locked -p fastmcp-xtask` on the RCH lane with these
+pins, 202 passed and 0 failed, including the declaration ratchet. The full
+per-crate release gate ran on the same lockfile.
+
+## 2026-10-07 upgrade run (v0.12.0 release)
+
+A currency sweep of every exact direct registry pin (root and member
+manifests) against the crates.io API found all of them at latest stable except
+`zeroize` (1.9.1). `asupersync =0.5.0` and `rich_rust =0.2.3` are constellation
+pins and are also the latest published versions.
+
+| Dependency | Current | Target | Status |
+|---|---|---|---|
+| zeroize | 1.9.0 | 1.9.1 | Reverted, kept at =1.9.0: the bump compiled and passed clippy, but `fnd_01_policy_declarations_have_not_drifted_further` (tools/xtask/tests/fnd_01_declaration_drift.rs) refuses it as NEW FND-01 declaration drift (`dependency.zeroize: policy="=1.9.0"`). Moving the pin needs the FND-01 policy re-measured (bd-dmnn6), not a release-time edit |
+| lockfile | - | - | `cargo update` within existing requirements: 80 transitive packages advanced (cc 1.6.0, mio 1.2.4, libc 0.2.190, rustls-webpki 0.103.15, quick-xml 0.42.0, smallvec 1.16.2, icu_* 2.3, futures-* 0.3.34, ...); `base64 0.22.1` dropped out of the graph and `synstructure 0.14.0` entered it |
+
+
+## 2026-09-15 upgrade run
+
+**Date:** 2026-09-15 | **Project:** fastmcp_rust | **Language:** Rust
 
 A fresh currency sweep of all 29 exact direct registry pins (root and member
 manifests) against the crates.io API found 27 already at latest stable and

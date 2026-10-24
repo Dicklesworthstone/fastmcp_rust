@@ -528,7 +528,7 @@ pub(super) async fn scenario(cx: Cx, case: Case) {
             Some(ManagedCoreEvent::Result(_))
         ));
     };
-    pair(peer.dispatch(&cx, Delivery::Complete), sibling).await;
+    Box::pin(pair(peer.dispatch(&cx, Delivery::Complete), sibling)).await;
     assert_eq!(peer.seen.lock().unwrap().len(), 2 + case.continuations());
     assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
     peer.quiet();

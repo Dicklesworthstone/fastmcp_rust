@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.0"
+version = "0.13.0"
 edition = "2024"
 license-file = "LICENSE"
 # Cargo lower-bound check only; the supported compiler is the dated nightly
@@ -49,7 +49,7 @@ rustix = { version = "=1.1.5", default-features = false }
 # Serialization (only these)
 serde = { version = "=1.0.229", features = ["derive"] }
 # FND-01 ROOT-SERDE-JSON: exact version + arbitrary_precision for protocol numbers
-serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
+serde_json = { version = "=1.0.154", features = ["arbitrary_precision"] }
 serde_yaml = { version = "=0.9.34" }
 
 # Logging (facade only, zero-cost when disabled)
@@ -73,15 +73,15 @@ glob = { version = "=0.3.4" }
 console = { version = "=0.16.6" }
 
 # Configuration file parsing
-toml = { version = "=1.1.6" }
+toml = { version = "=1.1.8" }
 dirs = { version = "=7.0.0" }
 
 # FND-01 foundation pins (exact feature surfaces)
 url = { version = "=2.5.8", default-features = false, features = ["std"] }
 getrandom = { version = "=0.4.3", default-features = false }
-sha2 = { version = "=0.11.0", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }
 hmac = { version = "=0.13.0", default-features = false }
-zeroize = { version = "=1.9.0", default-features = false, features = ["alloc", "derive"] }
+zeroize = { version = "=1.9.1", default-features = false, features = ["alloc", "derive"] }
 # FND-08 ephemeral protection, using the frozen FND-01 envelope candidate.
 # Entropy stays in fastmcp-core; no cipher RNG or reduced-round features.
 chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
@@ -105,18 +105,18 @@ regex = { version = "=1.13.1" }
 clap = { version = "=4.6.7", features = ["derive", "env", "wrap_help"] }
 
 # Testing
-trybuild = { version = "=1.0.121", default-features = false }
+trybuild = { version = "=1.0.122", default-features = false }
 
 # Internal crates
-fastmcp-rust = { version = "0.11.0", path = "crates/fastmcp" }
-fastmcp-core = { version = "0.11.0", path = "crates/fastmcp-core" }
-fastmcp-transport = { version = "0.11.0", path = "crates/fastmcp-transport" }
-fastmcp-protocol = { version = "0.11.0", path = "crates/fastmcp-protocol" }
-fastmcp-server = { version = "0.11.0", path = "crates/fastmcp-server", default-features = false }
-fastmcp-client = { version = "0.11.0", path = "crates/fastmcp-client", default-features = false }
-fastmcp-derive = { version = "0.11.0", path = "crates/fastmcp-macros" }
-fastmcp-console = { version = "0.11.0", path = "crates/fastmcp-console" }
-fastmcp-cli = { version = "0.11.0", path = "crates/fastmcp-cli" }
+fastmcp-rust = { version = "0.13.0", path = "crates/fastmcp" }
+fastmcp-core = { version = "0.13.0", path = "crates/fastmcp-core" }
+fastmcp-transport = { version = "0.13.0", path = "crates/fastmcp-transport" }
+fastmcp-protocol = { version = "0.13.0", path = "crates/fastmcp-protocol" }
+fastmcp-server = { version = "0.13.0", path = "crates/fastmcp-server", default-features = false }
+fastmcp-client = { version = "0.13.0", path = "crates/fastmcp-client", default-features = false }
+fastmcp-derive = { version = "0.13.0", path = "crates/fastmcp-macros" }
+fastmcp-console = { version = "0.13.0", path = "crates/fastmcp-console" }
+fastmcp-cli = { version = "0.13.0", path = "crates/fastmcp-cli" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

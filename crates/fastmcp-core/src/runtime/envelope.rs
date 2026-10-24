@@ -229,10 +229,27 @@ impl std::error::Error for EnvelopeError {}
 
 /// Authenticated plaintext in zeroizing custody. No Clone, serialization,
 /// Debug, or non-zeroizing ownership conversion is exposed.
-pub struct OpenedState(Zeroizing<Vec<u8>>);
+pub struct OpenedState {
+    plaintext: Zeroizing<Vec<u8>>,
+    expires_at: Instant,
+}
 impl OpenedState {
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.plaintext
+    }
+
+    /// Returns the authenticated deadline in this process's monotonic clock.
+    ///
+    /// Reading or copying this deadline cannot renew the sealed envelope.
+    /// Continuations can pass it to [EphemeralEnvelopeProtector::seal_until]
+    /// to retain the original lifetime instead of starting a new one.
+    pub fn expires_at(&self) -> Instant {
+        self.expires_at
+    }
+
+    /// Remaining validity of the authenticated state, never rounded upward.
+    pub fn remaining_lifetime(&self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
     }
 }
 
@@ -374,12 +391,43 @@ impl EphemeralEnvelopeProtector {
         if lifetime.is_zero() || lifetime > self.policy.lifetime_bound {
             return Err(EnvelopeError::InvalidLifetime);
         }
-        let expiry = self
-            .elapsed()?
-            .checked_add(
-                u64::try_from(lifetime.as_nanos()).map_err(|_| EnvelopeError::InvalidLifetime)?,
-            )
+        let expires_at = Instant::now()
+            .checked_add(lifetime)
             .ok_or(EnvelopeError::InvalidLifetime)?;
+        self.seal_until(cx, binding, plaintext, expires_at)
+    }
+
+    /// Seals state without extending an existing monotonic deadline.
+    ///
+    /// The remaining lifetime must be positive and within this owner's
+    /// policy. A caller continuing authenticated state uses its
+    /// [OpenedState::expires_at] unchanged; time spent between opening and
+    /// sealing therefore cannot renew the continuation's validity.
+    pub fn seal_until(
+        &mut self,
+        cx: &Cx,
+        binding: &EnvelopeBinding,
+        plaintext: &[u8],
+        expires_at: Instant,
+    ) -> Result<Vec<u8>, EnvelopeError> {
+        self.check(cx)?;
+        if binding.purpose != self.purpose {
+            return Err(EnvelopeError::InvalidBinding);
+        }
+        if plaintext.len() > self.policy.plaintext_limit {
+            return Err(EnvelopeError::TooLarge);
+        }
+        let expiry = expires_at
+            .checked_duration_since(self.started)
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+            .ok_or(EnvelopeError::InvalidLifetime)?;
+        let remaining = expiry
+            .checked_sub(self.elapsed()?)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(EnvelopeError::InvalidLifetime)?;
+        if Duration::from_nanos(remaining) > self.policy.lifetime_bound {
+            return Err(EnvelopeError::InvalidLifetime);
+        }
         let key = self.keys.last_mut().ok_or(EnvelopeError::Closed)?;
         let counter = key.next_nonce;
         key.next_nonce = counter
@@ -475,7 +523,14 @@ impl EphemeralEnvelopeProtector {
         if self.elapsed()? >= expiry {
             return Err(EnvelopeError::InvalidEnvelope);
         }
-        Ok(OpenedState(payload))
+        let expires_at = self
+            .started
+            .checked_add(Duration::from_nanos(expiry))
+            .ok_or(EnvelopeError::InvalidEnvelope)?;
+        Ok(OpenedState {
+            plaintext: payload,
+            expires_at,
+        })
     }
 
     fn check(&self, cx: &Cx) -> Result<(), EnvelopeError> {

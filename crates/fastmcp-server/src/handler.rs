@@ -1516,6 +1516,14 @@ pub trait ToolHandler: Send + Sync {
     /// Returns the tool definition.
     fn definition(&self) -> Tool;
 
+    /// Retains the configured proxy origin through composition. Local
+    /// handlers leave this absent; catalog similarity cannot establish origin.
+    #[cfg(feature = "proxy")]
+    #[doc(hidden)]
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        None
+    }
+
     /// Returns the tool's icon, if any.
     ///
     /// Default implementation returns `None`. Override to provide an icon.
@@ -1917,6 +1925,14 @@ pub trait ToolHandler: Send + Sync {
 pub trait ResourceHandler: Send + Sync {
     /// Returns the resource definition.
     fn definition(&self) -> Resource;
+
+    /// Retains the configured proxy origin through composition. Subscription
+    /// admission consults the effective handler, including duplicate policy.
+    #[cfg(feature = "proxy")]
+    #[doc(hidden)]
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        None
+    }
 
     /// Returns whether locally authored final resource identities may use HTTPS
     /// at client-direct use sites. Exact MCP 2024-11-05 dispatch never consults
@@ -2344,6 +2360,14 @@ pub trait PromptHandler: Send + Sync {
     /// Returns the prompt definition.
     fn definition(&self) -> Prompt;
 
+    /// Retains the configured proxy origin through composition. Local
+    /// handlers leave this absent; catalog similarity cannot establish origin.
+    #[cfg(feature = "proxy")]
+    #[doc(hidden)]
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        None
+    }
+
     /// Returns whether resource links authored by this prompt's final result
     /// may use client-direct HTTPS. Exact MCP 2024-11-05 dispatch never
     /// consults this declaration.
@@ -2713,6 +2737,10 @@ impl FinalProxyResourceHandler {
 
 #[cfg(feature = "proxy")]
 impl ResourceHandler for FinalProxyResourceHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Resource {
         self.legacy.clone()
     }
@@ -2798,6 +2826,10 @@ impl FinalProxyResourceTemplateHandler {
 
 #[cfg(feature = "proxy")]
 impl ResourceHandler for FinalProxyResourceTemplateHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Resource {
         Resource {
             uri: self.legacy_template.uri_template.clone(),
@@ -2950,6 +2982,10 @@ impl FinalProxyPromptHandler {
 
 #[cfg(feature = "proxy")]
 impl PromptHandler for FinalProxyPromptHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Prompt {
         self.legacy.clone()
     }
@@ -3032,6 +3068,11 @@ impl MountedToolHandler {
 }
 
 impl ToolHandler for MountedToolHandler {
+    #[cfg(feature = "proxy")]
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        self.inner.proxy_catalog_client()
+    }
+
     fn definition(&self) -> Tool {
         let mut def = self.inner.definition();
         def.name.clone_from(&self.mounted_name);
@@ -3383,6 +3424,11 @@ impl MountedResourceHandler {
 }
 
 impl ResourceHandler for MountedResourceHandler {
+    #[cfg(feature = "proxy")]
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        self.inner.proxy_catalog_client()
+    }
+
     fn definition(&self) -> Resource {
         let mut def = self.inner.definition();
         def.uri.clone_from(&self.mounted_uri);
@@ -3741,6 +3787,11 @@ impl MountedPromptHandler {
 }
 
 impl PromptHandler for MountedPromptHandler {
+    #[cfg(feature = "proxy")]
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        self.inner.proxy_catalog_client()
+    }
+
     fn definition(&self) -> Prompt {
         let mut def = self.inner.definition();
         def.name.clone_from(&self.mounted_name);

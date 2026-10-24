@@ -59,10 +59,20 @@ where
         // wider ambient authority through `Cx::current()`. Intersecting both
         // layers is what makes the caller's bound actually bind.
         let _caller = cx.clone().set_current_restricted();
-        check_tool_call(cx, cancellation, contract)?;
+        // The deadline is tested BEFORE `check_tool_call`, and the order is the
+        // whole point. `Cx::checkpoint` itself reports an expired deadline as a
+        // cancellation -- it detects `budget.is_past_deadline(now)` and fails
+        // with `CancelKind::Deadline` (asupersync 0.5.0 cx.rs:2881) -- and
+        // `check_tool_call` maps ANY checkpoint error to
+        // `ManagedCoreError::Cancelled`. With the old order, the first poll
+        // after expiry returned Cancelled and the TimedOut arm below was
+        // unreachable dead code, so every deadline was misreported as a
+        // cancellation. A timeout and an interruption are different diagnoses
+        // and the caller can act on them differently.
         if deadline.is_some_and(|deadline| cx.now() >= deadline) {
             return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
         }
+        check_tool_call(cx, cancellation, contract)?;
         if let Some(timer) = deadline_timer.as_mut() {
             // Sleep resolves its driver on poll in asupersync 0.5. Never borrow
             // an unrelated ambient driver or silently omit a caller deadline.
@@ -84,10 +94,13 @@ where
         let outcome = future.as_mut().poll(task);
         // Refuse even a simultaneously ready result. Owned response state is
         // dropped on this error; partially read work cannot become reusable.
-        check_tool_call(cx, cancellation, contract)?;
+        // Deadline first here for the same reason as the pre-poll pair above:
+        // otherwise a result that became ready in the same poll as the deadline
+        // expiring is withheld as Cancelled rather than TimedOut.
         if deadline.is_some_and(|deadline| cx.now() >= deadline) {
             return Poll::Ready(Err(ManagedCoreError::TimedOut.into()));
         }
+        check_tool_call(cx, cancellation, contract)?;
         outcome.map(Ok)
     })
     .await
@@ -214,6 +227,13 @@ mod context_cancellation_tests {
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
+        // `Waiting` is an always-Pending future used here only as a
+        // drop-observable PAYLOAD, so this block is deliberately Ready with an
+        // awaitable value. Taking clippy's suggestion and awaiting it would
+        // make the block Pending forever, there would be no "ready poll" left
+        // to cancel during, and the property in this test's name would no
+        // longer be exercised at all.
+        #[allow(clippy::async_yields_async)]
         let inner = async {
             cx.cancel_fast(CancelKind::User);
             Waiting(state.clone())
@@ -270,7 +290,9 @@ mod context_cancellation_tests {
         assert_eq!(abandoned_wakes.0.load(Ordering::SeqCst), retired_wakes);
         assert!(sibling_wakes.0.load(Ordering::SeqCst) > 0);
         assert!(matches!(
-            sibling.as_mut().poll(&mut Context::from_waker(&sibling_waker)),
+            sibling
+                .as_mut()
+                .poll(&mut Context::from_waker(&sibling_waker)),
             Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::Cancelled)))
         ));
     }
@@ -393,7 +415,11 @@ mod context_cancellation_tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        observed.borrow().as_ref().unwrap().cancel_fast(CancelKind::User);
+        observed
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .cancel_fast(CancelKind::User);
         assert!(cx.is_cancel_requested());
         assert!(!ambient.is_cancel_requested());
         Cx::current().unwrap().cancel_fast(CancelKind::User);
@@ -406,9 +432,8 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let (foreign_runtime, foreign_timer, foreign_clock) = clocked_runtime();
         foreign_clock.advance(1_000_000_000);
         let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
@@ -456,9 +481,8 @@ mod context_cancellation_tests {
     fn bounded_callers_without_a_driver_refuse_before_owned_work() {
         use asupersync::{Budget, Time};
 
-        let cx = Cx::for_testing_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX)),
-        );
+        let cx =
+            Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX)));
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
@@ -472,7 +496,9 @@ mod context_cancellation_tests {
             future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::RuntimeUnavailable)))
+            Poll::Ready(Err(ManagedToolError::Core(
+                ManagedCoreError::RuntimeUnavailable
+            )))
         ));
         assert_eq!(state.polls.load(Ordering::SeqCst), 0);
         assert!(state.dropped.load(Ordering::SeqCst));
@@ -484,12 +510,16 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());
+        // Ready-with-an-awaitable on purpose; see the note on
+        // `caller_cancellation_during_a_ready_poll_withholds_and_drops_the_value`.
+        // Awaiting `Waiting` would remove the ready callback this test needs the
+        // expiring deadline to land inside.
+        #[allow(clippy::async_yields_async)]
         let inner = async {
             clock.advance(10_000_000);
             Waiting(state.clone())
@@ -514,9 +544,8 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime.request_cx_with_budget(
-            Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-        );
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let contract = contract();
         let cancellation = McpRequestCancellation::new();
         let state = Arc::new(State::default());

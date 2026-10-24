@@ -919,13 +919,91 @@ fn elicit_request_params_from_embedded(
 
 /// Maximum input responses accepted for one MRTR continuation.
 ///
-/// This is an individual continuation bound. The multi-round stdio driver also
-/// limits cumulative entries across the complete MRTR operation.
+/// This is an individual continuation bound. Automatic MRTR drivers also
+/// limit cumulative entries across the complete operation.
 pub const MAX_MRTR_INPUT_RESPONSES: usize = 128;
-/// Maximum `input_required` continuations for one stdio MRTR operation.
+/// Maximum `input_required` continuations for one MRTR operation.
 pub const MAX_MRTR_CONTINUATION_ROUNDS: usize = 4;
 /// Maximum response entries admitted across every continuation in one MRTR operation.
 pub const MAX_MRTR_TOTAL_INPUT_RESPONSES: usize = MAX_MRTR_INPUT_RESPONSES;
+
+fn mrtr_operation_deadline(cx: &Cx, policy: RequestTimeoutPolicy) -> McpResult<Instant> {
+    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+    Instant::now()
+        .checked_add(policy.absolute_timeout())
+        .ok_or_else(|| McpError::internal_error("MRTR operation deadline exceeds the clock range"))
+}
+
+fn check_mrtr_operation(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+    deadline: Instant,
+) -> McpResult<()> {
+    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        || cx.checkpoint().is_err()
+        || cx
+            .budget()
+            .deadline
+            .is_some_and(|deadline| cx.now() >= deadline)
+    {
+        return Err(McpError::request_cancelled());
+    }
+    if Instant::now() >= deadline {
+        return Err(McpError::with_data(
+            McpErrorCode::InternalError,
+            "MRTR operation absolute deadline elapsed",
+            serde_json::json!({"timeoutSource": "absolute"}),
+        ));
+    }
+    Ok(())
+}
+
+/// Bounds caller-owned work even when its future never arranges another wake.
+/// Only use this around work whose abandonment already owns its cleanup.
+async fn wait_for_mrtr_operation<T, E>(
+    cx: &Cx,
+    cancellation: Option<&McpRequestCancellation>,
+    deadline: Instant,
+    operation: impl Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<McpError>,
+{
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(async {
+        match cancellation {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending::<()>().await,
+        }
+    });
+    let mut wake = Box::pin(asupersync::time::sleep(
+        cx.now(),
+        REVERSE_CALLBACK_POLL_SLICE,
+    ));
+    std::future::poll_fn(|task_cx| {
+        if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
+            return std::task::Poll::Ready(Err(error.into()));
+        }
+        if cancelled.as_mut().poll(task_cx).is_ready() {
+            return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
+        }
+        let result = operation.as_mut().poll(task_cx);
+        // A callback may cancel its owner or finish after the deadline in
+        // this same poll. Its late result must never authorize another RPC.
+        if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
+            return std::task::Poll::Ready(Err(error.into()));
+        }
+        if result.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
+            wake.set(asupersync::time::sleep(
+                cx.now(),
+                REVERSE_CALLBACK_POLL_SLICE,
+            ));
+            task_cx.waker().wake_by_ref();
+        }
+        result
+    })
+    .await
+}
 
 fn mrtr_retry_parameters(
     mut parameters: serde_json::Value,
@@ -5349,6 +5427,8 @@ where
     session: ClientSession,
     reverse_request_handlers: ReverseRequestHandlers,
     reverse_callback_pool: WebSocketReverseCallbackPool<IO>,
+    /// Absolute budget shared by automatic MRTR rounds and their callbacks.
+    request_timeout_policy: RequestTimeoutPolicy,
     final_server_notifications: VecDeque<ServerNotification>,
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
     /// Exact-2024 server notifications retained from the WebSocket receive loop.
@@ -5588,6 +5668,7 @@ where
             session,
             reverse_request_handlers,
             reverse_callback_pool,
+            request_timeout_policy: RequestTimeoutPolicy::default(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
             legacy_server_notifications: VecDeque::new(),
@@ -5668,6 +5749,14 @@ where
         let auto_plan = ClientProtocolPlan::websocket(ProtocolPolicy::Auto);
         validate_protocol_plan_feature(&auto_plan)?;
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        // Modern MRTR callbacks belong to the selected modern connection.
+        // Keep exact-2024 reverse RPC handlers out of that constructor while
+        // retaining the original configuration for a fresh legacy fallback.
+        let modern_handlers = ReverseRequestHandlers {
+            sampling_create_message: None,
+            roots_list: None,
+            ..reverse_request_handlers.clone()
+        };
         let first = fresh_transport(cx).await?;
         match Self::connect_with_builder_configuration_with_cx(
             cx,
@@ -5675,7 +5764,7 @@ where
             client_info.clone(),
             None,
             client_capabilities.clone(),
-            ReverseRequestHandlers::new(),
+            modern_handlers,
             mcp_apps_settings.clone(),
             client_extension_runtime.clone(),
             first,
@@ -5782,6 +5871,20 @@ where
     where
         IO: Send + 'static,
     {
+        self.request_admitted_with_raw_result_with_deadline(cx, request, cancellation, None)
+            .await
+    }
+
+    async fn request_admitted_with_raw_result_with_deadline(
+        &mut self,
+        cx: &Cx,
+        request: JsonRpcRequest,
+        cancellation: Option<&McpRequestCancellation>,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<WebSocketResponse>
+    where
+        IO: Send + 'static,
+    {
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
         {
@@ -5790,6 +5893,18 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
+        if let Some(deadline) = operation_deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
+        }
+        let timeout_policy = self.request_timeout_policy;
+        timeout_policy.validate()?;
+        let expected_progress_key = request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get("progressToken"))
+            .and_then(|marker| serde_json::from_value::<ProgressMarker>(marker.clone()).ok())
+            .and_then(|marker| execution::progress_marker_key(&marker));
         let id = request.id.clone().ok_or_else(|| {
             McpError::internal_error("WebSocket admitted request requires a JSON-RPC ID")
         })?;
@@ -5800,8 +5915,26 @@ where
             return Err(self.terminal_transport_error(cx, error).await);
         }
 
+        // Response budgets begin only after the send commits. Keep their
+        // deadlines in the caller's runtime clock, including progress resets,
+        // so a virtual timer cannot accidentally restart a wall-clock budget.
+        let committed_at = cx.now();
+        let mut idle_deadline = committed_at + timeout_policy.idle_timeout();
+        let mut absolute_deadline = committed_at + timeout_policy.absolute_timeout();
+        if let Some(deadline) = operation_deadline {
+            absolute_deadline = absolute_deadline
+                .min(committed_at + deadline.saturating_duration_since(Instant::now()));
+        }
+        let mut last_progress = None;
+        let mut last_final_progress = None;
         loop {
-            if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
+            if cx.checkpoint().is_err()
+                || cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline)
+                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            {
                 return Err(self
                     .retire_committed_request_after_cancellation(id, false)
                     .await);
@@ -5809,7 +5942,55 @@ where
             if let Err(error) = self.drain_completed_reverse_callbacks() {
                 return Err(self.terminal_callback_error(cx, error).await);
             }
-            let frame = match self.recv_with_callback_terminal(cx, cancellation).await {
+            if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(self
+                    .retire_committed_request_after_timeout(id, RequestTimeoutSource::Absolute)
+                    .await);
+            }
+            let timeout_source = if absolute_deadline <= idle_deadline {
+                RequestTimeoutSource::Absolute
+            } else {
+                RequestTimeoutSource::Idle
+            };
+            let response_deadline = idle_deadline.min(absolute_deadline);
+            if cx.now() >= response_deadline {
+                return Err(self
+                    .retire_committed_request_after_timeout(id, timeout_source)
+                    .await);
+            }
+            let receive_deadline = cx.budget().deadline.map_or(response_deadline, |deadline| {
+                deadline.min(response_deadline)
+            });
+            // The native reader is borrowed in place and retains partial
+            // framing state when this wait is dropped. Retire the exact ID
+            // before returning so a late response cannot poison the next call.
+            let received = match asupersync::time::timeout_at(
+                receive_deadline,
+                self.recv_with_callback_terminal(cx, cancellation),
+            )
+            .await
+            {
+                Ok(received) => received,
+                Err(_)
+                    if cx.checkpoint().is_err()
+                        || cx
+                            .budget()
+                            .deadline
+                            .is_some_and(|deadline| cx.now() >= deadline)
+                        || cancellation
+                            .is_some_and(McpRequestCancellation::is_cancel_requested) =>
+                {
+                    return Err(self
+                        .retire_committed_request_after_cancellation(id, false)
+                        .await);
+                }
+                Err(_) => {
+                    return Err(self
+                        .retire_committed_request_after_timeout(id, timeout_source)
+                        .await);
+                }
+            };
+            let frame = match received {
                 Ok(frame) => frame,
                 Err(_) if self.reverse_callback_pool.terminal_error().is_some() => {
                     return Err(self
@@ -5822,7 +6003,8 @@ where
                         .await);
                 }
                 Err(TransportError::Cancelled)
-                    if cx.is_cancel_requested()
+                    if cx.checkpoint().is_err()
+                        || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
                         || cancellation
                             .is_some_and(McpRequestCancellation::is_cancel_requested) =>
                 {
@@ -5832,9 +6014,53 @@ where
                 }
                 Err(error) => return Err(self.terminal_transport_error(cx, error).await),
             };
+            let received_at = cx.now();
             let JsonRpcMessage::Response(response) = frame.message() else {
+                let retained_progress = self.final_progress_notifications.len();
                 if let Err(error) = self.handle_unsolicited_websocket_request(cx, &frame).await {
                     return Err(self.terminal_callback_error(cx, error).await);
+                }
+                if timeout_policy.resets_idle_on_matching_progress()
+                    && let Some(expected_key) = expected_progress_key.as_ref()
+                {
+                    let advances = if self.selected_protocol_era() == ProtocolEra::Modern2026 {
+                        if self.final_progress_notifications.len() > retained_progress
+                            && let JsonRpcMessage::Request(notification) = frame.message()
+                            && let Some(params) = notification.params.as_ref()
+                            // Optional members must be absent or typed. The
+                            // retained serde view maps explicit null to None,
+                            // which must not acquire idle-timer authority.
+                            && !["total", "message", "_meta"].iter().any(|member| {
+                                params.get(*member).is_some_and(serde_json::Value::is_null)
+                            })
+                            && let Some(progress) = self.final_progress_notifications.back()
+                            && execution::progress_marker_key(&progress.progress_token)
+                                .as_ref() == Some(expected_key)
+                            && last_final_progress
+                                .as_ref()
+                                .is_none_or(|last| progress.progress.cmp(last).is_gt())
+                        {
+                            last_final_progress = Some(progress.progress.clone());
+                            true
+                        } else {
+                            false
+                        }
+                    } else if let JsonRpcMessage::Request(notification) = frame.message()
+                        && server_notification_kind(notification)
+                            == Some(ServerNotificationKind::Progress)
+                        && let Some(params) = notification.params.as_ref()
+                        && let Some(progress) = parse_valid_client_progress(params, last_progress)
+                        && execution::progress_marker_key(&progress.marker).as_ref()
+                            == Some(expected_key)
+                    {
+                        last_progress = Some(progress.progress);
+                        true
+                    } else {
+                        false
+                    };
+                    if advances {
+                        idle_deadline = received_at + timeout_policy.idle_timeout();
+                    }
                 }
                 continue;
             };
@@ -5913,6 +6139,26 @@ where
                 response,
                 raw_result,
             });
+        }
+    }
+
+    async fn retire_committed_request_after_timeout(
+        &mut self,
+        request_id: RequestId,
+        source: RequestTimeoutSource,
+    ) -> McpError
+    where
+        IO: Send + 'static,
+    {
+        let cleanup = self
+            .retire_committed_request_after_cancellation(request_id, false)
+            .await;
+        if cleanup.code == McpErrorCode::RequestCancelled && !self.closed {
+            request_timeout_error(source)
+        } else {
+            // A failed cancellation send or teardown is the actionable
+            // connection failure; do not disguise it as a reusable timeout.
+            cleanup
         }
     }
 
@@ -6918,6 +7164,10 @@ where
     ///
     /// When modern reverse handlers are installed, a peer `input_required`
     /// result is fulfilled locally and retried with `inputResponses`.
+    /// Response waits and input callbacks across all continuations share the
+    /// configured absolute deadline. Response waits start after each send
+    /// commits and are capped by the remaining operation budget. The cumulative
+    /// input limit rejects an over-budget round before invoking host callbacks.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -6946,8 +7196,28 @@ where
     where
         IO: Send + 'static,
     {
-        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        self.request_core_verb_with_options(cx, Some(cancellation), None, method, parameters)
+            .await
+    }
+
+    async fn request_core_verb_with_options(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        deadline: Option<Instant>,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<CoreResult>
+    where
+        IO: Send + 'static,
+    {
+        if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.checkpoint().is_err()
+        {
             return Err(McpError::request_cancelled());
+        }
+        if let Some(deadline) = deadline {
+            check_mrtr_operation(cx, cancellation, deadline)?;
         }
         let era = self.selected_protocol_era();
         let parameters = if era == ProtocolEra::Modern2026 {
@@ -6965,10 +7235,11 @@ where
         }
         let request_id = self.allocate_request_id()?;
         let received = self
-            .request_admitted_with_raw_result(
+            .request_admitted_with_raw_result_with_deadline(
                 cx,
                 JsonRpcRequest::new(method, Some(parameters), request_id),
-                Some(cancellation),
+                cancellation,
+                deadline,
             )
             .await?;
         if let Some(error) = received.response.error {
@@ -7228,40 +7499,65 @@ where
     where
         IO: Send + 'static,
     {
-        let handlers = self
-            .reverse_request_handlers
-            .has_modern_handlers()
-            .then(|| self.reverse_request_handlers.clone());
-        let mut parameters = original_parameters.clone();
-        let mut rounds = 0_usize;
-        loop {
-            let result = match cancellation {
+        if self.selected_protocol_era() != ProtocolEra::Modern2026
+            || !self.reverse_request_handlers.has_modern_handlers()
+        {
+            return match cancellation {
                 Some(cancellation) => {
-                    self.request_core_verb_with_cancellation(cx, cancellation, method, parameters)
-                        .await?
+                    self.request_core_verb_with_cancellation(
+                        cx,
+                        cancellation,
+                        method,
+                        original_parameters,
+                    )
+                    .await
                 }
-                None => self.request_core_verb(cx, method, parameters).await?,
+                None => {
+                    self.request_core_verb(cx, method, original_parameters)
+                        .await
+                }
             };
+        }
+        let handlers = self.reverse_request_handlers.clone();
+        let deadline = mrtr_operation_deadline(cx, self.request_timeout_policy)?;
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
+        let mut parameters = original_parameters.clone();
+        loop {
+            driver.before_request()?;
+            let result = self
+                .request_core_verb_with_options(
+                    cx,
+                    cancellation,
+                    Some(deadline),
+                    method,
+                    parameters,
+                )
+                .await?;
+            check_mrtr_operation(cx, cancellation, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
                 return Ok(result);
             };
-            let Some(handlers) = handlers.as_ref() else {
-                return Ok(result);
-            };
-            if rounds >= MAX_MRTR_CONTINUATION_ROUNDS {
-                return Err(McpError::invalid_request(
-                    "MRTR continuation-round limit exceeded",
-                ));
-            }
-            rounds += 1;
-            let input_responses = handlers
-                .respond_to_input_required_async(cx, input_required, || {
-                    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-                        return Err(McpError::request_cancelled());
-                    }
-                    cx.checkpoint().map_err(|_| McpError::request_cancelled())
-                })
-                .await?;
+            driver.begin_continuation()?;
+            // Installed handlers answer every descriptor. Reserve the whole
+            // round before any host callback can have an effect.
+            driver.admit_input_responses(
+                input_required
+                    .input_requests()
+                    .map_or(0, |inputs| inputs.members().len()),
+            )?;
+            let input_responses = wait_for_mrtr_operation(
+                cx,
+                cancellation,
+                deadline,
+                handlers.respond_to_input_required_async(cx, input_required, || {
+                    check_mrtr_operation(cx, cancellation, deadline)
+                }),
+            )
+            .await?;
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
@@ -7315,8 +7611,9 @@ where
 
     /// Calls a modern tool and follows bounded input-required MRTR rounds.
     ///
-    /// The supplied deadline covers every request in the operation; a retry
-    /// cannot restart the caller's absolute time budget.
+    /// The supplied deadline caps every response wait and is checked after
+    /// each synchronous responder returns. A retry cannot restart the caller's
+    /// absolute time budget.
     pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -7342,8 +7639,9 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_final_core(cx, "tools/call", parameters)
+                .request_core_verb_with_options(cx, None, Some(deadline), "tools/call", parameters)
                 .await?;
+            check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("tools/call", &result) else {
                 let CoreResult::Final(result) = result else {
                     return Err(McpError::invalid_request(
@@ -7354,6 +7652,7 @@ where
             };
             driver.begin_continuation()?;
             let input_responses = respond(input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
@@ -7366,7 +7665,8 @@ where
 
     /// Reads a modern resource and follows bounded input-required MRTR rounds.
     ///
-    /// The caller-owned deadline covers the initial read and every retry.
+    /// The caller-owned deadline caps response waits in the initial read and
+    /// every retry. Synchronous responder results are rechecked before retrying.
     pub async fn read_resource_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -7388,8 +7688,9 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_final_core(cx, "resources/read", parameters)
+                .request_core_verb_with_options(cx, None, Some(deadline), "resources/read", parameters)
                 .await?;
+            check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("resources/read", &result)
             else {
                 let CoreResult::Final(result) = result else {
@@ -7401,6 +7702,7 @@ where
             };
             driver.begin_continuation()?;
             let input_responses = respond(input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
@@ -7413,8 +7715,9 @@ where
 
     /// Gets a modern prompt and follows bounded input-required MRTR rounds.
     ///
-    /// The caller-owned deadline covers the initial prompt request and every
-    /// retry.
+    /// The caller-owned deadline caps response waits in the initial prompt
+    /// request and every retry. Synchronous responder results are rechecked
+    /// before retrying.
     pub async fn get_prompt_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -7440,8 +7743,9 @@ where
         loop {
             driver.before_request()?;
             let result = self
-                .request_final_core(cx, "prompts/get", parameters)
+                .request_core_verb_with_options(cx, None, Some(deadline), "prompts/get", parameters)
                 .await?;
+            check_mrtr_operation(cx, None, deadline)?;
             let Some(input_required) = mrtr_input_required_for_method("prompts/get", &result)
             else {
                 let CoreResult::Final(result) = result else {
@@ -7453,6 +7757,7 @@ where
             };
             driver.begin_continuation()?;
             let input_responses = respond(input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
@@ -10363,21 +10668,21 @@ pub struct BoundedListPage<T> {
     pub peer_has_more: bool,
 }
 
-/// A complete HTTP catalog traversal, retaining each exact typed result page.
+/// A complete catalog traversal, retaining each exact selected-era result page.
 ///
 /// Pages preserve their individual TTL, cache scope and unknown result members;
-/// no merged result or synthetic TTL is created. The collection uses one local
-/// invalidation generation and cache scope, but does not promise an atomic
+/// no merged result or synthetic TTL is created. Modern collections use one
+/// local invalidation generation and cache scope, but do not promise an atomic
 /// snapshot of a changing server catalog. A failed traversal returns no partial
-/// collection.
+/// collection. The same representation is used for stdio and HTTP catalogs.
 #[derive(Debug, Clone)]
-pub struct CollectedHttpCatalog {
+pub struct CollectedCatalog {
     method: &'static str,
     pages: Vec<CoreResult>,
     item_count: usize,
 }
 
-impl CollectedHttpCatalog {
+impl CollectedCatalog {
     /// Returns the catalog method used for every page.
     #[must_use]
     pub const fn method(&self) -> &'static str {
@@ -10403,7 +10708,7 @@ impl CollectedHttpCatalog {
     }
 }
 
-fn http_catalog_page(method: &str, result: &CoreResult) -> McpResult<(usize, Option<String>)> {
+fn catalog_page(method: &str, result: &CoreResult) -> McpResult<(usize, Option<String>)> {
     let (items, cursor) = match (method, result) {
         ("tools/list", CoreResult::Legacy(LegacyCoreResult::ToolsList(result))) => {
             (result.tools.len(), &result.next_cursor)
@@ -12682,6 +12987,11 @@ impl HttpClient {
             None
         };
 
+        // Capture before lookup: an expired continuation may be the last
+        // retained evidence that its cursor belongs to this exact query.
+        let cursor_origin = key
+            .as_ref()
+            .and_then(|key| self.final_result_cache.capture_cursor_origin(key));
         // Every branch below assigns or returns before the value is read.
         let mut miss: Option<FinalCacheMiss>;
         if read_cache && let Some(key) = key.as_ref() {
@@ -12766,18 +13076,9 @@ impl HttpClient {
         if let Some(error) = response.error.take() {
             let error = json_rpc_error_to_mcp(error);
             if error.code == McpErrorCode::InvalidParams
-                && parameters
-                    .get("cursor")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some()
-                && let Some(
-                    result_set @ (FinalCacheResultSet::Tools
-                    | FinalCacheResultSet::Resources
-                    | FinalCacheResultSet::ResourceTemplates
-                    | FinalCacheResultSet::Prompts),
-                ) = result_set.as_ref()
+                && let Some(origin) = cursor_origin
             {
-                self.final_result_cache.invalidate_result_set(result_set);
+                self.final_result_cache.invalidate_rejected_cursor(origin);
             }
             return Err(HttpClientError::CoreResult(error));
         }
@@ -12973,7 +13274,7 @@ impl HttpClient {
         &mut self,
         cx: &Cx,
         params: ListToolsParams,
-    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+    ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
             "tools/list",
@@ -12994,7 +13295,7 @@ impl HttpClient {
         &mut self,
         cx: &Cx,
         params: ListResourcesParams,
-    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+    ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
             "resources/list",
@@ -13015,7 +13316,7 @@ impl HttpClient {
         &mut self,
         cx: &Cx,
         params: ListResourceTemplatesParams,
-    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+    ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
             "resources/templates/list",
@@ -13036,7 +13337,7 @@ impl HttpClient {
         &mut self,
         cx: &Cx,
         params: ListPromptsParams,
-    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+    ) -> Result<CollectedCatalog, HttpClientError> {
         self.collect_http_catalog_with_budget(
             cx,
             "prompts/list",
@@ -13058,7 +13359,7 @@ impl HttpClient {
         parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
         mut budget: PaginationBudget,
-    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+    ) -> Result<CollectedCatalog, HttpClientError> {
         if parameters.get("cursor").is_some() {
             return Err(McpError::invalid_params(
                 "Complete HTTP catalog collection requires an absent initial cursor",
@@ -13105,7 +13406,7 @@ impl HttpClient {
         parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
         budget: &mut PaginationBudget,
-    ) -> Result<CollectedHttpCatalog, HttpClientError> {
+    ) -> Result<CollectedCatalog, HttpClientError> {
         let mut rebuilds = 0;
         'rebuild: loop {
             let mut pages = Vec::new();
@@ -13150,7 +13451,7 @@ impl HttpClient {
                     }
                     other => other?,
                 };
-                let (page_items, next_cursor) = http_catalog_page(method, &result)?;
+                let (page_items, next_cursor) = catalog_page(method, &result)?;
                 budget.account_core_page(&result, page_items)?;
                 let next_cursor = budget.admit_next_cursor(next_cursor)?;
                 // Check even terminal pages and disabled caches: a list-change
@@ -13180,7 +13481,7 @@ impl HttpClient {
                 cursor = next_cursor;
                 budget.check_deadline()?;
                 if cursor.is_none() {
-                    return Ok(CollectedHttpCatalog {
+                    return Ok(CollectedCatalog {
                         method,
                         pages,
                         item_count,
@@ -13717,6 +14018,9 @@ impl HttpClient {
     /// When modern reverse handlers are installed, a peer `input_required`
     /// result is fulfilled locally and retried with `inputResponses` instead of
     /// being returned to the caller.
+    /// The configured absolute timeout covers the entire operation, including
+    /// every POST and input callback. Continuations share one cumulative input
+    /// limit; a rejected round invokes no host callbacks.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -13735,9 +14039,10 @@ impl HttpClient {
     /// Calls one tool with reviewed `Mcp-Param-*` mirrors (HTTP-05).
     ///
     /// `reviewed` is the host's current plan for `name`, bound to this
-    /// client's HTTPS endpoint. If the server refuses this exact request
-    /// before dispatch (HTTP 400, -32020, same id, canonical message), the plan
-    /// is presumed stale: the cached `tools/list` is dropped, a fresh listing
+    /// client's approved HTTPS or numeric-loopback HTTP endpoint. If the server
+    /// refuses this exact request before dispatch (HTTP 400, -32020, same id,
+    /// canonical message), the plan is presumed stale: the cached `tools/list`
+    /// is dropped, a fresh listing
     /// supplies the tool's schema, `review` re-approves every projected
     /// binding, and the call is retried exactly once with a new request id.
     ///
@@ -13745,6 +14050,9 @@ impl HttpClient {
     /// after the send committed, and not any response the handler may have
     /// produced. If `review` refuses a binding of the refreshed schema, no
     /// retry is sent. An `input_required` result is returned, not followed.
+    /// Every refreshed catalog page comes from the peer, including when its
+    /// cursor repeats a previously cacheable page. Page/item/byte bounds apply,
+    /// and one absolute timeout covers the initial call, refresh and retry.
     pub async fn call_tool_with_parameter_headers(
         &mut self,
         cx: &Cx,
@@ -13753,76 +14061,117 @@ impl HttpClient {
         reviewed: &http_executor::parameter_headers::ReviewedToolHeaders,
         review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
     ) -> Result<CoreResult, HttpClientError> {
-        let parameters = serde_json::json!({ "name": name, "arguments": arguments });
-        match self
-            .request_final_core_with_optional_cancellation(
+        cx.checkpoint()
+            .map_err(|_| HttpClientError::CoreResult(McpError::request_cancelled()))?;
+        let now = cx.now();
+        let timeout = self.request_timeout_policy.absolute_timeout();
+        let remaining = cx.budget().deadline.map_or(timeout, |deadline| {
+            timeout.min(Duration::from_nanos(deadline.duration_since(now)))
+        });
+        let deadline =
+            now.saturating_add_nanos(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX));
+        match asupersync::time::timeout_at(deadline, async {
+            let parameters = serde_json::json!({ "name": name, "arguments": arguments });
+            match self
+                .request_final_core_with_optional_cancellation(
+                    cx,
+                    None,
+                    "tools/call",
+                    parameters.clone(),
+                    Some(reviewed),
+                )
+                .await
+            {
+                Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::ParameterHeaderMismatch { .. },
+                )) => {}
+                outcome => return outcome,
+            }
+            let refreshed = self
+                .refreshed_parameter_headers(cx, reviewed, review)
+                .await?;
+            self.request_final_core_with_optional_cancellation(
                 cx,
                 None,
                 "tools/call",
-                parameters.clone(),
-                Some(reviewed),
+                parameters,
+                Some(&refreshed),
             )
             .await
-        {
-            Err(HttpClientError::Connection(
-                ClientHttpConnectionError::ParameterHeaderMismatch { .. },
-            )) => {}
-            outcome => return outcome,
-        }
-        let refreshed = self
-            .refreshed_parameter_headers(cx, name, reviewed.resource().clone(), review)
-            .await?;
-        self.request_final_core_with_optional_cancellation(
-            cx,
-            None,
-            "tools/call",
-            parameters,
-            Some(&refreshed),
-        )
+        })
         .await
+        {
+            Ok(result) => result,
+            Err(_) if cx.checkpoint().is_err() => Err(McpError::request_cancelled().into()),
+            Err(_) => Err(McpError::with_data(
+                McpErrorCode::InternalError,
+                "Parameter-header tool call absolute timeout exceeded",
+                serde_json::json!({"timeoutSource":"absolute"}),
+            )
+            .into()),
+        }
     }
 
-    /// Re-reviews `name` from a fresh, uncached `tools/list`.
+    /// Re-reviews the approved tool from a fresh, uncached `tools/list`.
     async fn refreshed_parameter_headers(
         &mut self,
         cx: &Cx,
-        name: &str,
-        resource: CanonicalHttpUrl,
+        reviewed: &http_executor::parameter_headers::ReviewedToolHeaders,
         review: &dyn Fn(&fastmcp_protocol::http_headers::ParameterHeaderBinding) -> bool,
     ) -> Result<http_executor::parameter_headers::ReviewedToolHeaders, HttpClientError> {
         const MAX_REFRESH_PAGES: usize = 64;
         self.final_result_cache
             .invalidate_result_set(&FinalCacheResultSet::Tools);
+        let mut budget = PaginationBudget::for_request(self.request_timeout_policy);
+        budget.limits.pages = MAX_REFRESH_PAGES;
         let mut cursor: Option<String> = None;
-        for _ in 0..MAX_REFRESH_PAGES {
-            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) =
-                self.list_tools(cx, cursor.as_deref()).await?
-            else {
+        loop {
+            budget.begin_page()?;
+            let parameters = match cursor.take() {
+                Some(cursor) => serde_json::json!({"cursor":cursor}),
+                None => serde_json::json!({}),
+            };
+            let (result, _) = self
+                .request_final_core_with_cache_policy(
+                    cx,
+                    None,
+                    "tools/list",
+                    parameters,
+                    None,
+                    false,
+                )
+                .await?;
+            let (items, next_cursor) = catalog_page("tools/list", &result)?;
+            budget.account_core_page(&result, items)?;
+            cursor = budget.admit_next_cursor(next_cursor)?;
+            let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
                 return Err(HttpClientError::CoreResult(McpError::invalid_request(
                     "Parameter-header refresh requires a final tools/list result",
                 )));
             };
             let payload = result.payload;
-            if let Some(tool) = payload.tools.into_iter().find(|tool| tool.name == name) {
-                return http_executor::parameter_headers::ReviewedToolHeaders::new(
-                    resource,
-                    name,
-                    tool.input_schema,
-                    review,
-                )
-                .map_err(|error| {
-                    HttpClientError::Connection(ClientHttpConnectionError::Modern(
-                        ModernHttpClientError::ParameterHeaders(error),
-                    ))
-                });
+            if let Some(tool) = payload
+                .tools
+                .into_iter()
+                .find(|tool| tool.name == reviewed.tool_name())
+            {
+                return reviewed
+                    .re_review(tool.input_schema, review)
+                    .map_err(|error| {
+                        HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                            ModernHttpClientError::ParameterHeaders(error),
+                        ))
+                    });
             }
-            match payload.next_cursor {
-                Some(next) => cursor = Some(next),
-                None => break,
+            if cursor.is_none() {
+                break;
             }
         }
         Err(HttpClientError::CoreResult(McpError::invalid_params(
-            format!("Tool '{name}' is not listed after refreshing tools/list"),
+            format!(
+                "Tool '{}' is not listed after refreshing tools/list",
+                reviewed.tool_name()
+            ),
         )))
     }
 
@@ -13887,42 +14236,70 @@ impl HttpClient {
             .modern_reverse_request_handlers()
             .filter(|handlers| handlers.has_modern_handlers())
             .cloned();
-        let mut parameters = original_parameters.clone();
-        let mut rounds = 0_usize;
-        loop {
-            let result = match cancellation {
+        let Some(handlers) = handlers else {
+            return match cancellation {
                 Some(cancellation) => {
-                    self.request_final_core_with_cancellation(cx, cancellation, method, parameters)
-                        .await?
+                    self.request_final_core_with_cancellation(
+                        cx,
+                        cancellation,
+                        method,
+                        original_parameters,
+                    )
+                    .await
                 }
-                None => self.request_final_core(cx, method, parameters).await?,
+                None => {
+                    self.request_final_core(cx, method, original_parameters)
+                        .await
+                }
             };
-            let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
-                return Ok(result);
-            };
-            let Some(handlers) = handlers.as_ref() else {
-                return Ok(result);
-            };
-            if rounds >= MAX_MRTR_CONTINUATION_ROUNDS {
-                return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                    "MRTR continuation-round limit exceeded",
-                )));
-            }
-            rounds += 1;
-            let input_responses = handlers
-                .respond_to_input_required_async(cx, input_required, || {
-                    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
-                        return Err(McpError::request_cancelled());
+        };
+        let deadline = mrtr_operation_deadline(cx, self.request_timeout_policy)?;
+        let mut driver = MrtrDriver::new(
+            cx,
+            deadline,
+            MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
+        )?;
+        // HTTP execution owns cancellation on drop. One bound therefore
+        // safely encloses every POST and every caller-owned input callback.
+        wait_for_mrtr_operation(cx, cancellation, deadline, async {
+            let mut parameters = original_parameters.clone();
+            loop {
+                driver.before_request()?;
+                let result = match cancellation {
+                    Some(cancellation) => {
+                        self.request_final_core_with_cancellation(
+                            cx,
+                            cancellation,
+                            method,
+                            parameters,
+                        )
+                        .await?
                     }
-                    cx.checkpoint().map_err(|_| McpError::request_cancelled())
-                })
-                .await?;
-            parameters = mrtr_retry_parameters(
-                original_parameters.clone(),
-                input_required,
-                input_responses,
-            )?;
-        }
+                    None => self.request_final_core(cx, method, parameters).await?,
+                };
+                check_mrtr_operation(cx, cancellation, deadline)?;
+                let Some(input_required) = mrtr_input_required_for_method(method, &result) else {
+                    return Ok(result);
+                };
+                driver.begin_continuation()?;
+                driver.admit_input_responses(
+                    input_required
+                        .input_requests()
+                        .map_or(0, |inputs| inputs.members().len()),
+                )?;
+                let input_responses = handlers
+                    .respond_to_input_required_async(cx, input_required, || {
+                        check_mrtr_operation(cx, cancellation, deadline)
+                    })
+                    .await?;
+                parameters = mrtr_retry_parameters(
+                    original_parameters.clone(),
+                    input_required,
+                    input_responses,
+                )?;
+            }
+        })
+        .await
     }
 
     /// Sends one raw final extension request after exact bilateral admission.
@@ -14547,9 +14924,21 @@ impl HttpClient {
     fn final_cache_key(
         &self,
         method: &str,
-        semantic_parameters: serde_json::Value,
+        mut semantic_parameters: serde_json::Value,
         result_set: FinalCacheResultSet,
     ) -> Result<FinalCacheKey, HttpClientError> {
+        // Cursor bytes have their own presence-aware identity below. Keep the
+        // query projection independent of the page so a rejected continuation
+        // can be tied to the exact cached query that supplied it.
+        let cursor = semantic_parameters
+            .get("cursor")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        if cursor.is_some()
+            && let Some(parameters) = semantic_parameters.as_object_mut()
+        {
+            parameters.remove("cursor");
+        }
         let normalized_capabilities =
             serde_json::to_string(&self.client_capabilities).map_err(|_| {
                 HttpClientError::CoreResult(McpError::internal_error(
@@ -14582,10 +14971,7 @@ impl HttpClient {
             extension_settings,
             method,
             semantic_projection,
-            semantic_parameters
-                .get("cursor")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
+            cursor,
             FINAL_CACHE_POLICY_REVISION,
             FINAL_CACHE_EXTENSION_REVISION,
             FINAL_CACHE_REPRESENTATION_POLICY_REVISION,
@@ -15995,6 +16381,12 @@ impl Client {
     ///
     /// Returns an error if initialization fails.
     pub fn ensure_initialized(&mut self) -> McpResult<()> {
+        self.ensure_initialized_until(None)
+    }
+
+    /// Includes a fresh or retained handshake in the caller's original
+    /// operation deadline without changing the connection timeout policy.
+    fn ensure_initialized_until(&mut self, operation_deadline: Option<Instant>) -> McpResult<()> {
         if let Err(error) = self.drain_completed_reverse_callbacks() {
             return Err(self.terminate_connection(error));
         }
@@ -16009,11 +16401,26 @@ impl Client {
             return Err(error.clone());
         }
 
+        let cx = self.cx.clone();
+        if let Some(deadline) = operation_deadline {
+            if self.pending_initialization.is_none() {
+                if Instant::now() >= deadline {
+                    return Err(request_timeout_error(RequestTimeoutSource::Absolute));
+                }
+                self.pending_initialization = Some(
+                    self.start_initialization(&cx, Some(deadline))
+                        .map_err(|error| self.record_initialization_failure(error))?,
+                );
+            }
+            if let Some(pending) = self.pending_initialization.as_mut() {
+                pending.deadlines.cap_absolute_at(deadline);
+            }
+        }
+
         // An async first-use future may have been dropped after committing
         // the handshake. Synchronous callers resume its original waiter and
         // deadline, rather than issuing a second initialize/discover request.
         if self.pending_initialization.is_some() {
-            let cx = self.cx.clone();
             loop {
                 match self.poll_pending_initialization(&cx, false, false) {
                     Ok(std::task::Poll::Ready(None)) => return Ok(()),
@@ -16113,7 +16520,7 @@ impl Client {
                 return Err(McpError::request_cancelled());
             }
             if self.pending_initialization.is_none() {
-                self.pending_initialization = Some(self.start_initialization(cx)?);
+                self.pending_initialization = Some(self.start_initialization(cx, None)?);
             }
             if let std::task::Poll::Ready(result) =
                 self.poll_pending_initialization(cx, auto_probe, true)?
@@ -16136,8 +16543,11 @@ impl Client {
         }
     }
 
-    #[cfg(unix)]
-    fn start_initialization(&mut self, cx: &Cx) -> McpResult<PendingClientInitialization> {
+    fn start_initialization(
+        &mut self,
+        cx: &Cx,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<PendingClientInitialization> {
         self.timeout_policy.validate()?;
         let modern = self.handshake_era() == ProtocolEra::Modern2026;
         let (method, params) = if modern {
@@ -16164,6 +16574,9 @@ impl Client {
             })?;
             ("initialize", self.prepare_request_parameters(params)?)
         };
+        if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(request_timeout_error(RequestTimeoutSource::Absolute));
+        }
         let id = self.next_request_id()?;
         let request_id = RequestId::Number(
             i64::try_from(id).expect("request ID allocator enforces the i64 bound"),
@@ -16173,8 +16586,11 @@ impl Client {
         if let Err(error) = self.send_to_server_with_cx(cx, &JsonRpcMessage::Request(request)) {
             return Err(self.record_send_failure(Some(&request_id), error));
         }
-        let deadlines = RequestDeadlines::start_at(self.timeout_policy, Instant::now())
+        let mut deadlines = RequestDeadlines::start_at(self.timeout_policy, Instant::now())
             .map_err(|error| self.finish_committed_request_locally(&request_id, error))?;
+        if let Some(deadline) = operation_deadline {
+            deadlines.cap_absolute_at(deadline);
+        }
         Ok(PendingClientInitialization {
             waiter,
             deadlines,
@@ -19197,6 +19613,7 @@ impl Client {
 
         self.drain_final_cache_invalidations(pagination)?;
         let key = self.final_cache_key(method, semantic_parameters, cursor, result_set)?;
+        let cursor_origin = self.final_result_cache.capture_cursor_origin(&key);
         // A present nextCursor requires another peer page even when its opaque
         // token repeats. Reusing a prior page here can trap a stateful cursor
         // in a cached loop. Only the first page of an automatic traversal may
@@ -19230,9 +19647,10 @@ impl Client {
                 let result = match fetch(self) {
                     Ok(result) => result,
                     Err(error) => {
-                        if cursor.is_some() && error.code == McpErrorCode::InvalidParams {
-                            self.final_result_cache
-                                .invalidate_result_set(key.result_set());
+                        if error.code == McpErrorCode::InvalidParams
+                            && let Some(origin) = cursor_origin
+                        {
+                            self.final_result_cache.invalidate_rejected_cursor(origin);
                         }
                         return Err(error);
                     }
@@ -19321,6 +19739,115 @@ impl Client {
             }
             self.final_result_cache.clear();
             Ok(())
+        }
+    }
+
+    fn collect_stdio_catalog_with_budget(
+        &mut self,
+        result_set: FinalCacheResultSet,
+        initial_cursor: Option<String>,
+        include_tags: Option<Vec<String>>,
+        exclude_tags: Option<Vec<String>>,
+        mut budget: PaginationBudget,
+    ) -> McpResult<CollectedCatalog> {
+        if initial_cursor.is_some() {
+            return Err(McpError::invalid_params(
+                "Complete catalog collection requires an absent initial cursor",
+            ));
+        }
+        let method = match &result_set {
+            FinalCacheResultSet::Tools => "tools/list",
+            FinalCacheResultSet::Resources => "resources/list",
+            FinalCacheResultSet::ResourceTemplates => "resources/templates/list",
+            FinalCacheResultSet::Prompts => "prompts/list",
+            FinalCacheResultSet::ServerDiscovery | FinalCacheResultSet::Resource(_) => {
+                return Err(McpError::invalid_params(
+                    "Automatic pagination requires a catalog result set",
+                ));
+            }
+        };
+        if self.cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        let wall_now = Instant::now();
+        if let Some(deadline) = self.cx.budget().deadline {
+            let remaining = Duration::from_nanos(deadline.duration_since(self.cx.now()))
+                .min(budget.deadline.saturating_duration_since(wall_now));
+            budget.deadline = budget.deadline.min(wall_now + remaining);
+        }
+        budget.check_deadline()?;
+        self.ensure_initialized_until(Some(budget.deadline))?;
+
+        let mut rebuilds = 0;
+        'rebuild: loop {
+            let mut pages = Vec::new();
+            let mut item_count = 0;
+            let mut cursor: Option<String> = None;
+            let mut baseline = None;
+            loop {
+                if self.cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
+                budget.begin_page()?;
+                let page = self.request_paginated_catalog_page(
+                    result_set.clone(),
+                    cursor.as_deref(),
+                    include_tags.as_ref(),
+                    exclude_tags.as_ref(),
+                    &budget,
+                );
+                if self.cx.checkpoint().is_err() {
+                    return Err(McpError::request_cancelled());
+                }
+                let result = match page {
+                    Err(error)
+                        if cursor.is_some()
+                            && error.code == McpErrorCode::InvalidParams
+                            && rebuilds == 0 =>
+                    {
+                        self.final_result_cache.invalidate_result_set(&result_set);
+                        rebuilds += 1;
+                        continue 'rebuild;
+                    }
+                    other => other?,
+                };
+                let (page_items, next_cursor) = catalog_page(method, &result)?;
+                budget.account_core_page(&result, page_items)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
+                // A cached prefix may belong to an expired server snapshot.
+                // Only a terminal cached first page can satisfy a collection;
+                // the bounded rebuild bypasses cache for every later page.
+                let cached_prefix = budget.pages == 1
+                    && next_cursor.is_some()
+                    && self
+                        .last_final_cache_page
+                        .as_ref()
+                        .is_some_and(|state| state.miss.is_none());
+                let changed = self.final_list_restart_needed(&result_set, &mut baseline);
+                if cached_prefix || changed {
+                    self.final_result_cache.invalidate_result_set(&result_set);
+                    if rebuilds != 0 {
+                        return Err(McpError::invalid_request(
+                            FINAL_CACHE_LIST_RESTART_LIMIT_ERROR,
+                        ));
+                    }
+                    rebuilds += 1;
+                    continue 'rebuild;
+                }
+                // account_core_page already bounds the aggregate count,
+                // including every page discarded by the one allowed rebuild.
+                item_count += page_items;
+                pages.push(result);
+                cursor = next_cursor;
+                budget.check_deadline()?;
+                if cursor.is_none() {
+                    return Ok(CollectedCatalog {
+                        method,
+                        pages,
+                        item_count,
+                    });
+                }
+            }
         }
     }
 
@@ -20495,6 +21022,43 @@ impl Client {
         })
     }
 
+    /// Fetches one catalog page directly from the selected peer.
+    ///
+    /// Accepts only `tools/list`, `resources/list`, `resources/templates/list`,
+    /// and `prompts/list`. This integration hook preserves an opaque cursor
+    /// exactly, including an empty string, and neither reads nor populates the
+    /// complete-result cache. A caller materializing a catalog can therefore
+    /// follow repeated cursors without replaying an earlier cached page.
+    ///
+    /// The connection retains its ordinary request deadline, cancellation,
+    /// notification routing and selected-era response validation. Callers own
+    /// the bounds spanning multiple pages.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported method, failed initialization or
+    /// request, or a response contradicting the selected-era result contract.
+    pub fn list_catalog_page_uncached(
+        &mut self,
+        method: &str,
+        cursor: Option<&str>,
+    ) -> McpResult<CoreResult> {
+        if !matches!(
+            method,
+            "tools/list" | "resources/list" | "resources/templates/list" | "prompts/list"
+        ) {
+            return Err(McpError::invalid_params(
+                "Uncached catalog requests require a list method",
+            ));
+        }
+        self.ensure_initialized()?;
+        let parameters = cursor.map_or_else(
+            || serde_json::json!({}),
+            |cursor| serde_json::json!({ "cursor": cursor }),
+        );
+        self.send_typed_core_request(method, parameters)
+    }
+
     /// Lists one page of tools and returns its negotiated core result.
     ///
     /// The caller supplies the opaque peer cursor, if any. A modern session
@@ -20675,11 +21239,87 @@ impl Client {
         self.request_core_with_cancellation(cx, cancellation, "prompts/list", parameters, |_| {})
     }
 
+    /// Collects every tools page while preserving exact selected-era results.
+    ///
+    /// `params.cursor` must be absent. Include/exclude filters and this client's
+    /// configured identity survive every request. Empty and repeated cursors
+    /// require another peer request; only an absent cursor completes the list.
+    ///
+    /// The entire operation, including discarded rebuild pages, is limited to
+    /// 1,024 pages, 100,000 entries, 64 MiB of encoded results, 4 KiB cursors, and
+    /// the earliest of five minutes, the configured absolute request timeout,
+    /// or the connection's caller deadline. Caller cancellation is checked
+    /// before every page and during the existing request wait.
+    ///
+    /// A cached terminal first page may satisfy the collection. A cached
+    /// prefix, rejected continuation cursor, or observed generation/scope
+    /// change discards the traversal and permits one fresh cursorless rebuild.
+    /// Each returned page retains its TTL, cache scope, metadata, and unknown
+    /// result members, including their original number lexemes. This local
+    /// consistency policy does not establish a server snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without a partial collection if a request, bound,
+    /// cancellation, or selected-era result admission fails.
+    pub fn list_all_tools(&mut self, params: ListToolsParams) -> McpResult<CollectedCatalog> {
+        self.collect_stdio_catalog_with_budget(
+            FinalCacheResultSet::Tools,
+            params.cursor,
+            params.include_tags,
+            params.exclude_tags,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+    }
+
+    /// Collects all resource pages with the bounds and consistency policy of
+    /// [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub fn list_all_resources(
+        &mut self,
+        params: ListResourcesParams,
+    ) -> McpResult<CollectedCatalog> {
+        self.collect_stdio_catalog_with_budget(
+            FinalCacheResultSet::Resources,
+            params.cursor,
+            params.include_tags,
+            params.exclude_tags,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+    }
+
+    /// Collects all resource-template pages with the bounds and consistency
+    /// policy of [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub fn list_all_resource_templates(
+        &mut self,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CollectedCatalog> {
+        self.collect_stdio_catalog_with_budget(
+            FinalCacheResultSet::ResourceTemplates,
+            params.cursor,
+            params.include_tags,
+            params.exclude_tags,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+    }
+
+    /// Collects all prompt pages with the bounds and consistency policy of
+    /// [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub fn list_all_prompts(&mut self, params: ListPromptsParams) -> McpResult<CollectedCatalog> {
+        self.collect_stdio_catalog_with_budget(
+            FinalCacheResultSet::Prompts,
+            params.cursor,
+            params.include_tags,
+            params.exclude_tags,
+            PaginationBudget::for_request(self.timeout_policy),
+        )
+    }
+
     /// Lists available tools.
     ///
     /// This convenience API follows peer cursors and returns the flattened
     /// legacy-compatible tool vector. Use [`Self::list_tools_typed`] to retain
-    /// the negotiated, single-page core result.
+    /// one negotiated core result or [`Self::list_all_tools`] to retain every
+    /// typed page.
     ///
     /// The complete traversal, including its one permitted cache rebuild, has
     /// bounded page/item/byte counts and an absolute response-wait deadline of
@@ -23950,10 +24590,14 @@ impl Client {
                     return Ok(result);
                 }
                 driver.begin_continuation()?;
+                driver.admit_input_responses(
+                    input_required
+                        .input_requests()
+                        .map_or(0, |inputs| inputs.members().len()),
+                )?;
                 let responses = handlers
                     .respond_to_input_required_async(cx, input_required, check)
                     .await?;
-                driver.admit_input_responses(responses.len())?;
                 parameters =
                     mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
             }
@@ -24686,6 +25330,627 @@ mod tests {
                 );
             }
             client.close(&cx).await.expect("close rejected raw client");
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn websocket_response_wait_timeout_reuse_probe(
+        policy: RequestTimeoutPolicy,
+        expected_source: &'static str,
+        send_late_response: bool,
+    ) {
+        let cx = Cx::current().expect("test runtime installs caller context");
+        let (client_io, server_io) = async_websocket_pair();
+        let mut peer = cx
+            .spawn(move |peer_cx| async move {
+                let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                let JsonRpcMessage::Request(discover) =
+                    server.recv(&peer_cx).await.expect("receive discovery")
+                else {
+                    panic!("client must discover before ordinary requests");
+                };
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            discover.id.expect("discovery has an ID"),
+                            async_modern_discovery_result(),
+                        )),
+                    )
+                    .await
+                    .expect("send discovery result");
+                let JsonRpcMessage::Request(control) =
+                    server.recv(&peer_cx).await.expect("receive timely request")
+                else {
+                    panic!("timely operation must be a request");
+                };
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            control.id.expect("timely request has an ID"),
+                            serde_json::json!({"timely": true}),
+                        )),
+                    )
+                    .await
+                    .expect("send timely response");
+                let JsonRpcMessage::Request(pending) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive pending request")
+                else {
+                    panic!("pending operation must be a request");
+                };
+                let pending_id = pending.id.expect("pending request has an ID");
+                // Deliberately send no response until the client's own policy
+                // selects a timeout; no caller cancellation wakes this wait.
+                let JsonRpcMessage::Request(cancellation) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive timeout cancellation")
+                else {
+                    panic!("timeout must send one cancellation notification");
+                };
+                let CancellationWireMessage::Modern2026 { params, .. } =
+                    CancellationWireMessage::decode(
+                        ProtocolEra::Modern2026,
+                        CancellationSender::Client,
+                        &cancellation,
+                    )
+                    .expect("timeout cancellation is admitted")
+                else {
+                    panic!("modern connection must send modern cancellation");
+                };
+                assert!(params.request_id.correlates_with(&pending_id));
+                let JsonRpcMessage::Request(next) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive request after timeout")
+                else {
+                    panic!("connection reuse must send a request");
+                };
+                assert_eq!(next.method, "tools/list", "no duplicate cancellation");
+                let next_id = next.id.expect("reused request has an ID");
+                assert!(!next_id.correlates_with(&pending_id));
+                if send_late_response {
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                pending_id,
+                                serde_json::json!({"late": true}),
+                            )),
+                        )
+                        .await
+                        .expect("send late timed-out response");
+                }
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            next_id,
+                            serde_json::json!({"reused": true}),
+                        )),
+                    )
+                    .await
+                    .expect("send next correlated response");
+                assert!(matches!(
+                    server.recv(&peer_cx).await,
+                    Err(TransportError::Closed)
+                ));
+            })
+            .expect("spawn timeout peer");
+        let mut client = WebSocketClient::connect_with_cx(
+            &cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities::default(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .expect("connect before response-wait probe");
+        client.request_timeout_policy = policy;
+        let parameters = client
+            .with_modern_request_metadata(serde_json::json!({}))
+            .expect("construct ordinary request parameters");
+        let timely = client
+            .request_with_raw_result(&cx, "tools/list", Some(parameters.clone()))
+            .await
+            .expect("response before the deadline succeeds");
+        assert_eq!(
+            timely.response.result,
+            Some(serde_json::json!({"timely": true}))
+        );
+        let error = asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(2),
+            client.request_with_raw_result(&cx, "tools/list", Some(parameters.clone())),
+        )
+        .await
+        .expect("response policy wakes a silent peer wait")
+        .expect_err("silent request must expire");
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource": expected_source}))
+        );
+        assert!(
+            !cx.is_cancel_requested(),
+            "timeout does not cancel the caller"
+        );
+        assert!(
+            !client.closed,
+            "successful timeout cleanup keeps the connection"
+        );
+        assert!(
+            client.receiver.is_some(),
+            "timeout retains the native reader"
+        );
+        assert_eq!(client.retired_requests.len(), 1, "one exact ID is retired");
+        let reused = client
+            .request_with_raw_result(&cx, "tools/list", Some(parameters))
+            .await
+            .expect("next request succeeds with a silent or late previous response");
+        assert_eq!(
+            reused.response.result,
+            Some(serde_json::json!({"reused": true}))
+        );
+        assert_eq!(
+            client.retired_requests.len(),
+            usize::from(!send_late_response),
+            "only the exact late response consumes its tombstone",
+        );
+        client
+            .close(&cx)
+            .await
+            .expect("close reused timeout client");
+        assert!(matches!(peer.join(&cx).await, Ok(())));
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_idle_timeout_retires_without_poisoning_reuse() {
+        run_test(|| async {
+            for send_late_response in [false, true] {
+                websocket_response_wait_timeout_reuse_probe(
+                    RequestTimeoutPolicy::new(
+                        Duration::from_millis(40),
+                        Duration::from_millis(400),
+                    )
+                    .expect("valid idle-first policy"),
+                    "idle",
+                    send_late_response,
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_absolute_timeout_retires_without_poisoning_reuse() {
+        run_test(|| async {
+            for send_late_response in [false, true] {
+                websocket_response_wait_timeout_reuse_probe(
+                    RequestTimeoutPolicy::new(
+                        Duration::from_millis(400),
+                        Duration::from_millis(40),
+                    )
+                    .expect("valid absolute-first policy"),
+                    "absolute",
+                    send_late_response,
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn websocket_response_wait_progress_probe(
+        progress: &[(serde_json::Value, u64)],
+        policy: RequestTimeoutPolicy,
+        expected_timeout: Option<&'static str>,
+        null_optional: Option<&'static str>,
+        request_marker: serde_json::Value,
+    ) {
+        let cx = Cx::current().expect("test runtime installs caller context");
+        let (client_io, server_io) = async_websocket_pair();
+        let sent_progress = progress.to_vec();
+        let peer_marker = request_marker.clone();
+        let mut peer = cx
+            .spawn(move |peer_cx| async move {
+                let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                let JsonRpcMessage::Request(discover) =
+                    server.recv(&peer_cx).await.expect("receive discovery")
+                else {
+                    panic!("client discovery must be a request");
+                };
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            discover.id.expect("discovery ID"),
+                            async_modern_discovery_result(),
+                        )),
+                    )
+                    .await
+                    .expect("send discovery result");
+                let JsonRpcMessage::Request(request) = server
+                    .recv(&peer_cx)
+                    .await
+                    .expect("receive progressed request")
+                else {
+                    panic!("progress owner must be a request");
+                };
+                assert_eq!(
+                    request
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("_meta"))
+                        .and_then(|meta| meta.get("progressToken")),
+                    Some(&peer_marker),
+                );
+                let request_id = request.id.expect("progress owner ID");
+                for (marker, value) in sent_progress {
+                    asupersync::time::sleep(peer_cx.now(), Duration::from_millis(120)).await;
+                    let mut params =
+                        serde_json::json!({"progressToken": marker, "progress": value});
+                    if let Some(member) = null_optional {
+                        params[member] = serde_json::Value::Null;
+                    }
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                                NOTIFICATIONS_PROGRESS,
+                                Some(params),
+                            )),
+                        )
+                        .await
+                        .expect("send admitted progress notification");
+                }
+                asupersync::time::sleep(peer_cx.now(), Duration::from_millis(120)).await;
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            request_id.clone(),
+                            serde_json::json!({"progressed": true}),
+                        )),
+                    )
+                    .await
+                    .expect("send progressed response");
+                if expected_timeout.is_some() {
+                    let JsonRpcMessage::Request(cancellation) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("receive progress-policy cancellation")
+                    else {
+                        panic!("expired progress wait must cancel");
+                    };
+                    let CancellationWireMessage::Modern2026 { params, .. } =
+                        CancellationWireMessage::decode(
+                            ProtocolEra::Modern2026,
+                            CancellationSender::Client,
+                            &cancellation,
+                        )
+                        .expect("decode progress-policy cancellation")
+                    else {
+                        panic!("progress owner negotiated modern cancellation");
+                    };
+                    assert!(params.request_id.correlates_with(&request_id));
+                    let JsonRpcMessage::Request(next) =
+                        server.recv(&peer_cx).await.expect("receive reused request")
+                    else {
+                        panic!("reuse must be a request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                next.id.expect("reused request ID"),
+                                serde_json::json!({"reused": true}),
+                            )),
+                        )
+                        .await
+                        .expect("send reused result after late progressed result");
+                }
+                assert!(matches!(
+                    server.recv(&peer_cx).await,
+                    Err(TransportError::Closed)
+                ));
+            })
+            .expect("spawn progress-policy peer");
+        let mut client = WebSocketClient::connect_with_cx(
+            &cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities::default(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .expect("connect progress-policy client");
+        client.request_timeout_policy = policy;
+        let parameters = client
+            .with_modern_request_metadata(serde_json::json!({
+                "_meta": {"progressToken": request_marker}
+            }))
+            .expect("build progress-owned request");
+        let result = asupersync::time::timeout(
+            cx.now(),
+            Duration::from_secs(2),
+            client.request_with_raw_result(&cx, "tools/list", Some(parameters)),
+        )
+        .await
+        .expect("progress policy must bound the request");
+        if let Some(expected_source) = expected_timeout {
+            let error = result.expect_err("ineligible progress cannot extend the selected limit");
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": expected_source}))
+            );
+            client.request_timeout_policy = RequestTimeoutPolicy::default();
+            let next_parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("build request with no previous progress authority");
+            let reused = client
+                .request_with_raw_result(&cx, "tools/list", Some(next_parameters))
+                .await
+                .expect("late progressed response is retired before reuse");
+            assert_eq!(
+                reused.response.result,
+                Some(serde_json::json!({"reused": true}))
+            );
+            assert!(client.retired_requests.is_empty());
+        } else {
+            let response =
+                result.expect("matching increasing progress extends only the idle timer");
+            assert_eq!(
+                response.response.result,
+                Some(serde_json::json!({"progressed": true}))
+            );
+            assert!(
+                client.retired_requests.is_empty(),
+                "timely completion is not retired"
+            );
+        }
+        assert_eq!(
+            client.take_final_progress_notifications().len(),
+            progress.len()
+        );
+        client
+            .close(&cx)
+            .await
+            .expect("close progress-policy client");
+        assert!(matches!(peer.join(&cx).await, Ok(())));
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_matching_progress_extends_only_idle() {
+        run_test(|| async {
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 2),
+                    (serde_json::json!("active-progress"), 3),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid progress policy"),
+                None,
+                None,
+                serde_json::json!("active-progress"),
+            )
+            .await;
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 2),
+                    (serde_json::json!("active-progress"), 3),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid disabled-progress policy")
+                    .reset_idle_on_matching_progress(false),
+                Some("idle"),
+                None,
+                serde_json::json!("active-progress"),
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_unrelated_or_nonmonotonic_progress_cannot_extend_idle() {
+        run_test(|| async {
+            for progress in [
+                &[
+                    (serde_json::json!("foreign-progress"), 1),
+                    (serde_json::json!("foreign-progress"), 2),
+                    (serde_json::json!("foreign-progress"), 3),
+                ][..],
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 0),
+                ][..],
+            ] {
+                websocket_response_wait_progress_probe(
+                    progress,
+                    RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                        .expect("valid progress rejection policy"),
+                    Some("idle"),
+                    None,
+                    serde_json::json!("active-progress"),
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_progress_cannot_extend_absolute_deadline() {
+        run_test(|| async {
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("active-progress"), 1),
+                    (serde_json::json!("active-progress"), 2),
+                    (serde_json::json!("active-progress"), 3),
+                    (serde_json::json!("active-progress"), 4),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(420))
+                    .expect("valid absolute progress policy"),
+                Some("absolute"),
+                None,
+                serde_json::json!("active-progress"),
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_null_progress_members_cannot_extend_idle() {
+        run_test(|| async {
+            for member in ["total", "message", "_meta"] {
+                websocket_response_wait_progress_probe(
+                    &[
+                        (serde_json::json!("active-progress"), 1),
+                        (serde_json::json!("active-progress"), 2),
+                        (serde_json::json!("active-progress"), 3),
+                    ],
+                    RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                        .expect("valid malformed-progress policy"),
+                    Some("idle"),
+                    Some(member),
+                    serde_json::json!("active-progress"),
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_numeric_progress_aliases_preserve_token_type() {
+        run_test(|| async {
+            websocket_response_wait_progress_probe(
+                &[
+                    (
+                        serde_json::from_str("4.2e1").expect("integral exponent token"),
+                        1,
+                    ),
+                    (
+                        serde_json::from_str("420e-1").expect("integral scaled token"),
+                        2,
+                    ),
+                    (
+                        serde_json::from_str("42.0").expect("integral decimal token"),
+                        3,
+                    ),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid numeric-token policy"),
+                None,
+                None,
+                serde_json::json!(42),
+            )
+            .await;
+            websocket_response_wait_progress_probe(
+                &[
+                    (serde_json::json!("42"), 1),
+                    (serde_json::json!("42"), 2),
+                    (serde_json::json!("42"), 3),
+                ],
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_secs(1))
+                    .expect("valid numeric-versus-string policy"),
+                Some("idle"),
+                None,
+                serde_json::json!(42),
+            )
+            .await;
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_async_response_wait_timeout_preserves_cancellation_send_failure() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = stalled_cancellation_async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) =
+                        server.recv(&peer_cx).await.expect("receive discovery")
+                    else {
+                        panic!("discovery must be a request");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("send discovery result");
+                    let JsonRpcMessage::Request(request) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("receive committed request")
+                    else {
+                        panic!("pending operation must be a request");
+                    };
+                    assert_eq!(request.method, "tools/list");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn unsendable-cancellation peer");
+            let mut client = WebSocketClient::connect_with_cx(
+                &cx,
+                ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                async_websocket_client_info(),
+                ClientCapabilities::default(),
+                AsyncWsClientTransport::from_upgraded(client_io),
+            )
+            .await
+            .expect("connect before timeout cleanup failure");
+            client.request_timeout_policy =
+                RequestTimeoutPolicy::from_application_timeout_ms(40).expect("valid short policy");
+            let parameters = client
+                .with_modern_request_metadata(serde_json::json!({}))
+                .expect("construct pending request parameters");
+            let error = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(2),
+                client.request_with_raw_result(&cx, "tools/list", Some(parameters)),
+            )
+            .await
+            .expect("response timeout and cancellation cleanup are bounded")
+            .expect_err("stalled cancellation delivery is a connection failure");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, "Request timed out");
+            assert!(
+                error
+                    .data
+                    .as_ref()
+                    .is_none_or(|data| data.get("timeoutSource").is_none()),
+                "cleanup transport failure must not be replaced by an ordinary response timeout",
+            );
+            assert!(
+                client.closed,
+                "failed cancellation commit prevents connection reuse"
+            );
+            assert!(
+                client.close_settled,
+                "transport failure settles native teardown"
+            );
+            assert!(matches!(peer.join(&cx).await, Ok(())));
         });
     }
 
@@ -26943,6 +28208,269 @@ mod tests {
 
     #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
     #[test]
+    fn websocket_async_auto_modern_retains_mrtr_handlers_without_legacy_dispatch() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives Auto discovery")
+                    else {
+                        panic!("Auto must send discovery first");
+                    };
+                    assert_eq!(discover.method, SERVER_DISCOVER_METHOD);
+                    let capabilities = &discover.params.as_ref().expect("discovery parameters")
+                        ["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
+                    for capability in ["sampling", "roots", "elicitation"] {
+                        assert!(capabilities[capability].is_object());
+                    }
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.expect("discovery has an ID"),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .expect("peer selects modern");
+                    let JsonRpcMessage::Request(initial) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives initial tool call")
+                    else {
+                        panic!("initial tool call must be a request");
+                    };
+                    assert_eq!(initial.method, "tools/call");
+                    let initial_id = initial.id.expect("initial tool call has an ID");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initial_id.clone(),
+                                serde_json::json!({
+                                    "resultType": "input_required",
+                                    "requestState": "auto-modern-round",
+                                    "inputRequests": {
+                                        "sampling": {
+                                            "method": "sampling/createMessage",
+                                            "params": {
+                                                "messages": [{"role": "user", "content": {"type": "text", "text": "hello"}}],
+                                                "maxTokens": 8
+                                            }
+                                        },
+                                        "roots": {"method": "roots/list"},
+                                        "elicitation": {
+                                            "method": "elicitation/create",
+                                            "params": {
+                                                "mode": "form",
+                                                "message": "Choose a name",
+                                                "requestedSchema": {
+                                                    "type": "object",
+                                                    "properties": {"name": {"type": "string"}},
+                                                    "required": ["name"]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("peer requests all three modern inputs");
+                    let JsonRpcMessage::Request(retry) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives MRTR continuation")
+                    else {
+                        panic!("modern callbacks must produce a continuation request");
+                    };
+                    assert_eq!(retry.method, "tools/call");
+                    let retry_id = retry.id.expect("MRTR continuation has an ID");
+                    assert!(!retry_id.correlates_with(&initial_id));
+                    let parameters = retry.params.expect("MRTR continuation parameters");
+                    assert_eq!(parameters["name"], "auto-modern");
+                    assert_eq!(parameters["arguments"], serde_json::json!({"value": 7}));
+                    assert_eq!(parameters["requestState"], "auto-modern-round");
+                    let responses = parameters["inputResponses"]
+                        .as_object()
+                        .expect("MRTR response map");
+                    assert_eq!(responses.len(), 3);
+                    assert_eq!(responses["sampling"]["model"], "auto-modern-model");
+                    assert_eq!(responses["sampling"]["content"]["text"], "sampled");
+                    assert_eq!(responses["roots"]["roots"][0]["uri"], "file:///workspace");
+                    assert_eq!(responses["elicitation"]["action"], "accept");
+                    assert_eq!(responses["elicitation"]["content"]["name"], "Ada");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                retry_id,
+                                serde_json::json!({"resultType": "complete", "content": [], "isError": false}),
+                            )),
+                        )
+                        .await
+                        .expect("peer completes the modern operation");
+
+                    let JsonRpcMessage::Request(next) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives next modern request")
+                    else {
+                        panic!("next modern operation must be a request");
+                    };
+                    assert_eq!(next.method, "tools/list");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "sampling/createMessage",
+                                Some(serde_json::json!({"messages": [], "maxTokens": 1})),
+                                RequestId::Number(99),
+                            )),
+                        )
+                        .await
+                        .expect("peer sends forbidden exact-legacy reverse RPC");
+                    let JsonRpcMessage::Response(rejected) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("peer receives the exact-legacy request refusal")
+                    else {
+                        panic!("wrong-era reverse request must receive an error response");
+                    };
+                    assert!(rejected.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(99))));
+                    assert_eq!(rejected.error.expect("wrong-era request error").code, (-32602).into());
+                    assert!(rejected.result.is_none());
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                next.id.expect("tools/list ID"),
+                                async_modern_tools_list_result(),
+                            )),
+                        )
+                        .await
+                        .expect("ordinary modern operation survives rejected reverse RPC");
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .expect("spawn Auto modern MRTR peer");
+
+            let modern_calls = Arc::new([
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ]);
+            let legacy_calls = Arc::new(AtomicUsize::new(0));
+            let handlers = ReverseRequestHandlers::new()
+                .with_sampling_create_message({
+                    let calls = Arc::clone(&legacy_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(CreateMessageResult::text("legacy", "legacy")) })
+                    }
+                })
+                .with_modern_sampling_create_message({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, params| {
+                        calls[0].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            assert_eq!(params.max_tokens.to_string(), "8");
+                            Ok(FinalCreateMessageResult {
+                                content: fastmcp_protocol::FinalSamplingMessageContent::Block(
+                                    fastmcp_protocol::common_types::SamplingContentBlock::Text {
+                                        text: "sampled".to_owned(),
+                                        annotations: None,
+                                        meta: None,
+                                        additional: BTreeMap::new(),
+                                    },
+                                ),
+                                model: "auto-modern-model".to_owned(),
+                                role: fastmcp_protocol::Role::Assistant,
+                                stop_reason: None,
+                                meta: None,
+                            })
+                        })
+                    }
+                })
+                .with_modern_roots_list({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls[1].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(FinalEmbeddedRootsListResult {
+                                roots: vec![fastmcp_protocol::Root::new("file:///workspace")],
+                            })
+                        })
+                    }
+                })
+                .with_modern_elicitation_create({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, params| {
+                        calls[2].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            assert_eq!(params.message(), "Choose a name");
+                            Ok(ElicitResult::accept(HashMap::from([(
+                                "name".to_owned(),
+                                fastmcp_protocol::ElicitContentValue::String("Ada".to_owned()),
+                            )])))
+                        })
+                    }
+                });
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_counter = Arc::clone(&factory_calls);
+            let mut transport = Some(AsyncWsClientTransport::from_upgraded(client_io));
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::Auto))
+                .reverse_request_handlers(handlers)
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    factory_counter.fetch_add(1, Ordering::SeqCst);
+                    let first = transport.take();
+                    async move {
+                        first.ok_or_else(|| McpError::internal_error("unexpected Auto fallback"))
+                    }
+                })
+                .await
+                .expect("Auto retains modern callbacks from a mixed-era configuration");
+            assert_eq!(client.selected_protocol_era(), ProtocolEra::Modern2026);
+            let result = client
+                .call_tool(&cx, "auto-modern", serde_json::json!({"value": 7}))
+                .await
+                .expect("Auto modern tool call fulfills installed MRTR callbacks");
+            assert!(mrtr_input_required_for_method("tools/call", &result).is_none());
+            assert!(matches!(
+                result,
+                CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+            ));
+            for calls in modern_calls.iter() {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            let listed = client.list_tools(&cx, None).await.expect(
+                "Auto modern selection rejects legacy reverse RPC without invoking a callback",
+            );
+            assert!(matches!(
+                listed,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            for calls in modern_calls.iter() {
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+            assert!(!client.closed);
+            client.close(&cx).await.expect("close Auto modern client");
+            assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(all(feature = "legacy-2024-11-05", feature = "websocket-experimental"))]
+    #[test]
     fn websocket_async_auto_uses_one_fresh_legacy_transport_after_recognized_refusal() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
@@ -26998,6 +28526,10 @@ mod tests {
                     };
                     legacy_contacts_for_peer.fetch_add(1, Ordering::SeqCst);
                     assert_eq!(initialize.method, "initialize");
+                    let capabilities = &initialize.params.as_ref().expect("initialize parameters")
+                        ["capabilities"];
+                    assert!(capabilities["roots"].is_object());
+                    assert!(capabilities.get("elicitation").is_none());
                     server
                         .send(
                             &peer_cx,
@@ -27020,6 +28552,48 @@ mod tests {
                         panic!("exact legacy connection must send initialized notification");
                     };
                     assert_eq!(initialized.method, "notifications/initialized");
+                    let JsonRpcMessage::Request(completion) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("fresh legacy peer receives completion")
+                    else {
+                        panic!("legacy operation must be a request");
+                    };
+                    assert_eq!(completion.method, "completion/complete");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Request(JsonRpcRequest::new(
+                                "roots/list",
+                                Some(serde_json::json!({})),
+                                RequestId::Number(41),
+                            )),
+                        )
+                        .await
+                        .expect("fresh legacy peer requests roots");
+                    let JsonRpcMessage::Response(roots) = server
+                        .recv(&peer_cx)
+                        .await
+                        .expect("fresh legacy peer receives roots response")
+                    else {
+                        panic!("legacy callback must produce a JSON-RPC response");
+                    };
+                    assert!(roots.error.is_none());
+                    assert!(roots.id.as_ref().is_some_and(|id| id.correlates_with(&RequestId::Number(41))));
+                    assert_eq!(
+                        roots.result.expect("roots result")["roots"][0]["uri"],
+                        "file:///legacy"
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                completion.id.expect("completion ID"),
+                                serde_json::json!({"completion": {"values": ["staging"], "total": 1, "hasMore": false}}),
+                            )),
+                        )
+                        .await
+                        .expect("legacy operation completes after the retained callback");
                     assert!(matches!(
                         server.recv(&peer_cx).await,
                         Err(TransportError::Closed)
@@ -27032,10 +28606,39 @@ mod tests {
                 AsyncWsClientTransport::from_upgraded(first_client_io),
                 AsyncWsClientTransport::from_upgraded(legacy_client_io),
             ]);
-            let mut client = WebSocketClient::connect_auto_with_cx(
+            let legacy_calls = Arc::new(AtomicUsize::new(0));
+            let modern_calls = Arc::new(AtomicUsize::new(0));
+            let handlers = ReverseRequestHandlers::new()
+                .with_roots_list({
+                    let calls = Arc::clone(&legacy_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(ListRootsResult::new(vec![fastmcp_protocol::Root::new(
+                                "file:///legacy",
+                            )]))
+                        })
+                    }
+                })
+                .with_modern_roots_list({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+                    }
+                })
+                .with_modern_elicitation_create({
+                    let calls = Arc::clone(&modern_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(ElicitResult::accept(HashMap::new())) })
+                    }
+                });
+            let mut client = WebSocketClient::connect_auto_with_reverse_request_handlers_with_cx(
                 &cx,
                 async_websocket_client_info(),
                 ClientCapabilities::default(),
+                handlers,
                 move |_| {
                     factory_calls_for_factory.fetch_add(1, Ordering::SeqCst);
                     let transport = transports.pop_front();
@@ -27054,6 +28657,25 @@ mod tests {
             assert_eq!(factory_calls.load(Ordering::SeqCst), 2);
             assert_eq!(first_contacts.load(Ordering::SeqCst), 1);
             assert_eq!(legacy_contacts.load(Ordering::SeqCst), 1);
+            let result = client
+                .complete(
+                    &cx,
+                    CompletionParams {
+                        reference: CompletionReference::Prompt {
+                            name: "deploy".to_owned(),
+                        },
+                        argument: CompletionArgument {
+                            name: "environment".to_owned(),
+                            value: "sta".to_owned(),
+                        },
+                        context: None,
+                    },
+                )
+                .await
+                .expect("fresh legacy fallback retains only exact-legacy callback dispatch");
+            assert!(matches!(result, CoreResult::Legacy(LegacyCoreResult::Completion(_))));
+            assert_eq!(legacy_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(modern_calls.load(Ordering::SeqCst), 0);
             assert_eq!(
                 first_close_frames.load(Ordering::SeqCst),
                 1,
@@ -27098,9 +28720,13 @@ mod tests {
                             &peer_cx,
                             &JsonRpcMessage::Response(JsonRpcResponse::success(
                                 discover.id.expect("discovery has an ID"),
+                                // A missing server identity is admitted
+                                // since 0.12.0, so the result is made
+                                // invalid another way: `supportedVersions`
+                                // is a bare string, not an array.
                                 serde_json::json!({
                                     "resultType": "complete",
-                                    "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                                    "supportedVersions": MODERN_PROTOCOL_VERSION,
                                     "capabilities": {},
                                     "_meta": {},
                                     "ttlMs": 0,
@@ -27109,7 +28735,7 @@ mod tests {
                             )),
                         )
                         .await
-                        .expect("peer returns a structurally incomplete discovery result");
+                        .expect("peer returns a structurally invalid discovery result");
                     assert!(matches!(
                         server.recv(&peer_cx).await,
                         Err(TransportError::Closed)
@@ -27125,11 +28751,11 @@ mod tests {
                 AsyncWsClientTransport::from_upgraded(client_io),
             )
             .await
-            .expect_err("incomplete discovery remains a handshake error");
+            .expect_err("an invalid discovery result remains a handshake error");
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             assert_eq!(
                 error.message,
-                "Modern WebSocket discovery response has no server identity"
+                "Modern WebSocket discovery response has an invalid result"
             );
             assert_eq!(contacts.load(Ordering::SeqCst), 1);
             assert!(matches!(peer.join(&cx).await, Ok(())));
@@ -31269,7 +32895,7 @@ mod tests {
                 } else {
                     // The cancellation/deadline negatives deliberately never
                     // arrange a callback wake. The framework must observe them.
-                    if mode != 1 && mode != 2 {
+                    if mode != 1 && mode != 2 && mode != 7 {
                         *state.wake.lock().unwrap() = Some(cx.waker().clone());
                     }
                     std::task::Poll::Pending
@@ -31332,7 +32958,8 @@ mod tests {
         use std::task::Poll;
 
         // 0=success, 1=cancel, 2=deadline, 3=drop, 4=creation panic,
-        // 5=panic after await, 6=cancel in the completing callback poll.
+        // 5=panic after await, 6=cancel in the completing callback poll,
+        // 7=configured operation deadline with an unlimited caller context.
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
             .blocking_threads(0, 0)
@@ -31525,6 +33152,11 @@ mod tests {
                     state.permit.store(false, Ordering::Release);
                     let cancellation = if attempt == 0 { state.request_cancellation.clone() } else { McpRequestCancellation::new() };
                     let operation_cx = if current == 2 { &limited } else { &cx };
+                    client.request_timeout_policy = if current == 0 || current == 7 {
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap()
+                    } else {
+                        RequestTimeoutPolicy::default()
+                    };
                     let mut operation = Box::pin(invoke_http_mrtr_callback_probe(&mut client, operation_cx, &cancellation, verb, &target));
                     // Sibling runaway guard, raised with the accept guard
                     // above. Fixing only one of a pair leaves the other to
@@ -31553,7 +33185,7 @@ mod tests {
                             assert_eq!(std::thread::current().id(), worker);
                             match current {
                                 1 => { sibling_state.request_cancellation.cancel(); }
-                                2 => {}
+                                2 | 7 => {}
                                 _ => {
                                     sibling_state.permit.store(true, Ordering::Release);
                                     if let Some(wake) = sibling_state.wake.lock().unwrap().take() { wake.wake(); }
@@ -31572,11 +33204,15 @@ mod tests {
                     } else {
                         if let Some(result) = observed {
                             let HttpClientError::CoreResult(error) = result.unwrap_err() else { panic!("local callback errors retain their typed class"); };
-                            assert_eq!(error.code, if current == 4 || current == 5 { McpErrorCode::InternalError } else { McpErrorCode::RequestCancelled });
+                            assert_eq!(error.code, if current == 4 || current == 5 || current == 7 { McpErrorCode::InternalError } else { McpErrorCode::RequestCancelled });
                             if current == 4 || current == 5 { assert_eq!(error.message, "Client reverse request handler failed"); }
+                            if current == 7 {
+                                assert_eq!(error.message, "MRTR operation absolute deadline elapsed");
+                                assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                            }
                         }
                         assert!(retained.is_cancel_requested(), "abandoned callback token is cancelled");
-                        if (1..=3).contains(&current) {
+                        if (1..=3).contains(&current) || current == 7 {
                             assert_eq!(state.dropped.load(Ordering::Acquire), dropped_before + 1);
                             assert!(state.cancelled_at_drop.load(Ordering::Acquire), "token is cancelled before dropping callback state");
                         }
@@ -31605,6 +33241,597 @@ mod tests {
             for mode in 1..=6 {
                 public_http_mrtr_callback_caller_runtime_probe(verb, mode);
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_mrtr_configured_deadline_retires_stalled_callbacks_and_allows_reuse() {
+        for verb in 0..3 {
+            public_http_mrtr_callback_caller_runtime_probe(verb, 7);
+        }
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn installed_mrtr_roots_result(count: usize, state: &str) -> serde_json::Value {
+        let inputs: serde_json::Map<String, serde_json::Value> = (0..count)
+            .map(|index| {
+                (
+                    format!("root-{index}"),
+                    serde_json::json!({"method":"roots/list"}),
+                )
+            })
+            .collect();
+        serde_json::json!({
+            "resultType":"input_required",
+            "inputRequests":inputs,
+            "requestState":state,
+        })
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn installed_mrtr_counting_roots_handler(count: &Arc<AtomicUsize>) -> ReverseRequestHandlers {
+        let count = Arc::clone(count);
+        ReverseRequestHandlers::new().with_modern_roots_list(move |_cx, _token, _params| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+        })
+    }
+
+    #[cfg(unix)]
+    fn public_http_installed_mrtr_input_budget(second_round_count: usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let rejected = second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let discovery = read_http_cache_test_request(&mut stream);
+            assert_eq!(discovery["method"], "server/discover");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                modern_discovery_response("input-budget-peer", &[MODERN_PROTOCOL_VERSION])
+                    .as_bytes(),
+            );
+            for (id, count, state) in [
+                (2, MAX_MRTR_TOTAL_INPUT_RESPONSES / 2, "first"),
+                (3, second_round_count, "second"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], id);
+                assert_eq!(request["method"], "tools/call");
+                if id == 3 {
+                    assert_eq!(request["params"]["requestState"], "first");
+                    assert_eq!(
+                        request["params"]["inputResponses"]
+                            .as_object()
+                            .unwrap()
+                            .len(),
+                        64
+                    );
+                }
+                let response = serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":installed_mrtr_roots_result(count, state),
+                });
+                write_http_cache_test_response(
+                    &mut stream,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
+            }
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["id"], 4);
+            let result = if rejected {
+                assert_eq!(
+                    request["method"], "tools/list",
+                    "rejection must not send another continuation"
+                );
+                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
+            } else {
+                assert_eq!(request["method"], "tools/call");
+                assert_eq!(request["params"]["requestState"], "second");
+                assert_eq!(
+                    request["params"]["inputResponses"]
+                        .as_object()
+                        .unwrap()
+                        .len(),
+                    64
+                );
+                serde_json::json!({"resultType":"complete","content":[]})
+            };
+            let response = serde_json::json!({"jsonrpc":"2.0","id":4,"result":result});
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &serde_json::to_vec(&response).unwrap(),
+            );
+        });
+        let cx = Cx::for_request();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&format!("http://{address}/mcp")))
+                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let result =
+            http_test_runtime_block_on(client.call_tool(&cx, "budget-tool", serde_json::json!({})));
+        if rejected {
+            assert!(matches!(result, Err(HttpClientError::CoreResult(ref error))
+                if error.code == McpErrorCode::InvalidParams && error.message == "MRTR total input-response limit exceeded"));
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                64,
+                "rejected round must not invoke any host callback"
+            );
+            let reused = http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
+            assert!(matches!(
+                reused,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+            ));
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                MAX_MRTR_TOTAL_INPUT_RESPONSES
+            );
+        }
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_installed_mrtr_accepts_exact_cumulative_input_budget() {
+        public_http_installed_mrtr_input_budget(64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
+        public_http_installed_mrtr_input_budget(65);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn public_websocket_installed_mrtr_input_budget(second_round_count: usize) {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            for (id, count, state) in [(2, 64, "first"), (3, second_round_count, "second")] {
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::json!({
+                        "jsonrpc":"2.0", "id":id,
+                        "result":installed_mrtr_roots_result(count, state),
+                    })
+                    .to_string(),
+                )
+                .await;
+            }
+            let rejected = second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+            let result = if rejected {
+                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
+            } else {
+                serde_json::json!({"resultType":"complete","content":[]})
+            };
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::json!({"jsonrpc":"2.0","id":4,"result":result}).to_string(),
+            )
+            .await;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            let result = client
+                .call_tool(&cx, "budget-tool", serde_json::json!({}))
+                .await;
+            if rejected {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(error.message, "MRTR total input-response limit exceeded");
+                assert_eq!(callbacks.load(Ordering::SeqCst), 64);
+                assert_eq!(
+                    client.next_id, 4,
+                    "rejected round must not allocate another request"
+                );
+                assert!(matches!(
+                    client.list_tools(&cx, None).await.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                ));
+                assert_eq!(
+                    callbacks.load(Ordering::SeqCst),
+                    MAX_MRTR_TOTAL_INPUT_RESPONSES
+                );
+            }
+            assert_eq!(client.next_id, 5);
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_accepts_exact_cumulative_input_budget() {
+        public_websocket_installed_mrtr_input_budget(64);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
+        public_websocket_installed_mrtr_input_budget(65);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn public_websocket_installed_mrtr_callback_budget(stall: bool) {
+        run_test(|| async {
+            struct CallbackDrop {
+                token: ReverseRequestCancellation,
+                observed: Arc<Mutex<Option<bool>>>,
+            }
+            impl Drop for CallbackDrop {
+                fn drop(&mut self) {
+                    *self.observed.lock().unwrap() = Some(self.token.is_cancel_requested());
+                }
+            }
+            let cx = Cx::current().unwrap();
+            let observed = Arc::new(Mutex::new(None));
+            let callback_observed = Arc::clone(&observed);
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |_cx, token, _params| {
+                    let observed = Arc::clone(&callback_observed);
+                    Box::pin(async move {
+                        let _drop = CallbackDrop { token, observed };
+                        if stall {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                    })
+                });
+            let (client_io, mut peer_io) = async_websocket_pair();
+            write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::json!({
+                    "jsonrpc":"2.0", "id":2,
+                    "result":installed_mrtr_roots_result(1, "callback-state"),
+                })
+                .to_string(),
+            )
+            .await;
+            let result = if stall {
+                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
+            } else {
+                serde_json::json!({"resultType":"complete","content":[]})
+            };
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::json!({"jsonrpc":"2.0","id":3,"result":result}).to_string(),
+            )
+            .await;
+            let policy =
+                RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(200))
+                    .unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(policy)
+                .reverse_request_handlers(handlers)
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            assert_eq!(client.request_timeout_policy, policy);
+            let result = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(3),
+                client.call_tool(&cx, "callback-tool", serde_json::json!({})),
+            )
+            .await
+            .expect("configured deadline must wake even a callback that never wakes itself");
+            if stall {
+                let error = result.unwrap_err();
+                assert_eq!(error.message, "MRTR operation absolute deadline elapsed");
+                assert_eq!(
+                    client.next_id, 3,
+                    "timed-out callback must not allocate a continuation"
+                );
+                assert_eq!(
+                    *observed.lock().unwrap(),
+                    Some(true),
+                    "callback cancellation precedes its destruction"
+                );
+                assert!(matches!(
+                    client.list_tools(&cx, None).await.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                ));
+                assert_eq!(*observed.lock().unwrap(), Some(false));
+            }
+            assert!(!cx.is_cancel_requested());
+            client.close(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_callback_completes_within_operation_budget() {
+        public_websocket_installed_mrtr_callback_budget(false);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_callback_deadline_cancels_and_preserves_connection() {
+        public_websocket_installed_mrtr_callback_budget(true);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn public_websocket_mrtr_continuation_budget(
+        late: bool,
+        explicit_method: Option<&'static str>,
+    ) {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let method = explicit_method.unwrap_or("tools/call");
+            let callbacks = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&callbacks);
+            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
+                move |callback_cx, _cancellation, _params| {
+                    let callback_cx = callback_cx.clone();
+                    let callback_calls = Arc::clone(&callback_calls);
+                    Box::pin(async move {
+                        callback_calls.fetch_add(1, Ordering::SeqCst);
+                        asupersync::time::sleep(callback_cx.now(), Duration::from_millis(1_200))
+                            .await;
+                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                    })
+                },
+            );
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discovery) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR peer expects discovery");
+                    };
+                    assert_eq!(discovery.method, "server/discover");
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discovery.id.unwrap(),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(initial) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR peer expects initial tool call");
+                    };
+                    assert_eq!(initial.method, method);
+                    assert!(initial.id.as_ref().unwrap().correlates_with(&RequestId::Number(2)));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initial.id.unwrap(),
+                                installed_mrtr_roots_result(1, "remaining-budget"),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(continuation) =
+                        server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR peer expects callback-driven continuation");
+                    };
+                    assert_eq!(continuation.method, method);
+                    assert!(continuation.id.as_ref().unwrap().correlates_with(&RequestId::Number(3)));
+                    let parameters = continuation.params.as_ref().unwrap();
+                    assert_eq!(parameters["requestState"], "remaining-budget");
+                    assert_eq!(parameters["inputResponses"]["root-0"]["roots"], serde_json::json!([]));
+                    // The late reply is after the original two-second budget
+                    // but before a fresh two-second continuation budget. The
+                    // observable proof is exact-ID retirement and reuse, not
+                    // a scheduler-sensitive elapsed-time assertion.
+                    asupersync::time::sleep(
+                        peer_cx.now(),
+                        Duration::from_millis(if late { 1_200 } else { 200 }),
+                    )
+                    .await;
+                    let terminal = match method {
+                        "tools/call" => serde_json::json!({"resultType":"complete","content":[]}),
+                        "resources/read" => serde_json::json!({"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}),
+                        "prompts/get" => serde_json::json!({"resultType":"complete","messages":[]}),
+                        _ => unreachable!(),
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                continuation.id.unwrap(),
+                                terminal,
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    if late {
+                        let JsonRpcMessage::Request(cancelled) =
+                            server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("expired continuation must emit correlated cancellation");
+                        };
+                        assert_eq!(cancelled.method, "notifications/cancelled");
+                        assert!(cancelled.id.is_none());
+                        assert_eq!(cancelled.params.unwrap()["requestId"], 3);
+                    }
+                    let JsonRpcMessage::Request(reused) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("MRTR connection must remain usable after the operation");
+                    };
+                    assert_eq!(reused.method, "tools/list");
+                    assert!(reused.id.as_ref().unwrap().correlates_with(&RequestId::Number(4)));
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                reused.id.unwrap(),
+                                serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(server.recv(&peer_cx).await, Err(TransportError::Closed)));
+                })
+                .unwrap();
+            let policy =
+                RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(policy)
+                .reverse_request_handlers(if explicit_method.is_some() {
+                    ReverseRequestHandlers::new()
+                } else {
+                    handlers
+                })
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            let deadline = Instant::now() + policy.absolute_timeout();
+            let respond = |input_required: &InputRequiredResult| {
+                assert_eq!(input_required.request_state(), Some("remaining-budget"));
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                // These public adapters deliberately accept synchronous host
+                // work. Its consumed time must reduce the subsequent wait.
+                std::thread::sleep(Duration::from_millis(1_200));
+                Ok(BTreeMap::from([(
+                    "root-0".to_owned(),
+                    serde_json::json!({"roots":[]}),
+                )]))
+            };
+            let result = asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                match explicit_method {
+                    None => {
+                        client
+                            .call_tool(&cx, "continuation-budget", serde_json::json!({}))
+                            .await
+                    }
+                    Some("tools/call") => client
+                        .call_tool_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "continuation-budget",
+                            serde_json::json!({}),
+                            respond,
+                        )
+                        .await
+                        .map(CoreResult::Final),
+                    Some("resources/read") => client
+                        .read_resource_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "file:///continuation-budget",
+                            respond,
+                        )
+                        .await
+                        .map(CoreResult::Final),
+                    Some("prompts/get") => client
+                        .get_prompt_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "continuation-budget",
+                            std::collections::HashMap::from([(
+                                "topic".to_owned(),
+                                "deadline".to_owned(),
+                            )]),
+                            respond,
+                        )
+                        .await
+                        .map(CoreResult::Final),
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .expect("MRTR continuation must remain bounded independently of the fixture");
+            if late {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                assert_eq!(
+                    client.retired_requests.len(),
+                    1,
+                    "the pending continuation owns a tombstone"
+                );
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.method(), method);
+                assert!(matches!(result, CoreResult::Final(_)));
+                assert!(client.retired_requests.is_empty());
+            }
+            assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                client.next_id, 4,
+                "only the initial and continuation RPCs were admitted"
+            );
+            assert!(!client.closed);
+            assert!(matches!(
+                client.list_tools(&cx, None).await.unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            assert!(
+                client.retired_requests.is_empty(),
+                "the late reply was consumed by its exact retired ID"
+            );
+            assert!(!cx.is_cancel_requested());
+            client.close(&cx).await.unwrap();
+            peer.join(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_continuation_completes_within_remaining_budget() {
+        public_websocket_mrtr_continuation_budget(false, None);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_continuation_keeps_original_deadline_and_retires_late_reply()
+    {
+        public_websocket_mrtr_continuation_budget(true, None);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_explicit_mrtr_continuations_complete_within_remaining_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_websocket_mrtr_continuation_budget(false, Some(method));
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_explicit_mrtr_continuations_keep_deadline_and_retire_late_replies() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_websocket_mrtr_continuation_budget(true, Some(method));
         }
     }
 
@@ -32597,6 +34824,232 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn write_http_parameter_header_test_refusal(
+        stream: &mut TcpStream,
+        request: &serde_json::Value,
+    ) {
+        let body = serde_json::json!({
+            "jsonrpc":"2.0", "id":request["id"],
+            "error":{
+                "code":fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE,
+                "message":fastmcp_protocol::HEADER_MISMATCH_MESSAGE
+            }
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[cfg(unix)]
+    fn http_parameter_header_test_review(
+        client: &HttpClient,
+    ) -> http_executor::parameter_headers::ReviewedToolHeaders {
+        http_executor::parameter_headers::ReviewedToolHeaders::new_for_loopback_http(
+            CanonicalHttpUrl::parse(client.protocol_plan().modern_post_target().unwrap()).unwrap(),
+            "lookup",
+            serde_json::json!({"type":"object","properties":{
+                "region":{"type":"string","x-mcp-header":"OldRegion"}
+            }}),
+            |_| true,
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_parameter_header_repair_follows_repeated_cacheable_cursors() {
+        for allow_review in [true, false] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let reviewed = http_parameter_header_test_review(&client);
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for index in 0..4 + usize::from(allow_review) {
+                    let mut stream = accept_http_catalog_test_request(&listener);
+                    let request = read_http_cache_test_request(&mut stream);
+                    if index == 0 {
+                        assert_eq!(request["method"], "tools/call");
+                        write_http_parameter_header_test_refusal(&mut stream, &request);
+                    } else {
+                        let result = if index < 4 {
+                            assert_eq!(request["method"], "tools/list");
+                            assert_eq!(
+                                request["params"]
+                                    .get("cursor")
+                                    .and_then(serde_json::Value::as_str),
+                                if index == 1 { None } else { Some("") }
+                            );
+                            let mut result = http_catalog_test_result(
+                                "tools/list",
+                                "lookup",
+                                (index < 3).then_some(""),
+                                60_000,
+                                "private",
+                            );
+                            if index < 3 {
+                                result["tools"] = serde_json::json!([]);
+                            } else {
+                                result["tools"][0]["inputSchema"] = serde_json::json!({
+                                    "type":"object","properties":{
+                                        "region":{"type":"string","x-mcp-header":"NewRegion"}
+                                    }
+                                });
+                            }
+                            result
+                        } else {
+                            assert_eq!(request["method"], "tools/call");
+                            assert_eq!(request["params"]["name"], "lookup");
+                            assert_eq!(
+                                request["params"]["arguments"],
+                                serde_json::json!({"region":"east"})
+                            );
+                            serde_json::json!({
+                                "resultType":"complete", "content":[{"type":"text","text":"done"}],
+                                "isError":false
+                            })
+                        };
+                        let response = serde_json::json!({
+                            "jsonrpc":"2.0", "id":request["id"], "result":result
+                        });
+                        write_http_cache_test_response(
+                            &mut stream,
+                            "application/json",
+                            response.to_string().as_bytes(),
+                        );
+                    }
+                    requests.push(request);
+                }
+                (requests, listener)
+            });
+            let reviews = std::sync::atomic::AtomicUsize::new(0);
+            let outcome = http_test_runtime_block_on(client.call_tool_with_parameter_headers(
+                &Cx::for_request(),
+                "lookup",
+                serde_json::json!({"region":"east"}),
+                &reviewed,
+                &|binding| {
+                    assert_eq!(binding.header_name(), "Mcp-Param-NewRegion");
+                    reviews.fetch_add(1, Ordering::Relaxed);
+                    allow_review
+                },
+            ));
+            if allow_review {
+                assert!(matches!(
+                    outcome,
+                    Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+                ));
+            } else {
+                assert!(matches!(
+                    outcome,
+                    Err(HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::ParameterHeaders(
+                            http_executor::parameter_headers::ToolHeaderDispatchError::DisclosureDenied
+                        )
+                    )))
+                ));
+            }
+            assert_eq!(reviews.load(Ordering::Relaxed), 1);
+            assert_eq!(reviewed.bindings()[0].header_name(), "Mcp-Param-OldRegion");
+            assert_eq!(client.final_result_cache_stats().hits, 0);
+            let (requests, listener) = server.join().unwrap();
+            assert_eq!(requests.len(), 4 + usize::from(allow_review));
+            for pair in requests.windows(2) {
+                assert_ne!(pair[0]["id"], pair[1]["id"]);
+            }
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_parameter_header_repair_keeps_the_original_deadline_through_retry() {
+        let (mut client, listener) = http_owned_execution_fixture();
+        let reviewed = http_parameter_header_test_review(&client);
+        client.request_timeout_policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_millis(1_500))
+                .unwrap();
+        let server = std::thread::spawn(move || {
+            let mut initial = accept_http_catalog_test_request(&listener);
+            let first = read_http_cache_test_request(&mut initial);
+            assert_eq!(first["method"], "tools/call");
+            std::thread::sleep(Duration::from_millis(500));
+            write_http_parameter_header_test_refusal(&mut initial, &first);
+
+            let mut catalog = accept_http_catalog_test_request(&listener);
+            let listed = read_http_cache_test_request(&mut catalog);
+            assert_eq!(listed["method"], "tools/list");
+            std::thread::sleep(Duration::from_millis(500));
+            let response = serde_json::json!({
+                "jsonrpc":"2.0", "id":listed["id"],
+                "result":http_catalog_test_result("tools/list", "lookup", None, 60_000, "private")
+            });
+            write_http_cache_test_response(
+                &mut catalog,
+                "application/json",
+                response.to_string().as_bytes(),
+            );
+
+            let mut pending = accept_http_catalog_test_request(&listener);
+            let retried = read_http_cache_test_request(&mut pending);
+            assert_eq!(retried["method"], "tools/call");
+            assert_eq!(retried["params"]["arguments"], first["params"]["arguments"]);
+            assert_ne!(retried["id"], first["id"]);
+            let waiting = Instant::now();
+            let mut probe = [0_u8; 1];
+            assert_eq!(
+                pending.read(&mut probe).unwrap(),
+                0,
+                "timeout releases the retried POST"
+            );
+            assert!(
+                waiting.elapsed() < Duration::from_millis(1_200),
+                "the retry cannot acquire a fresh 1.5-second timeout"
+            );
+
+            let mut healthy = accept_http_catalog_test_request(&listener);
+            let request = read_http_cache_test_request(&mut healthy);
+            assert_eq!(request["params"]["name"], "healthy");
+            let response = serde_json::json!({
+                "jsonrpc":"2.0", "id":request["id"],
+                "result":{"resultType":"complete","content":[],"isError":false}
+            });
+            write_http_cache_test_response(
+                &mut healthy,
+                "application/json",
+                response.to_string().as_bytes(),
+            );
+        });
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let outcome = runtime.block_on(client.call_tool_with_parameter_headers(
+            &cx,
+            "lookup",
+            serde_json::json!({"region":"east"}),
+            &reviewed,
+            &|_| true,
+        ));
+        assert!(matches!(
+            outcome,
+            Err(HttpClientError::CoreResult(error))
+                if error.message == "Parameter-header tool call absolute timeout exceeded"
+                    && error.data.as_ref().is_some_and(|data| data["timeoutSource"] == "absolute")
+        ));
+        assert!(cx.checkpoint().is_ok());
+        assert!(matches!(
+            runtime.block_on(client.call_tool(&cx, "healthy", serde_json::json!({}))),
+            Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+        ));
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn clt_01_http_full_catalogs_preserve_opaque_cursors_filters_and_exact_pages() {
         for method in [
@@ -32775,6 +35228,103 @@ mod tests {
             }
             assert_eq!(server.join().unwrap().len(), 4);
             assert_eq!(client.next_id.load(Ordering::Relaxed), 6);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_http_unrelated_cursor_rejections_preserve_cached_catalog() {
+        for (dimension, rejected_method, rejected_parameters) in [
+            (
+                "query",
+                "tools/list",
+                serde_json::json!({"cursor":"page-2", "includeTags":["other"]}),
+            ),
+            (
+                "catalog",
+                "resources/list",
+                serde_json::json!({"cursor":"page-2", "includeTags":["visible"]}),
+            ),
+            (
+                "empty cursor",
+                "tools/list",
+                serde_json::json!({"cursor":"", "includeTags":["visible"]}),
+            ),
+            (
+                "unknown cursor",
+                "tools/list",
+                serde_json::json!({"cursor":"foreign", "includeTags":["visible"]}),
+            ),
+        ] {
+            let (mut client, listener) = http_owned_execution_fixture();
+            let expected_rejection = rejected_parameters.clone();
+            let server = http_catalog_test_server(listener, 2, move |index, request| {
+                let response = if index == 0 {
+                    assert_eq!(request["method"], "tools/list");
+                    assert_eq!(
+                        request["params"]["includeTags"],
+                        serde_json::json!(["visible"])
+                    );
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "result":http_catalog_test_result("tools/list", "retained", Some("page-2"),
+                            60_000, "private")})
+                } else {
+                    assert_eq!(request["method"], rejected_method);
+                    assert_eq!(request["params"]["cursor"], expected_rejection["cursor"]);
+                    assert_eq!(
+                        request["params"]["includeTags"],
+                        expected_rejection["includeTags"]
+                    );
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"],
+                        "error":{"code":-32602,"message":"invalid cursor"}})
+                };
+                ("application/json", response.to_string())
+            });
+            let cx = Cx::for_request();
+            let parameters = serde_json::json!({"includeTags":["visible"]});
+            let first = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                "tools/list",
+                parameters.clone(),
+            ))
+            .expect("the original catalog page is cached");
+            let before = client.final_result_cache_stats();
+            let rejection = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                rejected_method,
+                rejected_parameters,
+            ));
+            assert!(matches!(rejection,
+                Err(HttpClientError::CoreResult(error)) if error.code == McpErrorCode::InvalidParams));
+            assert_eq!(server.join().unwrap().len(), 2);
+            let rejected_stats = client.final_result_cache_stats();
+            assert_eq!(rejected_stats.fills, before.fills, "{dimension}");
+            assert_eq!(
+                rejected_stats.invalidations, before.invalidations,
+                "{dimension}"
+            );
+            assert_eq!(rejected_stats.evictions, before.evictions, "{dimension}");
+            let next_id = client.next_id.load(Ordering::Relaxed);
+            let replay = http_test_runtime_block_on(client.request_final_core(
+                &cx,
+                "tools/list",
+                parameters,
+            ))
+            .expect("an unrelated rejection cannot force the original query back onto the wire");
+            assert_eq!(
+                replay.encode().unwrap(),
+                first.encode().unwrap(),
+                "{dimension}"
+            );
+            assert_eq!(
+                client.next_id.load(Ordering::Relaxed),
+                next_id,
+                "{dimension}"
+            );
+            let replay_stats = client.final_result_cache_stats();
+            assert_eq!(replay_stats.hits, rejected_stats.hits + 1, "{dimension}");
+            assert_eq!(replay_stats.misses, rejected_stats.misses, "{dimension}");
+            assert_eq!(replay_stats.fills, rejected_stats.fills, "{dimension}");
         }
     }
 
@@ -40275,6 +42825,364 @@ exec sleep 30
     }
 
     #[cfg(unix)]
+    fn stdio_catalog_test_discovery_script() -> String {
+        let discovery = modern_discovery_response("typed-catalog-peer", &[MODERN_PROTOCOL_VERSION]);
+        format!(
+            "IFS= read -r request || exit 1\n\
+             case \"$request\" in *server/discover*) ;; *) exit 2 ;; esac\n\
+             case \"$request\" in *'\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"typed-catalog-client\",\"version\":\"7.2\"}}'*) ;; *) exit 3 ;; esac\n\
+             printf '%s\\n' '{discovery}'\n"
+        )
+    }
+
+    #[cfg(unix)]
+    fn stdio_catalog_test_script(pages: &[(&str, Option<&str>, String)]) -> String {
+        let mut script = stdio_catalog_test_discovery_script();
+        for (index, (method, cursor, result)) in pages.iter().enumerate() {
+            let id = index + 2;
+            script.push_str(&format!(
+                "IFS= read -r request || exit 4\n\
+                 case \"$request\" in *'\"method\":\"{method}\"'*) ;; *) exit 5 ;; esac\n\
+                 case \"$request\" in *'\"id\":{id},'*|*'\"id\":{id}}}'*) ;; *) exit 6 ;; esac\n\
+                 case \"$request\" in *'\"includeTags\":[\"visible\"]'*) ;; *) exit 7 ;; esac\n\
+                 case \"$request\" in *'\"excludeTags\":[\"hidden\"]'*) ;; *) exit 8 ;; esac\n\
+                 case \"$request\" in *'\"io.modelcontextprotocol/clientInfo\":{{\"name\":\"typed-catalog-client\",\"version\":\"7.2\"}}'*) ;; *) exit 9 ;; esac\n"
+            ));
+            match cursor {
+                Some(cursor) => script.push_str(&format!(
+                    "case \"$request\" in *'\"cursor\":{}'*) ;; *) exit 10 ;; esac\n",
+                    serde_json::to_string(cursor).unwrap(),
+                )),
+                None => {
+                    script.push_str("case \"$request\" in *'\"cursor\":'*) exit 11 ;; *) ;; esac\n")
+                }
+            }
+            script.push_str(&format!(
+                "printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}'\n"
+            ));
+        }
+        script.push_str("while IFS= read -r unexpected; do exit 12; done\n");
+        script
+    }
+
+    #[cfg(unix)]
+    fn connect_stdio_catalog_test_client(script: &str) -> Client {
+        block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("typed-catalog-client", "7.2")
+                .max_retries(0)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(10), Duration::from_secs(30))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+        )
+        .expect("the public stdio builder discovers the typed catalog peer")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_all_catalogs_preserve_typed_pages_and_opaque_cursors() {
+        let methods = [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ];
+        let mut peer_pages = Vec::new();
+        for method in methods {
+            for index in 0..3 {
+                let mut result = http_catalog_test_result(
+                    method,
+                    &format!("page-{index}"),
+                    (index < 2).then_some(""),
+                    60_000,
+                    "private",
+                )
+                .to_string();
+                result.pop();
+                result.push_str(
+                    ",\"vendorExact\":922337203685477580812345678901234567890,\"vendorDecimal\":1.2300e+42}",
+                );
+                peer_pages.push((method, (index != 0).then_some(""), result));
+            }
+        }
+        let script = stdio_catalog_test_script(&peer_pages);
+        let mut client = connect_stdio_catalog_test_client(&script);
+        for method in methods {
+            let include_tags = Some(vec!["visible".to_owned()]);
+            let exclude_tags = Some(vec!["hidden".to_owned()]);
+            let collection = match method {
+                "tools/list" => client.list_all_tools(ListToolsParams {
+                    cursor: None,
+                    include_tags,
+                    exclude_tags,
+                }),
+                "resources/list" => client.list_all_resources(ListResourcesParams {
+                    cursor: None,
+                    include_tags,
+                    exclude_tags,
+                }),
+                "resources/templates/list" => {
+                    client.list_all_resource_templates(ListResourceTemplatesParams {
+                        cursor: None,
+                        include_tags,
+                        exclude_tags,
+                    })
+                }
+                "prompts/list" => client.list_all_prompts(ListPromptsParams {
+                    cursor: None,
+                    include_tags,
+                    exclude_tags,
+                }),
+                _ => unreachable!(),
+            }
+            .expect("all four public stdio collectors preserve empty repeated cursors");
+            assert_eq!(collection.method(), method);
+            assert_eq!(collection.item_count(), 3);
+            assert_eq!(collection.pages().len(), 3);
+            for (index, page) in collection.into_pages().into_iter().enumerate() {
+                assert!(matches!(&page, CoreResult::Final(_)));
+                let encoded = page.encode().unwrap();
+                assert!(encoded.contains(&format!("page-{index}")));
+                assert!(encoded.contains("\"ttlMs\":60000"));
+                assert!(encoded.contains("\"cacheScope\":\"private\""));
+                assert!(
+                    encoded.contains("\"vendorExact\":922337203685477580812345678901234567890")
+                );
+                assert!(encoded.contains("\"vendorDecimal\":1.2300e+42"));
+            }
+        }
+        client.close().expect("the typed catalog peer is reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_all_catalogs_rebuild_cached_prefix_without_mixing_pages() {
+        let script = stdio_catalog_test_script(&[
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "stale", Some("expired"), 60_000, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                None,
+                http_catalog_test_result("tools/list", "fresh-first", Some("fresh"), 0, "private")
+                    .to_string(),
+            ),
+            (
+                "tools/list",
+                Some("fresh"),
+                http_catalog_test_result("tools/list", "fresh-last", None, 0, "private")
+                    .to_string(),
+            ),
+        ]);
+        let mut client = connect_stdio_catalog_test_client(&script);
+        let params = ListToolsParams {
+            cursor: None,
+            include_tags: Some(vec!["visible".to_owned()]),
+            exclude_tags: Some(vec!["hidden".to_owned()]),
+        };
+        client
+            .list_tools_typed_with_params(params.clone())
+            .expect("one public page request populates the first-page cache");
+        let collection = client
+            .list_all_tools(params)
+            .expect("the collector rebuilds a cached prefix from a cursorless request");
+        assert_eq!(collection.pages().len(), 2);
+        assert_eq!(collection.item_count(), 2);
+        for (page, expected) in collection.pages().iter().zip(["fresh-first", "fresh-last"]) {
+            let encoded = page.encode().unwrap();
+            assert!(encoded.contains(expected));
+            assert!(!encoded.contains("stale"));
+            assert!(encoded.contains("\"ttlMs\":0"));
+        }
+        client.close().expect("the rebuilt catalog peer is reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_all_catalogs_bound_repeated_cursors() {
+        let mut script = stdio_catalog_test_discovery_script();
+        script.push_str(
+            r#"page=0
+while [ "$page" -lt 1024 ]; do
+    IFS= read -r request || exit 20
+    case "$request" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
+    id=$((page + 2))
+    case "$request" in *"\"id\":$id,"*|*"\"id\":$id}"*) ;; *) exit 22 ;; esac
+    if [ "$page" -eq 0 ]; then
+        case "$request" in *'"cursor":'*) exit 23 ;; *) ;; esac
+    else
+        case "$request" in *'"cursor":""'*) ;; *) exit 24 ;; esac
+    fi
+    printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","nextCursor":""}}\n' "$id"
+    page=$((page + 1))
+done
+IFS= read -r request || exit 25
+case "$request" in *'"method":"prompts/list"'*) ;; *) exit 26 ;; esac
+case "$request" in *'"id":1026,'*|*'"id":1026}'*) ;; *) exit 27 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1026,"result":{"resultType":"complete","prompts":[{"name":"healthy"}],"ttlMs":0,"cacheScope":"private"}}'
+while IFS= read -r unexpected; do exit 28; done
+"#,
+        );
+        let mut client = connect_stdio_catalog_test_client(&script);
+        let error = client
+            .list_all_tools(ListToolsParams::default())
+            .expect_err("a perpetually present cursor hits the real public page bound");
+        assert_eq!(error.message, PAGINATION_PAGE_LIMIT_ERROR);
+        let healthy = client
+            .list_all_prompts(ListPromptsParams::default())
+            .expect("the limit sends no 1,025th tools request and leaves the client usable");
+        assert_eq!(healthy.item_count(), 1);
+        assert!(healthy.pages()[0].encode().unwrap().contains("healthy"));
+        client.close().expect("the bounded catalog peer is reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_all_catalogs_reject_initial_cursor_without_contact() {
+        let script = stdio_catalog_test_script(&[(
+            "tools/list",
+            None,
+            http_catalog_test_result("tools/list", "healthy", None, 0, "private").to_string(),
+        )]);
+        let mut client = connect_stdio_catalog_test_client(&script);
+        for cursor in ["", "opaque"] {
+            let error = client
+                .list_all_tools(ListToolsParams {
+                    cursor: Some(cursor.to_owned()),
+                    ..ListToolsParams::default()
+                })
+                .expect_err("complete collection cannot begin at an arbitrary peer cursor");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+        }
+        let healthy = client
+            .list_all_tools(ListToolsParams {
+                cursor: None,
+                include_tags: Some(vec!["visible".to_owned()]),
+                exclude_tags: Some(vec!["hidden".to_owned()]),
+            })
+            .expect("the first valid traversal uses the untouched request ID after discovery");
+        assert_eq!(healthy.item_count(), 1);
+        client
+            .close()
+            .expect("the no-contact catalog peer is reaped");
+    }
+
+    #[cfg(unix)]
+    fn deferred_stdio_catalog_test_client(cx: &Cx, script: &str) -> Client {
+        block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .client_info("typed-catalog-client", "7.2")
+                .auto_initialize(true)
+                .max_retries(0)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx(cx, "sh", &["-c", script]),
+        )
+        .expect("the public builder retains a deferred stdio client")
+    }
+
+    #[cfg(unix)]
+    fn stdio_catalog_initialization_deadline_probe(retain_handshake: bool) {
+        let cx = Cx::for_request();
+        let script = "IFS= read -r request || exit 1; \
+            case \"$request\" in *server/discover*) ;; *) exit 2 ;; esac; \
+            exec sleep 3";
+        let mut client = deferred_stdio_catalog_test_client(&cx, script);
+        assert!(!client.is_initialized());
+        assert_eq!(client.peek_next_request_id(), 1);
+        if retain_handshake {
+            block_on(async {
+                let mut initializing = Box::pin(client.ensure_initialized_with_cx(&cx));
+                let first_poll = std::future::poll_fn(|task_cx| {
+                    std::task::Poll::Ready(initializing.as_mut().poll(task_cx))
+                })
+                .await;
+                assert!(first_poll.is_pending());
+                // Dropping the public future retains the same committed waiter.
+            });
+            assert_eq!(client.peek_next_request_id(), 2);
+        }
+        // Exercise the production collector with an operation bound shorter
+        // than the connection policy and any previously committed handshake.
+        let budget = PaginationBudget::for_request(
+            RequestTimeoutPolicy::new(Duration::from_millis(80), Duration::from_millis(80))
+                .unwrap(),
+        );
+        let started = Instant::now();
+        let error = client
+            .collect_stdio_catalog_with_budget(FinalCacheResultSet::Tools, None, None, None, budget)
+            .expect_err("initialization must consume the original catalog deadline");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource":"absolute"}))
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            client.peek_next_request_id(),
+            2,
+            "no restarted handshake or first page"
+        );
+        assert!(!client.is_initialized());
+        assert!(client.child_cleanup_complete());
+        let terminal = client.ensure_initialized().unwrap_err();
+        assert_eq!(terminal.code, error.code);
+        assert_eq!(client.peek_next_request_id(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_catalog_initialization_fresh_uses_original_deadline() {
+        stdio_catalog_initialization_deadline_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_catalog_initialization_retained_uses_original_deadline() {
+        stdio_catalog_initialization_deadline_probe(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_stdio_catalog_initialization_expired_deadline_makes_no_contact() {
+        let script = stdio_catalog_test_script(&[(
+            "tools/list",
+            None,
+            http_catalog_test_result("tools/list", "healthy", None, 0, "private").to_string(),
+        )]);
+        let cx = Cx::for_request();
+        let mut client = deferred_stdio_catalog_test_client(&cx, &script);
+        let error = client
+            .ensure_initialized_until(Some(Instant::now() - Duration::from_millis(1)))
+            .expect_err("an expired operation cannot commit its first handshake");
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({"timeoutSource":"absolute"}))
+        );
+        assert_eq!(client.peek_next_request_id(), 1);
+        assert!(!client.is_initialized());
+        assert!(!client.transport_is_closed());
+        let catalog = client
+            .list_all_tools(ListToolsParams {
+                cursor: None,
+                include_tags: Some(vec!["visible".to_owned()]),
+                exclude_tags: Some(vec!["hidden".to_owned()]),
+            })
+            .expect("an uncommitted timeout leaves the deferred connection usable");
+        assert_eq!(catalog.item_count(), 1);
+        assert_eq!(client.peek_next_request_id(), 3);
+        client.close().expect("the deferred catalog peer is reaped");
+    }
+
+    #[cfg(unix)]
     fn modern_public_client_script(discovery_response: &str) -> String {
         format!(
             "IFS= read -r first || exit 1; \
@@ -40825,7 +43733,10 @@ exec sleep 30
         let object = result
             .as_object_mut()
             .expect("a discovery result is a JSON object");
-        if let Some(meta) = object.get_mut("_meta").and_then(serde_json::Value::as_object_mut) {
+        if let Some(meta) = object
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
             meta.remove(META_KEY);
         }
         if let Some(name) = in_meta {
@@ -40948,10 +43859,8 @@ exec sleep 30
     /// would admit two divergent identities as if they agreed.
     #[test]
     fn modern_discovery_refuses_identity_in_both_positions() {
-        let ambiguous = discovery_result_with_identity_placement(
-            Some("meta-peer"),
-            Some("sibling-peer"),
-        );
+        let ambiguous =
+            discovery_result_with_identity_placement(Some("meta-peer"), Some("sibling-peer"));
 
         // Layer 1, the cause. The client collapses every deserialization
         // failure into one opaque message, so the ONLY place the specific
@@ -43241,7 +46150,9 @@ exec sleep 5
                 let expected_calls = match mode {
                     "warm" | "deferred" | "deadline-rounds" => 2,
                     "round-bound" => 4,
-                    "total-bound" => 129,
+                    // The second 64-input round exceeds the remaining 63
+                    // entries, so none of its callbacks may run.
+                    "total-bound" => 65,
                     "handler-error" | "deadline-callback" => 1,
                     m if m.starts_with("callback-") => 1,
                     m if m.starts_with("ready-callback-") => 1,
@@ -45864,6 +48775,87 @@ exec sleep 2
         client
             .close()
             .expect("modern disabled-cache list-restart cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_03_stdio_unrelated_cursor_rejections_preserve_cached_catalog() {
+        for dimension in ["query", "catalog", "empty cursor", "unknown cursor"] {
+            let discovery = modern_discovery_response(
+                "cache-unrelated-cursor-modern-server",
+                &[MODERN_PROTOCOL_VERSION],
+            );
+            let script = format!(
+                "IFS= read -r discover || exit 1; \
+                 printf '%s\\n' '{discovery}'; \
+                 IFS= read -r first_page || exit 1; \
+                 case \"$first_page\" in *tools/list*visible*) \
+                 printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"nextCursor\":\"page-2\",\"ttlMs\":60000,\"cacheScope\":\"private\"}}}}' ;; *) exit 1 ;; esac; \
+                 IFS= read -r rejected_page || exit 1; \
+                 case \"$rejected_page\" in *cursor*) \
+                 printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{{\"code\":-32602,\"message\":\"invalid cursor\"}}}}' ;; *) exit 1 ;; esac; \
+                 exec sleep 2"
+            );
+            let mut client = Client::stdio_with_protocol_plan_with_cx(
+                Cx::for_request(),
+                "sh",
+                &["-c", script.as_str()],
+                ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+            )
+            .expect("modern discovery initializes the cursor-isolation client");
+            let parameters = ListToolsParams {
+                cursor: None,
+                include_tags: Some(vec!["visible".to_owned()]),
+                exclude_tags: None,
+            };
+            let first = client
+                .list_tools_typed_with_params(parameters.clone())
+                .unwrap();
+            let rejected = if dimension == "catalog" {
+                client.list_resources_typed_with_params(ListResourcesParams {
+                    cursor: Some("page-2".to_owned()),
+                    include_tags: parameters.include_tags.clone(),
+                    exclude_tags: None,
+                })
+            } else {
+                client.list_tools_typed_with_params(ListToolsParams {
+                    cursor: Some(
+                        match dimension {
+                            "empty cursor" => "",
+                            "unknown cursor" => "foreign",
+                            _ => "page-2",
+                        }
+                        .to_owned(),
+                    ),
+                    include_tags: Some(vec![if dimension == "query" {
+                        "other".to_owned()
+                    } else {
+                        "visible".to_owned()
+                    }]),
+                    exclude_tags: None,
+                })
+            };
+            assert_eq!(
+                rejected.unwrap_err().code,
+                McpErrorCode::InvalidParams,
+                "{dimension}"
+            );
+            let rejected_stats = client.final_result_cache_stats();
+            assert_eq!(rejected_stats.invalidations, 0, "{dimension}");
+            let replay = client
+                .list_tools_typed_with_params(parameters)
+                .expect("the refused variation preserves the cached first page");
+            assert_eq!(
+                replay.encode().unwrap(),
+                first.encode().unwrap(),
+                "{dimension}"
+            );
+            let replay_stats = client.final_result_cache_stats();
+            assert_eq!(replay_stats.hits, rejected_stats.hits + 1, "{dimension}");
+            assert_eq!(replay_stats.misses, rejected_stats.misses, "{dimension}");
+            assert_eq!(replay_stats.fills, rejected_stats.fills, "{dimension}");
+            client.close().expect("cursor-isolation client cleanup");
+        }
     }
 
     #[cfg(unix)]

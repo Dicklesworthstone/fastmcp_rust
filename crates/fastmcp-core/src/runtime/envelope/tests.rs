@@ -158,6 +158,67 @@ fn catalog_cursor_envelope_binds_context_expires_and_cannot_cross_purposes() {
 }
 
 #[test]
+fn ephemeral_envelope_continuations_preserve_authenticated_deadline_and_expire_together() {
+    let cx = context();
+    let mut owner = owner(EnvelopePolicy::new(64, ttl(), 1).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let first = owner
+        .seal_until(&cx, &binding(1), b"page-one", deadline)
+        .unwrap();
+    let opened = owner.open(&cx, &binding(1), &first).unwrap();
+    assert_eq!(opened.expires_at(), deadline);
+    assert!(!opened.remaining_lifetime().is_zero());
+    assert!(opened.remaining_lifetime() <= Duration::from_secs(30));
+    let second = owner
+        .seal_until(&cx, &binding(1), b"page-two", opened.expires_at())
+        .unwrap();
+    assert_eq!(
+        owner.open(&cx, &binding(1), &second).unwrap().expires_at(),
+        deadline,
+        "a fresh nonce and payload retain the exact authenticated deadline"
+    );
+    assert_eq!(&first[58..66], &second[58..66]);
+    assert_ne!(&first[50..58], &second[50..58]);
+
+    // Advance the same monotonic origin used by production opening, without
+    // sleeping. Only elapsed time changes for these previously valid bytes.
+    owner.started = owner.started.checked_sub(Duration::from_secs(31)).unwrap();
+    for envelope in [&first, &second] {
+        assert!(matches!(
+            owner.open(&cx, &binding(1), envelope),
+            Err(EnvelopeError::InvalidEnvelope)
+        ));
+    }
+    assert_eq!(owner.keys[0].next_nonce, 2);
+    assert_eq!(owner.generation(), 1);
+}
+
+#[test]
+fn ephemeral_envelope_absolute_deadline_admission_does_not_spend_nonce_on_refusal() {
+    let cx = context();
+    let mut owner = owner(EnvelopePolicy::new(64, ttl(), 1).unwrap());
+    for deadline in [
+        Instant::now() - Duration::from_secs(1),
+        Instant::now() + ttl() + Duration::from_secs(60),
+    ] {
+        assert!(matches!(
+            owner.seal_until(&cx, &binding(1), b"page", deadline),
+            Err(EnvelopeError::InvalidLifetime)
+        ));
+    }
+    assert_eq!(owner.keys[0].next_nonce, 0);
+    assert_eq!(owner.keys[0].latest_expiry, 0);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let sealed = owner
+        .seal_until(&cx, &binding(1), b"page", deadline)
+        .unwrap();
+    assert_eq!(
+        owner.open(&cx, &binding(1), &sealed).unwrap().expires_at(),
+        deadline
+    );
+}
+
+#[test]
 fn ephemeral_envelope_nonce_allocation_is_unique_and_never_wraps() {
     let cx = context();
     let mut owner = owner(EnvelopePolicy::default());

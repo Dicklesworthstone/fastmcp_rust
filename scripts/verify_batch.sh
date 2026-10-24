@@ -103,7 +103,15 @@ command -v rsync >/dev/null || die 'rsync not found locally'
 OUT="${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/fastmcp-verify.XXXXXX")}" || die 'cannot create output dir'
 mkdir -p "$OUT" || die "cannot create $OUT"
 
-SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 "$WORKER")
+# ServerAliveInterval is load-bearing, not hygiene. The remote script redirects
+# every phase to a file on the worker, so this channel carries NO bytes for the
+# whole build -- 10 to 30 minutes for a cold fastmcp-server test target. Without
+# keepalives an idle NAT or firewall drop closes the channel, the remote process
+# group takes SIGHUP, and the run dies with no receipt and no log, which reads
+# exactly like a build failure. 60s x 30 tolerates a half-hour silent link and
+# still gives up within ~30 minutes of a genuinely dead peer.
+SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 \
+     -o ServerAliveInterval=60 -o ServerAliveCountMax=30 "$WORKER")
 
 # ---------------------------------------------------------------------------
 # Subject identity, captured BEFORE the run.
@@ -199,7 +207,7 @@ printf '== sync ==\nworker    %s\nremote    %s\n' "$WORKER" "$remote_dir"
 # added here must also be considered for MANIFEST_PATHS above.
 rsync -az --no-perms --omit-dir-times \
     --exclude 'target/' --exclude '.rch-target-*' --exclude '*.log' \
-    -e "ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=25" \
+    -e "ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=25 -o ServerAliveInterval=60 -o ServerAliveCountMax=30" \
     "${SYNC_PATHS[@]}" "$WORKER:$remote_dir/" > "$OUT/rsync.log" 2>&1
 rsync_rc=$?
 printf 'rsync     rc=%s\n\n' "$rsync_rc"
@@ -244,6 +252,24 @@ echo "RECEIPT_HOST=\$(hostname -s)"
 echo "RECEIPT_RUSTC=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^release: //p')"
 echo "RECEIPT_COMMIT_HASH=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^commit-hash: //p')"
 echo "RECEIPT_TARGET=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^host: //p')"
+
+# FREE SPACE ON THE TARGET-POOL FILESYSTEM, captured BEFORE the build and
+# therefore present even on a receipt whose build died.
+#
+# This is a diagnosis field, not hygiene. A worker that runs out of disk does
+# not report "out of disk": the link step dies as
+#   collect2: fatal error: ld terminated with signal 7 [Bus error]
+# because ld writes its output through mmap, and the surrounding cargo text is
+# an ordinary "error: could not compile". The receipt then says compile FAILED,
+# which reads exactly like a code defect in the subject under test. Observed
+# 2026-10-11 on hz3 at 50MB free of 906GB, where a 2365-test lib target had
+# compiled green on the same pool twenty minutes earlier.
+#
+# Reported unconditionally so a GREEN receipt also records how much headroom it
+# had. A run that finished with almost nothing left is a run whose next sibling
+# will fail for reasons that have nothing to do with the code.
+echo "RECEIPT_DISK_AVAIL_KB=\$(df -Pk '$target_dir' 2>/dev/null | awk 'NR==2 { print \$4 }')"
+echo "RECEIPT_DISK_PCT_USED=\$(df -Pk '$target_dir' 2>/dev/null | awk 'NR==2 { gsub(/%/, "", \$5); print \$5 }')"
 
 if [ '$CHECK_ONLY' = 1 ]; then
     if [ '$CLIPPY' = 1 ]; then
@@ -294,7 +320,10 @@ cargo +$TOOLCHAIN test --locked $SCOPE $feature_args \
     -- -Z unstable-options --format json $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
 run_rc=\$?
 echo "RECEIPT_RUN_RC=\$run_rc"
-echo "RECEIPT_JSON_EVENTS=\$(grep -c '^{"type":"test"' \$RUNTMP/vb_run.log)"
+# Not anchored and tolerant of the space libtest actually emits
+# ({ "type": "test", ...}); the anchored no-space form matched nothing at all
+# and reported 0 events for a run that emitted 4,722 of them.
+echo "RECEIPT_JSON_EVENTS=\$(grep -c '\"type\": *\"test\"' \$RUNTMP/vb_run.log)"
 # The whole log is returned and parsed locally, so there is ONE parser and the
 # worker needs no python.
 echo "RECEIPT_END"
@@ -303,14 +332,33 @@ REMOTE
 scp -i "$KEY" -o BatchMode=yes -q "$OUT/remote.sh" "$WORKER:$remote_dir/vb_remote.sh" \
     || die 'cannot stage the remote script'
 
-printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
-    "$SCOPE" "$feature_args" "$thread_args" "${FILTERS[*]-}"
+# The header must name the command that ACTUALLY runs. It previously printed
+# the `cargo test` form unconditionally, so a --check-only log read as if a
+# test run had happened. receipt.json's `mode` was honest; the human-facing
+# header was not, and a misread log is exactly the evidence defect this script
+# exists to prevent.
+if [ "$CHECK_ONLY" = 1 ]; then
+    if [ "$CLIPPY" = 1 ]; then
+        printf '== run ==\ncargo clippy --locked %s %s -- -D warnings\n\n' \
+            "$SCOPE" "$feature_args"
+    else
+        printf '== run ==\ncargo check --locked %s %s\n\n' "$SCOPE" "$feature_args"
+    fi
+else
+    printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
+        "$SCOPE" "$feature_args" "$thread_args" "${FILTERS[*]-}"
+fi
 
 "${SSH[@]}" "chmod +x '$remote_dir/vb_remote.sh' && '$remote_dir/vb_remote.sh' ${FILTERS[*]-}" \
     > "$OUT/remote.out" 2>&1
 remote_rc=$?
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_discovered.txt'" > "$OUT/discovered.txt" 2>/dev/null || :
 "${SSH[@]}" "cat '$remote_dir/.vb-run/vb_run.log'"        > "$OUT/run.log"       2>/dev/null || :
+# The compiler/clippy diagnostic stream. The receipt greps this file ON THE
+# WORKER for counts and a truncated sample, so without fetching it a --clippy
+# or --check-only run leaves no diagnostics behind at all: run.log is the TEST
+# stream and is empty for those modes. A pass/fail verdict is not a work list.
+"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_build.log'"      > "$OUT/build.log"     2>/dev/null || :
 
 # Subject identity AFTER the run. Movement invalidates the receipt.
 git status --porcelain --untracked-files=no > "$OUT/dirty-after.txt"
@@ -333,24 +381,38 @@ def field(name):
     m = re.search(rf'^RECEIPT_{name}=(.*)$', raw, re.M)
     return m.group(1).strip() if m else None
 
-# libtest JSON events: one object per line, so interleaved product stderr
-# cannot corrupt an outcome the way it corrupted the text progress lines.
-# Non-JSON lines are skipped rather than guessed at.
+# libtest JSON events, extracted from ANYWHERE in the line rather than anchored
+# at its start.
+#
+# The anchored form read 2361 of 2365 outcomes on fastmcp-server --lib and
+# reported the other 4 as "discovered but never ran". They had all run and
+# passed; product code had written to stderr WITHOUT a trailing newline, so the
+# event arrived as a suffix:
+#   Note: Rich logging not initialized (logger already set){ "type": "test", ... }
+#   Server ready.{ "type": "test", ... }
+# This is the same defect that made the text progress lines unreadable, and
+# moving to JSON events did not cure it, because the corruption is in the byte
+# stream, not the format. raw_decode also lets several objects share one line.
+#
+# This widens only WHERE an event may be found. It does not infer an outcome
+# from a corrupt object, and a name with no decodable outcome event stays
+# missing, which is what keeps the PL-1 comparison below honest.
 events, suites = [], []
+decoder = json.JSONDecoder()
 run_log = root / 'run.log'
 if run_log.exists():
     for line in run_log.read_text(errors='replace').splitlines():
-        line = line.strip()
-        if not line.startswith('{'):
-            continue
-        try:
-            event = json.loads(line)
-        except ValueError:
-            continue
-        if event.get('type') == 'test' and event.get('event') in ('ok', 'failed', 'ignored'):
-            events.append(event)
-        elif event.get('type') == 'suite' and event.get('event') in ('ok', 'failed'):
-            suites.append(event)
+        for start in (i for i, ch in enumerate(line) if ch == '{'):
+            try:
+                event, _ = decoder.raw_decode(line, start)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get('type') == 'test' and event.get('event') in ('ok', 'failed', 'ignored'):
+                events.append(event)
+            elif event.get('type') == 'suite' and event.get('event') in ('ok', 'failed'):
+                suites.append(event)
 
 results  = suites
 passed   = sum(s.get('passed', 0) for s in suites)
@@ -378,10 +440,43 @@ if manifest_remote != manifest_local:
                    f'{(manifest_remote or "<none>")[:16]} - a stale or partial mirror was measured')
 if field('MANIFEST_FILES') != manifest_files:
     reasons.append(f'manifest file count differs: local {manifest_files} vs worker {field("MANIFEST_FILES")}')
+# Worker capacity is read BEFORE the compile verdict, because an exhausted
+# filesystem makes the compile verdict mean something different. ld dies of
+# SIGBUS on a full disk and cargo reports it as "could not compile", so a
+# receipt that says only "compile FAILED" sends the reader looking for a defect
+# in the subject. Naming the capacity failure separately is the whole point:
+# the subject was never evaluated, so this receipt is void rather than red.
+disk_avail_kb = None
+try:
+    disk_avail_kb = int(field('DISK_AVAIL_KB'))
+except (TypeError, ValueError):
+    pass
+# 2 GiB. A single fastmcp-server test binary and its incremental artifacts do
+# not fit below this, so a run starting here is untrustworthy whatever it
+# reports. The bound is deliberately generous: it is cheaper to re-run on
+# another worker than to debug a phantom link error.
+disk_exhausted = disk_avail_kb is not None and disk_avail_kb < 2 * 1024 * 1024
+
 if field('BUILD_RC') is None:
     reasons.append('no build status reported: the remote script did not reach the compile step')
 elif field('BUILD_RC') != '0':
-    reasons.append('compile FAILED: a test count taken after a failed build measures a stale binary')
+    if disk_exhausted:
+        reasons.append(
+            f'WORKER OUT OF DISK, not a subject failure: {disk_avail_kb} KiB free on the '
+            f'target-pool filesystem ({field("DISK_PCT_USED")}% used). A full disk kills ld '
+            'with SIGBUS and cargo reports it as "could not compile". This receipt is VOID, '
+            'not red: re-run on a worker with free space before reading anything into it.'
+        )
+    else:
+        reasons.append('compile FAILED: a test count taken after a failed build measures a stale binary')
+elif disk_exhausted:
+    # The build survived, but with no headroom left. Say so on the receipt
+    # rather than letting the next lane discover it as a mystery link error.
+    reasons.append(
+        f'worker disk is effectively full ({disk_avail_kb} KiB free, '
+        f'{field("DISK_PCT_USED")}% used): this run finished, but its result is not '
+        'reproducible on this worker and a sibling run will likely fail in the linker'
+    )
 if 'RECEIPT_END' not in raw:
     reasons.append('remote script did not reach its end marker: early abort')
 # In check-only mode there is no test count to judge, so PL-1's zero-run rule
@@ -447,6 +542,32 @@ if not check_only and discovered and executed:
         reasons.append(f'no discovered test matched {wanted}: a filter that selects '
                        f'nothing is a zero-run green (PL-1)')
 
+# --scope is handed to cargo verbatim, so it may legitimately carry its own
+# feature flags. When it does, reporting features as "(default)" is a FALSE
+# provenance field on an otherwise honest receipt: PL-3 binds a claim to the
+# feature set, and this one would have under-recorded it.
+#
+# Observed 2026-10-11: a sweep passing --all-features inside --scope recorded
+# features "(default)" while discovering 516 tests in a target that yields 322
+# under legacy-2024-11-05,tasks,proxy. The flag had plainly taken effect. The
+# scope string preserved the truth, but the field a reader checks did not.
+#
+# This only widens what the field REPORTS. It does not change what cargo runs,
+# and it never invents a feature that is not in one of the two places a feature
+# can be selected.
+scope_feature_flags = [
+    flag for flag in ('--all-features', '--no-default-features')
+    if flag in scope.split()
+]
+if '--features' in scope.split():
+    scope_feature_flags.append('--features (see scope)')
+if features and scope_feature_flags:
+    effective_features = f'{features} + in scope: {" ".join(scope_feature_flags)}'
+elif scope_feature_flags:
+    effective_features = f'in scope: {" ".join(scope_feature_flags)}'
+else:
+    effective_features = features or '(default)'
+
 receipt = {
     'subject': {
         'head_before': head_before, 'head_after': head_after, 'tree': tree,
@@ -462,9 +583,13 @@ receipt = {
         'worker': worker, 'worker_host': field('HOST'), 'remote_dir': remote_dir,
         'toolchain': toolchain, 'rustc': field('RUSTC'),
         'rustc_commit': field('COMMIT_HASH'), 'host_target': field('TARGET'),
-        'profile': profile, 'scope': scope, 'features': features or '(default)',
+        'profile': profile, 'scope': scope, 'features': effective_features,
         'test_threads': threads or '(default)', 'filters': filters or '(none)',
         'scheduler': 'none: direct ssh, bypassing the RCH queue',
+        # Capacity belongs on every receipt, green ones included: it is how a
+        # later reader tells a subject failure from a worker that ran out of room.
+        'disk_avail_kb': field('DISK_AVAIL_KB'),
+        'disk_pct_used': field('DISK_PCT_USED'),
     },
     'counts': {
         'discovered_listed': field('DISCOVERED'),
@@ -501,6 +626,8 @@ if check_only and field('CHECK_RC') != '0':
     for line in [l for l in raw.split('\n') if l.startswith(('error', '  -->'))][:40]:
         print(f'  {line}')
 print(f'\nreceipt.json -> {root}/receipt.json')
+# Retain and print the complete receipt before propagating its rejection.
+sys.exit(1 if reasons else 0)
 PY
 status=$?
 printf '\nartifacts: %s\n' "$OUT"

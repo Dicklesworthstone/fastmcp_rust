@@ -1598,8 +1598,7 @@ mod tests {
             });
         assert!(std::error::Error::source(&http_plan_err).is_some());
 
-        let http_client_err =
-            ConfigError::HttpClientError(HttpClientError::RequestIdExhausted);
+        let http_client_err = ConfigError::HttpClientError(HttpClientError::RequestIdExhausted);
         assert!(std::error::Error::source(&http_client_err).is_some());
     }
 

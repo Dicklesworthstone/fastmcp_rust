@@ -6,10 +6,52 @@ use std::task::{Context, Poll};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use asupersync::time::Sleep;
 
 use super::{BoxFuture, poll_slot};
 use crate::error::{McpError, McpResult};
+
+mod bounded;
+
+// Capture the active effect ceiling before installing the explicit caller.
+// Cx::set_current preserves the supplied Cx's restrictions, not those of the
+// ambient frame it replaces. The ambient context contributes only a ceiling:
+// it must not replace the caller's identity, cancellation or runtime drivers.
+fn ambient_capability_ceiling() -> CapMask {
+    let Some(active) = Cx::current() else {
+        return CapMask::all();
+    };
+    let capabilities = active.capabilities();
+    let mut ceiling = CapMask::all();
+    for (allowed, without_effect) in [
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
+    ] {
+        if !allowed {
+            ceiling = ceiling.intersect(without_effect);
+        }
+    }
+    ceiling
+}
 
 fn checkpoint(cx: &Cx) -> McpResult<()> {
     if cx
@@ -73,8 +115,12 @@ pub(super) async fn cancellable<T>(
     poll_fn(|task| {
         checkpoint(cx)?;
         // Native timers and I/O must resolve the caller's drivers, not an
-        // unrelated ambient context. The guard never crosses a suspension.
+        // unrelated ambient context. The guards never cross a suspension.
+        // Re-read the ambient ceiling on every poll: a pending future may
+        // resume inside a different restriction scope.
+        let ceiling = ambient_capability_ceiling();
         let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(ceiling);
         if cancelled.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
@@ -570,6 +616,173 @@ mod tests {
             drop(cx);
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
             assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    fn effects(cx: &Cx) -> [bool; 5] {
+        let capabilities = cx.capabilities();
+        [
+            capabilities.spawn,
+            capabilities.time,
+            capabilities.entropy,
+            capabilities.io,
+            capabilities.remote,
+        ]
+    }
+
+    #[test]
+    fn first_ok_preserves_each_ambient_effect_restriction_and_the_live_control() {
+        let masks = [
+            CapMask::all(),
+            CapSet::<false, true, true, true, true>::MASK,
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, false, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+            CapSet::<true, true, true, true, false>::MASK,
+            CapMask::none(),
+        ];
+        for mask in masks {
+            let cx = Cx::for_testing();
+            let ambient = Cx::for_testing();
+            let _ambient = Cx::set_current(Some(ambient.clone()));
+            let _restriction = Cx::push_restriction(mask);
+            let expected = effects(&Cx::current().unwrap());
+            let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async move {
+                assert_eq!(effects(&Cx::current().unwrap()), expected);
+                Ok(42)
+            })];
+            let mut future = run(Kind::FirstOk, &cx, futures);
+            let Poll::Ready(result) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("a pure ready child must remain usable under a restriction");
+            };
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(effects(&Cx::current().unwrap()), expected);
+            assert_eq!(effects(&cx), [true; 5]);
+            // Restoring the ambient frame must also restore its identity.
+            Cx::current().unwrap().set_cancel_requested(true);
+            assert!(ambient.is_cancel_requested());
+            assert!(!cx.is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn every_combinator_rechecks_ambient_io_authority_after_pending() {
+        for kind in KINDS {
+            for initially_allowed in [false, true] {
+                let cx = Cx::for_testing();
+                let ambient = Cx::for_testing();
+                let _ambient = Cx::set_current(Some(ambient.clone()));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&polls);
+                let futures: Vec<BoxFuture<'_, McpResult<i32>>> =
+                    vec![Box::pin(poll_fn(move |_| {
+                        let count = observed.fetch_add(1, Ordering::Relaxed);
+                        let expected = if count == 0 {
+                            initially_allowed
+                        } else {
+                            !initially_allowed
+                        };
+                        assert_eq!(Cx::current().unwrap().capabilities().io, expected);
+                        if count == 0 {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(Ok(42))
+                        }
+                    }))];
+                let mut future = run(kind, &cx, futures);
+                for (turn, allowed) in [initially_allowed, !initially_allowed]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let ceiling = if allowed {
+                        CapMask::all()
+                    } else {
+                        CapSet::<true, true, true, false, true>::MASK
+                    };
+                    let _restriction = Cx::push_restriction(ceiling);
+                    let result = future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()));
+                    if turn == 0 {
+                        assert!(result.is_pending(), "{kind:?}");
+                    } else {
+                        let Poll::Ready(result) = result else {
+                            panic!("ready {kind:?} did not finish");
+                        };
+                        assert_eq!(result.unwrap(), 42);
+                    }
+                    assert_eq!(Cx::current().unwrap().capabilities().io, allowed);
+                }
+                assert_eq!(polls.load(Ordering::Relaxed), 2);
+                assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+                assert!(!cx.is_cancel_requested());
+                assert!(!ambient.is_cancel_requested());
+            }
+        }
+    }
+
+    #[test]
+    fn held_and_ambient_restrictions_intersect_without_reparenting_the_child() {
+        let owner = Cx::for_testing();
+        let held = {
+            let _owner = Cx::set_current(Some(owner.clone()));
+            let _restriction = Cx::push_restriction(CapSet::<true, true, false, true, true>::MASK);
+            Cx::current().unwrap()
+        };
+        let foreign = Cx::for_testing();
+        let _foreign = Cx::set_current(Some(foreign.clone()));
+        let _restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+        let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async {
+            let active = Cx::current().unwrap();
+            assert_eq!(effects(&active), [true, true, false, false, true]);
+            active.set_cancel_requested(true);
+            Ok(42)
+        })];
+        let mut future = run(Kind::FirstOk, &held, futures);
+        let Poll::Ready(result) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("the child's caller cancellation was not observed");
+        };
+        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+        assert!(owner.is_cancel_requested());
+        assert!(!foreign.is_cancel_requested());
+        assert_eq!(
+            effects(&Cx::current().unwrap()),
+            [true, true, true, false, true]
+        );
+    }
+
+    #[test]
+    fn child_panic_restores_the_ambient_restriction_and_identity() {
+        for kind in KINDS {
+            let cx = Cx::for_testing();
+            let ambient = Cx::for_testing();
+            let _ambient = Cx::set_current(Some(ambient.clone()));
+            let _restriction = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+            let futures: Vec<BoxFuture<'_, McpResult<i32>>> = vec![Box::pin(async {
+                assert!(!Cx::current().unwrap().capabilities().io);
+                panic!("intentional child panic");
+            })];
+            let mut future = run(kind, &cx, futures);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+            }));
+            assert!(result.is_err());
+            drop(future);
+            assert_eq!(
+                effects(&Cx::current().unwrap()),
+                [true, true, true, false, true]
+            );
+            Cx::current().unwrap().set_cancel_requested(true);
+            assert!(ambient.is_cancel_requested());
+            assert!(!cx.is_cancel_requested());
         }
     }
 }

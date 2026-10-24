@@ -274,7 +274,7 @@ fn run(case: Case) {
                         }
                         Case::Complete => json_reply(&mut tls, &terminal(2, COMPLETE)).await,
                         Case::Continue | Case::ContinueLost | Case::CloseInput => {
-                            json_reply(&mut tls, &terminal(2, FIRST)).await
+                            json_reply(&mut tls, &terminal(2, FIRST)).await;
                         }
                         _ => unreachable!(),
                     }

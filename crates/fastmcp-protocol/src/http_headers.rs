@@ -99,7 +99,7 @@ impl AdmittedToolHeaderSchema {
             nodes: 0,
             path_bytes: 0,
         };
-        compiler.visit(&source, &mut Vec::new(), true, 0)?;
+        compiler.visit(&source, &mut Vec::new(), true, false, 0)?;
         Ok(Self {
             source,
             validation,
@@ -221,7 +221,8 @@ pub enum HeaderExposureError {
     /// The annotations themselves are malformed, e.g. a header name that is
     /// not an RFC 9110 token, or a non-exact primitive type.
     Annotation(McpHeaderError),
-    /// The property is `writeOnly` or password-formatted; no review applies.
+    /// The property or one of its containing objects is `writeOnly` or
+    /// password-formatted; no review applies.
     SecretField { path: Vec<String> },
     /// No review names this tool and property path.
     Unreviewed {
@@ -250,7 +251,7 @@ impl fmt::Display for HeaderExposureError {
             }
             Self::SecretField { path } => write!(
                 f,
-                "x-mcp-header at {} marks a writeOnly or password field, which is never exposed",
+                "x-mcp-header at {} selects a writeOnly or password field or its descendant, which is never exposed",
                 pointer(path)
             ),
             Self::Unreviewed { path, revision } => write!(
@@ -272,8 +273,9 @@ impl std::error::Error for HeaderExposureError {}
 /// [`admit_final_tool_input_schema`], and additionally requires every
 /// `x-mcp-header` annotation to be reviewed for this exact tool, schema
 /// revision and property path. A `writeOnly` or password-formatted property is
-/// refused even when reviewed. Remote descriptors are not admitted here; a
-/// client applies its own invocation policy to them.
+/// refused even when reviewed, including descendants of such an object.
+/// A child cannot override its ancestor's restriction. Remote descriptors are
+/// not admitted here; a client applies its own invocation policy to them.
 pub fn admit_local_tool_input_schema(
     tool: &str,
     source: Value,
@@ -545,8 +547,10 @@ impl ParameterHeaderBinding {
     pub fn parameter_type(&self) -> ParameterHeaderType {
         self.kind
     }
-    /// Whether the annotated property marks itself `writeOnly` or
-    /// password-formatted, which no exposure review can override.
+    /// Whether this property or any containing object on its exact property
+    /// path marks itself `writeOnly` or password-formatted. This effective
+    /// restriction is computed once by the shared compiler; neither a child
+    /// annotation nor an exposure review can clear an ancestor's restriction.
     pub fn marks_secret_field(&self) -> bool {
         self.secret
     }
@@ -583,7 +587,7 @@ impl ToolParameterHeaderPlan {
             nodes: 0,
             path_bytes: 0,
         };
-        compiler.visit(schema.schema(), &mut Vec::new(), true, 0)?;
+        compiler.visit(schema.schema(), &mut Vec::new(), true, false, 0)?;
         Ok(Self {
             bindings: compiler.bindings,
         })
@@ -750,6 +754,7 @@ impl Compiler {
         schema: &Value,
         path: &mut Vec<String>,
         reachable: bool,
+        inherited_secret: bool,
         depth: usize,
     ) -> Result<(), McpHeaderError> {
         self.nodes += 1;
@@ -759,6 +764,15 @@ impl Compiler {
         let Some(schema) = schema.as_object() else {
             return Ok(());
         };
+        // Keep this immutable and branch-local: a secret parent protects all
+        // of its descendants, but visiting one secret child must never mark a
+        // public sibling. Literal annotations are not schema traversal edges.
+        let secret = inherited_secret
+            || schema.get("writeOnly") == Some(&Value::Bool(true))
+            || schema
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|format| format.eq_ignore_ascii_case("password"));
         if let Some(annotation) = schema.get("x-mcp-header") {
             if !reachable || path.is_empty() {
                 return Err(McpHeaderError::UnreachableAnnotation);
@@ -795,11 +809,6 @@ impl Compiler {
             if self.path_bytes > MAX_PARAMETER_HEADER_PATH_BYTES {
                 return Err(McpHeaderError::LimitExceeded);
             }
-            let secret = schema.get("writeOnly") == Some(&Value::Bool(true))
-                || schema
-                    .get("format")
-                    .and_then(Value::as_str)
-                    .is_some_and(|format| format.eq_ignore_ascii_case("password"));
             self.bindings.push(ParameterHeaderBinding {
                 path: path.clone(),
                 name,
@@ -819,7 +828,7 @@ impl Compiler {
                                 return Err(McpHeaderError::LimitExceeded);
                             }
                             path.push(name.clone());
-                            let result = self.visit(child, path, reachable, depth + 1);
+                            let result = self.visit(child, path, reachable, secret, depth + 1);
                             path.pop();
                             result?;
                         }
@@ -828,14 +837,14 @@ impl Compiler {
                 "$defs" | "patternProperties" | "dependentSchemas" => {
                     if let Some(children) = value.as_object() {
                         for child in children.values() {
-                            self.visit(child, path, false, depth + 1)?;
+                            self.visit(child, path, false, secret, depth + 1)?;
                         }
                     }
                 }
                 "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
                     if let Some(children) = value.as_array() {
                         for child in children {
-                            self.visit(child, path, false, depth + 1)?;
+                            self.visit(child, path, false, secret, depth + 1)?;
                         }
                     }
                 }
@@ -850,7 +859,7 @@ impl Compiler {
                 | "then"
                 | "else"
                 | "contentSchema" => {
-                    self.visit(value, path, false, depth + 1)?;
+                    self.visit(value, path, false, secret, depth + 1)?;
                 }
                 _ => {}
             }
@@ -1469,6 +1478,163 @@ mod tests {
         let mut custom = source;
         custom["properties"]["value"]["x-other"] = json!(true);
         assert!(admit_final_tool_input_schema(custom).is_err());
+    }
+
+    fn review_every_header(source: &Value) -> Vec<NonSensitiveHeaderExposure> {
+        let revision = ToolSchemaRevision::of(source).unwrap();
+        AdmittedToolHeaderSchema::admit(source.clone())
+            .unwrap()
+            .header_plan()
+            .bindings()
+            .iter()
+            .map(|binding| {
+                NonSensitiveHeaderExposure::new(
+                    "lookup",
+                    revision,
+                    binding.property_path().iter().cloned(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn local_registration_cannot_review_away_an_ancestor_secret() {
+        for kind in ["string", "integer", "boolean"] {
+            for at_root in [false, true] {
+                for (keyword, marker) in [
+                    ("writeOnly", json!(true)),
+                    ("format", json!("PaSsWoRd")),
+                ] {
+                    let public = json!({"type":"object", "properties":{
+                        "a/b~c":{"type":"object", "properties":{
+                            "0":{"type":kind, "writeOnly":false, "x-mcp-header":"Value"}
+                        }}
+                    }});
+                    let reviews = review_every_header(&public);
+                    assert!(
+                        admit_local_tool_input_schema("lookup", public.clone(), &reviews).is_ok()
+                    );
+
+                    // Change only one ancestor annotation; re-review the exact
+                    // new revision so a stale review cannot mask the defect.
+                    let mut secret = public.clone();
+                    if at_root {
+                        secret[keyword] = marker;
+                    } else {
+                        secret["properties"]["a/b~c"][keyword] = marker;
+                    }
+                    let before = secret.clone();
+                    let reviews = review_every_header(&secret);
+                    assert_eq!(
+                        admit_local_tool_input_schema("lookup", secret.clone(), &reviews)
+                            .unwrap_err(),
+                        HeaderExposureError::SecretField {
+                            path: vec!["a/b~c".to_owned(), "0".to_owned()]
+                        }
+                    );
+                    assert_eq!(secret, before, "refusal never rewrites the source");
+                    // Refusing the secret revision does not poison admission
+                    // of the original public revision with its own reviews.
+                    assert!(
+                        admit_local_tool_input_schema(
+                            "lookup",
+                            public.clone(),
+                            &review_every_header(&public),
+                        )
+                        .is_ok()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_secret_flags_do_not_leak_across_sibling_subtrees() {
+        for secret_name in ["a_secret", "z_secret"] {
+            let mut source = json!({"type":"object", "properties":{
+                "m_public":{"type":"string", "x-mcp-header":"Public"}
+            }});
+            source["properties"][secret_name] = json!({
+                "type":"object", "writeOnly":true, "properties":{
+                    "nested":{"type":"object", "writeOnly":false, "properties":{
+                        "value":{"type":"string", "writeOnly":false, "x-mcp-header":"Secret"}
+                    }}
+                }
+            });
+            let admitted = AdmittedToolHeaderSchema::admit(source.clone()).unwrap();
+            assert_eq!(admitted.schema(), &source);
+            assert_eq!(admitted.header_plan().bindings().len(), 2);
+            for binding in admitted.header_plan().bindings() {
+                assert_eq!(
+                    binding.marks_secret_field(),
+                    binding.header_name() == "Mcp-Param-Secret"
+                );
+            }
+            // Both public compiler entry points must carry the effective flag.
+            let generic = crate::schema::admit_final_schema(source).unwrap();
+            let compiled = ToolParameterHeaderPlan::compile(&generic).unwrap();
+            assert_eq!(&compiled, admitted.header_plan());
+        }
+    }
+
+    #[test]
+    fn body_only_secrets_and_literal_annotations_keep_public_headers_usable() {
+        let source = json!({"type":"object", "properties":{
+            "public":{"type":"object", "properties":{
+                "region":{"type":"string", "x-mcp-header":"Region",
+                    "default":"password", "examples":[{"writeOnly":true}],
+                    "x-ui":{"writeOnly":true,"format":"password"}}
+            }},
+            "private":{"type":"object", "writeOnly":true, "properties":{
+                "token":{"type":"string", "format":"password"}
+            }}
+        }, "default":{"writeOnly":true, "format":"password"}});
+        let arguments = json!({
+            "public":{"region":"eu"}, "private":{"token":"body-only-canary"}
+        });
+        let before = arguments.clone();
+        let admitted = AdmittedToolHeaderSchema::admit(source.clone()).unwrap();
+        assert!(!admitted.header_plan().bindings()[0].marks_secret_field());
+        let registered =
+            admit_local_tool_input_schema("lookup", source.clone(), &review_every_header(&source))
+                .unwrap();
+        assert!(registered.validate(&arguments).is_ok());
+        assert_eq!(
+            admitted
+                .header_plan()
+                .project(Some(&arguments))
+                .unwrap()
+                .fields(),
+            &[("Mcp-Param-Region".to_owned(), "eu".to_owned())]
+        );
+        assert_eq!(arguments, before);
+    }
+
+    #[test]
+    fn inherited_secrets_do_not_skip_annotation_admission() {
+        for (source, expected) in [
+            (
+                json!({"type":"object", "writeOnly":true, "$defs":{
+                    "unused":{"type":"string", "x-mcp-header":"Secret"}
+                }}),
+                McpHeaderError::UnreachableAnnotation,
+            ),
+            (
+                json!({"type":"object", "writeOnly":true, "properties":{
+                    "first":{"type":"string", "x-mcp-header":"Same"},
+                    "second":{"type":"string", "x-mcp-header":"same"}
+                }}),
+                McpHeaderError::DuplicateAnnotation,
+            ),
+            (
+                json!({"type":"object", "writeOnly":true, "properties":{
+                    "invalid":{"type":"object", "x-mcp-header":"Secret"}
+                }}),
+                McpHeaderError::InvalidAnnotation,
+            ),
+        ] {
+            assert_eq!(AdmittedToolHeaderSchema::admit(source).unwrap_err(), expected);
+        }
     }
 
     fn reviewed_schema() -> Value {

@@ -3,11 +3,12 @@
 //! machine authentication does not execute a browser or authorization-code flow.
 use super::*;
 use fastmcp_client::http_auth::discovery::TrustedOAuthIssuer;
+use fastmcp_client::http_auth::discovery::client_credentials::rpc::ClientCredentialsCoreError;
 use fastmcp_client::http_auth::discovery::client_credentials::rpc::interaction::{
     ClientCredentialsInputReply, ClientCredentialsInteraction, ClientCredentialsInteractionError,
 };
 use fastmcp_client::http_auth::discovery::client_credentials::{
-    CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsPlan,
+    CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsError, ClientCredentialsPlan,
 };
 
 #[path = "mixed_inputs.rs"]
@@ -284,11 +285,13 @@ fn run_machine(case: MachineCase) {
                     2
                 }
                 MachineCase::DiscoveryRefusal => {
-                    let denied = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}"#;
+                    let denied = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/oauth-client-credentials":{"enabled":true}}},"ttlMs":0,"cacheScope":"private"}"#;
                     let (wire, result) = Box::pin(pair(peer.response(62, denied), operation.resume_partial(
                         &cx, RequestId::Number(62), RequestId::Number(63), answers("one")))).await;
                     assert_eq!(wire["method"], "server/discover");
-                    assert!(result.is_err()); assert!(operation.pending_input().is_none());
+                    assert!(matches!(result, Err(ClientCredentialsInteractionError::Core(
+                        ClientCredentialsCoreError::Authentication(ClientCredentialsError::Negotiation)))));
+                    assert!(operation.pending_input().is_none());
                     assert_eq!(operation.continuation_count(),1);
                     assert!(matches!(Box::pin(operation.resume_partial(&cx, RequestId::Number(64), RequestId::Number(65), answers("one"))).await,
                         Err(ClientCredentialsInteractionError::Interaction(ManagedInteractionError::Closed))));

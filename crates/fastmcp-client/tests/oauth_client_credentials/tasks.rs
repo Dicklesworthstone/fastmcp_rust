@@ -217,7 +217,7 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),12);
                 }
                 TaskCase::MissingTasks | TaskCase::MalformedAuth => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     let mut missing=discovery();
                     if matches!(case,TaskCase::MissingTasks) {
                         missing["capabilities"]["extensions"].as_object_mut().unwrap().remove(TASKS_EXTENSION);
@@ -242,7 +242,7 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.grants.load(Ordering::SeqCst),1);
                 }
                 TaskCase::WrongResponse | TaskCase::WrongTask => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     let server=async {
                         discover(&peer,1,"access-one",&discovery()).await;
                         let (mut tls,_)=rpc(&peer,2,"tasks/get","access-one").await;
@@ -267,7 +267,7 @@ fn run_tasks(case: TaskCase) {
                 }
                 TaskCase::InvalidProgress | TaskCase::Truncated | TaskCase::Cancel | TaskCase::Close
                 | TaskCase::Abandon | TaskCase::Expiry | TaskCase::Deadline | TaskCase::RecordLimit => {
-                    acquire(&peer,&cx,&client,"access-one",if matches!(case,TaskCase::Expiry) { 2 } else { 300 }).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",if matches!(case,TaskCase::Expiry) { 2 } else { 300 })).await;
                     let cancellation=McpRequestCancellation::new();
                     let server=async {
                         discover(&peer,1,"access-one",&discovery()).await;
@@ -307,7 +307,7 @@ fn run_tasks(case: TaskCase) {
                     assert_eq!(peer.rpcs.load(Ordering::SeqCst),2,"interruption never sends tasks/cancel or replays the tool");
                 }
                 TaskCase::Denied | TaskCase::Redirect | TaskCase::LostMutation => {
-                    acquire(&peer,&cx,&client,"access-one",300).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",300)).await;
                     let server=async {
                         discover(&peer,1,"access-one",&discovery()).await;
                         let (mut tls,_)=rpc(&peer,2,"tasks/cancel","access-one").await;
@@ -343,7 +343,7 @@ fn run_tasks(case: TaskCase) {
                     assert!(matches!(snapshot,ManagedTaskEvent::Snapshot(_)));
                 }
                 TaskCase::Renewal => {
-                    acquire(&peer,&cx,&client,"access-one",1).await;
+                    Box::pin(acquire(&peer,&cx,&client,"access-one",1)).await;
                     let working=task("working","complete");
                     Box::pin(pair(operation(&peer,1,"tasks/get","access-one",&working),result(&tasks,&cx,1,ManagedTaskRequest::Get(task_id())))).await;
                     Sleep::new(cx.now().saturating_add_nanos(1_100_000_000)).await;

@@ -260,10 +260,97 @@ impl Drop for TestHarness {
         self.client.take();
 
         if let Some(handle) = self.server_thread.take() {
-            // If the server thread panicked, fail the test (assert! is acceptable in test-only Drop).
-            assert!(handle.join().is_ok(), "server thread panicked");
+            if handle.join().is_err() {
+                // A panicked server thread must fail its own test and never
+                // abort the harness. Panicking unconditionally here aborted the
+                // binary and destroyed every other test's result, because this
+                // Drop is normally reached BY unwinding: the test panics, the
+                // server thread has already panicked on its own timeout, and a
+                // second panic during unwinding is the one thing Rust turns
+                // into SIGABRT. Measured at 153 of 165 tests voided (bd-3lb6v).
+                //
+                // Asserting on `thread::panicking()` keeps both outcomes. With
+                // no panic in flight the assert fails and fails this test, the
+                // original behaviour. With a panic in flight it passes and
+                // leaves that panic as the reported cause, which is the more
+                // useful of the two. Same idiom as `FinalTasksHttpFixture` in
+                // e2e_workflow.rs, from 4135f590 for bd-fdxmx.
+                assert!(std::thread::panicking(), "server thread panicked");
+            }
         }
     }
+}
+
+/// bd-3lb6v: `TestHarness::drop` must fail its own test when the server thread
+/// panicked, and must NEVER panic a second time while a panic is already
+/// unwinding, because Rust turns that into SIGABRT and it voided 153 of this
+/// target's 165 tests.
+///
+/// The two halves differ in exactly one dimension, whether a panic is in
+/// flight, and nothing else: same drop, same panicked server thread. The
+/// load-dependent server timeout that triggers this in the wild cannot be
+/// relied on to reproduce, so this proves the repaired branch directly.
+#[test]
+fn test_harness_drop_fails_its_test_but_never_aborts_while_unwinding() {
+    fn panicked_server_thread() -> JoinHandle<()> {
+        let handle = std::thread::spawn(|| panic!("simulated server thread panic"));
+        // Join readiness is not assumed: drop() joins it again and must observe
+        // Err either way.
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+        handle
+    }
+
+    // A panic payload is `&str` for a literal message and `String` once
+    // formatted. Reading only one of the two would make this pair pass or fail
+    // for the wrong reason, so both are accepted.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default()
+    }
+
+    // POSITIVE. A panic is already unwinding when the harness drops. Under the
+    // old `assert!(handle.join().is_ok(), ...)` this aborted the process, so
+    // merely RETURNING from catch_unwind is the observable.
+    let unwinding = std::panic::catch_unwind(|| {
+        let _harness = TestHarness {
+            client: None,
+            server_thread: Some(panicked_server_thread()),
+        };
+        panic!("original test failure");
+    });
+    assert!(
+        unwinding.is_err(),
+        "the original panic must still propagate out of the harness drop"
+    );
+    assert_eq!(
+        panic_message(&*unwinding.unwrap_err()),
+        "original test failure",
+        "drop must preserve the in-flight panic rather than replace it with its own"
+    );
+
+    // PLANTED NEGATIVE, differing only in the absence of an in-flight panic.
+    // The same drop with the same panicked server thread must still fail
+    // loudly, so the repair cannot be mistaken for swallowing the condition.
+    let quiescent = std::panic::catch_unwind(|| {
+        let _harness = TestHarness {
+            client: None,
+            server_thread: Some(panicked_server_thread()),
+        };
+    });
+    assert!(
+        quiescent.is_err(),
+        "a panicked server thread with no in-flight panic must still fail its test"
+    );
+    assert_eq!(
+        panic_message(&*quiescent.unwrap_err()),
+        "server thread panicked",
+        "the quiescent failure must name the panicked server thread"
+    );
 }
 
 fn spawn_thread(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {

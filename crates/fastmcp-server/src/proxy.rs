@@ -6,16 +6,13 @@
 #[cfg(feature = "tasks")]
 use std::collections::VecDeque;
 use std::collections::{BTreeMap, HashMap, HashSet};
-#[cfg(feature = "tasks")]
 use std::future::Future;
-#[cfg(feature = "tasks")]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Instant;
 
 use asupersync::Cx;
-#[cfg(feature = "tasks")]
 use asupersync::cx::{ChildRegion, ChildRegionSpec};
 #[cfg(feature = "tasks")]
 use base64::Engine as _;
@@ -50,7 +47,7 @@ use fastmcp_core::{
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use fastmcp_core::{SamplingRequest, SamplingRequestMessage, SamplingRole};
-use fastmcp_protocol::common_types::{Implementation, LoggingLevel, RawIcon};
+use fastmcp_protocol::common_types::{AbsoluteUri, Implementation, LoggingLevel, RawIcon};
 #[cfg(feature = "tasks")]
 use fastmcp_protocol::extensions::{
     ExtensionLocalEnablement, OFFICIAL_TASKS_RESULT_DISCRIMINATOR, official_tasks_empty_settings,
@@ -65,8 +62,9 @@ use fastmcp_protocol::protocol_policy::{
 use fastmcp_protocol::{
     CacheScope, CacheTtl, CallToolResult, ClientCapabilities, ClientInfo, CompleteResult,
     CompletionValues, Content, CoreRequest, CoreResult, ElicitationCapability,
-    FINAL_LOG_LEVEL_META_KEY, FinalCallToolResult, FinalCompletionParams, FinalCompletionValues,
-    FinalCoreResult, FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
+    FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionValues, FinalCoreResult,
+    FinalGetPromptResult, FinalLogMessageParams, FinalProgressNotificationParams,
     FinalReadResourceResult, FinalRequestMeta, FormElicitationCapability, GetPromptResult,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, LegacyCompletionParams,
     LegacyCompletionReference, LegacyContent, LegacyCoreResult, LegacyPromptMessage,
@@ -171,9 +169,7 @@ impl ProxyFinalCoreRequest {
             mut client,
             request_id,
         } = self;
-        if let Some(level) = inbound_logging_level(ctx) {
-            client.set_log_level(level);
-        }
+        overlay_inbound_identity_on_detached_client(&mut client, ctx);
         if let Some(marker) = ctx.progress_marker() {
             overlay_legacy_progress_token(&mut parameters, marker)?;
         }
@@ -288,9 +284,7 @@ impl ProxyFinalTaskRequest {
             operation,
             maximum_response_bytes,
         } = self;
-        if let Some(level) = inbound_logging_level(ctx) {
-            client.set_log_level(level);
-        }
+        overlay_inbound_identity_on_detached_client(&mut client, ctx);
         match operation {
             ProxyFinalTaskOperation::CallTool { name, arguments } => {
                 let progress_marker = ctx_progress_marker(ctx);
@@ -506,7 +500,6 @@ impl ProxyFinalTaskListenerRequest {
 }
 
 /// One independent HTTP catalog `subscriptions/listen` opening.
-#[cfg(feature = "tasks")]
 pub struct ProxyCatalogListenerRequest {
     client: ModernHttpClient,
     request_id: RequestId,
@@ -514,7 +507,6 @@ pub struct ProxyCatalogListenerRequest {
     limits: SseLimits,
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyCatalogListenerRequest {
     async fn open(self, ctx: &McpContext) -> McpResult<Box<dyn ProxyCatalogListener>> {
         let listener = await_proxy_request_or_cancellation(
@@ -541,12 +533,10 @@ impl ProxyCatalogListenerRequest {
 }
 
 /// One live HTTP catalog listener detached from the proxy route mutex.
-#[cfg(feature = "tasks")]
 struct ProxyHttpCatalogListener {
     listener: ModernHttpSubscriptionListener,
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyHttpCatalogListener {
     fn map_listen_event(
         event: Option<ModernHttpSubscriptionListenEvent>,
@@ -580,7 +570,6 @@ impl ProxyHttpCatalogListener {
     }
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyCatalogListener for ProxyHttpCatalogListener {
     fn next_async<'a>(
         &'a mut self,
@@ -791,7 +780,6 @@ pub trait ProxyFinalTaskListener: Send {
 /// One live upstream catalog `subscriptions/listen` owned by a downstream
 /// request. HTTP uses an independent SSE POST so the route mutex stays free;
 /// stdio drives the incremental listener under a brief lock.
-#[cfg(feature = "tasks")]
 pub trait ProxyCatalogListener: Send {
     /// Awaits the next upstream catalog listener event on the caller's `Cx`.
     fn next_async<'a>(
@@ -803,7 +791,6 @@ pub trait ProxyCatalogListener: Send {
 
 /// One event emitted by a [`ProxyCatalogListener`].
 #[derive(Debug)]
-#[cfg(feature = "tasks")]
 pub enum ProxyCatalogListenerEvent {
     /// Upstream accepted the requested catalog filter.
     Acknowledged(SubscriptionFilter),
@@ -1836,13 +1823,18 @@ pub trait ProxyBackend: Send {
 
     /// Reserves an independent HTTP catalog listener opening without beginning
     /// upstream I/O. Incremental stdio backends return `None`.
-    #[cfg(feature = "tasks")]
     #[doc(hidden)]
     fn start_catalog_listener_request(
         &mut self,
         _notifications: SubscriptionFilter,
     ) -> McpResult<Option<ProxyCatalogListenerRequest>> {
         Ok(None)
+    }
+
+    /// Reports live core subscription support without opening an upstream
+    /// request. It is independent of the optional Tasks extension.
+    fn supports_catalog_listener(&mut self) -> McpResult<bool> {
+        self.supports_incremental_catalog_listener()
     }
 
     /// Reports whether this backend uses the sequential stdio ingress loop
@@ -1960,7 +1952,6 @@ pub trait ProxyBackend: Send {
 
     /// Retires a live incremental catalog listener so later route requests can
     /// use the sole stdio ingress reader again.
-    #[cfg(feature = "tasks")]
     fn cancel_incremental_catalog_listener(&mut self, _cx: &Cx) -> McpResult<()> {
         Ok(())
     }
@@ -2099,6 +2090,48 @@ fn sampling_request_from_create_message_params(
     Ok(request)
 }
 
+/// Projects a handler-visible inbound identity back onto the official
+/// Implementation object stamped on a native upstream request.
+///
+/// This serves the gateway legs only. A custom [`ProxyAsyncRequest`] backend
+/// owns its upstream identity through its own trait method and must never
+/// receive a downstream substitution; see
+/// `proxy_custom_async_request_configured_identity_probe`.
+fn implementation_from_request_identity(
+    identity: &fastmcp_core::ClientImplementationInfo,
+) -> Option<Implementation> {
+    let mut implementation = Implementation::try_new(&identity.name, &identity.version).ok()?;
+    implementation.title = identity.title.clone();
+    implementation.description = identity.description.clone();
+    if let Some(website_url) = identity.website_url.as_deref()
+        && let Ok(uri) = AbsoluteUri::parse(website_url)
+    {
+        implementation.website_url = Some(uri);
+    }
+    implementation.icons = identity
+        .icon_sources
+        .iter()
+        .filter_map(|src| RawIcon::try_new(src.clone()).ok())
+        .collect();
+    Some(implementation)
+}
+
+fn inbound_client_info_value(
+    identity: &fastmcp_core::ClientImplementationInfo,
+) -> Option<serde_json::Value> {
+    serde_json::to_value(implementation_from_request_identity(identity)?).ok()
+}
+
+/// Inbound identity projected for the client crate's own inbound overlay,
+/// which takes the official `Implementation` rather than the handler view.
+///
+/// Both detached native HTTP request forms stamp this onto their own cloned
+/// `ModernHttpClient`, so this is not gated on the Tasks relay.
+fn inbound_identity_implementation(ctx: &McpContext) -> Option<Implementation> {
+    ctx.client_implementation()
+        .and_then(implementation_from_request_identity)
+}
+
 fn inbound_logging_level(ctx: &McpContext) -> Option<LoggingLevel> {
     ctx.min_log_level().map(logging_level_from_mcp)
 }
@@ -2125,6 +2158,34 @@ fn inbound_client_capabilities(ctx: &McpContext) -> Option<ClientCapabilities> {
         });
     }
     Some(capabilities)
+}
+
+/// Stamps the inbound caller's per-request identity, log level and
+/// reverse-direction capabilities onto one detached native HTTP handle.
+///
+/// A gateway leg is transparent. The upstream needs the inbound caller's
+/// identity, and `sampling`/`elicitation`/`roots` are the capabilities it
+/// exercises by calling BACK through this proxy, so they must describe the
+/// caller that will service them rather than this proxy's own upstream-leg
+/// configuration. `ModernHttpClient` is cloneable and stateless after
+/// discovery and `start_final_*` hands out a per-request clone, so this
+/// mutates nothing the route shares and no caller's identity can leak into
+/// another request.
+///
+/// Custom [`ProxyAsyncRequest`] backends are deliberately NOT covered: they
+/// declare their own upstream identity through the trait and must never admit
+/// a downstream substitution; see
+/// `proxy_custom_async_request_configured_identity_probe`.
+fn overlay_inbound_identity_on_detached_client(client: &mut ModernHttpClient, ctx: &McpContext) {
+    if let Some(implementation) = inbound_identity_implementation(ctx) {
+        client.set_client_implementation(implementation);
+    }
+    if let Some(level) = inbound_logging_level(ctx) {
+        client.set_log_level(level);
+    }
+    if let Some(capabilities) = inbound_client_capabilities(ctx) {
+        client.overlay_client_capabilities(capabilities);
+    }
 }
 
 fn mrtr_input_responses_from_completed(
@@ -2200,17 +2261,30 @@ fn mcp_log_level_from_logging(level: LoggingLevel) -> McpLogLevel {
 fn stdio_parameters_with_inbound_identity(
     era: Option<ProtocolEra>,
     mut parameters: serde_json::Value,
-    _identity: Option<&fastmcp_core::ClientImplementationInfo>,
+    identity: Option<&fastmcp_core::ClientImplementationInfo>,
     log_level: Option<LoggingLevel>,
-    _capabilities: Option<ClientCapabilities>,
+    capabilities: Option<ClientCapabilities>,
 ) -> serde_json::Value {
-    // Identity and capabilities belong to the configured upstream client.
-    // Downstream metadata may request a logging level but cannot replace
-    // either local field. Exact-2024 receives no reserved final metadata.
+    // A gateway leg is transparent: the inbound caller's per-request identity
+    // and its reverse-direction capabilities are what the upstream needs in
+    // order to address the caller at all. `sampling`, `elicitation` and
+    // `roots` are the capabilities the upstream exercises by calling BACK
+    // through this proxy, so they must describe the caller that will service
+    // them rather than this proxy's own upstream-leg configuration; stamping
+    // the local set instead makes the upstream refuse requests the caller can
+    // in fact answer. Absent an inbound identity the locally configured one
+    // stands. Exact-2024 decode rejects reserved final `_meta` members, so
+    // every overlay here is modern-only and a legacy stdio session keeps
+    // progressToken (stamped by the caller) and nothing else.
+    //
+    // Custom `ProxyAsyncRequest` backends are deliberately NOT covered: they
+    // declare their own upstream identity and capabilities through the trait
+    // and must never admit a downstream substitution.
     if era != Some(ProtocolEra::Modern2026) {
         return parameters;
     }
-    if log_level.is_none() {
+    let client_info = identity.and_then(inbound_client_info_value);
+    if client_info.is_none() && log_level.is_none() && capabilities.is_none() {
         return parameters;
     }
     let Some(object) = parameters.as_object_mut() else {
@@ -2220,10 +2294,33 @@ fn stdio_parameters_with_inbound_identity(
         .entry("_meta")
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
     if let Some(metadata) = metadata.as_object_mut() {
+        if let Some(client_info) = client_info {
+            metadata.insert(FINAL_CLIENT_INFO_META_KEY.to_owned(), client_info);
+        }
         if let Some(log_level) = log_level
             && let Ok(value) = serde_json::to_value(log_level)
         {
             metadata.insert(FINAL_LOG_LEVEL_META_KEY.to_owned(), value);
+        }
+        if let Some(capabilities) = capabilities
+            && let Ok(value) = serde_json::to_value(capabilities)
+            && let Some(inbound) = value.as_object()
+        {
+            let existing = metadata
+                .entry(FINAL_CLIENT_CAPABILITIES_META_KEY.to_owned())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(existing) = existing.as_object_mut() {
+                for key in ["sampling", "elicitation", "roots"] {
+                    match inbound.get(key) {
+                        Some(member) => {
+                            existing.insert(key.to_owned(), member.clone());
+                        }
+                        None => {
+                            existing.remove(key);
+                        }
+                    }
+                }
+            }
         }
     }
     parameters
@@ -2634,8 +2731,8 @@ fn handler_prompt_to_legacy(message: PromptMessage) -> McpResult<LegacyPromptMes
 ///
 /// Proxy registration creates a fixed downstream snapshot, so every page must
 /// be collected before any entry is registered. The bound keeps an upstream
-/// cursor cycle or an unbounded catalog from turning that one-time operation
-/// into unbounded work.
+/// peer that never omits `nextCursor` from turning that one-time operation
+/// into unbounded work. Cursor contents do not determine whether a page exists.
 const MAX_MODERN_PROXY_CATALOG_PAGES: usize = 64;
 
 /// Maximum entries retained while materializing one proxy catalog family.
@@ -2772,12 +2869,14 @@ impl std::io::Write for ProxyCatalogByteCounter {
     }
 }
 
-/// Collects one paginated modern catalog without accepting a cursor cycle.
+/// Collects one paginated modern catalog within the independent local bounds.
 ///
 /// The caller owns selected-era decoding; this helper owns only the invariant
 /// shared by tools, resources, templates, and prompts. Returning an error
 /// drops the locally accumulated entries, so the caller cannot construct a
-/// partial proxy catalog after an invalid cursor sequence.
+/// partial proxy catalog after a failed page or an exhausted local bound.
+/// Every present cursor, including an empty or repeated value, is forwarded
+/// unchanged; only absence of `nextCursor` terminates a successful listing.
 fn collect_modern_proxy_catalog_pages<T: Serialize>(
     method: &str,
     mut fetch_page: impl FnMut(
@@ -2800,7 +2899,6 @@ fn collect_proxy_catalog_pages<T: Serialize>(
     let mut entries = Vec::new();
     let mut cache_hints = Vec::new();
     let mut cursor = None;
-    let mut observed_cursors = HashSet::new();
     let mut admission = ProxyCatalogAdmission::default();
 
     for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
@@ -2815,16 +2913,6 @@ fn collect_proxy_catalog_pages<T: Serialize>(
                 cache_hints,
             });
         };
-        if cursor.as_deref() == Some(next_cursor.as_str()) {
-            return Err(McpError::invalid_request(format!(
-                "Proxy {era} {method} catalog returned a non-advancing cursor"
-            )));
-        }
-        if !observed_cursors.insert(next_cursor.clone()) {
-            return Err(McpError::invalid_request(format!(
-                "Proxy {era} {method} catalog returned a repeated cursor"
-            )));
-        }
         cursor = Some(next_cursor);
     }
 
@@ -3079,7 +3167,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::TOOLS_LIST,
-                    |cursor| match Client::list_tools_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("tools/list", cursor)? {
                         CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) => {
                             let payload = result.payload;
                             Ok((
@@ -3146,7 +3234,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::RESOURCES_LIST,
-                    |cursor| match Client::list_resources_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("resources/list", cursor)? {
                         CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) => {
                             let payload = result.payload;
                             Ok((
@@ -3213,7 +3301,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST,
-                    |cursor| match Client::list_resource_templates_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("resources/templates/list", cursor)? {
                     CoreResult::Final(FinalCoreResult::ResourceTemplatesList {
                         result, ..
                     }) => {
@@ -3280,7 +3368,7 @@ impl ProxyBackend for Client {
                 }
                 collect_modern_proxy_catalog_pages(
                     fastmcp_protocol::methods::PROMPTS_LIST,
-                    |cursor| match Client::list_prompts_typed(self, cursor)? {
+                    |cursor| match self.list_catalog_page_uncached("prompts/list", cursor)? {
                         CoreResult::Final(FinalCoreResult::PromptsList { result, .. }) => {
                             let payload = result.payload;
                             Ok((
@@ -3779,9 +3867,9 @@ impl ProxyBackend for Client {
             name,
             arguments,
             progress_marker.as_ref(),
-            None,
+            inbound_identity_implementation(ctx).as_ref(),
             inbound_logging_level(ctx),
-            None,
+            inbound_client_capabilities(ctx),
         )?;
         relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
@@ -3933,7 +4021,6 @@ impl ProxyBackend for Client {
         Client::try_next_subscription_event(self, cx, request_cancellation)
     }
 
-    #[cfg(feature = "tasks")]
     fn cancel_incremental_catalog_listener(&mut self, cx: &Cx) -> McpResult<()> {
         Client::cancel_live_catalog_subscription(self, cx)
     }
@@ -4103,7 +4190,6 @@ impl Drop for ProxyIncrementalStdioFinalTaskListener {
 
 /// A route-owned bridge to a stdio catalog listener. Each `next_async` call
 /// briefly obtains the route mutex only to drive one bounded receive turn.
-#[cfg(feature = "tasks")]
 struct ProxyIncrementalStdioCatalogListener {
     client: ProxyClient,
     /// Owned context for best-effort Drop-time cancellation. Derived from the
@@ -4124,7 +4210,6 @@ struct ProxyIncrementalStdioCatalogListener {
 /// when its request has gone away, drops the returned child handle and triggers
 /// its close backstop. Admission observation must not checkpoint or charge the
 /// caller's shared context.
-#[cfg(feature = "tasks")]
 async fn open_owned_proxy_listener_region(
     cx: &Cx,
     listener_kind: &'static str,
@@ -4161,7 +4246,6 @@ async fn open_owned_proxy_listener_region(
     }
 }
 
-#[cfg(feature = "tasks")]
 impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
     fn next_async<'a>(
         &'a mut self,
@@ -4196,7 +4280,6 @@ impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
     }
 }
 
-#[cfg(feature = "tasks")]
 impl Drop for ProxyIncrementalStdioCatalogListener {
     fn drop(&mut self) {
         let cx = self.cx.clone();
@@ -4452,6 +4535,410 @@ impl std::fmt::Debug for ProxyClient {
             .field("upstream_binding", &self.upstream_binding)
             .field("observed_era", &self.observed_protocol_era().ok())
             .finish_non_exhaustive()
+    }
+}
+
+const MAX_PROXY_CATALOG_ROUTES: usize = 32;
+
+fn admit_proxy_catalog_acknowledgement(
+    expected: &SubscriptionFilter,
+    event: ProxyCatalogListenerEvent,
+) -> McpResult<()> {
+    match event {
+        ProxyCatalogListenerEvent::Acknowledged(accepted)
+            if accepted.additional.is_empty()
+                && crate::subscription_filter_admission_matches(expected, &accepted)? =>
+        {
+            Ok(())
+        }
+        ProxyCatalogListenerEvent::Acknowledged(_) => Err(McpError::invalid_params(
+            "Proxy upstream changed the admitted catalog subscription filter",
+        )),
+        ProxyCatalogListenerEvent::Notification(_) | ProxyCatalogListenerEvent::Terminal => {
+            Err(McpError::invalid_request(
+                "Proxy upstream catalog listener did not acknowledge before events",
+            ))
+        }
+    }
+}
+
+/// Core subscriptions keep the immutable upstream route and catalog ownership
+/// separately from the optional Tasks service. Composition copies these
+/// receipts; an active downstream listen never borrows a mutable broker.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ProxyCatalogRelay {
+    routes: Vec<ProxyCatalogRoute>,
+}
+
+#[derive(Clone, Debug)]
+struct ProxyCatalogRoute {
+    client: ProxyClient,
+    binding: ProxyUpstreamBinding,
+    tools: bool,
+    resources: bool,
+    prompts: bool,
+    resource_uris: HashSet<String>,
+    resource_templates: Vec<fastmcp_protocol::uri_template::ReversibleResourceTemplate>,
+}
+
+impl ProxyCatalogRoute {
+    fn owns_resource(&self, uri: &str) -> McpResult<Option<String>> {
+        if !self.resources {
+            return Ok(None);
+        }
+        if self.resource_uris.contains(uri) {
+            return Ok(Some(uri.to_owned()));
+        }
+        for template in &self.resource_templates {
+            if template
+                .match_uri(uri)
+                .map_err(|_| McpError::invalid_params("invalid proxied resource subscription URI"))?
+                .is_some()
+            {
+                return Ok(Some(uri.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn ensure_binding(&self) -> McpResult<()> {
+        if self.client.upstream_binding() == Some(self.binding)
+            && self.binding.era() == ProtocolEra::Modern2026
+            && matches!(
+                self.binding.adapter(),
+                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
+            )
+        {
+            Ok(())
+        } else {
+            Err(McpError::invalid_request(
+                "Proxy catalog listener lost its admitted upstream route",
+            ))
+        }
+    }
+}
+
+impl ProxyCatalogRelay {
+    pub(crate) fn merge(&self, other: &Self) -> McpResult<Self> {
+        let mut routes = self.routes.clone();
+        for route in &other.routes {
+            if let Some(existing) = routes.iter_mut().find(|existing| {
+                Arc::ptr_eq(&existing.client.inner, &route.client.inner)
+                    && existing.binding == route.binding
+            }) {
+                existing.tools |= route.tools;
+                existing.resources |= route.resources;
+                existing.prompts |= route.prompts;
+                existing
+                    .resource_uris
+                    .extend(route.resource_uris.iter().cloned());
+                for template in &route.resource_templates {
+                    if !existing.resource_templates.contains(template) {
+                        existing.resource_templates.push(template.clone());
+                    }
+                }
+            } else {
+                if routes.len() == MAX_PROXY_CATALOG_ROUTES {
+                    return Err(McpError::invalid_params(
+                        "Proxy catalog subscription route capacity exhausted",
+                    ));
+                }
+                routes.push(route.clone());
+            }
+        }
+        Ok(Self { routes })
+    }
+
+    /// Mount only the selected component families. A nonempty resource prefix
+    /// creates relative exact-2024 keys in Router and removes their modern
+    /// visibility; only URI-preserving mounts may relay core resource events.
+    pub(crate) fn mounted(
+        &self,
+        tools: bool,
+        resources: bool,
+        prompts: bool,
+        resource_prefix: Option<&str>,
+    ) -> Self {
+        let routes = self
+            .routes
+            .iter()
+            .cloned()
+            .filter_map(|mut route| {
+                route.tools &= tools;
+                route.resources &= resources;
+                route.prompts &= prompts;
+                if resource_prefix.is_some_and(|prefix| !prefix.is_empty()) {
+                    route.resources = false;
+                }
+                (route.tools || route.resources || route.prompts).then_some(route)
+            })
+            .collect();
+        Self { routes }
+    }
+
+    pub(crate) async fn open_listener_async(
+        &self,
+        ctx: &McpContext,
+        requested: SubscriptionFilter,
+        router: &crate::Router,
+    ) -> McpResult<Option<Box<dyn ProxyCatalogListener>>> {
+        ctx.ensure_live()?;
+        // Admit all route/filter receipts and the fan-out bound before any
+        // upstream side effect. No URI may select two independent authorities.
+        if self.routes.len() > MAX_PROXY_CATALOG_ROUTES {
+            return Err(McpError::invalid_params(
+                "Proxy catalog subscription route capacity exhausted",
+            ));
+        }
+        let downstream_filter = crate::core_accepted_subscription_filter(&requested);
+        let mut owners = HashSet::new();
+        let mut prepared = Vec::new();
+        for route in &self.routes {
+            route.ensure_binding()?;
+            let (owns_tools, owns_resources, owns_prompts) =
+                router.proxy_catalog_membership(&route.client);
+            let mut rewrites = HashMap::new();
+            if let Some(uris) = &downstream_filter.resource_subscriptions {
+                for uri in uris {
+                    if router.proxy_resource_owned_by(uri, &route.client)
+                        && let Some(upstream_uri) = route.owns_resource(uri)?
+                    {
+                        if !owners.insert(uri.clone()) && !rewrites.contains_key(&upstream_uri) {
+                            return Err(McpError::invalid_params(
+                                "Proxy resource subscription matches multiple upstream routes",
+                            ));
+                        }
+                        rewrites.insert(upstream_uri, uri.clone());
+                    }
+                }
+            }
+            let mut resource_subscriptions: Vec<_> = rewrites.keys().cloned().collect();
+            resource_subscriptions.sort();
+            let filter = SubscriptionFilter {
+                tools_list_changed: (route.tools
+                    && owns_tools
+                    && downstream_filter.tools_list_changed == Some(true))
+                .then_some(true),
+                resources_list_changed: (route.resources
+                    && owns_resources
+                    && downstream_filter.resources_list_changed == Some(true))
+                .then_some(true),
+                prompts_list_changed: (route.prompts
+                    && owns_prompts
+                    && downstream_filter.prompts_list_changed == Some(true))
+                .then_some(true),
+                resource_subscriptions: (!resource_subscriptions.is_empty())
+                    .then_some(resource_subscriptions),
+                additional: BTreeMap::new(),
+            };
+            if crate::catalog_filter_requests_events(&filter) {
+                prepared.push((route.clone(), filter, rewrites));
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(None);
+        }
+        let mut listeners: Vec<Box<dyn ProxyCatalogListener>> = Vec::with_capacity(prepared.len());
+        for (route, filter, rewrites) in prepared {
+            ctx.ensure_live()?;
+            let mut inner = route
+                .client
+                .open_catalog_listener_async(ctx, filter.clone())
+                .await?;
+            let cancellation = ctx.request_cancellation();
+            admit_proxy_catalog_acknowledgement(
+                &filter,
+                inner.next_async(ctx.cx(), &cancellation).await?,
+            )?;
+            ctx.ensure_live()?;
+            listeners.push(Box::new(AdmittedProxyCatalogListener {
+                inner,
+                route,
+                filter,
+                rewrites,
+                context: ctx.clone(),
+            }));
+        }
+        Ok(Some(Box::new(MultiplexedProxyCatalogListener::new(
+            listeners,
+            downstream_filter,
+        ))))
+    }
+}
+
+struct AdmittedProxyCatalogListener {
+    inner: Box<dyn ProxyCatalogListener>,
+    route: ProxyCatalogRoute,
+    filter: SubscriptionFilter,
+    rewrites: HashMap<String, String>,
+    context: McpContext,
+}
+
+impl ProxyCatalogListener for AdmittedProxyCatalogListener {
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>> {
+        Box::pin(async move {
+            let ctx = self
+                .context
+                .clone()
+                .with_request_cx(cx.clone())
+                .with_request_cancellation(cancellation.clone());
+            ctx.ensure_live()?;
+            self.route.ensure_binding()?;
+            let event = self.inner.next_async(cx, cancellation).await?;
+            ctx.ensure_live()?;
+            self.route.ensure_binding()?;
+            match event {
+                ProxyCatalogListenerEvent::Notification(mut notification) => {
+                    if !crate::subscription_filter_accepts(&self.filter, &notification) {
+                        return Err(McpError::invalid_request(
+                            "Proxy upstream event is outside the admitted catalog subscription",
+                        ));
+                    }
+                    if let ServerNotification::ResourceUpdated(params) = &mut notification {
+                        let uri = self.rewrites.get(params.uri.as_str()).ok_or_else(|| {
+                            McpError::invalid_request(
+                                "Proxy resource event has no admitted URI mapping",
+                            )
+                        })?;
+                        params.uri = AbsoluteUri::parse(uri).map_err(|_| {
+                            McpError::invalid_params(
+                                "Proxy resource subscription URI is not absolute",
+                            )
+                        })?;
+                    }
+                    Ok(ProxyCatalogListenerEvent::Notification(notification))
+                }
+                ProxyCatalogListenerEvent::Acknowledged(_) => Err(McpError::invalid_request(
+                    "Proxy upstream catalog listener acknowledged more than once",
+                )),
+                ProxyCatalogListenerEvent::Terminal => Ok(ProxyCatalogListenerEvent::Terminal),
+            }
+        })
+    }
+}
+
+type ProxyCatalogListenTurn = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Box<dyn ProxyCatalogListener>,
+                    McpResult<ProxyCatalogListenerEvent>,
+                ),
+            > + Send,
+    >,
+>;
+
+/// At most one owned read per admitted route: a ready sibling never drops an
+/// unfinished HTTP/stdio read. The existing transport and delivery queues
+/// retain their byte/count bounds; this broker adds no unbounded event queue.
+struct MultiplexedProxyCatalogListener {
+    listeners: Vec<Option<Box<dyn ProxyCatalogListener>>>,
+    turns: Vec<Option<ProxyCatalogListenTurn>>,
+    acknowledgement: Option<SubscriptionFilter>,
+    next_route: usize,
+    terminated: bool,
+}
+
+impl MultiplexedProxyCatalogListener {
+    fn new(listeners: Vec<Box<dyn ProxyCatalogListener>>, filter: SubscriptionFilter) -> Self {
+        Self {
+            turns: (0..listeners.len()).map(|_| None).collect(),
+            listeners: listeners.into_iter().map(Some).collect(),
+            acknowledgement: Some(filter),
+            next_route: 0,
+            terminated: false,
+        }
+    }
+
+    fn terminate(&mut self) {
+        self.terminated = true;
+        self.acknowledgement = None;
+        self.turns.clear();
+        self.listeners.clear();
+    }
+
+    async fn next_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &fastmcp_core::McpRequestCancellation,
+    ) -> McpResult<ProxyCatalogListenerEvent> {
+        if self.terminated {
+            return Err(McpError::invalid_request(
+                "Proxy catalog listener was polled after terminal completion",
+            ));
+        }
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            self.terminate();
+            return Err(McpError::request_cancelled());
+        }
+        if let Some(filter) = self.acknowledgement.take() {
+            return Ok(ProxyCatalogListenerEvent::Acknowledged(filter));
+        }
+        let event = await_proxy_operation_or_cancellation(
+            cx,
+            cancellation,
+            Box::pin(std::future::poll_fn(|task_cx| {
+                let route_count = self.listeners.len();
+                for offset in 0..route_count {
+                    let index = (self.next_route + offset) % route_count;
+                    if self.turns[index].is_none() {
+                        let mut listener = self.listeners[index]
+                            .take()
+                            .expect("catalog route is owned by its listener or read turn");
+                        let owned_cx = cx.clone();
+                        let owned_cancellation = cancellation.clone();
+                        self.turns[index] = Some(Box::pin(async move {
+                            let event = listener.next_async(&owned_cx, &owned_cancellation).await;
+                            (listener, event)
+                        }));
+                    }
+                    let turn = self.turns[index]
+                        .as_mut()
+                        .expect("catalog read was installed");
+                    if let Poll::Ready((listener, event)) = turn.as_mut().poll(task_cx) {
+                        self.turns[index] = None;
+                        self.listeners[index] = Some(listener);
+                        self.next_route = (index + 1) % route_count;
+                        return Poll::Ready(event);
+                    }
+                }
+                Poll::Pending
+            })),
+        )
+        .await;
+        match event {
+            Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
+                Ok(ProxyCatalogListenerEvent::Notification(notification))
+            }
+            Ok(ProxyCatalogListenerEvent::Terminal) => {
+                self.terminate();
+                Ok(ProxyCatalogListenerEvent::Terminal)
+            }
+            Ok(ProxyCatalogListenerEvent::Acknowledged(_)) => {
+                self.terminate();
+                Err(McpError::invalid_request(
+                    "Proxy upstream catalog listener acknowledged more than once",
+                ))
+            }
+            Err(error) => {
+                self.terminate();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl ProxyCatalogListener for MultiplexedProxyCatalogListener {
+    fn next_async<'a>(
+        &'a mut self,
+        cx: &'a Cx,
+        cancellation: &'a fastmcp_core::McpRequestCancellation,
+    ) -> Pin<Box<dyn Future<Output = McpResult<ProxyCatalogListenerEvent>> + Send + 'a>> {
+        Box::pin(self.next_event(cx, cancellation))
     }
 }
 
@@ -5465,17 +5952,6 @@ impl ProxyFinalTaskRelay {
                 )) as Box<dyn ProxyFinalTaskListener>
             })
     }
-
-    pub(crate) async fn open_catalog_listener_async(
-        &self,
-        ctx: &McpContext,
-        notifications: SubscriptionFilter,
-    ) -> McpResult<Box<dyn ProxyCatalogListener>> {
-        self.ensure_modern_route()?;
-        self.client
-            .open_catalog_listener_async(ctx, notifications)
-            .await
-    }
 }
 
 #[cfg(feature = "tasks")]
@@ -5847,9 +6323,9 @@ impl ProxyHttpClient {
     fn request_parameters(
         &self,
         mut parameters: serde_json::Value,
-        _inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
+        inbound_identity: Option<&fastmcp_core::ClientImplementationInfo>,
         inbound_log_level: Option<LoggingLevel>,
-        _inbound_capabilities: Option<ClientCapabilities>,
+        inbound_capabilities: Option<ClientCapabilities>,
     ) -> McpResult<serde_json::Value> {
         if self.binding.era() == ProtocolEra::Legacy2024 {
             return Ok(parameters);
@@ -5868,8 +6344,53 @@ impl ProxyHttpClient {
                     .and_then(|value| serde_json::from_value(value.clone()).ok())
             })
         });
-        let mut metadata = FinalRequestMeta::new(self.client_capabilities.clone());
-        metadata.client_info = Some(self.client_info.to_implementation());
+        // IDENTITY AND THE THREE REVERSE-DIRECTION CAPABILITIES NEED THE SAME
+        // `existing_meta` FALLBACK THE LOG LEVEL ABOVE ALREADY HAS. This whole
+        // function rebuilds `_meta` from scratch after removing the incoming
+        // one, so anything it does not explicitly carry over is dropped. The
+        // log level survived a missing ctx argument only because it is re-read
+        // from the removed metadata; identity and capabilities had no such
+        // fallback and were replaced by the locally configured set, which is
+        // what made the HTTP-upstream as_proxy identity and sampling tests
+        // report the gateway's own name back to the caller.
+        //
+        // Precedence: the explicit inbound argument, then the identity and
+        // capabilities already stamped on the incoming request, then this
+        // proxy's locally configured values. The upstream calls BACK through
+        // this proxy for sampling, elicitation and roots, so the set it reads
+        // must describe the inbound caller that will service those calls;
+        // every other advertised capability stays locally configured.
+        //
+        // Custom `ProxyAsyncRequest` backends are deliberately NOT covered:
+        // they declare their own upstream identity through the trait and must
+        // never admit a downstream substitution.
+        let inbound_capabilities = inbound_capabilities.or_else(|| {
+            existing_meta.and_then(|meta| {
+                meta.get(FINAL_CLIENT_CAPABILITIES_META_KEY)
+                    .and_then(|value| {
+                        serde_json::from_value::<ClientCapabilities>(value.clone()).ok()
+                    })
+            })
+        });
+        let mut capabilities = self.client_capabilities.clone();
+        if let Some(inbound) = &inbound_capabilities {
+            capabilities.sampling = inbound.sampling.clone();
+            capabilities.elicitation = inbound.elicitation.clone();
+            capabilities.roots = inbound.roots.clone();
+        }
+        let mut metadata = FinalRequestMeta::new(capabilities);
+        metadata.client_info = Some(
+            inbound_identity
+                .and_then(implementation_from_request_identity)
+                .or_else(|| {
+                    existing_meta.and_then(|meta| {
+                        meta.get(FINAL_CLIENT_INFO_META_KEY).and_then(|value| {
+                            serde_json::from_value::<Implementation>(value.clone()).ok()
+                        })
+                    })
+                })
+                .unwrap_or_else(|| self.client_info.to_implementation()),
+        );
         if let Some(progress_marker) = progress_marker {
             metadata
                 .additional_metadata
@@ -6092,7 +6613,6 @@ impl ProxyHttpClient {
     ) -> McpResult<Vec<T>> {
         let mut entries = Vec::new();
         let mut cursor = None;
-        let mut observed_cursors = HashSet::new();
         let mut admission = ProxyCatalogAdmission::default();
 
         for _ in 0..MAX_MODERN_PROXY_CATALOG_PAGES {
@@ -6108,16 +6628,6 @@ impl ProxyHttpClient {
             let Some(next_cursor) = next_cursor else {
                 return Ok(entries);
             };
-            if cursor.as_deref() == Some(next_cursor.as_str()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy legacy {method} catalog returned a non-advancing cursor"
-                )));
-            }
-            if !observed_cursors.insert(next_cursor.clone()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy legacy {method} catalog returned a repeated cursor"
-                )));
-            }
             cursor = Some(next_cursor);
         }
 
@@ -7331,7 +7841,6 @@ impl ProxyBackend for ProxyHttpClient {
         }))
     }
 
-    #[cfg(feature = "tasks")]
     fn start_catalog_listener_request(
         &mut self,
         notifications: SubscriptionFilter,
@@ -7345,6 +7854,10 @@ impl ProxyBackend for ProxyHttpClient {
             notifications,
             limits: Self::sse_limits(),
         }))
+    }
+
+    fn supports_catalog_listener(&mut self) -> McpResult<bool> {
+        Ok(modern_http_client(&self.connection).is_some())
     }
 
     #[cfg(feature = "tasks")]
@@ -8096,9 +8609,8 @@ async fn await_proxy_final_tool_body_or_cancellation(
 
 /// Awaits an upstream operation or a request-owned cancellation token when no
 /// full [`McpContext`] can be moved into the operation. This is used by the
-/// final Tasks listener, whose upstream SSE read must wake even when it is
-/// otherwise silent.
-#[cfg(feature = "tasks")]
+/// catalog and Tasks listeners, whose upstream SSE reads must wake even when
+/// they are otherwise silent.
 async fn await_proxy_operation_or_cancellation<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
@@ -9118,12 +9630,104 @@ impl ProxyClient {
         self.upstream_binding
     }
 
+    pub(crate) fn same_upstream_route(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner) && self.upstream_binding == other.upstream_binding
+    }
+
     /// Returns the era sealed by an admitted typed catalog or result.
     fn observed_protocol_era(&self) -> McpResult<Option<ProtocolEra>> {
         self.observed_era
             .lock()
             .map(|era| *era)
             .map_err(|_| McpError::internal_error("Proxy observed-era lock poisoned"))
+    }
+
+    pub(crate) fn catalog_relay(
+        &self,
+        catalog: &ProxyCatalog,
+    ) -> McpResult<Option<Arc<ProxyCatalogRelay>>> {
+        if catalog.era()? != ProtocolEra::Modern2026 {
+            return Ok(None);
+        }
+        self.catalog_relay_for_components(
+            !catalog.final_tools.is_empty(),
+            !catalog.final_prompts.is_empty(),
+            &catalog.final_resources,
+            &catalog.final_resource_templates,
+        )
+    }
+
+    pub(crate) fn typed_catalog_relay(
+        &self,
+        catalog: &ProxyTypedCatalog,
+    ) -> McpResult<Option<Arc<ProxyCatalogRelay>>> {
+        catalog.era()?;
+        match (
+            &catalog.tools,
+            &catalog.resources,
+            &catalog.resource_templates,
+            &catalog.prompts,
+        ) {
+            (
+                ProxyToolCatalog::Final(tools),
+                ProxyResourceCatalog::Final(resources),
+                ProxyResourceTemplateCatalog::Final(templates),
+                ProxyPromptCatalog::Final(prompts),
+            ) => self.catalog_relay_for_components(
+                !tools.entries.is_empty(),
+                !prompts.entries.is_empty(),
+                &resources.entries,
+                &templates.entries,
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    fn catalog_relay_for_components(
+        &self,
+        tools: bool,
+        prompts: bool,
+        resources: &[fastmcp_protocol::FinalResource],
+        templates: &[fastmcp_protocol::FinalResourceTemplate],
+    ) -> McpResult<Option<Arc<ProxyCatalogRelay>>> {
+        let Some(binding) = self.upstream_binding else {
+            return Ok(None);
+        };
+        if binding.era() != ProtocolEra::Modern2026
+            || !matches!(
+                binding.adapter(),
+                ProxyUpstreamAdapter::ModernHttp | ProxyUpstreamAdapter::ModernStdio
+            )
+            || !self.with_backend(|backend| backend.supports_catalog_listener())?
+        {
+            return Ok(None);
+        }
+        let resource_templates = templates
+            .iter()
+            .map(|template| {
+                fastmcp_protocol::UriTemplate::parse(&template.uri_template)
+                    .and_then(|template| template.compile_reversible())
+                    .map_err(|_| {
+                        McpError::invalid_params(
+                            "Proxy resource subscription template cannot be routed unambiguously",
+                        )
+                    })
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        Ok(Some(Arc::new(ProxyCatalogRelay {
+            routes: vec![ProxyCatalogRoute {
+                client: self.clone(),
+                binding,
+                tools,
+                resources: !resources.is_empty() || !templates.is_empty(),
+                prompts,
+                resource_uris: resources
+                    .iter()
+                    .map(|resource| resource.uri.as_str().to_owned())
+                    .collect(),
+                resource_templates,
+            }],
+        })))
     }
 
     /// Returns a route-bound relay only when the selected upstream is modern
@@ -9364,7 +9968,6 @@ impl ProxyClient {
     ) -> McpResult<ProxyFinalCatalog<T>> {
         let mut catalog = ProxyFinalCatalog::new(Vec::new());
         let mut cursor = None;
-        let mut observed_cursors = HashSet::new();
         let mut admission = ProxyCatalogAdmission::default();
         let era = if self.upstream_binding.map(|binding| binding.era())
             == Some(ProtocolEra::Legacy2024)
@@ -9406,16 +10009,6 @@ impl ProxyClient {
             let Some(next_cursor) = next_cursor else {
                 return Ok(catalog);
             };
-            if cursor.as_deref() == Some(next_cursor.as_str()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy {era} {method} catalog returned a non-advancing cursor"
-                )));
-            }
-            if !observed_cursors.insert(next_cursor.clone()) {
-                return Err(McpError::invalid_request(format!(
-                    "Proxy {era} {method} catalog returned a repeated cursor"
-                )));
-            }
             cursor = Some(next_cursor);
         }
         Err(McpError::invalid_request(format!(
@@ -10644,7 +11237,6 @@ impl ProxyClient {
         self.with_backend(|backend| backend.open_final_task_listener(notifications))
     }
 
-    #[cfg(feature = "tasks")]
     async fn open_catalog_listener_async(
         &self,
         ctx: &McpContext,
@@ -11798,6 +12390,10 @@ impl ProxyToolHandler {
 }
 
 impl ToolHandler for ProxyToolHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Tool {
         self.tool.clone()
     }
@@ -12057,6 +12653,10 @@ impl ProxyResourceHandler {
 }
 
 impl ResourceHandler for ProxyResourceHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Resource {
         self.resource.clone()
     }
@@ -12268,6 +12868,10 @@ impl ProxyPromptHandler {
 }
 
 impl PromptHandler for ProxyPromptHandler {
+    fn proxy_catalog_client(&self) -> Option<&ProxyClient> {
+        Some(&self.client)
+    }
+
     fn definition(&self) -> Prompt {
         self.prompt.clone()
     }
@@ -12442,6 +13046,238 @@ mod tests {
     use crate::handler::{FinalToolOutcome, FinalToolSchemaAuthority, PromptHandler, ToolHandler};
     #[cfg(feature = "tasks")]
     use std::task::Poll;
+
+    #[test]
+    fn core_catalog_same_origin_mounts_share_one_upstream_listener_route() {
+        let binding = proxy_binding(ProtocolEra::Modern2026);
+        let client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            binding,
+            "2026-07-28",
+        )
+        .unwrap();
+        let source = super::ProxyCatalogRelay {
+            routes: vec![super::ProxyCatalogRoute {
+                client: client.clone(),
+                binding,
+                tools: true,
+                resources: true,
+                prompts: true,
+                resource_uris: std::collections::HashSet::from(["resource://shared".to_owned()]),
+                resource_templates: Vec::new(),
+            }],
+        };
+        let left = source.mounted(true, true, true, Some("left"));
+        let right = source.mounted(true, true, true, Some("right"));
+        let combined = left.merge(&right).unwrap();
+        assert_eq!(
+            combined.routes.len(),
+            1,
+            "different name prefixes cannot duplicate an origin's catalog stream"
+        );
+        assert!(combined.routes[0].tools && combined.routes[0].prompts);
+        assert!(
+            !combined.routes[0].resources,
+            "ordinary prefixed mounts remove modern resource visibility"
+        );
+        assert_eq!(
+            combined.routes[0]
+                .owns_resource("resource://shared")
+                .unwrap(),
+            None
+        );
+
+        let preserved = source.mounted(false, true, false, None);
+        let combined = combined.merge(&preserved).unwrap();
+        assert_eq!(
+            combined.routes.len(),
+            1,
+            "an exact-URI resource mount shares the same origin's one listener"
+        );
+        assert!(
+            combined.routes[0].tools && combined.routes[0].resources && combined.routes[0].prompts
+        );
+        assert_eq!(
+            combined.routes[0]
+                .owns_resource("resource://shared")
+                .unwrap(),
+            Some("resource://shared".to_owned())
+        );
+        assert_eq!(
+            combined.routes[0]
+                .owns_resource("left/resource://shared")
+                .unwrap(),
+            None
+        );
+        assert_eq!(combined.routes[0].resource_uris.len(), 1);
+
+        let mut independent = preserved;
+        independent.routes[0].client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            binding,
+            "2026-07-28",
+        )
+        .unwrap();
+        assert_eq!(
+            combined.merge(&independent).unwrap().routes.len(),
+            2,
+            "equal adapter/generation metadata cannot merge independent origins"
+        );
+    }
+
+    #[test]
+    fn core_catalog_acknowledgement_rejects_filter_changes_before_delivery() {
+        use super::{ProxyCatalogListenerEvent, admit_proxy_catalog_acknowledgement};
+
+        let requested = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resource_subscriptions: Some(vec!["resource://a".into(), "resource://b".into()]),
+            ..SubscriptionFilter::default()
+        };
+        let mut reordered = requested.clone();
+        reordered.resource_subscriptions = Some(vec![
+            "resource://b".into(),
+            "resource://a".into(),
+            "resource://a".into(),
+        ]);
+        reordered.prompts_list_changed = Some(false);
+        admit_proxy_catalog_acknowledgement(
+            &requested,
+            ProxyCatalogListenerEvent::Acknowledged(reordered),
+        )
+        .expect("set-equivalent core acknowledgement is admitted");
+
+        let mut narrowed = requested.clone();
+        narrowed.resource_subscriptions = Some(vec!["resource://a".into()]);
+        let mut widened = requested.clone();
+        widened.prompts_list_changed = Some(true);
+        let mut extension = requested.clone();
+        extension
+            .additional
+            .insert("example.org/extra".into(), serde_json::json!(true));
+        for changed in [narrowed, widened, extension] {
+            let error = admit_proxy_catalog_acknowledgement(
+                &requested,
+                ProxyCatalogListenerEvent::Acknowledged(changed),
+            )
+            .expect_err("one-field filter drift must not acknowledge downstream");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+        }
+        for event in [
+            ProxyCatalogListenerEvent::Terminal,
+            ProxyCatalogListenerEvent::Notification(ServerNotification::ToolsListChanged(None)),
+        ] {
+            let error = admit_proxy_catalog_acknowledgement(&requested, event)
+                .expect_err("acknowledgement must precede every other event");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn core_catalog_multiplexer_retains_pending_reads_and_closes_every_leg() {
+        use super::{ProxyCatalogListener, ProxyCatalogListenerEvent};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct ReadLifetime(Arc<AtomicUsize>);
+        impl Drop for ReadLifetime {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Listener {
+            gate: Arc<AtomicBool>,
+            read_drops: Arc<AtomicUsize>,
+            listener_drops: Arc<AtomicUsize>,
+            terminal: bool,
+        }
+        impl Drop for Listener {
+            fn drop(&mut self) {
+                self.listener_drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl ProxyCatalogListener for Listener {
+            fn next_async<'a>(
+                &'a mut self,
+                _cx: &'a Cx,
+                _cancellation: &'a McpRequestCancellation,
+            ) -> super::Pin<
+                Box<
+                    dyn super::Future<Output = fastmcp_core::McpResult<ProxyCatalogListenerEvent>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let lifetime = ReadLifetime(Arc::clone(&self.read_drops));
+                Box::pin(async move {
+                    let _lifetime = lifetime;
+                    std::future::poll_fn(|_| {
+                        if self.terminal {
+                            super::Poll::Ready(Ok(ProxyCatalogListenerEvent::Terminal))
+                        } else if self.gate.swap(false, Ordering::SeqCst) {
+                            self.terminal = true;
+                            super::Poll::Ready(Ok(ProxyCatalogListenerEvent::Notification(
+                                ServerNotification::ToolsListChanged(None),
+                            )))
+                        } else {
+                            super::Poll::Pending
+                        }
+                    })
+                    .await
+                })
+            }
+        }
+
+        let slow_gate = Arc::new(AtomicBool::new(false));
+        let slow_read_drops = Arc::new(AtomicUsize::new(0));
+        let slow_listener_drops = Arc::new(AtomicUsize::new(0));
+        let fast_listener_drops = Arc::new(AtomicUsize::new(0));
+        let mut listener = super::MultiplexedProxyCatalogListener::new(
+            vec![
+                Box::new(Listener {
+                    gate: Arc::clone(&slow_gate),
+                    read_drops: Arc::clone(&slow_read_drops),
+                    listener_drops: Arc::clone(&slow_listener_drops),
+                    terminal: false,
+                }),
+                Box::new(Listener {
+                    gate: Arc::new(AtomicBool::new(true)),
+                    read_drops: Arc::new(AtomicUsize::new(0)),
+                    listener_drops: Arc::clone(&fast_listener_drops),
+                    terminal: false,
+                }),
+            ],
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+        );
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        assert!(matches!(
+            block_on(listener.next_event(&cx, &cancellation)).unwrap(),
+            ProxyCatalogListenerEvent::Acknowledged(_)
+        ));
+        assert!(matches!(
+            block_on(listener.next_event(&cx, &cancellation)).unwrap(),
+            ProxyCatalogListenerEvent::Notification(_)
+        ));
+        assert_eq!(
+            slow_read_drops.load(Ordering::SeqCst),
+            0,
+            "a ready sibling cannot discard a partially consumed upstream read"
+        );
+        assert!(matches!(
+            block_on(listener.next_event(&cx, &cancellation)).unwrap(),
+            ProxyCatalogListenerEvent::Terminal
+        ));
+        assert_eq!(slow_read_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_listener_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(fast_listener_drops.load(Ordering::SeqCst), 1);
+        assert!(
+            block_on(listener.next_event(&cx, &cancellation)).is_err(),
+            "a terminal broker must not reconnect or replay"
+        );
+    }
 
     #[cfg(feature = "tasks")]
     fn catalog_listener_filter() -> SubscriptionFilter {
@@ -13040,7 +13876,7 @@ IFS= read -r end
                     assert_eq!(wire["id"], index + 2);
                     assert_eq!(wire["method"], method);
                     assert_eq!(wire["params"]["taskId"], if index == 0 { first_id.as_str() } else { second_id.as_str() });
-                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY]["name"], "fastmcp-client");
+                    assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY], serde_json::json!({"name": subject.clone(), "version": "19"}), "the gateway leg forwards the inbound per-request identity rather than its own configured one");
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"][fastmcp_protocol::TASKS_EXTENSION], serde_json::json!({}));
                     assert_eq!(wire["params"]["_meta"][fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"], serde_json::json!({}));
                     if method == "tasks/update" {
@@ -14832,6 +15668,15 @@ IFS= read -r end
                     listener.set_nonblocking(true).unwrap();
                     let address = listener.local_addr().unwrap();
                     let subject = format!("read-prompt-{}", address.port());
+                    // The inbound caller's declared version, bound once so the
+                    // upstream assertion below and the McpContext that declares
+                    // it cannot drift apart. a70b0eb9 made the gateway leg
+                    // forward the INBOUND per-request identity rather than its
+                    // own configured one, so this value is what the peer must
+                    // observe; a literal in each place would let one side move
+                    // silently, which is how the stale expectation this
+                    // replaces survived.
+                    let caller_version = "17";
                     let target = if resource {
                         format!("db://{subject}")
                     } else {
@@ -14916,7 +15761,11 @@ IFS= read -r end
                             assert_eq!(metadata["progressToken"], peer_subject);
                             assert_eq!(
                                 metadata[fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY],
-                                serde_json::to_value(proxy_http_client_info()).unwrap()
+                                serde_json::json!({
+                                    "name": peer_subject,
+                                    "version": caller_version
+                                }),
+                                "the gateway leg forwards the inbound per-request identity rather than its own configured one"
                             );
                             assert_eq!(
                                 metadata[fastmcp_protocol::FINAL_CLIENT_CAPABILITIES_META_KEY]["roots"],
@@ -15015,7 +15864,7 @@ IFS= read -r end
                         let ctx = McpContext::with_progress(cx.clone(), 892,
                             ProgressReporter::with_marker(serde_json::json!(subject), Arc::clone(&capture) as Arc<dyn NotificationSender>))
                             .with_request_cancellation(cancellation.clone()).with_client_capabilities(capabilities)
-                            .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), "17"));
+                            .with_client_implementation(fastmcp_core::ClientImplementationInfo::new(subject.clone(), caller_version));
                         let exchange_binding = MrtrExchangeBinding::new(method, target.clone(), [8;32], [10;32], None, [12;32]);
                         let mut resumes = Vec::new();
                         let exposed_uri = format!("tenant/remote/{target}");
@@ -16239,7 +17088,7 @@ IFS= read -r end
                         let params = &wire["params"];
                         assert_eq!(params[if method == "resources/read" { "uri" } else { "name" }], target);
                         assert_eq!(params["_meta"]["io.modelcontextprotocol/protocolVersion"], "2026-07-28");
-                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY]["name"], "fastmcp-client");
+                        assert_eq!(params["_meta"][FINAL_CLIENT_INFO_META_KEY], serde_json::json!({"name": subject.clone(), "version": "18"}), "the gateway leg forwards the inbound per-request identity rather than its own configured one");
                         assert_eq!(params["_meta"]["progressToken"], if index % 2 == 0 { "first" } else { "second" });
                         let tasks = params["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get("io.modelcontextprotocol/tasks");
                         if task_result.is_some() { assert_eq!(tasks, Some(&serde_json::json!({}))); }
@@ -16880,16 +17729,18 @@ IFS= read -r end
                         &serde_json::to_vec(&response).unwrap(),
                     );
                 }
-                let methods: &[&str] = if interrupt == 4 {
-                    &["tools/list", "tools/list"]
+                let methods = if interrupt == 4 {
+                    vec!["tools/list"; 64]
                 } else {
-                    &[
-                        "tools/list",
+                    [
                         "tools/list",
                         "resources/list",
                         "resources/templates/list",
                         "prompts/list",
                     ]
+                    .into_iter()
+                    .flat_map(|method| std::iter::repeat_n(method, 4))
+                    .collect()
                 };
                 for (index, method) in methods.iter().enumerate() {
                     let mut post = accept();
@@ -16905,20 +17756,39 @@ IFS= read -r end
                             break;
                         }
                     }
+                    let page = index % 4;
                     let mut result = match *method {
-                        "tools/list" => {
-                            serde_json::json!({"tools":[{"name":format!("registry-{}-{index}", address.port()), "inputSchema":{"type":"object"}}]})
+                        "tools/list" if page == 0 || page == 3 => {
+                            let entry = usize::from(page == 3);
+                            serde_json::json!({"tools":[{"name":format!("registry-{}-{entry}", address.port()), "inputSchema":{"type":"object"}}]})
                         }
+                        "tools/list" => serde_json::json!({"tools":[]}),
                         "resources/list" => serde_json::json!({"resources":[]}),
                         "resources/templates/list" => serde_json::json!({"resourceTemplates":[]}),
                         "prompts/list" => serde_json::json!({"prompts":[]}),
                         _ => unreachable!(),
                     };
-                    if index == 0 || (index == 1 && interrupt == 4) {
+                    if interrupt == 4 {
                         result["nextCursor"] = serde_json::json!("page-two");
-                    }
-                    if index == 1 {
-                        assert_eq!(message["params"]["cursor"], "page-two");
+                        assert_eq!(
+                            message["params"].get("cursor"),
+                            (index > 0).then(|| serde_json::json!("page-two")).as_ref()
+                        );
+                    } else {
+                        if page < 3 {
+                            result["nextCursor"] =
+                                serde_json::json!(if page < 2 { "" } else { " \tresume\n " });
+                        }
+                        assert_eq!(
+                            message["params"].get("cursor"),
+                            match page {
+                                0 => None,
+                                1 | 2 => Some(serde_json::json!("")),
+                                _ => Some(serde_json::json!(" \tresume\n ")),
+                            }
+                            .as_ref(),
+                            "each async catalog forwards the exact preceding opaque cursor"
+                        );
                     }
                     if !legacy {
                         result["resultType"] = serde_json::json!("complete");
@@ -17165,7 +18035,7 @@ IFS= read -r end
                         if interrupt == 4 {
                             let error = catalog.unwrap_err();
                             assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                            assert!(error.message.contains("non-advancing cursor"));
+                            assert!(error.message.contains("64-page limit"));
                         } else {
                             let catalog = catalog.unwrap();
                             let names: Vec<_> = match &catalog.tools {
@@ -17173,7 +18043,7 @@ IFS= read -r end
                                     tools.iter().map(|tool| tool.name.clone()).collect()
                                 }
                                 ProxyToolCatalog::Final(tools) => {
-                                    assert_eq!(tools.cache_hints.len(), 2);
+                                    assert_eq!(tools.cache_hints.len(), 4);
                                     assert_eq!(
                                         serde_json::to_value(&tools.cache_hints[1].ttl_ms).unwrap(),
                                         18
@@ -17388,7 +18258,7 @@ IFS= read -r end
         use std::future::Future;
         use std::task::Poll;
 
-        // 0: complete, 1: cursor cycle, 2: cancellation, 3: deadline, 4: drop.
+        // 0: complete, 1: page exhaustion, 2: cancellation, 3: deadline, 4: drop.
         let legacy = policy == ProtocolPolicy::LegacyOnly;
         let clock = Arc::new(asupersync::time::VirtualClock::new());
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -17423,7 +18293,8 @@ IFS= read -r end
         );
         let mut pages = Vec::new();
         if interrupt == 1 {
-            pages.extend([(0, true), (1, true)]);
+            pages.push((0, true));
+            pages.extend(std::iter::repeat_n((1, true), 63));
         } else if interrupt >= 2 {
             pages.push((0, true));
         }
@@ -17552,7 +18423,7 @@ IFS= read -r end
                     let catalog = if interrupt == 1 {
                         let error = observed.unwrap_err();
                         assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                        assert!(error.message.contains("non-advancing cursor"));
+                        assert!(error.message.contains("64-page limit"));
                         proxy.catalog_typed_with_cx(&cx).await.unwrap()
                     } else {
                         observed.unwrap()
@@ -20793,7 +21664,7 @@ IFS= read -r end
                 };
                 match finish {
                     "cancel" => {
-                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled)
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
                     }
                     "error" => assert_eq!(result.unwrap_err().message, "upstream stream failed"),
                     _ => assert!(matches!(
@@ -23391,7 +24262,57 @@ IFS= read -r end
     }
 
     #[test]
-    fn proxy_catalog_rejects_one_non_advancing_modern_cursor_without_replacing_catalog() {
+    fn proxy_catalog_accepts_empty_repeated_and_cyclic_opaque_cursors() {
+        for era in ["modern", "legacy"] {
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                let cursors = [
+                    Some(""),
+                    Some(" \tresume\n "),
+                    Some(" \tresume\n "),
+                    Some(""),
+                    None,
+                ];
+                let mut page_requests = 0_usize;
+                let catalog = super::collect_proxy_catalog_pages(era, method, |cursor| {
+                    let page = page_requests;
+                    assert_eq!(cursor, page.checked_sub(1).and_then(|index| cursors[index]));
+                    page_requests += 1;
+                    // Zero entries do not terminate a catalog when a cursor is
+                    // present, nor does returning a previously seen token.
+                    let entries = if matches!(page, 1 | 2) {
+                        Vec::new()
+                    } else {
+                        vec![page]
+                    };
+                    Ok((
+                        entries,
+                        cursors[page].map(str::to_owned),
+                        (era == "modern").then(|| {
+                            ProxyCatalogCacheHint::new(
+                                CacheTtl::milliseconds(page as u64),
+                                CacheScope::Private,
+                            )
+                        }),
+                    ))
+                })
+                .expect("every present opaque cursor must be followed unchanged");
+                assert_eq!(page_requests, cursors.len());
+                assert_eq!(catalog.entries, [0, 3, 4]);
+                assert_eq!(
+                    catalog.cache_hints.len(),
+                    if era == "modern" { 5 } else { 0 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_catalog_page_limit_bounds_repeated_cursors_without_replacing_catalog() {
         let retained_catalog = ProxyCatalog {
             tool_catalog_era: Some(ProtocolEra::Modern2026),
             final_tools: vec![final_catalog_tool()],
@@ -23417,8 +24338,8 @@ IFS= read -r end
                         page_hint(),
                     )),
                     Some("tools-page-2") => {
-                        // The one forbidden difference from the terminal
-                        // positive page is retaining this same cursor.
+                        // A repeated token is valid until the independent
+                        // page bound is reached without a terminal page.
                         Ok((
                             vec![second_page.clone()],
                             Some("tools-page-2".to_owned()),
@@ -23437,14 +24358,12 @@ IFS= read -r end
             final_tool_cache_hints: final_tools.cache_hints,
             ..ProxyCatalog::default()
         });
-        let error = replacement.expect_err(
-            "only changing the terminal nextCursor to the current cursor must fail closed",
-        );
+        let error = replacement.expect_err("an unterminated listing must hit its page bound");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
-        assert!(error.message.contains("non-advancing cursor"));
+        assert!(error.message.contains("64-page limit"));
         assert_eq!(
-            page_requests, 2,
-            "the repeated cursor is rejected before a third catalog request"
+            page_requests, 64,
+            "the page bound prevents the 65th request independently of cursor contents"
         );
 
         assert_eq!(
@@ -24647,7 +25566,7 @@ exec sleep 2
     #[cfg(feature = "legacy-2024-11-05")]
     #[derive(Clone, Copy)]
     enum LegacyCatalogPageFailure {
-        RepeatedCursor,
+        PageLimit,
         UpstreamError,
     }
 
@@ -24674,41 +25593,53 @@ exec sleep 2
                 "resources/templates/list",
                 "prompts/list",
             ] {
-                for page in 1..=2 {
+                let page_count = if method == "resources/list"
+                    && matches!(attempt, Some(LegacyCatalogPageFailure::PageLimit))
+                {
+                    64
+                } else {
+                    4
+                };
+                for page in 1..=page_count {
+                    let entry_page = if page == 1 { 1 } else { 2 };
                     let mut result = match method {
                         "tools/list" => serde_json::json!({"tools":[{
-                            "name": format!("tool-{page}"),
-                            "description": format!("Tool from page {page}"),
+                            "name": format!("tool-{entry_page}"),
+                            "description": format!("Tool from page {entry_page}"),
                             "inputSchema": {"type":"object","properties":{"city":{"type":"string"}}}
                         }]}),
                         "resources/list" => serde_json::json!({"resources":[{
-                            "uri": format!("https://example.test/resource/{page}"),
-                            "name": format!("resource-{page}"),
-                            "description": format!("Resource from page {page}"),
+                            "uri": format!("https://example.test/resource/{entry_page}"),
+                            "name": format!("resource-{entry_page}"),
+                            "description": format!("Resource from page {entry_page}"),
                             "mimeType":"text/plain"
                         }]}),
                         "resources/templates/list" => serde_json::json!({"resourceTemplates":[{
-                            "uriTemplate": format!("https://example.test/template/{page}/{{id}}"),
-                            "name": format!("template-{page}"),
+                            "uriTemplate": format!("https://example.test/template/{entry_page}/{{id}}"),
+                            "name": format!("template-{entry_page}"),
                             "mimeType":"text/plain"
                         }]}),
                         "prompts/list" => serde_json::json!({"prompts":[{
-                            "name": format!("prompt-{page}"),
-                            "description": format!("Prompt from page {page}"),
+                            "name": format!("prompt-{entry_page}"),
+                            "description": format!("Prompt from page {entry_page}"),
                             "arguments":[{"name":"city","description":"City name","required":true}]
                         }]}),
                         _ => unreachable!(),
                     };
-                    // Reuse the same opaque token across families. Each list
-                    // operation must retain its own cursor history.
-                    if page == 1 {
-                        result["nextCursor"] = serde_json::json!("catalog-page-two");
+                    // Two empty pages reuse the empty cursor before the final
+                    // populated page. Only an absent nextCursor ends a list.
+                    if page > 1 && page < page_count {
+                        let entries = result.as_object_mut().unwrap().values_mut().next().unwrap();
+                        *entries = serde_json::json!([]);
                     }
-                    let failing_page = attempt.is_some() && method == "resources/list" && page == 2;
-                    if failing_page
-                        && matches!(attempt, Some(LegacyCatalogPageFailure::RepeatedCursor))
+                    let failing_page =
+                        attempt.is_some() && method == "resources/list" && page == page_count;
+                    if page < page_count
+                        || (failing_page
+                            && matches!(attempt, Some(LegacyCatalogPageFailure::PageLimit)))
                     {
-                        result["nextCursor"] = serde_json::json!("catalog-page-two");
+                        result["nextCursor"] =
+                            serde_json::json!(if page <= 2 { "" } else { "catalog-page-two" });
                     }
                     let response = if failing_page
                         && matches!(attempt, Some(LegacyCatalogPageFailure::UpstreamError))
@@ -24721,12 +25652,16 @@ exec sleep 2
                     };
                     replies.push(LegacyCatalogPageReply {
                         method,
-                        cursor: (page == 2).then_some("catalog-page-two"),
+                        cursor: match page {
+                            1 => None,
+                            2 | 3 => Some(""),
+                            _ => Some("catalog-page-two"),
+                        },
                         response,
                     });
                     if failing_page {
                         // The next attempt must restart tools/list without a
-                        // cursor, never request page three or later families.
+                        // cursor, never exceed the page bound or list later families.
                         break 'catalog;
                     }
                 }
@@ -24812,9 +25747,9 @@ exec sleep 2
                 .catalog()
                 .expect_err("a failed page cannot become a shorter catalog");
             match failure {
-                LegacyCatalogPageFailure::RepeatedCursor => {
+                LegacyCatalogPageFailure::PageLimit => {
                     assert_eq!(error.code, McpErrorCode::InvalidRequest);
-                    assert!(error.message.contains("non-advancing cursor"));
+                    assert!(error.message.contains("64-page limit"));
                 }
                 LegacyCatalogPageFailure::UpstreamError => {
                     assert_eq!(error.code, McpErrorCode::InvalidParams);
@@ -24852,15 +25787,15 @@ trap 'exit 99' HUP INT TERM
 expect_request() {{
     IFS= read -r request || exit 90
     case "$request" in *"\"method\":\"$1\""*) ;; *) exit 91 ;; esac
-    if [ -n "$2" ]; then
+    if [ "$3" = present ]; then
         case "$request" in *"\"cursor\":\"$2\""*) ;; *) exit 92 ;; esac
     else
         case "$request" in *'"cursor":'*) exit 93 ;; esac
     fi
 }}
-expect_request initialize ''
+expect_request initialize '' absent
 printf '%s\n' '{initialize}'
-expect_request notifications/initialized ''
+expect_request notifications/initialized '' absent
 "#
         );
         for (index, reply) in legacy_catalog_page_replies(failure).into_iter().enumerate() {
@@ -24873,9 +25808,14 @@ expect_request notifications/initialized ''
                 "shell fixture response must be quote-safe"
             );
             script.push_str(&format!(
-                "expect_request '{}' '{}'\nprintf '%s\\n' '{response}'\n",
+                "expect_request '{}' '{}' '{}'\nprintf '%s\\n' '{response}'\n",
                 reply.method,
                 reply.cursor.unwrap_or_default(),
+                if reply.cursor.is_some() {
+                    "present"
+                } else {
+                    "absent"
+                },
             ));
         }
         script.push_str("while IFS= read -r remaining; do :; done\n");
@@ -24902,7 +25842,7 @@ expect_request notifications/initialized ''
     #[test]
     fn proxy_legacy_stdio_catalog_pagination_planted_negative() {
         for failure in [
-            LegacyCatalogPageFailure::RepeatedCursor,
+            LegacyCatalogPageFailure::PageLimit,
             LegacyCatalogPageFailure::UpstreamError,
         ] {
             proxy_legacy_stdio_catalog_pagination_probe(Some(failure));
@@ -25005,7 +25945,14 @@ expect_request notifications/initialized ''
             ClientCapabilities::default(),
         ));
         assert_legacy_catalog_pagination(&proxy, failure);
-        assert_eq!(peer.join().unwrap(), if failure.is_some() { 20 } else { 8 });
+        assert_eq!(
+            peer.join().unwrap(),
+            match failure {
+                None => 16,
+                Some(LegacyCatalogPageFailure::UpstreamError) => 40,
+                Some(LegacyCatalogPageFailure::PageLimit) => 100,
+            }
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
@@ -25018,7 +25965,7 @@ expect_request notifications/initialized ''
     #[test]
     fn proxy_legacy_http_catalog_pagination_planted_negative() {
         for failure in [
-            LegacyCatalogPageFailure::RepeatedCursor,
+            LegacyCatalogPageFailure::PageLimit,
             LegacyCatalogPageFailure::UpstreamError,
         ] {
             proxy_legacy_http_catalog_pagination_probe(Some(failure));
@@ -25068,11 +26015,37 @@ expect_request notifications/initialized ''
                 br#"{"jsonrpc":"2.0","id":9,"result":{"resultType":"complete","prompts":[{"name":"prompt-two"}],"ttlMs":0,"cacheScope":"private"}}"#.as_slice(),
                 br#"{"jsonrpc":"2.0","id":10,"result":{"resultType":"complete","content":[{"type":"text","text":"forwarded"}]}}"#.as_slice(),
             ];
-            let mut normal_requests = Vec::new();
+            let mut opaque_cursor_responses = Vec::new();
             for response in responses {
+                let mut response: serde_json::Value = serde_json::from_slice(response).unwrap();
+                if response["result"].get("nextCursor").is_some() {
+                    let entries = ["tools", "resources", "resourceTemplates", "prompts"]
+                        .into_iter()
+                        .find(|field| response["result"].get(*field).is_some())
+                        .unwrap();
+                    response["result"]["nextCursor"] = serde_json::json!("");
+                    let mut empty = response.clone();
+                    empty["result"][entries] = serde_json::json!([]);
+                    opaque_cursor_responses.push(response);
+                    opaque_cursor_responses.push(empty.clone());
+                    empty["result"]["nextCursor"] = serde_json::json!(" \tresume\n ");
+                    opaque_cursor_responses.push(empty);
+                } else {
+                    opaque_cursor_responses.push(response);
+                }
+            }
+            let mut normal_requests = Vec::new();
+            for mut response in opaque_cursor_responses {
                 let (mut normal, _) = listener.accept().expect("accept modern proxy request");
                 let request = read_http_request(&mut normal);
-                write_http_response(&mut normal, 200, "application/json", response);
+                let message: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                response["id"] = message["id"].clone();
+                write_http_response(
+                    &mut normal,
+                    200,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
                 normal_requests.push(request);
             }
             (probe_request, normal_requests)
@@ -25185,17 +26158,16 @@ expect_request notifications/initialized ''
                 ["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
             "proxy-http-test-client"
         );
-        let expected_methods = [
-            "tools/list",
+        let expected_methods: Vec<_> = [
             "tools/list",
             "resources/list",
-            "resources/list",
-            "resources/templates/list",
             "resources/templates/list",
             "prompts/list",
-            "prompts/list",
-            "tools/call",
-        ];
+        ]
+        .into_iter()
+        .flat_map(|method| std::iter::repeat_n(method, 4))
+        .chain(std::iter::once("tools/call"))
+        .collect();
         assert_eq!(normal.len(), expected_methods.len());
         for (request, method) in normal.iter().zip(expected_methods) {
             assert!(request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
@@ -25211,27 +26183,22 @@ expect_request notifications/initialized ''
                 serde_json::json!({})
             );
         }
-        for (request, cursor) in normal.iter().zip([
-            None,
-            Some("tools-page-2"),
-            None,
-            Some("resources-page-2"),
-            None,
-            Some("templates-page-2"),
-            None,
-            Some("prompts-page-2"),
-            None,
-        ]) {
+        for (index, request) in normal.iter().enumerate() {
+            let cursor = match index % 4 {
+                0 => None,
+                1 | 2 => Some(""),
+                _ => Some(" \tresume\n "),
+            };
             let parameters = serde_json::from_slice::<serde_json::Value>(&request.body)
                 .expect("modern paged catalog request JSON")["params"]
                 .clone();
             assert_eq!(
                 parameters.get("cursor").and_then(serde_json::Value::as_str),
                 cursor,
-                "only second modern catalog pages carry their predecessor cursor"
+                "empty, repeated and whitespace-bearing cursors are forwarded verbatim"
             );
         }
-        let call = serde_json::from_slice::<serde_json::Value>(&normal[8].body)
+        let call = serde_json::from_slice::<serde_json::Value>(&normal[16].body)
             .expect("modern handler request JSON");
         assert_eq!(call["method"], "tools/call");
         assert_eq!(call["params"]["name"], "echo");
@@ -27190,6 +28157,187 @@ exec sleep 2
         assert!(catalog.resource_templates.is_empty());
         assert!(catalog.prompts.is_empty());
         client.close().expect("close proxy catalog client");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_catalog_repeated_cursors_bypass_positive_ttl_cache() {
+        let methods = [
+            ("tools/list", "tools"),
+            ("resources/list", "resources"),
+            ("resources/templates/list", "resourceTemplates"),
+            ("prompts/list", "prompts"),
+        ];
+        let page = |method: &str, member: &str, name: Option<&str>, next: Option<&str>| {
+            let mut result = serde_json::json!({
+                "resultType": "complete", "ttlMs": 60000, "cacheScope": "private"
+            });
+            result[member] = name.map_or_else(
+                || serde_json::json!([]),
+                |name| {
+                    let entry = match method {
+                        "tools/list" => serde_json::json!({"name":name,"inputSchema":{"type":"object"}}),
+                        "resources/list" => serde_json::json!({"name":name,"uri":format!("file:///cache/{name}")}),
+                        "resources/templates/list" => serde_json::json!({"name":name,"uriTemplate":format!("file:///cache/{name}/{{id}}")}),
+                        "prompts/list" => serde_json::json!({"name":name}),
+                        _ => unreachable!(),
+                    };
+                    serde_json::json!([entry])
+                },
+            );
+            if let Some(next) = next {
+                result["nextCursor"] = serde_json::json!(next);
+            }
+            result
+        };
+        let cached_page = |client: &mut Client, method| match method {
+            "tools/list" => client.list_tools_typed(Some("")),
+            "resources/list" => client.list_resources_typed(Some("")),
+            "resources/templates/list" => client.list_resource_templates_typed(Some("")),
+            "prompts/list" => client.list_prompts_typed(Some("")),
+            _ => unreachable!(),
+        };
+        for cache_enabled in [true, false] {
+            let discovery = scripted_response_line(
+                1,
+                serde_json::json!({
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{"tools":{},"resources":{},"prompts":{}},
+                    "ttlMs":0,"cacheScope":"private"
+                }),
+            );
+            let mut script = format!(
+                r#"
+peer_pid=$$
+(sleep 12; kill -TERM "$peer_pid" 2>/dev/null) >/dev/null 2>&1 &
+watchdog_pid=$!
+trap 'kill "$watchdog_pid" 2>/dev/null || true' EXIT
+trap 'exit 99' HUP INT TERM
+expect_request() {{
+    IFS= read -r request || exit 90
+    case "$request" in *"\"method\":\"$1\""*) ;; *) exit 91 ;; esac
+    if [ "$2" = present ]; then
+        case "$request" in *'"cursor":""'*) ;; *) exit 92 ;; esac
+    else
+        case "$request" in *'"cursor":'*) exit 93 ;; esac
+    fi
+}}
+expect_request server/discover absent
+printf '%s\n' '{discovery}'
+"#
+            );
+            let mut id = 2;
+            // Warm each ordinary page cache with a nonterminal response whose
+            // cursor and content must never substitute for a new proxy page.
+            for (method, member) in methods {
+                let response =
+                    scripted_response_line(id, page(method, member, Some("cached"), Some("")));
+                script.push_str(&format!(
+                    "expect_request '{method}' present\nprintf '%s\\n' '{response}'\n"
+                ));
+                id += 1;
+            }
+            for (method, member) in methods {
+                for (index, name) in [Some("first"), None, Some("last")].into_iter().enumerate() {
+                    let response = scripted_response_line(
+                        id,
+                        page(method, member, name, (index < 2).then_some("")),
+                    );
+                    let presence = if index == 0 { "absent" } else { "present" };
+                    script.push_str(&format!(
+                        "expect_request '{method}' {presence}\nprintf '%s\\n' '{response}'\n"
+                    ));
+                    id += 1;
+                }
+            }
+            let response = scripted_response_line(id, page("tools/list", "tools", None, Some("")));
+            script.push_str(&format!(
+                "expect_request tools/list absent\nprintf '%s\\n' '{response}'\n"
+            ));
+            let response = serde_json::json!({
+                "jsonrpc":"2.0", "id":id + 1,
+                "error":{"code":-32603,"message":"upstream catalog failure"}
+            });
+            script.push_str(&format!(
+                "expect_request tools/list present\nprintf '%s\\n' '{response}'\nwhile IFS= read -r remaining; do :; done\n"
+            ));
+
+            let cx = Cx::for_testing();
+            let mut client = block_on(
+                fastmcp_client::ClientBuilder::new()
+                    .auto_initialize(true)
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .request_timeout_policy(scripted_peer_timeout_policy())
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+            )
+            .expect("spawn positive-TTL repeated-cursor peer");
+            for (method, _) in methods {
+                cached_page(&mut client, method).unwrap();
+                cached_page(&mut client, method).unwrap();
+            }
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 4);
+            client.set_final_result_cache_enabled(cache_enabled);
+            let before = client.peek_next_request_id();
+            let catalog = ProxyCatalog::from_client(&mut client)
+                .expect("every present opaque cursor obtains another live peer page");
+            assert_eq!(client.peek_next_request_id() - before, 12);
+            assert_eq!(client.final_result_cache_enabled(), cache_enabled);
+            let tools: Vec<_> = catalog
+                .final_tools
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let resources: Vec<_> = catalog
+                .final_resources
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let templates: Vec<_> = catalog
+                .final_resource_templates
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            let prompts: Vec<_> = catalog
+                .final_prompts
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            for names in [tools, resources, templates, prompts] {
+                assert_eq!(names, ["first", "last"]);
+            }
+            for hints in [
+                &catalog.final_tool_cache_hints,
+                &catalog.final_resource_cache_hints,
+                &catalog.final_resource_template_cache_hints,
+                &catalog.final_prompt_cache_hints,
+            ] {
+                assert_eq!(hints.len(), 3);
+                assert!(hints.iter().all(|hint| hint.ttl_ms.as_str() == "60000"));
+            }
+
+            let error = ProxyBackend::list_tool_catalog(&mut client)
+                .expect_err("a failed continuation cannot publish a partial catalog");
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(client.final_result_cache_enabled(), cache_enabled);
+            assert_eq!(client.final_result_cache_stats().fills, 4);
+            assert_eq!(client.final_result_cache_stats().hits, 4);
+            client.set_final_result_cache_enabled(true);
+            for (method, _) in methods {
+                cached_page(&mut client, method).expect("unrelated retained page cache survives");
+            }
+            assert_eq!(client.final_result_cache_stats().hits, 8);
+            let before = client.peek_next_request_id();
+            assert_eq!(
+                client
+                    .list_catalog_page_uncached("tools/call", None)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::InvalidParams
+            );
+            assert_eq!(client.peek_next_request_id(), before);
+            client.close().expect("close repeated-cursor proxy peer");
+        }
     }
 
     #[cfg(unix)]

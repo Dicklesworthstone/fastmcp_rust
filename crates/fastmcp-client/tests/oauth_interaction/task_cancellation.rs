@@ -826,7 +826,7 @@ mod input_driver {
                                         json!({"resultType":"complete"}),
                                     ),
                                 )
-                                .await
+                                .await;
                             }
                             InputCase::LostAck => lose_reply(cancel).await,
                             InputCase::DropResolver => {

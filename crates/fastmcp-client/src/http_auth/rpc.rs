@@ -27,7 +27,7 @@ use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
-    JsonInteger, JsonRpcMessage, ProgressMarker, RequestId, ServerNotification,
+    JsonInteger, JsonRpcMessage, JsonRpcRequest, ProgressMarker, RequestId, ServerNotification,
     decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
 };
 use serde::Deserialize;
@@ -81,6 +81,10 @@ impl ManagedCoreLimits {
     }
     pub(crate) fn total_bytes(self) -> usize {
         self.total_bytes
+    }
+    #[cfg(feature = "tasks")]
+    pub(crate) fn notifications(self) -> usize {
+        self.notifications
     }
     pub(crate) fn timeout(self) -> Duration {
         self.timeout
@@ -395,6 +399,22 @@ pub(crate) struct CoreDecoder {
     notifications: usize,
 }
 
+// Mandatory core routing mirrors come from the exact encoded parameters, not
+// from credentials, request state or the HTTP target. Resource reads mirror
+// `uri`, while tool calls and prompt gets mirror `name`. Both authenticated
+// core composers use this selection; ModernHttpRequest owns safe wire encoding.
+pub(crate) fn core_routing_name(method: &str, params: &serde_json::Value) -> Option<String> {
+    let field = match method {
+        "tools/call" | "prompts/get" => "name",
+        "resources/read" => "uri",
+        _ => return None,
+    };
+    params
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
 fn prepare(
     target: &str,
     request: CoreRequest,
@@ -437,14 +457,7 @@ fn prepare(
     {
         return Err(ManagedCoreError::UnsupportedRequest);
     }
-    let name = if matches!(request.method(), "tools/call" | "prompts/get") {
-        params
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    } else {
-        None
-    };
+    let name = core_routing_name(request.method(), &params);
     let envelope = serde_json::json!({
         "jsonrpc": "2.0", "id": request_id, "method": request.method(), "params": params,
     });
@@ -597,36 +610,14 @@ impl CoreDecoder {
                 if self.notifications >= self.limits.notifications {
                     return Err(ManagedCoreError::NotificationLimit);
                 }
-                #[derive(Deserialize)]
-                struct RawNotification {
-                    params: Option<Box<serde_json::value::RawValue>>,
-                }
-                let raw: RawNotification =
-                    serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
-                let notification = match raw.params {
-                    Some(params) => {
-                        ServerNotification::decode_with_raw_params(&request, params.get())
-                    }
-                    None => ServerNotification::decode(&request),
-                }
-                .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
-                match &notification {
-                    ServerNotification::Cancelled(_)
-                    | ServerNotification::SubscriptionsAcknowledged(_) => {
-                        return Err(ManagedCoreError::UnexpectedNotification);
-                    }
-                    ServerNotification::Progress(progress) => {
-                        if self.progress_marker.as_ref() != Some(&progress.progress_token)
-                            || self
-                                .last_progress
-                                .as_ref()
-                                .is_some_and(|previous| progress.progress.cmp(previous).is_le())
-                        {
-                            return Err(ManagedCoreError::InvalidProgress);
-                        }
-                        self.last_progress = Some(progress.progress.clone());
-                    }
-                    _ => {}
+                let notification = admit_http_notification(
+                    frame,
+                    &request,
+                    self.progress_marker.as_ref(),
+                    self.last_progress.as_ref(),
+                )?;
+                if let ServerNotification::Progress(progress) = &notification {
+                    self.last_progress = Some(progress.progress.clone());
                 }
                 self.notifications += 1;
                 ManagedCoreEvent::Notification(Box::new(notification))
@@ -635,6 +626,47 @@ impl CoreDecoder {
         self.bytes += frame.len();
         Ok(event)
     }
+}
+
+// Shared by ordinary core and explicitly negotiated Task response streams.
+// Callers first admit the same frame through bounded, duplicate-aware raw
+// JSON-RPC decoding and check their own byte/count budgets. This function does
+// not mutate progress or quotas: only the owning decoder commits those after
+// successful admission. A subscription needs its separate filter/ID decoder.
+pub(crate) fn admit_http_notification(
+    frame: &[u8],
+    request: &JsonRpcRequest,
+    progress_marker: Option<&ProgressMarker>,
+    last_progress: Option<&ExactNonNegativeJsonNumber>,
+) -> Result<ServerNotification, ManagedCoreError> {
+    if request.id.is_some() {
+        return Err(ManagedCoreError::UnexpectedNotification);
+    }
+    #[derive(Deserialize)]
+    struct RawNotification {
+        params: Option<Box<serde_json::value::RawValue>>,
+    }
+    let raw: RawNotification =
+        serde_json::from_slice(frame).map_err(|_| ManagedCoreError::InvalidResponse)?;
+    let notification = match raw.params {
+        Some(params) => ServerNotification::decode_with_raw_params(request, params.get()),
+        None => ServerNotification::decode(request),
+    }
+    .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
+    match &notification {
+        ServerNotification::Cancelled(_) | ServerNotification::SubscriptionsAcknowledged(_) => {
+            return Err(ManagedCoreError::UnexpectedNotification);
+        }
+        ServerNotification::Progress(progress) => {
+            if progress_marker != Some(&progress.progress_token)
+                || last_progress.is_some_and(|previous| progress.progress.cmp(previous).is_le())
+            {
+                return Err(ManagedCoreError::InvalidProgress);
+            }
+        }
+        _ => {}
+    }
+    Ok(notification)
 }
 
 struct BoundedWriter {
@@ -799,6 +831,63 @@ mod tests {
             ),
             Err(ManagedCoreError::RequestTooLarge)
         ));
+    }
+
+    #[test]
+    fn authenticated_core_routing_matches_the_servers_mandatory_mirror_contract() {
+        use fastmcp_protocol::{
+            FinalHttpRequestMetadata, RequestVersionMetadata, admit_final_http_request,
+        };
+        fn header<'a>(fields: &'a [(String, String)], wanted: &str) -> Option<&'a str> {
+            fields.iter().find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+                .map(|(_, value)| value.as_str())
+        }
+        for (method, parameters, key) in [
+            ("tools/call", json!({"name":"echo"}), "name"),
+            ("prompts/get", json!({"name":"greeting"}), "name"),
+            ("resources/read", json!({"uri":"file:///sample"}), "uri"),
+            ("resources/read", json!({"uri":"https://resources.example/a%2Fb?q=one#part"}), "uri"),
+        ] {
+            let core = request(method, parameters);
+            let original = core.encode_params().unwrap().unwrap();
+            let (wire, _) = prepare(
+                "https://mcp.example/mcp", core, RequestId::Number(7), ManagedCoreLimits::default(),
+            ).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(wire.body()).unwrap();
+            let headers = wire.headers();
+            assert_eq!(body["params"], original);
+            assert_eq!(wire.target(), "https://mcp.example/mcp");
+            assert_eq!(headers.iter().filter(|(name, _)| name.eq_ignore_ascii_case("mcp-name")).count(), 1);
+            let name = header(&headers, "mcp-name").unwrap();
+            assert_eq!(
+                fastmcp_protocol::http_headers::decode_mcp_header_value(name.as_bytes()).unwrap(),
+                body["params"][key].as_str().unwrap(),
+            );
+            // This is the protocol admission function the shipped server uses,
+            // fed with actual prepared headers and body rather than a mock rule.
+            let admitted = |header_name: Option<&str>| {
+                admit_final_http_request(FinalHttpRequestMetadata {
+                    version: RequestVersionMetadata {
+                        header_version: header(&headers, "mcp-protocol-version"),
+                        body_version: body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str(),
+                    },
+                    header_method: header(&headers, "mcp-method"),
+                    body_method: body["method"].as_str(),
+                    header_name,
+                    body_name: body["params"][key].as_str(),
+                }).is_ok()
+            };
+            assert!(admitted(Some(name)), "the prepared {method} is admitted");
+            assert!(!admitted(None), "removing only {method}'s mirror must fail");
+            assert!(!admitted(Some("different")), "changing only the mirror must fail");
+        }
+        for method in ["server/discover", "tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+            let (wire, _) = prepare(
+                "https://mcp.example/mcp", request(method, json!({})),
+                RequestId::Number(7), ManagedCoreLimits::default(),
+            ).unwrap();
+            assert!(!wire.headers().iter().any(|(name, _)| name.eq_ignore_ascii_case("mcp-name")));
+        }
     }
 
     #[test]

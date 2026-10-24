@@ -141,6 +141,8 @@ use oauth::{
     OAuthHttpRoutes, OAuthParameterAdmission, OAuthParameterEndpoint, OAuthParameterName,
     TokenRequest,
 };
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+use proxy::ProxyFinalTaskRelay;
 #[cfg(feature = "proxy")]
 pub use proxy::{
     FinalProgressCallback, ProgressCallback, ProxyAsyncRequest, ProxyBackend, ProxyCatalog,
@@ -148,8 +150,8 @@ pub use proxy::{
     ProxyPromptCatalog, ProxyResourceCatalog, ProxyResourceTemplateCatalog, ProxyToolCatalog,
     ProxyTypedCatalog, ProxyUpstreamAdapter, ProxyUpstreamBinding, ProxyUpstreamBindingRegistry,
 };
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyFinalTaskRelay};
+#[cfg(feature = "proxy")]
+use proxy::{ProxyCatalogListener, ProxyCatalogListenerEvent, ProxyCatalogRelay};
 #[cfg(all(feature = "proxy", feature = "tasks"))]
 pub use proxy::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
 pub use router::{
@@ -164,13 +166,28 @@ use session::{
     InitializationSnapshot, MAX_RESOURCE_SUBSCRIPTION_BYTES_PER_SESSION, SubscriptionAdmission,
     SubscriptionAdmissionError, SubscriptionRemoval, SubscriptionRemovalError,
 };
+// The two `...Claim` types are here because `FinalTaskStore` is a public trait
+// an external store implements, and they are the RETURN types of two of its
+// defaulted methods:
+//   take_input_handoff_for_owner_if_current       -> Option<FinalTaskAcceptedInputClaim>
+//   take_initial_work_handoff_for_owner_if_current -> Option<FinalTaskInitialWorkClaim>
+// `mod tasks;` is private, so a type absent from this list is unnameable
+// outside this crate and the override cannot be written at all. Their plain
+// counterparts `FinalTaskAcceptedInput` and `FinalTaskInitialWork` were already
+// listed; the `Claim` wrappers that carry task_id/generation/owner_id alongside
+// them were not, which is the one-item-at-a-time shape this kind of list rots
+// in. Both expose `pub fn new`, so external construction is intended -- unlike
+// `UpstreamFinalToolSchemaRegistration` and `PreparedIncrementalHttpListen`,
+// which have no public constructor and are deliberately sealed, and so are
+// correctly absent.
 #[cfg(feature = "tasks")]
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
-    FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
-    FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
-    FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
-    FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+    FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
+    FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
+    FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
+    FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
+    FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
     InMemoryFinalTaskStore, MAX_IN_MEMORY_FINAL_TASK_INPUT_KEY_BYTES,
     MAX_IN_MEMORY_FINAL_TASK_INPUT_KEYS,
 };
@@ -185,7 +202,7 @@ pub use bidirectional::{
 
 use std::any::Any;
 use std::cell::Cell;
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(feature = "proxy")]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
@@ -3995,6 +4012,11 @@ pub struct HttpServerConfig {
     pub max_connections: usize,
     /// Time allowed to receive one complete request on an accepted
     /// connection before it is closed (default: 30 seconds).
+    ///
+    /// This is one budget for the whole request, head and body together, not
+    /// an idle timeout: a large body uploaded slowly is cut off when it
+    /// expires even while bytes are still arriving. Raise it for deployments
+    /// that accept large request bodies over slow links.
     pub request_read_timeout: Duration,
     /// Inner HTTP handler configuration (endpoint path, CORS, and body size).
     pub handler_config: HttpHandlerConfig,
@@ -4123,6 +4145,10 @@ impl HttpServerConfig {
 
     /// Sets the time allowed to receive one complete request before the
     /// connection is closed and its slot released.
+    ///
+    /// The budget covers the request head and body together, so it must be
+    /// long enough for the largest body the deployment accepts at the slowest
+    /// upload rate it tolerates.
     #[must_use]
     pub fn request_read_timeout(mut self, timeout: Duration) -> Self {
         self.request_read_timeout = timeout;
@@ -5107,6 +5133,14 @@ struct FinalSubscriptionLease {
 }
 
 impl FinalSubscriptionLease {
+    /// A relayed event belongs to this exact downstream listen request. It
+    /// must never enter the application-wide notification broadcast path.
+    #[cfg(feature = "proxy")]
+    fn publish(&self, notification: ServerNotification) -> McpResult<usize> {
+        self.registry
+            .publish_selected(notification, Some((self.key, &self.election)))
+    }
+
     fn has_graceful_completion(&self) -> bool {
         self.election.graceful_completion.load(Ordering::Acquire)
     }
@@ -5546,6 +5580,14 @@ impl FinalSubscriptionRegistry {
     }
 
     fn publish(&self, notification: ServerNotification) -> McpResult<usize> {
+        self.publish_selected(notification, None)
+    }
+
+    fn publish_selected(
+        &self,
+        notification: ServerNotification,
+        target_subscription: Option<(usize, &Arc<FinalSubscriptionElection>)>,
+    ) -> McpResult<usize> {
         if !is_final_subscription_event(&notification) {
             return Err(McpError::invalid_params(
                 "only final catalog or resource change notifications may use subscriptions/listen",
@@ -5578,9 +5620,14 @@ impl FinalSubscriptionRegistry {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state
                 .entries
-                .values()
-                .filter(|entry| subscription_filter_accepts(&entry.accepted_filter, &notification))
-                .cloned()
+                .iter()
+                .filter_map(|(key, entry)| {
+                    let selected = target_subscription.is_none_or(|(target_key, election)| {
+                        *key == target_key && Arc::ptr_eq(&entry.election, election)
+                    });
+                    (selected && subscription_filter_accepts(&entry.accepted_filter, &notification))
+                        .then(|| entry.clone())
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -6041,13 +6088,19 @@ fn accepted_subscription_filter(
 /// extension members cannot make an upstream acknowledgement appear narrower;
 /// every admitted category plus the resource URI and Tasks ID sets must still
 /// match.
-#[cfg(all(feature = "proxy", feature = "tasks"))]
+#[cfg(feature = "proxy")]
 fn subscription_filter_admission_matches(
     expected: &SubscriptionFilter,
     acknowledged: &SubscriptionFilter,
 ) -> McpResult<bool> {
+    #[cfg(feature = "tasks")]
     let expected = accepted_subscription_filter(expected, true)?;
+    #[cfg(not(feature = "tasks"))]
+    let expected = accepted_subscription_filter(expected, true);
+    #[cfg(feature = "tasks")]
     let acknowledged = accepted_subscription_filter(acknowledged, true)?;
+    #[cfg(not(feature = "tasks"))]
+    let acknowledged = accepted_subscription_filter(acknowledged, true);
     let expected_resource_subscriptions = expected
         .resource_subscriptions
         .as_deref()
@@ -6121,12 +6174,15 @@ fn subscription_cancellation_notification(
     })
 }
 
-#[cfg(all(feature = "proxy", feature = "tasks"))]
-fn catalog_filter_requests_resource_updates(filter: &SubscriptionFilter) -> bool {
-    filter
-        .resource_subscriptions
-        .as_ref()
-        .is_some_and(|uris| !uris.is_empty())
+#[cfg(feature = "proxy")]
+fn catalog_filter_requests_events(filter: &SubscriptionFilter) -> bool {
+    filter.tools_list_changed == Some(true)
+        || filter.resources_list_changed == Some(true)
+        || filter.prompts_list_changed == Some(true)
+        || filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|uris| !uris.is_empty())
 }
 
 fn is_final_subscription_event(notification: &ServerNotification) -> bool {
@@ -7078,21 +7134,34 @@ pub enum HttpShutdownSettlement {
 #[must_use = "a nonquiescent HTTP shutdown owns child handles that must be settled"]
 pub struct HttpNonquiescentShutdown {
     children: HttpConnectionChildren,
+    server: Arc<Server>,
     listener_error: Option<McpError>,
+    shutdown_complete: bool,
 }
 
 impl HttpNonquiescentShutdown {
+    fn finish_shutdown(&mut self) {
+        if !self.shutdown_complete {
+            self.server.graceful_shutdown_returning();
+            self.shutdown_complete = true;
+        }
+    }
+
     /// Returns the listener failure that accompanied this shutdown, if any.
     #[must_use]
     pub fn listener_error(&self) -> Option<&McpError> {
         self.listener_error.as_ref()
     }
 
-    /// Reaps completed children without waiting.
+    /// Reaps completed children without waiting for live children.
+    ///
+    /// Once all children are terminal, runs the shutdown lifecycle hook
+    /// synchronously, exactly once across settlement observations.
     #[must_use]
     pub fn poll_settlement(&mut self) -> HttpShutdownSettlement {
         self.children.reap_finished();
         if self.children.tasks.is_empty() {
+            self.finish_shutdown();
             if self.children.terminal_failures.is_empty() {
                 HttpShutdownSettlement::Settled
             } else {
@@ -7107,7 +7176,10 @@ impl HttpNonquiescentShutdown {
         }
     }
 
-    /// Waits no longer than `timeout` for cooperative completion.
+    /// Waits no longer than `timeout` for cooperative child completion.
+    ///
+    /// Once the children are terminal, shutdown finalization runs synchronously;
+    /// the application's shutdown hook is outside the child-wait bound.
     pub async fn settle_for(&mut self, timeout: Duration) -> HttpShutdownSettlement {
         let deadline = Instant::now() + timeout;
         loop {
@@ -7137,6 +7209,7 @@ impl HttpNonquiescentShutdown {
                 Err(error) => failures.push(error.to_string()),
             }
         }
+        self.finish_shutdown();
         if failures.is_empty() {
             Ok(())
         } else {
@@ -7564,7 +7637,12 @@ impl BoundHttpServer {
                 Server::settle_hosted_task_service(hosted_task_service, cx).await;
             #[cfg(not(feature = "tasks"))]
             let task_service_result: McpResult<()> = Ok(());
-            server.graceful_shutdown_returning();
+            // Live children may need this runtime to finish their cleanup.
+            // Preserve their server lifecycle with the retained settlement
+            // authority instead of synchronously waiting on those same children.
+            if connection_children.tasks.is_empty() {
+                server.graceful_shutdown_returning();
+            }
             let result = result.and(task_service_result);
             match (connection_shutdown, connection_children.tasks.len()) {
                 (_, 0) if connection_children.terminal_failures.is_empty() => {
@@ -7579,7 +7657,9 @@ impl BoundHttpServer {
                     debug_assert!(remaining > 0);
                     Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
                         children: connection_children,
+                        server,
                         listener_error: result.err(),
+                        shutdown_complete: false,
                     }))
                 }
             }
@@ -8027,7 +8107,14 @@ async fn serve_websocket_connection(
     expected_path: &str,
 ) -> McpResult<()> {
     let read_timeout = server.http_config.request_read_timeout;
-    let (request, trailing) = match read_websocket_handshake(cx, &mut stream, read_timeout).await {
+    let handshake = read_websocket_handshake(
+        cx,
+        &mut stream,
+        read_timeout,
+        &server.http_config.handler_config,
+    )
+    .await;
+    let (request, trailing) = match handshake {
         Ok(handshake) => handshake,
         Err(error) => {
             let rejection = if error.message == "WebSocket Authorization admission failed" {
@@ -8133,6 +8220,7 @@ async fn read_websocket_handshake(
     cx: &Cx,
     stream: &mut AsyncTcpStream,
     read_timeout: Duration,
+    handler_config: &HttpHandlerConfig,
 ) -> McpResult<(asupersync::net::websocket::HttpRequest, Vec<u8>)> {
     let mut bytes = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 1024];
@@ -8181,7 +8269,7 @@ async fn read_websocket_handshake(
             if raw_websocket_upgrade_headers_are_well_formed(header_block).is_err() {
                 return Err(McpError::invalid_request("WebSocket handshake is invalid"));
             }
-            if !raw_websocket_upgrade_origin_is_admissible(header_block) {
+            if !raw_websocket_upgrade_origin_is_admissible(header_block, handler_config) {
                 return Err(McpError::invalid_request("WebSocket Origin is not allowed"));
             }
         }
@@ -8214,12 +8302,16 @@ fn raw_websocket_upgrade_headers_are_well_formed(head: &[u8]) -> Result<(), ()> 
 }
 
 /// Cross-site WebSocket hijacking protection: a browser always sends
-/// `Origin` on a WebSocket upgrade, and the server-side transport has no CORS
-/// allowlist, so a present `Origin` must be a loopback origin (the same
-/// admission policy the HTTP routes apply by default). Non-browser clients
-/// that send no `Origin` are unaffected.
+/// `Origin` on a WebSocket upgrade, so a present `Origin` must pass the same
+/// admission policy the HTTP routes apply: a loopback origin, or one the
+/// listener's `handler_config` allows explicitly (`allow_cors` with an exact
+/// `cors_origins` entry). Non-browser clients that send no `Origin` are
+/// unaffected.
 #[cfg(feature = "websocket")]
-fn raw_websocket_upgrade_origin_is_admissible(head: &[u8]) -> bool {
+fn raw_websocket_upgrade_origin_is_admissible(
+    head: &[u8],
+    handler_config: &HttpHandlerConfig,
+) -> bool {
     let Ok(head) = std::str::from_utf8(head) else {
         // Left to the handshake parser's generic bounded 400 path.
         return true;
@@ -8231,7 +8323,7 @@ fn raw_websocket_upgrade_origin_is_admissible(head: &[u8]) -> bool {
     });
     match (origins.next(), origins.next()) {
         (None, _) => true,
-        (Some(origin), None) => HttpHandlerConfig::default().admits_origin(origin),
+        (Some(origin), None) => handler_config.admits_origin(origin),
         // A repeated Origin is ambiguous; refuse rather than pick one.
         (Some(_), Some(_)) => false,
     }
@@ -13131,6 +13223,9 @@ pub struct Server {
     /// task state because its identifiers and lifecycle remain upstream-owned.
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     final_task_relay: Option<Arc<ProxyFinalTaskRelay>>,
+    /// Independently admitted upstream routes for core catalog subscriptions.
+    #[cfg(feature = "proxy")]
+    catalog_relay: Option<Arc<ProxyCatalogRelay>>,
     /// Request-owned final subscription streams shared by stdio and HTTP.
     final_subscriptions: Arc<FinalSubscriptionRegistry>,
 }
@@ -14712,16 +14807,16 @@ impl Server {
             relay_listener = Some(listener);
         }
 
-        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        #[cfg(feature = "proxy")]
         let mut catalog_relay_listener: Option<Box<dyn ProxyCatalogListener>> = None;
-        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        #[cfg(feature = "proxy")]
         if !tasks_requested
-            && catalog_filter_requests_resource_updates(&params.notifications)
-            && let Some(relay) = self.final_task_relay.as_ref()
+            && catalog_filter_requests_events(&params.notifications)
+            && let Some(relay) = self.catalog_relay.as_ref()
+            && let Some(mut listener) = relay
+                .open_listener_async(request_ctx, params.notifications.clone(), &self.router)
+                .await?
         {
-            let mut listener = relay
-                .open_catalog_listener_async(request_ctx, params.notifications.clone())
-                .await?;
             match listener
                 .next_async(request_ctx.cx(), &request_cancellation)
                 .await?
@@ -14810,18 +14905,18 @@ impl Server {
                     Err(error) => return Err(error),
                 }
             }
-            #[cfg(all(feature = "proxy", feature = "tasks"))]
+            #[cfg(feature = "proxy")]
             if let Some(listener) = catalog_relay_listener.as_mut() {
                 match listener
                     .next_async(request_ctx.cx(), &request_cancellation)
                     .await
                 {
-                    Ok(ProxyCatalogListenerEvent::Notification(
-                        notification @ ServerNotification::ResourceUpdated(_),
-                    )) => {
-                        self.final_subscriptions.publish(notification)?;
+                    Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
+                        // This upstream request belongs to one downstream
+                        // lease. Publishing globally duplicates overlapping
+                        // listeners and crosses their authorization boundary.
+                        lease.publish(notification)?;
                     }
-                    Ok(ProxyCatalogListenerEvent::Notification(_)) => {}
                     Ok(ProxyCatalogListenerEvent::Terminal) => {
                         return self.final_subscription_complete_result(&subscription_id);
                     }
@@ -22529,6 +22624,110 @@ mod lib_unit_tests {
     }
 
     #[cfg(feature = "websocket")]
+    fn websocket_upgrade_head(origins: &[&str]) -> Vec<u8> {
+        let mut head = String::from(
+            "GET /mcp HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade",
+        );
+        for origin in origins {
+            head.push_str("\r\nOrigin: ");
+            head.push_str(origin);
+        }
+        head.into_bytes()
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_upgrade_origin_follows_the_configured_cors_allowlist() {
+        let listed = "https://app.example";
+        let configured = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec![listed.to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        let default = HttpHandlerConfig::default();
+
+        // The listed origin is admitted only by the listener that lists it.
+        assert!(raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&[listed]),
+            &configured
+        ));
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&[listed]),
+            &default
+        ));
+
+        // Planted negatives against the configured listener: an unlisted
+        // origin, a lookalike, and the same list with CORS switched off.
+        for refused in ["https://evil.example", "https://app.example.evil.example"] {
+            assert!(
+                !raw_websocket_upgrade_origin_is_admissible(
+                    &websocket_upgrade_head(&[refused]),
+                    &configured
+                ),
+                "{refused} must not be admitted"
+            );
+        }
+        let cors_off = HttpHandlerConfig {
+            allow_cors: false,
+            ..configured.clone()
+        };
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&[listed]),
+            &cors_off
+        ));
+    }
+
+    #[cfg(feature = "websocket")]
+    #[test]
+    fn websocket_upgrade_origin_respects_strict_allowlists_and_repeated_origin_rules() {
+        let default = HttpHandlerConfig::default();
+        let configured = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["https://app.example".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+
+        // Non-browser clients send no Origin and remain unaffected.
+        for config in [&default, &configured] {
+            assert!(raw_websocket_upgrade_origin_is_admissible(
+                &websocket_upgrade_head(&[]),
+                config
+            ));
+            assert!(!raw_websocket_upgrade_origin_is_admissible(
+                &websocket_upgrade_head(&["http://localhost.evil.example"]),
+                config
+            ));
+        }
+
+        // The implicit loopback exception is a convenience only when no
+        // explicit allowlist exists. An operator-provided list is strict.
+        assert!(raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["http://localhost:6274"]),
+            &default
+        ));
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["http://localhost:6274"]),
+            &configured
+        ));
+
+        let explicit_loopback = HttpHandlerConfig {
+            allow_cors: true,
+            cors_origins: vec!["http://localhost:6274".to_string()],
+            ..HttpHandlerConfig::default()
+        };
+        assert!(raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["http://localhost:6274"]),
+            &explicit_loopback
+        ));
+
+        // A repeated Origin is refused even when both values are admissible.
+        assert!(!raw_websocket_upgrade_origin_is_admissible(
+            &websocket_upgrade_head(&["https://app.example", "https://app.example"]),
+            &configured
+        ));
+    }
+
+    #[cfg(feature = "websocket")]
     async fn websocket_upgrade(
         cx: &Cx,
         address: std::net::SocketAddr,
@@ -23242,14 +23441,51 @@ mod lib_unit_tests {
                         .to_owned(),
                 );
             }
+            // This loop breaks ONLY on end of stream, and every byte it
+            // receives is read into a buffer that is then dropped. So two
+            // opposite peer behaviours used to mint the identical timeout
+            // string: a peer that sent nothing at all, and a peer that sent a
+            // terminal frame without closing the stream. Those have opposite
+            // owners -- a server that fails to close an offending peer versus
+            // a test that does not answer the close it was handed -- so the
+            // timeout records what actually arrived and lets the reader tell
+            // them apart. Message-only: the break condition is unchanged.
+            let mut terminal_prefix: Vec<u8> = Vec::new();
+            let mut terminal_bytes = 0_usize;
+            let mut terminal_reads = 0_u32;
+            let terminal_started = std::time::Instant::now();
             loop {
                 let mut terminal = [0_u8; 64];
                 let read = asupersync::time::timeout_at(deadline, mixed.read(&mut terminal))
                     .await
-                    .map_err(|_| "Auto cross-era peer close timed out".to_owned())?
+                    .map_err(|_| {
+                        format!(
+                            "Auto cross-era peer close timed out after {terminal_reads} \
+                             non-empty reads totalling {terminal_bytes} bytes over {:?}; bytes \
+                             {terminal_prefix:02x?}; as text {:?}. An empty capture means the \
+                             peer sent nothing and the close is missing; a non-empty one means \
+                             the peer did send something this loop does not treat as terminal, \
+                             since it breaks only on end of stream. The elapsed figure says \
+                             whether the shared deadline still had room when the peer went \
+                             quiet, which distinguishes a close that never comes from one this \
+                             bound cannot wait for",
+                            terminal_started.elapsed(),
+                            String::from_utf8_lossy(&terminal_prefix)
+                        )
+                    })?
                     .map_err(|error| format!("Auto cross-era peer close failed: {error}"))?;
                 if read == 0 {
                     break;
+                }
+                terminal_reads += 1;
+                terminal_bytes += read;
+                // 512 rather than a token prefix: the observed frame was 344
+                // bytes and a JSON-RPC response carries its id at the END, so
+                // a short prefix showed the result but hid which request it
+                // answered.
+                let room = 512_usize.saturating_sub(terminal_prefix.len());
+                if room > 0 {
+                    terminal_prefix.extend_from_slice(&terminal[..read.min(room)]);
                 }
             }
             drop(mixed);
@@ -33414,7 +33650,7 @@ mod lib_unit_tests {
             params["requestState"] = serde_json::json!(state);
             params["inputResponses"] = serde_json::json!({
                 "roots": bidirectional::MrtrInputResponse::roots(
-                    fastmcp_protocol::ListRootsResult::empty(),
+                    fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                 ).expect("valid roots response"),
             });
             request.body = serde_json::to_vec(&rpc).unwrap();
@@ -33699,7 +33935,7 @@ mod lib_unit_tests {
                     if !state_only {
                         params["inputResponses"] = serde_json::json!({
                             "roots": bidirectional::MrtrInputResponse::roots(
-                                fastmcp_protocol::ListRootsResult::empty(),
+                                fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                             ).unwrap(),
                         });
                     }
@@ -33911,7 +34147,7 @@ mod lib_unit_tests {
                         if !state_only {
                             params["inputResponses"] = serde_json::json!({
                                 "roots": bidirectional::MrtrInputResponse::roots(
-                                    fastmcp_protocol::ListRootsResult::empty(),
+                                    fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                                 ).unwrap(),
                             });
                         }
@@ -34081,7 +34317,7 @@ mod lib_unit_tests {
                         })?;
                     let roots = serde_json::to_value(
                         bidirectional::MrtrInputResponse::roots(
-                            fastmcp_protocol::ListRootsResult::empty(),
+                            fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                         )
                         .map_err(|error| format!("MRTR roots response failed: {error}"))?,
                     )
@@ -36219,6 +36455,208 @@ mod lib_unit_tests {
         assert!(
             error.message.contains("open_subscription_listen"),
             "error must name the in-process listen API: {error:?}"
+        );
+    }
+
+    /// `ping` is a MCP 2024-11-05 method that MCP 2026-07-28 REMOVED, so a
+    /// modern request naming it is an unknown method and -32601 is the
+    /// specified answer. That rule is stated independently in five places:
+    /// the frozen plan's protocol comparison table (`| Ping | Removed |
+    /// Present | Legacy-only |`), the plan's twice-written "the removed MCP
+    /// core method", `FINAL_2026_07_28_METHODS` (eighteen entries, no
+    /// `ping`), `CoreRequest::decode(ProtocolEra::Modern2026, "ping", ..)`
+    /// which is required to return `UnsupportedMethod`, and
+    /// `is_removed_legacy_method` in this crate.
+    ///
+    /// This assertion is the INVERSE of the one it replaces. The earlier
+    /// version asserted a modern ping answers an empty object, and I filed
+    /// the resulting -32601 as a p1 server defect before reading any of those
+    /// five sources; the measurement was right and the expectation was stale.
+    /// It is inverted rather than removed because the stateless chains had no
+    /// direct coverage of the removal rule at all, so the corrected test is
+    /// the regression guard the original coverage audit was actually looking
+    /// for: it fails if anyone routes `ping` back into the modern era.
+    ///
+    /// The second half is the near-identical negative control (RH-5). It
+    /// changes only the one forbidden dimension -- whether the method
+    /// survived into 2026-07-28 -- by sending `server/discover`, the first
+    /// entry in `FINAL_2026_07_28_METHODS`, with the identical modern `_meta`
+    /// to the identical server. Without it, a server that answered -32601 to
+    /// everything would satisfy the positive.
+    ///
+    /// `server/discover` is chosen over a registration-dependent method such
+    /// as `tools/list` because it is already known to be claimed on a plain
+    /// server two ways: `modern_request_version_refusal`'s own planted
+    /// negative answers it -32602 for missing metadata rather than -32601,
+    /// which is only reachable for a CLAIMED method, and an instrumented
+    /// websocket capture on this crate recorded a complete 344-byte
+    /// `server/discover` result frame from a server with no registrations.
+    /// `dispatch_stateless_listen_is_not_method_not_found` above is the second
+    /// control, establishing that this dispatch does distinguish an unclaimed
+    /// method from a claimed-but-unsupported one.
+    #[test]
+    fn dispatch_stateless_refuses_the_removed_modern_ping() {
+        let server = Server::new("stateless-modern-ping", "1.0.0").build();
+        let modern_meta = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let mark_modern = |request: &mut JsonRpcRequest| {
+            request
+                .params
+                .as_mut()
+                .expect("the request retains its object parameters")
+                .as_object_mut()
+                .expect("the request parameters remain an object")
+                .insert("_meta".to_owned(), modern_meta.clone());
+        };
+
+        let inbound =
+            InboundRequestContext::new(Cx::for_testing(), 927, InboundRequestTransport::Memory);
+        let mut ping = JsonRpcRequest::new("ping", Some(serde_json::json!({})), 927_i64);
+        mark_modern(&mut ping);
+        let refused = block_on(server.dispatch_stateless(&inbound, &ping))
+            .expect("ping with an id must produce a JSON-RPC response");
+        let error = refused
+            .error
+            .as_ref()
+            .unwrap_or_else(|| panic!("a modern ping is a removed method: {refused:?}"));
+        assert_eq!(
+            error.code,
+            i32::from(McpErrorCode::MethodNotFound).into(),
+            "MCP 2026-07-28 removed ping, so the modern era answers -32601: {error:?}"
+        );
+        assert!(
+            refused.result.is_none(),
+            "a refused ping carries no result: {:?}",
+            refused.result
+        );
+
+        let surviving_inbound =
+            InboundRequestContext::new(Cx::for_testing(), 929, InboundRequestTransport::Memory);
+        let mut surviving =
+            JsonRpcRequest::new("server/discover", Some(serde_json::json!({})), 929_i64);
+        mark_modern(&mut surviving);
+        let answered = block_on(server.dispatch_stateless(&surviving_inbound, &surviving))
+            .expect("server/discover with an id must produce a JSON-RPC response");
+        if let Some(error) = answered.error.as_ref() {
+            assert_ne!(
+                error.code,
+                i32::from(McpErrorCode::MethodNotFound).into(),
+                "server/discover survived into 2026-07-28, so the -32601 above is about ping's \
+                 removal and not a server that refuses every method: {error:?}"
+            );
+        }
+    }
+
+    /// The same removal rule as
+    /// `dispatch_stateless_refuses_the_removed_modern_ping`, on the chain a
+    /// real transport uses.
+    ///
+    /// That companion dispatches through `dispatch_stateless`, which for those
+    /// arguments resolves to `dispatch_stateless_with_cancellation`. The
+    /// production stdio loop does NOT use that function: `async_stdio` contains
+    /// no ping handling of its own and routes every inbound request through
+    /// `dispatch_with_protocol_policy_owned` under `ProtocolPolicy::ModernOnly`,
+    /// which descends the separate `dispatch_stateless_owned_*` chain. So the
+    /// companion alone cannot say what a shipped transport does, and a test
+    /// that merely swapped in the non-owned policy wrapper would have been
+    /// close to tautological against it, because that wrapper delegates to the
+    /// very same call. This one takes the owned path, shaped exactly like the
+    /// stdio call site, and keeps `Auto` beside `ModernOnly` because `Auto` is
+    /// the default policy.
+    ///
+    /// `LegacyOnly` is deliberately absent. The served half of the rule -- a
+    /// 2024-11-05 ping answering an empty object -- is already proven on the
+    /// path that owns it, by the legacy arm of
+    /// `builder::tests::proxy_registration_tests::public_legacy_and_stateless_ping_answer_empty_object_without_entering_the_final_request_union`,
+    /// which dispatches through a negotiated 2024-11-05 `Session`. Asserting
+    /// it here would mean pairing `LegacyOnly` with a `ModernConnection`
+    /// inbound context and a session-less request, which is not a shape any
+    /// transport produces, so the result would say nothing about the shipped
+    /// legacy path.
+    ///
+    /// Written self-contained rather than sharing a request-building helper
+    /// with its companion on purpose: if one fixture fed both, a fault in the
+    /// fixture would fail both halves together and destroy exactly the
+    /// independence that makes the pair worth having.
+    #[test]
+    fn the_owned_production_dispatch_refuses_the_removed_ping_under_every_modern_policy() {
+        // Every policy is evaluated before anything is asserted. An assertion
+        // inside the loop ends the test on the first disagreement and silently
+        // leaves the remaining policies unmeasured, which is how the first
+        // version of this test reported one policy while its name promised
+        // two -- and the unmeasured one, ModernOnly, is precisely what the
+        // stdio loop dispatches under.
+        //
+        // `tools/list` rides along as the near-identical negative control
+        // (RH-5): same chain, same policy, same server, same modern `_meta`,
+        // differing only in whether the method survived into 2026-07-28. A
+        // server that answered -32601 to everything would satisfy the ping
+        // half alone.
+        let mut observed: Vec<(ProtocolPolicy, &str, bool, String)> = Vec::new();
+        for policy in [ProtocolPolicy::Auto, ProtocolPolicy::ModernOnly] {
+            for (method, id) in [("ping", 928_i64), ("tools/list", 930_i64)] {
+                let server = Arc::new(Server::new("policy-modern-ping", "1.0.0").build());
+                let connection = ModernConnection::new();
+                let inbound = InboundRequestContext::with_modern_connection(
+                    Cx::for_testing(),
+                    u64::try_from(id).expect("the literal request ids are positive"),
+                    InboundRequestTransport::Memory,
+                    &connection,
+                );
+                let notifications: NotificationSender = Arc::new(|_| {});
+                let mut request = JsonRpcRequest::new(method, Some(serde_json::json!({})), id);
+                request
+                    .params
+                    .as_mut()
+                    .expect("the request retains its object parameters")
+                    .as_object_mut()
+                    .expect("the request parameters remain an object")
+                    .insert(
+                        "_meta".to_owned(),
+                        serde_json::json!({
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        }),
+                    );
+                let response = block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                    policy,
+                    &inbound,
+                    request,
+                    None,
+                    None,
+                    None,
+                    None,
+                    fastmcp_core::McpRequestCancellation::new(),
+                    None,
+                    Arc::clone(&notifications),
+                ))
+                .unwrap_or_else(|| {
+                    panic!("{method} with an id must produce a JSON-RPC response under {policy:?}")
+                });
+                let method_not_found = response.error.as_ref().is_some_and(|error| {
+                    error.code == i32::from(McpErrorCode::MethodNotFound).into()
+                });
+                observed.push((
+                    policy,
+                    method,
+                    method_not_found,
+                    format!("result={:?} error={:?}", response.result, response.error),
+                ));
+            }
+        }
+        let disagreed: Vec<&(ProtocolPolicy, &str, bool, String)> = observed
+            .iter()
+            .filter(|(_, method, method_not_found, _)| (*method == "ping") != *method_not_found)
+            .collect();
+        assert!(
+            disagreed.is_empty(),
+            "MCP 2026-07-28 removed ping and kept tools/list, so every modern policy must answer \
+             -32601 to the first and something other than -32601 to the second; {} of {} rows \
+             disagreed: {disagreed:#?}",
+            disagreed.len(),
+            observed.len()
         );
     }
 
@@ -42919,7 +43357,7 @@ mod lib_unit_tests {
                         let calls_after_wrong_kind = client_calls.load(Ordering::Acquire);
                         let roots = serde_json::to_value(
                             bidirectional::MrtrInputResponse::roots(
-                                fastmcp_protocol::ListRootsResult::empty(),
+                                fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
                             )
                             .map_err(|error| {
                                 format!("MRTR valid roots response failed: {error}")
@@ -43114,8 +43552,10 @@ mod lib_unit_tests {
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| "MRTR shutdown initial response omitted requestState".to_owned())?;
             let roots = serde_json::to_value(
-                bidirectional::MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                    .map_err(|error| format!("MRTR shutdown roots response failed: {error}"))?,
+                bidirectional::MrtrInputResponse::roots(
+                    fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
+                )
+                .map_err(|error| format!("MRTR shutdown roots response failed: {error}"))?,
             )
             .map_err(|error| format!("MRTR shutdown roots response did not serialize: {error}"))?;
             let retry = HttpRequest::new(HttpMethod::Post, "/mcp")
@@ -44234,8 +44674,11 @@ mod lib_unit_tests {
                 let mut stream = std::net::TcpStream::connect(address).map_err(|error| {
                     format!("post-admission capability connect failed: {error}")
                 })?;
+                // Bound named once so the message below cannot drift from the
+                // value actually installed on the socket.
+                let acknowledgement_read_bound = Duration::from_secs(2);
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .set_read_timeout(Some(acknowledgement_read_bound))
                     .map_err(|error| {
                         format!("post-admission capability timeout setup failed: {error}")
                     })?;
@@ -44255,7 +44698,33 @@ mod lib_unit_tests {
                 {
                     let mut chunk = [0_u8; 2048];
                     let count = std::io::Read::read(&mut stream, &mut chunk).map_err(|error| {
-                        format!("post-admission capability acknowledgement read failed: {error}")
+                        // An expired SO_RCVTIMEO on a blocking socket surfaces
+                        // as WouldBlock (EAGAIN, "Resource temporarily
+                        // unavailable") or TimedOut depending on the platform,
+                        // which reads like an I/O fault rather than the missed
+                        // bound it actually is. Naming the bound and the bytes
+                        // already received separates "the peer sent nothing"
+                        // from "the peer sent a partial response" from a real
+                        // transport error, which the bare OS string cannot.
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) {
+                            format!(
+                                "post-admission capability acknowledgement did not arrive within \
+                                 {acknowledgement_read_bound:?}; {} byte(s) received so far, as \
+                                 text {:?}. This is the read bound elapsing, not a transport \
+                                 fault: the underlying error is {error:?}",
+                                received.len(),
+                                String::from_utf8_lossy(&received[..received.len().min(512)])
+                            )
+                        } else {
+                            format!(
+                                "post-admission capability acknowledgement read failed after {} \
+                                 byte(s): {error}",
+                                received.len()
+                            )
+                        }
                     })?;
                     if count == 0 {
                         return Err(
@@ -47595,11 +48064,20 @@ mod lib_unit_tests {
         });
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[derive(Clone, Copy)]
+    enum LiveHttpShutdownSettlement {
+        Join,
+        Poll,
+        Bounded,
+    }
+
     // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
     #[cfg(feature = "legacy-2024-11-05")]
     async fn live_http_shutdown_ownership_probe(
         cx: &Cx,
         cooperate_with_cancellation: bool,
+        settlement: LiveHttpShutdownSettlement,
     ) -> Result<(), String> {
         struct ReleaseOnExit(Arc<AtomicBool>);
 
@@ -47616,12 +48094,17 @@ mod lib_unit_tests {
         // before runtime teardown joins its blocking thread.
         let _release_on_exit = ReleaseOnExit(Arc::clone(&release));
         let finished = Arc::new(AtomicBool::new(false));
+        let shutdown_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_observer = Arc::clone(&shutdown_calls);
         let tool_name = if cooperate_with_cancellation {
             "live_http_cooperative_shutdown_tool"
         } else {
             "live_http_noncooperative_shutdown_tool"
         };
         let bound = Server::new("live-http-shutdown-ownership", "1.0.0")
+            .on_shutdown(move || {
+                shutdown_observer.fetch_add(1, Ordering::SeqCst);
+            })
             .tool(LiveHttpShutdownTool {
                 name: tool_name,
                 cooperate_with_cancellation,
@@ -47724,7 +48207,14 @@ mod lib_unit_tests {
         }
 
         match (cooperate_with_cancellation, shutdown) {
-            (true, HttpServerShutdown::Quiescent) if finished.load(Ordering::Acquire) => Ok(()),
+            (true, HttpServerShutdown::Quiescent) if finished.load(Ordering::Acquire) => {
+                if shutdown_calls.load(Ordering::SeqCst) != 1 {
+                    return Err(
+                        "cooperative HTTP shutdown must run its hook exactly once".to_owned()
+                    );
+                }
+                Ok(())
+            }
             (true, HttpServerShutdown::Quiescent) => {
                 Err("cooperative HTTP handler was joined before recording completion".to_owned())
             }
@@ -47754,6 +48244,11 @@ mod lib_unit_tests {
                             .to_owned(),
                     );
                 }
+                if shutdown_calls.load(Ordering::SeqCst) != 0 {
+                    return Err(
+                        "HTTP shutdown hook ran while its handler was still live".to_owned()
+                    );
+                }
                 release.store(true, Ordering::Release);
                 let deadline = Instant::now() + Duration::from_secs(1);
                 while !finished.load(Ordering::Acquire) {
@@ -47764,10 +48259,59 @@ mod lib_unit_tests {
                     }
                     asupersync::runtime::yield_now().await;
                 }
-                shutdown
-                    .settle(cx)
-                    .await
-                    .map_err(|error| format!("caller-owned HTTP child join failed: {error}"))
+                match settlement {
+                    LiveHttpShutdownSettlement::Join => {
+                        shutdown.settle(cx).await.map_err(|error| {
+                            format!("caller-owned HTTP child join failed: {error}")
+                        })?;
+                    }
+                    LiveHttpShutdownSettlement::Poll => {
+                        let deadline = Instant::now() + Duration::from_secs(1);
+                        loop {
+                            match shutdown.poll_settlement() {
+                                HttpShutdownSettlement::Settled => break,
+                                HttpShutdownSettlement::Pending { .. }
+                                    if Instant::now() < deadline =>
+                                {
+                                    asupersync::runtime::yield_now().await;
+                                }
+                                observed => {
+                                    return Err(format!(
+                                        "released HTTP child did not settle by polling: {observed:?}"
+                                    ));
+                                }
+                            }
+                        }
+                        for _ in 0..2 {
+                            if !matches!(
+                                shutdown.poll_settlement(),
+                                HttpShutdownSettlement::Settled
+                            ) {
+                                return Err("settled HTTP shutdown changed its outcome".to_owned());
+                            }
+                        }
+                    }
+                    LiveHttpShutdownSettlement::Bounded => {
+                        let observed = shutdown.settle_for(Duration::from_secs(1)).await;
+                        if !matches!(observed, HttpShutdownSettlement::Settled) {
+                            return Err(format!(
+                                "released HTTP child did not settle: {observed:?}"
+                            ));
+                        }
+                        for _ in 0..2 {
+                            if !matches!(
+                                shutdown.settle_for(Duration::ZERO).await,
+                                HttpShutdownSettlement::Settled
+                            ) {
+                                return Err("settled HTTP shutdown changed its outcome".to_owned());
+                            }
+                        }
+                    }
+                }
+                if shutdown_calls.load(Ordering::SeqCst) != 1 {
+                    return Err("settled HTTP shutdown must run its hook exactly once".to_owned());
+                }
+                Ok(())
             }
         }
     }
@@ -47776,7 +48320,9 @@ mod lib_unit_tests {
     #[cfg(feature = "legacy-2024-11-05")]
     #[test]
     fn live_http_shutdown_joins_a_cooperative_child() {
-        run_live_http_test(|cx| async move { live_http_shutdown_ownership_probe(&cx, true).await });
+        run_live_http_test(|cx| async move {
+            live_http_shutdown_ownership_probe(&cx, true, LiveHttpShutdownSettlement::Join).await
+        });
     }
 
     // Exact-2024 era: hosts its child in a legacy HTTP SSE session.
@@ -47786,7 +48332,24 @@ mod lib_unit_tests {
         run_live_http_test(|cx| async move {
             // This differs from the positive only in the handler's
             // cancellation cooperation, preserving the same live HTTP path.
-            live_http_shutdown_ownership_probe(&cx, false).await
+            live_http_shutdown_ownership_probe(&cx, false, LiveHttpShutdownSettlement::Join).await
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn live_http_shutdown_polled_settlement_finishes_lifecycle_once() {
+        run_live_http_test(|cx| async move {
+            live_http_shutdown_ownership_probe(&cx, false, LiveHttpShutdownSettlement::Poll).await
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn live_http_shutdown_bounded_settlement_finishes_lifecycle_once() {
+        run_live_http_test(|cx| async move {
+            live_http_shutdown_ownership_probe(&cx, false, LiveHttpShutdownSettlement::Bounded)
+                .await
         });
     }
 
@@ -55816,8 +56379,10 @@ mod lib_unit_tests {
         assert_eq!(calls.load(Ordering::Acquire), 1);
 
         let roots = serde_json::to_value(
-            bidirectional::MrtrInputResponse::roots(fastmcp_protocol::ListRootsResult::empty())
-                .expect("MRTR roots response must construct"),
+            bidirectional::MrtrInputResponse::roots(
+                fastmcp_protocol::FinalEmbeddedRootsListResult { roots: Vec::new() },
+            )
+            .expect("MRTR roots response must construct"),
         )
         .expect("MRTR roots response must serialize");
         let retry =

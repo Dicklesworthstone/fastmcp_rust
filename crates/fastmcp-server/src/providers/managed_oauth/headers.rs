@@ -149,7 +149,7 @@ impl CoreBackend for ReviewedNativeBackend {
                         };
                     }
                     ManagedCoreEvent::Notification(notification) => {
-                        forward_notification(ctx, *notification)?
+                        forward_notification(ctx, *notification)?;
                     }
                 }
             }

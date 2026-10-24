@@ -90,6 +90,7 @@
 //! Source wiring and local tests are not official-conformance results.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::process::ExitCode;
 
 use fastmcp_client::http_executor::parameter_headers::ReviewedToolHeaders;
@@ -212,7 +213,9 @@ fn header_review_notice(name: &str, protected: bool) -> String {
     if protected {
         "tools/call: parameter-header review refused; calling without header mirrors".to_owned()
     } else {
-        format!("tools/call {name}: parameter-header review refused; calling without header mirrors")
+        format!(
+            "tools/call {name}: parameter-header review refused; calling without header mirrors"
+        )
     }
 }
 
@@ -360,17 +363,22 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
         .capabilities(capabilities)
         .reverse_request_handlers(handlers());
     if managed_refresh {
-        let raw = oauth.as_deref().ok_or_else(|| "managed refresh requires OAuth".to_owned())?;
+        let raw = oauth
+            .as_deref()
+            .ok_or_else(|| "managed refresh requires OAuth".to_owned())?;
         let grant = managed::configure(cx, &endpoint, builder, raw).await?;
         let mut client = grant.client()?;
-        return grant.run(cx, exercise(cx, &endpoint, &mut client, true)).await;
+        return grant
+            .run(cx, exercise(cx, &endpoint, &mut client, true))
+            .await;
     }
     let (builder, authorization) =
         conformance_oauth::configure(cx, &endpoint, builder, oauth.as_deref()).await?;
     let protected = authorization.is_some();
     // Keep connection/discovery inside the fixed lease's lifetime too.
     let flow = async {
-        let mut client = FixtureClient::ordinary(cx, builder).await
+        let mut client = FixtureClient::ordinary(cx, builder)
+            .await
             .map_err(|error| failure("connect", &error, protected))?;
         exercise(cx, &endpoint, &mut client, protected).await
     };
@@ -380,7 +388,22 @@ async fn run(cx: &Cx, url: &str) -> Result<(), String> {
     }
 }
 
-async fn exercise(
+// Boxed return, not an `async fn`. This is the whole MCP exercise flow and was
+// the last `large_future` in the workspace at ~27 KB: both of its callers
+// materialised it on their own frame, and at the `grant.run(cx, exercise(..))`
+// site that happened even though `run` now boxes internally, because the
+// ARGUMENT is built on the caller's stack before being moved into the box.
+// Boxing here fixes both call sites at source (bd-y2xoc).
+fn exercise<'a>(
+    cx: &'a Cx,
+    endpoint: &'a CanonicalHttpUrl,
+    client: &'a mut FixtureClient,
+    protected: bool,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
+    Box::pin(exercise_inner(cx, endpoint, client, protected))
+}
+
+async fn exercise_inner(
     cx: &Cx,
     endpoint: &CanonicalHttpUrl,
     client: &mut FixtureClient,
@@ -550,7 +573,10 @@ fn main() -> ExitCode {
     };
     let outcome = runtime.block_on(async {
         let cx = Cx::current().ok_or_else(|| "no ambient context".to_owned())?;
-        run(&cx, &url).await
+        // Boxed at the single site that owns it. `run` is this binary's whole
+        // entry flow and has exactly one caller, so there is no root further
+        // in to box and nothing is relocated by doing it here (bd-y2xoc).
+        Box::pin(run(&cx, &url)).await
     });
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -602,7 +628,10 @@ mod tests {
             assert_eq!(call.name, "lookup");
             assert!(call.headers.is_none());
             assert!(call.header_review_refused);
-            assert_eq!(call.arguments, json!({"region":"conformance","private":"conformance"}));
+            assert_eq!(
+                call.arguments,
+                json!({"region":"conformance","private":"conformance"})
+            );
             // No annotation means no disclosure review was attempted. These
             // ordinary tools must not acquire either a plan or a refusal notice.
             let ordinary = json!({"name":"plain","inputSchema":{
@@ -725,15 +754,17 @@ mod tests {
         );
         assert!(!failure("connect", &secret, true).contains(secret));
         assert!(failure("connect", &secret, false).contains(secret));
-        let denied: ClientError = fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret)).into();
+        let denied: ClientError =
+            fastmcp_client::HttpClientError::CoreResult(McpError::invalid_request(secret)).into();
         assert!(
             !optional_catalog_failure("resources/list", &denied, true)
                 .unwrap_err()
                 .contains(secret)
         );
-        let unsupported: ClientError = fastmcp_client::HttpClientError::CoreResult(McpError::method_not_found(
-            "resources/list",
-        )).into();
+        let unsupported: ClientError = fastmcp_client::HttpClientError::CoreResult(
+            McpError::method_not_found("resources/list"),
+        )
+        .into();
         assert!(optional_catalog_failure("resources/list", &unsupported, true).is_ok());
     }
 }

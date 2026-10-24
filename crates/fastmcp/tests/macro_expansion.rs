@@ -5347,6 +5347,210 @@ fn json_schema_optional_custom_types_reach_registered_modern_tool() {
 #[derive(Debug, Default, PartialEq)]
 struct SerdeSchemaLocalState;
 
+/// A bounded scalar with application-local state outside its wire value.
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct TransparentNamedSchema {
+    value: u8,
+    #[serde(skip)]
+    local: SerdeSchemaLocalState,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct TransparentTupleSchema(
+    #[serde(skip)] SerdeSchemaLocalState,
+    char,
+    std::marker::PhantomData<SerdeSchemaLocalState>,
+);
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct TransparentDefaultedSchema {
+    #[serde(default, skip_serializing)]
+    local: SerdeSchemaLocalState,
+    value: u16,
+}
+
+#[test]
+fn json_schema_transparent_structs_match_scalar_wire_values_and_skip_markers() {
+    let named = fastmcp_rust::schema::admit_final_schema(TransparentNamedSchema::json_schema())
+        .expect("a named transparent wrapper advertises its scalar payload");
+    assert_eq!(named.schema()["type"], "integer");
+    assert_eq!(named.schema()["minimum"], 0);
+    assert_eq!(named.schema()["maximum"], 255);
+    assert_eq!(
+        named.schema()["description"],
+        "A bounded scalar with application-local state outside its wire value."
+    );
+    for value in [json!(0), json!(7), json!(255)] {
+        named.validate(&value).unwrap();
+        let decoded: TransparentNamedSchema = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.local, SerdeSchemaLocalState);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+    for value in [
+        json!(-1),
+        json!(256),
+        json!(7.5),
+        json!({"value": 7}),
+        json!(null),
+    ] {
+        assert!(named.validate(&value).is_err(), "{value}");
+        assert!(serde_json::from_value::<TransparentNamedSchema>(value).is_err());
+    }
+
+    let tuple = fastmcp_rust::schema::admit_final_schema(TransparentTupleSchema::json_schema())
+        .expect("skipped local state and PhantomData do not need schema providers");
+    for value in [json!("A"), json!("🦀")] {
+        tuple.validate(&value).unwrap();
+        let decoded: TransparentTupleSchema = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+    for value in [json!(""), json!("AB"), json!(["A"]), json!(null)] {
+        assert!(tuple.validate(&value).is_err(), "{value}");
+        assert!(serde_json::from_value::<TransparentTupleSchema>(value).is_err());
+    }
+
+    let defaulted =
+        fastmcp_rust::schema::admit_final_schema(TransparentDefaultedSchema::json_schema())
+            .expect("an auxiliary default and serialization skip select the same payload");
+    for value in [json!(0), json!(65535)] {
+        defaulted.validate(&value).unwrap();
+        let decoded: TransparentDefaultedSchema = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.local, SerdeSchemaLocalState);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    }
+    assert!(defaulted.validate(&json!(65536)).is_err());
+    assert!(serde_json::from_value::<TransparentDefaultedSchema>(json!(65536)).is_err());
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct TransparentConstrainedSchema {
+    value: ConstChoice,
+}
+
+#[test]
+fn json_schema_transparent_struct_preserves_handwritten_payload_constraints() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(TransparentConstrainedSchema::json_schema())
+            .expect("a transparent wrapper keeps the complete handwritten payload schema");
+    let value = json!("Allowed");
+    schema.validate(&value).unwrap();
+    let decoded: TransparentConstrainedSchema = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+    for invalid in [json!("Denied"), json!({"value": "Allowed"}), json!(null)] {
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<TransparentConstrainedSchema>(invalid).is_err());
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(transparent)]
+struct TransparentRecursiveSchema {
+    payload: TransparentRecursivePayload,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TransparentRecursivePayload {
+    level: u8,
+    child: Option<Box<TransparentRecursiveSchema>>,
+}
+
+#[test]
+fn json_schema_transparent_recursive_struct_preserves_local_references_and_closed_payload() {
+    let schema =
+        fastmcp_rust::schema::admit_final_schema(TransparentRecursiveSchema::json_schema())
+            .expect("transparent recursion shares the document's bounded definition context");
+    assert!(schema.schema()["$defs"].is_object());
+    let valid = json!({"level": 3, "child": {"level": 4}});
+    schema.validate(&valid).unwrap();
+    let decoded: TransparentRecursiveSchema = serde_json::from_value(valid.clone()).unwrap();
+    schema
+        .validate(&serde_json::to_value(decoded).unwrap())
+        .unwrap();
+    for (pointer, replacement) in [
+        ("/child/level", json!(256)),
+        ("/child", json!({"level": 4, "unknown": true})),
+        ("/child", json!("invalid")),
+    ] {
+        let mut invalid = valid.clone();
+        *invalid.pointer_mut(pointer).unwrap() = replacement;
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<TransparentRecursiveSchema>(invalid).is_err());
+    }
+    assert!(schema.validate(&json!({"payload": valid})).is_err());
+}
+
+static TRANSPARENT_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn transparent_schema_error(_kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    Some(json!(0))
+}
+
+#[tool(output_schema = TransparentNamedSchema, error_mapper = transparent_schema_error)]
+async fn echo_transparent_schema(
+    ctx: &McpContext,
+    value: TransparentNamedSchema,
+) -> McpResult<TransparentNamedSchema> {
+    ctx.checkpoint()?;
+    TRANSPARENT_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(value)
+}
+
+#[test]
+fn json_schema_transparent_tool_input_and_output_reach_registered_modern_dispatch() {
+    on_caller_runtime(async {
+        let server = Server::new("transparent-schema", "1.0.0")
+            .tool(EchoTransparentSchema)
+            .try_build()
+            .expect("transparent input, scalar output, and mapped errors share the real schema");
+        let connection = ModernConnection::new();
+        for invalid in [
+            json!(-1),
+            json!(256),
+            json!(7.5),
+            json!({"value": 7}),
+            json!(null),
+        ] {
+            let before = TRANSPARENT_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let accepted = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_transparent_schema",
+                    json!({"value": 7}),
+                )
+                .await,
+            );
+            assert_schema_bound_success(&accepted, &json!(7));
+            assert_eq!(
+                TRANSPARENT_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+            let rejected = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_transparent_schema",
+                    json!({"value": invalid}),
+                )
+                .await,
+            );
+            assert_eq!(rejected["isError"], true);
+            assert_eq!(rejected["structuredContent"], 0);
+            assert_eq!(
+                TRANSPARENT_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid neighboring wire values cannot invoke the application handler"
+            );
+        }
+    });
+}
+
 fn serde_schema_default_retry_limit() -> u32 {
     3
 }

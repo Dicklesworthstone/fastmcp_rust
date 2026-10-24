@@ -227,6 +227,19 @@ fn prepare(
     request_id: RequestId,
     limits: ManagedCoreLimits,
 ) -> Result<(ModernHttpRequest, SubscriptionDecoder), ManagedCoreError> {
+    prepare_bounded(target, params, request_id, limits, limits.request_bytes)
+}
+
+// Managed Bearer and explicit DPoP subscriptions share one request/filter
+// admission path. A transport may tighten the request cap, never widen it.
+// Refusal precedes proof signing, credential renewal and network activity.
+pub(crate) fn prepare_bounded(
+    target: &str,
+    params: FinalSubscriptionsListenParams,
+    request_id: RequestId,
+    limits: ManagedCoreLimits,
+    transport_request_bytes: usize,
+) -> Result<(ModernHttpRequest, SubscriptionDecoder), ManagedCoreError> {
     if limits.notifications == 0 {
         return Err(ManagedCoreError::InvalidLimits);
     }
@@ -258,7 +271,7 @@ fn prepare(
     });
     let mut encoded = BoundedWriter {
         bytes: Vec::new(),
-        maximum: limits.request_bytes,
+        maximum: limits.request_bytes.min(transport_request_bytes),
     };
     serde_json::to_writer(&mut encoded, &envelope)
         .map_err(|_| ManagedCoreError::RequestTooLarge)?;
@@ -325,7 +338,7 @@ fn is_subset(accepted: &SubscriptionFilter, requested: &SubscriptionFilter) -> b
             })
 }
 
-struct SubscriptionDecoder {
+pub(crate) struct SubscriptionDecoder {
     request: CoreRequest,
     request_id: RequestId,
     requested: SubscriptionFilter,
@@ -337,7 +350,15 @@ struct SubscriptionDecoder {
 }
 
 impl SubscriptionDecoder {
-    fn admit(&mut self, frame: &[u8]) -> Result<ManagedCoreEvent, ManagedCoreError> {
+    pub(crate) fn usage(&self) -> (usize, usize) {
+        (self.bytes, self.notifications)
+    }
+
+    pub(crate) fn json_error(&self, frame: &[u8]) -> ManagedCoreError {
+        json_subscription_error(frame, &self.request_id, self.limits)
+    }
+
+    pub(crate) fn admit(&mut self, frame: &[u8]) -> Result<ManagedCoreEvent, ManagedCoreError> {
         if self.terminal {
             return Err(ManagedCoreError::InvalidResponse);
         }

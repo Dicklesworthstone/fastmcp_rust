@@ -468,9 +468,9 @@ impl BoundSecuredHttpServer {
                 Server::settle_hosted_task_service(hosted_task_service, cx).await;
             #[cfg(not(feature = "tasks"))]
             let task_service_result: McpResult<()> = Ok(());
-            server.graceful_shutdown_returning();
             let result = result.and(task_service_result);
             if children.tasks.is_empty() {
+                server.graceful_shutdown_returning();
                 if !children.terminal_failures.is_empty() {
                     return Err(McpError::internal_error(
                         "secured HTTP child settlement failed",
@@ -481,7 +481,9 @@ impl BoundSecuredHttpServer {
             } else {
                 Ok(HttpServerShutdown::Nonquiescent(HttpNonquiescentShutdown {
                     children,
+                    server,
                     listener_error: result.err(),
+                    shutdown_complete: false,
                 }))
             }
         }

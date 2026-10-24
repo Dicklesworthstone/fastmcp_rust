@@ -2159,7 +2159,7 @@ fn generate_prompt_execution_methods(
                     Box::pin(async move {
                         match self.get_async_in_request(ctx, request_cx, arguments).await {
                             fastmcp_core::Outcome::Ok(messages) => {
-                                match ::fastmcp_server::promote_legacy_prompt_messages(messages) {
+                                match fastmcp_server::promote_legacy_prompt_messages(messages) {
                                     Ok(complete) => fastmcp_core::Outcome::Ok(
                                         fastmcp_server::FinalMethodOutcome::Complete(complete),
                                     ),
@@ -2480,9 +2480,19 @@ fn generate_final_resource_result_conversion(output: &syn::ReturnType) -> Option
 
 /// Marks a final `#[resource]` expansion as the author of its cache hints.
 fn explicit_final_resource_cache_hint_methods() -> TokenStream2 {
-    let server = handler_crate_paths()
-        .map(|paths| paths.server)
-        .unwrap_or_else(|_| quote!(::fastmcp_server));
+    // Every other crate-path resolution in this file propagates with `?`; this
+    // was the one site that swallowed the error and substituted a path, and the
+    // path it substituted was `::fastmcp_server`. A leading `::` names an
+    // EXTERN CRATE, which is exactly the shape that kept `#[prompt]` and
+    // `#[resource]` from expanding for any consumer whose manifest names only
+    // `fastmcp-rust` -- in-workspace tests could not see it because Cargo gives
+    // a package's own dependencies to its own test targets. Emit the macro's own
+    // diagnostic instead, so a consumer missing both entry points is told which
+    // dependency to add rather than shown an unresolved crate they never named.
+    let server = match handler_crate_paths() {
+        Ok(paths) => paths.server,
+        Err(error) => return error.to_compile_error(),
+    };
     quote! {
         fn final_resource_read_cache_hint_provenance(
             &self,
@@ -2591,7 +2601,7 @@ fn generate_resource_execution_methods(
                         .await
                     {
                         fastmcp_core::Outcome::Ok(contents) => {
-                            match ::fastmcp_server::promote_legacy_resource_contents(contents) {
+                            match fastmcp_server::promote_legacy_resource_contents(contents) {
                                 Ok(complete) => fastmcp_core::Outcome::Ok(
                                     fastmcp_server::FinalMethodOutcome::Complete(complete),
                                 ),
@@ -6275,8 +6285,11 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// alternatives remain valid. Enum aliases, catch-all variants, flattened
 /// fields, and custom wire conversions require an explicit schema and produce
 /// diagnostics instead of silently advertising the Rust field layout.
-/// Other struct representations, including flattening and custom serializers,
-/// are not inferred by this derive.
+/// Serde transparent structs preserve their one payload's schema, including
+/// named wrappers, skipped local fields, and `PhantomData` markers. The same
+/// field must be the payload in both wire directions. Struct flattening,
+/// aliases, and custom wire conversions require an explicit schema and produce
+/// diagnostics instead of silently advertising the Rust field layout.
 ///
 /// Recursive and repeated derived types share bounded local `$defs` in each
 /// generated document. `Box`, `Rc`, `Arc`, and `Cow` retain their payload's
@@ -6321,9 +6334,8 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
 
     // Process fields based on data type
     let schema_impl = match &input.data {
-        syn::Data::Struct(data_struct) => {
-            generate_struct_schema(data_struct, &type_desc_tokens, &serde_attrs)
-        }
+        syn::Data::Struct(data_struct) => validate_struct_schema_attributes(&input.attrs, true)
+            .and_then(|()| generate_struct_schema(data_struct, &type_desc_tokens, &serde_attrs)),
         syn::Data::Enum(data_enum) => validate_enum_schema_attributes(&input.attrs)
             .and_then(|()| generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs)),
         syn::Data::Union(_) => {
@@ -6503,15 +6515,25 @@ struct SchemaSerdeAttrs {
     rename_all_fields: Option<SchemaRenameRule>,
     default: bool,
     skip: bool,
+    skip_serializing: bool,
+    skip_deserializing: bool,
     skip_serializing_if: bool,
     deny_unknown_fields: bool,
     tag: Option<String>,
     content: Option<String>,
     untagged: bool,
+    transparent: bool,
 }
 
 impl SchemaSerdeAttrs {
     fn parse(attrs: &[Attribute]) -> syn::Result<Self> {
+        Self::parse_with_directional_skips(attrs, false)
+    }
+
+    fn parse_with_directional_skips(
+        attrs: &[Attribute],
+        allow_directional_skips: bool,
+    ) -> syn::Result<Self> {
         let mut result = Self::default();
         let mut skip_serializing = false;
         let mut skip_deserializing = false;
@@ -6562,15 +6584,25 @@ impl SchemaSerdeAttrs {
                         ));
                     }
                     result.untagged = true;
+                } else if entry.path().is_ident("transparent") {
+                    if !matches!(entry, Meta::Path(_)) || result.transparent {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected one bare serde(transparent) attribute",
+                        ));
+                    }
+                    result.transparent = true;
                 }
             }
         }
-        if !result.skip && skip_serializing != skip_deserializing {
+        if !allow_directional_skips && !result.skip && skip_serializing != skip_deserializing {
             return Err(syn::Error::new_spanned(
                 quote! { #(#attrs)* },
                 "JsonSchema needs the same skipped fields and variants in both directions; use serde(skip) or implement json_schema() explicitly",
             ));
         }
+        result.skip_serializing = result.skip || skip_serializing;
+        result.skip_deserializing = result.skip || skip_deserializing;
         result.skip |= skip_serializing && skip_deserializing;
         Ok(result)
     }
@@ -6624,6 +6656,56 @@ fn validate_enum_schema_attributes(attrs: &[Attribute]) -> syn::Result<()> {
         return Err(syn::Error::new_spanned(
             quote! { #(#attrs)* },
             "JsonSchema cannot infer flattened enum fields; implement json_schema() explicitly",
+        ));
+    }
+    Ok(())
+}
+
+/// A struct schema must describe the Serde value, not an unrelated Rust
+/// layout. These conversions need an explicit provider until their wire
+/// shape can be inferred without losing constraints or changing acceptance.
+fn validate_struct_schema_attributes(attrs: &[Attribute], container: bool) -> syn::Result<()> {
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        let entries =
+            attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        for entry in entries {
+            if let Some(name) = [
+                "flatten",
+                "alias",
+                "with",
+                "serialize_with",
+                "deserialize_with",
+                "from",
+                "try_from",
+                "into",
+                "remote",
+                "getter",
+                "other",
+                "field_identifier",
+                "variant_identifier",
+            ]
+            .into_iter()
+            .find(|name| entry.path().is_ident(name))
+            {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    format!(
+                        "JsonSchema cannot infer serde({name}) for a struct; implement json_schema() explicitly"
+                    ),
+                ));
+            }
+            if !container && entry.path().is_ident("transparent") {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    "serde transparent belongs on a struct, not its fields",
+                ));
+            }
+        }
+    }
+    if has_json_schema_attr(attrs, "flatten") {
+        return Err(syn::Error::new_spanned(
+            quote! { #(#attrs)* },
+            "JsonSchema cannot infer flattened struct fields; implement json_schema() explicitly",
         ));
     }
     Ok(())
@@ -6683,7 +6765,87 @@ fn generate_struct_schema(
             "JsonSchema supports serde tagging attributes on enums; implement json_schema() explicitly for a tagged struct",
         ));
     }
+    if serde_attrs.transparent {
+        return generate_transparent_struct_schema(data, type_desc_tokens);
+    }
+    for field in &data.fields {
+        let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
+        if !attrs.skip && !has_json_schema_attr(&field.attrs, "skip") {
+            validate_struct_schema_attributes(&field.attrs, false)?;
+        }
+    }
     generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs)
+}
+
+fn generate_transparent_struct_schema(
+    data: &syn::DataStruct,
+    type_desc_tokens: &TokenStream2,
+) -> syn::Result<TokenStream2> {
+    let mut serialized = None;
+    let mut deserialized = None;
+    for (index, field) in data.fields.iter().enumerate() {
+        let attrs = SchemaSerdeAttrs::parse_with_directional_skips(&field.attrs, true)?;
+        // Match Serde's transparent field election: PhantomData never carries
+        // the wire value, even without an explicit skip. Parentheses/groups do
+        // not turn that marker into a payload.
+        let mut ty = &field.ty;
+        loop {
+            match ty {
+                Type::Paren(paren) => ty = &paren.elem,
+                Type::Group(group) => ty = &group.elem,
+                _ => break,
+            }
+        }
+        if type_last_segment(ty).is_some_and(|segment| segment.ident == "PhantomData") {
+            continue;
+        }
+        let in_serialized = !attrs.skip_serializing;
+        let in_deserialized = !attrs.skip_deserializing && !attrs.default;
+        if !in_serialized && !in_deserialized {
+            continue;
+        }
+        validate_struct_schema_attributes(&field.attrs, false)?;
+        if has_json_schema_attr(&field.attrs, "skip") {
+            return Err(syn::Error::new_spanned(
+                field,
+                "JsonSchema cannot skip a Serde transparent payload; use serde(skip) for local fields or implement json_schema() explicitly",
+            ));
+        }
+        if in_serialized && serialized.replace((index, field)).is_some()
+            || in_deserialized && deserialized.replace((index, field)).is_some()
+        {
+            return Err(syn::Error::new_spanned(
+                field,
+                "JsonSchema serde(transparent) requires exactly one payload in each wire direction",
+            ));
+        }
+    }
+    let (Some((serialized_index, payload)), Some((deserialized_index, _))) =
+        (serialized, deserialized)
+    else {
+        return Err(syn::Error::new_spanned(
+            data.struct_token,
+            "JsonSchema serde(transparent) requires one non-skipped payload without a serde default",
+        ));
+    };
+    if serialized_index != deserialized_index {
+        return Err(syn::Error::new_spanned(
+            data.struct_token,
+            "JsonSchema serde(transparent) requires the same payload in both wire directions; implement json_schema() explicitly",
+        ));
+    }
+    let payload_schema = type_to_json_schema(&payload.ty);
+    Ok(quote! {
+        {
+            let mut schema = #payload_schema;
+            if let Some(desc) = #type_desc_tokens {
+                if let Some(obj) = schema.as_object_mut() {
+                    obj.insert("description".to_string(), serde_json::json!(desc));
+                }
+            }
+            schema
+        }
+    })
 }
 
 fn schema_field_name(
@@ -6866,6 +7028,12 @@ fn generate_enum_schema(
     type_desc_tokens: &TokenStream2,
     serde_attrs: &SchemaSerdeAttrs,
 ) -> syn::Result<TokenStream2> {
+    if serde_attrs.transparent {
+        return Err(syn::Error::new_spanned(
+            data.enum_token,
+            "serde transparent is supported on structs, not enums",
+        ));
+    }
     let representation = match (
         serde_attrs.tag.as_deref(),
         serde_attrs.content.as_deref(),
@@ -7185,8 +7353,136 @@ fn get_json_schema_rename(attrs: &[Attribute]) -> Option<String> {
 #[cfg(test)]
 mod serde_schema_tests {
     use super::{
-        SchemaRenameRule, SchemaSerdeAttrs, generate_enum_schema, validate_enum_schema_attributes,
+        SchemaRenameRule, SchemaSerdeAttrs, generate_enum_schema, generate_struct_schema,
+        validate_enum_schema_attributes, validate_struct_schema_attributes,
     };
+
+    fn struct_representation_error(input: syn::DeriveInput) -> String {
+        let attrs = SchemaSerdeAttrs::parse(&input.attrs).expect("valid attribute syntax");
+        let syn::Data::Struct(data) = &input.data else {
+            panic!("struct fixture required");
+        };
+        validate_struct_schema_attributes(&input.attrs, true)
+            .and_then(|()| generate_struct_schema(data, &quote::quote! { None::<&str> }, &attrs))
+            .expect_err("unmodeled struct representation must produce a diagnostic")
+            .to_string()
+    }
+
+    #[test]
+    fn serde_schema_transparent_requires_one_shared_wire_payload() {
+        for (input, expected) in [
+            (
+                syn::parse_quote! { #[serde(transparent)] struct Invalid; },
+                "one non-skipped payload without a serde default",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(transparent)] struct Invalid(#[serde(skip)] String);
+                },
+                "one non-skipped payload without a serde default",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(transparent)] struct Invalid { first: String, second: u8 }
+                },
+                "exactly one payload in each wire direction",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(transparent)] struct Invalid(#[serde(default)] String);
+                },
+                "one non-skipped payload without a serde default",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(transparent)]
+                    struct Invalid {
+                        #[serde(skip_deserializing)] output: String,
+                        #[serde(skip_serializing)] input: u8,
+                    }
+                },
+                "the same payload in both wire directions",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(transparent)] struct Invalid(#[json_schema(skip)] String);
+                },
+                "cannot skip a Serde transparent payload",
+            ),
+        ] {
+            let error = struct_representation_error(input);
+            assert!(error.contains(expected), "{error}");
+        }
+        for attribute in [
+            syn::parse_quote! { #[serde(transparent = true)] },
+            syn::parse_quote! { #[serde(transparent, transparent)] },
+        ] {
+            let error = SchemaSerdeAttrs::parse(&[attribute]).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "expected one bare serde(transparent) attribute"
+            );
+        }
+    }
+
+    #[test]
+    fn serde_schema_struct_wire_conversions_require_explicit_schemas() {
+        for (input, name) in [
+            (
+                syn::parse_quote! { #[serde(from = "String")] struct Invalid { value: u8 } },
+                "from",
+            ),
+            (
+                syn::parse_quote! { #[serde(try_from = "String")] struct Invalid { value: u8 } },
+                "try_from",
+            ),
+            (
+                syn::parse_quote! { #[serde(into = "String")] struct Invalid { value: u8 } },
+                "into",
+            ),
+            (
+                syn::parse_quote! { #[serde(remote = "Remote")] struct Invalid { value: u8 } },
+                "remote",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: Payload } },
+                "flatten",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(alias = "other")] value: u8 } },
+                "alias",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(with = "custom")] value: u8 } },
+                "with",
+            ),
+            (
+                syn::parse_quote! { struct Invalid(#[serde(serialize_with = "custom")] u8); },
+                "serialize_with",
+            ),
+            (
+                syn::parse_quote! { struct Invalid(#[serde(deserialize_with = "custom")] u8); },
+                "deserialize_with",
+            ),
+            (
+                syn::parse_quote! { #[serde(transparent)] struct Invalid { #[serde(with = "custom")] value: u8 } },
+                "with",
+            ),
+        ] {
+            let error = struct_representation_error(input);
+            assert!(error.contains(&format!("serde({name})")), "{error}");
+            assert!(
+                error.contains("implement json_schema() explicitly"),
+                "{error}"
+            );
+        }
+        assert!(
+            struct_representation_error(syn::parse_quote! {
+                struct Invalid { #[json_schema(flatten)] value: Payload }
+            })
+            .contains("flattened struct fields")
+        );
+    }
 
     fn enum_representation_error(input: syn::DeriveInput) -> String {
         let attrs = SchemaSerdeAttrs::parse(&input.attrs).expect("valid attribute syntax");
@@ -7213,6 +7509,10 @@ mod serde_schema_tests {
             (
                 syn::parse_quote! { #[serde(tag = "kind", untagged)] enum Invalid { Unit } },
                 "serde untagged cannot be combined with tag or content",
+            ),
+            (
+                syn::parse_quote! { #[serde(transparent)] enum Invalid { Unit } },
+                "serde transparent is supported on structs, not enums",
             ),
             (
                 syn::parse_quote! {

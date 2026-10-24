@@ -25,15 +25,41 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::common_types::SamplingContentBlock;
-use fastmcp_protocol::sampling::{
-    SamplingToolLoop, SamplingToolLoopError, SamplingToolLoopLimits, SamplingToolLoopStep,
-};
+use fastmcp_protocol::sampling::{SamplingToolLoop, SamplingToolLoopStep};
 use fastmcp_protocol::{
     AdmittedSchema, FinalCreateMessageResult, FinalEmbeddedCreateMessageParams, admit_final_schema,
 };
 
+use super::caller::with_caller;
+
+/// Re-exported because `SamplingRunLimits::new` below takes one BY VALUE, so a
+/// consumer depending only on the `fastmcp-rust` facade must be able to write
+/// the name. Without this the constructor is reachable but uncallable with a
+/// non-default conversation bound: the facade forwards `http_auth`
+/// (`crates/fastmcp/src/lib.rs:936`) and `sampling` is `pub mod`, yet
+/// `fastmcp_protocol::sampling` is NOT among the facade's forwarded modules and
+/// the type appears nowhere in the facade's explicit re-export lists, so the
+/// caller's only alternative was a direct dependency on `fastmcp-protocol`.
+///
+/// It lives here rather than in the parent `http_auth` root because the
+/// signature demanding it is here; the parent closed the identical defect class
+/// for `OAuthCredentialStore::open` with
+/// `pub use fastmcp_core::partition::PartitionAuthorization`.
+///
+/// `SamplingToolLoopError` joins it for a position the first pass did not
+/// examine: `SamplingRunError::Protocol` below carries one as its payload, and
+/// that enum IS facade-reachable. Matching the variant binds the payload
+/// without naming it, but a consumer who PROPAGATES the error -- storing it in
+/// their own error type or returning it -- must write the name, and could not.
+/// When this re-export was first added only `pub fn` parameter and return
+/// positions had been swept, which is why three of the four imported siblings
+/// were judged internal; an enum-variant payload is the same defect.
+pub use fastmcp_protocol::sampling::{SamplingToolLoopError, SamplingToolLoopLimits};
+
 /// Bounded sampling-only resolution of final input-required response maps.
 pub mod inputs;
+/// Opt-in bounded concurrency for independently executable, approved tools.
+pub mod parallel;
 
 /// A host-owned operation borrowing its model/tool implementation and caller.
 /// There is no 'static requirement and no task is spawned by this driver.
@@ -80,6 +106,18 @@ pub trait SamplingHost: Send {
         cancellation: &'a McpRequestCancellation,
         call: &'a SamplingContentBlock,
     ) -> SamplingHostFuture<'a, SamplingContentBlock>;
+
+    /// Opt into concurrent execution of this approved batch. The default keeps
+    /// the existing sequential `execute_tool` path. This hook runs only after
+    /// whole-batch approval, under the caller's Cx and lifetime checks.
+    ///
+    /// The host must select only tools safe to overlap under its own policy.
+    /// The returned executor is borrowed until the batch finishes or is
+    /// dropped; the model and approval callbacks cannot overlap that batch.
+    /// Embedded sampling resolvers use this same hook through the runner.
+    fn parallel_tools(&self) -> Option<parallel::ParallelSamplingTools<'_>> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,8 +207,10 @@ pub struct SamplingRunResult {
 /// Runs a complete bounded sampling conversation using explicit host callbacks.
 ///
 /// Initial schemas/history and each whole model batch are admitted before host
-/// tool approval or execution. Each result is correlated and output-validated
-/// before the next tool can start. Explicit null, metadata, multimodal content,
+/// tool approval or execution. Sequential execution validates each result
+/// before starting the next tool. An explicitly installed parallel executor
+/// validates each completion before admitting queued work and preserves model
+/// order in the next request. Explicit null, metadata, multimodal content,
 /// model names and open stop-reason values remain in their typed wire forms.
 ///
 /// Dropping this future retires the conversation and its pending host future;
@@ -246,27 +286,47 @@ pub async fn run_sampling_tool_loop<H: SamplingHost + ?Sized>(
                         })
                 })
                 .await?;
-                let mut results = Vec::with_capacity(count);
-                for call in &calls {
-                    // A cooperative boundary also gives cancellation a chance
-                    // to run when every host callback completes immediately.
-                    cooperate(cx, cancellation, deadline).await?;
-                    let result = within(cx, cancellation, deadline, async {
-                        host.execute_tool(cx, cancellation, call)
-                            .await
-                            .map_err(|reason| SamplingRunError::Host {
-                                stage: SamplingStage::Tool,
-                                reason,
-                            })
-                    })
-                    .await?;
-                    let remaining = limits.tool_result_bytes - result_bytes;
-                    let bytes = encoded_size(&result, remaining)?;
-                    validate_output(call, &result, &outputs)?;
-                    result_bytes += bytes;
-                    executed_tools += 1;
-                    results.push(result);
-                }
+                let parallel = with_caller(cx, || {
+                    check(cx, cancellation, deadline)?;
+                    let executor = host.parallel_tools();
+                    check(cx, cancellation, deadline)?;
+                    Ok::<_, SamplingRunError>(executor)
+                })?;
+                let results = if let Some(executor) = parallel {
+                    executor
+                        .execute(
+                            cx,
+                            cancellation,
+                            deadline,
+                            &calls,
+                            &outputs,
+                            limits.tool_result_bytes,
+                            &mut result_bytes,
+                        )
+                        .await?
+                } else {
+                    let mut results = Vec::with_capacity(count);
+                    for call in &calls {
+                        // Yield even when every host callback is immediately ready.
+                        cooperate(cx, cancellation, deadline).await?;
+                        let result = within(cx, cancellation, deadline, async {
+                            host.execute_tool(cx, cancellation, call)
+                                .await
+                                .map_err(|reason| SamplingRunError::Host {
+                                    stage: SamplingStage::Tool,
+                                    reason,
+                                })
+                        })
+                        .await?;
+                        let remaining = limits.tool_result_bytes - result_bytes;
+                        let bytes = encoded_size(&result, remaining)?;
+                        validate_output(call, &result, &outputs)?;
+                        result_bytes += bytes;
+                        results.push(result);
+                    }
+                    results
+                };
+                executed_tools += results.len();
                 conversation.submit_tool_results(results)?;
                 cooperate(cx, cancellation, deadline).await?;
             }
@@ -347,19 +407,32 @@ fn deadline(
     cancellation: &McpRequestCancellation,
     timeout: Duration,
 ) -> Result<Time, SamplingRunError> {
-    check(cx, cancellation, Time::from_nanos(u64::MAX))?;
-    if cx.timer_driver().is_none() {
+    with_caller(cx, || {
+        check(cx, cancellation, Time::from_nanos(u64::MAX))?;
+        require_timer(cx)?;
+        let nanos =
+            u64::try_from(timeout.as_nanos()).map_err(|_| SamplingRunError::InvalidLimits)?;
+        let end = cx
+            .now()
+            .as_nanos()
+            .checked_add(nanos)
+            .ok_or(SamplingRunError::InvalidLimits)?;
+        let deadline = Time::from_nanos(end);
+        check(cx, cancellation, deadline)?;
+        Ok(deadline)
+    })
+}
+
+// Called inside with_caller, before any timer registration or host effect.
+// Possession of a driver is not permission to use it. Never fall back to a
+// different runtime when the effective caller cannot drive a bounded wait.
+fn require_timer(cx: &Cx) -> Result<(), SamplingRunError> {
+    if cx.timer_driver().is_none()
+        || !Cx::current().is_some_and(|active| active.capabilities().time)
+    {
         return Err(SamplingRunError::RuntimeUnavailable);
     }
-    let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| SamplingRunError::InvalidLimits)?;
-    let end = cx
-        .now()
-        .as_nanos()
-        .checked_add(nanos)
-        .ok_or(SamplingRunError::InvalidLimits)?;
-    let deadline = Time::from_nanos(end);
-    check(cx, cancellation, deadline)?;
-    Ok(deadline)
+    Ok(())
 }
 
 fn check(
@@ -403,19 +476,21 @@ async fn within<T>(
     let mut caller_cancelled = std::pin::pin!(receiver.recv(cx));
     let mut future = std::pin::pin!(future);
     poll_fn(|task| {
-        let _caller = Cx::set_current(Some(cx.clone()));
-        check(cx, cancellation, deadline)?;
-        if cancelled.as_mut().poll(task).is_ready()
-            || caller_cancelled.as_mut().poll(task).is_ready()
-        {
-            return Poll::Ready(Err(SamplingRunError::Cancelled));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(SamplingRunError::TimedOut));
-        }
-        let result = future.as_mut().poll(task);
-        check(cx, cancellation, deadline)?;
-        result
+        with_caller(cx, || {
+            check(cx, cancellation, deadline)?;
+            require_timer(cx)?;
+            if cancelled.as_mut().poll(task).is_ready()
+                || caller_cancelled.as_mut().poll(task).is_ready()
+            {
+                return Poll::Ready(Err(SamplingRunError::Cancelled));
+            }
+            if sleep.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(SamplingRunError::TimedOut));
+            }
+            let result = future.as_mut().poll(task);
+            check(cx, cancellation, deadline)?;
+            result
+        })
     })
     .await
 }
@@ -442,3 +517,6 @@ async fn cooperate(
     )
     .await
 }
+
+#[cfg(test)]
+mod authority;

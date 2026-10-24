@@ -10,13 +10,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Instant;
 
+use crate::http_auth::managed::OAuthSessionPolicy;
+use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+use crate::{ClientProtocolPlan, ReverseRequestHandlers};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder};
-use crate::http_auth::managed::OAuthSessionPolicy;
-use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
-use crate::{ClientProtocolPlan, ReverseRequestHandlers};
 use fastmcp_core::McpError;
 use fastmcp_protocol::{FINAL_PROTOCOL_VERSION, FinalCoreResult};
 use serde_json::json;
@@ -27,25 +27,43 @@ const LEAF: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIBjjCCATSgAwIBAgICA+owCgYIK
 const KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgcCe44IBKhbw+D/s7\nBjDHOOV0g+EoxFno7VJGKhJeer2hRANCAATzyspS52vVaVgJabIRwYUrEBzTr9wW\nhBl+B0gYR4gVXpdHHvqnxxdeTtE+t2Zae07cZTHRGPqz6YIqEhQ0FWnY\n-----END PRIVATE KEY-----\n";
 type TlsStream = asupersync::tls::TlsStream<TcpStream>;
 
-fn url(value: &str) -> CanonicalHttpUrl { CanonicalHttpUrl::parse(value).unwrap() }
-fn root() -> Certificate { Certificate::from_pem(ROOT).unwrap().remove(0) }
+fn url(value: &str) -> CanonicalHttpUrl {
+    CanonicalHttpUrl::parse(value).unwrap()
+}
+fn root() -> Certificate {
+    Certificate::from_pem(ROOT).unwrap().remove(0)
+}
 
 fn builder(resource: CanonicalHttpUrl) -> ClientBuilder {
-    ClientBuilder::new().protocol_plan(ClientProtocolPlan::http(
-        ProtocolPolicy::ModernOnly, Some(resource), None, None,
-        "managed-test-owner".into(), "managed-test-trust".into(), "native-http".into(),
-        0, 0, 0,
-    ).unwrap())
+    ClientBuilder::new().protocol_plan(
+        ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(resource),
+            None,
+            None,
+            "managed-test-owner".into(),
+            "managed-test-trust".into(),
+            "native-http".into(),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    )
 }
 
 fn run(future: impl Future<Output = ()>) {
-    RuntimeBuilder::current_thread().with_reactor(create_reactor().unwrap())
-        .blocking_threads(0, 8).build().unwrap().block_on(async {
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .blocking_threads(0, 8)
+        .build()
+        .unwrap()
+        .block_on(async {
             let cx = Cx::current().unwrap();
             // A fixture runaway guard, not a protocol latency assertion.
-            asupersync::time::timeout_at(
-                cx.now().saturating_add_nanos(120_000_000_000), future,
-            ).await.expect("managed HTTP fixture must settle");
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(120_000_000_000), future)
+                .await
+                .expect("managed HTTP fixture must settle");
         });
 }
 
@@ -56,22 +74,33 @@ async fn pair<L: Future, R: Future>(left: L, right: R) -> (L::Output, R::Output)
     let mut r = None;
     poll_fn(|cx| {
         if l.is_none() {
-            if let Poll::Ready(value) = left.as_mut().poll(cx) { l = Some(value); }
+            if let Poll::Ready(value) = left.as_mut().poll(cx) {
+                l = Some(value);
+            }
         }
         if r.is_none() {
-            if let Poll::Ready(value) = right.as_mut().poll(cx) { r = Some(value); }
+            if let Poll::Ready(value) = right.as_mut().poll(cx) {
+                r = Some(value);
+            }
         }
         if l.is_some() && r.is_some() {
             Poll::Ready((l.take().unwrap(), r.take().unwrap()))
-        } else { Poll::Pending }
-    }).await
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 fn encode(text: &str) -> String {
-    text.bytes().map(|byte| match byte {
-        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => char::from(byte).to_string(),
-        byte => format!("%{byte:02X}"),
-    }).collect()
+    text.bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                char::from(byte).to_string()
+            }
+            byte => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 fn decode(text: &str) -> String {
@@ -106,9 +135,17 @@ async fn callback(authorization: CanonicalHttpUrl, issuer: String) -> Result<(),
     let redirect = url(&fields["redirect_uri"]);
     // Owned: TcpStream::connect is `A: ToSocketAddrs + Send + 'static`, so a
     // borrow of the local `redirect` cannot satisfy it (E0597).
-    let authority = redirect.as_str().strip_prefix("http://").unwrap()
-        .split('/').next().unwrap().to_owned();
-    let mut stream = TcpStream::connect(authority.clone()).await.map_err(|_| OAuthError::TransportFailed)?;
+    let authority = redirect
+        .as_str()
+        .strip_prefix("http://")
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut stream = TcpStream::connect(authority.clone())
+        .await
+        .map_err(|_| OAuthError::TransportFailed)?;
     stream.write_all(format!(
         "GET /oauth/callback?code=fixture-code&state={}&iss={} HTTP/1.1\r\nHost: {authority}\r\n\r\n",
         encode(&fields["state"]), encode(&issuer),
@@ -130,7 +167,9 @@ async fn read<IO: AsyncRead + Unpin>(stream: &mut IO) -> Request {
         let count = stream.read(&mut buffer).await.unwrap();
         assert!(count > 0 && wire.len() + count <= 128 * 1024);
         wire.extend_from_slice(&buffer[..count]);
-        if let Some(at) = wire.windows(4).position(|b| b == b"\r\n\r\n") { break at + 4; }
+        if let Some(at) = wire.windows(4).position(|b| b == b"\r\n\r\n") {
+            break at + 4;
+        }
     };
     let head = std::str::from_utf8(&wire[..end]).unwrap();
     let mut lines = head.split("\r\n");
@@ -141,7 +180,11 @@ async fn read<IO: AsyncRead + Unpin>(stream: &mut IO) -> Request {
     let mut headers = BTreeMap::new();
     for line in lines.filter(|line| !line.is_empty()) {
         let (name, value) = line.split_once(':').unwrap();
-        assert!(headers.insert(name.to_ascii_lowercase(), value.trim().to_owned()).is_none());
+        assert!(
+            headers
+                .insert(name.to_ascii_lowercase(), value.trim().to_owned())
+                .is_none()
+        );
     }
     let length = headers["content-length"].parse::<usize>().unwrap();
     assert!(end + length <= 128 * 1024);
@@ -151,7 +194,11 @@ async fn read<IO: AsyncRead + Unpin>(stream: &mut IO) -> Request {
         wire.extend_from_slice(&buffer[..count]);
     }
     assert_eq!(wire.len(), end + length);
-    Request { target, headers, body: wire[end..].to_vec() }
+    Request {
+        target,
+        headers,
+        body: wire[end..].to_vec(),
+    }
 }
 
 async fn reply(stream: &mut TlsStream, status: u16, value: Value) {
@@ -164,21 +211,34 @@ async fn reply(stream: &mut TlsStream, status: u16, value: Value) {
     stream.shutdown().await.unwrap();
 }
 
-struct Peer { listener: TcpListener, tls: TlsAcceptor }
+struct Peer {
+    listener: TcpListener,
+    tls: TlsAcceptor,
+}
 
 impl Peer {
     async fn new() -> Self {
         Self {
             listener: TcpListener::bind("127.0.0.1:0").await.unwrap(),
             tls: TlsAcceptorBuilder::new(
-                CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap(),
-            ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap(),
+                CertificateChain::from_pem(LEAF).unwrap(),
+                PrivateKey::from_pem(KEY).unwrap(),
+            )
+            .alpn_protocols(vec![b"http/1.1".to_vec()])
+            .build()
+            .unwrap(),
         }
     }
-    fn origin(&self) -> String { format!("https://{}", self.listener.local_addr().unwrap()) }
-    fn resource(&self) -> CanonicalHttpUrl { url(&format!("{}/mcp", self.origin())) }
+    fn origin(&self) -> String {
+        format!("https://{}", self.listener.local_addr().unwrap())
+    }
+    fn resource(&self) -> CanonicalHttpUrl {
+        url(&format!("{}/mcp", self.origin()))
+    }
     fn client_builder(&self) -> ClientBuilder {
-        builder(self.resource()).http_resource_root_certificate(self.resource(), root()).unwrap()
+        builder(self.resource())
+            .http_resource_root_certificate(self.resource(), root())
+            .unwrap()
     }
     async fn next(&self) -> (TlsStream, Request) {
         let (tcp, _) = self.listener.accept().await.unwrap();
@@ -206,38 +266,78 @@ impl Peer {
         reply(&mut stream, 200, token_result(second)).await;
     }
     async fn login(&self, cx: &Cx) -> ManagedOAuthSession {
-        let client = OAuthClient::new(OAuthClientConfiguration::from_trusted_endpoints(
-            self.origin(), url(&format!("{}/authorize", self.origin())),
-            url(&format!("{}/token", self.origin())), self.resource(),
-            "native-client", vec!["read".into(), "write".into()],
-        ).unwrap().with_extra_root_certificate(root()).unwrap()
-            .with_authorization_timeout(Duration::from_secs(90)).unwrap());
-        let (session, ()) = pair(
-            ManagedOAuthSession::authorize(cx, client, OAuthSessionPolicy::default(),
-                |authorization| callback(authorization, self.origin())),
+        let client = OAuthClient::new(
+            OAuthClientConfiguration::from_trusted_endpoints(
+                self.origin(),
+                url(&format!("{}/authorize", self.origin())),
+                url(&format!("{}/token", self.origin())),
+                self.resource(),
+                "native-client",
+                vec!["read".into(), "write".into()],
+            )
+            .unwrap()
+            .with_extra_root_certificate(root())
+            .unwrap()
+            .with_authorization_timeout(Duration::from_secs(90))
+            .unwrap(),
+        );
+        // Boxed in the fixture that owns it: this `pair` is the root for all
+        // thirteen `peer.login(&cx)` await sites in this module, so one box
+        // here removes the bytes instead of relocating them thirteen times.
+        // Same fix as the sibling fixture in tests/managed_http_client.rs.
+        let (session, ()) = Box::pin(pair(
+            ManagedOAuthSession::authorize(
+                cx,
+                client,
+                OAuthSessionPolicy::default(),
+                |authorization| callback(authorization, self.origin()),
+            ),
             self.token("authorization_code", false),
-        ).await;
+        ))
+        .await;
         session.unwrap()
     }
-    async fn mcp_request(&self, method: &str, token: &str) -> (TlsStream, Value, BTreeMap<String, String>) {
+    async fn mcp_request(
+        &self,
+        method: &str,
+        token: &str,
+    ) -> (TlsStream, Value, BTreeMap<String, String>) {
         let (stream, request) = self.next().await;
         assert_eq!(request.target, "/mcp");
         assert_eq!(request.headers["authorization"], format!("Bearer {token}"));
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["method"], method);
-        assert_eq!(body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], FINAL_PROTOCOL_VERSION);
+        assert_eq!(
+            body["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            FINAL_PROTOCOL_VERSION
+        );
         (stream, body, request.headers)
     }
     async fn mcp(&self, method: &str, token: &str, result: Value) {
         let (mut stream, body, _) = self.mcp_request(method, token).await;
-        reply(&mut stream, 200, json!({"jsonrpc":"2.0","id":body["id"],"result":result})).await;
+        reply(
+            &mut stream,
+            200,
+            json!({"jsonrpc":"2.0","id":body["id"],"result":result}),
+        )
+        .await;
     }
-    async fn discovery(&self, token: &str) { self.mcp("server/discover", token, discovery()).await; }
-    async fn catalog(&self, token: &str, name: &str) { self.mcp("tools/list", token, catalog(name)).await; }
+    async fn discovery(&self, token: &str) {
+        self.mcp("server/discover", token, discovery()).await;
+    }
+    async fn catalog(&self, token: &str, name: &str) {
+        self.mcp("tools/list", token, catalog(name)).await;
+    }
     async fn no_more(&self, cx: &Cx) {
-        assert!(asupersync::time::timeout_at(
-            cx.now().saturating_add_nanos(100_000_000), self.listener.accept(),
-        ).await.is_err(), "unexpected discovery, refresh, or replay");
+        assert!(
+            asupersync::time::timeout_at(
+                cx.now().saturating_add_nanos(100_000_000),
+                self.listener.accept(),
+            )
+            .await
+            .is_err(),
+            "unexpected discovery, refresh, or replay"
+        );
     }
 }
 
@@ -279,16 +379,29 @@ async fn warmup(cx: &Cx, peer: &Peer, client: &mut ManagedHttpClient) {
     let (listed, ()) = pair(client.list_tools(cx, None), async {
         peer.discovery("access-one").await;
         peer.catalog("access-one", "lookup").await;
-    }).await;
+    })
+    .await;
     assert_catalog(listed.unwrap(), "lookup");
 }
 
 #[test]
 fn policy_is_modern_only_exact_resource_and_finite_before_any_io() {
     let resource = url("https://resource.example/mcp");
-    assert!(admit_builder(&builder(resource.clone()), &resource, Duration::from_secs(30)).is_ok());
+    assert!(
+        admit_builder(
+            &builder(resource.clone()),
+            &resource,
+            Duration::from_secs(30)
+        )
+        .is_ok()
+    );
     assert!(admit_builder(&ClientBuilder::new(), &resource, Duration::from_secs(30)).is_err());
-    for target in ["https://other.example/mcp", "https://resource.example/other", "https://resource.example/mcp?q=1", "http://127.0.0.1/mcp"] {
+    for target in [
+        "https://other.example/mcp",
+        "https://resource.example/other",
+        "https://resource.example/mcp?q=1",
+        "http://127.0.0.1/mcp",
+    ] {
         assert!(admit_builder(&builder(url(target)), &resource, Duration::from_secs(30)).is_err());
     }
     for timeout in [Duration::ZERO, Duration::from_secs(901)] {
@@ -298,33 +411,55 @@ fn policy_is_modern_only_exact_resource_and_finite_before_any_io() {
 
 #[test]
 fn diagnostics_keep_protocol_code_without_peer_messages_or_payloads() {
-    let error = request_error(HttpClientError::CoreResult(McpError::invalid_request("secret-canary")));
-    assert!(matches!(error, ManagedHttpClientError::Request { code: Some(McpErrorCode::InvalidRequest) }));
+    let error = request_error(HttpClientError::CoreResult(McpError::invalid_request(
+        "secret-canary",
+    )));
+    assert!(matches!(
+        error,
+        ManagedHttpClientError::Request {
+            code: Some(McpErrorCode::InvalidRequest)
+        }
+    ));
     assert!(!format!("{error:?} {error}").contains("secret-canary"));
-    let error = ManagedHttpClientError::Session(OAuthSessionError::OAuth(OAuthError::TokenEndpointRejected));
+    let error = ManagedHttpClientError::Session(OAuthSessionError::OAuth(
+        OAuthError::TokenEndpointRejected,
+    ));
     assert_eq!(format!("{error:?}"), "ManagedHttpClientError::Session(..)");
 }
 
 #[test]
 fn high_level_calls_reuse_one_grant_then_renew_and_discard_the_old_catalog() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         warmup(&cx, &peer, &mut client).await;
         assert_eq!(client.cached_credential_generation(), Some(1));
-        let (called, ()) = pair(client.call_tool(&cx, "lookup", json!({})),
-            peer.mcp("tools/call", "access-one", complete())).await;
+        let (called, ()) = pair(
+            client.call_tool(&cx, "lookup", json!({})),
+            peer.mcp("tools/call", "access-one", complete()),
+        )
+        .await;
         assert!(called.is_ok()); // No second discovery while the grant is unchanged.
         force_renewal(&session);
         let (listed, ()) = pair(client.list_tools(&cx, None), async {
             peer.token("refresh_token", true).await;
             peer.discovery("access-two").await;
             peer.catalog("access-two", "narrowed-catalog").await;
-        }).await;
+        })
+        .await;
         assert_catalog(listed.unwrap(), "narrowed-catalog");
         assert_eq!(client.cached_credential_generation(), Some(2));
-        assert_eq!(session.credential(&cx).await.unwrap().scopes(), &["read".to_owned()]);
+        assert_eq!(
+            session.credential(&cx).await.unwrap().scopes(),
+            &["read".to_owned()]
+        );
         peer.no_more(&cx).await;
     });
 }
@@ -332,31 +467,49 @@ fn high_level_calls_reuse_one_grant_then_renew_and_discard_the_old_catalog() {
 #[test]
 fn stale_catalog_cursor_cannot_cross_a_credential_generation() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
-        assert!(matches!(client.list_tools(&cx, Some("unbound-cursor")).await,
-            Err(ManagedHttpClientError::CatalogGenerationChanged)));
-        let mut page = catalog("lookup"); page["nextCursor"] = json!("generation-one-page");
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.list_tools(&cx, Some("unbound-cursor")).await,
+            Err(ManagedHttpClientError::CatalogGenerationChanged)
+        ));
+        let mut page = catalog("lookup");
+        page["nextCursor"] = json!("generation-one-page");
         let (listed, ()) = pair(client.list_tools(&cx, None), async {
             peer.discovery("access-one").await;
             peer.mcp("tools/list", "access-one", page).await;
-        }).await;
-        let CoreResult::Final(FinalCoreResult::ToolsList { result: page, .. }) = listed.unwrap() else {
+        })
+        .await;
+        let CoreResult::Final(FinalCoreResult::ToolsList { result: page, .. }) = listed.unwrap()
+        else {
             panic!("expected a tools catalog");
         };
         let cursor = page.payload.next_cursor.unwrap();
         assert_ne!(cursor, "generation-one-page");
         force_renewal(&session);
-        let (result, ()) = pair(client.list_tools(&cx, Some(&cursor)),
-            peer.token("refresh_token", true)).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::CatalogGenerationChanged)));
+        let (result, ()) = pair(
+            client.list_tools(&cx, Some(&cursor)),
+            peer.token("refresh_token", true),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::CatalogGenerationChanged)
+        ));
         assert_eq!(client.cached_credential_generation(), None);
         peer.no_more(&cx).await; // Neither discovery nor the stale cursor is sent.
         let (fresh, ()) = pair(client.list_tools(&cx, None), async {
             peer.discovery("access-two").await;
             peer.catalog("access-two", "fresh").await;
-        }).await;
+        })
+        .await;
         assert_catalog(fresh.unwrap(), "fresh");
     });
 }
@@ -367,7 +520,12 @@ fn unrelated_renewal_and_reissued_wire_cursors_do_not_revive_old_handles() {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         let first_page = || {
             let mut page = catalog("lookup");
             page["nextCursor"] = json!("same-wire-cursor");
@@ -376,7 +534,8 @@ fn unrelated_renewal_and_reissued_wire_cursors_do_not_revive_old_handles() {
         let (first, ()) = pair(client.list_tools(&cx, None), async {
             peer.discovery("access-one").await;
             peer.mcp("tools/list", "access-one", first_page()).await;
-        }).await;
+        })
+        .await;
         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = first.unwrap() else {
             panic!("expected first page");
         };
@@ -386,37 +545,55 @@ fn unrelated_renewal_and_reissued_wire_cursors_do_not_revive_old_handles() {
             peer.token("refresh_token", true).await;
             peer.discovery("access-two").await;
             peer.mcp("tools/call", "access-two", complete()).await;
-        }).await;
+        })
+        .await;
         assert!(called.is_ok());
         assert_eq!(client.cached_credential_generation(), Some(2));
         // This was the bypass: current connection == current token generation,
         // but this cursor came from the connection that renewal discarded.
-        assert!(matches!(client.list_tools(&cx, Some(&old)).await,
-            Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        assert!(matches!(
+            client.list_tools(&cx, Some(&old)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)
+        ));
         peer.no_more(&cx).await;
 
-        let (next, ()) = pair(client.list_tools(&cx, None),
-            peer.mcp("tools/list", "access-two", first_page())).await;
+        let (next, ()) = pair(
+            client.list_tools(&cx, None),
+            peer.mcp("tools/list", "access-two", first_page()),
+        )
+        .await;
         let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = next.unwrap() else {
             panic!("expected renewed first page");
         };
         let current = result.payload.next_cursor.unwrap();
         assert_ne!(old, current);
         for rejected in [old.as_str(), "same-wire-cursor"] {
-            assert!(matches!(client.list_tools(&cx, Some(rejected)).await,
-                Err(ManagedHttpClientError::InvalidCatalogCursor)));
+            assert!(matches!(
+                client.list_tools(&cx, Some(rejected)).await,
+                Err(ManagedHttpClientError::InvalidCatalogCursor)
+            ));
         }
-        assert!(matches!(client.list_prompts(&cx, Some(&current)).await,
-            Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        assert!(matches!(
+            client.list_prompts(&cx, Some(&current)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)
+        ));
         peer.no_more(&cx).await;
         let (last, ()) = pair(client.list_tools(&cx, Some(&current)), async {
             let (mut stream, body, _) = peer.mcp_request("tools/list", "access-two").await;
             assert_eq!(body["params"]["cursor"], "same-wire-cursor");
-            reply(&mut stream, 200, json!({"jsonrpc":"2.0","id":body["id"],"result":catalog("last")})).await;
-        }).await;
+            reply(
+                &mut stream,
+                200,
+                json!({"jsonrpc":"2.0","id":body["id"],"result":catalog("last")}),
+            )
+            .await;
+        })
+        .await;
         assert_catalog(last.unwrap(), "last");
-        assert!(matches!(client.list_tools(&cx, Some(&current)).await,
-            Err(ManagedHttpClientError::InvalidCatalogCursor)));
+        assert!(matches!(
+            client.list_tools(&cx, Some(&current)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)
+        ));
         peer.no_more(&cx).await;
     });
 }
@@ -424,9 +601,15 @@ fn unrelated_renewal_and_reissued_wire_cursors_do_not_revive_old_handles() {
 #[test]
 fn request_cancellation_discards_connection_without_cancelling_the_shared_login() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         warmup(&cx, &peer, &mut client).await;
         let cancellation = McpRequestCancellation::new();
         let (result, held_socket) = pair(
@@ -436,8 +619,14 @@ fn request_cancellation_discards_connection_without_cancelling_the_shared_login(
                 cancellation.cancel();
                 stream // Retain the silent socket, so EOF cannot cause the failure.
             },
-        ).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))));
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::Cancelled
+            ))
+        ));
         assert_eq!(client.cached_credential_generation(), None);
         assert!(cx.checkpoint().is_ok());
         assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
@@ -450,15 +639,30 @@ fn request_cancellation_discards_connection_without_cancelling_the_shared_login(
 #[test]
 fn unauthorized_response_never_refreshes_or_replays_the_failed_tool() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         warmup(&cx, &peer, &mut client).await;
         let (result, ()) = pair(client.call_tool(&cx, "lookup", json!({})), async {
             let (mut stream, _, _) = peer.mcp_request("tools/call", "access-one").await;
-            reply(&mut stream, 401, json!({"error":"invalid_token","message":"access-one"})).await;
-        }).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Request { .. })));
+            reply(
+                &mut stream,
+                401,
+                json!({"error":"invalid_token","message":"access-one"}),
+            )
+            .await;
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Request { .. })
+        ));
         assert!(!format!("{result:?}").contains("access-one"));
         assert_eq!(client.cached_credential_generation(), None);
         assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
@@ -467,22 +671,224 @@ fn unauthorized_response_never_refreshes_or_replays_the_failed_tool() {
 }
 
 #[test]
-fn closing_the_shared_session_in_a_reverse_handler_prevents_a_continuation() {
+fn credential_revoked_during_tls_setup_cannot_become_an_anonymous_post() {
+    for revoke in [false, true] {
+        run(async {
+            use crate::http_executor::{
+                ClientHttpConnectionError, ModernHttpClientError, ModernHttpExecutorError,
+            };
+
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let credential =
+                crate::http_auth::BoundBearerCredential::bind(peer.resource(), "setup-token")
+                    .unwrap();
+            let (result, ()) = Box::pin(pair(
+                peer.client_builder()
+                    .http_bearer_credential(credential.clone())
+                    .connect_http_with_cx(&cx),
+                async {
+                    let (tcp, _) = peer.listener.accept().await.unwrap();
+                    if revoke {
+                        credential.revoke();
+                    }
+                    let mut tls = peer.tls.accept(tcp).await.unwrap();
+                    if revoke {
+                        let mut byte = [0_u8; 1];
+                        match tls.read(&mut byte).await {
+                            Ok(0) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {}
+                            other => panic!("revoked setup must write no HTTP byte: {other:?}"),
+                        }
+                    } else {
+                        let request = read(&mut tls).await;
+                        assert_eq!(request.headers["authorization"], "Bearer setup-token");
+                        let body: Value = serde_json::from_slice(&request.body).unwrap();
+                        assert_eq!(body["method"], "server/discover");
+                        reply(
+                            &mut tls,
+                            200,
+                            json!({"jsonrpc":"2.0","id":body["id"],"result":discovery()}),
+                        )
+                        .await;
+                    }
+                },
+            ))
+            .await;
+            if revoke {
+                assert!(matches!(
+                    result,
+                    Err(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::Executor(
+                            ModernHttpExecutorError::CredentialUnavailable
+                        )
+                    ))
+                ));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert!(cx.checkpoint().is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn owned_http_dispatch_retains_the_local_credential_terminal_reason() {
+    for revoke in [false, true] {
+        run(async {
+            use crate::http_executor::{
+                ClientHttpConnection, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
+                ModernHttpFinalCoreListenError,
+            };
+            use crate::{ExecutionTerminalReason, RequestTimeoutPolicy};
+            use fastmcp_protocol::RequestId;
+
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let credential = session.credential(&cx).await.unwrap().credential().clone();
+            let (connected, ()) = Box::pin(pair(
+                peer.client_builder()
+                    .http_bearer_credential(credential.clone())
+                    .connect_http_with_cx(&cx),
+                peer.discovery("access-one"),
+            ))
+            .await;
+            let ClientHttpConnection::Modern(client) = connected.unwrap() else {
+                panic!("the authenticated client must select modern HTTP");
+            };
+            let mut execution = client
+                .execute_core(
+                    &cx,
+                    "tools/call",
+                    json!({"name":"lookup","arguments":{}}),
+                    RequestId::Number(41),
+                    crate::sse::SseLimits::new(4096, 16384, 16).unwrap(),
+                    RequestTimeoutPolicy::default(),
+                )
+                .unwrap();
+            let control = execution.control();
+            if revoke {
+                credential.revoke();
+                assert!(matches!(
+                    execution.next_event(&cx).await,
+                    Err(ModernHttpFinalCoreListenError::Executor(
+                        ModernHttpExecutorError::CredentialUnavailable
+                    ))
+                ));
+                assert_eq!(
+                    control.terminal_reason(),
+                    Some(ExecutionTerminalReason::CredentialUnavailable)
+                );
+            } else {
+                let (event, ()) = pair(
+                    execution.next_event(&cx),
+                    peer.mcp("tools/call", "access-one", complete()),
+                )
+                .await;
+                assert!(matches!(
+                    event,
+                    Ok(Some(ModernHttpFinalCoreEvent::Terminal(_)))
+                ));
+                assert_eq!(
+                    control.terminal_reason(),
+                    Some(ExecutionTerminalReason::FinalResponse)
+                );
+            }
+            assert!(control.is_terminal_nonblocking());
+            assert!(control.take_cancellation_event().is_none());
+            assert!(!session.inner.closed.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn keeping_the_shared_session_open_in_a_reverse_handler_allows_a_continuation() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
         let callbacks = Arc::new(AtomicUsize::new(0));
-        let called = callbacks.clone(); let owner = session.clone();
+        let called = callbacks.clone();
+        let owner = session.clone();
         let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
-            called.fetch_add(1, Ordering::SeqCst); owner.close();
+            called.fetch_add(1, Ordering::SeqCst);
+            assert!(!owner.inner.closed.is_cancel_requested());
             Box::pin(async { Ok(serde_json::from_value(json!({"roots":[]})).unwrap()) })
         });
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder().reverse_request_handlers(handlers), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder().reverse_request_handlers(handlers),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         let (result, ()) = pair(client.call_tool(&cx, "lookup", json!({})), async {
             peer.discovery("access-one").await;
             peer.mcp("tools/call", "access-one", input_required()).await;
-        }).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))));
+            let (mut stream, body, _) = peer.mcp_request("tools/call", "access-one").await;
+            assert_eq!(body["params"]["requestState"], "bound-state");
+            assert_eq!(
+                body["params"]["inputResponses"],
+                json!({"roots":{"roots":[]}})
+            );
+            reply(
+                &mut stream,
+                200,
+                json!({"jsonrpc":"2.0","id":body["id"],"result":complete()}),
+            )
+            .await;
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(client.cached_credential_generation(), Some(1));
+        assert!(!session.inner.closed.is_cancel_requested());
+        let mut sibling =
+            ManagedHttpClient::new(session, peer.client_builder(), Duration::from_secs(30))
+                .unwrap();
+        let (result, ()) = pair(sibling.call_tool(&cx, "lookup", json!({})), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/call", "access-one", complete()).await;
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(sibling.cached_credential_generation(), Some(1));
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
+fn closing_the_shared_session_in_a_reverse_handler_prevents_a_continuation() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let called = callbacks.clone();
+        let owner = session.clone();
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
+            called.fetch_add(1, Ordering::SeqCst);
+            owner.close();
+            Box::pin(async { Ok(serde_json::from_value(json!({"roots":[]})).unwrap()) })
+        });
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder().reverse_request_handlers(handlers),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (result, ()) = pair(client.call_tool(&cx, "lookup", json!({})), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/call", "access-one", input_required()).await;
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+        ));
         assert_eq!(callbacks.load(Ordering::SeqCst), 1);
         assert_eq!(client.cached_credential_generation(), None);
         peer.no_more(&cx).await;
@@ -492,9 +898,12 @@ fn closing_the_shared_session_in_a_reverse_handler_prevents_a_continuation() {
 #[test]
 fn quiet_response_is_bounded_by_the_whole_operation_deadline() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session, peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client =
+            ManagedHttpClient::new(session, peer.client_builder(), Duration::from_secs(30))
+                .unwrap();
         warmup(&cx, &peer, &mut client).await;
         client.operation_timeout = Duration::from_secs(2);
         let (result, held_socket) = pair(client.call_tool(&cx, "lookup", json!({})), async {
@@ -502,7 +911,10 @@ fn quiet_response_is_bounded_by_the_whole_operation_deadline() {
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{").await.unwrap();
             stream
         }).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))));
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::TimedOut))
+        ));
         assert_eq!(client.cached_credential_generation(), None);
         drop(held_socket);
         peer.no_more(&cx).await;
@@ -512,15 +924,31 @@ fn quiet_response_is_bounded_by_the_whole_operation_deadline() {
 #[test]
 fn independent_high_level_clients_share_one_refresh_exchange() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut first = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
-        let mut second = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut first = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut second = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         force_renewal(&session);
-        let ((a, b), (refreshes, discoveries, calls)) = pair(
-            pair(first.call_tool(&cx, "lookup", json!({"caller":1})), second.call_tool(&cx, "lookup", json!({"caller":2}))),
+        let ((a, b), (refreshes, discoveries, calls)) = Box::pin(pair(
+            pair(
+                first.call_tool(&cx, "lookup", json!({"caller":1})),
+                second.call_tool(&cx, "lookup", json!({"caller":2})),
+            ),
             async {
-                let mut refreshes = 0; let mut discoveries = 0; let mut calls = 0;
+                let mut refreshes = 0;
+                let mut discoveries = 0;
+                let mut calls = 0;
                 for _ in 0..5 {
                     let (mut stream, request) = peer.next().await;
                     if request.target == "/token" {
@@ -535,16 +963,28 @@ fn independent_high_level_clients_share_one_refresh_exchange() {
                         assert_eq!(request.headers["authorization"], "Bearer access-two");
                         let body: Value = serde_json::from_slice(&request.body).unwrap();
                         let result = match body["method"].as_str().unwrap() {
-                            "server/discover" => { discoveries += 1; discovery() }
-                            "tools/call" => { calls += 1; complete() }
+                            "server/discover" => {
+                                discoveries += 1;
+                                discovery()
+                            }
+                            "tools/call" => {
+                                calls += 1;
+                                complete()
+                            }
                             _ => panic!("unexpected operation"),
                         };
-                        reply(&mut stream, 200, json!({"jsonrpc":"2.0","id":body["id"],"result":result})).await;
+                        reply(
+                            &mut stream,
+                            200,
+                            json!({"jsonrpc":"2.0","id":body["id"],"result":result}),
+                        )
+                        .await;
                     }
                 }
                 (refreshes, discoveries, calls)
             },
-        ).await;
+        ))
+        .await;
         assert!(a.is_ok() && b.is_ok());
         assert_eq!((refreshes, discoveries, calls), (1, 2, 2));
         assert_eq!(first.cached_credential_generation(), Some(2));
@@ -556,60 +996,233 @@ fn independent_high_level_clients_share_one_refresh_exchange() {
 #[test]
 fn reviewed_header_repair_and_mrtr_stay_on_the_original_grant() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let owner = session.clone(); let callbacks = Arc::new(AtomicUsize::new(0));
+        let owner = session.clone();
+        let callbacks = Arc::new(AtomicUsize::new(0));
         let count = callbacks.clone();
         let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, _, _| {
             count.fetch_add(1, Ordering::SeqCst);
             force_renewal(&owner); // Becoming due must not rotate an active exchange.
             Box::pin(async { Ok(serde_json::from_value(json!({"roots":[]})).unwrap()) })
         });
-        let schema = |field: &str| json!({"type":"object","properties":{
-            "region":{"type":"string","x-mcp-header":field}}});
-        let reviewed = ReviewedToolHeaders::new(peer.resource(), "lookup", schema("Old"), |_| true).unwrap();
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder().reverse_request_handlers(handlers), Duration::from_secs(30)).unwrap();
-        let (result, ()) = pair(client.call_tool_with_reviewed_headers(&cx, json!({"region":"east"}), &reviewed, &|_| true), async {
-            peer.discovery("access-one").await;
-            let (mut stream, body, headers) = peer.mcp_request("tools/call", "access-one").await;
-            assert_eq!(headers["mcp-param-old"], "east");
-            reply(&mut stream, 400, json!({"jsonrpc":"2.0","id":body["id"],"error":{
+        let schema = |field: &str| {
+            json!({"type":"object","properties":{
+            "region":{"type":"string","x-mcp-header":field}}})
+        };
+        let reviewed =
+            ReviewedToolHeaders::new(peer.resource(), "lookup", schema("Old"), |_| true).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder().reverse_request_handlers(handlers),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let (result, ()) = pair(
+            client.call_tool_with_reviewed_headers(
+                &cx,
+                json!({"region":"east"}),
+                &reviewed,
+                &|_| true,
+            ),
+            async {
+                peer.discovery("access-one").await;
+                let (mut stream, body, headers) =
+                    peer.mcp_request("tools/call", "access-one").await;
+                assert_eq!(headers["mcp-param-old"], "east");
+                reply(
+                    &mut stream,
+                    400,
+                    json!({"jsonrpc":"2.0","id":body["id"],"error":{
                 "code":fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE,
-                "message":fastmcp_protocol::HEADER_MISMATCH_MESSAGE}})).await;
-            peer.mcp("tools/list", "access-one", json!({"resultType":"complete","ttlMs":0,"cacheScope":"private",
-                "tools":[{"name":"lookup","inputSchema":schema("Region")}]})).await;
-            for result in [input_required(), complete()] {
-                let (mut stream, body, headers) = peer.mcp_request("tools/call", "access-one").await;
-                assert_eq!(headers["mcp-param-region"], "east");
-                assert!(!headers.contains_key("mcp-param-old"));
-                reply(&mut stream, 200, json!({"jsonrpc":"2.0","id":body["id"],"result":result})).await;
-            }
-        }).await;
-        assert!(result.is_ok()); assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+                "message":fastmcp_protocol::HEADER_MISMATCH_MESSAGE}}),
+                )
+                .await;
+                peer.mcp(
+                    "tools/list",
+                    "access-one",
+                    json!({"resultType":"complete","ttlMs":0,"cacheScope":"private",
+                "tools":[{"name":"lookup","inputSchema":schema("Region")}]}),
+                )
+                .await;
+                for result in [input_required(), complete()] {
+                    let (mut stream, body, headers) =
+                        peer.mcp_request("tools/call", "access-one").await;
+                    assert_eq!(headers["mcp-param-region"], "east");
+                    assert!(!headers.contains_key("mcp-param-old"));
+                    reply(
+                        &mut stream,
+                        200,
+                        json!({"jsonrpc":"2.0","id":body["id"],"result":result}),
+                    )
+                    .await;
+                }
+            },
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
         assert_eq!(client.cached_credential_generation(), Some(1));
         let (next, ()) = pair(client.list_tools(&cx, None), async {
-            peer.token("refresh_token", true).await; peer.discovery("access-two").await;
+            peer.token("refresh_token", true).await;
+            peer.discovery("access-two").await;
             peer.catalog("access-two", "renewed").await;
-        }).await;
+        })
+        .await;
         assert_catalog(next.unwrap(), "renewed");
         assert_eq!(client.cached_credential_generation(), Some(2));
     });
 }
 
 #[test]
+fn pre_cancelled_call_retires_catalog_custody_before_any_network_poll() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut page = catalog("lookup");
+        page["nextCursor"] = json!("retired-wire-cursor");
+        let (listed, ()) = pair(client.list_tools(&cx, None), async {
+            peer.discovery("access-one").await;
+            peer.mcp("tools/list", "access-one", page).await;
+        })
+        .await;
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = listed.unwrap()
+        else {
+            panic!("expected a catalog page with live continuation custody");
+        };
+        let cursor = result.payload.next_cursor.unwrap();
+        assert_eq!(client.cached_credential_generation(), Some(1));
+
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        let mut call = Box::pin(client.call_tool_with_cancellation(
+            &cx,
+            &cancellation,
+            "lookup",
+            json!({}),
+        ));
+        poll_fn(|task| {
+            assert!(matches!(
+                call.as_mut().poll(task),
+                Poll::Ready(Err(ManagedHttpClientError::Session(
+                    OAuthSessionError::Cancelled
+                )))
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        drop(call);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(matches!(
+            client.list_tools(&cx, Some(&cursor)).await,
+            Err(ManagedHttpClientError::CatalogGenerationChanged)
+        ));
+        peer.no_more(&cx).await;
+
+        // Local cancellation retires only the client's retained connection,
+        // not the login or parent. A fresh explicit call must rediscover and
+        // succeeds with the original credential, without a token refresh.
+        let snapshot = session.credential(&cx).await.unwrap();
+        assert_eq!(snapshot.generation(), 1);
+        assert!(!snapshot.credential().is_revoked());
+        assert!(cx.checkpoint().is_ok());
+        warmup(&cx, &peer, &mut client).await;
+        assert_eq!(client.cached_credential_generation(), Some(1));
+        assert!(matches!(
+            client.list_tools(&cx, Some(&cursor)).await,
+            Err(ManagedHttpClientError::InvalidCatalogCursor)
+        ));
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
+fn shared_login_close_retires_cached_connection_on_the_first_refused_poll() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        warmup(&cx, &peer, &mut client).await;
+        assert_eq!(client.cached_credential_generation(), Some(1));
+        session.close();
+        let mut call = Box::pin(client.list_tools(&cx, None));
+        poll_fn(|task| {
+            assert!(matches!(
+                call.as_mut().poll(task),
+                Poll::Ready(Err(ManagedHttpClientError::Session(
+                    OAuthSessionError::Closed
+                )))
+            ));
+            Poll::Ready(())
+        })
+        .await;
+        drop(call);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(matches!(
+            client.call_tool(&cx, "lookup", json!({})).await,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+        ));
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(cx.checkpoint().is_ok());
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
 fn local_client_close_does_not_revoke_a_sibling_or_the_shared_login() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut closed = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
-        let mut sibling = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
-        closed.close(); closed.close();
-        assert!(matches!(closed.list_tools(&cx, None).await, Err(ManagedHttpClientError::Closed)));
-        assert!(!session.credential(&cx).await.unwrap().credential().is_revoked());
+        let mut closed = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut sibling = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        closed.close();
+        closed.close();
+        assert!(matches!(
+            closed.list_tools(&cx, None).await,
+            Err(ManagedHttpClientError::Closed)
+        ));
+        assert!(
+            !session
+                .credential(&cx)
+                .await
+                .unwrap()
+                .credential()
+                .is_revoked()
+        );
         warmup(&cx, &peer, &mut sibling).await;
-        let snapshot = session.credential(&cx).await.unwrap(); snapshot.credential().revoke();
-        assert!(matches!(sibling.call_tool(&cx, "lookup", json!({})).await,
-            Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))));
+        let snapshot = session.credential(&cx).await.unwrap();
+        snapshot.credential().revoke();
+        assert!(matches!(
+            sibling.call_tool(&cx, "lookup", json!({})).await,
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::LoginRequired
+            ))
+        ));
         assert_eq!(sibling.cached_credential_generation(), None);
         peer.no_more(&cx).await;
     });
@@ -618,21 +1231,39 @@ fn local_client_close_does_not_revoke_a_sibling_or_the_shared_login() {
 #[test]
 fn abandoned_polled_call_cannot_restore_its_half_consumed_connection() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         warmup(&cx, &peer, &mut client).await;
         let reached = std::sync::atomic::AtomicBool::new(false);
         let mut call = Box::pin(client.call_tool(&cx, "lookup", json!({})));
-        let ((), held_socket) = pair(poll_fn(|task| {
-            assert!(call.as_mut().poll(task).is_pending());
-            if reached.load(Ordering::SeqCst) { Poll::Ready(()) } else { Poll::Pending }
-        }), async {
-            let (stream, _, _) = peer.mcp_request("tools/call", "access-one").await;
-            reached.store(true, Ordering::SeqCst);
-            poll_fn(|task| { task.waker().wake_by_ref(); Poll::Ready(()) }).await;
-            stream
-        }).await;
+        let ((), held_socket) = pair(
+            poll_fn(|task| {
+                assert!(call.as_mut().poll(task).is_pending());
+                if reached.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+            async {
+                let (stream, _, _) = peer.mcp_request("tools/call", "access-one").await;
+                reached.store(true, Ordering::SeqCst);
+                poll_fn(|task| {
+                    task.waker().wake_by_ref();
+                    Poll::Ready(())
+                })
+                .await;
+                stream
+            },
+        )
+        .await;
         drop(call);
         assert_eq!(client.cached_credential_generation(), None);
         assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
@@ -645,9 +1276,15 @@ fn abandoned_polled_call_cannot_restore_its_half_consumed_connection() {
 #[test]
 fn failed_renewal_cannot_fall_back_to_the_old_connection_or_anonymous_traffic() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session.clone(), peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client = ManagedHttpClient::new(
+            session.clone(),
+            peer.client_builder(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
         warmup(&cx, &peer, &mut client).await;
         force_renewal(&session);
         let (result, ()) = pair(client.call_tool(&cx, "lookup", json!({})), async {
@@ -656,12 +1293,21 @@ fn failed_renewal_cannot_fall_back_to_the_old_connection_or_anonymous_traffic() 
             let fields = form(std::str::from_utf8(&request.body).unwrap());
             assert_eq!(fields["refresh_token"], "refresh-one");
             reply(&mut stream, 400, json!({"error":"invalid_grant"})).await;
-        }).await;
-        assert!(matches!(result, Err(ManagedHttpClientError::Session(
-            OAuthSessionError::OAuth(OAuthError::TokenEndpointRejected)))));
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::OAuth(
+                OAuthError::TokenEndpointRejected
+            )))
+        ));
         assert_eq!(client.cached_credential_generation(), None);
-        assert!(matches!(client.list_tools(&cx, None).await,
-            Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))));
+        assert!(matches!(
+            client.list_tools(&cx, None).await,
+            Err(ManagedHttpClientError::Session(
+                OAuthSessionError::LoginRequired
+            ))
+        ));
         peer.no_more(&cx).await;
     });
 }
@@ -669,9 +1315,12 @@ fn failed_renewal_cannot_fall_back_to_the_old_connection_or_anonymous_traffic() 
 #[test]
 fn resource_template_and_prompt_calls_use_the_same_authenticated_client() {
     run(async {
-        let cx = Cx::current().unwrap(); let peer = Peer::new().await;
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
         let session = peer.login(&cx).await;
-        let mut client = ManagedHttpClient::new(session, peer.client_builder(), Duration::from_secs(30)).unwrap();
+        let mut client =
+            ManagedHttpClient::new(session, peer.client_builder(), Duration::from_secs(30))
+                .unwrap();
         pair(async {
             assert!(matches!(client.list_resources(&cx, None).await.unwrap(),
                 CoreResult::Final(FinalCoreResult::ResourcesList { .. })));

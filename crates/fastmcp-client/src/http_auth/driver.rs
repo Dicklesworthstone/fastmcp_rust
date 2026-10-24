@@ -15,7 +15,7 @@
 use std::fmt;
 use std::future::{Future, Ready, poll_fn, ready};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::Poll;
+use std::task::{Poll, Waker};
 use std::time::Duration;
 
 use asupersync::Cx;
@@ -24,6 +24,7 @@ use asupersync::time::Sleep;
 use asupersync::types::Time;
 
 use super::CanonicalHttpUrl;
+use super::caller::with_caller;
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::oauth::{OAuthClient, OAuthCredentials, OAuthError};
 
@@ -64,6 +65,7 @@ impl<E> std::error::Error for AuthorizationDriverError<E> {}
 struct LaunchSlot {
     url: Option<CanonicalHttpUrl>,
     retired: bool,
+    waiter: Option<Waker>,
 }
 
 /// Single-use launcher passed to an authorization operation.
@@ -79,6 +81,8 @@ pub struct AuthorizationLauncher {
 impl AuthorizationLauncher {
     /// Enqueues one HTTPS authorization URL without waiting for a callback.
     /// The original operation remains responsible for endpoint trust and PKCE.
+    /// Publishing wakes the waiting scope even if the operation has retained
+    /// this launcher and no network or timer event occurs in the meantime.
     pub fn launch(self, url: CanonicalHttpUrl) -> Ready<Result<(), OAuthError>> {
         ready(self.submit(url))
     }
@@ -87,27 +91,68 @@ impl AuthorizationLauncher {
         if url.scheme() != "https" || url.has_userinfo() || url.fragment().is_some() {
             return Err(OAuthError::BrowserLaunchFailed);
         }
-        let mut slot = self
-            .slot
-            .lock()
-            .map_err(|_| OAuthError::BrowserLaunchFailed)?;
-        if slot.retired || slot.url.is_some() {
-            return Err(OAuthError::BrowserLaunchFailed);
+        let waiter = {
+            let mut slot = self
+                .slot
+                .lock()
+                .map_err(|_| OAuthError::BrowserLaunchFailed)?;
+            if slot.retired || slot.url.is_some() {
+                return Err(OAuthError::BrowserLaunchFailed);
+            }
+            slot.url = Some(url);
+            slot.waiter.take()
+        };
+        // The executor's waker may re-enter application code. Neither wake nor
+        // its final destructor may run under the URL custody lock.
+        if let Some(waiter) = waiter {
+            waiter.wake();
         }
-        slot.url = Some(url);
         Ok(())
     }
 }
 
 struct LaunchScope(Arc<Mutex<LaunchSlot>>);
 
+impl LaunchScope {
+    fn register(&self, waker: &Waker) -> Result<(), OAuthError> {
+        let replacement = waker.clone();
+        let previous = {
+            let mut slot = self.0.lock().map_err(|_| OAuthError::BrowserLaunchFailed)?;
+            if slot.retired {
+                return Err(OAuthError::BrowserLaunchFailed);
+            }
+            slot.waiter.replace(replacement)
+        };
+        drop(previous);
+        Ok(())
+    }
+
+    fn take_url(&self) -> Result<Option<CanonicalHttpUrl>, OAuthError> {
+        let (url, waiter) = {
+            let mut slot = self.0.lock().map_err(|_| OAuthError::BrowserLaunchFailed)?;
+            let url = slot.url.take();
+            let waiter = if url.is_some() {
+                slot.waiter.take()
+            } else {
+                None
+            };
+            (url, waiter)
+        };
+        drop(waiter);
+        Ok(url)
+    }
+}
+
 impl Drop for LaunchScope {
     fn drop(&mut self) {
         // Poison recovery is used only to retire custody, never to continue
         // an authorization. A launcher retained by a host cannot resurrect it.
-        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        slot.retired = true;
-        slot.url = None;
+        let retired = {
+            let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.retired = true;
+            (slot.url.take(), slot.waiter.take())
+        };
+        drop(retired);
     }
 }
 
@@ -119,6 +164,17 @@ fn check_lifetime(cx: &Cx, deadline: Time) -> Result<(), OAuthError> {
     } else {
         Ok(())
     }
+}
+
+// Called only inside the caller scope. Owning a timer driver does not grant
+// permission to use it when the surrounding effect ceiling denies time.
+fn require_timer(cx: &Cx) -> Result<(), OAuthError> {
+    if cx.timer_driver().is_none()
+        || !Cx::current().is_some_and(|active| active.capabilities().time)
+    {
+        return Err(OAuthError::RuntimeTimerUnavailable);
+    }
+    Ok(())
 }
 
 /// Runs an existing authorization operation alongside one host-owned driver.
@@ -136,6 +192,10 @@ fn check_lifetime(cx: &Cx, deadline: Time) -> Result<(), OAuthError> {
 /// wakes the scope even when both futures are quiet. Dropping the scope also
 /// retires a launcher the host retained. No automatic retry or consent occurs.
 /// The caller supplies the runtime and all authorization/driver policy.
+/// Factories and polls preserve the current ambient effect ceiling without
+/// replacing the explicit caller's identity, cancellation or runtime drivers.
+/// Denied time capability fails before entering host code or polling either
+/// operation. Guards are restored on return, suspension and unwinding.
 pub async fn with_authorization_driver<T, E, O, OF, D, DF>(
     cx: &Cx,
     timeout: Duration,
@@ -148,43 +208,43 @@ where
     D: FnOnce(CanonicalHttpUrl) -> DF,
     DF: Future<Output = Result<(), OAuthError>>,
 {
-    if cx.checkpoint().is_err() {
-        return Err(AuthorizationDriverError::Driver(OAuthError::Cancelled));
-    }
-    if timeout.is_zero() || timeout > Duration::from_mins(15) {
-        return Err(AuthorizationDriverError::Driver(
-            OAuthError::InvalidConfiguration,
-        ));
-    }
-    if cx.timer_driver().is_none() {
-        return Err(AuthorizationDriverError::Driver(
-            OAuthError::RuntimeTimerUnavailable,
-        ));
-    }
-    let nanos = u64::try_from(timeout.as_nanos())
-        .map_err(|_| AuthorizationDriverError::Driver(OAuthError::InvalidConfiguration))?;
-    let deadline = cx
-        .now()
-        .as_nanos()
-        .checked_add(nanos)
-        .map(Time::from_nanos)
-        .ok_or(AuthorizationDriverError::Driver(
-            OAuthError::InvalidConfiguration,
-        ))?;
-    let deadline = cx
-        .budget()
-        .deadline
-        .map_or(deadline, |parent| parent.min(deadline));
-    check_lifetime(cx, deadline).map_err(AuthorizationDriverError::Driver)?;
+    let deadline = with_caller(cx, || {
+        if cx.checkpoint().is_err() {
+            return Err(OAuthError::Cancelled);
+        }
+        if timeout.is_zero() || timeout > Duration::from_mins(15) {
+            return Err(OAuthError::InvalidConfiguration);
+        }
+        require_timer(cx)?;
+        let nanos =
+            u64::try_from(timeout.as_nanos()).map_err(|_| OAuthError::InvalidConfiguration)?;
+        let deadline = cx
+            .now()
+            .as_nanos()
+            .checked_add(nanos)
+            .map(Time::from_nanos)
+            .ok_or(OAuthError::InvalidConfiguration)?;
+        let deadline = cx
+            .budget()
+            .deadline
+            .map_or(deadline, |parent| parent.min(deadline));
+        check_lifetime(cx, deadline)?;
+        Ok(deadline)
+    })
+    .map_err(AuthorizationDriverError::Driver)?;
 
     let scope = LaunchScope(Arc::new(Mutex::new(LaunchSlot::default())));
     let launcher = AuthorizationLauncher {
         slot: Arc::clone(&scope.0),
     };
-    let operation = {
-        let _caller = Cx::set_current(Some(cx.clone()));
-        operation(launcher)
-    };
+    let operation = with_caller(cx, || {
+        check_lifetime(cx, deadline)?;
+        require_timer(cx)?;
+        let future = operation(launcher);
+        check_lifetime(cx, deadline)?;
+        Ok(future)
+    })
+    .map_err(AuthorizationDriverError::Driver)?;
     // Heap the caller's operation future rather than storing `OF` by value in
     // this one. `OF` is the whole authorization flow, so holding it inline here
     // made every `.await` of a public wrapper carry 16-23 KB (bd-y2xoc). The
@@ -193,73 +253,82 @@ where
     let mut operation = Box::pin(operation);
     let mut driver_factory = Some(driver);
     let mut driving: Option<std::pin::Pin<Box<DF>>> = None;
-    let sleep = {
-        let _caller = Cx::set_current(Some(cx.clone()));
-        Sleep::new(deadline)
-    };
-    let mut sleep = std::pin::pin!(sleep);
+    let mut sleep = std::pin::pin!(Sleep::new(deadline));
     let (_cancel_sender, mut cancel_receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(cancel_receiver.recv(cx));
     poll_fn(|task| {
-        if let Err(error) = check_lifetime(cx, deadline) {
-            return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
-        }
-        let _caller = Cx::set_current(Some(cx.clone()));
-        if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::Cancelled)));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::TimedOut)));
-        }
-        // A known driver failure wins before any further authorization work.
-        if let Some(future) = driving.as_mut() {
-            match future.as_mut().poll(task) {
-                Poll::Ready(Err(_)) => {
-                    let error = check_lifetime(cx, deadline)
-                        .err()
-                        .unwrap_or(OAuthError::BrowserLaunchFailed);
-                    return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
-                }
-                Poll::Ready(Ok(())) => driving = None,
-                Poll::Pending => {}
-            }
-        }
-        // A driver can cancel the caller or consume the remaining budget in
-        // this very poll. Do not poll a token-redemption future afterward.
-        if let Err(error) = check_lifetime(cx, deadline) {
-            return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
-        }
-        if let Poll::Ready(result) = operation.as_mut().poll(task) {
+        with_caller(cx, || {
             if let Err(error) = check_lifetime(cx, deadline) {
                 return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
             }
-            return Poll::Ready(result.map_err(AuthorizationDriverError::Operation));
-        }
-        if driver_factory.is_some() {
-            let url = match scope.0.lock() {
-                Ok(mut slot) => slot.url.take(),
-                Err(_) => {
-                    return Poll::Ready(Err(AuthorizationDriverError::Driver(
-                        OAuthError::BrowserLaunchFailed,
-                    )));
+            if let Err(error) = require_timer(cx) {
+                return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
+            }
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::Cancelled)));
+            }
+            if sleep.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(AuthorizationDriverError::Driver(OAuthError::TimedOut)));
+            }
+            // Register BEFORE polling authorization: a concurrent or deferred
+            // launch either wakes this registration or is observed below. Replace
+            // the registration each poll so a migrated wait never wakes an old task.
+            if driver_factory.is_some() {
+                if let Err(error) = scope.register(task.waker()) {
+                    return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
                 }
-            };
-            if let Some(url) = url {
+            }
+            // A known driver failure wins before any further authorization work.
+            if let Some(future) = driving.as_mut() {
+                match future.as_mut().poll(task) {
+                    Poll::Ready(Err(_)) => {
+                        let error = check_lifetime(cx, deadline)
+                            .err()
+                            .unwrap_or(OAuthError::BrowserLaunchFailed);
+                        return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
+                    }
+                    Poll::Ready(Ok(())) => driving = None,
+                    Poll::Pending => {}
+                }
+            }
+            // A driver can cancel the caller or consume the remaining budget in
+            // this very poll. Do not poll a token-redemption future afterward.
+            if let Err(error) = check_lifetime(cx, deadline) {
+                return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
+            }
+            if let Poll::Ready(result) = operation.as_mut().poll(task) {
                 if let Err(error) = check_lifetime(cx, deadline) {
                     return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
                 }
-                if let Some(factory) = driver_factory.take() {
-                    driving = Some(Box::pin(factory(url)));
-                    // The newly installed driver has not registered a waker yet.
-                    // Schedule one poll rather than spawning or busy-waiting.
-                    task.waker().wake_by_ref();
+                return Poll::Ready(result.map_err(AuthorizationDriverError::Operation));
+            }
+            if driver_factory.is_some() {
+                let url = match scope.take_url() {
+                    Ok(url) => url,
+                    Err(error) => {
+                        return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
+                    }
+                };
+                if let Some(url) = url {
+                    if let Err(error) = check_lifetime(cx, deadline) {
+                        return Poll::Ready(Err(AuthorizationDriverError::Driver(error)));
+                    }
+                    if let Some(factory) = driver_factory.take() {
+                        driving = Some(Box::pin(factory(url)));
+                        // The newly installed driver has not registered a waker yet.
+                        // Schedule one poll rather than spawning or busy-waiting.
+                        task.waker().wake_by_ref();
+                    }
                 }
             }
-        }
-        Poll::Pending
+            Poll::Pending
+        })
     })
     .await
 }
+
+#[cfg(test)]
+mod liveness;
 
 impl OAuthClient {
     /// Authorizes with a driver allowed to await the loopback callback response.
@@ -275,12 +344,18 @@ impl OAuthClient {
         D: FnOnce(CanonicalHttpUrl) -> F,
         F: Future<Output = Result<(), OAuthError>>,
     {
-        with_authorization_driver(
+        // Heap the driver step rather than awaiting it inline. It holds the
+        // whole authorization flow plus the driver future, and dominated this
+        // future's 18 KB, which every caller of this public method paid at its
+        // own `.await` (bd-y2xoc). Boxing the inner step keeps the public
+        // signature intact -- same remedy already applied to
+        // `ClientBuilder::connect_http_client_with_cx` in commit 0d3c51e6.
+        Box::pin(with_authorization_driver(
             cx,
             timeout,
             |launcher| self.authorize(cx, move |url| launcher.launch(url)),
             driver,
-        )
+        ))
         .await
         .map_err(|error| match error {
             AuthorizationDriverError::Operation(error)
@@ -304,12 +379,15 @@ impl ManagedOAuthSession {
         D: FnOnce(CanonicalHttpUrl) -> F,
         F: Future<Output = Result<(), OAuthError>>,
     {
-        with_authorization_driver(
+        // Boxed for the same reason as the `OAuthClient` method above: this is
+        // the 23 KB root, and the cost landed on every caller's `.await`
+        // instead of here (bd-y2xoc). Public signature unchanged.
+        Box::pin(with_authorization_driver(
             cx,
             timeout,
             |launcher| Self::authorize(cx, client, policy, move |url| launcher.launch(url)),
             driver,
-        )
+        ))
         .await
         .map_err(|error| match error {
             AuthorizationDriverError::Operation(error) => error,
