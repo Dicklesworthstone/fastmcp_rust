@@ -482,32 +482,19 @@ impl ReverseRequestHandlers {
     /// This is the modern MRTR path: the server asked for sampling, roots, or
     /// elicitation inside `inputRequests`, and the client supplies
     /// `inputResponses` on the next `tools/call` without sending reverse
-    /// JSON-RPC.
+    /// JSON-RPC. The complete input batch is admitted against the original
+    /// request's transmitted capabilities before any handler is invoked.
     pub(crate) fn respond_to_input_required(
         &self,
         cx: &Cx,
+        capabilities: &serde_json::Value,
         input_required: &InputRequiredResult,
     ) -> McpResult<MrtrInputResponses> {
-        let Some(input_requests) = input_required.input_requests() else {
-            return Ok(MrtrInputResponses::new());
-        };
+        let requests = Self::admit_input_required(capabilities, input_required)?;
         let mut responses = MrtrInputResponses::new();
-        for member in input_requests.members() {
-            let wire = exact_json_to_serde(&member.value).map_err(|error| {
-                McpError::invalid_params(format!(
-                    "MRTR input request {} is not valid JSON: {error}",
-                    member.name
-                ))
-            })?;
-            let request: FinalEmbeddedInputRequest =
-                serde_json::from_value(wire).map_err(|error| {
-                    McpError::invalid_params(format!(
-                        "MRTR input request {} is not a final embedded descriptor: {error}",
-                        member.name
-                    ))
-                })?;
-            let value = self.invoke_embedded_input_request(cx, &member.name, request)?;
-            responses.insert(member.name.clone(), value);
+        for (input_key, request) in requests {
+            let value = self.invoke_embedded_input_request(cx, input_key, request)?;
+            responses.insert(input_key.to_owned(), value);
         }
         Ok(responses)
     }
@@ -517,33 +504,19 @@ impl ReverseRequestHandlers {
     pub(crate) async fn respond_to_input_required_async(
         &self,
         cx: &Cx,
+        capabilities: &serde_json::Value,
         input_required: &InputRequiredResult,
         checkpoint: impl Fn() -> McpResult<()>,
     ) -> McpResult<MrtrInputResponses> {
         checkpoint()?;
-        let Some(input_requests) = input_required.input_requests() else {
-            return Ok(MrtrInputResponses::new());
-        };
+        let requests = Self::admit_input_required(capabilities, input_required)?;
         let mut responses = MrtrInputResponses::new();
-        for member in input_requests.members() {
+        for (input_key, request) in requests {
             checkpoint()?;
-            let wire = exact_json_to_serde(&member.value).map_err(|error| {
-                McpError::invalid_params(format!(
-                    "MRTR input request {} is not valid JSON: {error}",
-                    member.name
-                ))
-            })?;
-            let request: FinalEmbeddedInputRequest =
-                serde_json::from_value(wire).map_err(|error| {
-                    McpError::invalid_params(format!(
-                        "MRTR input request {} is not a final embedded descriptor: {error}",
-                        member.name
-                    ))
-                })?;
             let cancellation = ReverseRequestCancellation::new();
             let mut callback = Box::pin(self.invoke_embedded_input_request_async(
                 cx,
-                &member.name,
+                input_key,
                 request,
                 cancellation.clone(),
             ));
@@ -580,9 +553,46 @@ impl ReverseRequestHandlers {
             .await?;
             checkpoint()?;
             owner.0.record_response_sent();
-            responses.insert(member.name.clone(), value);
+            responses.insert(input_key.to_owned(), value);
         }
         Ok(responses)
+    }
+
+    fn admit_input_required<'input>(
+        capabilities: &serde_json::Value,
+        input_required: &'input InputRequiredResult,
+    ) -> McpResult<Vec<(&'input str, FinalEmbeddedInputRequest)>> {
+        use crate::http_auth::rpc::interaction::{ManagedInteractionError, admit_embedded_input};
+
+        let Some(input_requests) = input_required.input_requests() else {
+            return Ok(Vec::new());
+        };
+        let invalid = || {
+            McpError::invalid_request(
+                "MRTR input-required result contains an invalid embedded input request",
+            )
+        };
+        // ExactJsonObject has already bounded this batch and rejected duplicate
+        // keys. Keep the admitted descriptors so no later conversion can erase
+        // presence or discover a forbidden sibling after an earlier host effect.
+        input_requests
+            .members()
+            .iter()
+            .map(|member| {
+                let wire = exact_json_to_serde(&member.value).map_err(|_| invalid())?;
+                let request = admit_embedded_input(capabilities, wire).map_err(|error| {
+                    match error {
+                        ManagedInteractionError::CapabilityNotAdvertised => {
+                            McpError::invalid_request(
+                                "MRTR input-required result requests an unadvertised client capability",
+                            )
+                        }
+                        _ => invalid(),
+                    }
+                })?;
+                Ok((member.name.as_str(), request))
+            })
+            .collect()
     }
 
     fn invoke_embedded_input_request(
@@ -928,6 +938,12 @@ pub const MAX_MRTR_INPUT_RESPONSES: usize = 128;
 pub const MAX_MRTR_CONTINUATION_ROUNDS: usize = 4;
 /// Maximum response entries admitted across every continuation in one MRTR operation.
 pub const MAX_MRTR_TOTAL_INPUT_RESPONSES: usize = MAX_MRTR_INPUT_RESPONSES;
+
+#[derive(Clone, Copy)]
+enum MrtrResponderKind {
+    Installed,
+    CallerProvided,
+}
 
 fn mrtr_operation_deadline(cx: &Cx, policy: RequestTimeoutPolicy) -> McpResult<Instant> {
     cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
@@ -8581,6 +8597,11 @@ where
             deadline,
             MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
         )?;
+        // Freeze the same core capability leaves carried on the first frame.
+        // Subsequent metadata decoration preserves these explicit fields, so
+        // neither handler presence nor a nested peer descriptor grants more.
+        let original_parameters = self.with_modern_request_metadata(original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original_parameters.clone();
         loop {
             driver.before_request()?;
@@ -8609,7 +8630,7 @@ where
                 cx,
                 cancellation,
                 deadline,
-                handlers.respond_to_input_required_async(cx, input_required, || {
+                handlers.respond_to_input_required_async(cx, &capabilities, input_required, || {
                     check_mrtr_operation(cx, cancellation, deadline)
                 }),
             )
@@ -15788,6 +15809,10 @@ impl HttpClient {
             deadline,
             MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?,
         )?;
+        // The HTTP executor preserves these prepared core capability leaves
+        // while stamping its own extension settings onto every POST.
+        let original_parameters = self.core_request_parameters(&original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         // HTTP execution owns cancellation on drop. One bound therefore
         // safely encloses every POST and every caller-owned input callback.
         wait_for_mrtr_operation(cx, cancellation, deadline, async {
@@ -15817,7 +15842,7 @@ impl HttpClient {
                         .map_or(0, |inputs| inputs.members().len()),
                 )?;
                 let input_responses = handlers
-                    .respond_to_input_required_async(cx, input_required, || {
+                    .respond_to_input_required_async(cx, &capabilities, input_required, || {
                         check_mrtr_operation(cx, cancellation, deadline)
                     })
                     .await?;
@@ -23420,10 +23445,11 @@ impl Client {
         &mut self,
         method: &str,
         original_parameters: serde_json::Value,
+        responder_kind: MrtrResponderKind,
         mut respond: F,
     ) -> McpResult<CoreResult>
     where
-        F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
+        F: FnMut(&InputRequiredResult, &serde_json::Value) -> McpResult<MrtrInputResponses>,
     {
         self.ensure_initialized()?;
         let cx = self.cx.clone();
@@ -23435,6 +23461,8 @@ impl Client {
         let limits =
             MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
         let mut driver = MrtrDriver::new(&cx, deadline, limits)?;
+        let original_parameters = self.prepare_request_parameters(original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original_parameters.clone();
 
         loop {
@@ -23453,14 +23481,31 @@ impl Client {
             // caller callback can produce an effect or another request can be
             // committed.
             driver.begin_continuation()?;
-            let input_responses = respond(input_required)?;
+            if matches!(responder_kind, MrtrResponderKind::Installed) {
+                // Installed handlers resolve the complete batch. Reserve its
+                // entries before the first host effect, so a rejected later
+                // round cannot invoke even one additional handler.
+                driver.admit_input_responses(
+                    input_required
+                        .input_requests()
+                        .map_or(0, |requests| requests.members().len()),
+                )?;
+            }
+            let input_responses = respond(input_required, &capabilities)?;
             let input_response_count = input_responses.len();
             let retry_parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
                 input_responses,
             )?;
-            driver.admit_input_responses(input_response_count)?;
+            match responder_kind {
+                // Preserve caller-provided responders' existing map
+                // validation and returned-response accounting.
+                MrtrResponderKind::CallerProvided => {
+                    driver.admit_input_responses(input_response_count)?;
+                }
+                MrtrResponderKind::Installed => driver.before_request()?,
+            }
             parameters = retry_parameters;
         }
     }
@@ -23482,20 +23527,28 @@ impl Client {
         arguments: serde_json::Value,
     ) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
-        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
-            && self.reverse_request_handlers.has_modern_handlers()
-        {
-            let handlers = self.reverse_request_handlers.clone();
-            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
-            return self.call_tool_with_mrtr_retry(name, arguments, |input_required| {
-                handlers.respond_to_input_required(&cx, input_required)
-            });
-        }
         let params = CallToolParams {
             name: name.to_string(),
             arguments: Some(arguments),
             meta: None,
         };
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
+            && self.reverse_request_handlers.has_modern_handlers()
+        {
+            let handlers = self.reverse_request_handlers.clone();
+            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
+            let original_parameters = serde_json::to_value(&params).map_err(|_| {
+                McpError::internal_error("MRTR tool parameters could not serialize")
+            })?;
+            return self.drive_mrtr_retry(
+                "tools/call",
+                original_parameters,
+                MrtrResponderKind::Installed,
+                |input_required, capabilities| {
+                    handlers.respond_to_input_required(&cx, capabilities, input_required)
+                },
+            );
+        }
         self.send_typed_core_request("tools/call", params)
     }
 
@@ -23538,7 +23591,7 @@ impl Client {
         &mut self,
         name: &str,
         arguments: serde_json::Value,
-        respond: F,
+        mut respond: F,
     ) -> McpResult<CoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
@@ -23551,7 +23604,12 @@ impl Client {
             "name": name,
             "arguments": arguments,
         });
-        self.drive_mrtr_retry("tools/call", original_parameters, respond)
+        self.drive_mrtr_retry(
+            "tools/call",
+            original_parameters,
+            MrtrResponderKind::CallerProvided,
+            |input_required, _| respond(input_required),
+        )
     }
 
     /// Calls a final tool with the official Tasks result surface enabled.
@@ -24603,9 +24661,14 @@ impl Client {
         {
             let handlers = self.reverse_request_handlers.clone();
             let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
-            return self.read_resource_with_mrtr_retry(uri, |input_required| {
-                handlers.respond_to_input_required(&cx, input_required)
-            });
+            return self.drive_mrtr_retry(
+                "resources/read",
+                serde_json::json!({"uri": uri}),
+                MrtrResponderKind::Installed,
+                |input_required, capabilities| {
+                    handlers.respond_to_input_required(&cx, capabilities, input_required)
+                },
+            );
         }
         let uri = uri.to_owned();
         let params = ReadResourceParams {
@@ -24641,7 +24704,7 @@ impl Client {
     pub fn read_resource_with_mrtr_retry<F>(
         &mut self,
         uri: &str,
-        respond: F,
+        mut respond: F,
     ) -> McpResult<CoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
@@ -24651,7 +24714,12 @@ impl Client {
             return self.read_resource_typed(uri);
         }
         let original_parameters = serde_json::json!({ "uri": uri });
-        self.drive_mrtr_retry("resources/read", original_parameters, respond)
+        self.drive_mrtr_retry(
+            "resources/read",
+            original_parameters,
+            MrtrResponderKind::CallerProvided,
+            |input_required, _| respond(input_required),
+        )
     }
 
     /// Reads a resource and returns its exact MCP 2026-07-28 result payload.
@@ -24885,20 +24953,28 @@ impl Client {
         arguments: std::collections::HashMap<String, String>,
     ) -> McpResult<CoreResult> {
         self.ensure_initialized()?;
-        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
-            && self.reverse_request_handlers.has_modern_handlers()
-        {
-            let handlers = self.reverse_request_handlers.clone();
-            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
-            return self.get_prompt_with_mrtr_retry(name, arguments, |input_required| {
-                handlers.respond_to_input_required(&cx, input_required)
-            });
-        }
         let params = GetPromptParams {
             name: name.to_owned(),
             arguments: (!arguments.is_empty()).then_some(arguments),
             meta: None,
         };
+        if self.session.selected_era() == Some(ProtocolEra::Modern2026)
+            && self.reverse_request_handlers.has_modern_handlers()
+        {
+            let handlers = self.reverse_request_handlers.clone();
+            let cx = Cx::current().unwrap_or_else(|| self.cx.clone());
+            let original_parameters = serde_json::to_value(&params).map_err(|_| {
+                McpError::internal_error("MRTR prompt parameters could not serialize")
+            })?;
+            return self.drive_mrtr_retry(
+                "prompts/get",
+                original_parameters,
+                MrtrResponderKind::Installed,
+                |input_required, capabilities| {
+                    handlers.respond_to_input_required(&cx, capabilities, input_required)
+                },
+            );
+        }
         self.send_typed_core_request("prompts/get", params)
     }
 
@@ -24930,7 +25006,7 @@ impl Client {
         &mut self,
         name: &str,
         arguments: std::collections::HashMap<String, String>,
-        respond: F,
+        mut respond: F,
     ) -> McpResult<CoreResult>
     where
         F: FnMut(&InputRequiredResult) -> McpResult<MrtrInputResponses>,
@@ -24953,7 +25029,12 @@ impl Client {
                 })?,
             );
         }
-        self.drive_mrtr_retry("prompts/get", retry_parameters, respond)
+        self.drive_mrtr_retry(
+            "prompts/get",
+            retry_parameters,
+            MrtrResponderKind::CallerProvided,
+            |input_required, _| respond(input_required),
+        )
     }
 
     /// Gets a prompt and returns its exact MCP 2026-07-28 result payload.
@@ -26633,6 +26714,8 @@ impl Client {
             MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
         let mut driver = MrtrDriver::new(cx, deadline, limits)?;
         let handlers = self.reverse_request_handlers.clone();
+        let original_parameters = self.prepare_request_parameters(original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let check = || {
             if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 Err(McpError::request_cancelled())
@@ -26665,7 +26748,7 @@ impl Client {
                         .map_or(0, |inputs| inputs.members().len()),
                 )?;
                 let responses = handlers
-                    .respond_to_input_required_async(cx, input_required, check)
+                    .respond_to_input_required_async(cx, &capabilities, input_required, check)
                     .await?;
                 parameters =
                     mrtr_retry_parameters(original_parameters.clone(), input_required, responses)?;
@@ -38945,6 +39028,543 @@ mod tests {
         public_http_installed_mrtr_input_budget(65);
     }
 
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    #[derive(Clone)]
+    struct InstalledMrtrCapabilityCase {
+        name: &'static str,
+        method: &'static str,
+        capabilities: serde_json::Value,
+        input_requests: Option<serde_json::Value>,
+        accepted: bool,
+        rejection_message: &'static str,
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn installed_mrtr_capability_cases(accepted: bool) -> Vec<InstalledMrtrCapabilityCase> {
+        let roots = serde_json::json!({"method":"roots/list"});
+        let sample = serde_json::json!({
+            "method":"sampling/createMessage",
+            "params":{"messages":[{"role":"user","content":{"type":"text","text":"sample"}}],"maxTokens":8},
+        });
+        let mut sample_tools = sample.clone();
+        sample_tools["params"]["tools"] = serde_json::json!([]);
+        let mut sample_choice = sample.clone();
+        sample_choice["params"]["toolChoice"] = serde_json::json!({});
+        let mut sample_context = sample.clone();
+        sample_context["params"]["includeContext"] = serde_json::json!("allServers");
+        let mut null_tools_params = sample["params"].clone();
+        null_tools_params["tools"] = serde_json::Value::Null;
+        let mut null_choice_params = sample["params"].clone();
+        null_choice_params["toolChoice"] = serde_json::Value::Null;
+        let form = serde_json::json!({
+            "method":"elicitation/create",
+            "params":{"message":"Review form","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}},
+        });
+        let mut explicit_form = form.clone();
+        explicit_form["params"]["mode"] = serde_json::json!("form");
+        let url = serde_json::json!({
+            "method":"elicitation/create",
+            "params":{"mode":"url","message":"Review URL","url":"https://example.test/private-elicitation"},
+        });
+        let rows = if accepted {
+            vec![
+                (
+                    "roots-and-sampling",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"sampling":{}}),
+                    roots.clone(),
+                    sample.clone(),
+                ),
+                (
+                    "sampling-empty-tools",
+                    "resources/read",
+                    serde_json::json!({"roots":{},"sampling":{"tools":{}}}),
+                    roots.clone(),
+                    sample_tools.clone(),
+                ),
+                (
+                    "sampling-empty-choice",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"sampling":{"tools":{}}}),
+                    roots.clone(),
+                    sample_choice.clone(),
+                ),
+                (
+                    "sampling-context-advisory",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"sampling":{}}),
+                    roots.clone(),
+                    sample_context.clone(),
+                ),
+                (
+                    "sampling-context-declared",
+                    "resources/read",
+                    serde_json::json!({"roots":{},"sampling":{"context":{}}}),
+                    roots.clone(),
+                    sample_context,
+                ),
+                (
+                    "implicit-form-empty-parent",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"elicitation":{}}),
+                    roots.clone(),
+                    form.clone(),
+                ),
+                (
+                    "explicit-form-empty-parent",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"elicitation":{}}),
+                    roots.clone(),
+                    explicit_form.clone(),
+                ),
+                (
+                    "implicit-form-leaf",
+                    "resources/read",
+                    serde_json::json!({"roots":{},"elicitation":{"form":{}}}),
+                    roots.clone(),
+                    form.clone(),
+                ),
+                (
+                    "explicit-form-leaf",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"elicitation":{"form":{}}}),
+                    roots.clone(),
+                    explicit_form.clone(),
+                ),
+                (
+                    "explicit-url-leaf",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"elicitation":{"url":{}}}),
+                    roots.clone(),
+                    url.clone(),
+                ),
+            ]
+        } else {
+            vec![
+                (
+                    "missing-sampling-parent",
+                    "tools/call",
+                    serde_json::json!({"roots":{}}),
+                    roots.clone(),
+                    sample.clone(),
+                ),
+                (
+                    "missing-sampling-tools",
+                    "resources/read",
+                    serde_json::json!({"roots":{},"sampling":{}}),
+                    roots.clone(),
+                    sample_tools,
+                ),
+                (
+                    "missing-sampling-choice",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"sampling":{}}),
+                    roots.clone(),
+                    sample_choice,
+                ),
+                (
+                    "missing-roots-parent",
+                    "tools/call",
+                    serde_json::json!({"sampling":{}}),
+                    sample,
+                    roots.clone(),
+                ),
+                (
+                    "missing-elicitation-parent",
+                    "resources/read",
+                    serde_json::json!({"roots":{}}),
+                    roots.clone(),
+                    form.clone(),
+                ),
+                (
+                    "missing-url-parent",
+                    "prompts/get",
+                    serde_json::json!({"roots":{}}),
+                    roots.clone(),
+                    url.clone(),
+                ),
+                (
+                    "url-only-denies-implicit-form",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"elicitation":{"url":{}}}),
+                    roots.clone(),
+                    form,
+                ),
+                (
+                    "url-only-denies-explicit-form",
+                    "resources/read",
+                    serde_json::json!({"roots":{},"elicitation":{"url":{}}}),
+                    roots.clone(),
+                    explicit_form,
+                ),
+                (
+                    "form-only-denies-url",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"elicitation":{"form":{}}}),
+                    roots.clone(),
+                    url.clone(),
+                ),
+                (
+                    "empty-elicitation-denies-url",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"elicitation":{}}),
+                    roots,
+                    url,
+                ),
+            ]
+        };
+        let mut cases: Vec<_> = rows
+            .into_iter()
+            .map(|(name, method, capabilities, first, later)| InstalledMrtrCapabilityCase {
+                name,
+                method,
+                capabilities,
+                input_requests: Some(serde_json::json!({"a-valid":first,"z-private-input-key":later})),
+                accepted,
+                rejection_message: "MRTR input-required result requests an unadvertised client capability",
+            })
+            .collect();
+        if accepted {
+            for (name, input_requests) in [
+                ("state-only", None),
+                ("empty-input-map", Some(serde_json::json!({}))),
+            ] {
+                cases.push(InstalledMrtrCapabilityCase {
+                    name,
+                    method: "tools/call",
+                    capabilities: serde_json::json!({"roots":{}}),
+                    input_requests,
+                    accepted,
+                    rejection_message: "MRTR input-required result requests an unadvertised client capability",
+                });
+            }
+        } else {
+            for (name, method, params) in [
+                ("null-sampling-tools", "tools/call", null_tools_params),
+                ("null-sampling-choice", "resources/read", null_choice_params),
+                (
+                    "sequence-sampling-params",
+                    "prompts/get",
+                    serde_json::json!([]),
+                ),
+            ] {
+                cases.push(InstalledMrtrCapabilityCase {
+                    name,
+                    method,
+                    capabilities: serde_json::json!({"roots":{},"sampling":{"tools":{}}}),
+                    input_requests: Some(serde_json::json!({
+                        "a-valid":{"method":"roots/list"},
+                        "z-private-input-key":{"method":"sampling/createMessage","params":params},
+                    })),
+                    accepted,
+                    rejection_message: "MRTR input-required result contains an invalid embedded input request",
+                });
+            }
+        }
+        cases
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn installed_mrtr_capability_handlers(
+        capabilities: &serde_json::Value,
+        observed: &Arc<Mutex<Vec<serde_json::Value>>>,
+    ) -> ReverseRequestHandlers {
+        let mut handlers = ReverseRequestHandlers::new();
+        if capabilities.get("roots").is_some() {
+            let observed = Arc::clone(observed);
+            handlers = handlers.with_modern_roots_list(move |_cx, _token, params| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::json!({"method":"roots/list","params":params}));
+                Box::pin(async {
+                    Ok(FinalEmbeddedRootsListResult {
+                        roots: vec![fastmcp_protocol::Root::new("file:///mrtr-capability")],
+                    })
+                })
+            });
+        }
+        if capabilities.get("sampling").is_some() {
+            let observed = Arc::clone(observed);
+            handlers = handlers.with_modern_sampling_create_message(move |_cx, _token, params| {
+                observed.lock().unwrap().push(serde_json::json!({"method":"sampling/createMessage","params":params}));
+                Box::pin(async {
+                    serde_json::from_value(serde_json::json!({
+                        "role":"assistant","model":"capability-model","content":{"type":"text","text":"admitted sample"},
+                    })).map_err(|_| McpError::internal_error("invalid capability-test sampling result"))
+                })
+            });
+        }
+        if capabilities.get("elicitation").is_some() {
+            let observed = Arc::clone(observed);
+            handlers = handlers.with_modern_elicitation_create(move |_cx, _token, params| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::json!({"method":"elicitation/create","params":params}));
+                Box::pin(async { Ok(ElicitResult::decline()) })
+            });
+        }
+        handlers
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    impl InstalledMrtrCapabilityCase {
+        fn input_required(&self) -> serde_json::Value {
+            let mut result = serde_json::json!({"resultType":"input_required","requestState":"private-capability-state"});
+            if let Some(inputs) = &self.input_requests {
+                result["inputRequests"] = inputs.clone();
+            }
+            result
+        }
+
+        fn responses(&self) -> serde_json::Value {
+            let mut responses = serde_json::Map::new();
+            if let Some(inputs) = &self.input_requests {
+                for (key, descriptor) in inputs.as_object().unwrap() {
+                    let value = match descriptor["method"].as_str().unwrap() {
+                        "roots/list" => {
+                            serde_json::json!({"roots":[{"uri":"file:///mrtr-capability"}]})
+                        }
+                        "sampling/createMessage" => {
+                            serde_json::json!({"role":"assistant","model":"capability-model","content":{"type":"text","text":"admitted sample"}})
+                        }
+                        "elicitation/create" => serde_json::json!({"action":"decline"}),
+                        _ => unreachable!(),
+                    };
+                    responses.insert(key.clone(), value);
+                }
+            }
+            serde_json::Value::Object(responses)
+        }
+
+        fn complete(&self) -> serde_json::Value {
+            match self.method {
+                "tools/call" => serde_json::json!({"resultType":"complete","content":[]}),
+                "resources/read" => {
+                    serde_json::json!({"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"})
+                }
+                "prompts/get" => serde_json::json!({"resultType":"complete","messages":[]}),
+                _ => unreachable!(),
+            }
+        }
+
+        fn assert_outcome(&self, result: McpResult<CoreResult>, observed: &[serde_json::Value]) {
+            if !self.accepted {
+                let error = result.expect_err(self.name);
+                assert_eq!(error.code, McpErrorCode::InvalidRequest, "{}", self.name);
+                assert_eq!(error.message, self.rejection_message, "{}", self.name);
+                assert!(
+                    error.data.is_none(),
+                    "peer input details must not enter the diagnostic"
+                );
+                assert!(
+                    observed.is_empty(),
+                    "{}: a later invalid descriptor must prevent even the first valid callback",
+                    self.name
+                );
+                return;
+            }
+            let result = result.expect(self.name);
+            assert_eq!(result.method(), self.method, "{}", self.name);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.encode().unwrap()).unwrap(),
+                self.complete(),
+                "{}",
+                self.name
+            );
+            let inputs = self
+                .input_requests
+                .as_ref()
+                .and_then(serde_json::Value::as_object);
+            assert_eq!(
+                observed.len(),
+                inputs.map_or(0, serde_json::Map::len),
+                "{}",
+                self.name
+            );
+            if let Some(inputs) = inputs {
+                for ((key, expected), actual) in inputs.iter().zip(observed) {
+                    assert_eq!(actual["method"], expected["method"], "{}", self.name);
+                    match expected["method"].as_str().unwrap() {
+                        "sampling/createMessage" => {
+                            for field in [
+                                "messages",
+                                "maxTokens",
+                                "tools",
+                                "toolChoice",
+                                "includeContext",
+                            ] {
+                                assert_eq!(
+                                    actual["params"][field], expected["params"][field],
+                                    "{}: {field}",
+                                    self.name
+                                );
+                            }
+                        }
+                        "elicitation/create" => {
+                            for field in ["message", "requestedSchema", "url"] {
+                                assert_eq!(
+                                    actual["params"][field], expected["params"][field],
+                                    "{}: {field}",
+                                    self.name
+                                );
+                            }
+                            if expected["params"]["mode"] == "url" {
+                                assert_eq!(actual["params"]["elicitationId"], key.as_str());
+                            } else {
+                                assert_eq!(actual["params"]["mode"], "form");
+                            }
+                        }
+                        "roots/list" => assert_eq!(actual["params"], serde_json::json!({})),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn public_http_installed_mrtr_capability_probe(case: InstalledMrtrCapabilityCase) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer_case = case.clone();
+        let peer = std::thread::spawn(move || {
+            let mut stream = accept_http_catalog_test_request(&listener);
+            let discovery = read_http_cache_test_request(&mut stream);
+            assert_eq!(discovery["method"], "server/discover");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                modern_discovery_response("capability-peer", &[MODERN_PROTOCOL_VERSION]).as_bytes(),
+            );
+            let mut stream = accept_http_catalog_test_request(&listener);
+            let original = read_http_cache_test_request(&mut stream);
+            assert_eq!(original["id"], 2);
+            assert_eq!(original["method"], peer_case.method);
+            assert_eq!(
+                original["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                peer_case.capabilities
+            );
+            assert!(original["params"].get("inputResponses").is_none());
+            let response =
+                serde_json::json!({"jsonrpc":"2.0","id":2,"result":peer_case.input_required()});
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &serde_json::to_vec(&response).unwrap(),
+            );
+            if peer_case.accepted {
+                let mut stream = accept_http_catalog_test_request(&listener);
+                let retry = read_http_cache_test_request(&mut stream);
+                assert_eq!(retry["id"], 3);
+                assert_eq!(retry["method"], peer_case.method);
+                assert_eq!(
+                    retry["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                    peer_case.capabilities
+                );
+                assert_eq!(retry["params"]["requestState"], "private-capability-state");
+                if peer_case.responses().as_object().unwrap().is_empty() {
+                    assert!(retry["params"].get("inputResponses").is_none());
+                } else {
+                    assert_eq!(retry["params"]["inputResponses"], peer_case.responses());
+                }
+                let response =
+                    serde_json::json!({"jsonrpc":"2.0","id":3,"result":peer_case.complete()});
+                write_http_cache_test_response(
+                    &mut stream,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
+            }
+            let mut stream = accept_http_catalog_test_request(&listener);
+            let reused = read_http_cache_test_request(&mut stream);
+            let next_id = if peer_case.accepted { 4 } else { 3 };
+            assert_eq!(
+                reused["id"], next_id,
+                "rejection must allocate no continuation ID"
+            );
+            assert_eq!(
+                reused["method"], "tools/list",
+                "rejection must emit no continuation"
+            );
+            assert!(reused["params"].get("requestState").is_none());
+            let response = serde_json::json!({"jsonrpc":"2.0","id":next_id,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}});
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                &serde_json::to_vec(&response).unwrap(),
+            );
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        http_test_runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .capabilities(serde_json::from_value(case.capabilities.clone()).unwrap())
+                .reverse_request_handlers(installed_mrtr_capability_handlers(
+                    &case.capabilities,
+                    &observed,
+                ))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .connect_http_client_with_cx(&cx)
+                .await
+                .unwrap();
+            let result = match case.method {
+                "tools/call" => {
+                    client
+                        .call_tool(&cx, "capability-tool", serde_json::json!({}))
+                        .await
+                }
+                "resources/read" => {
+                    client
+                        .read_resource(&cx, "file:///capability-resource")
+                        .await
+                }
+                "prompts/get" => {
+                    client
+                        .get_prompt(&cx, "capability-prompt", HashMap::new())
+                        .await
+                }
+                _ => unreachable!(),
+            }
+            .map_err(|error| match error {
+                HttpClientError::CoreResult(error) => error,
+                other => panic!("{}: unexpected HTTP failure: {other}", case.name),
+            });
+            case.assert_outcome(result, &observed.lock().unwrap());
+            assert_eq!(
+                client.next_id.load(Ordering::SeqCst),
+                if case.accepted { 4 } else { 3 }
+            );
+            assert!(matches!(
+                client.list_tools(&cx, None).await.unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+        });
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_installed_mrtr_enforces_advertised_hard_capabilities_before_any_callback() {
+        for case in installed_mrtr_capability_cases(false) {
+            public_http_installed_mrtr_capability_probe(case);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_installed_mrtr_resolves_advertised_inputs_and_advisory_context() {
+        for case in installed_mrtr_capability_cases(true) {
+            public_http_installed_mrtr_capability_probe(case);
+        }
+    }
+
     #[cfg(feature = "websocket-experimental")]
     fn public_websocket_installed_mrtr_input_budget(second_round_count: usize) {
         run_test(|| async {
@@ -39021,6 +39641,256 @@ mod tests {
     #[test]
     fn public_websocket_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
         public_websocket_installed_mrtr_input_budget(65);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn public_websocket_installed_mrtr_capability_probe(
+        case: InstalledMrtrCapabilityCase,
+        with_cancellation: bool,
+        invalid_descriptor: bool,
+    ) {
+        let cx = Cx::current().unwrap();
+        let (client_io, peer_io) = async_websocket_pair();
+        let peer_case = case.clone();
+        let mut peer = cx
+            .spawn(move |peer_cx| async move {
+                let mut server = AsyncWsServerTransport::from_upgraded(peer_io);
+                let JsonRpcMessage::Request(discovery) = server.recv(&peer_cx).await.unwrap()
+                else {
+                    panic!("capability peer must first receive discovery");
+                };
+                assert_eq!(discovery.id, Some(RequestId::Number(1)));
+                assert_eq!(discovery.method, SERVER_DISCOVER_METHOD);
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(1),
+                            async_modern_discovery_result(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                let JsonRpcMessage::Request(original) = server.recv(&peer_cx).await.unwrap() else {
+                    panic!("capability peer must receive the original request");
+                };
+                assert_eq!(original.id, Some(RequestId::Number(2)));
+                assert_eq!(original.method, peer_case.method);
+                let original_parameters = original.params.unwrap();
+                assert_eq!(
+                    original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                    peer_case.capabilities
+                );
+                assert!(original_parameters.get("inputResponses").is_none());
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            peer_case.input_required(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                if peer_case.accepted {
+                    let JsonRpcMessage::Request(retry) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("admitted inputs produce one continuation");
+                    };
+                    assert_eq!(retry.id, Some(RequestId::Number(3)));
+                    assert_eq!(retry.method, peer_case.method);
+                    let mut retry_parameters = retry.params.unwrap();
+                    assert_eq!(retry_parameters["requestState"], "private-capability-state");
+                    if peer_case.responses().as_object().unwrap().is_empty() {
+                        assert!(retry_parameters.get("inputResponses").is_none());
+                    } else {
+                        assert_eq!(retry_parameters["inputResponses"], peer_case.responses());
+                    }
+                    retry_parameters
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("requestState");
+                    retry_parameters
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("inputResponses");
+                    assert_eq!(
+                        retry_parameters, original_parameters,
+                        "continuations retain original parameters and advertised capabilities"
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                RequestId::Number(3),
+                                peer_case.complete(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let JsonRpcMessage::Request(reused) = server.recv(&peer_cx).await.unwrap() else {
+                    panic!("a later ordinary request must remain independently usable");
+                };
+                let next_id = if peer_case.accepted { 4 } else { 3 };
+                assert_eq!(reused.id, Some(RequestId::Number(next_id)));
+                assert_eq!(
+                    reused.method, "tools/list",
+                    "refusal must not send a continuation or a partial response map"
+                );
+                let reused_parameters = reused.params.unwrap();
+                assert!(reused_parameters.get("requestState").is_none());
+                assert!(reused_parameters.get("inputResponses").is_none());
+                server
+                    .send(
+                        &peer_cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(next_id),
+                            async_modern_tools_list_result(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    server.recv(&peer_cx).await,
+                    Err(TransportError::Closed)
+                ));
+            })
+            .unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut client = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+            .capabilities(serde_json::from_value(case.capabilities.clone()).unwrap())
+            .reverse_request_handlers(installed_mrtr_capability_handlers(
+                &case.capabilities,
+                &observed,
+            ))
+            .request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
+            )
+            .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+            .await
+            .unwrap();
+        let cancellation = McpRequestCancellation::new();
+        let result = match (case.method, with_cancellation) {
+            ("tools/call", false) => {
+                client
+                    .call_tool(&cx, "capability-tool", serde_json::json!({}))
+                    .await
+            }
+            ("tools/call", true) => {
+                client
+                    .call_tool_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        "capability-tool",
+                        serde_json::json!({}),
+                    )
+                    .await
+            }
+            ("resources/read", false) => {
+                client
+                    .read_resource(&cx, "file:///capability-resource")
+                    .await
+            }
+            ("resources/read", true) => {
+                client
+                    .read_resource_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        "file:///capability-resource",
+                    )
+                    .await
+            }
+            ("prompts/get", false) => {
+                client
+                    .get_prompt(&cx, "capability-prompt", HashMap::new())
+                    .await
+            }
+            ("prompts/get", true) => {
+                client
+                    .get_prompt_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        "capability-prompt",
+                        HashMap::new(),
+                    )
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        if invalid_descriptor {
+            let error = result.unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                "MRTR input-required result contains an invalid embedded input request"
+            );
+            assert!(error.data.is_none());
+            assert!(
+                observed.lock().unwrap().is_empty(),
+                "a malformed later descriptor must prevent the first valid host callback"
+            );
+        } else {
+            case.assert_outcome(result, &observed.lock().unwrap());
+        }
+        assert_eq!(client.next_id, if case.accepted { 4 } else { 3 });
+        assert!(!client.closed);
+        assert!(!cancellation.is_cancel_requested());
+        assert!(matches!(
+            client.list_tools(&cx, None).await.unwrap(),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. })
+        ));
+        client.close(&cx).await.unwrap();
+        peer.join(&cx).await.unwrap();
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_enforces_advertised_hard_capabilities_before_any_callback() {
+        run_test(|| async {
+            for (index, case) in installed_mrtr_capability_cases(false)
+                .into_iter()
+                .enumerate()
+            {
+                public_websocket_installed_mrtr_capability_probe(case, index % 2 != 0, false).await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_resolves_advertised_inputs_and_advisory_context() {
+        run_test(|| async {
+            for (index, case) in installed_mrtr_capability_cases(true)
+                .into_iter()
+                .enumerate()
+            {
+                public_websocket_installed_mrtr_capability_probe(case, index % 2 != 0, false).await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_installed_mrtr_rejects_malformed_later_descriptor_before_any_callback() {
+        run_test(|| async {
+            for (field, value) in [
+                ("tools", serde_json::Value::Null),
+                ("toolChoice", serde_json::json!([])),
+                ("toolChoice", serde_json::json!({"mode": null})),
+                ("includeContext", serde_json::Value::Null),
+            ] {
+                let mut case = installed_mrtr_capability_cases(true)
+                    .into_iter()
+                    .find(|case| case.name == "sampling-empty-choice")
+                    .unwrap();
+                case.accepted = false;
+                case.input_requests.as_mut().unwrap()["z-private-input-key"]["params"][field] =
+                    value;
+                public_websocket_installed_mrtr_capability_probe(case, false, true).await;
+            }
+        });
     }
 
     #[cfg(feature = "websocket-experimental")]
@@ -39513,10 +40383,10 @@ mod tests {
                 .expect_err("missing sampling handler must reject the input_required result");
         match error {
             HttpClientError::CoreResult(error) => {
-                assert!(
-                    error.message.contains("sampling/createMessage"),
-                    "missing handler error must name the requested method: {}",
-                    error.message
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert_eq!(
+                    error.message,
+                    "MRTR input-required result requests an unadvertised client capability"
                 );
             }
             other => panic!("expected a core result error, got {other}"),
@@ -53285,6 +54155,296 @@ IFS= read -r end
         client.close().expect("final tool task client cleanup");
     }
 
+    #[cfg(unix)]
+    fn public_stdio_installed_mrtr_capability_probe(
+        case: InstalledMrtrCapabilityCase,
+        asynchronous: bool,
+    ) {
+        let script = r#"
+IFS= read -r discover || exit 80
+case "$discover" in *'"method":"server/discover"'*) ;; *) exit 81;; esac
+printf '%s\n' "$1"
+IFS= read -r original || exit 82
+case "$original" in *'"method":"'"$6"'"'*) ;; *) exit 83;; esac
+case "$original" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 84;; esac
+case "$original" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *) exit 85;; esac
+case "$original" in *inputResponses*|*requestState*) exit 86;; esac
+printf '%s\n' "$2"
+next=3
+if [ "$4" = accept ]; then
+    IFS= read -r retry || exit 87
+    case "$retry" in *'"method":"'"$6"'"'*) ;; *) exit 88;; esac
+    case "$retry" in *'"id":3,'*|*'"id":3}'*) ;; *) exit 89;; esac
+    case "$retry" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *) exit 90;; esac
+    case "$retry" in *'"requestState":"private-capability-state"'*) ;; *) exit 91;; esac
+    if [ "$5" = '{}' ]; then
+        case "$retry" in *inputResponses*) exit 92;; esac
+    else
+        case "$retry" in *'"inputResponses":'"$5"*) ;; *) exit 93;; esac
+    fi
+    printf '{"jsonrpc":"2.0","id":3,"result":%s}\n' "$7"
+    next=4
+fi
+IFS= read -r reused || exit 94
+case "$reused" in *'"method":"tools/list"'*) ;; *) exit 95;; esac
+case "$reused" in *'"id":'"$next"','*|*'"id":'"$next"'}'*) ;; *) exit 96;; esac
+case "$reused" in *inputResponses*|*requestState*) exit 97;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}\n' "$next"
+IFS= read -r unexpected
+exit 0
+"#;
+        let discovery =
+            modern_discovery_response("stdio-capability-peer", &[MODERN_PROTOCOL_VERSION]);
+        let input =
+            serde_json::json!({"jsonrpc":"2.0","id":2,"result":case.input_required()}).to_string();
+        let capabilities = case.capabilities.to_string();
+        let responses = case.responses().to_string();
+        let complete = case.complete().to_string();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        http_test_runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .capabilities(serde_json::from_value(case.capabilities.clone()).unwrap())
+                .reverse_request_handlers(installed_mrtr_capability_handlers(
+                    &case.capabilities,
+                    &observed,
+                ))
+                .auto_initialize(asynchronous)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .max_retries(0)
+                .connect_stdio_with_cx(
+                    &cx,
+                    "sh",
+                    &[
+                        "-c",
+                        script,
+                        "capability-peer",
+                        &discovery,
+                        &input,
+                        &capabilities,
+                        if case.accepted { "accept" } else { "deny" },
+                        &responses,
+                        case.method,
+                        &complete,
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.is_initialized(), !asynchronous);
+            let result = if asynchronous {
+                match case.method {
+                    "tools/call" => {
+                        client
+                            .call_tool_with_cx(
+                                &cx,
+                                &cancellation,
+                                "capability-tool",
+                                serde_json::json!({}),
+                            )
+                            .await
+                    }
+                    "resources/read" => {
+                        client
+                            .read_resource_with_cx(
+                                &cx,
+                                &cancellation,
+                                "file:///capability-resource",
+                            )
+                            .await
+                    }
+                    "prompts/get" => {
+                        client
+                            .get_prompt_with_cx(
+                                &cx,
+                                &cancellation,
+                                "capability-prompt",
+                                HashMap::new(),
+                            )
+                            .await
+                    }
+                    _ => unreachable!(),
+                }
+            } else {
+                match case.method {
+                    "tools/call" => {
+                        client.call_tool_typed("capability-tool", serde_json::json!({}))
+                    }
+                    "resources/read" => client.read_resource_typed("file:///capability-resource"),
+                    "prompts/get" => client.get_prompt_typed("capability-prompt", HashMap::new()),
+                    _ => unreachable!(),
+                }
+            };
+            case.assert_outcome(result, &observed.lock().unwrap());
+            assert!(client.is_initialized());
+            assert_eq!(
+                client.next_id.load(Ordering::SeqCst),
+                if case.accepted { 4 } else { 3 }
+            );
+            let reused = if asynchronous {
+                client
+                    .request_core_with_cx(&cx, &cancellation, "tools/list", serde_json::json!({}))
+                    .await
+            } else {
+                client.list_tools_typed(None)
+            }
+            .expect("the next request must reuse the transport without an implicit continuation");
+            assert!(matches!(
+                reused,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            cx.checkpoint().unwrap();
+            client.close_with_cx(&cx).await.unwrap();
+            assert!(client.child.is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_installed_mrtr_enforces_advertised_hard_capabilities_before_any_callback() {
+        for asynchronous in [false, true] {
+            for case in installed_mrtr_capability_cases(false) {
+                public_stdio_installed_mrtr_capability_probe(case, asynchronous);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_installed_mrtr_resolves_advertised_inputs_and_advisory_context() {
+        for asynchronous in [false, true] {
+            for case in installed_mrtr_capability_cases(true) {
+                public_stdio_installed_mrtr_capability_probe(case, asynchronous);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn public_stdio_installed_mrtr_input_budget(second_round_count: usize) {
+        let first_round_count = MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+        let rejected = first_round_count + second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES;
+        let discovery =
+            modern_discovery_response("stdio-input-budget-peer", &[MODERN_PROTOCOL_VERSION]);
+        let first = serde_json::json!({"jsonrpc":"2.0","id":2,"result":installed_mrtr_roots_result(first_round_count, "first")}).to_string();
+        let second = serde_json::json!({"jsonrpc":"2.0","id":3,"result":installed_mrtr_roots_result(second_round_count, "second")}).to_string();
+        let expected_responses: serde_json::Map<String, serde_json::Value> = (0..first_round_count)
+            .map(|index| (format!("root-{index}"), serde_json::json!({"roots":[]})))
+            .collect();
+        let expected_responses = serde_json::Value::Object(expected_responses).to_string();
+        let script = r#"
+IFS= read -r discover || exit 80
+case "$discover" in *'"method":"server/discover"'*) ;; *) exit 81;; esac
+printf '%s\n' "$1"
+IFS= read -r first || exit 82
+case "$first" in *'"method":"tools/call"'*) ;; *) exit 83;; esac
+case "$first" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 84;; esac
+case "$first" in *inputResponses*|*requestState*) exit 85;; esac
+printf '%s\n' "$2"
+IFS= read -r second || exit 86
+case "$second" in *'"method":"tools/call"'*) ;; *) exit 87;; esac
+case "$second" in *'"id":3,'*|*'"id":3}'*) ;; *) exit 88;; esac
+case "$second" in *'"requestState":"first"'*) ;; *) exit 89;; esac
+case "$second" in *'"inputResponses":'"$4"*) ;; *) exit 90;; esac
+printf '%s\n' "$3"
+next=4
+if [ "$5" = accept ]; then
+    IFS= read -r third || exit 91
+    case "$third" in *'"method":"tools/call"'*) ;; *) exit 92;; esac
+    case "$third" in *'"id":4,'*|*'"id":4}'*) ;; *) exit 93;; esac
+    case "$third" in *'"requestState":"second"'*) ;; *) exit 94;; esac
+    case "$third" in *'"inputResponses":'"$4"*) ;; *) exit 95;; esac
+    printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","content":[]}}'
+    next=5
+fi
+IFS= read -r reused || exit 96
+case "$reused" in *'"method":"tools/list"'*) ;; *) exit 97;; esac
+case "$reused" in *'"id":'"$next"','*|*'"id":'"$next"'}'*) ;; *) exit 98;; esac
+case "$reused" in *inputResponses*|*requestState*) exit 99;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}\n' "$next"
+IFS= read -r unexpected
+exit 0
+"#;
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        http_test_runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .max_retries(0)
+                .connect_stdio_with_cx(
+                    &cx,
+                    "sh",
+                    &[
+                        "-c",
+                        script,
+                        "input-budget-peer",
+                        &discovery,
+                        &first,
+                        &second,
+                        &expected_responses,
+                        if rejected { "deny" } else { "accept" },
+                    ],
+                )
+                .await
+                .unwrap();
+            let result = client.call_tool_typed("budget-tool", serde_json::json!({}));
+            if rejected {
+                let error =
+                    result.expect_err("the second round must be refused before its first callback");
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(error.message, "MRTR total input-response limit exceeded");
+                assert_eq!(
+                    callbacks.load(Ordering::SeqCst),
+                    first_round_count,
+                    "none of the 65 second-round callbacks may run"
+                );
+                assert_eq!(
+                    client.next_id.load(Ordering::SeqCst),
+                    4,
+                    "the rejected round must allocate no continuation ID"
+                );
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                ));
+                assert_eq!(
+                    callbacks.load(Ordering::SeqCst),
+                    MAX_MRTR_TOTAL_INPUT_RESPONSES
+                );
+                assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+            }
+            assert!(matches!(
+                client.list_tools_typed(None).unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            assert!(client.is_initialized());
+            cx.checkpoint().unwrap();
+            client.close_with_cx(&cx).await.unwrap();
+            assert!(client.child.is_none());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget() {
+        public_stdio_installed_mrtr_input_budget(64);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
+        public_stdio_installed_mrtr_input_budget(65);
+    }
+
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     fn async_mrtr_probe(method: &'static str, mode: &'static str) {
         struct HandlerDrop(Arc<AtomicBool>);
@@ -53593,7 +54753,7 @@ exec sleep 5
                                 assert!(result_elapsed - last_callback < timeout, "a continuation must not receive a fresh absolute budget");
                             }
                         }
-                        "missing-handler" => assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidParams),
+                        "missing-handler" => assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest),
                         "handler-error" => assert_eq!(result.unwrap_err().message, "input handler failed"),
                         "malformed" => {
                             assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);

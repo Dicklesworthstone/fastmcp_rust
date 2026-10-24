@@ -6,7 +6,7 @@ use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::http_headers::ParameterHeaderBinding;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_protocol::{CoreResult, FinalCoreResult};
+use fastmcp_protocol::{CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FinalCoreResult};
 use serde_json::{Value, json};
 
 use super::{ReviewedToolHeaders, ToolHeaderDispatchError};
@@ -157,7 +157,10 @@ impl HttpClient {
             .modern_reverse_request_handlers()
             .filter(|handlers| handlers.has_modern_handlers())
             .cloned();
-        let original = json!({"name":reviewed.tool_name(), "arguments":arguments});
+        let original = self.core_request_parameters(
+            &json!({"name":reviewed.tool_name(), "arguments":arguments}),
+        )?;
+        let capabilities = original["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original.clone();
         let mut refreshed = None;
         let mut repair_used = false;
@@ -213,7 +216,7 @@ impl HttpClient {
                     McpError::invalid_params("MRTR total input-response limit exceeded")
                 })?;
             let responses = handlers
-                .respond_to_input_required_async(cx, input_required, || {
+                .respond_to_input_required_async(cx, &capabilities, input_required, || {
                     if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
                         return Err(McpError::request_cancelled());
                     }
@@ -685,6 +688,54 @@ mod tests {
             .map(|call| call.body["id"].to_string())
             .collect();
         assert_eq!(ids.len(), captured.len());
+    }
+
+    #[test]
+    fn live_loopback_mrtr_rejects_unadvertised_later_input_before_callbacks_and_retry() {
+        let input_required = result(
+            "tools/call",
+            json!({
+                "resultType":"input_required", "requestState":"private-state",
+                "inputRequests":{
+                    "a-valid":{"method":"roots/list"},
+                    "z-private-input-key":{
+                        "method":"sampling/createMessage",
+                        "params":{"messages":[],"maxTokens":1}
+                    }
+                }
+            }),
+        );
+        let (outcome, captured, callbacks) = exercise(vec![input_required], true, false, false);
+        let Err(HttpClientError::CoreResult(error)) = outcome else {
+            panic!("an unadvertised sampling input must reject the complete round");
+        };
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "MRTR input-required result requests an unadvertised client capability"
+        );
+        assert!(error.data.is_none());
+        assert_eq!(callbacks, 0, "the earlier valid roots handler must not run");
+        assert_eq!(captured.len(), 2, "a denied round sends no continuation");
+        let call = &captured[1];
+        assert_eq!(call.body["method"], "tools/call");
+        assert_eq!(call.body["id"], 2);
+        assert_eq!(
+            call.body["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+            json!({"roots":{}})
+        );
+        assert_eq!(
+            call.body["params"]["arguments"],
+            json!({"region":"east","bodyOnly":"private"})
+        );
+        assert!(call.body["params"].get("inputResponses").is_none());
+        assert!(call.body["params"].get("requestState").is_none());
+        assert_eq!(
+            mirrored(call, "Mcp-Param-OldRegion").as_deref(),
+            Some("east")
+        );
+        assert_eq!(mirrored(call, "Mcp-Param-Region"), None);
+        assert!(!call.headers.contains("private"));
     }
 
     #[test]
