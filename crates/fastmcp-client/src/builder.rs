@@ -1125,6 +1125,7 @@ impl ClientBuilder {
         ))
         .await?;
         client.request_timeout_policy = self.timeout_policy;
+        client.subscription_timeout_policy = self.subscription_timeout_policy;
         Ok(client)
     }
 
@@ -1159,6 +1160,7 @@ impl ClientBuilder {
         )
         .await?;
         client.request_timeout_policy = self.timeout_policy;
+        client.subscription_timeout_policy = self.subscription_timeout_policy;
         Ok(client)
     }
 
