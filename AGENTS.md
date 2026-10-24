@@ -108,7 +108,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `chrono` | Date/time handling |
 | `clap` | CLI argument parsing |
 | `notify` + `glob` | File watching for dev mode |
-| `getrandom` | Cryptographic RNG (WebSocket masking) |
+| `getrandom` | OS entropy behind the sealed `fastmcp-core` random draws: HMAC keys, security identifiers, ephemeral key material, nonce domains, WebSocket masks |
 | `sha2` + `hmac` | Bounded SHA-256 and HMAC primitives for credential digests, partitioning, and protocol security |
 | `regex` | JSON Schema `pattern` validation |
 | `base64` | Opaque cursor encoding for pagination |
