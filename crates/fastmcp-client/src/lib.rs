@@ -5431,6 +5431,10 @@ where
     request_timeout_policy: RequestTimeoutPolicy,
     final_server_notifications: VecDeque<ServerNotification>,
     final_progress_notifications: VecDeque<FinalProgressNotificationParams>,
+    /// Catalog receipts remain observable if subscription cleanup drains queues.
+    tools_list_generation: u64,
+    resources_list_generation: u64,
+    prompts_list_generation: u64,
     /// Exact-2024 server notifications retained from the WebSocket receive loop.
     legacy_server_notifications: VecDeque<JsonRpcRequest>,
     retired_requests: VecDeque<RetiredWebSocketRequest>,
@@ -5671,6 +5675,9 @@ where
             request_timeout_policy: RequestTimeoutPolicy::default(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
+            tools_list_generation: 0,
+            resources_list_generation: 0,
+            prompts_list_generation: 0,
             legacy_server_notifications: VecDeque::new(),
             retired_requests: VecDeque::new(),
             live_catalog_subscription: None,
@@ -6265,6 +6272,27 @@ where
             .is_some_and(|id| id.correlates_with(request_id))
     }
 
+    fn websocket_catalog_generation(&self, method: &str) -> u64 {
+        match method {
+            "tools/list" => self.tools_list_generation,
+            "resources/list" | "resources/templates/list" => self.resources_list_generation,
+            "prompts/list" => self.prompts_list_generation,
+            _ => 0,
+        }
+    }
+
+    fn record_websocket_catalog_change(&mut self, notification_method: &str) {
+        let generation = match notification_method {
+            NOTIFICATIONS_TOOLS_LIST_CHANGED => &mut self.tools_list_generation,
+            NOTIFICATIONS_RESOURCES_LIST_CHANGED => &mut self.resources_list_generation,
+            NOTIFICATIONS_PROMPTS_LIST_CHANGED => &mut self.prompts_list_generation,
+            _ => return,
+        };
+        // A bounded ingress queue cannot admit 2^64 events during one page.
+        // Wrapping preserves a signal at MAX instead of saturating forever.
+        *generation = generation.wrapping_add(1);
+    }
+
     fn retain_modern_websocket_notification(
         &mut self,
         frame: &ReceivedTransportFrame,
@@ -6298,6 +6326,7 @@ where
                 ));
             }
             self.final_server_notifications.push_back(notification);
+            self.record_websocket_catalog_change(&request.method);
             return Ok(true);
         };
         if self.final_progress_notifications.len() >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
@@ -6322,6 +6351,7 @@ where
             ));
         }
         self.legacy_server_notifications.push_back(request.clone());
+        self.record_websocket_catalog_change(&request.method);
         Ok(true)
     }
 
@@ -6677,6 +6707,328 @@ where
         IO: Send + 'static,
     {
         self.request_core_verb(cx, method, parameters).await
+    }
+
+    /// Collects every tools page while preserving exact selected-era results.
+    ///
+    /// `params.cursor` must be absent. Include/exclude filters and local client
+    /// identity survive every request. Empty and repeated cursors are passed
+    /// back verbatim; only an absent cursor completes the collection.
+    ///
+    /// The complete traversal, including discarded rebuild pages, is bounded
+    /// by 1,024 requests/pages, 100,000 entries, 64 MiB of encoded results,
+    /// 4 KiB cursors, and the earliest of five minutes, the configured absolute
+    /// request timeout, or the caller deadline. Response waits use the remaining
+    /// traversal budget after each send commits. A failed traversal returns no
+    /// partial collection.
+    ///
+    /// WebSocket pages are fetched from the peer without a result cache. A
+    /// rejected continuation cursor, observed matching list-change notification,
+    /// or change in modern cache scope discards the traversal and permits one
+    /// cursorless rebuild. Notifications remain available to their caller.
+    /// Each page retains its own TTL, scope, metadata and exact unknown result
+    /// members. This local consistency policy does not promise a server snapshot.
+    pub async fn list_all_tools(
+        &mut self,
+        cx: &Cx,
+        params: ListToolsParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            None,
+            "tools/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all tools with the bounds and consistency policy of
+    /// [`Self::list_all_tools`] under a request-local cancellation domain.
+    /// Cancellation retires the active page without cancelling the connection.
+    pub async fn list_all_tools_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListToolsParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            Some(cancellation),
+            "tools/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects every resource page with the bounds and consistency policy of
+    /// [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub async fn list_all_resources(
+        &mut self,
+        cx: &Cx,
+        params: ListResourcesParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            None,
+            "resources/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all resources under a request-local cancellation domain.
+    /// See [`Self::list_all_tools`] for bounds and consistency semantics.
+    pub async fn list_all_resources_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourcesParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            Some(cancellation),
+            "resources/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects every resource-template page with the bounds and consistency
+    /// policy of [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub async fn list_all_resource_templates(
+        &mut self,
+        cx: &Cx,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            None,
+            "resources/templates/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all resource templates under a request-local cancellation domain.
+    /// See [`Self::list_all_tools`] for bounds and consistency semantics.
+    pub async fn list_all_resource_templates_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListResourceTemplatesParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            Some(cancellation),
+            "resources/templates/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects every prompt page with the bounds and consistency policy of
+    /// [`Self::list_all_tools`]. The initial cursor must be absent.
+    pub async fn list_all_prompts(
+        &mut self,
+        cx: &Cx,
+        params: ListPromptsParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            None,
+            "prompts/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    /// Collects all prompts under a request-local cancellation domain.
+    /// See [`Self::list_all_tools`] for bounds and consistency semantics.
+    pub async fn list_all_prompts_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        params: ListPromptsParams,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        self.collect_websocket_catalog_with_budget(
+            cx,
+            Some(cancellation),
+            "prompts/list",
+            list_catalog_wire_parameters(
+                params.cursor.as_deref(),
+                params.include_tags.as_ref(),
+                params.exclude_tags.as_ref(),
+            ),
+            PaginationBudget::for_request(self.request_timeout_policy),
+        )
+        .await
+    }
+
+    async fn collect_websocket_catalog_with_budget(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &'static str,
+        parameters: serde_json::Value,
+        mut budget: PaginationBudget,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: Send + 'static,
+    {
+        if parameters.get("cursor").is_some() {
+            return Err(McpError::invalid_params(
+                "Complete WebSocket catalog collection requires an absent initial cursor",
+            ));
+        }
+        let cancelled = || {
+            cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                || cx.checkpoint().is_err()
+                || cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline)
+        };
+        let mut rebuilds = 0;
+        'rebuild: loop {
+            let mut pages = Vec::new();
+            let mut item_count = 0;
+            let mut cursor: Option<String> = None;
+            let mut scope: Option<fastmcp_protocol::CacheScope> = None;
+            loop {
+                if cancelled() {
+                    return Err(McpError::request_cancelled());
+                }
+                budget.begin_page()?;
+                let mut page_parameters = parameters.clone();
+                if let Some(cursor) = cursor.as_ref() {
+                    page_parameters["cursor"] = serde_json::Value::String(cursor.clone());
+                }
+                let generation = self.websocket_catalog_generation(method);
+                // The native request owner bounds this individual wait and
+                // retires its exact ID on expiry. Do not drop that owner from
+                // an outer timeout around the complete traversal.
+                let page = self
+                    .request_core_verb_with_options(
+                        cx,
+                        cancellation,
+                        Some(budget.deadline),
+                        method,
+                        page_parameters,
+                    )
+                    .await;
+                let result = match page {
+                    Err(error)
+                        if !self.closed
+                            && cursor.is_some()
+                            && error.code == McpErrorCode::InvalidParams
+                            && rebuilds == 0 =>
+                    {
+                        if cancelled() {
+                            return Err(McpError::request_cancelled());
+                        }
+                        budget.check_deadline()?;
+                        rebuilds += 1;
+                        continue 'rebuild;
+                    }
+                    // The request owner can report a failed cancellation
+                    // send or settled connection failure. Preserve it rather
+                    // than replacing it with the elapsed traversal budget.
+                    other => other?,
+                };
+                if cancelled() {
+                    return Err(McpError::request_cancelled());
+                }
+                budget.check_deadline()?;
+                let (page_items, next_cursor) = catalog_page(method, &result)?;
+                budget.account_core_page(&result, page_items)?;
+                let next_cursor = budget.admit_next_cursor(next_cursor)?;
+                let page_scope = final_cache_hints(&result).map(|(_, scope)| scope);
+                let changed_scope = scope.is_some_and(|previous| Some(previous) != page_scope);
+                if let Some(page_scope) = page_scope {
+                    scope.get_or_insert(page_scope);
+                }
+                let changed_catalog = self.websocket_catalog_generation(method) != generation;
+                if changed_scope || changed_catalog {
+                    if rebuilds != 0 {
+                        return Err(McpError::invalid_request(
+                            "WebSocket catalog changed during its bounded rebuild",
+                        ));
+                    }
+                    rebuilds += 1;
+                    continue 'rebuild;
+                }
+                item_count += page_items;
+                pages.push(result);
+                cursor = next_cursor;
+                budget.check_deadline()?;
+                if cursor.is_none() {
+                    return Ok(CollectedCatalog {
+                        method,
+                        pages,
+                        item_count,
+                    });
+                }
+            }
+        }
     }
 
     /// Proves the peer is answering through the negotiated WebSocket era:
@@ -10671,10 +11023,13 @@ pub struct BoundedListPage<T> {
 /// A complete catalog traversal, retaining each exact selected-era result page.
 ///
 /// Pages preserve their individual TTL, cache scope and unknown result members;
-/// no merged result or synthetic TTL is created. Modern collections use one
-/// local invalidation generation and cache scope, but do not promise an atomic
-/// snapshot of a changing server catalog. A failed traversal returns no partial
-/// collection. The same representation is used for stdio and HTTP catalogs.
+/// no merged result or synthetic TTL is created. Cached stdio and HTTP modern
+/// collections use one local invalidation generation and cache scope. WebSocket
+/// collections fetch uncached pages with a consistent modern cache scope and
+/// restart on an observed matching list-change notification. These local
+/// policies do not promise an atomic snapshot of a changing server catalog.
+/// A failed traversal returns no partial collection. The same representation
+/// is used for stdio, HTTP and WebSocket catalogs.
 #[derive(Debug, Clone)]
 pub struct CollectedCatalog {
     method: &'static str,
@@ -26317,6 +26672,1054 @@ mod tests {
                 .await
                 .expect("client closes after late-response reuse proof");
             assert!(matches!(peer.join(&cx).await, Ok(())));
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn websocket_catalog_test_result(
+        method: &str,
+        name: Option<&str>,
+        cursor: Option<&str>,
+        scope: &str,
+        legacy: bool,
+    ) -> String {
+        let (field, item) = match method {
+            "tools/list" => (
+                "tools",
+                serde_json::json!({"name":name,"inputSchema":{"type":"object"}}),
+            ),
+            "resources/list" => (
+                "resources",
+                serde_json::json!({"name":name,"uri":format!("file:///{}", name.unwrap_or("empty"))}),
+            ),
+            "resources/templates/list" => (
+                "resourceTemplates",
+                serde_json::json!({"name":name,"uriTemplate":"file:///{name}"}),
+            ),
+            "prompts/list" => ("prompts", serde_json::json!({"name":name})),
+            _ => panic!("unknown catalog test method"),
+        };
+        let mut result = serde_json::json!({});
+        result[field] = if name.is_some() {
+            serde_json::json!([item])
+        } else {
+            serde_json::json!([])
+        };
+        if let Some(cursor) = cursor {
+            result["nextCursor"] = serde_json::json!(cursor);
+        }
+        if !legacy {
+            result["resultType"] = serde_json::json!("complete");
+            result["ttlMs"] = serde_json::json!(0);
+            result["cacheScope"] = serde_json::json!(scope);
+            result["_meta"] = serde_json::json!({"com.example/page":name});
+        }
+        let mut source = result.to_string();
+        if !legacy {
+            source.pop();
+            source.push_str(
+                ",\"vendorExact\":922337203685477580812345678901234567890,\"vendorDecimal\":1.2300e+42,\"vendorHints\":{\"nextCursor\":\"inert\",\"ttlMs\":999}}",
+            );
+        }
+        source
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn websocket_catalog_test_fixture(
+        cx: &Cx,
+        legacy: bool,
+    ) -> (
+        WebSocketClient<asupersync::net::tcp::VirtualTcpStream>,
+        asupersync::net::tcp::VirtualTcpStream,
+    ) {
+        let (client_io, mut peer_io) = async_websocket_pair();
+        let discovery = if legacy {
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"catalog-peer","version":"1"}}}"#.to_owned()
+        } else {
+            raw_modern_discovery_source("1")
+        };
+        write_server_text_frame(&mut peer_io, &discovery).await;
+        let client = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::websocket(if legacy {
+                ProtocolPolicy::LegacyOnly
+            } else {
+                ProtocolPolicy::ModernOnly
+            }))
+            .client_info("catalog-client", "7")
+            .connect_websocket_with_cx(cx, AsyncWsClientTransport::from_upgraded(client_io))
+            .await
+            .expect("public WebSocket builder negotiates the selected catalog era");
+        (client, peer_io)
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn invoke_websocket_catalog_test<IO>(
+        client: &mut WebSocketClient<IO>,
+        cx: &Cx,
+        method: &str,
+        cancellation: Option<&McpRequestCancellation>,
+        cursor: Option<String>,
+    ) -> McpResult<CollectedCatalog>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let include_tags = Some(vec!["visible".to_owned()]);
+        let exclude_tags = Some(vec!["hidden".to_owned()]);
+        macro_rules! collect {
+            ($params:ident, $ordinary:ident, $cancellable:ident) => {
+                match cancellation {
+                                    Some(cancellation) => client.$cancellable(
+                                        cx,
+                                        cancellation,
+                                        $params { cursor, include_tags, exclude_tags },
+                                    ).await,
+                                    None => client.$ordinary(
+                                        cx,
+                                        $params { cursor, include_tags, exclude_tags },
+                                    ).await,
+                                }
+            };
+        }
+        match method {
+            "tools/list" => collect!(
+                ListToolsParams,
+                list_all_tools,
+                list_all_tools_with_cancellation
+            ),
+            "resources/list" => collect!(
+                ListResourcesParams,
+                list_all_resources,
+                list_all_resources_with_cancellation
+            ),
+            "resources/templates/list" => collect!(
+                ListResourceTemplatesParams,
+                list_all_resource_templates,
+                list_all_resource_templates_with_cancellation
+            ),
+            "prompts/list" => collect!(
+                ListPromptsParams,
+                list_all_prompts,
+                list_all_prompts_with_cancellation
+            ),
+            _ => panic!("unknown catalog test method"),
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn receive_websocket_catalog_test_handshake(
+        peer: &mut AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+        cx: &Cx,
+        legacy: bool,
+    ) {
+        let JsonRpcMessage::Request(request) = peer.recv(cx).await.unwrap() else {
+            panic!("catalog connection begins with discovery or initialize");
+        };
+        if legacy {
+            assert_eq!(request.method, "initialize");
+            assert_eq!(
+                request.params.unwrap()["clientInfo"]["name"],
+                "catalog-client"
+            );
+            let JsonRpcMessage::Request(initialized) = peer.recv(cx).await.unwrap() else {
+                panic!("exact legacy initialization requires an acknowledgement");
+            };
+            assert_eq!(initialized.method, "notifications/initialized");
+            assert!(initialized.id.is_none());
+        } else {
+            assert_eq!(request.method, "server/discover");
+            assert_eq!(
+                request.params.unwrap()["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+                "catalog-client"
+            );
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn assert_websocket_catalog_test_request(
+        peer: &mut AsyncWsServerTransport<asupersync::net::tcp::VirtualTcpStream>,
+        cx: &Cx,
+        method: &str,
+        id: i64,
+        cursor: Option<&str>,
+        legacy: bool,
+    ) {
+        let JsonRpcMessage::Request(request) = peer.recv(cx).await.unwrap() else {
+            panic!("catalog page must be a request");
+        };
+        assert_eq!(request.method, method);
+        assert!(request.id.unwrap().correlates_with(&RequestId::Number(id)));
+        let parameters = request.params.unwrap();
+        assert_eq!(
+            parameters.get("cursor").and_then(serde_json::Value::as_str),
+            cursor
+        );
+        assert_eq!(parameters["includeTags"], serde_json::json!(["visible"]));
+        assert_eq!(parameters["excludeTags"], serde_json::json!(["hidden"]));
+        if legacy {
+            assert!(parameters.get("_meta").is_none());
+            assert!(parameters.get("protocolVersion").is_none());
+        } else {
+            assert_eq!(
+                parameters["_meta"]["io.modelcontextprotocol/clientInfo"],
+                serde_json::json!({"name":"catalog-client","version":"7"})
+            );
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn websocket_catalogs_preserve_pages_probe(legacy: bool) {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                for cancellable in [false, true] {
+                    let (mut client, mut peer_io) =
+                        websocket_catalog_test_fixture(&cx, legacy).await;
+                    let names = [Some("first"), None, Some("third"), Some("last")];
+                    for (index, cursor) in [Some(""), Some(" opaque "), Some(" opaque "), None]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let result = websocket_catalog_test_result(
+                            method,
+                            names[index],
+                            cursor,
+                            "private",
+                            legacy,
+                        );
+                        write_server_text_frame(
+                            &mut peer_io,
+                            &format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",
+                                index + 2
+                            ),
+                        )
+                        .await;
+                    }
+                    let cancellation = McpRequestCancellation::new();
+                    let collection = invoke_websocket_catalog_test(
+                        &mut client,
+                        &cx,
+                        method,
+                        cancellable.then_some(&cancellation),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(collection.method(), method);
+                    assert_eq!(collection.item_count(), 3);
+                    assert_eq!(collection.pages().len(), 4);
+                    for (index, page) in collection.pages().iter().enumerate() {
+                        assert_eq!(
+                            page.era(),
+                            if legacy {
+                                ProtocolEra::Legacy2024
+                            } else {
+                                ProtocolEra::Modern2026
+                            }
+                        );
+                        let encoded = page.encode().unwrap();
+                        if !legacy {
+                            assert!(encoded.contains(
+                                "\"vendorExact\":922337203685477580812345678901234567890"
+                            ));
+                            assert!(encoded.contains("\"vendorDecimal\":1.2300e+42"));
+                            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+                            assert_eq!(
+                                value["_meta"]["com.example/page"],
+                                serde_json::json!(names[index])
+                            );
+                            assert_eq!(value["ttlMs"], 0);
+                            assert_eq!(value["cacheScope"], "private");
+                            assert_eq!(value["vendorHints"]["nextCursor"], "inert");
+                        }
+                    }
+                    assert_eq!(
+                        client.next_id, 6,
+                        "only absent nextCursor completes the walk"
+                    );
+                    let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                    receive_websocket_catalog_test_handshake(&mut peer, &cx, legacy).await;
+                    for (index, cursor) in [None, Some(""), Some(" opaque "), Some(" opaque ")]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        assert_websocket_catalog_test_request(
+                            &mut peer,
+                            &cx,
+                            method,
+                            index as i64 + 2,
+                            cursor,
+                            legacy,
+                        )
+                        .await;
+                    }
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_all_catalogs_preserve_opaque_cursors_filters_and_exact_pages() {
+        websocket_catalogs_preserve_pages_probe(false);
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn clt_01_websocket_all_catalogs_preserve_exact_legacy_pages_and_request_shapes() {
+        websocket_catalogs_preserve_pages_probe(true);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_catalog_bounds_charge_complete_pages_and_stop_without_extra_rpc() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let first = websocket_catalog_test_result(
+                "tools/list",
+                Some("first"),
+                Some("next"),
+                "private",
+                false,
+            );
+            let last =
+                websocket_catalog_test_result("tools/list", Some("last"), None, "private", false);
+            for dimension in ["pages", "items", "bytes", "cursor"] {
+                for rejected in [false, true] {
+                    let (mut client, mut peer_io) =
+                        websocket_catalog_test_fixture(&cx, false).await;
+                    let mut limits = PaginationLimits::DEFAULT;
+                    let error_message = match dimension {
+                        "pages" => {
+                            limits.pages = if rejected { 1 } else { 2 };
+                            PAGINATION_PAGE_LIMIT_ERROR
+                        }
+                        "items" => {
+                            limits.items = if rejected { 1 } else { 2 };
+                            PAGINATION_ITEM_LIMIT_ERROR
+                        }
+                        "bytes" => {
+                            limits.serialized_bytes =
+                                first.len() + last.len() - usize::from(rejected);
+                            PAGINATION_BYTE_LIMIT_ERROR
+                        }
+                        "cursor" => {
+                            limits.cursor_bytes = if rejected { 3 } else { 4 };
+                            PAGINATION_CURSOR_LIMIT_ERROR
+                        }
+                        _ => unreachable!(),
+                    };
+                    let admitted_pages = if rejected && matches!(dimension, "pages" | "cursor") {
+                        1
+                    } else {
+                        2
+                    };
+                    for (index, result) in
+                        [&first, &last].into_iter().take(admitted_pages).enumerate()
+                    {
+                        write_server_text_frame(
+                            &mut peer_io,
+                            &format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}",
+                                index + 2
+                            ),
+                        )
+                        .await;
+                    }
+                    let reuse_id = admitted_pages + 2;
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{reuse_id},\"result\":{}}}",
+                            websocket_catalog_test_result(
+                                "tools/list",
+                                Some("healthy"),
+                                None,
+                                "private",
+                                false
+                            )
+                        ),
+                    )
+                    .await;
+                    let result = client
+                        .collect_websocket_catalog_with_budget(
+                            &cx,
+                            None,
+                            "tools/list",
+                            serde_json::json!({"includeTags":["visible"],"excludeTags":["hidden"]}),
+                            PaginationBudget::with_limits(limits),
+                        )
+                        .await;
+                    if rejected {
+                        let error = result
+                            .expect_err("one excess unit must fail without a partial collection");
+                        assert_eq!(error.code, McpErrorCode::InternalError, "{dimension}");
+                        assert_eq!(error.message, error_message, "{dimension}");
+                    } else {
+                        let collection = result.expect("the exact boundary is admitted");
+                        assert_eq!(collection.item_count(), 2);
+                        assert_eq!(collection.pages().len(), 2);
+                        assert_eq!(
+                            collection
+                                .pages()
+                                .iter()
+                                .map(|page| page.encode().unwrap().len())
+                                .sum::<usize>(),
+                            first.len() + last.len()
+                        );
+                    }
+                    assert_eq!(
+                        client.next_id, reuse_id as u64,
+                        "{dimension} must not allocate another catalog request"
+                    );
+                    assert!(!client.closed);
+                    assert!(
+                        client
+                            .list_tools(&cx, None)
+                            .await
+                            .unwrap()
+                            .encode()
+                            .unwrap()
+                            .contains("healthy")
+                    );
+                    let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                    receive_websocket_catalog_test_handshake(&mut peer, &cx, false).await;
+                    for index in 0..admitted_pages {
+                        assert_websocket_catalog_test_request(
+                            &mut peer,
+                            &cx,
+                            "tools/list",
+                            index as i64 + 2,
+                            (index != 0).then_some("next"),
+                            false,
+                        )
+                        .await;
+                    }
+                    let JsonRpcMessage::Request(reused) = peer.recv(&cx).await.unwrap() else {
+                        panic!("reuse must be a request");
+                    };
+                    assert_eq!(reused.method, "tools/list");
+                    assert!(
+                        reused
+                            .id
+                            .unwrap()
+                            .correlates_with(&RequestId::Number(reuse_id as i64))
+                    );
+                    assert!(reused.params.unwrap().get("cursor").is_none());
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_catalog_rebuilds_cursor_scope_or_observed_changes_only_once() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for (method, cause) in [
+                ("tools/list", "cursor"),
+                ("tools/list", "scope"),
+                ("tools/list", "notification"),
+                ("resources/list", "notification"),
+                ("resources/templates/list", "notification"),
+                ("prompts/list", "notification"),
+            ] {
+                for reject_rebuild in [false, true] {
+                    let (mut client, mut peer_io) =
+                        websocket_catalog_test_fixture(&cx, false).await;
+                    let matching = match method {
+                        "tools/list" => NOTIFICATIONS_TOOLS_LIST_CHANGED,
+                        "resources/list" | "resources/templates/list" => {
+                            NOTIFICATIONS_RESOURCES_LIST_CHANGED
+                        }
+                        "prompts/list" => NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+                        _ => unreachable!(),
+                    };
+                    let unrelated = if matching == NOTIFICATIONS_TOOLS_LIST_CHANGED {
+                        NOTIFICATIONS_PROMPTS_LIST_CHANGED
+                    } else {
+                        NOTIFICATIONS_TOOLS_LIST_CHANGED
+                    };
+                    // Existing receipts and changes to a different catalog
+                    // must not discard this traversal's first page.
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::json!({"jsonrpc":"2.0","method":unrelated,"params":{}})
+                            .to_string(),
+                    )
+                    .await;
+                    for index in 0..4 {
+                        let change = index == 1 || (index == 3 && reject_rebuild);
+                        if cause == "notification" && change {
+                            write_server_text_frame(
+                                &mut peer_io,
+                                &serde_json::json!({"jsonrpc":"2.0","method":matching,"params":{}})
+                                    .to_string(),
+                            )
+                            .await;
+                        }
+                        let response = if cause == "cursor" && change {
+                            serde_json::json!({"jsonrpc":"2.0","id":index + 2,"error":{"code":-32602,"message":"invalid cursor"}}).to_string()
+                        } else {
+                            let (name, cursor) = match index {
+                                0 => ("discarded-first", Some("old")),
+                                1 => ("discarded-last", None),
+                                2 => ("fresh-first", Some("new")),
+                                _ => ("fresh-last", None),
+                            };
+                            let scope = if cause == "scope" && change {
+                                "public"
+                            } else {
+                                "private"
+                            };
+                            format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
+                                index + 2,
+                                websocket_catalog_test_result(
+                                    method,
+                                    Some(name),
+                                    cursor,
+                                    scope,
+                                    false
+                                )
+                            )
+                        };
+                        write_server_text_frame(&mut peer_io, &response).await;
+                    }
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{}}}",
+                            websocket_catalog_test_result(
+                                "tools/list",
+                                Some("healthy"),
+                                None,
+                                "private",
+                                false
+                            )
+                        ),
+                    )
+                    .await;
+                    let result =
+                        invoke_websocket_catalog_test(&mut client, &cx, method, None, None).await;
+                    if reject_rebuild {
+                        let error = result
+                            .expect_err("a second inconsistency cannot authorize another rebuild");
+                        assert_eq!(
+                            error.code,
+                            if cause == "cursor" {
+                                McpErrorCode::InvalidParams
+                            } else {
+                                McpErrorCode::InvalidRequest
+                            }
+                        );
+                    } else {
+                        let collection =
+                            result.expect("one inconsistency permits a cursorless rebuild");
+                        assert_eq!(collection.pages().len(), 2);
+                        assert_eq!(collection.item_count(), 2);
+                        assert!(
+                            collection.pages()[0]
+                                .encode()
+                                .unwrap()
+                                .contains("fresh-first")
+                        );
+                        assert!(
+                            collection.pages()[1]
+                                .encode()
+                                .unwrap()
+                                .contains("fresh-last")
+                        );
+                        assert!(
+                            collection
+                                .pages()
+                                .iter()
+                                .all(|page| !page.encode().unwrap().contains("discarded"))
+                        );
+                    }
+                    assert_eq!(client.next_id, 6, "{cause} must allow at most one rebuild");
+                    let receipts = client.take_final_server_notifications();
+                    assert_eq!(
+                        receipts.len(),
+                        1 + if cause == "notification" {
+                            1 + usize::from(reject_rebuild)
+                        } else {
+                            0
+                        }
+                    );
+                    assert!(!client.closed);
+                    assert!(
+                        client
+                            .list_tools(&cx, None)
+                            .await
+                            .unwrap()
+                            .encode()
+                            .unwrap()
+                            .contains("healthy")
+                    );
+                    let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                    receive_websocket_catalog_test_handshake(&mut peer, &cx, false).await;
+                    for (index, cursor) in [None, Some("old"), None, Some("new")]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        assert_websocket_catalog_test_request(
+                            &mut peer,
+                            &cx,
+                            method,
+                            index as i64 + 2,
+                            cursor,
+                            false,
+                        )
+                        .await;
+                    }
+                    let JsonRpcMessage::Request(reused) = peer.recv(&cx).await.unwrap() else {
+                        panic!("reuse must be a request");
+                    };
+                    assert!(reused.id.unwrap().correlates_with(&RequestId::Number(6)));
+                    client.close(&cx).await.unwrap();
+                    assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn cache_03_websocket_catalog_rebuild_does_not_reset_the_page_budget() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for rejected in [false, true] {
+                let (mut client, mut peer_io) = websocket_catalog_test_fixture(&cx, false).await;
+                let admitted_pages = if rejected { 3 } else { 4 };
+                for index in 0..admitted_pages {
+                    let response = if index == 1 {
+                        serde_json::json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"invalid cursor"}}).to_string()
+                    } else {
+                        let (name, cursor) = match index {
+                            0 => ("discarded", Some("old")),
+                            2 => ("fresh-first", Some("new")),
+                            _ => ("fresh-last", None),
+                        };
+                        format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
+                            index + 2,
+                            websocket_catalog_test_result(
+                                "tools/list",
+                                Some(name),
+                                cursor,
+                                "private",
+                                false
+                            )
+                        )
+                    };
+                    write_server_text_frame(&mut peer_io, &response).await;
+                }
+                let limits = PaginationLimits {
+                    pages: admitted_pages,
+                    ..PaginationLimits::DEFAULT
+                };
+                let result = client
+                    .collect_websocket_catalog_with_budget(
+                        &cx,
+                        None,
+                        "tools/list",
+                        serde_json::json!({}),
+                        PaginationBudget::with_limits(limits),
+                    )
+                    .await;
+                if rejected {
+                    assert_eq!(result.unwrap_err().message, PAGINATION_PAGE_LIMIT_ERROR);
+                } else {
+                    assert_eq!(result.unwrap().pages().len(), 2);
+                }
+                assert_eq!(client.next_id, admitted_pages as u64 + 2);
+                client.close(&cx).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_catalog_preflight_and_first_page_errors_do_not_authorize_retry() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for method in [
+                "tools/list",
+                "resources/list",
+                "resources/templates/list",
+                "prompts/list",
+            ] {
+                for refusal in ["initial-cursor", "cancelled", "first-page-error"] {
+                    let (mut client, mut peer_io) =
+                        websocket_catalog_test_fixture(&cx, false).await;
+                    let cancellation = McpRequestCancellation::new();
+                    if refusal == "cancelled" {
+                        cancellation.cancel();
+                    }
+                    let reuse_id = if refusal == "first-page-error" {
+                        write_server_text_frame(&mut peer_io, r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32602,"message":"invalid initial filters"}}"#).await;
+                        3
+                    } else {
+                        2
+                    };
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{reuse_id},\"result\":{}}}",
+                            websocket_catalog_test_result(
+                                "tools/list",
+                                Some("healthy"),
+                                None,
+                                "private",
+                                false
+                            )
+                        ),
+                    )
+                    .await;
+                    let error = invoke_websocket_catalog_test(
+                        &mut client,
+                        &cx,
+                        method,
+                        Some(&cancellation),
+                        (refusal == "initial-cursor").then(String::new),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(
+                        error.code,
+                        if refusal == "cancelled" {
+                            McpErrorCode::RequestCancelled
+                        } else {
+                            McpErrorCode::InvalidParams
+                        }
+                    );
+                    assert_eq!(client.next_id, reuse_id);
+                    assert!(!client.closed);
+                    assert!(!cx.is_cancel_requested());
+                    assert!(
+                        client
+                            .list_tools(&cx, None)
+                            .await
+                            .unwrap()
+                            .encode()
+                            .unwrap()
+                            .contains("healthy")
+                    );
+                    client.close(&cx).await.unwrap();
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    fn websocket_catalog_pending_page_probe(mode: &'static str) {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let (client_io, server_io) = async_websocket_pair();
+            let cancellation = McpRequestCancellation::new();
+            let peer_cancellation = cancellation.clone();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discovery) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("catalog peer expects discovery");
+                    };
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discovery.id.unwrap(),
+                                async_modern_discovery_result(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(first) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("catalog peer expects first page");
+                    };
+                    assert_eq!(first.method, "tools/list");
+                    assert!(first.params.unwrap().get("cursor").is_none());
+                    asupersync::time::sleep(peer_cx.now(), Duration::from_millis(1_200)).await;
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                first.id.unwrap(),
+                                serde_json::from_str(&websocket_catalog_test_result(
+                                    "tools/list",
+                                    Some("first"),
+                                    Some("next"),
+                                    "private",
+                                    false,
+                                ))
+                                .unwrap(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    let JsonRpcMessage::Request(second) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("catalog peer expects continuation");
+                    };
+                    assert_eq!(second.method, "tools/list");
+                    assert_eq!(second.params.unwrap()["cursor"], "next");
+                    assert!(
+                        second
+                            .id
+                            .as_ref()
+                            .unwrap()
+                            .correlates_with(&RequestId::Number(3))
+                    );
+                    if mode == "cancelled" {
+                        peer_cancellation.cancel();
+                    } else {
+                        // A late terminal reply arrives after the original two
+                        // seconds, but before a fresh per-page budget would end.
+                        asupersync::time::sleep(
+                            peer_cx.now(),
+                            Duration::from_millis(if mode == "late" { 1_200 } else { 200 }),
+                        )
+                        .await;
+                    }
+                    if mode == "cancelled" {
+                        let JsonRpcMessage::Request(control) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("cancelled page requires control");
+                        };
+                        assert_eq!(control.method, "notifications/cancelled");
+                        assert_eq!(control.params.unwrap()["requestId"], 3);
+                    }
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                second.id.unwrap(),
+                                serde_json::from_str(&websocket_catalog_test_result(
+                                    "tools/list",
+                                    Some("last"),
+                                    None,
+                                    "private",
+                                    false,
+                                ))
+                                .unwrap(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    if mode == "late" {
+                        let JsonRpcMessage::Request(control) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("expired page requires control");
+                        };
+                        assert_eq!(control.method, "notifications/cancelled");
+                        assert!(control.id.is_none());
+                        assert_eq!(control.params.unwrap()["requestId"], 3);
+                    }
+                    let JsonRpcMessage::Request(reused) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("catalog connection must remain reusable");
+                    };
+                    assert_eq!(reused.method, "tools/list");
+                    assert!(
+                        reused
+                            .id
+                            .as_ref()
+                            .unwrap()
+                            .correlates_with(&RequestId::Number(4))
+                    );
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                reused.id.unwrap(),
+                                async_modern_tools_list_result(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        server.recv(&peer_cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                })
+                .unwrap();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            let result = asupersync::time::timeout(
+                cx.now(),
+                Duration::from_secs(5),
+                invoke_websocket_catalog_test(
+                    &mut client,
+                    &cx,
+                    "tools/list",
+                    Some(&cancellation),
+                    None,
+                ),
+            )
+            .await
+            .expect("catalog page ownership must settle independently of the fixture timeout");
+            if mode == "timely" {
+                let collection = result.unwrap();
+                assert_eq!(collection.pages().len(), 2);
+                assert_eq!(collection.item_count(), 2);
+                assert!(client.retired_requests.is_empty());
+            } else {
+                let error = result
+                    .expect_err("pending continuation must stop without a partial collection");
+                if mode == "cancelled" {
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                } else {
+                    assert_eq!(error.code, McpErrorCode::InternalError);
+                    assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+                }
+                assert_eq!(
+                    client.retired_requests.len(),
+                    1,
+                    "pending continuation owns exactly one tombstone"
+                );
+            }
+            assert_eq!(client.next_id, 4, "no third catalog page is sent");
+            assert!(!client.closed);
+            assert!(matches!(
+                client.list_tools(&cx, None).await.unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            assert!(
+                client.retired_requests.is_empty(),
+                "exact late continuation is discarded before reused reply"
+            );
+            assert!(!cx.is_cancel_requested());
+            client.close(&cx).await.unwrap();
+            peer.join(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_catalog_completes_within_one_shared_deadline() {
+        websocket_catalog_pending_page_probe("timely");
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_catalog_deadline_retires_pending_continuation_and_reuses_connection() {
+        websocket_catalog_pending_page_probe("late");
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_catalog_cancellation_retires_only_pending_continuation() {
+        websocket_catalog_pending_page_probe("cancelled");
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn clt_01_websocket_catalog_preserves_failed_cancellation_send_on_expiry_or_cancel() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for cancelled in [false, true] {
+                let (client_io, server_io) = stalled_cancellation_async_websocket_pair();
+                let cancellation = McpRequestCancellation::new();
+                let peer_cancellation = cancellation.clone();
+                let mut peer = cx
+                    .spawn(move |peer_cx| async move {
+                        let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                        let JsonRpcMessage::Request(discovery) =
+                            server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("peer expects discovery");
+                        };
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    discovery.id.unwrap(),
+                                    async_modern_discovery_result(),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                        let JsonRpcMessage::Request(page) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("peer expects a committed first page");
+                        };
+                        assert_eq!(page.method, "tools/list");
+                        if cancelled {
+                            peer_cancellation.cancel();
+                        }
+                        assert!(matches!(
+                            server.recv(&peer_cx).await,
+                            Err(TransportError::Closed)
+                        ));
+                    })
+                    .unwrap();
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::from_application_timeout_ms(if cancelled {
+                            2_000
+                        } else {
+                            40
+                        })
+                        .unwrap(),
+                    )
+                    .connect_websocket_with_cx(
+                        &cx,
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    )
+                    .await
+                    .unwrap();
+                let error = asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(3),
+                    invoke_websocket_catalog_test(
+                        &mut client,
+                        &cx,
+                        "tools/list",
+                        Some(&cancellation),
+                        None,
+                    ),
+                )
+                .await
+                .expect("catalog cancellation cleanup must settle")
+                .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "Request timed out");
+                assert!(
+                    error
+                        .data
+                        .as_ref()
+                        .is_none_or(|data| data.get("timeoutSource").is_none()),
+                    "failed control send must not be hidden by a catalog timeout or cancellation"
+                );
+                assert!(client.closed);
+                assert!(client.close_settled);
+                assert_eq!(
+                    client.next_id, 3,
+                    "failed cleanup cannot authorize another catalog request"
+                );
+                assert!(!cx.is_cancel_requested());
+                peer.join(&cx).await.unwrap();
+            }
         });
     }
 
