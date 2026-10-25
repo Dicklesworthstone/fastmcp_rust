@@ -37,6 +37,25 @@ const ISSUER_LOCATIONS: [&str; 3] = [
     "/.well-known/openid-configuration/tenant",
     "/tenant/.well-known/openid-configuration",
 ];
+// Shared budget for the two configured-deadline rows at the end of this file.
+// The property they divide is that A deadline bounds a live silent token
+// socket, not that one second does, so this must dominate the four loopback
+// TLS exchanges the fixture completes first (PRM, issuer metadata,
+// /authorize, /token): the only operation still pending when it fires is then
+// the read of the token response, which is the one the silent row is about.
+// At one second the budget was the same order as the setup it had to cover,
+// so the deadline could instead land inside an earlier handshake and the
+// fixture's strict accept would panic BrokenPipe on correct client behaviour
+// (bd-5h1dm). One constant, not two literals, so the pair cannot drift apart
+// and leave the negative proving nothing. The silent row's wall-clock runtime
+// is this budget; that is the price of a deterministic abandonment site.
+//
+// It is bracketed on both sides, so it is a bound rather than a dial: too
+// small and the answering row below goes red, because its client gives up
+// during the setup it is supposed to complete; too large and the silent row
+// outlives the 60s ceiling `run` imposes on every test in this file. Neither
+// direction can be tuned into a quiet pass.
+const AUTHORIZATION_DEADLINE_SECONDS: u64 = 5;
 type Stream = asupersync::tls::TlsStream<TcpStream>;
 
 fn url(value: &str) -> CanonicalHttpUrl {
@@ -334,6 +353,13 @@ impl Peer {
         })
     }
 
+    // Both unwraps below stay strict deliberately. Every other row in this
+    // target completes each exchange it opens, so a variant tolerant of a
+    // closed peer would read a genuine premature close anywhere in this file
+    // as a pass -- it would blind the twenty rows it is not needed for in
+    // order to serve the one it is. The row whose subject IS abandonment
+    // keeps its handshakes clear of the deadline instead, by budgeting them
+    // (see AUTHORIZATION_DEADLINE_SECONDS), so no tolerance is needed here.
     async fn next(&self, method: &str, path: &str) -> (Stream, Request) {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut stream = self.acceptor.accept(socket).await.unwrap();
@@ -666,7 +692,7 @@ fn configured_authorization_deadline_bounds_a_live_silent_token_socket() {
         let cx = Cx::current().unwrap();
         let peer = Peer::new().await;
         let mut config = peer.config(Some("preregistered-client"), false, false);
-        config["timeout_seconds"] = json!(1);
+        config["timeout_seconds"] = json!(AUTHORIZATION_DEADLINE_SECONDS);
         let (result, held_token_socket) = pair(exercise(&cx, &peer, &config), async {
             peer.discovery(&[peer.metadata(json!(false))]).await;
             // pair retains this result while the other future is pending. Do
@@ -680,5 +706,33 @@ fn configured_authorization_deadline_bounds_a_live_silent_token_socket() {
         assert_eq!(peer.count("POST /register"), 0);
         peer.no_more(&cx).await;
         drop(held_token_socket);
+    });
+}
+
+// Near-identical planted negative for the row above (RH-5). Same client
+// identity, same configuration, same deadline constant and the same four
+// fixture exchanges; the single forbidden dimension is whether the token
+// socket answers. It must reach a response and must NOT take the abandonment
+// branch, which is what stops the row above from passing while bounding
+// nothing: if AUTHORIZATION_DEADLINE_SECONDS were ever too small to cover the
+// setup, this row goes red too rather than silently agreeing.
+#[test]
+fn configured_authorization_deadline_does_not_bound_a_token_socket_that_answers() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let mut config = peer.config(Some("preregistered-client"), false, false);
+        config["timeout_seconds"] = json!(AUTHORIZATION_DEADLINE_SECONDS);
+        let (result, ()) = pair(exercise(&cx, &peer, &config), async {
+            peer.discovery(&[peer.metadata(json!(false))]).await;
+            peer.login("preregistered-client", 200).await;
+            peer.mcp().await;
+        })
+        .await;
+        result.unwrap();
+        assert_eq!(peer.count("POST /token"), 1);
+        assert_eq!(peer.count("POST /mcp"), 3);
+        assert_eq!(peer.count("POST /register"), 0);
+        peer.no_more(&cx).await;
     });
 }
