@@ -512,7 +512,7 @@ mod modern_http_only {
 
 use crate::http_admission::{
     AdmittedModernPost, HttpAdmissionLimits, HttpEndpointConfig, ModernPostRejection,
-    ResponseRepresentation, admit_modern_post,
+    ResponseRepresentation,
 };
 
 use asupersync::bytes::BytesMut;
@@ -542,7 +542,6 @@ use fastmcp_core::{
     McpLogLevel, McpRequestCancellation, McpResult, ServerCapabilityInfo, SessionState,
     Sha256Digest, sha256_bounded,
 };
-#[cfg(any(feature = "apps", feature = "tasks"))]
 use fastmcp_protocol::ExtensionDescriptorRegistry;
 use fastmcp_protocol::common_types::OpenMetadata;
 use fastmcp_protocol::common_types::{Implementation, LoggingLevel};
@@ -4070,12 +4069,11 @@ fn modern_post_rejection_response(
             );
             HttpResponse::new(HttpStatus::BAD_REQUEST).with_json(&response)
         }
-        // A strictly decoded JSON-RPC notification is accepted with 202 and no
-        // body (plan HTTP-02 "successful notification acceptance"). Modern
-        // HTTP is stateless per POST: a request is cancelled by closing its
-        // own response stream, so a separately POSTed notification carries no
-        // authority over another connection's request and has no effect.
-        ModernPostRejection::NotARequest => HttpResponse::new(HttpStatus::ACCEPTED),
+        // Only completed, descriptor-authorized notification dispatch may
+        // acknowledge with 202. An unsupported notification or invalid proof
+        // must not look like accepted work. Modern HTTP cancellation still
+        // belongs to the original response stream, never another POST.
+        ModernPostRejection::NotARequest => HttpResponse::bad_request(),
         ModernPostRejection::TooManyHeaders { .. }
         | ModernPostRejection::HeaderBlockTooLarge { .. }
         | ModernPostRejection::DuplicateSingletonHeader { .. }
@@ -4092,6 +4090,7 @@ fn admit_modern_http_post(
     path: &str,
     headers: &[(String, String)],
     body: &[u8],
+    descriptors: Option<&ExtensionDescriptorRegistry>,
 ) -> Result<AdmittedModernPost, HttpResponse> {
     let limits = HttpAdmissionLimits::new(
         MODERN_HTTP_ADMISSION_MAX_HEADER_COUNT,
@@ -4102,7 +4101,15 @@ fn admit_modern_http_post(
     let config = HttpEndpointConfig::new(handler_config.base_path.clone(), limits)
         .ok_or_else(HttpResponse::bad_request)?;
 
-    admit_modern_post(&config, method, path, headers, body).map_err(|rejection| {
+    http_admission::admit_modern_post_with_notification_descriptors(
+        &config,
+        method,
+        path,
+        headers,
+        body,
+        descriptors,
+    )
+    .map_err(|rejection| {
         modern_post_rejection_response(rejection, body, handler_config.max_body_size)
     })
 }
@@ -4259,6 +4266,11 @@ impl ServerHttpEndpointError {
             DualEraHttpEndpointError::Closed => Self::Closed,
         }
     }
+}
+
+fn http_request_is_notification(request: &HttpRequest, max_body_size: usize) -> bool {
+    JsonRpcRequest::decode_strict_with_raw_params(&request.body, max_body_size)
+        .is_ok_and(|(request, _)| request.id.is_none())
 }
 
 fn http_request_accepts_sse(request: &HttpRequest) -> bool {
@@ -9075,6 +9087,9 @@ impl ServerHttpSession {
         #[cfg(not(feature = "legacy-2024-11-05"))]
         let _ = (legacy_response_preclassified_unmatched, legacy_auth_receipt);
         self.reap_modern_dispatches();
+        if self.closed {
+            return Err(DualEraHttpEndpointError::Closed);
+        }
         let mut request = request;
         if request.path == self.server.http_config.health_path && request.method == HttpMethod::Get
         {
@@ -9099,6 +9114,7 @@ impl ServerHttpSession {
         let mut raw_params = None;
         let mut http_parameter_headers = None;
         let mut auth_receipt = None;
+        let mut admitted_notification = None;
         #[cfg(feature = "legacy-2024-11-05")]
         let is_legacy = (request.method == HttpMethod::Get
             && request.path == self.server.http_config.legacy_sse_path)
@@ -9149,6 +9165,9 @@ impl ServerHttpSession {
                 };
             request = prepared_request;
             raw_params = admitted_raw_params;
+            if admitted_request.id.is_none() {
+                admitted_notification = Some(admitted_request.clone());
+            }
             http_parameter_headers = Some(http_admission::http_parameter_headers(&request.headers));
             auth_receipt = match self.preauthenticate_modern_http_request(
                 cx,
@@ -9272,6 +9291,35 @@ impl ServerHttpSession {
                     ))
                 });
             return Ok(result);
+        }
+        if let Some(notification) = admitted_notification {
+            let inbound = InboundRequestContext::with_modern_connection_and_transport_authorization(
+                cx.clone(),
+                0,
+                InboundRequestTransport::Http,
+                &self.modern_connection,
+                transport_authorization,
+            );
+            let result = Arc::clone(&self.server)
+                .dispatch_http_extension_notification(
+                    &inbound,
+                    notification,
+                    auth_receipt,
+                    modern_request_cancellation.unwrap_or_default(),
+                )
+                .await;
+            let status = match result {
+                Ok(()) => HttpStatus::ACCEPTED,
+                Err(error) => match error.code {
+                    McpErrorCode::ResourceForbidden => HttpStatus::FORBIDDEN,
+                    McpErrorCode::RequestCancelled => HttpStatus::SERVICE_UNAVAILABLE,
+                    McpErrorCode::InternalError => HttpStatus::INTERNAL_SERVER_ERROR,
+                    _ => HttpStatus::BAD_REQUEST,
+                },
+            };
+            return Ok(ServerHttpEndpointResponse::Immediate(HttpResponse::new(
+                status,
+            )));
         }
         let endpoint_response = self
             .endpoint_session
@@ -9419,6 +9467,7 @@ impl ServerHttpSession {
             &request.path,
             &headers,
             &request.body,
+            self.server.extension_handler_registry().map(ExtensionHandlerRegistry::descriptor_registry),
         )
     }
 
@@ -12747,7 +12796,10 @@ async fn serve_http_connection(
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         if let Err(response) =
-            admit_modern_http_post(http_config, "POST", raw_path, &headers, &request.body)
+            admit_modern_http_post(
+                http_config, "POST", raw_path, &headers, &request.body,
+                endpoint.server.extension_handler_registry().map(ExtensionHandlerRegistry::descriptor_registry),
+            )
         {
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
@@ -12765,6 +12817,7 @@ async fn serve_http_connection(
         && request.path == endpoint.server.http_config.legacy_sse_path;
     let is_modern_sse = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
+        && !http_request_is_notification(&request, http_config.max_body_size)
         && http_request_accepts_sse(&request);
     if is_modern_sse {
         if request.header("mcp-session-id").is_some() {
@@ -13141,7 +13194,10 @@ async fn serve_modern_http_connection(
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<Vec<_>>();
         if let Err(response) =
-            admit_modern_http_post(http_config, "POST", raw_path, &headers, &request.body)
+            admit_modern_http_post(
+                http_config, "POST", raw_path, &headers, &request.body,
+                endpoint.server.extension_handler_registry().map(ExtensionHandlerRegistry::descriptor_registry),
+            )
         {
             let _ = send_h1_response(cx, &listener_shutdown, &mut framed, response).await;
             return;
@@ -13156,6 +13212,7 @@ async fn serve_modern_http_connection(
     };
     let is_modern_sse = request.method == HttpMethod::Post
         && request.path == endpoint.server.http_config.handler_config.base_path
+        && !http_request_is_notification(&request, http_config.max_body_size)
         && http_request_accepts_sse(&request);
     if is_modern_sse {
         if request.header("mcp-session-id").is_some() {
@@ -13769,6 +13826,292 @@ impl Server {
     #[must_use]
     pub fn prompts(&self) -> Vec<Prompt> {
         self.router.prompts()
+    }
+
+    /// Completes one descriptor-owned notification inside the HTTP request.
+    ///
+    /// This profile never acknowledges a detached future. Every message owns
+    /// fresh authentication, explicit operation authorization, settings proof,
+    /// cancellation and a finite deadline; 202 follows completed work only.
+    async fn dispatch_http_extension_notification(
+        self: Arc<Self>,
+        inbound: &InboundRequestContext,
+        mut notification: JsonRpcRequest,
+        auth_receipt: Option<AuthDispatchCustody>,
+        cancellation: McpRequestCancellation,
+    ) -> McpResult<()> {
+        if notification.id.is_some() || notification.validate().is_err() {
+            return Err(McpError::invalid_request(
+                "Extension notification is not admitted",
+            ));
+        }
+        let context = self.attach_request_scoped_component_access(
+            self.with_final_catalog_publisher(
+                inbound
+                    .request_context()
+                    .with_request_cancellation(cancellation.clone()),
+            ),
+        );
+        // Even a deployment with ordinary request timeouts disabled must not
+        // retain unacknowledged notification work indefinitely.
+        let maximum = context.cx().now().saturating_add_nanos(60_000_000_000);
+        let budget = self
+            .create_request_budget(context.cx())
+            .meet(Budget::new().with_deadline(maximum));
+        let (context, _lease) = context
+            .with_budget_ceiling(budget)
+            .begin_request_scope()
+            .ok_or_else(|| McpError::internal_error("request scope could not be established"))?;
+        Self::enforce_request_context(&context)?;
+        self.authenticate_modern_request(
+            &context,
+            inbound,
+            &mut notification,
+            auth_receipt.as_ref(),
+            None,
+        )?;
+        let deadline = context.budget().deadline.unwrap_or(maximum).min(maximum);
+        let result = if let Some(region) = router::open_modern_request_region(&context).await? {
+            let server = Arc::clone(&self);
+            let dispatch_context = context.clone();
+            let dispatch_cancellation = cancellation.clone();
+            let task = region.cx().spawn(move |child_cx| async move {
+                let context = dispatch_context.with_request_cx(child_cx);
+                server
+                    .dispatch_http_extension_notification_in_region(
+                        &context,
+                        notification,
+                        dispatch_cancellation,
+                        deadline,
+                    )
+                    .await
+            });
+            let mut task = match task {
+                Ok(task) => task,
+                Err(_) => {
+                    region.close().await.map_err(|_| {
+                        McpError::internal_error("notification child region could not be closed")
+                    })?;
+                    return Err(McpError::internal_error(
+                        "request-owned notification dispatch could not be scheduled",
+                    ));
+                }
+            };
+            let joined = {
+                let mut join = std::pin::pin!(task.join(context.cx()));
+                let mut cancelled = std::pin::pin!(context.request_cancelled());
+                let mut timer = std::pin::pin!(asupersync::time::Sleep::new(deadline));
+                let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+                let mut runtime_cancelled = std::pin::pin!(receiver.recv(context.cx()));
+                let mut cancel_forwarded = false;
+                std::future::poll_fn(|task_cx| {
+                    let _current = Cx::set_current(Some(context.cx().clone()));
+                    if !cancel_forwarded
+                        && (context.cx().now() >= deadline
+                            || Self::enforce_request_context(&context).is_err()
+                            || cancelled.as_mut().poll(task_cx).is_ready()
+                            || runtime_cancelled.as_mut().poll(task_cx).is_ready()
+                            || (context.cx().timer_driver().is_some()
+                                && timer.as_mut().poll(task_cx).is_ready()))
+                    {
+                        let _ = region.cancel(asupersync::CancelReason::user(
+                            "HTTP extension notification cancelled",
+                        ));
+                        cancel_forwarded = true;
+                    }
+                    join.as_mut().poll(task_cx)
+                })
+                .await
+            };
+            // Callback completion alone does not settle work spawned through
+            // its Cx. Close cancels and drains all remaining descendants on
+            // success, error, panic and expiry before a finite HTTP result.
+            // Dropping this outer future also drops the region owner, so the
+            // runtime retains and cancels that subtree instead of detaching it.
+            region.close().await.map_err(|_| {
+                McpError::internal_error("notification child region could not be closed")
+            })?;
+            match joined {
+                Ok(result) => result,
+                Err(asupersync::runtime::JoinError::Panicked(_)) => {
+                    Err(extension_panic_error("notification_dispatch"))
+                }
+                Err(_) => Err(McpError::request_cancelled()),
+            }
+        } else {
+            // A detached testing context has no runtime gateway and therefore
+            // cannot spawn descendants. Immediate callbacks still work there;
+            // the inner watchdog rejects pending work without a timer driver.
+            self.dispatch_http_extension_notification_in_region(
+                &context,
+                notification,
+                cancellation.clone(),
+                deadline,
+            )
+            .await
+        };
+        result?;
+        Self::enforce_request_context(&context)?;
+        if context.cx().now() >= deadline || !cancellation.begin_finalization() {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(())
+    }
+
+    async fn dispatch_http_extension_notification_in_region(
+        &self,
+        context: &McpContext,
+        notification: JsonRpcRequest,
+        cancellation: McpRequestCancellation,
+        deadline: asupersync::Time,
+    ) -> McpResult<()> {
+        Self::enforce_request_context(context)?;
+        let runtime = self
+            .extension_runtime
+            .as_deref()
+            .ok_or_else(|| McpError::invalid_request("Extension notification is not admitted"))?;
+        let descriptors = runtime.handlers.descriptor_registry();
+        let descriptor = descriptors
+            .descriptors()
+            .find(|descriptor| {
+                descriptor.notification.as_ref().is_some_and(|candidate| {
+                    candidate.name == notification.method
+                        && candidate.direction
+                            == fastmcp_protocol::ExtensionDirection::ClientToServer
+                        && candidate.activation_proof.is_some()
+                })
+            })
+            .ok_or_else(|| McpError::invalid_request("Extension notification is not admitted"))?;
+        let id = &descriptor.id;
+        let server_settings = runtime
+            .server_discovery
+            .extensions
+            .get(id)
+            .ok_or_else(|| McpError::invalid_params("Extension notification is not active"))?;
+        // Authorization precedes the user-supplied compatibility resolver and
+        // middleware. No earlier request or transport identity activates it.
+        catch_extension_unwind(|| {
+            runtime
+                .handlers
+                .authorize_notification(context, id, &notification)
+        })
+        .map_err(|_| extension_panic_error("notification_authorizer"))??;
+        Self::enforce_request_context(context)?;
+        let parameters = notification
+            .params
+            .as_ref()
+            .ok_or_else(|| McpError::invalid_params("Extension notification proof is missing"))?;
+        let client_settings = descriptors
+            .notification_activation_settings(id, &notification.method, parameters)
+            .map_err(|_| McpError::invalid_params("Extension notification proof is invalid"))?;
+        let mut local = ExtensionLocalEnablement::default();
+        local.enable(id.clone());
+        let client = ClientExtensionDiscovery {
+            extensions: std::collections::BTreeMap::from([(id.clone(), client_settings)]),
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: std::collections::BTreeMap::from([(id.clone(), server_settings.clone())]),
+        };
+        let negotiated = catch_extension_unwind(|| {
+            let mut resolver = runtime
+                .resolver
+                .lock()
+                .map_err(|_| McpError::internal_error("extension resolver is unavailable"))?;
+            descriptors
+                .negotiate(
+                    ProtocolEra::Modern2026,
+                    &local,
+                    &client,
+                    &server,
+                    &mut *resolver,
+                )
+                .map_err(|_| {
+                    McpError::invalid_params("Extension notification proof is incompatible")
+                })
+        })
+        .map_err(|_| extension_panic_error("notification_resolver"))??;
+        negotiated
+            .admit_notification(
+                descriptors,
+                ProtocolEra::Modern2026,
+                id,
+                &notification.method,
+                fastmcp_protocol::ExtensionDirection::ClientToServer,
+            )
+            .map_err(|_| McpError::invalid_params("Extension notification is not active"))?;
+
+        let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
+        let result = {
+            let mut dispatch = std::pin::pin!(async {
+                for middleware in self.middleware.iter() {
+                    Self::enforce_request_context(context)?;
+                    entered_middleware.push(middleware.as_ref());
+                    let decision =
+                        catch_extension_unwind(|| middleware.on_request(context, &notification))
+                            .map_err(|_| extension_panic_error("middleware_on_request"))??;
+                    if !matches!(decision, MiddlewareDecision::Continue) {
+                        return Err(McpError::invalid_request(
+                            "Notification middleware cannot acknowledge incomplete work",
+                        ));
+                    }
+                }
+                runtime
+                    .handlers
+                    .invoke_notification_async(context, &negotiated, id, &notification)
+                    .await
+            });
+            let mut timer = std::pin::pin!(asupersync::time::Sleep::new(deadline));
+            let mut cancelled = std::pin::pin!(cancellation.cancelled());
+            let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+            let mut runtime_cancelled = std::pin::pin!(receiver.recv(context.cx()));
+            std::future::poll_fn(|task| {
+                let _current = Cx::set_current(Some(context.cx().clone()));
+                // Refuse expired work before polling a callback that may commit
+                // an effect immediately when its own I/O/timer becomes ready.
+                if context.cx().now() >= deadline
+                    || Self::enforce_request_context(context).is_err()
+                    || cancelled.as_mut().poll(task).is_ready()
+                    || runtime_cancelled.as_mut().poll(task).is_ready()
+                {
+                    return std::task::Poll::Ready(Err(McpError::request_cancelled()));
+                }
+                if context.cx().timer_driver().is_some() && timer.as_mut().poll(task).is_ready() {
+                    return std::task::Poll::Ready(Err(McpError::request_cancelled()));
+                }
+                match catch_extension_unwind(|| dispatch.as_mut().poll(task)) {
+                    Ok(std::task::Poll::Pending) if context.cx().timer_driver().is_none() => {
+                        std::task::Poll::Ready(Err(McpError::internal_error(
+                            "notification execution requires a timer driver",
+                        )))
+                    }
+                    Ok(result) => result,
+                    Err(_) => {
+                        std::task::Poll::Ready(Err(extension_panic_error("notification_handler")))
+                    }
+                }
+            })
+            .await
+        };
+        let result = match result {
+            Ok(()) => self
+                .apply_middleware_response_with_liveness(
+                    &entered_middleware,
+                    context,
+                    &notification,
+                    serde_json::Value::Null,
+                    true,
+                )
+                .map(|_| ()),
+            Err(error) => {
+                Err(self.apply_middleware_error(&entered_middleware, context, &notification, error))
+            }
+        };
+        result?;
+        Self::enforce_request_context(context)?;
+        if context.cx().now() >= deadline {
+            return Err(McpError::request_cancelled());
+        }
+        Ok(())
     }
 
     fn registered_extension_handler_id(&self, method: &str) -> McpResult<Option<&ExtensionId>> {
@@ -25217,6 +25560,559 @@ mod lib_unit_tests {
             &request_sender,
         ))
         .expect("test request should produce a JSON-RPC response")
+    }
+
+    #[derive(Default)]
+    struct HttpExtensionNotificationProbe {
+        authorized: AtomicUsize,
+        resolved: AtomicUsize,
+        started: AtomicUsize,
+        completed: AtomicUsize,
+        abandoned: AtomicUsize,
+        authenticated: AtomicBool,
+        child_started: AtomicUsize,
+        child_settled: AtomicUsize,
+        children: Mutex<Vec<asupersync::runtime::TaskHandle<()>>>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct HttpExtensionNotificationWork {
+        value: u64,
+        #[serde(default)]
+        delay_ms: u64,
+        #[serde(default)]
+        hold: bool,
+        #[serde(default)]
+        spawn_child: bool,
+    }
+
+    struct HttpExtensionNotificationWorkGuard {
+        probe: Arc<HttpExtensionNotificationProbe>,
+        completed: bool,
+    }
+
+    impl Drop for HttpExtensionNotificationWorkGuard {
+        fn drop(&mut self) {
+            if !self.completed {
+                self.probe.abandoned.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    struct HttpExtensionNotificationChildGuard(Arc<HttpExtensionNotificationProbe>);
+
+    impl Drop for HttpExtensionNotificationChildGuard {
+        fn drop(&mut self) {
+            self.0.child_settled.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn http_extension_notification_builder(
+        probe: Arc<HttpExtensionNotificationProbe>,
+    ) -> ServerBuilder {
+        use fastmcp_protocol::extensions::{
+            ExtensionFallbackPolicy, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+            ExtensionSettingsSchema, NotificationActivationProofDescriptor,
+            NotificationActivationProofLocation,
+        };
+        let id = ExtensionId::parse("com.example/notification").unwrap();
+        let descriptor = ExtensionDescriptor {
+            id: id.clone(),
+            client_settings: ExtensionSettingsSchema {
+                schema_id: "notification-client-v1".to_owned(),
+                codec_id: "notification-client-v1".to_owned(),
+            },
+            server_settings: ExtensionSettingsSchema {
+                schema_id: "notification-server-v1".to_owned(),
+                codec_id: "notification-server-v1".to_owned(),
+            },
+            resolver: ExtensionNegotiationResolver {
+                id: "notification-compatible-level".to_owned(),
+                version: 1,
+                fallback: ExtensionFallbackPolicy::RejectOneSided,
+            },
+            method: None,
+            notification: Some(ExtensionNotificationDescriptor {
+                name: "com.example/notify".to_owned(),
+                direction: fastmcp_protocol::ExtensionDirection::ClientToServer,
+                activation_proof: Some(NotificationActivationProofDescriptor::SelfContained {
+                    location: NotificationActivationProofLocation::Metadata,
+                    key: "com.example/activation".to_owned(),
+                }),
+            }),
+            result_discriminator: None,
+            routing_headers: Vec::new(),
+            stdio_correlation: None,
+        };
+        let mut unrelated = descriptor.clone();
+        unrelated.id = ExtensionId::parse("com.example/unrelated").unwrap();
+        unrelated.notification = None;
+        let unrelated_id = unrelated.id.clone();
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        descriptors.register(descriptor).unwrap();
+        descriptors.register(unrelated).unwrap();
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let authorization = Arc::clone(&probe);
+        let work = Arc::clone(&probe);
+        handlers
+            .register_notification_async(
+                id.clone(),
+                "com.example/notify",
+                move |context: &McpContext, parameters: &serde_json::Value| {
+                    authorization.authorized.fetch_add(1, Ordering::AcqRel);
+                    authorization
+                        .authenticated
+                        .store(context.auth().is_some(), Ordering::Release);
+                    if parameters.get("value").and_then(serde_json::Value::as_u64) == Some(13) {
+                        return Err(McpError::new(
+                            McpErrorCode::ResourceForbidden,
+                            "operation denied",
+                        ));
+                    }
+                    Ok(())
+                },
+                move |context: &McpContext,
+                      parameters: HttpExtensionNotificationWork|
+                      -> BoxFuture<'_, McpResult<()>> {
+                    let probe = Arc::clone(&work);
+                    Box::pin(async move {
+                        let mut guard = HttpExtensionNotificationWorkGuard {
+                            probe,
+                            completed: false,
+                        };
+                        guard.probe.started.fetch_add(1, Ordering::AcqRel);
+                        if parameters.spawn_child {
+                            let probe = Arc::clone(&guard.probe);
+                            let (ready, mut readiness) = asupersync::channel::oneshot::channel();
+                            let child = context
+                                .cx()
+                                .spawn(move |child_cx| async move {
+                                    let _guard =
+                                        HttpExtensionNotificationChildGuard(Arc::clone(&probe));
+                                    probe.child_started.fetch_add(1, Ordering::AcqRel);
+                                    let _ = ready.send(&child_cx, ());
+                                    let (_sender, mut receiver) =
+                                        asupersync::channel::oneshot::channel::<()>();
+                                    let _ = receiver.recv(&child_cx).await;
+                                })
+                                .map_err(|_| {
+                                    McpError::internal_error(
+                                        "notification test child did not spawn",
+                                    )
+                                })?;
+                            // Retain the join handle outside the callback so
+                            // only request-region closure can settle the child.
+                            guard.probe.children.lock().unwrap().push(child);
+                            readiness
+                                .recv(context.cx())
+                                .await
+                                .map_err(|_| McpError::request_cancelled())?;
+                        }
+                        if parameters.hold {
+                            std::future::pending::<()>().await;
+                        }
+                        if parameters.delay_ms > 0 {
+                            asupersync::time::sleep(
+                                context.cx().now(),
+                                Duration::from_millis(parameters.delay_ms),
+                            )
+                            .await;
+                        }
+                        if parameters.value == 99 {
+                            return Err(McpError::invalid_params("work was refused"));
+                        }
+                        guard.probe.completed.fetch_add(1, Ordering::AcqRel);
+                        guard.completed = true;
+                        Ok(())
+                    })
+                },
+            )
+            .unwrap();
+        let resolution = Arc::clone(&probe);
+        Server::new("extension-notification", "1.0.0")
+            .extension_registry(
+                handlers,
+                ServerExtensionDiscovery {
+                    extensions: std::collections::BTreeMap::from([
+                        (
+                            id,
+                            ExtensionSettings::new(serde_json::json!({"level": 1})).unwrap(),
+                        ),
+                        (
+                            unrelated_id,
+                            ExtensionSettings::new(serde_json::json!({"level": 1})).unwrap(),
+                        ),
+                    ]),
+                },
+                move |descriptor: &ExtensionDescriptor,
+                      client: &ExtensionSettings,
+                      server: &ExtensionSettings| {
+                    resolution.resolved.fetch_add(1, Ordering::AcqRel);
+                    if client.as_object().get("level") != Some(&serde_json::json!(1))
+                        || server.as_object().get("level") != Some(&serde_json::json!(1))
+                    {
+                        return Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                            descriptor.id.to_string(),
+                        ));
+                    }
+                    Ok(client.clone())
+                },
+            )
+            .unwrap()
+    }
+
+    fn http_extension_notification_request(value: u64, delay_ms: u64, hold: bool) -> HttpRequest {
+        HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("content-type", "application/json")
+            .with_header("accept", "application/json, text/event-stream")
+            .with_header("accept-encoding", "identity")
+            .with_body(
+                serde_json::to_vec(&JsonRpcRequest::notification(
+                    "com.example/notify",
+                    Some(serde_json::json!({
+                        "value": value, "delay_ms": delay_ms, "hold": hold,
+                        "_meta": { "com.example/activation": { "level": 1 } }
+                    })),
+                ))
+                .unwrap(),
+            )
+    }
+
+    #[test]
+    fn live_http_extension_notification_completes_before_202_and_revalidates_each_proof() {
+        run_live_http_test(|cx| async move {
+            let probe = Arc::new(HttpExtensionNotificationProbe::default());
+            let bound = http_extension_notification_builder(Arc::clone(&probe))
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let caller = cx.clone();
+            let observed = Arc::clone(&probe);
+            let mut client = cx.spawn(move |_client_cx| async move {
+                let result = async {
+                    let valid = http_extension_notification_request(41, 10, false);
+                    let headers = [
+                        ("Accept", "application/json, text/event-stream"),
+                        ("Accept-Encoding", "identity"),
+                    ];
+                    let accepted = live_http_exchange(address, live_http_post("/mcp", &valid.body, &headers)).await?;
+                    if !accepted.starts_with(b"HTTP/1.1 202")
+                        || !live_http_response_body(&accepted)?.is_empty()
+                        || observed.completed.load(Ordering::Acquire) != 1
+                    {
+                        return Err("202 did not follow completed notification work".to_owned());
+                    }
+                    let baseline = serde_json::from_slice::<serde_json::Value>(&valid.body).unwrap();
+                    let mut missing = baseline.clone();
+                    missing["params"]["_meta"].as_object_mut().unwrap().remove("com.example/activation");
+                    let mut incompatible = baseline.clone();
+                    incompatible["params"]["_meta"]["com.example/activation"]["level"] = serde_json::json!(2);
+                    let mut unauthorized = baseline.clone();
+                    unauthorized["params"]["value"] = serde_json::json!(13);
+                    let mut unknown = baseline.clone();
+                    unknown["method"] = serde_json::json!("com.example/unknown");
+                    let mut request_shaped = baseline.clone();
+                    request_shaped["id"] = serde_json::json!(901);
+                    let mut malformed = baseline.clone();
+                    malformed["params"]["value"] = serde_json::json!("wrong-type");
+                    for (message, status) in [
+                        (missing, 400), (incompatible, 400), (unauthorized, 403),
+                        (unknown, 400), (request_shaped, 400), (malformed, 400),
+                    ] {
+                        let body = serde_json::to_vec(&message).unwrap();
+                        let response = live_http_exchange(address, live_http_post("/mcp", &body, &headers)).await?;
+                        if !response.starts_with(format!("HTTP/1.1 {status}").as_bytes())
+                            || observed.completed.load(Ordering::Acquire) != 1
+                            || observed.started.load(Ordering::Acquire) != 1
+                        {
+                            return Err("rejected notification reached application work or wrong status".to_owned());
+                        }
+                    }
+                    if observed.authorized.load(Ordering::Acquire) != 4
+                        || observed.resolved.load(Ordering::Acquire) != 3
+                    {
+                        return Err("proof resolution crossed authentication/authorization precedence".to_owned());
+                    }
+                    let injected_header = live_http_exchange(address, live_http_post(
+                        "/mcp", &valid.body, &[
+                            ("Accept", "application/json, text/event-stream"),
+                            ("Mcp-Method", "com.example/notify"),
+                        ],
+                    )).await?;
+                    if !injected_header.starts_with(b"HTTP/1.1 400")
+                        || observed.authorized.load(Ordering::Acquire) != 4
+                    {
+                        return Err("request-only header activated a notification".to_owned());
+                    }
+                    // Request-shaped reserved metadata is inert on this wire
+                    // shape. Only this message's descriptor proof activates it.
+                    let mut again = baseline;
+                    again["params"]["_meta"][MODERN_PROTOCOL_VERSION_METADATA_KEY] =
+                        serde_json::json!("2025-11-25");
+                    again["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY] =
+                        serde_json::json!({"extensions": {"com.example/notification": {"level": 2}}});
+                    let body = serde_json::to_vec(&again).unwrap();
+                    let accepted = live_http_exchange(address, live_http_post("/mcp", &body, &headers)).await?;
+                    if !accepted.starts_with(b"HTTP/1.1 202")
+                        || observed.completed.load(Ordering::Acquire) != 2
+                    {
+                        return Err("a fresh proof could not complete after rejected neighbors".to_owned());
+                    }
+                    Ok(())
+                }.await;
+                caller.cancel_with(CancelKind::User, Some("notification wire probe complete"));
+                result
+            }).map_err(|error| format!("{error:?}"))?;
+            let serve = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            let result = client
+                .join(&cx)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            require_quiescent_http_shutdown(serve, "extension notifications").await?;
+            result
+        });
+    }
+
+    #[test]
+    fn http_extension_notification_authentication_precedes_authorizer_and_resolver() {
+        run_live_http_test(|cx| async move {
+            let probe = Arc::new(HttpExtensionNotificationProbe::default());
+            let auth_calls = Arc::new(AtomicUsize::new(0));
+            let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                .auth_provider(OneShotNativeAuthProvider {
+                    calls: Arc::clone(&auth_calls),
+                })
+                .test_http_endpoint("http://notification.test")
+                .unwrap();
+            let mut session = endpoint.open_session(&cx).unwrap();
+            let missing = session
+                .handle_async(&cx, http_extension_notification_request(41, 0, false))
+                .await
+                .unwrap();
+            let ServerHttpEndpointResponse::Immediate(missing) = missing else {
+                panic!("finite rejection")
+            };
+            assert_eq!(missing.status, HttpStatus::UNAUTHORIZED);
+            assert_eq!(probe.authorized.load(Ordering::Acquire), 0);
+            assert_eq!(probe.resolved.load(Ordering::Acquire), 0);
+            assert_eq!(auth_calls.load(Ordering::Acquire), 0);
+            let accepted = session
+                .handle_async(
+                    &cx,
+                    http_extension_notification_request(41, 0, false)
+                        .with_header("authorization", "Bearer alpha"),
+                )
+                .await
+                .unwrap();
+            let ServerHttpEndpointResponse::Immediate(accepted) = accepted else {
+                panic!("finite acceptance")
+            };
+            assert_eq!(accepted.status, HttpStatus::ACCEPTED);
+            assert_eq!(
+                auth_calls.load(Ordering::Acquire),
+                1,
+                "the pre-auth receipt is consumed once"
+            );
+            assert!(probe.authenticated.load(Ordering::Acquire));
+            assert_eq!(probe.completed.load(Ordering::Acquire), 1);
+            session.close(&cx).await;
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn http_extension_notification_deadline_and_drop_prevent_late_effects() {
+        let mut lab = asupersync::lab::LabRuntime::new(
+            asupersync::lab::LabConfig::new(1254)
+                .with_auto_advance()
+                .max_steps(256),
+        );
+        let budget = Budget::INFINITE;
+        let region = lab.state.create_root_region(budget);
+        let (task, mut outcome) = lab
+            .state
+            .create_task(region, budget, async {
+                let cx = Cx::current().unwrap();
+                let probe = Arc::new(HttpExtensionNotificationProbe::default());
+                let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                    .request_timeout(1)
+                    .test_http_endpoint("http://notification.test")
+                    .unwrap();
+                let mut session = endpoint.open_session(&cx).unwrap();
+                for (delay_ms, expected) in [
+                    (999, HttpStatus::ACCEPTED),
+                    (1000, HttpStatus::SERVICE_UNAVAILABLE),
+                ] {
+                    let response = session
+                        .handle_async(
+                            &cx,
+                            http_extension_notification_request(41, delay_ms, false),
+                        )
+                        .await
+                        .unwrap();
+                    let ServerHttpEndpointResponse::Immediate(response) = response else {
+                        panic!("finite notification")
+                    };
+                    assert_eq!(response.status, expected);
+                }
+                assert_eq!(probe.completed.load(Ordering::Acquire), 1);
+                assert_eq!(probe.abandoned.load(Ordering::Acquire), 1);
+                // Dropping the public handle future must drop its active callback;
+                // it cannot silently hand off work and later acknowledge it.
+                {
+                    let mut pending = Box::pin(
+                        session.handle_async(&cx, http_extension_notification_request(41, 0, true)),
+                    );
+                    std::future::poll_fn(|task| {
+                        assert!(pending.as_mut().poll(task).is_pending());
+                        if probe.started.load(Ordering::Acquire) == 3 {
+                            Poll::Ready(())
+                        } else {
+                            task.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    assert_eq!(probe.started.load(Ordering::Acquire), 3);
+                    drop(pending);
+                }
+                for _ in 0..128 {
+                    if probe.abandoned.load(Ordering::Acquire) == 2 {
+                        break;
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                assert_eq!(probe.abandoned.load(Ordering::Acquire), 2);
+                let response = session
+                    .handle_async(&cx, http_extension_notification_request(41, 0, false))
+                    .await
+                    .unwrap();
+                let ServerHttpEndpointResponse::Immediate(response) = response else {
+                    panic!("finite recovery")
+                };
+                assert_eq!(response.status, HttpStatus::ACCEPTED);
+                assert_eq!(probe.completed.load(Ordering::Acquire), 2);
+                session.close(&cx).await;
+            })
+            .unwrap();
+        lab.scheduler.lock().schedule(task, budget.priority);
+        assert_eq!(
+            lab.run_with_auto_advance().termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent
+        );
+        outcome
+            .try_join()
+            .unwrap()
+            .expect("notification deadline task completes");
+    }
+
+    #[test]
+    fn http_extension_notification_settles_children_before_status_and_after_drop() {
+        fn child_request(value: u64, hold: bool) -> HttpRequest {
+            let mut request = http_extension_notification_request(value, 0, hold);
+            let mut body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["params"]["spawn_child"] = serde_json::json!(true);
+            request.body = serde_json::to_vec(&body).unwrap();
+            request
+        }
+
+        let mut lab = asupersync::lab::LabRuntime::new(
+            asupersync::lab::LabConfig::new(1255)
+                .with_auto_advance()
+                .max_steps(512),
+        );
+        let budget = Budget::INFINITE;
+        let region = lab.state.create_root_region(budget);
+        let (task, mut outcome) = lab
+            .state
+            .create_task(region, budget, async {
+                let cx = Cx::current().unwrap();
+                let probe = Arc::new(HttpExtensionNotificationProbe::default());
+                let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                    .request_timeout(2)
+                    .test_http_endpoint("http://notification.test")
+                    .unwrap();
+                let mut session = endpoint.open_session(&cx).unwrap();
+                for (index, value, expected) in [
+                    (1, 41, HttpStatus::ACCEPTED),
+                    (2, 99, HttpStatus::BAD_REQUEST),
+                ] {
+                    let response = session
+                        .handle_async(&cx, child_request(value, false))
+                        .await
+                        .unwrap();
+                    let ServerHttpEndpointResponse::Immediate(response) = response else {
+                        panic!("finite notification status")
+                    };
+                    assert_eq!(response.status, expected);
+                    assert_eq!(probe.child_started.load(Ordering::Acquire), index);
+                    assert_eq!(
+                        probe.child_settled.load(Ordering::Acquire),
+                        index,
+                        "no HTTP success or error may precede descendant settlement",
+                    );
+                    let mut child = probe.children.lock().unwrap().pop().unwrap();
+                    assert!(matches!(
+                        child.try_join(),
+                        Ok(Some(())) | Err(asupersync::runtime::JoinError::Cancelled(_))
+                    ));
+                }
+                assert_eq!(probe.completed.load(Ordering::Acquire), 1);
+                assert_eq!(probe.abandoned.load(Ordering::Acquire), 1);
+
+                // Both the callback and its independently retained child are live
+                // when the outer request future is abandoned. Region Drop must
+                // cancel that exact subtree without cancelling the parent session.
+                let mut pending = Box::pin(session.handle_async(&cx, child_request(41, true)));
+                std::future::poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    if probe.child_started.load(Ordering::Acquire) == 3 {
+                        Poll::Ready(())
+                    } else {
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                drop(pending);
+                for _ in 0..128 {
+                    if probe.child_settled.load(Ordering::Acquire) == 3
+                        && probe.abandoned.load(Ordering::Acquire) == 2
+                    {
+                        break;
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                assert_eq!(probe.child_settled.load(Ordering::Acquire), 3);
+                assert_eq!(probe.abandoned.load(Ordering::Acquire), 2);
+                assert_eq!(probe.completed.load(Ordering::Acquire), 1);
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "request cancellation is confined to its region"
+                );
+                let response = session
+                    .handle_async(&cx, http_extension_notification_request(41, 0, false))
+                    .await
+                    .unwrap();
+                let ServerHttpEndpointResponse::Immediate(response) = response else {
+                    panic!("finite recovery status")
+                };
+                assert_eq!(response.status, HttpStatus::ACCEPTED);
+                assert_eq!(probe.completed.load(Ordering::Acquire), 2);
+                session.close(&cx).await;
+            })
+            .unwrap();
+        lab.scheduler.lock().schedule(task, budget.priority);
+        assert_eq!(
+            lab.run_with_auto_advance().termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent,
+        );
+        outcome
+            .try_join()
+            .unwrap()
+            .expect("notification descendant probe completes");
     }
 
     #[cfg(feature = "tasks")]
@@ -58948,9 +59844,9 @@ mod lib_unit_tests {
                     "HTTP cancellation notification was not rejected immediately".to_owned(),
                 );
             };
-            // Accepted with 202 (a notification), yet it carries no authority
-            // over either in-flight response body.
-            if rejected.status != HttpStatus::ACCEPTED
+            // Refused without acknowledgement or authority over either
+            // in-flight response body.
+            if rejected.status != HttpStatus::BAD_REQUEST
                 || first_guard.checkpoint(&cx).is_err()
                 || second_guard.checkpoint(&cx).is_err()
             {
@@ -58982,7 +59878,7 @@ mod lib_unit_tests {
             else {
                 return Err("live SSE cancellation POST was not rejected immediately".to_owned());
             };
-            if streaming_rejected.status != HttpStatus::ACCEPTED {
+            if streaming_rejected.status != HttpStatus::BAD_REQUEST {
                 return Err("live SSE cancellation POST used the wrong status".to_owned());
             }
             streaming_rejected_session.close(&cx).await;

@@ -234,6 +234,86 @@ impl ClientExtensionRuntime {
             })
     }
 
+    /// Builds one current-message proof from the locally configured settings.
+    ///
+    /// Discovery only supplies the peer's settings for this fresh compatibility
+    /// decision; it never substitutes for the proof emitted in this notification.
+    /// A caller cannot widen the local advertisement with a conflicting field.
+    pub(crate) fn prepare_notification(
+        &self,
+        discovery: &ServerDiscoverResult,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        mut parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        use fastmcp_protocol::extensions::{
+            NotificationActivationProofDescriptor, NotificationActivationProofLocation,
+            validate_extension_notification_metadata,
+        };
+
+        let refused = || McpError::invalid_params("Final extension notification is not admitted");
+        if !self.local_enablement.is_enabled(extension_id) {
+            return Err(refused());
+        }
+        validate_extension_notification_metadata(&parameters).map_err(|_| refused())?;
+        let descriptor = self
+            .descriptors
+            .notification_descriptor(extension_id, method)
+            .filter(|descriptor| descriptor.direction == ExtensionDirection::ClientToServer)
+            .ok_or_else(refused)?;
+        let Some(NotificationActivationProofDescriptor::SelfContained { location, key }) =
+            descriptor.activation_proof.as_ref()
+        else {
+            return Err(refused());
+        };
+        let proof = self
+            .client_discovery
+            .extensions
+            .get(extension_id)
+            .ok_or_else(refused)?
+            .clone()
+            .into_value();
+        let parameters_object = parameters.as_object_mut().ok_or_else(refused)?;
+        let object = match location {
+            NotificationActivationProofLocation::Params => parameters_object,
+            NotificationActivationProofLocation::Metadata => parameters_object
+                .entry("_meta".to_owned())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .ok_or_else(refused)?,
+        };
+        if object.get(key).is_some_and(|supplied| supplied != &proof) {
+            return Err(refused());
+        }
+        object.insert(key.clone(), proof);
+        let current = self
+            .descriptors
+            .notification_activation_settings(extension_id, method, &parameters)
+            .map_err(|_| refused())?;
+
+        // Enable exactly this message's owner. An unrelated extension whose
+        // fallback rejects one-sided support cannot activate or veto this POST.
+        let mut current_runtime = self.clone();
+        current_runtime.local_enablement = ExtensionLocalEnablement::default();
+        current_runtime
+            .local_enablement
+            .enable(extension_id.clone());
+        current_runtime.client_discovery = ClientExtensionDiscovery {
+            extensions: BTreeMap::from([(extension_id.clone(), current)]),
+        };
+        let negotiated = current_runtime.negotiate(discovery)?;
+        negotiated
+            .admit_notification(
+                &self.descriptors,
+                ProtocolEra::Modern2026,
+                extension_id,
+                method,
+                ExtensionDirection::ClientToServer,
+            )
+            .map_err(|_| refused())?;
+        Ok(parameters)
+    }
+
     /// Returns whether a configured descriptor owns this raw request method.
     ///
     /// Public raw request surfaces use this to ensure a registered extension

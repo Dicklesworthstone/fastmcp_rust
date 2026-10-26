@@ -36,6 +36,8 @@ pub const MAX_EXTENSION_ROUTING_HEADERS: usize = 32;
 pub const MAX_EXTENSION_ROUTING_HEADER_BYTES: usize = 256;
 /// Maximum notification method names owned by one stdio correlation descriptor.
 pub const MAX_STDIO_CORRELATION_METHODS: usize = 32;
+/// Maximum encoded bytes in one self-contained notification settings proof.
+pub const MAX_NOTIFICATION_ACTIVATION_PROOF_BYTES: usize = 64 * 1024;
 
 /// Official Tasks extension identifier.
 #[cfg(feature = "tasks")]
@@ -652,13 +654,68 @@ pub struct ExtensionMethodDescriptor {
     pub legacy_fallback: bool,
 }
 
-/// A registered notification name and direction.
+/// Exact placement of a current-message notification activation proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NotificationActivationProofLocation {
+    /// A namespaced field directly inside the extension notification parameters.
+    Params,
+    /// A namespaced field inside notification-role `params._meta`.
+    Metadata,
+}
+
+/// Frozen activation evidence for a client-to-server notification over HTTP.
+///
+/// This implementation supports self-contained settings only. A prior request,
+/// discovery result, transport connection, or unbound request identifier cannot
+/// supply a proof. The containing extension's client-settings schema/codec and
+/// compatibility resolver validate this object against local server settings
+/// after authentication. They remain part of the same frozen registry receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NotificationActivationProofDescriptor {
+    /// Exact extension-owned field containing the current client's settings.
+    SelfContained {
+        /// Object that contains the proof field.
+        location: NotificationActivationProofLocation,
+        /// Namespaced key owned by this extension's exact DNS prefix.
+        key: String,
+    },
+}
+
+/// A registered notification name, direction and optional HTTP activation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionNotificationDescriptor {
     /// Exact notification name.
     pub name: String,
     /// Message direction.
     pub direction: ExtensionDirection,
+    /// Explicit stateless-HTTP opt-in; absent proof configuration never permits
+    /// a client notification POST. The supported profile has no routing headers.
+    pub activation_proof: Option<NotificationActivationProofDescriptor>,
+}
+
+/// Validates notification-role metadata without granting it request authority.
+///
+/// Request-shaped open metadata remains inert. In particular, version, identity,
+/// capabilities and routing must come from the transport/registered proof, not
+/// from otherwise schema-legal unknown notification metadata.
+pub fn validate_extension_notification_metadata(
+    parameters: &Value,
+) -> Result<(), ExtensionRegistryError> {
+    let parameters = parameters
+        .as_object()
+        .ok_or(ExtensionRegistryError::InvalidNotificationActivationProof)?;
+    if let Some(metadata) = parameters.get("_meta") {
+        let metadata = metadata
+            .as_object()
+            .ok_or(ExtensionRegistryError::InvalidNotificationActivationProof)?;
+        crate::common_types::OpenMetadata::try_from_notification_entries(
+            metadata
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        )
+        .map_err(|_| ExtensionRegistryError::InvalidNotificationActivationProof)?;
+    }
+    Ok(())
 }
 
 /// A routing-header name owned by an extension descriptor.
@@ -739,6 +796,7 @@ pub fn official_tasks_descriptor() -> ExtensionDescriptor {
         notification: Some(ExtensionNotificationDescriptor {
             name: OFFICIAL_TASKS_NOTIFICATION.to_owned(),
             direction: ExtensionDirection::ServerToClient,
+            activation_proof: None,
         }),
         result_discriminator: Some(OFFICIAL_TASKS_RESULT_DISCRIMINATOR.to_owned()),
         routing_headers: Vec::new(),
@@ -799,8 +857,7 @@ impl ExtensionRegistryReceipt {
 
 /// Stable registry-validation diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExtensionRegistryError {
-    /// The identifier did not satisfy the mandatory prefix/name grammar.
+pub enum ExtensionRegistryError {    /// The identifier did not satisfy the mandatory prefix/name grammar.
     InvalidIdentifier(String),
     /// The identifier used a reserved official second DNS label.
     ReservedNamespace(String),
@@ -808,6 +865,8 @@ pub enum ExtensionRegistryError {
     SettingsNotObject,
     /// Typed settings decoding rejected the otherwise preserved object.
     SettingsCodecRejected,
+    /// A notification proof was absent, malformed, unowned, or exceeded its bound.
+    InvalidNotificationActivationProof,
     /// Official MCP Apps server settings must be the exact empty marker.
     OfficialMcpAppsServerSettingsNotEmpty,
     /// The official MCP Apps descriptor differed from its frozen method-free shape.
@@ -862,6 +921,9 @@ impl fmt::Display for ExtensionRegistryError {
             }
             Self::SettingsCodecRejected => {
                 formatter.write_str("extension settings codec rejected object")
+            }
+            Self::InvalidNotificationActivationProof => {
+                formatter.write_str("extension notification activation proof is not admitted")
             }
             Self::OfficialMcpAppsServerSettingsNotEmpty => {
                 formatter.write_str("official MCP Apps server settings must be empty")
@@ -1662,6 +1724,64 @@ impl ExtensionDescriptorRegistry {
         self.method(id, name)
     }
 
+    /// Returns one extension's exact notification descriptor.
+    #[must_use]
+    pub fn notification_descriptor(
+        &self,
+        id: &ExtensionId,
+        name: &str,
+    ) -> Option<&ExtensionNotificationDescriptor> {
+        self.descriptors
+            .get(id)?
+            .notification
+            .as_ref()
+            .filter(|notification| notification.name == name)
+    }
+
+    /// Structurally admits this notification's own self-contained settings.
+    ///
+    /// This is a pure pre-authentication check, not authorization or negotiated
+    /// support. A server must authenticate, negotiate this one extension with
+    /// these settings, then admit the exact notification before invoking code.
+    /// Discovery and prior request settings are never consulted here.
+    pub fn notification_activation_settings(
+        &self,
+        id: &ExtensionId,
+        name: &str,
+        parameters: &Value,
+    ) -> Result<ExtensionSettings, ExtensionRegistryError> {
+        if self.receipt.is_none() {
+            return Err(ExtensionRegistryError::InvalidNotificationActivationProof);
+        }
+        let notification = self
+            .notification_descriptor(id, name)
+            .filter(|notification| notification.direction == ExtensionDirection::ClientToServer)
+            .ok_or(ExtensionRegistryError::InvalidNotificationActivationProof)?;
+        let Some(NotificationActivationProofDescriptor::SelfContained { location, key }) =
+            notification.activation_proof.as_ref()
+        else {
+            return Err(ExtensionRegistryError::InvalidNotificationActivationProof);
+        };
+        validate_extension_notification_metadata(parameters)?;
+        let object = match location {
+            NotificationActivationProofLocation::Params => parameters,
+            NotificationActivationProofLocation::Metadata => parameters
+                .get("_meta")
+                .ok_or(ExtensionRegistryError::InvalidNotificationActivationProof)?,
+        };
+        let proof = object
+            .get(key)
+            .ok_or(ExtensionRegistryError::InvalidNotificationActivationProof)?;
+        let settings = ExtensionSettings::new(proof.clone())
+            .map_err(|_| ExtensionRegistryError::InvalidNotificationActivationProof)?;
+        let bytes = serde_json::to_vec(proof)
+            .map_err(|_| ExtensionRegistryError::InvalidNotificationActivationProof)?;
+        if bytes.len() > MAX_NOTIFICATION_ACTIVATION_PROOF_BYTES {
+            return Err(ExtensionRegistryError::InvalidNotificationActivationProof);
+        }
+        Ok(settings)
+    }
+
     /// Returns the frozen descriptors in deterministic identifier order.
     pub fn descriptors(&self) -> impl ExactSizeIterator<Item = &ExtensionDescriptor> {
         self.descriptors.values()
@@ -2053,6 +2173,36 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
                 notification.name.clone(),
             ));
         }
+        if let Some(NotificationActivationProofDescriptor::SelfContained { key, .. }) =
+            &notification.activation_proof
+        {
+            let proof_id = ExtensionId::parse(key.clone())?;
+            let owner_prefix = descriptor
+                .id
+                .as_str()
+                .split_once('/')
+                .map(|(prefix, _)| prefix);
+            let proof_prefix = proof_id.as_str().split_once('/').map(|(prefix, _)| prefix);
+            if notification.direction != ExtensionDirection::ClientToServer
+                || owner_prefix != proof_prefix
+                || matches!(
+                    key.as_str(),
+                    crate::messages::FINAL_PROTOCOL_VERSION_META_KEY
+                        | crate::messages::FINAL_CLIENT_CAPABILITIES_META_KEY
+                        | crate::messages::FINAL_CLIENT_INFO_META_KEY
+                        | crate::messages::FINAL_SERVER_INFO_META_KEY
+                        | crate::messages::FINAL_LOG_LEVEL_META_KEY
+                        | crate::messages::FINAL_SUBSCRIPTION_ID_META_KEY
+                )
+                || !descriptor.routing_headers.is_empty()
+                || descriptor
+                    .stdio_correlation
+                    .as_ref()
+                    .is_some_and(|correlation| correlation.metadata_key == *key)
+            {
+                return Err(ExtensionRegistryError::InvalidNotificationActivationProof);
+            }
+        }
         if descriptor
             .method
             .as_ref()
@@ -2243,6 +2393,44 @@ fn ensure_no_cross_owner_collision(
     ) {
         return Err(error);
     }
+    let proof_key = |descriptor: &ExtensionDescriptor| {
+        descriptor.notification.as_ref().and_then(|notification| {
+            notification
+                .activation_proof
+                .as_ref()
+                .map(|proof| match proof {
+                    NotificationActivationProofDescriptor::SelfContained { key, .. } => key.clone(),
+                })
+        })
+    };
+    let left_proof = proof_key(left);
+    let right_proof = proof_key(right);
+    if let Some(error) = collision(
+        "notification activation proof",
+        left_proof.as_deref(),
+        right_proof.as_deref(),
+    )
+    .or_else(|| {
+        collision(
+            "notification activation proof",
+            left_proof.as_deref(),
+            right
+                .stdio_correlation
+                .as_ref()
+                .map(|correlation| correlation.metadata_key.as_str()),
+        )
+    })
+    .or_else(|| {
+        collision(
+            "notification activation proof",
+            right_proof.as_deref(),
+            left.stdio_correlation
+                .as_ref()
+                .map(|correlation| correlation.metadata_key.as_str()),
+        )
+    }) {
+        return Err(error);
+    }
     for lhs in &left.routing_headers {
         for rhs in &right.routing_headers {
             if lhs.name.eq_ignore_ascii_case(&rhs.name) {
@@ -2276,6 +2464,30 @@ fn core_or_legacy_method(method: &str) -> bool {
     final_2026_07_28_method(method).is_some() || legacy_2024_11_05_method(method).is_some()
 }
 
+fn canonical_notification_row(
+    notification: Option<&ExtensionNotificationDescriptor>,
+) -> Option<Value> {
+    notification.map(|notification| {
+        let Some(NotificationActivationProofDescriptor::SelfContained { location, key }) =
+            &notification.activation_proof
+        else {
+            // Existing descriptors retain their exact receipt when they do not
+            // opt into this new wire behavior.
+            return serde_json::json!([notification.name, format!("{:?}", notification.direction)]);
+        };
+        serde_json::json!([
+            notification.name,
+            format!("{:?}", notification.direction),
+            {
+                "kind": "selfContainedSettings",
+                "location": format!("{location:?}"),
+                "key": key,
+                "maxBytes": MAX_NOTIFICATION_ACTIVATION_PROOF_BYTES,
+            },
+        ])
+    })
+}
+
 fn canonical_descriptor_row(
     descriptor: &ExtensionDescriptor,
     additional_methods: Option<&BTreeMap<String, ExtensionMethodDescriptor>>,
@@ -2289,7 +2501,7 @@ fn canonical_descriptor_row(
             "serverCodec": descriptor.server_settings.codec_id,
             "resolver": [descriptor.resolver.id, descriptor.resolver.version, format!("{:?}", descriptor.resolver.fallback)],
             "method": descriptor.method.as_ref().map(|m| (&m.name, format!("{:?}", m.direction), m.http_era_disposition.map(|e| format!("{:?}", e)), m.legacy_fallback)),
-            "notification": descriptor.notification.as_ref().map(|n| (&n.name, format!("{:?}", n.direction))),
+            "notification": canonical_notification_row(descriptor.notification.as_ref()),
             "resultDiscriminator": descriptor.result_discriminator,
             "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
             "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction))),
@@ -2323,7 +2535,7 @@ fn canonical_descriptor_row(
         "serverCodec": descriptor.server_settings.codec_id,
         "resolver": [descriptor.resolver.id, descriptor.resolver.version, format!("{:?}", descriptor.resolver.fallback)],
         "methods": methods,
-        "notification": descriptor.notification.as_ref().map(|n| (&n.name, format!("{:?}", n.direction))),
+        "notification": canonical_notification_row(descriptor.notification.as_ref()),
         "resultDiscriminator": descriptor.result_discriminator,
         "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
         "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction))),
@@ -2365,6 +2577,7 @@ mod tests {
             notification: Some(ExtensionNotificationDescriptor {
                 name: notification.to_owned(),
                 direction: ExtensionDirection::ServerToClient,
+                activation_proof: None,
             }),
             result_discriminator: Some(result_discriminator.to_owned()),
             // Routing headers are exclusively owned across the registry, so
@@ -2375,6 +2588,261 @@ mod tests {
             }],
             stdio_correlation: None,
         }
+    }
+
+    fn self_contained_notification_descriptor(
+        id: &str,
+        method: &str,
+        location: NotificationActivationProofLocation,
+        key: &str,
+    ) -> ExtensionDescriptor {
+        let mut descriptor = descriptor(
+            ExtensionId::parse(id).unwrap(),
+            &format!("{method}/request"),
+            method,
+            &format!("{method}/result"),
+        );
+        descriptor.routing_headers.clear();
+        let notification = descriptor.notification.as_mut().unwrap();
+        notification.direction = ExtensionDirection::ClientToServer;
+        notification.activation_proof =
+            Some(NotificationActivationProofDescriptor::SelfContained {
+                location,
+                key: key.to_owned(),
+            });
+        descriptor
+    }
+
+    #[test]
+    fn notification_activation_admits_only_its_exact_current_message_proof() {
+        for location in [
+            NotificationActivationProofLocation::Params,
+            NotificationActivationProofLocation::Metadata,
+        ] {
+            let descriptor = self_contained_notification_descriptor(
+                "com.example/events",
+                "example/events",
+                location,
+                "com.example/proof",
+            );
+            let id = descriptor.id.clone();
+            let mut registry = ExtensionDescriptorRegistry::default();
+            registry.register(descriptor).unwrap();
+            registry.freeze().unwrap();
+            let settings = json!({"version": 2, "options": {"nested": [null, 1.25]}});
+            let parameters = match location {
+                NotificationActivationProofLocation::Params => json!({
+                    "com.example/proof": settings,
+                    "event": "changed",
+                    "_meta": {"io.modelcontextprotocol/clientCapabilities": "inert"}
+                }),
+                NotificationActivationProofLocation::Metadata => json!({
+                    "event": "changed",
+                    "_meta": {"com.example/proof": settings}
+                }),
+            };
+            assert_eq!(
+                registry
+                    .notification_activation_settings(&id, "example/events", &parameters)
+                    .unwrap(),
+                ExtensionSettings::new(settings.clone()).unwrap(),
+            );
+            for invalid in [
+                json!({"event": "changed"}),
+                json!({"com.example/other": settings}),
+                json!({"com.example/proof": []}),
+                json!({"_meta": {"com.example/proof": []}}),
+                json!({"com.example/proof": settings, "_meta": null}),
+            ] {
+                assert!(
+                    registry
+                        .notification_activation_settings(&id, "example/events", &invalid)
+                        .is_err()
+                );
+            }
+            let other_location = match location {
+                NotificationActivationProofLocation::Params => {
+                    json!({"_meta": {"com.example/proof": settings}})
+                }
+                NotificationActivationProofLocation::Metadata => {
+                    json!({"com.example/proof": settings})
+                }
+            };
+            assert!(
+                registry
+                    .notification_activation_settings(&id, "example/events", &other_location)
+                    .is_err()
+            );
+            assert!(
+                registry
+                    .notification_activation_settings(&id, "example/other", &parameters)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn notification_activation_bounds_settings_and_metadata_without_resolving_them() {
+        let descriptor = self_contained_notification_descriptor(
+            "com.example/events",
+            "example/events",
+            NotificationActivationProofLocation::Params,
+            "com.example/proof",
+        );
+        let id = descriptor.id.clone();
+        let mut registry = ExtensionDescriptorRegistry::default();
+        registry.register(descriptor).unwrap();
+        let parameters = json!({"com.example/proof": {}});
+        assert!(
+            registry
+                .notification_activation_settings(&id, "example/events", &parameters)
+                .is_err()
+        );
+        registry.freeze().unwrap();
+        assert!(
+            registry
+                .notification_activation_settings(&id, "example/events", &parameters)
+                .is_ok()
+        );
+
+        let mut large = serde_json::Map::new();
+        for index in 0..8 {
+            large.insert(index.to_string(), json!("x".repeat(9_000)));
+        }
+        let oversized = json!({"com.example/proof": large});
+        assert!(ExtensionSettings::new(oversized["com.example/proof"].clone()).is_ok());
+        assert!(
+            registry
+                .notification_activation_settings(&id, "example/events", &oversized)
+                .is_err()
+        );
+        assert!(
+            registry
+                .notification_activation_settings(
+                    &id,
+                    "example/events",
+                    &json!({
+                        "com.example/proof": {}, "_meta": {"bad key": 1}
+                    })
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn notification_activation_freeze_rejects_ownership_drift_and_binds_placement() {
+        // Sharing the official DNS prefix does not make a core field owned
+        // by this extension. Reject that claim in either placement while
+        // allowing an otherwise identical extension-owned proof key.
+        for location in [
+            NotificationActivationProofLocation::Params,
+            NotificationActivationProofLocation::Metadata,
+        ] {
+            let official = self_contained_notification_descriptor(
+                "io.modelcontextprotocol/notify-example",
+                "example/official-notify",
+                location,
+                "io.modelcontextprotocol/notify-example-proof",
+            );
+            ExtensionDescriptorRegistry::default()
+                .register(official.clone())
+                .unwrap();
+            for key in [
+                crate::messages::FINAL_PROTOCOL_VERSION_META_KEY,
+                crate::messages::FINAL_CLIENT_CAPABILITIES_META_KEY,
+                crate::messages::FINAL_CLIENT_INFO_META_KEY,
+                crate::messages::FINAL_SERVER_INFO_META_KEY,
+                crate::messages::FINAL_LOG_LEVEL_META_KEY,
+                crate::messages::FINAL_SUBSCRIPTION_ID_META_KEY,
+            ] {
+                let mut claimed_core = official.clone();
+                claimed_core.notification.as_mut().unwrap().activation_proof =
+                    Some(NotificationActivationProofDescriptor::SelfContained {
+                        location,
+                        key: key.to_owned(),
+                    });
+                assert!(matches!(
+                    ExtensionDescriptorRegistry::default().register(claimed_core),
+                    Err(ExtensionRegistryError::InvalidNotificationActivationProof)
+                ));
+            }
+        }
+        let descriptor = self_contained_notification_descriptor(
+            "com.example/events",
+            "example/events",
+            NotificationActivationProofLocation::Params,
+            "com.example/proof",
+        );
+        let mut first = ExtensionDescriptorRegistry::default();
+        first.register(descriptor.clone()).unwrap();
+        let first_receipt = first.freeze().unwrap();
+        for (location, key) in [
+            (
+                NotificationActivationProofLocation::Metadata,
+                "com.example/proof",
+            ),
+            (
+                NotificationActivationProofLocation::Params,
+                "com.example/other",
+            ),
+        ] {
+            let mut changed = descriptor.clone();
+            changed.notification.as_mut().unwrap().activation_proof =
+                Some(NotificationActivationProofDescriptor::SelfContained {
+                    location,
+                    key: key.to_owned(),
+                });
+            let mut registry = ExtensionDescriptorRegistry::default();
+            registry.register(changed).unwrap();
+            assert_ne!(first_receipt.digest(), registry.freeze().unwrap().digest());
+        }
+        let mut foreign = descriptor.clone();
+        foreign.notification.as_mut().unwrap().activation_proof =
+            Some(NotificationActivationProofDescriptor::SelfContained {
+                location: NotificationActivationProofLocation::Params,
+                key: "com.foreign/proof".to_owned(),
+            });
+        assert!(
+            ExtensionDescriptorRegistry::default()
+                .register(foreign)
+                .is_err()
+        );
+
+        let mut wrong_direction = descriptor.clone();
+        wrong_direction.notification.as_mut().unwrap().direction =
+            ExtensionDirection::ServerToClient;
+        assert!(
+            ExtensionDescriptorRegistry::default()
+                .register(wrong_direction)
+                .is_err()
+        );
+        let mut routed = descriptor.clone();
+        routed
+            .routing_headers
+            .push(ExtensionRoutingHeaderDescriptor {
+                name: "Mcp-Event".to_owned(),
+            });
+        assert!(
+            ExtensionDescriptorRegistry::default()
+                .register(routed)
+                .is_err()
+        );
+
+        let other = self_contained_notification_descriptor(
+            "com.example/other",
+            "example/other",
+            NotificationActivationProofLocation::Metadata,
+            "com.example/proof",
+        );
+        let mut collision = ExtensionDescriptorRegistry::default();
+        collision.register(descriptor).unwrap();
+        assert!(matches!(
+            collision.register(other),
+            Err(ExtensionRegistryError::OwnershipCollision {
+                field: "notification activation proof",
+                ..
+            })
+        ));
     }
 
     #[test]

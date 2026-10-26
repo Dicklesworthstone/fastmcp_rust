@@ -333,6 +333,20 @@ pub fn admit_modern_post(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<AdmittedModernPost, ModernPostRejection> {
+    admit_modern_post_with_notification_descriptors(config, method, path, headers, body, None)
+}
+
+/// Applies the same strict HTTP boundary with an explicitly frozen extension
+/// notification profile. This performs structural admission only: the server
+/// must authenticate, authorize and negotiate this message before dispatch.
+pub(crate) fn admit_modern_post_with_notification_descriptors(
+    config: &HttpEndpointConfig,
+    method: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    descriptors: Option<&fastmcp_protocol::ExtensionDescriptorRegistry>,
+) -> Result<AdmittedModernPost, ModernPostRejection> {
     if path != config.path() {
         return Err(ModernPostRejection::EndpointMismatch);
     }
@@ -383,19 +397,68 @@ pub fn admit_modern_post(
             _ => ModernPostRejection::InvalidEnvelope,
         })
         .and_then(|(request, raw_params)| {
-            if request.id.is_some() {
-                Ok((request, raw_params))
-            } else {
-                Err(ModernPostRejection::NotARequest)
+            if request.id.is_none() {
+                let descriptors = descriptors.ok_or(ModernPostRejection::NotARequest)?;
+                let descriptor = descriptors
+                    .descriptors()
+                    .find(|descriptor| {
+                        descriptor
+                            .notification
+                            .as_ref()
+                            .is_some_and(|notification| {
+                                notification.name == request.method
+                                    && notification.direction
+                                        == fastmcp_protocol::ExtensionDirection::ClientToServer
+                                    && notification.activation_proof.is_some()
+                            })
+                    })
+                    .ok_or(ModernPostRejection::NotARequest)?;
+                if descriptors.receipt().is_none() || !descriptor.routing_headers.is_empty() {
+                    return Err(ModernPostRejection::NotARequest);
+                }
+                let parameters = request
+                    .params
+                    .as_ref()
+                    .ok_or(ModernPostRejection::NotARequest)?;
+                fastmcp_protocol::extensions::validate_extension_notification_metadata(parameters)
+                    .map_err(|_| ModernPostRejection::NotARequest)?;
+                descriptors
+                    .notification_activation_settings(&descriptor.id, &request.method, parameters)
+                    .map_err(|_| ModernPostRejection::NotARequest)?;
+                // The frozen notification descriptor is the modern-era marker.
+                // Request-only mirrors never activate or route a notification.
+                if headers.iter().any(|(name, _)| {
+                    name.eq_ignore_ascii_case(MCP_PROTOCOL_VERSION_HEADER)
+                        || name.eq_ignore_ascii_case(MCP_METHOD_HEADER)
+                        || name.eq_ignore_ascii_case(MCP_NAME_HEADER)
+                        || name
+                            .get(..MCP_PARAM_HEADER_PREFIX.len())
+                            .is_some_and(|prefix| {
+                                prefix.eq_ignore_ascii_case(MCP_PARAM_HEADER_PREFIX)
+                            })
+                }) {
+                    return Err(ModernPostRejection::NotARequest);
+                }
             }
+            Ok((request, raw_params))
         })
-        .and_then(
-            |(request, raw_params)| match request_meta_structure_issue(&request) {
-                Some(issue) => Err(ModernPostRejection::InvalidRequestMeta { issue }),
-                None => Ok((request, raw_params)),
-            },
-        )
         .and_then(|(request, raw_params)| {
+            if request.id.is_some()
+                && let Some(issue) = request_meta_structure_issue(&request)
+            {
+                return Err(ModernPostRejection::InvalidRequestMeta { issue });
+            }
+            Ok((request, raw_params))
+        })
+        .and_then(|(request, raw_params)| {
+            if request.id.is_none() {
+                return Ok(AdmittedModernPost {
+                    request,
+                    raw_params: raw_params.map(Arc::<str>::from),
+                    protocol_version: FinalProtocolVersion,
+                    representation: ResponseRepresentation::Json,
+                });
+            }
             let protocol_version = {
                 let metadata = FinalHttpRequestMetadata {
                     version: RequestVersionMetadata {

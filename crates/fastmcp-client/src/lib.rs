@@ -16750,6 +16750,25 @@ impl HttpClient {
             .map_err(HttpClientError::Connection)
     }
 
+    /// Sends a configured modern extension notification with fresh per-message proof.
+    ///
+    /// The proof uses this client's frozen local settings and retained peer
+    /// discovery. Conflicting caller proof, inactive extensions and legacy
+    /// connections are rejected before network contact. No request ID is consumed.
+    /// The operation owns one POST until an empty 202 or a bounded failure.
+    pub async fn notify_final_extension(
+        &mut self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<(), HttpClientError> {
+        self.connection
+            .notify_final_extension(cx, extension_id, method, parameters)
+            .await
+            .map_err(HttpClientError::Connection)
+    }
+
     /// Sends one notification through the selected HTTP era.
     pub async fn notify(
         &mut self,

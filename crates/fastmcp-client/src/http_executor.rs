@@ -425,6 +425,7 @@ pub struct ModernHttpRequest {
     name_header: Option<String>,
     authorization: Option<String>,
     parameter_headers: Option<Vec<(String, String)>>,
+    request_routing_headers: bool,
 }
 
 impl fmt::Debug for ModernHttpRequest {
@@ -496,7 +497,26 @@ impl ModernHttpRequest {
             name_header,
             authorization: None,
             parameter_headers: None,
+            request_routing_headers: true,
         })
+    }
+
+    /// Constructs a notification only after its frozen activation was admitted.
+    /// No ordinary request metadata or routing headers are synthesized here.
+    fn notification(
+        target: &str,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<Self, ModernHttpClientError> {
+        let notification = JsonRpcRequest::notification(method, Some(parameters));
+        crate::measure_serialized_bytes(&notification, crate::MAX_HTTP_EXECUTION_REQUEST_BYTES)
+            .map_err(|_| ModernHttpClientError::ExtensionNotificationNotAdmitted)?;
+        let body = serde_json::to_vec(&notification)
+            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+        let mut request = Self::new(target, body, MODERN_PROTOCOL_VERSION, method, None)
+            .map_err(ModernHttpClientError::Executor)?;
+        request.request_routing_headers = false;
+        Ok(request)
     }
 
     /// Attaches the bound bearer credential's `Authorization` header when —
@@ -556,17 +576,19 @@ impl ModernHttpRequest {
                 "Accept-Encoding".to_owned(),
                 MODERN_MCP_ACCEPT_ENCODING.to_owned(),
             ),
-            (
+        ];
+        if self.request_routing_headers {
+            headers.push((
                 "MCP-Protocol-Version".to_owned(),
                 self.protocol_version.clone(),
-            ),
-            ("Mcp-Method".to_owned(), self.method.clone()),
-        ];
-        if let Some(name) = &self.name_header {
-            headers.push(("Mcp-Name".to_owned(), name.clone()));
-        }
-        if let Some(parameters) = &self.parameter_headers {
-            headers.extend(parameters.iter().cloned());
+            ));
+            headers.push(("Mcp-Method".to_owned(), self.method.clone()));
+            if let Some(name) = &self.name_header {
+                headers.push(("Mcp-Name".to_owned(), name.clone()));
+            }
+            if let Some(parameters) = &self.parameter_headers {
+                headers.extend(parameters.iter().cloned());
+            }
         }
         let authorization = match credential {
             Some(credential) => self.bound_authorization(credential),
@@ -6786,12 +6808,35 @@ impl ClientHttpConnection {
         }
     }
 
-    /// Sends one client notification through the selected transport.
+    /// Sends one explicitly configured modern extension notification.
+    ///
+    /// The extension's current-message proof is built from its frozen local
+    /// settings. This API never falls back to exact-2024 or allocates an RPC ID.
+    pub async fn notify_final_extension(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<(), ClientHttpConnectionError> {
+        match self {
+            Self::Modern(client) => client
+                .notify_final_extension(cx, extension_id, method, parameters)
+                .await
+                .map_err(ClientHttpConnectionError::Modern),
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::LegacySse(_) => Err(ClientHttpConnectionError::Modern(
+                ModernHttpClientError::ExtensionNotificationNotAdmitted,
+            )),
+        }
+    }
+
+/// Sends one client notification through the selected transport.
     ///
     /// Exact legacy notifications are posted to the pinned message endpoint
-    /// without an ID. MCP 2026-07-28 rejects every client notification over
-    /// HTTP before a POST can be opened; client cancellation closes the owned
-    /// response body instead.
+    /// without an ID. Modern notifications require the explicit
+    /// [`Self::notify_final_extension`] proof-bound path. Core cancellation
+    /// closes its owned response body instead.
     #[cfg_attr(
         not(feature = "legacy-2024-11-05"),
         allow(clippy::unused_async, clippy::unused_async_trait_impl)
@@ -7023,8 +7068,7 @@ fn reject_final_only_legacy_request_metadata(
 
 /// Errors raised while connecting or issuing a policy-bound modern HTTP request.
 #[derive(Debug)]
-pub enum ModernHttpClientError {
-    /// A public constructor selected a protocol policy compiled out of this client.
+pub enum ModernHttpClientError {    /// A public constructor selected a protocol policy compiled out of this client.
     FeatureUnavailable(McpError),
     /// Reviewed parameter headers could not be projected onto this exact
     /// request, so nothing was sent.
@@ -7049,8 +7093,12 @@ pub enum ModernHttpClientError {
     MissingRequestId { method: String },
     /// The caller supplied an ID for a final notification method.
     NotificationHasRequestId { method: String },
-    /// MCP 2026-07-28 does not permit client notification POSTs over HTTP.
+    /// The generic request path cannot send client notification POSTs.
     ClientNotificationPostUnsupported { method: String },
+    /// No current-message proof could be admitted by the frozen local extension.
+    ExtensionNotificationNotAdmitted,
+    /// A notification did not receive the required finite HTTP 202 acknowledgement.
+    NotificationAcknowledgementInvalid { status: u16 },
     /// JSON-RPC or final metadata serialization failed before a native POST.
     RequestEncodingFailed,
     /// The native executor rejected or failed the HTTP exchange.
@@ -7195,7 +7243,14 @@ impl fmt::Display for ModernHttpClientError {
             }
             Self::ClientNotificationPostUnsupported { method } => write!(
                 formatter,
-                "modern HTTP does not permit a client notification POST for {method}"
+                "modern HTTP does not permit an unadmitted client notification POST for {method}"
+            ),
+            Self::ExtensionNotificationNotAdmitted => {
+                formatter.write_str("modern HTTP extension notification is not admitted")
+            }
+            Self::NotificationAcknowledgementInvalid { status } => write!(
+                formatter,
+                "modern HTTP notification expected an empty 202 acknowledgement, received {status}"
             ),
             Self::RequestEncodingFailed => {
                 formatter.write_str("modern MCP request encoding failed")
@@ -7325,6 +7380,8 @@ impl std::error::Error for ModernHttpClientError {
             | Self::MissingRequestId { .. }
             | Self::NotificationHasRequestId { .. }
             | Self::ClientNotificationPostUnsupported { .. }
+            | Self::ExtensionNotificationNotAdmitted
+            | Self::NotificationAcknowledgementInvalid { .. }
             | Self::RequestEncodingFailed
             | Self::DiscoveryRejected { .. }
             | Self::InvalidDiscoveryResponse
@@ -7676,6 +7733,55 @@ impl ModernHttpClient {
                 )
             })?;
         runtime.admit_method(&negotiated, extension_id, method)
+    }
+
+    /// Sends one proof-bound extension notification as one finite HTTP POST.
+    ///
+    /// The builder must install this exact client-to-server descriptor and local
+    /// settings. Each call performs a fresh compatibility decision and emits
+    /// its self-contained proof; connection/discovery state is never a substitute.
+    /// Ordinary MCP request routing headers and request metadata are omitted.
+    /// Only an empty HTTP 202 response acknowledges the notification. Failure,
+    /// cancellation and uncertain delivery never trigger an automatic retry.
+    pub async fn notify_final_extension(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<(), ModernHttpClientError> {
+        check_modern_http_context(cx).map_err(ModernHttpClientError::Executor)?;
+        let runtime = self
+            .client_extension_runtime
+            .as_ref()
+            .ok_or(ModernHttpClientError::ExtensionNotificationNotAdmitted)?;
+        let parameters = runtime
+            .prepare_notification(
+                &self.discovery_state.server_discovery,
+                extension_id,
+                method,
+                parameters,
+            )
+            .map_err(|_| ModernHttpClientError::ExtensionNotificationNotAdmitted)?;
+        check_modern_http_context(cx).map_err(ModernHttpClientError::Executor)?;
+        let request =
+            ModernHttpRequest::notification(&self.modern_post_target, method, parameters)?;
+        let response = self
+            .executor
+            .execute(cx, &request)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        let status = response.metadata().status();
+        if status != 202 || response.metadata().kind() == ModernHttpResponseKind::Sse {
+            return Err(ModernHttpClientError::NotificationAcknowledgementInvalid { status });
+        }
+        // Even a framed 202 may contain bytes. Admit EOF with zero body bytes;
+        // the existing executor bounds the complete wait and owns cancellation.
+        response
+            .read_to_end(cx, 0)
+            .await
+            .map_err(ModernHttpClientError::Executor)?;
+        Ok(())
     }
 
     fn configured_client_extensions(
@@ -12342,6 +12448,418 @@ mod tests {
     const LEGACY_TEST_PEER_BOUND: Duration = Duration::from_secs(2);
     #[cfg(any(feature = "legacy-2024-11-05", feature = "tasks"))]
     const LEGACY_TEST_PEER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    fn notification_test_builder(
+        target: &str,
+        location: fastmcp_protocol::NotificationActivationProofLocation,
+        proof_enabled: bool,
+        resolutions: Arc<AtomicUsize>,
+    ) -> ClientBuilder {
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+            ExtensionDirection, ExtensionFallbackPolicy, ExtensionId, ExtensionNegotiationError,
+            ExtensionNegotiationResolver, ExtensionNotificationDescriptor, ExtensionSettings,
+            ExtensionSettingsSchema, NotificationActivationProofDescriptor,
+        };
+        let id = ExtensionId::parse("com.example/events").unwrap();
+        let mut registry = ExtensionDescriptorRegistry::default();
+        registry
+            .register(ExtensionDescriptor {
+                id: id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: "events-client-v1".to_owned(),
+                    codec_id: "events-client-v1".to_owned(),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: "events-server-v1".to_owned(),
+                    codec_id: "events-server-v1".to_owned(),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: "events-compatibility-v1".to_owned(),
+                    version: 1,
+                    fallback: ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: None,
+                notification: Some(ExtensionNotificationDescriptor {
+                    name: "example/events".to_owned(),
+                    direction: ExtensionDirection::ClientToServer,
+                    activation_proof: proof_enabled.then(|| {
+                        NotificationActivationProofDescriptor::SelfContained {
+                            location,
+                            key: "com.example/proof".to_owned(),
+                        }
+                    }),
+                }),
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .unwrap();
+        ClientBuilder::new()
+            .protocol_plan(plan(
+                target,
+                "http://127.0.0.1:9/unused-sse",
+                "http://127.0.0.1:9/unused-messages",
+                ProtocolPolicy::ModernOnly,
+            ))
+            .extension_registry(
+                registry,
+                ClientExtensionDiscovery {
+                    extensions: BTreeMap::from([(
+                        id,
+                        ExtensionSettings::new(serde_json::json!({"version": 2})).unwrap(),
+                    )]),
+                },
+                move || {
+                    let resolutions = Arc::clone(&resolutions);
+                    move |descriptor: &ExtensionDescriptor,
+                          client: &ExtensionSettings,
+                          server: &ExtensionSettings| {
+                        resolutions.fetch_add(1, Ordering::SeqCst);
+                        // Client and server schemas deliberately differ.
+                        if client.clone().into_value()["version"] == 2
+                            && server.clone().into_value()["acceptVersion"] == 2
+                        {
+                            Ok(client.clone())
+                        } else {
+                            Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                                descriptor.id.to_string(),
+                            ))
+                        }
+                    }
+                },
+            )
+            .unwrap()
+    }
+
+    fn accept_notification_test_peer(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "notification peer accept exceeded its bound"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("accept notification peer: {error}"),
+            }
+        }
+    }
+
+    fn respond_notification_discovery(listener: &TcpListener) {
+        let mut stream = accept_notification_test_peer(listener);
+        let request = read_request(&mut stream);
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["method"], SERVER_DISCOVER);
+        assert_eq!(body["id"], 1);
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "resultType": "complete",
+                "supportedVersions": [MODERN_PROTOCOL_VERSION],
+                "capabilities": {"extensions": {"com.example/events": {"acceptVersion": 2}}},
+                "ttlMs": 0,
+                "cacheScope": "private"
+            }
+        });
+        write_response(
+            &mut stream,
+            200,
+            "application/json",
+            &serde_json::to_vec(&response).unwrap(),
+        );
+    }
+
+    fn respond_notification_followup(listener: &TcpListener) {
+        let mut stream = accept_notification_test_peer(listener);
+        let request = read_request(&mut stream);
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(
+            body["method"], "tools/list",
+            "no rejected or repeated notification may reach the peer"
+        );
+        assert_eq!(
+            body["id"], 2,
+            "notifications do not consume the RPC request allocator"
+        );
+        write_response(&mut stream, 200, "application/json",
+            br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#);
+    }
+
+    #[test]
+    fn modern_http_extension_notification_sends_current_proof_without_request_headers_or_id() {
+        use fastmcp_protocol::NotificationActivationProofLocation;
+        for location in [
+            NotificationActivationProofLocation::Params,
+            NotificationActivationProofLocation::Metadata,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = thread::spawn(move || {
+                respond_notification_discovery(&listener);
+                let mut stream = accept_notification_test_peer(&listener);
+                let request = read_request(&mut stream);
+                let headers = request.head.to_ascii_lowercase();
+                assert!(headers.starts_with("post /mcp http/1.1\r\n"));
+                assert!(headers.contains("content-type: application/json\r\n"));
+                assert!(headers.contains("accept: application/json, text/event-stream\r\n"));
+                assert!(headers.contains("accept-encoding: identity\r\n"));
+                for forbidden in [
+                    "mcp-protocol-version:",
+                    "mcp-method:",
+                    "mcp-name:",
+                    "mcp-session-id:",
+                    "content-encoding:",
+                ] {
+                    assert!(!headers.contains(forbidden));
+                }
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert!(body.get("id").is_none());
+                assert_eq!(body["method"], "example/events");
+                assert_eq!(body["params"]["event"], "changed");
+                match location {
+                    NotificationActivationProofLocation::Params => {
+                        assert_eq!(
+                            body["params"]["com.example/proof"],
+                            serde_json::json!({"version": 2})
+                        );
+                        assert!(body["params"].get("_meta").is_none());
+                    }
+                    NotificationActivationProofLocation::Metadata => {
+                        assert_eq!(
+                            body["params"]["_meta"],
+                            serde_json::json!({"com.example/proof": {"version": 2}})
+                        );
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                respond_notification_followup(&listener);
+            });
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            let cx = Cx::for_request();
+            let mut client = runtime_block_on(
+                notification_test_builder(&target, location, true, Arc::clone(&resolutions))
+                    .connect_http_client_with_cx(&cx),
+            )
+            .unwrap();
+            let id = fastmcp_protocol::ExtensionId::parse("com.example/events").unwrap();
+            let conflicting = match location {
+                NotificationActivationProofLocation::Params => {
+                    serde_json::json!({"event": "changed", "com.example/proof": {"version": 3}})
+                }
+                NotificationActivationProofLocation::Metadata => {
+                    serde_json::json!({"event": "changed", "_meta": {"com.example/proof": {"version": 3}}})
+                }
+            };
+            assert!(
+                runtime_block_on(client.notify_final_extension(
+                    &cx,
+                    &id,
+                    "example/events",
+                    conflicting
+                ))
+                .is_err()
+            );
+            assert!(
+                runtime_block_on(client.notify_final_extension(
+                    &cx,
+                    &id,
+                    "example/other",
+                    serde_json::json!({"event": "changed"})
+                ))
+                .is_err()
+            );
+            assert_eq!(
+                resolutions.load(Ordering::SeqCst),
+                1,
+                "invalid local proof cannot enter the resolver"
+            );
+            runtime_block_on(client.notify_final_extension(
+                &cx,
+                &id,
+                "example/events",
+                serde_json::json!({"event": "changed"}),
+            ))
+            .unwrap();
+            assert_eq!(
+                resolutions.load(Ordering::SeqCst),
+                2,
+                "each emitted notification has fresh compatibility admission"
+            );
+            runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
+                .unwrap();
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn modern_http_extension_notification_requires_explicit_http_proof_descriptor() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = thread::spawn(move || {
+            respond_notification_discovery(&listener);
+            respond_notification_followup(&listener);
+        });
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let cx = Cx::for_request();
+        let mut client = runtime_block_on(
+            notification_test_builder(
+                &target,
+                fastmcp_protocol::NotificationActivationProofLocation::Params,
+                false,
+                Arc::clone(&resolutions),
+            )
+            .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let id = fastmcp_protocol::ExtensionId::parse("com.example/events").unwrap();
+        assert!(
+            runtime_block_on(client.notify_final_extension(
+                &cx,
+                &id,
+                "example/events",
+                serde_json::json!({"com.example/proof": {"version": 2}})
+            ))
+            .is_err()
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+        runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
+            .unwrap();
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn modern_http_extension_notification_refuses_nonempty_or_wrong_ack_without_replay() {
+        for (status, content_type, body) in [
+            (202, "application/json", &b"x"[..]),
+            (200, "application/json", &b"{}"[..]),
+            (202, "text/event-stream", &b""[..]),
+            (302, "text/plain", &b""[..]),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = thread::spawn(move || {
+                respond_notification_discovery(&listener);
+                let mut stream = accept_notification_test_peer(&listener);
+                let request = read_request(&mut stream);
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(request["method"], "example/events");
+                assert!(request.get("id").is_none());
+                write_response(&mut stream, status, content_type, body);
+                respond_notification_followup(&listener);
+            });
+            let cx = Cx::for_request();
+            let mut client = runtime_block_on(
+                notification_test_builder(
+                    &target,
+                    fastmcp_protocol::NotificationActivationProofLocation::Params,
+                    true,
+                    Arc::new(AtomicUsize::new(0)),
+                )
+                .connect_http_client_with_cx(&cx),
+            )
+            .unwrap();
+            let id = fastmcp_protocol::ExtensionId::parse("com.example/events").unwrap();
+            assert!(
+                runtime_block_on(client.notify_final_extension(
+                    &cx,
+                    &id,
+                    "example/events",
+                    serde_json::json!({"event": "changed"})
+                ))
+                .is_err()
+            );
+            runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
+                .unwrap();
+            peer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn modern_http_extension_notification_drop_closes_only_its_pending_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            respond_notification_discovery(&listener);
+            let mut stream = accept_notification_test_peer(&listener);
+            let request = read_request(&mut stream);
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["method"], "example/events");
+            assert!(request.get("id").is_none());
+            started_tx.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                stream.read(&mut byte).unwrap(),
+                0,
+                "dropping the owned notification closes its response wait"
+            );
+            respond_notification_followup(&listener);
+        });
+        let cx = Cx::for_request();
+        let mut client = runtime_block_on(
+            notification_test_builder(
+                &target,
+                fastmcp_protocol::NotificationActivationProofLocation::Params,
+                true,
+                Arc::new(AtomicUsize::new(0)),
+            )
+            .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let id = fastmcp_protocol::ExtensionId::parse("com.example/events").unwrap();
+        let mut notification = Box::pin(client.notify_final_extension(
+            &cx,
+            &id,
+            "example/events",
+            serde_json::json!({"event": "changed"}),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        runtime_block_on(std::future::poll_fn(|task_cx| {
+            assert!(
+                notification.as_mut().poll(task_cx).is_pending(),
+                "peer has not acknowledged this notification"
+            );
+            match started_rx.try_recv() {
+                Ok(()) => Poll::Ready(()),
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "notification send exceeded its test bound"
+                    );
+                    task_cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Err(error) => panic!("notification peer stopped before dispatch: {error}"),
+            }
+        }));
+        drop(notification);
+        runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
+            .unwrap();
+        peer.join().unwrap();
+    }
 
     #[test]
     fn pending_sse_debug_never_exposes_peer_payload() {

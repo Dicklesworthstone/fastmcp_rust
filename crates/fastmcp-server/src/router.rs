@@ -1863,7 +1863,7 @@ fn request_cx_cancellation_is_visible(request_cx: &Cx) -> bool {
 /// the scheduler is opening the region. `ChildRegionOpening` itself has no
 /// drop cleanup in the pinned runtime. The short, parent-owned task consumes
 /// that result and drops the region (requesting close) if its receiver left.
-async fn open_modern_request_region(ctx: &McpContext) -> McpResult<Option<ChildRegion>> {
+pub(crate) async fn open_modern_request_region(ctx: &McpContext) -> McpResult<Option<ChildRegion>> {
     let budget = ctx.budget();
     let admission = ctx.cx().spawn(move |admission_cx| async move {
         admission_cx

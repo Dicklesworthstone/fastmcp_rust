@@ -425,6 +425,13 @@ impl std::error::Error for ExtensionHandlerInvocationError {
     }
 }
 
+type NotificationAuthorizer = dyn Fn(&McpContext, &Value) -> McpResult<()> + Send + Sync;
+
+struct RegisteredNotificationHandler {
+    authorize: Box<NotificationAuthorizer>,
+    handler: Box<dyn ErasedExtensionHandler>,
+}
+
 /// Frozen, typed server handlers bound to one protocol descriptor registry.
 ///
 /// The map is erased only internally. Each [`Self::register`] call fixes that
@@ -436,6 +443,7 @@ impl std::error::Error for ExtensionHandlerInvocationError {
 pub struct ExtensionHandlerRegistry {
     descriptor_registry: ExtensionDescriptorRegistry,
     handlers: BTreeMap<ExtensionHandlerKey, Box<dyn ErasedExtensionHandler>>,
+    notification_handlers: BTreeMap<ExtensionHandlerKey, RegisteredNotificationHandler>,
     server_metadata: BTreeMap<ExtensionId, ExtensionSettings>,
     frozen: bool,
 }
@@ -447,6 +455,7 @@ impl ExtensionHandlerRegistry {
         Self {
             descriptor_registry,
             handlers: BTreeMap::new(),
+            notification_handlers: BTreeMap::new(),
             server_metadata: BTreeMap::new(),
             frozen: false,
         }
@@ -482,13 +491,13 @@ impl ExtensionHandlerRegistry {
     /// Returns the number of registered typed handlers.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.handlers.len()
+        self.handlers.len() + self.notification_handlers.len()
     }
 
     /// Returns whether no typed handlers have been registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.handlers.is_empty()
+        self.handlers.is_empty() && self.notification_handlers.is_empty()
     }
 
     /// Returns the number of descriptor-bound server metadata entries.
@@ -622,6 +631,166 @@ impl ExtensionHandlerRegistry {
                 marker: PhantomData,
             }),
         )
+    }
+
+    /// Registers a typed, request-scoped extension notification handler.
+    ///
+    /// The explicit authorizer runs after transport authentication and before
+    /// settings negotiation or application dispatch. It must authorize this
+    /// exact operation and sanitized parameters from the supplied context.
+    /// A public operation can explicitly return `Ok(())`; registration never
+    /// supplies an implicit authorization policy. HTTP 202 is emitted only
+    /// after the handler completes. No work is detached or supervised.
+    pub fn register_notification<Request, Handler, Authorize>(
+        &mut self,
+        extension_id: ExtensionId,
+        method: impl Into<String>,
+        authorize: Authorize,
+        handler: Handler,
+    ) -> Result<(), ExtensionHandlerRegistrationError>
+    where
+        Request: DeserializeOwned + 'static,
+        Handler: ExtensionHandler<Request, ()> + 'static,
+        Authorize: Fn(&McpContext, &Value) -> McpResult<()> + Send + Sync + 'static,
+    {
+        self.register_notification_handler(
+            extension_id,
+            method.into(),
+            RegisteredNotificationHandler {
+                authorize: Box::new(authorize),
+                handler: Box::new(SerdeExtensionHandler::<Request, (), Handler> {
+                    handler,
+                    marker: PhantomData,
+                }),
+            },
+        )
+    }
+
+    /// Registers an asynchronous notification that completes in request scope.
+    ///
+    /// The supplied context owns cancellation and a finite execution deadline.
+    /// The callback may yield, but must not detach work whose completion would
+    /// outlive the HTTP acknowledgement. Authorization has the same explicit
+    /// contract as [`Self::register_notification`].
+    pub fn register_notification_async<Request, Handler, Authorize>(
+        &mut self,
+        extension_id: ExtensionId,
+        method: impl Into<String>,
+        authorize: Authorize,
+        handler: Handler,
+    ) -> Result<(), ExtensionHandlerRegistrationError>
+    where
+        Request: DeserializeOwned + Send + 'static,
+        Handler: for<'a> Fn(&'a McpContext, Request) -> BoxFuture<'a, McpResult<()>>
+            + Send
+            + Sync
+            + 'static,
+        Authorize: Fn(&McpContext, &Value) -> McpResult<()> + Send + Sync + 'static,
+    {
+        self.register_notification_handler(
+            extension_id,
+            method.into(),
+            RegisteredNotificationHandler {
+                authorize: Box::new(authorize),
+                handler: Box::new(AsyncSerdeExtensionHandler::<Request, (), Handler> {
+                    handler,
+                    marker: PhantomData,
+                }),
+            },
+        )
+    }
+
+    fn register_notification_handler(
+        &mut self,
+        extension_id: ExtensionId,
+        method: String,
+        handler: RegisteredNotificationHandler,
+    ) -> Result<(), ExtensionHandlerRegistrationError> {
+        if self.frozen {
+            return Err(ExtensionHandlerRegistrationError::Frozen);
+        }
+        let key = ExtensionHandlerKey::new(extension_id, method);
+        let descriptor = self
+            .descriptor_registry
+            .notification_descriptor(key.extension_id(), key.method())
+            .ok_or_else(|| ExtensionHandlerRegistrationError::MethodNotOwned(key.clone()))?;
+        if descriptor.direction != ExtensionDirection::ClientToServer {
+            return Err(ExtensionHandlerRegistrationError::MethodNotClientToServer(
+                key,
+            ));
+        }
+        if descriptor.activation_proof.is_none() {
+            return Err(ExtensionHandlerRegistrationError::MethodNotOwned(key));
+        }
+        if self.notification_handlers.contains_key(&key) {
+            return Err(ExtensionHandlerRegistrationError::DuplicateHandler(key));
+        }
+        self.notification_handlers.insert(key, handler);
+        Ok(())
+    }
+
+    pub(crate) fn authorize_notification(
+        &self,
+        context: &McpContext,
+        extension_id: &ExtensionId,
+        notification: &JsonRpcRequest,
+    ) -> McpResult<()> {
+        if !self.frozen || notification.id.is_some() {
+            return Err(McpError::invalid_request(
+                "Extension notification is not admitted",
+            ));
+        }
+        let key = ExtensionHandlerKey::new(extension_id.clone(), &notification.method);
+        let handler = self
+            .notification_handlers
+            .get(&key)
+            .ok_or_else(|| McpError::invalid_request("Extension notification is not admitted"))?;
+        context
+            .ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+        (handler.authorize)(
+            context,
+            notification.params.as_ref().unwrap_or(&Value::Null),
+        )
+    }
+
+    pub(crate) async fn invoke_notification_async(
+        &self,
+        context: &McpContext,
+        negotiated: &NegotiatedExtensionSet,
+        extension_id: &ExtensionId,
+        notification: &JsonRpcRequest,
+    ) -> McpResult<()> {
+        if !self.frozen || notification.id.is_some() {
+            return Err(McpError::invalid_request(
+                "Extension notification is not admitted",
+            ));
+        }
+        negotiated
+            .admit_notification(
+                &self.descriptor_registry,
+                ProtocolEra::Modern2026,
+                extension_id,
+                &notification.method,
+                ExtensionDirection::ClientToServer,
+            )
+            .map_err(|_| McpError::invalid_params("Extension notification is not active"))?;
+        let key = ExtensionHandlerKey::new(extension_id.clone(), &notification.method);
+        let handler = self
+            .notification_handlers
+            .get(&key)
+            .ok_or_else(|| McpError::invalid_request("Extension notification is not admitted"))?;
+        context
+            .ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+        handler
+            .handler
+            .invoke_async(context, notification.params.clone().unwrap_or(Value::Null))
+            .await?;
+        context
+            .ensure_live()
+            .map_err(|_| McpError::request_cancelled())?;
+        Ok(())
     }
 
     fn register_handler(
