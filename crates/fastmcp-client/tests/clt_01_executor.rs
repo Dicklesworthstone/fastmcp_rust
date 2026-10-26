@@ -25,6 +25,9 @@ struct ProbeState {
     received: VecDeque<Result<JsonRpcMessage, TransportError>>,
     sent: Vec<JsonRpcMessage>,
     send_error: Option<std::io::ErrorKind>,
+    send_attempts: usize,
+    close_error: Option<std::io::ErrorKind>,
+    close_attempts: usize,
     closed: bool,
 }
 
@@ -81,10 +84,12 @@ impl Probe {
 
 impl Transport for ScriptedTransport {
     fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        if let Some(kind) = self.state.borrow().send_error {
+        let mut state = self.state.borrow_mut();
+        state.send_attempts += 1;
+        if let Some(kind) = state.send_error {
             return Err(TransportError::Io(std::io::Error::from(kind)));
         }
-        self.state.borrow_mut().sent.push(message.clone());
+        state.sent.push(message.clone());
         Ok(())
     }
 
@@ -97,7 +102,12 @@ impl Transport for ScriptedTransport {
     }
 
     fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
-        self.state.borrow_mut().closed = true;
+        let mut state = self.state.borrow_mut();
+        state.close_attempts += 1;
+        if let Some(kind) = state.close_error {
+            return Err(TransportError::Io(std::io::Error::from(kind)));
+        }
+        state.closed = true;
         Ok(())
     }
 }
@@ -935,6 +945,132 @@ fn clt_01_b_positive() {
         McpErrorCode::RequestCancelled
     );
     assert_eq!(probe.sent_len(), 2);
+}
+
+#[test]
+fn shutdown_keeps_the_original_close_result_across_executor_clones() {
+    for close_error in [None, Some(std::io::ErrorKind::BrokenPipe)] {
+        let cx = Cx::for_testing();
+        let (transport, probe) = ScriptedTransport::new([]);
+        probe.0.borrow_mut().close_error = close_error;
+        let executor = RequestExecutor::new(transport);
+        let cloned = executor.clone();
+
+        let first = executor.shutdown(&cx);
+        assert_eq!(first.is_err(), close_error.is_some());
+        let expected = serde_json::to_value(&first).unwrap();
+        // Even if the underlying close would now succeed, cleanup is not
+        // retried and the original failure remains visible to every owner.
+        probe.0.borrow_mut().close_error = None;
+        for owner in [&cloned, &executor, &cloned] {
+            assert_eq!(serde_json::to_value(owner.shutdown(&cx)).unwrap(), expected);
+        }
+        assert_eq!(probe.0.borrow().close_attempts, 1);
+        assert_eq!(probe.0.borrow().send_attempts, 0);
+    }
+}
+
+#[test]
+fn shutdown_keeps_cancellation_write_failures_and_releases_all_waiters() {
+    for abandon_first in [false, true] {
+        for close_also_fails in [false, true] {
+            let cx = Cx::for_testing();
+            let (transport, probe) = ScriptedTransport::new([]);
+            let executor = RequestExecutor::new(transport);
+            let mut first = Some(executor.execute(&cx, request(801)).unwrap());
+            let mut second = executor.execute(&cx, request(802)).unwrap();
+            if abandon_first {
+                drop(first.take());
+            }
+            {
+                let mut state = probe.0.borrow_mut();
+                state.send_error = Some(std::io::ErrorKind::BrokenPipe);
+                state.close_error =
+                    close_also_fails.then_some(std::io::ErrorKind::PermissionDenied);
+            }
+            let error = executor
+                .shutdown(&cx)
+                .expect_err("a cancellation write failure is a cleanup failure");
+            assert_ne!(error.code, McpErrorCode::RequestCancelled);
+            assert!(executor.pending_records().is_empty());
+            let terminals = executor.terminal_records();
+            assert_eq!(terminals.len(), 1 + usize::from(!abandon_first));
+            assert!(terminals.iter().all(|record| record.waiter_release));
+            assert!(executor.try_take_response(&mut second).is_err());
+            if let Some(first) = first.as_mut() {
+                assert!(executor.try_take_response(first).is_err());
+            }
+            let attempts = probe.0.borrow().send_attempts;
+            {
+                let mut state = probe.0.borrow_mut();
+                state.send_error = None;
+                state.close_error = None;
+            }
+            let repeated = executor
+                .clone()
+                .shutdown(&cx)
+                .expect_err("a second owner must observe the original cleanup failure");
+            assert_eq!(
+                serde_json::to_value(repeated).unwrap(),
+                serde_json::to_value(error).unwrap()
+            );
+            assert_eq!(probe.0.borrow().send_attempts, attempts);
+            assert_eq!(probe.0.borrow().close_attempts, 1);
+        }
+    }
+}
+
+#[test]
+fn shutdown_discards_deferred_controls_before_later_live_maintenance() {
+    let live = Cx::for_testing();
+    let stopped = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new([]);
+    let executor = RequestExecutor::new(transport);
+    let mut active = executor.execute(&live, request(811)).unwrap();
+    let abandoned = executor.execute(&live, request(812)).unwrap();
+    drop(abandoned);
+    stopped.set_cancel_requested(true);
+
+    executor.shutdown(&stopped).unwrap();
+    assert_eq!(probe.0.borrow().send_attempts, 2);
+    assert_eq!(probe.0.borrow().close_attempts, 1);
+    assert!(probe.closed());
+    assert!(executor.pending_records().is_empty());
+    assert_eq!(
+        executor.try_take_response(&mut active).unwrap_err().code,
+        McpErrorCode::RequestCancelled
+    );
+
+    let cloned = executor.clone();
+    cloned.poll_timeouts_at(&live, Instant::now()).unwrap();
+    assert!(cloned.drive(&live).is_err());
+    assert!(cloned.execute(&live, request(813)).is_err());
+    cloned.shutdown(&live).unwrap();
+    assert_eq!(
+        probe.0.borrow().send_attempts,
+        2,
+        "maintenance cannot flush abandoned or shutdown controls after close"
+    );
+    assert_eq!(probe.0.borrow().close_attempts, 1);
+}
+
+#[test]
+fn shutdown_success_is_independent_of_a_prior_connection_failure() {
+    let cx = Cx::for_testing();
+    let (transport, probe) = ScriptedTransport::new([Err(TransportError::Io(
+        std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+    ))]);
+    let executor = RequestExecutor::new(transport);
+    let mut pending = executor.execute(&cx, request(821)).unwrap();
+    let operational_error = executor.drive(&cx).unwrap_err();
+
+    executor.shutdown(&cx).unwrap();
+    executor.clone().shutdown(&cx).unwrap();
+    assert_eq!(probe.0.borrow().close_attempts, 1);
+    assert_eq!(
+        serde_json::to_value(executor.try_take_response(&mut pending).unwrap_err()).unwrap(),
+        serde_json::to_value(operational_error).unwrap()
+    );
 }
 
 #[test]

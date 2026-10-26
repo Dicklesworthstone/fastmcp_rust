@@ -1219,6 +1219,9 @@ struct ExecutorState<T> {
     result_peer_era: ResultPeerEra,
     terminal_error: Option<McpError>,
     shutdown: bool,
+    /// Cleanup has its own outcome: a prior connection failure does not mean
+    /// transport closure failed, and a failed closure never becomes success.
+    shutdown_error: Option<McpError>,
 }
 
 /// The one authority allowed to take the next inbound transport frame.
@@ -1507,6 +1510,7 @@ where
                 result_peer_era,
                 terminal_error: None,
                 shutdown: false,
+                shutdown_error: None,
             }),
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT_EXECUTIONS,
@@ -2886,12 +2890,15 @@ where
     }
 
     /// Cancels live owners, releases their waiters, and closes the transport.
+    ///
+    /// Cleanup runs once across all executor clones. Later calls return the
+    /// original cleanup result without retrying transport writes or close.
     pub fn shutdown(&self, cx: &Cx) -> McpResult<()> {
         let turn = ExecutionTurn::new(cx);
         let cx = &turn;
         let mut state = self.state.borrow_mut();
         if state.shutdown {
-            return Ok(());
+            return state.shutdown_error.clone().map_or(Ok(()), Err);
         }
         let mut cleanup_error = self
             .flush_deferred_cancellations_locked(cx, &mut state)
@@ -2918,13 +2925,15 @@ where
             state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
             cleanup_error.get_or_insert(error);
         }
-        if let Some(error) = cleanup_error {
-            return Err(error);
-        }
+        // A stopped cleanup context can leave cancellation controls deferred.
+        // Their owners are already terminal and the transport has had its one
+        // close attempt; no later maintenance turn may write those controls.
+        state.deferred_cancellations.clear();
+        state.shutdown_error = cleanup_error;
         state.terminal_error.get_or_insert_with(|| {
             McpError::internal_error("Client request executor is shut down")
         });
-        Ok(())
+        state.shutdown_error.clone().map_or(Ok(()), Err)
     }
 
     /// Removes and returns unmatched final responses in arrival order.
