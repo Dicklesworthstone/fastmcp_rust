@@ -37,7 +37,10 @@ use asupersync::time::{TimerDriverHandle, VirtualClock};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptorBuilder};
 use asupersync::{CancelKind, Cx};
 use fastmcp_client::http_auth::BoundBearerCredential;
-use fastmcp_client::http_executor::{LegacySseHttpClient, ModernHttpClient};
+use fastmcp_client::http_executor::{
+    ClientHttpConnection, ClientHttpConnectionError, LegacySseHttpClient, LegacySseHttpClientError,
+    ModernHttpClient,
+};
 use fastmcp_client::{
     CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, LEG_HTTP_01_B_EVALUATOR_MANIFEST_V1,
     LimitConflict, ObservedLimit, ProtocolPolicy, frozen_limits, leg_http_01_b_manifest_digest,
@@ -904,6 +907,285 @@ async fn advance_after_yield(clock: &VirtualClock, nanos: u64) {
     })
     .await;
     clock.advance(nanos);
+}
+
+/// A broken idle guard must fail this test rather than wait forever on a
+/// virtual clock that deliberately stops at the boundary under examination.
+async fn bounded_ready<F: Future>(future: F) -> F::Output {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut future = std::pin::pin!(future);
+    poll_fn(|task| match future.as_mut().poll(task) {
+        Poll::Ready(value) => Poll::Ready(value),
+        Poll::Pending => {
+            assert!(
+                Instant::now() < deadline,
+                "the ready-client operation must finish"
+            );
+            task.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Opens the public connection-owned receive pump and waits until it has
+/// consumed the marker sent after the endpoint. At that point the same reader
+/// has reached its next, silent body read before the first request is admitted.
+async fn open_ready_legacy(cx: &Cx, peer: &Peer) -> ClientHttpConnection {
+    let mut connection = ClientHttpConnection::connect(
+        cx,
+        plan(&peer.modern, &peer.sse, &peer.message),
+        client_info(),
+        ClientCapabilities::default(),
+    )
+    .await
+    .expect("the public connection selects the exact-2024 lane");
+    connection
+        .start_legacy_receive_pump(cx)
+        .expect("the caller owns the persistent receive task");
+    bounded_ready(poll_fn(|_| match connection.take_legacy_notification() {
+        Some(notification) => {
+            assert_eq!(notification.method, "notifications/resources/list_changed");
+            Poll::Ready(())
+        }
+        None => Poll::Pending,
+    }))
+    .await;
+    connection
+}
+
+fn ready_marker() -> Vec<u8> {
+    message_event(r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#)
+}
+
+fn lifetime_nanos(name: &str) -> u64 {
+    let limit = frozen_limits()
+        .into_iter()
+        .find(|limit| limit.name() == name)
+        .expect("the frozen manifest names this lifetime");
+    limit.guarded() * 1_000_000_000
+}
+
+fn assert_response_id(message: JsonRpcMessage, expected: i64) {
+    let JsonRpcMessage::Response(response) = message else {
+        panic!("the waiter must receive a response");
+    };
+    assert_eq!(response.id, Some(RequestId::Number(expected)));
+}
+
+fn assert_ready_idle_boundary(expires: bool) {
+    let idle = lifetime_nanos("guarded-idle-lifetime");
+    let clock = Arc::new(VirtualClock::new());
+    let (answer, awaited) = mpsc::channel::<()>();
+    let peer = Peer::serve(move |message| {
+        let mut steps = vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message), ready_marker()],
+                end: false,
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+        ];
+        if !expires {
+            steps.extend([
+                Step::Await(awaited),
+                Step::Write(message_event(r#"{"jsonrpc":"2.0","id":41,"result":{}}"#)),
+                Step::Write(message_event(r#"{"jsonrpc":"2.0","id":42,"result":{}}"#)),
+            ]);
+        }
+        steps.push(Step::ExpectHeldClosed);
+        steps
+    });
+    virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut connection = open_ready_legacy(&cx, &peer).await;
+        // A quiet ready client has no idle deadline. The first waiter must
+        // wake the already-blocked reader and arm its deadline from admission.
+        advance_after_yield(&clock, idle * 2).await;
+        // An independent request context need not use the receive task's
+        // virtual clock. Admission must still use the connection owner's clock.
+        let request_cx = Cx::for_request();
+        let mut first = connection
+            .start_legacy_request(
+                &request_cx,
+                "ping",
+                serde_json::json!({}),
+                RequestId::Number(41),
+            )
+            .await
+            .expect("the idle receive pump remains available");
+        let mut second = connection
+            .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(42))
+            .await
+            .expect("a sibling request shares the live generation");
+        advance_after_yield(&clock, idle - u64::from(!expires)).await;
+        if !expires {
+            answer
+                .send(())
+                .expect("release the responses before the deadline");
+        }
+        let first = bounded_ready(first.wait(&cx)).await;
+        let second = bounded_ready(second.wait(&cx)).await;
+        if expires {
+            for result in [first, second] {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(ClientHttpConnectionError::Legacy(
+                            LegacySseHttpClientError::SseIdleLifetimeExceeded
+                        ))
+                    ),
+                    "all pending callers retain the typed idle refusal: {result:?}"
+                );
+            }
+            let later = connection
+                .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(43))
+                .await
+                .err()
+                .expect("an expired generation cannot post another request");
+            assert!(matches!(
+                later,
+                ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::SseIdleLifetimeExceeded
+                )
+            ));
+        } else {
+            assert_response_id(first.expect("first response before expiry"), 41);
+            assert_response_id(second.expect("sibling response before expiry"), 42);
+        }
+        drop(connection);
+        advance_after_yield(&clock, 0).await;
+    }));
+    let log = peer.finish();
+    assert_eq!(log.posts.len(), 2, "refused generations emit no later POST");
+    assert_eq!(log.held_closed_by_client, Some(true));
+    log.assert_legacy_hygiene("ready-client idle boundary");
+}
+
+#[test]
+fn ready_legacy_sse_idle_guard_admits_response_before_deadline() {
+    assert_ready_idle_boundary(false);
+}
+
+#[test]
+fn ready_legacy_sse_idle_guard_expires_waiters_at_deadline() {
+    assert_ready_idle_boundary(true);
+}
+
+#[test]
+fn ready_legacy_sse_last_waiter_retirement_disarms_idle_guard() {
+    let idle = lifetime_nanos("guarded-idle-lifetime");
+    let clock = Arc::new(VirtualClock::new());
+    let peer = Peer::serve(|message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message), ready_marker()],
+                end: false,
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+            // A late response belongs to the retired request's tombstone; it
+            // must not stop the receiver or satisfy the distinct live waiter.
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":51,"result":{}}"#)),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":52,"result":{}}"#)),
+            Step::ExpectHeldClosed,
+        ]
+    });
+    virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut connection = open_ready_legacy(&cx, &peer).await;
+        let abandoned = connection
+            .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(51))
+            .await
+            .expect("the first request commits");
+        drop(abandoned);
+        advance_after_yield(&clock, idle * 2).await;
+        let mut follow_up = connection
+            .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(52))
+            .await
+            .expect("retiring the last waiter disarms the idle guard");
+        let response = bounded_ready(follow_up.wait(&cx))
+            .await
+            .expect("the quiet receiver still routes the distinct response");
+        assert_response_id(response, 52);
+        drop(connection);
+        advance_after_yield(&clock, 0).await;
+    }));
+    let log = peer.finish();
+    assert_eq!(log.posts.len(), 2);
+    assert_eq!(log.held_closed_by_client, Some(true));
+    log.assert_legacy_hygiene("last waiter retirement");
+}
+
+#[test]
+fn ready_legacy_sse_absolute_lifetime_preserves_typed_refusal() {
+    let absolute = lifetime_nanos("absolute-lifetime");
+    let clock = Arc::new(VirtualClock::new());
+    let peer = Peer::serve(|message| {
+        vec![
+            Step::ModernProbe,
+            Step::Stream {
+                extra_headers: &[],
+                events: vec![endpoint_event(message), ready_marker()],
+                end: false,
+            },
+            Step::Post {
+                status: 202,
+                extra_headers: &[],
+            },
+            Step::ExpectHeldClosed,
+        ]
+    });
+    virtual_runtime(&clock).block_on(Box::pin(async {
+        let cx = Cx::current().expect("the runtime supplies its context");
+        let mut connection = open_ready_legacy(&cx, &peer).await;
+        advance_after_yield(&clock, absolute - 1).await;
+        let mut pending = connection
+            .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(61))
+            .await
+            .expect("the generation remains live before its absolute deadline");
+        advance_after_yield(&clock, 1).await;
+        let result = bounded_ready(pending.wait(&cx)).await;
+        assert!(
+            matches!(
+                &result,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::SseStreamLifetimeExpired
+                ))
+            ),
+            "absolute expiry retains its typed refusal: {result:?}"
+        );
+        let later = connection
+            .start_legacy_request(&cx, "ping", serde_json::json!({}), RequestId::Number(62))
+            .await
+            .err()
+            .expect("the expired generation cannot admit another request");
+        assert!(matches!(
+            later,
+            ClientHttpConnectionError::Legacy(LegacySseHttpClientError::SseStreamLifetimeExpired)
+        ));
+        drop(connection);
+    }));
+    let log = peer.finish();
+    assert_eq!(log.posts.len(), 1, "absolute expiry emits no later POST");
+    assert_eq!(log.held_closed_by_client, Some(true));
+    log.assert_legacy_hygiene("ready-client absolute lifetime");
 }
 
 /// A client request the peer can recognise in the POST body.

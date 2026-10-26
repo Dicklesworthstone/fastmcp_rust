@@ -4620,7 +4620,11 @@ impl LegacyHttpRequest {
             }
             Err(_) => {
                 self.retire()?;
-                Err(ClientHttpConnectionError::LegacyPersistentReceiverStopped)
+                Err(self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .stopped_error())
             }
         }
     }
@@ -4673,7 +4677,11 @@ impl LegacyHttpRequest {
             }
             Ok(Err(_)) => {
                 self.retire()?;
-                Err(ClientHttpConnectionError::LegacyPersistentReceiverStopped)
+                Err(self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .stopped_error())
             }
             Err(()) => match self
                 .cancel(cx, Some("caller request cancellation".to_owned()))
@@ -8973,20 +8981,80 @@ const fn cancellation_control_is_authorized(retirement: LegacyPersistentWaiterRe
 /// boundaries. The reader owns all I/O; callers cannot poll or consume its
 /// SSE stream directly.
 #[cfg(feature = "legacy-2024-11-05")]
+#[derive(Default)]
 struct LegacySsePersistentState {
     pending: HashMap<CorrelationKey, LegacyPersistentResponseWaiter>,
     cancelled_response_ids: VecDeque<RequestId>,
     notifications: VecDeque<JsonRpcRequest>,
     stopped: bool,
+    /// The first admitted waiter in the current nonempty pending interval.
+    pending_since: Option<Time>,
+    /// Wakes a reader already blocked on a quiet SSE body when the guard changes.
+    reader_waker: Option<Waker>,
+    /// Preserve the first lifetime refusal after dropping all response senders.
+    lifetime_expiry: Option<LegacySseLifetimeExpiry>,
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
 impl LegacySsePersistentState {
+    fn pending_activity(&self) -> (usize, Option<Time>, bool) {
+        (self.pending.len(), self.pending_since, self.stopped)
+    }
+
+    fn pending_changed(&mut self) {
+        if self.pending.is_empty() {
+            self.pending_since = None;
+        }
+        if let Some(waker) = self.reader_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn stopped_error(&self) -> ClientHttpConnectionError {
+        match self.lifetime_expiry {
+            Some(expiry) => ClientHttpConnectionError::Legacy(expiry.error()),
+            None => ClientHttpConnectionError::LegacyPersistentReceiverStopped,
+        }
+    }
+
+    fn stop_with_error(&mut self, error: &LegacySseHttpClientError) {
+        if !self.stopped {
+            self.lifetime_expiry = match error {
+                LegacySseHttpClientError::SseStreamLifetimeExpired => {
+                    Some(LegacySseLifetimeExpiry::Absolute)
+                }
+                LegacySseHttpClientError::SseIdleLifetimeExceeded => {
+                    Some(LegacySseLifetimeExpiry::Idle)
+                }
+                _ => None,
+            };
+        }
+        self.stop();
+    }
+
     fn stop(&mut self) {
         self.stopped = true;
         self.pending.clear();
         self.cancelled_response_ids.clear();
         self.notifications.clear();
+        self.pending_changed();
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Clone, Copy)]
+enum LegacySseLifetimeExpiry {
+    Idle,
+    Absolute,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacySseLifetimeExpiry {
+    const fn error(self) -> LegacySseHttpClientError {
+        match self {
+            Self::Idle => LegacySseHttpClientError::SseIdleLifetimeExceeded,
+            Self::Absolute => LegacySseHttpClientError::SseStreamLifetimeExpired,
+        }
     }
 }
 
@@ -9002,6 +9070,7 @@ fn retire_abandoned_persistent_waiter(
     if state.pending.remove(key).is_none() {
         return Ok(LegacyPersistentWaiterRetirement::ReaderWon);
     }
+    state.pending_changed();
     if state.cancelled_response_ids.len() >= MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS {
         state.stop();
         return Err(ClientHttpConnectionError::LegacyCancelledResponseQueueFull);
@@ -9327,6 +9396,8 @@ fn legacy_sse_reverse_request_dispatch(
 pub struct LegacySsePersistentReceiver {
     state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
     task: asupersync::runtime::TaskHandle<()>,
+    /// Admission and the receive task must measure the guard on one clock.
+    clock_cx: Cx,
     outbound: LegacySseHttpOutbound,
     reverse_callbacks: LegacySseReverseCallbackDispatcher,
 }
@@ -9343,12 +9414,8 @@ impl LegacySsePersistentReceiver {
         reverse_request_handlers
             .validate_legacy_capabilities(&client_capabilities)
             .map_err(ClientHttpConnectionError::LegacyCallbackConfiguration)?;
-        let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState {
-            pending: HashMap::new(),
-            cancelled_response_ids: VecDeque::new(),
-            notifications: VecDeque::new(),
-            stopped: false,
-        }));
+        let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+        reader.persistent_state = Some(Arc::clone(&state));
         let task_state = Arc::clone(&state);
         let task_outbound = outbound.clone();
         let reverse_callbacks = LegacySseReverseCallbackDispatcher::new();
@@ -9385,7 +9452,14 @@ impl LegacySsePersistentReceiver {
                     }
                     let message = match next_legacy_sse_message(&mut reader, &child_cx).await {
                         Ok(Some(message)) => message,
-                        Ok(None) | Err(_) => break,
+                        Ok(None) => break,
+                        Err(error) => {
+                            task_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .stop_with_error(&error);
+                            break;
+                        }
                     };
                     match message {
                         JsonRpcMessage::Request(notification) if notification.is_notification() => {
@@ -9400,6 +9474,7 @@ impl LegacySsePersistentReceiver {
                                 if let Some(key) = key
                                     && let Some(waiter) = state.pending.remove(&key)
                                 {
+                                    state.pending_changed();
                                     if state.cancelled_response_ids.len()
                                         < MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS
                                     {
@@ -9477,6 +9552,7 @@ impl LegacySsePersistentReceiver {
                                     continue;
                                 }
                                 if let Some(waiter) = state.pending.remove(&key) {
+                                    state.pending_changed();
                                     Some((waiter, LegacyPersistentResponse::Response(response)))
                                 } else if state.pending.len() == 1 {
                                     let waiter = state
@@ -9519,6 +9595,7 @@ impl LegacySsePersistentReceiver {
         Ok(Self {
             state,
             task,
+            clock_cx: task_cx,
             outbound,
             reverse_callbacks,
         })
@@ -9550,7 +9627,7 @@ impl LegacySsePersistentReceiver {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.stopped {
-                return Err(ClientHttpConnectionError::LegacyPersistentReceiverStopped);
+                return Err(state.stopped_error());
             }
             if state.pending.len() >= MAX_PERSISTENT_LEGACY_RESPONSE_WAITERS {
                 return Err(ClientHttpConnectionError::LegacyPersistentResponseQueueFull);
@@ -9567,9 +9644,13 @@ impl LegacySsePersistentReceiver {
             if state.pending.contains_key(&key) {
                 return Err(ClientHttpConnectionError::LegacyPersistentResponseQueueFull);
             }
+            if state.pending.is_empty() {
+                state.pending_since = Some(self.clock_cx.now());
+            }
             state
                 .pending
                 .insert(key.clone(), LegacyPersistentResponseWaiter { sender });
+            state.pending_changed();
         }
         let mut pending_post = LegacyPendingPost {
             state: &self.state,
@@ -9597,6 +9678,7 @@ impl LegacySsePersistentReceiver {
                 retire_abandoned_persistent_waiter(&mut state, &key, request_id)?;
             } else {
                 state.pending.remove(&key);
+                state.pending_changed();
             }
             return Err(ClientHttpConnectionError::Legacy(error));
         }
@@ -10564,6 +10646,8 @@ struct LegacySseResponseStream {
     /// When the guarded idle clock last started: the first outstanding
     /// request, or the latest bytes received since.
     idle_since: Time,
+    /// Ready clients admit waiters independently of the connection-owned reader.
+    persistent_state: Option<Arc<std::sync::Mutex<LegacySsePersistentState>>>,
 }
 
 /// The two lifetimes applied to each legacy SSE stream generation.
@@ -10587,6 +10671,7 @@ impl LegacySseStreamLifetimes {
 enum LegacySseWaitInterrupt {
     Cancelled,
     DeadlineReached,
+    PendingChanged,
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -10606,6 +10691,7 @@ impl LegacySseResponseStream {
             idle_lifetime: lifetimes.idle,
             awaiting_responses: 0,
             idle_since: opened_at,
+            persistent_state: None,
         }
     }
 
@@ -10716,6 +10802,22 @@ impl LegacySseResponseStream {
                 self.close_for_cancellation();
                 return Err(LegacySseHttpClientError::Cancelled);
             }
+            let pending_activity = self.persistent_state.as_ref().map(|state| {
+                state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_activity()
+            });
+            if let Some((pending, pending_since, stopped)) = pending_activity {
+                if stopped {
+                    self.close_for_cancellation();
+                    return Ok(None);
+                }
+                self.awaiting_responses = pending;
+                if let Some(since) = pending_since {
+                    self.idle_since = self.idle_since.max(since);
+                }
+            }
             if let Some(event) = self.pending_events.pop_front() {
                 self.pending_event_bytes = self.pending_event_bytes.saturating_sub(event.len());
                 return Ok(Some(event));
@@ -10732,6 +10834,7 @@ impl LegacySseResponseStream {
             let wake_at = self
                 .idle_deadline()
                 .map_or(self.deadline, |idle| idle.min(self.deadline));
+            let persistent_state = self.persistent_state.as_ref();
             let Some(response) = self.response.as_mut() else {
                 return Ok(None);
             };
@@ -10739,6 +10842,15 @@ impl LegacySseResponseStream {
             let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
             let mut expiry = std::pin::pin!(asupersync::time::sleep_until(wake_at));
             let frame = poll_fn(|task_cx| {
+                if let Some(state) = persistent_state {
+                    let mut state = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if Some(state.pending_activity()) != pending_activity {
+                        return Poll::Ready(Err(LegacySseWaitInterrupt::PendingChanged));
+                    }
+                    state.reader_waker = Some(task_cx.waker().clone());
+                }
                 if cancellation.as_mut().poll(task_cx).is_ready() {
                     return Poll::Ready(Err(LegacySseWaitInterrupt::Cancelled));
                 }
@@ -10760,6 +10872,8 @@ impl LegacySseResponseStream {
                 }
                 // The check at the top of the loop names the lifetime that ended.
                 Err(LegacySseWaitInterrupt::DeadlineReached) => continue,
+                // Recompute the guarded deadline without dropping body/parser state.
+                Err(LegacySseWaitInterrupt::PendingChanged) => continue,
             };
             let frame = match reject_body_frame_after_cancellation(cx, frame) {
                 Ok(frame) => frame,
@@ -11880,6 +11994,7 @@ mod tests {
                 cancelled_response_ids,
                 notifications: VecDeque::new(),
                 stopped: false,
+                ..LegacySsePersistentState::default()
             },
             key,
         )
@@ -11957,6 +12072,7 @@ mod tests {
                 None,
             )]),
             stopped: false,
+            ..LegacySsePersistentState::default()
         };
 
         state.stop();
