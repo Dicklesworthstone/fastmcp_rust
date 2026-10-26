@@ -84,12 +84,123 @@ fn streaming_configuration_requires_finite_independent_bounds() {
     }
     assert!(DpopStreamLimits::new(core, Duration::from_secs(60)).is_ok());
     for sse in [
-        SseLimits::with_data_lines(1024 * 1024 + 1, 8192, 1, 1).unwrap(),
-        SseLimits::with_data_lines(1, 8 * 1024 * 1024 + 1, 1, 1).unwrap(),
+        SseLimits::with_data_lines(8 * 1024 * 1024 + 9, 8192, 1, 1).unwrap(),
+        SseLimits::with_data_lines(1, 9 * 1024 * 1024 + 1, 1, 1).unwrap(),
         SseLimits::with_data_lines(1, 8192, 65_537, 1).unwrap(),
         SseLimits::new(1, 8192, 1).unwrap(),
     ] {
         assert!(matches!(limits().with_sse_limits(sse), Err(DpopStreamError::InvalidLimits)));
+    }
+    for configured in [
+        DpopStreamLimits::default(),
+        DpopStreamLimits::new(core, Duration::from_secs(60)).unwrap(),
+    ] {
+        // Freeze the LIMIT-01 floor independently of the implementation's
+        // shared constants; changing either constructor cannot shrink it.
+        assert_eq!(configured.sse.max_line_bytes(), 8 * 1024 * 1024 + 8);
+        assert_eq!(configured.sse.max_event_bytes(), 9 * 1024 * 1024);
+        assert_eq!(configured.sse.max_keepalive_lines(), 1024);
+        assert_eq!(configured.sse.max_data_lines(), 4096);
+        assert!(configured.with_sse_limits(configured.sse).is_ok());
+    }
+    assert!(limits().with_sse_limits(SseLimits::with_data_lines(
+        8 * 1024 * 1024 + 8, 9 * 1024 * 1024, 65_536, 65_536,
+    ).unwrap()).is_ok());
+}
+
+#[test]
+fn default_sse_line_limit_counts_raw_and_replacement_bytes_at_the_exact_boundary() {
+    use crate::sse::SseParseError;
+
+    let limits = DpopStreamLimits::default().sse;
+    let ceiling = 8 * 1024 * 1024 + 8;
+    for replacement in [false, true] {
+        for excess in [0, 1] {
+            // A comment isolates the line bound from JSON and event bounds.
+            // Invalid UTF-8 expands to three decoded bytes per raw octet.
+            let value_bytes = ceiling + excess - 1;
+            let mut wire = vec![b':'];
+            if replacement {
+                wire.extend(std::iter::repeat_n(0xff, value_bytes / 3));
+                wire.extend(std::iter::repeat_n(b'x', value_bytes % 3));
+            } else {
+                wire.extend(std::iter::repeat_n(b'x', value_bytes));
+            }
+            wire.extend_from_slice(b"\r\n");
+            for chunk_bytes in [wire.len(), BYTES_PER_TURN] {
+                let mut parser = BoundedSseParser::new(limits);
+                let outcome = wire.chunks(chunk_bytes).try_for_each(|chunk| {
+                    assert!(parser.push(chunk)?.is_empty());
+                    Ok::<(), SseParseError>(())
+                });
+                if excess == 0 {
+                    outcome.unwrap();
+                    assert_eq!(parser.buffered_bytes(), 0);
+                    let end = parser.finish().unwrap();
+                    assert!(!end.discarded_pending_event && !end.discarded_partial_line);
+                } else {
+                    assert_eq!(outcome, Err(SseParseError::LineTooLong { limit_bytes: ceiling }));
+                    assert_eq!(parser.buffered_bytes(), 0);
+                    assert_eq!(parser.push(b"\n"), Err(SseParseError::Poisoned));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn default_sse_event_limit_counts_raw_and_replacement_bytes_at_the_exact_boundary() {
+    use crate::sse::SseParseError;
+
+    let limits = DpopStreamLimits::default().sse;
+    let ceiling = 9 * 1024 * 1024;
+    for replacement in [false, true] {
+        for excess in [0, 1] {
+            // Two individually bounded lines reach the independent event
+            // ceiling. This parser-only probe does not enlarge the native
+            // HTTP body's separate 8 MiB ceiling or the JSON frame budget.
+            let first = ceiling / 2;
+            let second = ceiling + excess - first;
+            let mut wire = Vec::new();
+            for part in [first, second] {
+                wire.extend_from_slice(b"data: ");
+                if replacement {
+                    let value_bytes = part - 1; // parser-appended LF
+                    wire.extend(std::iter::repeat_n(0xff, value_bytes / 3));
+                    wire.extend(std::iter::repeat_n(b'x', value_bytes % 3));
+                } else {
+                    wire.extend(std::iter::repeat_n(b'x', part - b"data: ".len()));
+                }
+                wire.extend_from_slice(b"\r\n");
+            }
+            wire.extend_from_slice(b"\r\n");
+            for chunk_bytes in [wire.len(), BYTES_PER_TURN] {
+                let mut parser = BoundedSseParser::new(limits);
+                let mut calls = 0;
+                let outcome = wire.chunks(chunk_bytes).try_for_each(|chunk| {
+                    parser.push_with(chunk, |payload| {
+                        calls += 1;
+                        let overhead = if replacement { 1 } else { 11 };
+                        assert_eq!(payload.len(), ceiling - overhead);
+                        Ok::<(), ()>(())
+                    }).map(|_| ())
+                });
+                if excess == 0 {
+                    outcome.unwrap();
+                    assert_eq!(calls, 1);
+                    assert_eq!(parser.buffered_bytes(), 0);
+                    let end = parser.finish().unwrap();
+                    assert!(!end.discarded_pending_event && !end.discarded_partial_line);
+                } else {
+                    assert!(matches!(outcome, Err(SsePushError::Parse(
+                        SseParseError::EventTooLarge { limit_bytes }
+                    )) if limit_bytes == ceiling));
+                    assert_eq!(calls, 0);
+                    assert_eq!(parser.buffered_bytes(), 0);
+                    assert_eq!(parser.push(b"\n"), Err(SseParseError::Poisoned));
+                }
+            }
+        }
     }
 }
 

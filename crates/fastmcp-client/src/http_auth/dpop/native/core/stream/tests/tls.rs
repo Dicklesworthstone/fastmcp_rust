@@ -166,3 +166,139 @@ fn public_https_stream_delivers_before_terminal_and_never_replays_failed_calls()
             });
     }
 }
+
+#[test]
+fn public_https_large_image_result_matches_json_and_sse_and_preserves_tighter_limits() {
+    use base64::Engine;
+
+    #[derive(Clone, Copy)]
+    enum ImageCase { Json, Sse, TightSse }
+    let cases = [ImageCase::Json, ImageCase::Sse, ImageCase::TightSse];
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout_at(cx.now().saturating_add_nanos(60_000_000_000), async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let target = CanonicalHttpUrl::parse(&format!(
+                    "https://{}/mcp", listener.local_addr().unwrap(),
+                )).unwrap();
+                let issuer = CanonicalHttpUrl::parse("https://issuer.example/token").unwrap();
+                let session = DpopSession::new(DpopKey::generate().unwrap(), issuer.clone(), target).unwrap();
+                let credential = session.admit_token_response(
+                    &issuer, 200,
+                    br#"{"access_token":"image-access","token_type":"DPoP","expires_in":300}"#,
+                    Instant::now(), Duration::from_secs(300),
+                ).unwrap();
+                let root = Certificate::from_pem(ROOT).unwrap().remove(0);
+                let policy = DpopHttpPolicy::default().with_resource_root_der(root.as_der().to_vec()).unwrap();
+                let mut client = DpopHttpClient::new(session, policy).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let acceptor = TlsAcceptorBuilder::new(
+                    CertificateChain::from_pem(LEAF).unwrap(), PrivateKey::from_pem(KEY).unwrap(),
+                ).alpn_protocols(vec![b"http/1.1".to_vec()]).build().unwrap();
+
+                // LIMIT-01 permits one 3 MiB decoded binary block, whose
+                // Base64 string occupies 4 MiB on a single JSON/SSE line.
+                let data = base64::engine::general_purpose::STANDARD.encode(vec![0; 3 * 1024 * 1024]);
+                assert_eq!(data.len(), 4 * 1024 * 1024);
+                let result = json!({
+                    "resultType":"complete", "isError":false,
+                    "content":[{"type":"image", "mimeType":"image/png", "data":data}],
+                });
+                let envelope = serde_json::to_string(&json!({"jsonrpc":"2.0", "id":7, "result":result})).unwrap();
+                let sse = event(&envelope);
+                assert!(sse.len() < 8 * 1024 * 1024, "the native raw-body cap is unchanged");
+                let params = json!({
+                    "name":"render_image", "arguments":{},
+                    "_meta":FinalRequestMeta::new(ClientCapabilities::default()),
+                });
+                let request = CoreRequest::decode(ProtocolEra::Modern2026, "tools/call", Some(&params)).unwrap();
+
+                let application = async {
+                    let mut accepted = Vec::new();
+                    for case in cases {
+                        let mut limits = DpopStreamLimits::default();
+                        if matches!(case, ImageCase::TightSse) {
+                            // Change only the caller's line ceiling. The same
+                            // response remains inside every other budget.
+                            limits = limits.with_sse_limits(SseLimits::with_data_lines(
+                                64 * 1024, limits.sse.max_event_bytes(),
+                                limits.sse.max_keepalive_lines(), limits.sse.max_data_lines(),
+                            ).unwrap()).unwrap();
+                        }
+                        let mut notifications = 0;
+                        let outcome = client.request_core_with_events(
+                            &cx, &cancellation, &credential, request.clone(), RequestId::Number(7), limits,
+                            |_| { notifications += 1; true },
+                        ).await;
+                        assert_eq!(notifications, 0);
+                        assert!(!cancellation.is_cancel_requested());
+                        assert!(cx.checkpoint().is_ok());
+                        if matches!(case, ImageCase::TightSse) {
+                            assert!(matches!(outcome, Err(DpopStreamError::Core(
+                                DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)
+                            ))));
+                        } else {
+                            let outcome = outcome.expect("a valid large tool image must be admitted");
+                            let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = &outcome else {
+                                panic!("the image must retain its typed tools/call result");
+                            };
+                            let [fastmcp_protocol::ContentBlock::Image { data, mime_type, .. }] = result.payload.content.as_slice() else {
+                                panic!("the result must contain exactly its original image");
+                            };
+                            assert_eq!(mime_type, "image/png");
+                            assert_eq!(data.len(), 4 * 1024 * 1024);
+                            let decoded = base64::engine::general_purpose::STANDARD.decode(data).unwrap();
+                            assert_eq!(decoded.len(), 3 * 1024 * 1024);
+                            assert!(decoded.iter().all(|byte| *byte == 0));
+                            accepted.push(outcome.encode().unwrap());
+                        }
+                    }
+                    assert_eq!(accepted.len(), 2);
+                    assert!(accepted[0] == accepted[1], "JSON and single-line SSE must preserve the same complete result");
+                };
+                let server = async {
+                    for case in cases {
+                        let (socket, _) = listener.accept().await.unwrap();
+                        let mut socket = acceptor.accept(socket).await.unwrap();
+                        let (head, body) = read_request(&mut socket).await;
+                        assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+                        assert_eq!(body["id"], 7);
+                        assert_eq!(body["method"], "tools/call");
+                        assert_eq!(body["params"]["name"], "render_image");
+                        let headers: Vec<_> = head.lines().filter_map(|line| line.split_once(':'))
+                            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim())).collect();
+                        assert_eq!(headers.iter().filter(|(name, _)| name == "dpop").count(), 1);
+                        assert!(headers.iter().any(|(name, value)| name == "authorization" && *value == "DPoP image-access"));
+                        if matches!(case, ImageCase::Json) {
+                            socket.write_all(format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                envelope.len(),
+                            ).as_bytes()).await.unwrap();
+                            socket.write_all(envelope.as_bytes()).await.unwrap();
+                        } else {
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                            socket.write_all(format!("{:X}\r\n", sse.len()).as_bytes()).await.unwrap();
+                            let sent = async {
+                                socket.write_all(sse.as_bytes()).await?;
+                                socket.write_all(b"\r\n0\r\n\r\n").await?;
+                                socket.flush().await
+                            }.await;
+                            if matches!(case, ImageCase::TightSse) {
+                                // Refusal may interrupt the large write. The
+                                // request must release that same body/socket.
+                                let mut byte = [0];
+                                assert!(!matches!(socket.read(&mut byte).await, Ok(n) if n > 0));
+                                continue;
+                            }
+                            sent.unwrap();
+                        }
+                        socket.shutdown().await.unwrap();
+                    }
+                };
+                pair(application, server).await;
+                assert!(listener.poll_accept(&mut Context::from_waker(Waker::noop())).is_pending());
+            }).await.expect("large DPoP image cases must settle without retries");
+        });
+}

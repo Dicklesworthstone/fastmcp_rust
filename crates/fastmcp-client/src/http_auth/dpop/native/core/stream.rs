@@ -40,7 +40,10 @@ use super::super::{
 use super::{DpopCoreError, ModernHttpRequest, prepare};
 use crate::http_auth::caller::with_caller;
 use crate::http_auth::rpc::{CoreDecoder, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits};
-use crate::http_executor::{MODERN_MCP_ACCEPT, ModernHttpResponseKind, validate_response_head};
+use crate::http_executor::{
+    MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES, MODERN_MCP_ACCEPT, ModernHttpResponseKind,
+    validate_response_head,
+};
 use crate::sse::{BoundedSseParser, SseLimits, SsePushError};
 
 // Bound ready-body work independently from retained bytes. Neither many empty
@@ -60,12 +63,25 @@ pub struct DpopStreamLimits {
     reset_idle_on_progress: bool,
 }
 
+fn default_sse_limits() -> SseLimits {
+    // LIMIT-01 admits an 8 MiB message on one data line. Framing has its
+    // own allowance: neither the prefix nor the parser's appended LF may
+    // consume the core JSON budget. The shared 9 MiB event ceiling also
+    // leaves room for a bounded multi-line representation of that message.
+    SseLimits::with_data_lines(
+        ManagedCoreLimits::default().frame_bytes() + b"data: \r\n".len(),
+        MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES,
+        1024,
+        4096,
+    )
+    .expect("nonzero fixed SSE bounds")
+}
+
 impl Default for DpopStreamLimits {
     fn default() -> Self {
         Self {
             core: ManagedCoreLimits::default(),
-            sse: SseLimits::with_data_lines(64 * 1024, 8 * 1024 * 1024, 1024, 4096)
-                .expect("nonzero fixed SSE bounds"),
+            sse: default_sse_limits(),
             idle: Duration::from_secs(30),
             reset_idle_on_progress: true,
         }
@@ -84,11 +100,7 @@ impl DpopStreamLimits {
         }
         Ok(Self {
             core,
-            // SSE bounds include raw `data:` fields and the parser's appended
-            // LF. They are not the JSON payload limit: equating the two would
-            // reject an otherwise valid exact-sized core frame before decoding.
-            sse: SseLimits::with_data_lines(64 * 1024, 8 * 1024 * 1024, 1024, 4096)
-                .ok_or(DpopStreamError::InvalidLimits)?,
+            sse: default_sse_limits(),
             idle,
             reset_idle_on_progress: true,
         })
@@ -101,12 +113,13 @@ impl DpopStreamLimits {
         self
     }
 
-    /// Choose finite parser limits. Raw event bytes have an 8 MiB ceiling;
-    /// line bytes, keepalive lines and data lines have independent ceilings.
-    /// These include SSE syntax overhead, unlike the core JSON frame limit.
+    /// Choose finite parser limits. Lines have an 8 MiB + 8 B ceiling and
+    /// raw events a 9 MiB ceiling, including an allowance for SSE syntax.
+    /// Core JSON frame bytes, keepalive lines and data lines remain separately
+    /// bounded; a larger parser allowance cannot enlarge a core payload limit.
     pub fn with_sse_limits(mut self, sse: SseLimits) -> Result<Self, DpopStreamError> {
-        if sse.max_line_bytes() > 1024 * 1024
-            || sse.max_event_bytes() > 8 * 1024 * 1024
+        if sse.max_line_bytes() > default_sse_limits().max_line_bytes()
+            || sse.max_event_bytes() > MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES
             || sse.max_keepalive_lines() > 65_536
             || sse.max_data_lines() > 65_536
         {
