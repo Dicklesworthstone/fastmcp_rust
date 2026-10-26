@@ -6589,9 +6589,22 @@ impl ClientHttpConnection {
                 )
             }
             #[cfg(feature = "legacy-2024-11-05")]
-            Self::LegacySse(LegacySseConnection { client, .. }) => {
+            Self::LegacySse(LegacySseConnection {
+                client,
+                persistent_receiver,
+                ..
+            }) => {
                 if let Some(parameters) = parameters.as_ref() {
                     reject_final_only_legacy_request_metadata(parameters)?;
+                }
+                if let Some(receiver) = persistent_receiver {
+                    let state = receiver
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.stopped {
+                        return Err(state.stopped_error());
+                    }
                 }
                 client
                     .send(
@@ -10861,6 +10874,12 @@ impl LegacySseResponseStream {
                 }
                 if cancellation.as_mut().poll(task_cx).is_ready() {
                     return Poll::Ready(Err(LegacySseWaitInterrupt::Cancelled));
+                }
+                // Already-admitted events may outlive the deadline, but
+                // newly available bytes must not renew an expired generation
+                // or its guarded idle window.
+                if cx.now() >= wake_at {
+                    return Poll::Ready(Err(LegacySseWaitInterrupt::DeadlineReached));
                 }
                 if let Poll::Ready(frame) = Pin::new(&mut response.body).poll_frame(task_cx) {
                     return Poll::Ready(Ok(frame));

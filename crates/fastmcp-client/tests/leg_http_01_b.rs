@@ -564,6 +564,8 @@ enum Step {
     /// Waits until the test signals, so a later write lands at a chosen
     /// virtual time.
     Await(mpsc::Receiver<()>),
+    /// Confirms all preceding writes before the test resumes the receiver.
+    Signal(mpsc::Sender<()>),
 }
 
 /// Everything a scripted peer received.
@@ -812,6 +814,9 @@ impl Peer {
                             .recv_timeout(Duration::from_secs(20))
                             .expect("the test signals the peer");
                     }
+                    Step::Signal(signal) => {
+                        signal.send(()).expect("the test awaits the peer's writes");
+                    }
                 }
             }
             while let Some(mut stray) = accept_within(&listener, Duration::from_millis(400)) {
@@ -977,6 +982,7 @@ fn assert_ready_idle_boundary(expires: bool) {
     let idle = lifetime_nanos("guarded-idle-lifetime");
     let clock = Arc::new(VirtualClock::new());
     let (answer, awaited) = mpsc::channel::<()>();
+    let (written, wait_written) = mpsc::channel::<()>();
     let peer = Peer::serve(move |message| {
         let mut steps = vec![
             Step::ModernProbe,
@@ -994,12 +1000,17 @@ fn assert_ready_idle_boundary(expires: bool) {
                 extra_headers: &[],
             },
         ];
+        steps.extend([
+            Step::Await(awaited),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":41,"result":{}}"#)),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":42,"result":{}}"#)),
+            Step::Signal(written),
+        ]);
         if !expires {
-            steps.extend([
-                Step::Await(awaited),
-                Step::Write(message_event(r#"{"jsonrpc":"2.0","id":41,"result":{}}"#)),
-                Step::Write(message_event(r#"{"jsonrpc":"2.0","id":42,"result":{}}"#)),
-            ]);
+            steps.push(Step::Post {
+                status: 202,
+                extra_headers: &[],
+            });
         }
         steps.push(Step::ExpectHeldClosed);
         steps
@@ -1027,11 +1038,15 @@ fn assert_ready_idle_boundary(expires: bool) {
             .await
             .expect("a sibling request shares the live generation");
         advance_after_yield(&clock, idle - u64::from(!expires)).await;
-        if !expires {
-            answer
-                .send(())
-                .expect("release the responses before the deadline");
-        }
+        answer
+            .send(())
+            .expect("release the responses at the chosen boundary");
+        // This current-thread runtime must not resume the receiver until the
+        // peer has published both replies. At N they are fresh bytes, never
+        // previously admitted events that may legitimately drain after expiry.
+        wait_written
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the peer publishes both responses before the receiver resumes");
         let first = bounded_ready(first.wait(&cx)).await;
         let second = bounded_ready(second.wait(&cx)).await;
         if expires {
@@ -1061,11 +1076,27 @@ fn assert_ready_idle_boundary(expires: bool) {
             assert_response_id(first.expect("first response before expiry"), 41);
             assert_response_id(second.expect("sibling response before expiry"), 42);
         }
+        let notification =
+            bounded_ready(connection.notify(&cx, "notifications/roots/list_changed", None)).await;
+        if expires {
+            assert!(matches!(
+                notification,
+                Err(ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::SseIdleLifetimeExceeded
+                ))
+            ));
+        } else {
+            notification.expect("the live generation still accepts notifications");
+        }
         drop(connection);
         advance_after_yield(&clock, 0).await;
     }));
     let log = peer.finish();
-    assert_eq!(log.posts.len(), 2, "refused generations emit no later POST");
+    assert_eq!(
+        log.posts.len(),
+        if expires { 2 } else { 3 },
+        "only a live generation may POST the notification"
+    );
     assert_eq!(log.held_closed_by_client, Some(true));
     log.assert_legacy_hygiene("ready-client idle boundary");
 }
@@ -1137,7 +1168,9 @@ fn ready_legacy_sse_last_waiter_retirement_disarms_idle_guard() {
 fn ready_legacy_sse_absolute_lifetime_preserves_typed_refusal() {
     let absolute = lifetime_nanos("absolute-lifetime");
     let clock = Arc::new(VirtualClock::new());
-    let peer = Peer::serve(|message| {
+    let (answer, awaited) = mpsc::channel::<()>();
+    let (written, wait_written) = mpsc::channel::<()>();
+    let peer = Peer::serve(move |message| {
         vec![
             Step::ModernProbe,
             Step::Stream {
@@ -1149,6 +1182,9 @@ fn ready_legacy_sse_absolute_lifetime_preserves_typed_refusal() {
                 status: 202,
                 extra_headers: &[],
             },
+            Step::Await(awaited),
+            Step::Write(message_event(r#"{"jsonrpc":"2.0","id":61,"result":{}}"#)),
+            Step::Signal(written),
             Step::ExpectHeldClosed,
         ]
     });
@@ -1161,6 +1197,12 @@ fn ready_legacy_sse_absolute_lifetime_preserves_typed_refusal() {
             .await
             .expect("the generation remains live before its absolute deadline");
         advance_after_yield(&clock, 1).await;
+        answer
+            .send(())
+            .expect("release the response at absolute expiry");
+        wait_written
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the peer publishes its response before the receiver resumes");
         let result = bounded_ready(pending.wait(&cx)).await;
         assert!(
             matches!(
@@ -1179,6 +1221,14 @@ fn ready_legacy_sse_absolute_lifetime_preserves_typed_refusal() {
         assert!(matches!(
             later,
             ClientHttpConnectionError::Legacy(LegacySseHttpClientError::SseStreamLifetimeExpired)
+        ));
+        let notification =
+            bounded_ready(connection.notify(&cx, "notifications/roots/list_changed", None)).await;
+        assert!(matches!(
+            notification,
+            Err(ClientHttpConnectionError::Legacy(
+                LegacySseHttpClientError::SseStreamLifetimeExpired
+            ))
         ));
         drop(connection);
     }));
