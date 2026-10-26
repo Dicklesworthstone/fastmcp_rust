@@ -4552,6 +4552,7 @@ pub struct LegacySseConnection {
     reverse_request_handlers: ReverseRequestHandlers,
     cancelled_response_ids: VecDeque<RequestId>,
     persistent_receiver: Option<Arc<LegacySsePersistentReceiver>>,
+    request_timeout_policy: RequestTimeoutPolicy,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
 }
 
@@ -4629,6 +4630,8 @@ pub struct LegacyHttpRequest {
     receiver: oneshot::Receiver<LegacyPersistentResponse>,
     state: Arc<std::sync::Mutex<LegacySsePersistentState>>,
     outbound: LegacySseHttpOutbound,
+    deadline: Arc<std::sync::Mutex<LegacyHttpRequestDeadline>>,
+    request_cx: Cx,
     terminal: bool,
 }
 
@@ -4641,35 +4644,11 @@ impl LegacyHttpRequest {
     }
 
     /// Awaits this handle's correlated terminal response without borrowing the
-    /// owning connection or its independent SSE ingress reader.
+    /// owning connection or its independent SSE ingress reader. The configured
+    /// idle/absolute response policy starts at POST acknowledgement, including
+    /// time spent between creating this handle and first waiting on it.
     pub async fn wait(&mut self, cx: &Cx) -> Result<JsonRpcMessage, ClientHttpConnectionError> {
-        match self.receiver.recv(cx).await {
-            Ok(LegacyPersistentResponse::Response(response)) => {
-                self.terminal = true;
-                Ok(JsonRpcMessage::Response(response))
-            }
-            Ok(LegacyPersistentResponse::IdMismatch { actual }) => {
-                self.terminal = true;
-                Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
-                    expected: self.commit.request_id.clone(),
-                    actual: Some(actual),
-                })
-            }
-            Ok(LegacyPersistentResponse::Cancelled) => {
-                self.terminal = true;
-                Err(ClientHttpConnectionError::LegacyRequestCancelled {
-                    request_id: self.commit.request_id.clone(),
-                })
-            }
-            Err(_) => {
-                self.retire()?;
-                Err(self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .stopped_error())
-            }
-        }
+        self.wait_inner(cx, None).await
     }
 
     /// Awaits this committed request while honoring an independent caller
@@ -4683,64 +4662,189 @@ impl LegacyHttpRequest {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
     ) -> Result<JsonRpcMessage, ClientHttpConnectionError> {
-        let result = {
-            let mut response = std::pin::pin!(self.receiver.recv(cx));
-            let mut cancelled = std::pin::pin!(cancellation.cancelled());
-            poll_fn(|task_cx| match response.as_mut().poll(task_cx) {
-                Poll::Ready(result) => Poll::Ready(Ok(result)),
-                Poll::Pending => {
-                    if cancellation.is_cancel_requested()
-                        || cancelled.as_mut().poll(task_cx).is_ready()
-                    {
-                        Poll::Ready(Err(()))
-                    } else {
-                        Poll::Pending
-                    }
-                }
-            })
-            .await
-        };
-        match result {
-            Ok(Ok(LegacyPersistentResponse::Response(response))) => {
-                self.terminal = true;
-                Ok(JsonRpcMessage::Response(response))
-            }
-            Ok(Ok(LegacyPersistentResponse::IdMismatch { actual })) => {
-                self.terminal = true;
-                Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
-                    expected: self.commit.request_id.clone(),
-                    actual: Some(actual),
-                })
-            }
-            Ok(Ok(LegacyPersistentResponse::Cancelled)) => {
-                self.terminal = true;
-                Err(ClientHttpConnectionError::LegacyRequestCancelled {
-                    request_id: self.commit.request_id.clone(),
-                })
-            }
-            Ok(Err(_)) => {
-                self.retire()?;
-                Err(self
-                    .state
+        self.wait_inner(cx, Some(cancellation)).await
+    }
+
+    async fn wait_inner(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+    ) -> Result<JsonRpcMessage, ClientHttpConnectionError> {
+        self.deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .constrain_to(cx);
+        let mut reader_won = false;
+        loop {
+            let outcome = {
+                let receive_cx = self
+                    .deadline
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .stopped_error())
-            }
-            Err(()) => match self
-                .cancel(cx, Some("caller request cancellation".to_owned()))
+                    .response
+                    .cx
+                    .clone();
+                let mut response = std::pin::pin!(self.receiver.recv(&receive_cx));
+                let (_caller_guard, mut caller_signal) = oneshot::channel::<()>();
+                let mut caller_cancelled = std::pin::pin!(caller_signal.recv(&self.request_cx));
+                let (_wait_guard, mut wait_signal) = oneshot::channel::<()>();
+                let mut wait_cancelled = std::pin::pin!(wait_signal.recv(cx));
+                let mut cancelled = std::pin::pin!(async {
+                    match cancellation {
+                        Some(cancellation) => cancellation.cancelled().await,
+                        None => std::future::pending().await,
+                    }
+                });
+                let mut sleep: Option<Sleep> = None;
+                poll_fn(|task_cx| {
+                    match response.as_mut().poll(task_cx) {
+                        Poll::Ready(Ok(response)) => {
+                            return Poll::Ready(LegacyHttpRequestWait::Response(response));
+                        }
+                        Poll::Ready(Err(_)) => {
+                            return Poll::Ready(LegacyHttpRequestWait::Closed);
+                        }
+                        Poll::Pending => {}
+                    }
+                    if reader_won {
+                        return Poll::Pending;
+                    }
+                    if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                        || cancelled.as_mut().poll(task_cx).is_ready()
+                    {
+                        return Poll::Ready(LegacyHttpRequestWait::Cancelled);
+                    }
+                    if caller_cancelled.as_mut().poll(task_cx).is_ready() {
+                        let error = check_modern_http_context(&self.request_cx)
+                            .err()
+                            .unwrap_or(ModernHttpExecutorError::Cancelled);
+                        return Poll::Ready(LegacyHttpRequestWait::Interrupted(error));
+                    }
+                    if wait_cancelled.as_mut().poll(task_cx).is_ready() {
+                        let error = check_modern_http_context(cx)
+                            .err()
+                            .unwrap_or(ModernHttpExecutorError::Cancelled);
+                        return Poll::Ready(LegacyHttpRequestWait::Interrupted(error));
+                    }
+                    let (next, clock_cx) = {
+                        let mut deadline = self
+                            .deadline
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Err(error) = deadline.response.check() {
+                            return Poll::Ready(LegacyHttpRequestWait::Interrupted(error));
+                        }
+                        (
+                            deadline
+                                .response
+                                .response_deadlines
+                                .map(|(idle, absolute)| idle.min(absolute))
+                                .into_iter()
+                                .chain(deadline.response.caller_deadline)
+                                .min(),
+                            deadline.response.cx.clone(),
+                        )
+                    };
+                    if let Some(next) = next {
+                        let sleep = sleep.get_or_insert_with(|| Sleep::new(next));
+                        if sleep.deadline() != next {
+                            sleep.reset(next);
+                        }
+                        // Timer polling may clone/drop/wake an arbitrary caller
+                        // waker, so it must happen outside both shared locks.
+                        let ready = {
+                            let _clock = Cx::set_current(Some(clock_cx));
+                            Pin::new(sleep).poll(task_cx).is_ready()
+                        };
+                        if let Err(error) = self
+                            .deadline
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .response
+                            .check()
+                        {
+                            return Poll::Ready(LegacyHttpRequestWait::Interrupted(error));
+                        }
+                        if ready {
+                            // Progress can move idle while the old timer is
+                            // being polled. A completed old Sleep has no future
+                            // wake; poll again to register the new deadline.
+                            task_cx.waker().wake_by_ref();
+                        }
+                    }
+                    Poll::Pending
+                })
                 .await
-            {
-                Ok(()) => Err(ClientHttpConnectionError::Legacy(
-                    LegacySseHttpClientError::Cancelled,
-                )),
-                Err(ClientHttpConnectionError::LegacyRequestNoLongerPending { .. }) => {
-                    // The reader won the state-locked election between the
-                    // response poll and retirement. Consume that terminal
-                    // response instead of manufacturing a cancellation.
-                    self.wait(cx).await
+            };
+            let (error, reason, cleanup_cx) = match outcome {
+                LegacyHttpRequestWait::Response(response) => {
+                    self.terminal = true;
+                    return match response {
+                        LegacyPersistentResponse::Response(response) => {
+                            Ok(JsonRpcMessage::Response(response))
+                        }
+                        LegacyPersistentResponse::IdMismatch { actual } => {
+                            Err(ClientHttpConnectionError::LegacyResponseIdMismatch {
+                                expected: self.commit.request_id.clone(),
+                                actual: Some(actual),
+                            })
+                        }
+                        LegacyPersistentResponse::Cancelled => {
+                            Err(ClientHttpConnectionError::LegacyRequestCancelled {
+                                request_id: self.commit.request_id.clone(),
+                            })
+                        }
+                        LegacyPersistentResponse::Deadline(error) => {
+                            Err(ClientHttpConnectionError::Legacy(
+                                LegacySseHttpClientError::Executor(error),
+                            ))
+                        }
+                    };
                 }
-                Err(error) => Err(error),
-            },
+                LegacyHttpRequestWait::Closed => {
+                    self.retire()?;
+                    return Err(self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .stopped_error());
+                }
+                LegacyHttpRequestWait::Cancelled => (
+                    ClientHttpConnectionError::Legacy(LegacySseHttpClientError::Cancelled),
+                    "caller request cancellation",
+                    cx.clone(),
+                ),
+                LegacyHttpRequestWait::Interrupted(error) => (
+                    ClientHttpConnectionError::Legacy(LegacySseHttpClientError::Executor(error)),
+                    "request response deadline or cancellation",
+                    self.deadline
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .response
+                        .cx
+                        .clone(),
+                ),
+            };
+            let response_deadline = matches!(
+                &error,
+                ClientHttpConnectionError::Legacy(LegacySseHttpClientError::Executor(
+                    ModernHttpExecutorError::Timeout(_)
+                        | ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded)
+                ))
+            );
+            match self.cancel(&cleanup_cx, Some(reason.to_owned())).await {
+                Ok(()) => return Err(error),
+                Err(ClientHttpConnectionError::LegacyRequestNoLongerPending { .. }) => {
+                    // The pump removed the waiter after the response poll.
+                    // Its terminal result wins; no control POST was authorized.
+                    reader_won = true;
+                }
+                // The response deadline remains the primary failure even if
+                // this best-effort, independently bounded control POST fails.
+                // Retirement has already retained the late-response tombstone.
+                Err(_) if response_deadline => return Err(error),
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -4777,13 +4881,17 @@ impl LegacyHttpRequest {
             Some(params),
         ));
         let send = self.outbound.send(cx, &control);
-        match asupersync::time::timeout_at(
+        let mut send = std::pin::pin!(asupersync::time::timeout_at(
             cx.now()
                 .saturating_add_nanos(LEGACY_CANCELLATION_CONTROL_SEND_TIMEOUT_NANOS),
             send,
-        )
-        .await
-        {
+        ));
+        let result = poll_fn(|task_cx| {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            send.as_mut().poll(task_cx)
+        })
+        .await;
+        match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(ClientHttpConnectionError::Legacy(error.error)),
             Err(_) => Err(ClientHttpConnectionError::Legacy(
@@ -5140,6 +5248,8 @@ impl ClientHttpConnection {
         let legacy_client_capabilities = client_capabilities.clone();
         #[cfg(feature = "legacy-2024-11-05")]
         let legacy_client_extension_runtime = settings.extensions.clone();
+        #[cfg(feature = "legacy-2024-11-05")]
+        let legacy_request_timeout_policy = settings.request_timeout_policy;
         match ModernHttpClient::connect_with_settings(
             cx,
             protocol_plan,
@@ -5160,6 +5270,7 @@ impl ClientHttpConnection {
                     reverse_request_handlers: ReverseRequestHandlers::new(),
                     cancelled_response_ids: VecDeque::new(),
                     persistent_receiver: None,
+                    request_timeout_policy: legacy_request_timeout_policy,
                     client_extension_runtime: legacy_client_extension_runtime,
                 }))
             }
@@ -5343,6 +5454,7 @@ impl ClientHttpConnection {
             client_capabilities,
             reverse_request_handlers,
             persistent_receiver,
+            request_timeout_policy,
             ..
         }) = self
         else {
@@ -5361,6 +5473,7 @@ impl ClientHttpConnection {
             outbound,
             client_capabilities.clone(),
             reverse_request_handlers.clone(),
+            *request_timeout_policy,
         )?));
         Ok(())
     }
@@ -8987,6 +9100,7 @@ impl LegacySseOutboundSendError {
 #[cfg(feature = "legacy-2024-11-05")]
 struct LegacyPersistentResponseWaiter {
     sender: oneshot::Sender<LegacyPersistentResponse>,
+    deadline: Arc<std::sync::Mutex<LegacyHttpRequestDeadline>>,
 }
 
 /// Owns waiter retirement while POST acknowledgement is still pending. A
@@ -9015,10 +9129,103 @@ impl Drop for LegacyPendingPost<'_> {
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
-enum LegacyPersistentResponse {
-    Response(JsonRpcResponse),
+enum LegacyPersistentResponse {    Response(JsonRpcResponse),
     IdMismatch { actual: RequestId },
     Cancelled,
+    Deadline(ModernHttpExecutorError),
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+enum LegacyHttpRequestWait {
+    Response(LegacyPersistentResponse),
+    Closed,
+    Cancelled,
+    Interrupted(ModernHttpExecutorError),
+}
+
+/// The response clock is owned by the receive task, even when the request's
+/// caller has a different clock. No timer or caller waker is polled under this
+/// shared lock; only the monotonic deadline and admitted progress are shared.
+#[cfg(feature = "legacy-2024-11-05")]
+struct LegacyHttpRequestDeadline {
+    response: HttpResponseDeadline,
+    last_progress: Option<f64>,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacyHttpRequestDeadline {
+    fn new(
+        clock_cx: &Cx,
+        request_cx: &Cx,
+        policy: RequestTimeoutPolicy,
+        parameters: &serde_json::Value,
+    ) -> Result<Self, ModernHttpExecutorError> {
+        check_modern_http_context(request_cx)?;
+        policy
+            .validate()
+            .map_err(|_| ModernHttpExecutorError::InvalidTimeoutPolicy)?;
+        let now = clock_cx.now();
+        HttpResponseDeadline::add_timeout(now, policy.idle_timeout())?;
+        HttpResponseDeadline::add_timeout(now, policy.absolute_timeout())?;
+        let caller_deadline = request_cx.budget().deadline.map(|deadline| {
+            let remaining = deadline
+                .as_nanos()
+                .saturating_sub(request_cx.now().as_nanos());
+            now.saturating_add_nanos(remaining)
+        });
+        Ok(Self {
+            response: HttpResponseDeadline {
+                cx: clock_cx.clone(),
+                committed_at: Arc::new(OnceLock::new()),
+                policy: HttpResponseTimeoutPolicy::Ordinary(policy),
+                response_deadlines: None,
+                caller_deadline,
+                sleep: None,
+                progress_marker: parameters
+                    .pointer("/_meta/progressToken")
+                    .cloned()
+                    .and_then(|marker| serde_json::from_value(marker).ok()),
+                last_progress: None,
+            },
+            last_progress: None,
+        })
+    }
+
+    fn commit(&mut self) {
+        let _ = self.response.committed_at.set(self.response.cx.now());
+    }
+
+    fn constrain_to(&mut self, cx: &Cx) {
+        if let Some(deadline) = cx.budget().deadline {
+            let remaining = deadline.as_nanos().saturating_sub(cx.now().as_nanos());
+            let deadline = self.response.cx.now().saturating_add_nanos(remaining);
+            self.response.caller_deadline = Some(
+                self.response
+                    .caller_deadline
+                    .map_or(deadline, |previous| previous.min(deadline)),
+            );
+        }
+    }
+
+    fn observe_progress(&mut self, progress: &crate::ClientProgressParams) {
+        if self.response.check().is_err()
+            || !progress.is_semantically_valid_after(self.last_progress)
+        {
+            return;
+        }
+        if self.response.progress_marker.as_ref() != Some(&progress.marker) {
+            return;
+        }
+        self.last_progress = Some(progress.progress);
+        if let HttpResponseTimeoutPolicy::Ordinary(policy) = self.response.policy
+            && policy.resets_idle_on_matching_progress()
+            && let Some((idle, _)) = &mut self.response.response_deadlines
+            && let Ok(next) =
+                HttpResponseDeadline::add_timeout(self.response.cx.now(), policy.idle_timeout())
+        {
+            *idle = next;
+        }
+    }
 }
 
 /// Result of the state-locked request-retirement election.
@@ -9462,6 +9669,7 @@ pub struct LegacySsePersistentReceiver {
     /// Admission and the receive task must measure the guard on one clock.
     clock_cx: Cx,
     outbound: LegacySseHttpOutbound,
+    request_timeout_policy: RequestTimeoutPolicy,
     reverse_callbacks: LegacySseReverseCallbackDispatcher,
 }
 
@@ -9473,6 +9681,7 @@ impl LegacySsePersistentReceiver {
         outbound: LegacySseHttpOutbound,
         client_capabilities: ClientCapabilities,
         reverse_request_handlers: ReverseRequestHandlers,
+        request_timeout_policy: RequestTimeoutPolicy,
     ) -> Result<Self, ClientHttpConnectionError> {
         reverse_request_handlers
             .validate_legacy_capabilities(&client_capabilities)
@@ -9555,6 +9764,19 @@ impl LegacySsePersistentReceiver {
                                 state.stop();
                                 break;
                             }
+                            if notification.method == NOTIFICATIONS_PROGRESS
+                                && let Some(parameters) = notification.params.as_ref()
+                                && let Some(progress) =
+                                    crate::parse_valid_client_progress(parameters, None)
+                            {
+                                for waiter in state.pending.values() {
+                                    waiter
+                                        .deadline
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .observe_progress(&progress);
+                                }
+                            }
                             state.notifications.push_back(notification);
                         }
                         JsonRpcMessage::Request(server_request) => {
@@ -9616,7 +9838,17 @@ impl LegacySsePersistentReceiver {
                                 }
                                 if let Some(waiter) = state.pending.remove(&key) {
                                     state.pending_changed();
-                                    Some((waiter, LegacyPersistentResponse::Response(response)))
+                                    let deadline = waiter
+                                        .deadline
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .response
+                                        .check();
+                                    let response = match deadline {
+                                        Ok(()) => LegacyPersistentResponse::Response(response),
+                                        Err(error) => LegacyPersistentResponse::Deadline(error),
+                                    };
+                                    Some((waiter, response))
                                 } else if state.pending.len() == 1 {
                                     let waiter = state
                                         .pending
@@ -9660,6 +9892,7 @@ impl LegacySsePersistentReceiver {
             task,
             clock_cx: task_cx,
             outbound,
+            request_timeout_policy,
             reverse_callbacks,
         })
     }
@@ -9683,6 +9916,17 @@ impl LegacySsePersistentReceiver {
         let key = request_id
             .correlation_key()
             .map_err(|_| ClientHttpConnectionError::LegacyPersistentReceiverStopped)?;
+        let deadline = Arc::new(std::sync::Mutex::new(
+            LegacyHttpRequestDeadline::new(
+                &self.clock_cx,
+                cx,
+                self.request_timeout_policy,
+                &parameters,
+            )
+            .map_err(|error| {
+                ClientHttpConnectionError::Legacy(LegacySseHttpClientError::Executor(error))
+            })?,
+        ));
         let (sender, receiver) = oneshot::channel();
         {
             let mut state = self
@@ -9712,7 +9956,13 @@ impl LegacySsePersistentReceiver {
             }
             state
                 .pending
-                .insert(key.clone(), LegacyPersistentResponseWaiter { sender });
+                .insert(
+                    key.clone(),
+                    LegacyPersistentResponseWaiter {
+                        sender,
+                        deadline: Arc::clone(&deadline),
+                    },
+                );
             state.pending_changed();
         }
         let mut pending_post = LegacyPendingPost {
@@ -9747,12 +9997,18 @@ impl LegacySsePersistentReceiver {
         }
         pending_post.armed = false;
         drop(pending_post);
+        deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .commit();
         Ok(LegacyHttpRequest {
             commit: LegacyHttpRequestCommit { request_id },
             key,
             receiver,
             state: Arc::clone(&self.state),
             outbound: self.outbound.clone(),
+            deadline,
+            request_cx: cx.clone(),
             terminal: false,
         })
     }
@@ -12047,6 +12303,25 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
+    fn legacy_test_response_waiter(
+        sender: oneshot::Sender<LegacyPersistentResponse>,
+    ) -> LegacyPersistentResponseWaiter {
+        let cx = Cx::for_request();
+        LegacyPersistentResponseWaiter {
+            sender,
+            deadline: Arc::new(std::sync::Mutex::new(
+                super::LegacyHttpRequestDeadline::new(
+                    &cx,
+                    &cx,
+                    crate::RequestTimeoutPolicy::default(),
+                    &serde_json::json!({}),
+                )
+                .expect("the default request deadline is representable"),
+            )),
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
     fn persistent_state_with_waiter(
         request_id: RequestId,
         cancelled_response_ids: VecDeque<RequestId>,
@@ -12056,7 +12331,7 @@ mod tests {
             .expect("test request ID has a correlation key");
         let (sender, _receiver) = oneshot::channel::<LegacyPersistentResponse>();
         let mut pending = HashMap::new();
-        pending.insert(key.clone(), LegacyPersistentResponseWaiter { sender });
+        pending.insert(key.clone(), legacy_test_response_waiter(sender));
         (
             LegacySsePersistentState {
                 pending,
@@ -12132,7 +12407,7 @@ mod tests {
             .expect("test request ID has a correlation key");
         let (sender, mut receiver) = oneshot::channel::<LegacyPersistentResponse>();
         let mut pending = HashMap::new();
-        pending.insert(key, LegacyPersistentResponseWaiter { sender });
+        pending.insert(key, legacy_test_response_waiter(sender));
         let mut state = LegacySsePersistentState {
             pending,
             cancelled_response_ids: VecDeque::from([RequestId::Number(42)]),
