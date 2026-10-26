@@ -1,6 +1,6 @@
 use super::*;
 
-const CANCEL: &str = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"remote-only-canary"}}"#;
+const CANCEL: &str = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"_meta":{"io.modelcontextprotocol/subscriptionId":7},"reason":"remote-only-canary"}}"#;
 
 #[test]
 fn core_subscription_terminal_orders_preserve_one_outcome_at_every_split() {
@@ -28,7 +28,7 @@ fn core_subscription_terminal_orders_preserve_one_outcome_at_every_split() {
                 reader.push(&wire.as_bytes()[..split], life, &mut idle, &mut observe).unwrap();
                 reader.push(&wire.as_bytes()[split..], life, &mut idle, &mut observe).unwrap();
                 let completed = reader.finish(life, &idle).unwrap();
-                assert_eq!(completed.usage, (ack.len() + first.len() + second.map_or(0, str::len), 1));
+                assert_eq!(completed.usage, (ack.len() + first.len(), 1));
                 assert_eq!(calls, 1);
                 assert_eq!(idle.deadline, deadline);
                 if cancelled {
@@ -49,27 +49,27 @@ fn core_subscription_terminal_orders_preserve_one_outcome_at_every_split() {
 fn core_control_signals_obey_exact_total_and_frame_bounds_without_event_slots() {
     fixture(|life, _| {
         let ack = ack(json!(7), filter());
-        let total = ack.len() + CANCEL.len() + COMPLETE.len();
         let maximum = ack.len().max(CANCEL.len()).max(COMPLETE.len());
         for reverse in [false, true] {
+            let first = if reverse { COMPLETE } else { CANCEL };
+            let total = ack.len() + first.len();
             for short in [false, true] {
                 let core = ManagedCoreLimits::new(8192, maximum, total - usize::from(short),
                     1, Duration::from_secs(60)).unwrap();
                 let selected = DpopStreamLimits::new(core, Duration::from_secs(10)).unwrap();
                 let mut reader = reader(ModernHttpResponseKind::Sse, filter(), selected);
                 let mut idle = Idle::new(life.cx.now(), selected.idle);
-                let (first, second) = if reverse { (COMPLETE, CANCEL) } else { (CANCEL, COMPLETE) };
                 reader.push(event(&ack).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
-                reader.push(event(first).as_bytes(), life, &mut idle, &mut |_| panic!("terminal callback")).unwrap();
                 let before = reader.decoder.usage();
-                let tail = reader.push(event(second).as_bytes(), life, &mut idle,
-                    &mut |_| panic!("late callback"));
+                let terminal = reader.push(event(first).as_bytes(), life, &mut idle,
+                    &mut |_| panic!("terminal callback"));
                 if short {
-                    assert!(matches!(tail, Err(DpopStreamError::Core(DpopCoreError::Protocol(
+                    assert!(matches!(terminal, Err(DpopStreamError::Core(DpopCoreError::Protocol(
                         ManagedCoreError::ResponseByteLimit)))));
                     assert_eq!(reader.decoder.usage(), before);
                 } else {
-                    tail.unwrap();
+                    terminal.unwrap();
+                    assert!(reader.complete());
                     assert_eq!(reader.finish(life, &idle).unwrap().usage, (total, 1));
                 }
             }
@@ -78,38 +78,91 @@ fn core_control_signals_obey_exact_total_and_frame_bounds_without_event_slots() 
 }
 
 #[test]
-fn core_teardown_cannot_target_another_listen_or_hide_nonterminal_or_malformed_data() {
+fn core_teardown_requires_acknowledgement_and_both_exact_ids_before_state_changes() {
     fixture(|life, _| {
-        for (established, first, bad) in [
-            (false, None, CANCEL.to_owned()),
-            (true, None, CANCEL.replace("\"requestId\":7", "\"requestId\":8")),
-            (true, None, notification(json!(8), "notifications/cancelled", json!({"requestId":7}))),
-            (true, Some(COMPLETE), CANCEL.replace("\"requestId\":7", "\"requestId\":\"7\"")),
-            (true, Some(CANCEL), COMPLETE.replace("\"id\":7", "\"id\":8")),
-            (true, Some(CANCEL), change(json!(7))),
-            (true, Some(COMPLETE), COMPLETE.to_owned()),
-            (true, Some(CANCEL), CANCEL.to_owned()),
-            (true, None, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"requestId":7}}"#.to_owned()),
+        for (established, bad) in [
+            (false, CANCEL.to_owned()),
+            (true, CANCEL.replace("\"requestId\":7", "\"requestId\":8")),
+            (true, notification(json!(8), "notifications/cancelled", json!({"requestId":7}))),
+            (true, CANCEL.replace("\"requestId\":7", "\"requestId\":\"7\"")),
+            (true, notification(json!("7"), "notifications/cancelled", json!({"requestId":7}))),
+            (true, notification(Value::Null, "notifications/cancelled", json!({"requestId":7}))),
+            (true, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#.to_owned()),
+            (true, r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"requestId":7}}"#.to_owned()),
         ] {
             let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
             let mut idle = Idle::new(life.cx.now(), limits().idle);
             if established {
                 reader.push(event(&ack(json!(7), filter())).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
             }
-            if let Some(first) = first {
-                reader.push(event(first).as_bytes(), life, &mut idle, &mut |_| true).unwrap();
-            }
             let before = reader.decoder.usage();
             assert!(reader.push(event(&bad).as_bytes(), life, &mut idle,
                 &mut |_| panic!("refused traffic cannot reach the observer")).is_err());
             assert_eq!(reader.decoder.usage(), before);
+            assert!(!reader.complete());
         }
-        let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
-        let mut idle = Idle::new(life.cx.now(), limits().idle);
-        let wire = format!("{}{}data: unfinished", event(&ack(json!(7), filter())), event(CANCEL));
-        reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
-        assert!(reader.finish(life, &idle).is_err());
     });
+}
+
+#[test]
+fn core_first_terminal_discards_buffered_suffix_and_rechecks_original_authority() {
+    for first in [CANCEL, COMPLETE] {
+        for suffix in ["data: unfinished".to_owned(), event(CANCEL), event(COMPLETE),
+            event(&change(json!(999))), "data: {malformed}\n\n".to_owned()] {
+            fixture(|life, _| {
+                let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
+                let mut idle = Idle::new(life.cx.now(), limits().idle);
+                let acknowledged = ack(json!(7), filter());
+                let wire = format!("{}{}{suffix}", event(&acknowledged), event(first));
+                reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+                assert!(reader.complete());
+                assert_eq!(reader.finish(life, &idle).unwrap().usage,
+                    (acknowledged.len() + first.len(), 1));
+            });
+        }
+        for retire in 0..4 {
+            fixture(|life, clock| {
+                let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
+                let mut idle = Idle::new(life.cx.now(), limits().idle);
+                let wire = format!("{}{}", event(&ack(json!(7), filter())), event(first));
+                reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
+                match retire {
+                    0 => { life.cancellation.cancel(); }
+                    1 => { life.credential.revoke(); }
+                    2 => { life.session.revoke(); }
+                    _ => { clock.advance(11_000_000_000); }
+                }
+                assert!(matches!(reader.finish(life, &idle),
+                    Err(DpopStreamError::Core(DpopCoreError::Transport(_)))));
+                assert!(life.cx.checkpoint().is_ok());
+            });
+        }
+    }
+}
+
+#[test]
+fn original_credential_expiry_remains_a_terminal_publication_ceiling() {
+    for first in [CANCEL, COMPLETE] {
+        fixture(|life, clock| {
+            let credential = life.session.admit_token_response(
+                &CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(), 200,
+                br#"{"access_token":"short-lived-subscription","token_type":"DPoP","expires_in":1}"#,
+                Instant::now(), Duration::from_secs(1),
+            ).unwrap();
+            let bounds = WaitBounds::new(life.cx, Duration::from_secs(60), &credential).unwrap();
+            let original = Lifetime { cx: life.cx, cancellation: life.cancellation,
+                session: life.session, credential: &credential, bounds };
+            let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
+            let mut idle = Idle::new(life.cx.now(), limits().idle);
+            let wire = format!("{}{}", event(&ack(json!(7), filter())), event(first));
+            reader.push(wire.as_bytes(), &original, &mut idle, &mut |_| true).unwrap();
+            clock.advance(2_000_000_000);
+            assert!(matches!(reader.finish(&original, &idle),
+                Err(DpopStreamError::Core(DpopCoreError::Transport(DpopHttpError::Authorization(_))))));
+            assert!(!life.cancellation.is_cancel_requested());
+            assert!(life.cx.checkpoint().is_ok());
+        });
+    }
 }
 
 #[test]

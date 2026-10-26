@@ -193,8 +193,7 @@ fn pending_companion_keeps_listening_and_teardown_drops_it_without_waiting_for_e
         assert_eq!(polls.get(), before, "terminal wins before another host poll");
         drop(follow);
         assert_eq!(drops.get(), 1);
-        assert_eq!(body_drops.load(Ordering::SeqCst), 0, "tail still needs clean EOF");
-        control.finish();
+        assert_eq!(body_drops.load(Ordering::SeqCst), 1, "winning terminal releases the body before EOF");
         {
             let mut next = Box::pin(listen.next(owner));
             assert!(matches!(next.as_mut().poll(&mut task), Poll::Ready(Ok(LiveStep::Closed))));
@@ -216,6 +215,40 @@ fn ready_terminal_prevents_even_the_first_companion_poll() {
         assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Ok(Follow::Stopped))));
     });
+}
+
+#[test]
+fn peer_cancellation_closes_the_body_and_stops_companion_work_without_eof() {
+    for already_pending in [false, true] {
+        fixture(|owner, _, _| {
+            let (mut listen, control, _, body_drops) = listen(owner, 1);
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            let work = Work { polls: polls.clone(), drops: drops.clone(),
+                ready: Rc::new(Cell::new(false)) };
+            let mut follow = Box::pin(listen.follow(owner, work));
+            let mut task = Context::from_waker(Waker::noop());
+            if already_pending {
+                assert!(follow.as_mut().poll(&mut task).is_pending());
+            }
+            let before = polls.get();
+            let mut wire = event(json!({"jsonrpc":"2.0", "method":"notifications/cancelled",
+                "params":{"requestId":"watch.listen",
+                    "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"watch.listen"}}}));
+            wire.extend(terminal());
+            wire.extend_from_slice(b"data: {malformed}\n\n");
+            control.send(wire);
+            assert!(matches!(follow.as_mut().poll(&mut task),
+                Poll::Ready(Err(DpopTaskWatchError::Stream(DpopStreamError::SubscriptionCancelled)))));
+            assert_eq!(polls.get(), before);
+            drop(follow);
+            assert_eq!(drops.get(), 1);
+            assert_eq!(body_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(listen.budget.usage().unwrap().1, 1);
+            assert!(!owner.cancellation.is_cancel_requested());
+            assert!(owner.cx.checkpoint().is_ok());
+        });
+    }
 }
 
 #[test]
@@ -241,9 +274,9 @@ fn a_large_unread_frame_suffix_cannot_be_overtaken_by_host_work() {
 }
 
 #[test]
-fn provisional_terminal_does_not_authorize_reconciliation_with_a_malformed_tail() {
+fn completed_subscription_discards_its_tail_before_any_successor_work() {
     fixture(|owner, _, _| {
-        let (mut listen, control, _, _) = listen(owner, 8);
+        let (mut listen, control, polls, drops) = listen(owner, 8);
         control.send(terminal());
         control.send(b"data: {\"unfinished\":".to_vec());
         control.finish();
@@ -252,8 +285,12 @@ fn provisional_terminal_does_not_authorize_reconciliation_with_a_malformed_tail(
             assert!(matches!(follow.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                 Poll::Ready(Ok(Follow::Stopped))));
         }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let before = polls.load(Ordering::SeqCst);
         let mut next = Box::pin(listen.next(owner));
-        assert!(matches!(next.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Ready(Err(_))));
+        assert!(matches!(next.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(LiveStep::Closed))));
+        assert_eq!(polls.load(Ordering::SeqCst), before);
     });
 }
 

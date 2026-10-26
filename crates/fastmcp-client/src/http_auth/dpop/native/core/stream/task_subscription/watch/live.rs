@@ -45,8 +45,7 @@ pub(super) enum Follow<T> {
     // Only input resolution opts in. This is a request for an authoritative
     // get, not adoption of the notification's Task or permission to replay.
     Changed,
-    // Terminal framing has retired mutation authority, even before clean EOF.
-    // The caller still has to drain/validate the tail before any reconciliation.
+    // The first completion retired mutation authority and released its body.
     Stopped,
 }
 
@@ -100,6 +99,9 @@ where
         let (mut bytes_left, mut frames_left) = (BYTES_PER_TURN, FRAMES_PER_TURN);
         loop {
             if self.closed { return Ok(Pump::Closed); }
+            if self.reader.as_ref().is_some_and(Reader::complete) {
+                return self.finish_response(owner);
+            }
             if self.teardown() {
                 if stop_on_teardown { return Ok(Pump::Teardown); }
             } else if stop_on_hint && self.dirty {
@@ -139,18 +141,21 @@ where
             if let Some(frame) = frame {
                 self.pending = frame.into_data();
             } else {
-                let reader = self.reader.take().ok_or(ManagedCoreError::InvalidResponse)?;
-                let completed = reader.finish_with_check(&self.idle, |idle| owner.check(idle))?;
-                match completed.result {
-                    Ok(_) | Err(DpopStreamError::SubscriptionCancelled) => {}
-                    Err(error) => return Err(error.into()),
-                }
-                // Dispose the physical response before any final get/reconnect.
-                self.body = None;
-                self.closed = true;
-                return Ok(Pump::Closed);
+                return self.finish_response(owner);
             }
         }
+    }
+
+    fn finish_response(&mut self, owner: &ReadOwner<'_>) -> Result<Pump, DpopTaskWatchError> {
+        let reader = self.reader.take().ok_or(ManagedCoreError::InvalidResponse)?;
+        self.pending = None;
+        self.body = None;
+        self.closed = true;
+        let completed = reader.finish_with_check(&self.idle, |idle| owner.check(idle))?;
+        // Peer cancellation is not successful completion or recovery authority.
+        // Propagate its typed outcome before a final get, reconnect or update.
+        completed.result?;
+        Ok(Pump::Closed)
     }
 
     pub(super) async fn next(&mut self, owner: &ReadOwner<'_>)

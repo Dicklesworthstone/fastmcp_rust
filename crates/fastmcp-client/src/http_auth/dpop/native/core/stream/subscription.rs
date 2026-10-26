@@ -4,7 +4,8 @@
 //! an accepted filter and every later notification must belong to that filter
 //! and request ID. Both Bearer and DPoP use the same subscription decoder. The
 //! transport owner remains the ordinary DPoP reader, including its bounded
-//! ready-work turns, original credential, cancellation and clean-EOF rule.
+//! ready-work turns, original credential and cancellation guards. Only the
+//! subscription owner releases its body on the first valid terminal signal.
 
 mod termination;
 use termination::TerminalDecoder;
@@ -58,14 +59,14 @@ impl DpopHttpClient {
     /// The observer returns true to continue or false to release the socket.
     /// It must be brief and nonblocking. Already-observed notifications cannot
     /// be recalled after a later failure. The returned result is the shared
-    /// typed subscription completion, published only after clean HTTP body EOF.
-    /// Peer cancellation after ACK instead returns SubscriptionCancelled after
-    /// clean EOF; it never cancels the caller or fabricates successful completion.
-    /// The first terminal wins, tolerating one complementary correlated signal
-    /// without publishing it. Both signals spend payload bytes but not event
-    /// slots. Same-signal duplicates and nonterminal/foreign traffic still fail.
-    /// EOF without a terminal, foreign IDs, unselected events and incomplete
-    /// SSE tails are errors. A finite JSON refusal exposes only its error code.
+    /// typed subscription completion. Peer cancellation after ACK instead
+    /// returns SubscriptionCancelled; it never cancels the caller or fabricates
+    /// completion. Both its request ID and subscription metadata must match.
+    /// The first valid terminal releases the body without waiting for HTTP EOF,
+    /// and later buffered signals are discarded. Terminal control spends
+    /// payload bytes but not event slots. Before that terminal, premature EOF,
+    /// foreign IDs, unselected events and incomplete SSE frames are errors.
+    /// A finite JSON refusal exposes only its error code.
     ///
     /// This is a bounded listen, not an indefinitely renewed connection. The
     /// original native/core/caller/token deadlines and raw/payload/parser bounds
@@ -462,9 +463,9 @@ mod tests {
             for tail in ["data: unfinished", ": unfinished"] {
                 let mut reader = reader(ModernHttpResponseKind::Sse, filter(), limits());
                 let mut idle = Idle::new(life.cx.now(), limits().idle);
-                let wire = format!("{}{}{tail}", event(&ack(json!(7), filter())), event(COMPLETE));
+                let wire = format!("{}{tail}", event(&ack(json!(7), filter())));
                 reader.push(wire.as_bytes(), life, &mut idle, &mut |_| true).unwrap();
-                assert!(reader.terminal.is_some());
+                assert!(reader.terminal.is_none());
                 assert!(matches!(reader.finish(life, &idle), Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))));
             }
         });

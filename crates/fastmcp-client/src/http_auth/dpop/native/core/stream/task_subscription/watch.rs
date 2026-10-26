@@ -567,8 +567,9 @@ impl DpopHttpClient {
     ///
     /// The returned complete GetTaskResult is preserved, including metadata.
     /// Input-required is an explicit host handoff; failed/cancelled remote Tasks
-    /// are terminal snapshots, not successful executions. A clean subscription
-    /// terminal, whether completion or peer cancellation, requires a final get.
+    /// are terminal snapshots, not successful executions. Subscription
+    /// completion requires a final get. Peer cancellation instead stops the
+    /// watch with SubscriptionCancelled before reconciliation or reconnection.
     /// If still Working, an explicitly configured reconnect opens a fresh listen
     /// after a bounded delay. It must acknowledge this Task again, then another
     /// get closes the rollover race. When reconnects are exhausted, an explicit

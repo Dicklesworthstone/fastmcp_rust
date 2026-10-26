@@ -243,8 +243,11 @@ fn public_https_subscriptions_deliver_live_changes_and_refuse_invalid_or_retired
                                 if !matches!(case, Case::CancelAfterAck | Case::RevokeAfterAck | Case::ObserverStop) {
                                     let changed = change(if matches!(case, Case::ForeignEventId) { json!(8) } else { json!(7) });
                                     let uri = if matches!(case, Case::UnselectedUri) { "file:///a/b?scope=one" } else { RESOURCE };
-                                    let mut last = format!("{}{}{}", event(&changed), event(&updated(uri)), event(COMPLETE));
-                                    if matches!(case, Case::IncompleteTail) { last.push_str("data: unfinished"); }
+                                    let last = if matches!(case, Case::IncompleteTail) {
+                                        format!("{}{}data: unfinished", event(&changed), event(&updated(uri)))
+                                    } else {
+                                        format!("{}{}{}", event(&changed), event(&updated(uri)), event(COMPLETE))
+                                    };
                                     socket.write_all(format!("{:X}\r\n{last}\r\n0\r\n\r\n", last.len()).as_bytes()).await.unwrap();
                                     socket.shutdown().await.unwrap();
                                     return proof;

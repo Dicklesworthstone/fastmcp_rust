@@ -14,7 +14,8 @@ const ENDINGS: [Ending; 4] = [Ending::Cancel, Ending::Complete,
 
 fn cancellation(prefix: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"notifications/cancelled",
-        "params":{"requestId":format!("{prefix}.listen"),"reason":"peer-only-canary"}})).unwrap()
+        "params":{"requestId":format!("{prefix}.listen"),"reason":"peer-only-canary",
+            "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:format!("{prefix}.listen")}}})).unwrap()
 }
 
 fn terminal_wire(prefix: &str, ending: Ending) -> Vec<u8> {
@@ -112,7 +113,7 @@ async fn listen(
 }
 
 #[test]
-fn public_core_and_task_listeners_publish_the_first_terminal_only_after_clean_eof() {
+fn public_core_and_task_listeners_publish_the_first_terminal_without_http_eof() {
     for tasks in [false, true] {
         for ending in ENDINGS {
             run(async {
@@ -135,12 +136,11 @@ fn public_core_and_task_listeners_publish_the_first_terminal_only_after_clean_eo
                     event(&mut socket, &acknowledgement("end", tasks)).await;
                     observed.cancelled().await;
                     socket.write_all(&terminal_wire("end", ending)).await.unwrap();
-                    // The first signal and its optional counterpart are available,
-                    // but neither result nor peer cancellation may settle yet.
-                    asupersync::time::Sleep::new(cx.now().saturating_add_nanos(10_000_000)).await;
-                    assert!(!finished.is_cancel_requested(), "terminal escaped before HTTP EOF");
-                    socket.write_all(b"0\r\n\r\n").await.unwrap();
-                    let _ = socket.shutdown().await;
+                    socket.flush().await.unwrap();
+                    // Deliberately omit the HTTP terminal chunk. The admitted
+                    // first terminal must release the response on its own.
+                    assert_watch_closed(&mut socket).await;
+                    assert!(finished.is_cancel_requested());
                 };
                 let (result, ()) = pair(application, server).await;
                 if matches!(ending, Ending::Cancel | Ending::CancelComplete) {
@@ -160,16 +160,21 @@ fn public_core_and_task_listeners_publish_the_first_terminal_only_after_clean_eo
 }
 
 #[test]
-fn watch_reconciles_each_peer_ending_without_equating_subscription_and_task_cancellation() {
+fn watch_reconciles_completion_but_peer_cancellation_stops_without_recovery() {
     for ending in ENDINGS {
         for final_status in ["working", "input_required", "cancelled"] {
             run(async {
                 let cx = Cx::current().unwrap();
                 let (mut peer, mut client, credential) = Peer::new().await;
                 let cancellation = McpRequestCancellation::new();
+                let cancelled = matches!(ending, Ending::Cancel | Ending::CancelComplete);
+                let policy = if cancelled {
+                    watch_policy(3).with_reconnects(1, Duration::from_millis(1)).unwrap()
+                        .with_polling_fallback(1, Duration::from_millis(1)).unwrap()
+                } else { watch_policy(3) };
                 let application = client.watch_task_with_cancellation(
                     &cx, &cancellation, &credential, driver_metadata(), TaskId::parse("task-one").unwrap(),
-                    "reconcile", watch_policy(3), watch_limits(1),
+                    "reconcile", policy, watch_limits(1),
                 );
                 let server = async {
                     peer.watch_snapshot_reply("reconcile", 0, "working").await;
@@ -177,26 +182,31 @@ fn watch_reconciles_each_peer_ending_without_equating_subscription_and_task_canc
                     socket.write_all(HEAD).await.unwrap();
                     event(&mut socket, &watch_ack("reconcile", true)).await;
                     peer.watch_snapshot_reply("reconcile", 1, "working").await;
-                    let mut wire = terminal_wire("reconcile", ending);
-                    wire.extend_from_slice(b"0\r\n\r\n");
-                    socket.write_all(&wire).await.unwrap();
-                    let _ = socket.shutdown().await;
-                    // A fresh get is mandatory after either terminal signal;
-                    // the listen's state is not an authoritative Task snapshot.
-                    peer.watch_snapshot_reply("reconcile", 2, final_status).await;
+                    socket.write_all(&terminal_wire("reconcile", ending)).await.unwrap();
+                    socket.flush().await.unwrap();
+                    assert_watch_closed(&mut socket).await;
+                    // Completion permits explicit reconciliation. Cancellation
+                    // cannot turn configured recovery into successor requests.
+                    if !cancelled {
+                        peer.watch_snapshot_reply("reconcile", 2, final_status).await;
+                    }
                 };
                 let (result, ()) = pair(application, server).await;
-                match final_status {
+                if cancelled {
+                    assert!(matches!(result, Err(DpopTaskWatchError::Stream(
+                        DpopStreamError::SubscriptionCancelled))));
+                } else { match final_status {
                     "working" => assert!(matches!(result, Err(DpopTaskWatchError::SubscriptionEndedWhileWorking))),
                     "input_required" => assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::InputRequired(_))),
                     _ => assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::Terminal(snapshot)
                         if matches!(snapshot.task, Task::Cancelled(_)))),
-                }
-                peer.only_requests(8);
+                }}
+                let requests = if cancelled { 6 } else { 8 };
+                peer.only_requests(requests);
                 assert!(!cancellation.is_cancel_requested());
                 assert!(cx.checkpoint().is_ok());
                 followup(&mut peer, &mut client, &credential).await;
-                peer.only_requests(10);
+                peer.only_requests(requests + 2);
             });
         }
     }
@@ -204,7 +214,7 @@ fn watch_reconciles_each_peer_ending_without_equating_subscription_and_task_canc
 
 #[test]
 fn invalid_watch_termination_never_schedules_a_final_get_or_replays_the_listen() {
-    for failure in 0..4 {
+    for failure in 0..6 {
         run(async {
             let cx = Cx::current().unwrap();
             let (mut peer, mut client, credential) = Peer::new().await;
@@ -219,21 +229,24 @@ fn invalid_watch_termination_never_schedules_a_final_get_or_replays_the_listen()
                 socket.write_all(HEAD).await.unwrap();
                 event(&mut socket, &watch_ack("invalid-end", true)).await;
                 peer.watch_snapshot_reply("invalid-end", 1, "working").await;
-                let mut wire = terminal_wire("invalid-end", Ending::Cancel);
+                let mut invalid: Value = serde_json::from_slice(&self::cancellation("invalid-end")).unwrap();
                 match failure {
-                    0 => wire.extend_from_slice(&event_chunk(&watch_terminal("foreign"))),
-                    1 => wire.extend_from_slice(&terminal_wire("invalid-end", Ending::Cancel)),
-                    2 => wire.extend_from_slice(&event_chunk(&watch_status("invalid-end", "cancelled"))),
-                    _ => wire.extend_from_slice(&chunk(b"data: unfinished")),
+                    0 => invalid["params"]["requestId"] = json!("foreign.listen"),
+                    1 => invalid["params"]["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY] = json!("foreign.listen"),
+                    2 => { invalid["params"].as_object_mut().unwrap().remove("_meta"); }
+                    3 => invalid["params"]["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY] = Value::Null,
+                    4 => invalid["params"]["requestId"] = json!(41),
+                    _ => invalid["params"]["_meta"] = json!({}),
                 }
+                let mut wire = event_chunk(&serde_json::to_vec(&invalid).unwrap());
                 wire.extend_from_slice(b"0\r\n\r\n");
                 socket.write_all(&wire).await.unwrap();
                 let _ = socket.shutdown().await;
             };
             let (result, ()) = pair(application, server).await;
             assert!(result.is_err());
-            assert!(!matches!(result, Err(DpopTaskWatchError::SubscriptionEndedWhileWorking)),
-                "invalid EOF is not a successfully reconciled Working snapshot");
+            assert!(matches!(result, Err(DpopTaskWatchError::Stream(DpopStreamError::Core(
+                DpopCoreError::Protocol(ManagedCoreError::ResponseIdMismatch))))));
             peer.only_requests(6);
             followup(&mut peer, &mut client, &credential).await;
             peer.only_requests(8);
@@ -242,7 +255,7 @@ fn invalid_watch_termination_never_schedules_a_final_get_or_replays_the_listen()
 }
 
 #[test]
-fn local_cancellation_and_idle_expiry_win_while_a_remote_terminal_lacks_eof() {
+fn local_cancellation_and_idle_expiry_retire_a_listen_before_any_terminal() {
     for tasks in [false, true] {
         for idle in [false, true] {
             run(async {
@@ -267,9 +280,7 @@ fn local_cancellation_and_idle_expiry_win_while_a_remote_terminal_lacks_eof() {
                     socket.write_all(HEAD).await.unwrap();
                     event(&mut socket, &acknowledgement("silent-end", tasks)).await;
                     observed.cancelled().await;
-                    socket.write_all(&terminal_wire("silent-end", Ending::Cancel)).await.unwrap();
                     if !idle {
-                        asupersync::time::Sleep::new(cx.now().saturating_add_nanos(10_000_000)).await;
                         cancellation.cancel();
                     }
                     assert_watch_closed(&mut socket).await;
@@ -286,6 +297,75 @@ fn local_cancellation_and_idle_expiry_win_while_a_remote_terminal_lacks_eof() {
                 followup(&mut peer, &mut client, &credential).await;
                 peer.only_requests(requests + 2);
             });
+        }
+    }
+}
+
+#[test]
+fn buffered_core_and_tasks_terminals_cannot_outlive_original_request_or_credential_authority() {
+    for tasks in [false, true] {
+        for ending in [Ending::Cancel, Ending::Complete] {
+            for retire in 0..3 {
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let (mut peer, mut client, credential) = Peer::new().await;
+                    let cancellation = McpRequestCancellation::new();
+                    let revocation = client.revocation_handle();
+                    let mut calls = 0;
+                    let mut after_ack = || {
+                        calls += 1;
+                        match retire {
+                            0 => { cancellation.cancel(); }
+                            1 => { credential.revoke(); }
+                            _ => { revocation.revoke(); }
+                        }
+                    };
+                    let application = async {
+                        if tasks {
+                            let selection = DpopTaskSubscription::new(
+                                RequestId::String("retired.listen.discover".to_owned()),
+                                RequestId::String("retired.listen".to_owned()), driver_metadata(),
+                                vec![TaskId::parse("task-one").unwrap()],
+                            ).unwrap();
+                            client.listen_tasks_with_events(&cx, &cancellation, &credential,
+                                selection, watch_limits(1), |event| {
+                                    assert!(matches!(event, DpopTaskSubscriptionEvent::Acknowledged(_)));
+                                    after_ack();
+                                    true
+                                }).await
+                        } else {
+                            client.listen_core_with_events(&cx, &cancellation, &credential,
+                                core_params(), RequestId::String("retired.listen".to_owned()),
+                                watch_limits(1), |event| {
+                                    assert!(matches!(event, ServerNotification::SubscriptionsAcknowledged(_)));
+                                    after_ack();
+                                    true
+                                }).await
+                        }
+                    };
+                    let server = async {
+                        let mut socket = if tasks { peer.watch_listen("retired").await }
+                            else { peer.core_listen_for_termination("retired").await };
+                        socket.write_all(HEAD).await.unwrap();
+                        let mut wire = event_chunk(&acknowledgement("retired", tasks));
+                        wire.extend_from_slice(&terminal_wire("retired", ending));
+                        socket.write_all(&wire).await.unwrap();
+                        socket.flush().await.unwrap();
+                        assert_watch_closed(&mut socket).await;
+                    };
+                    let (result, ()) = pair(application, server).await;
+                    if retire == 0 {
+                        assert!(matches!(result, Err(DpopStreamError::Core(DpopCoreError::Transport(
+                            DpopHttpError::Cancelled)))));
+                    } else {
+                        assert!(matches!(result, Err(DpopStreamError::Core(DpopCoreError::Transport(
+                            DpopHttpError::Authorization(_))))));
+                    }
+                    assert_eq!(calls, 1);
+                    peer.only_requests(if tasks { 2 } else { 1 });
+                    assert!(cx.checkpoint().is_ok());
+                });
+            }
         }
     }
 }

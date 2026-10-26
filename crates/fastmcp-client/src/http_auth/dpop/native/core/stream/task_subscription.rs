@@ -30,7 +30,7 @@ use super::{
     Idle, Lifetime, ManagedCoreError, ManagedCoreLimits, ModernHttpRequest,
     PreparedStream, StreamDecoder, StreamEvent, StreamNotification, WaitBounds, with_caller,
 };
-use super::subscription_end::{SubscriptionEnd, admit_cancelled};
+use super::subscription_end::admit_cancelled;
 use super::super::{BoundedWriter, DpopHttpResponse, decode_response};
 use super::super::tasks::{DpopTasksError, ManagedTasksError};
 use crate::http_auth::rpc::subscription::json_subscription_error;
@@ -156,7 +156,6 @@ impl Prepared {
                 bytes: 0,
                 notifications: 0,
                 terminal: false,
-                end: SubscriptionEnd::default(),
             },
         })
     }
@@ -189,19 +188,18 @@ impl DpopHttpClient {
     /// exact-ID `subscriptions/listen` POST. The observer receives the admitted
     /// acknowledgement first, then only Task statuses in its accepted subset.
     /// A Task's terminal status is an observation, not the listen's completion.
-    /// The returned core subscriptions/listen result requires clean HTTP EOF.
+    /// The first admitted terminal releases its HTTP response immediately.
     ///
-    /// Peer cancellation after acknowledgement also requires clean EOF and
-    /// returns `DpopStreamError::SubscriptionCancelled`, not a fabricated result
-    /// or a cancelled Task. The first terminal wins: one matching cancellation
-    /// after completion, or one correlated response after cancellation, is
-    /// consumed without another outcome. Other post-terminal records still fail.
+    /// Peer cancellation after acknowledgement requires both exact listen IDs
+    /// and returns `DpopStreamError::SubscriptionCancelled`, not a fabricated
+    /// result or a cancelled Task. The first valid terminal wins without HTTP
+    /// EOF; later buffered records are discarded without another outcome.
     ///
     /// No task polling, updates, cancellation POSTs, reconnect, login, refresh,
     /// redirect or bearer fallback occurs. A finite JSON body can report a
     /// correlated refusal, never establish a subscription. Premature EOF,
-    /// incomplete SSE tails, duplicate terminals, unselected events and foreign
-    /// subscription/task IDs fail without publishing a provisional completion.
+    /// incomplete SSE frames, unselected events and foreign subscription/task
+    /// IDs before the terminal fail without publishing completion.
     ///
     /// Discovery and listen share the original native/core/caller/token bounds
     /// and aggregate JSON payload budget. The acknowledgement counts against
@@ -254,9 +252,8 @@ impl DpopHttpClient {
     }
 }
 
-// An admitted remote cancellation is a provisional terminal, not a parsing
-// error. The reader must still validate the complete HTTP/SSE response before
-// publishing it. Outer errors retain transport, protocol and quota failures.
+// An admitted remote cancellation ends the listen, not the Task. Outer errors
+// retain transport, protocol, authorization and quota failures.
 type TaskSubscriptionResult = Result<CoreResult, DpopStreamError>;
 
 struct TaskSubscriptionDecoder {
@@ -268,7 +265,6 @@ struct TaskSubscriptionDecoder {
     bytes: usize,
     notifications: usize,
     terminal: bool,
-    end: SubscriptionEnd,
 }
 
 fn accepted_ids(filter: &SubscriptionFilter, requested: &[TaskId])
@@ -294,6 +290,8 @@ fn accepted_ids(filter: &SubscriptionFilter, requested: &[TaskId])
 
 impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
     type Terminal = TaskSubscriptionResult;
+
+    fn completes_on_terminal(&self) -> bool { true }
 
     fn admit(
         &mut self,
@@ -345,7 +343,6 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
                         return Err(ManagedCoreError::UnexpectedNotification.into());
                     }
                     admit_cancelled(frame, &self.id, maximum)?;
-                    self.end.cancel();
                     self.terminal = true;
                     self.bytes += frame.len();
                     return Ok(StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled)));
@@ -398,26 +395,10 @@ impl StreamDecoder<DpopTaskSubscriptionEvent> for TaskSubscriptionDecoder {
             StreamEvent::Notification(_) => self.notifications += 1,
             StreamEvent::Result(_) => {
                 self.terminal = true;
-                self.end.complete();
             }
         }
         self.bytes += frame.len();
         Ok(event)
-    }
-
-    fn admit_terminal_tail(&mut self, frame: &[u8]) -> Result<(), DpopStreamError> {
-        if !self.terminal {
-            return Err(ManagedCoreError::InvalidResponse.into());
-        }
-        let maximum = self.limits.frame_bytes().min(
-            self.limits.total_bytes().saturating_sub(self.bytes),
-        );
-        if frame.len() > maximum {
-            return Err(ManagedCoreError::ResponseByteLimit.into());
-        }
-        self.end.admit_tail(frame, &self.id, maximum)?;
-        self.bytes += frame.len();
-        Ok(())
     }
 
     fn usage(&self) -> (usize, usize) { (self.bytes, self.notifications) }

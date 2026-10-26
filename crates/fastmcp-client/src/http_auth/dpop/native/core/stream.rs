@@ -1,9 +1,9 @@
 //! One explicit DPoP POST with incremental, strictly admitted notifications.
 //!
 //! Uses the native HTTP body and the shared SSE/core codecs, not a second
-//! event-stream dialect. A final result is retained until clean HTTP EOF;
-//! a second result, later notification or unfinished SSE tail rejects it.
-//! Subscription decoders alone may admit the complementary teardown signal.
+//! event-stream dialect. Ordinary RPC results are retained until clean HTTP
+//! EOF; later records or unfinished framing reject them. Subscription decoders
+//! alone release their response after the first admitted terminal signal.
 //! No response owner, proof, raw cursor or credential escapes to the observer.
 
 /// Streaming multi-round operations with an explicitly supplied typed input host.
@@ -128,7 +128,7 @@ pub enum DpopStreamError {
     ObserverStopped,
     ObserverPanicked,
     /// The peer ended this subscription with notifications/cancelled. This
-    /// is published only after clean EOF, not as a fabricated complete result.
+    /// releases the response without waiting for EOF or fabricating completion.
     /// It does not mean a watched Task or the caller's context was cancelled.
     SubscriptionCancelled,
 }
@@ -219,13 +219,15 @@ pub(super) trait StreamDecoder<E: StreamNotification = ServerNotification> {
         allow_notification: bool,
     ) -> Result<StreamEvent<Self::Terminal, E>, DpopStreamError>;
 
-    // Ordinary RPCs reject every post-terminal record. Only subscription
-    // codecs may opt in to bounded admission of their complementary teardown
-    // signal, with exact correlation and cumulative accounting. No callback
-    // or replacement terminal can escape this seam.
+    // Ordinary RPCs reject every post-terminal record while awaiting EOF.
+    // No callback or replacement terminal can escape this seam.
     fn admit_terminal_tail(&mut self, _frame: &[u8]) -> Result<(), DpopStreamError> {
         Err(ManagedCoreError::InvalidResponse.into())
     }
+
+    // Only acknowledged subscription decoders may end an indefinitely open
+    // response at their terminal. Ordinary RPCs keep the clean-EOF requirement.
+    fn completes_on_terminal(&self) -> bool { false }
 
     fn usage(&self) -> (usize, usize);
 }
@@ -483,6 +485,9 @@ where
         C: FnMut(&Idle) -> Result<(), DpopHttpError>,
     {
         check(idle)?;
+        if self.complete() {
+            return Ok(());
+        }
         // Admit the same byte prefix regardless of HTTP frame boundaries. A
         // large native frame must not suppress notifications that a fragmented
         // delivery would have emitted before the raw-body cap was reached.
@@ -501,47 +506,61 @@ where
             WireBody::Sse(parser) => {
                 let decoder = &mut self.decoder;
                 let terminal = &mut self.terminal;
-                parser.push_with(bytes, |frame| {
-                    check(idle)?;
-                    if terminal.is_some() {
-                        decoder.admit_terminal_tail(frame.as_bytes())?;
-                        // A tolerated peer teardown cannot bypass the same
-                        // lifetime guard used for every other admitted frame.
+                // `None` is private control flow: the winning terminal stops
+                // the parser before it can inspect a buffered successor. The
+                // retired parser is never reused or required to reach EOF.
+                let pushed = parser.push_with(bytes, |frame| -> Result<(), Option<DpopStreamError>> {
+                    let accepted = (|| -> Result<(), DpopStreamError> {
                         check(idle)?;
-                        return Ok(());
-                    }
-                    let event = decoder.admit(frame.as_bytes(), true)?;
-                    // Decoder work cannot revive a deadline that it exhausted.
-                    check(idle)?;
-                    match event {
-                        StreamEvent::Result(result) => *terminal = Some(result),
-                        StreamEvent::Notification(notification) => {
-                            if reset_idle_on_progress && notification.is_progress() {
-                                idle.progress(cx.now());
-                            }
-                            let observed = catch_unwind(AssertUnwindSafe(|| observer(&notification)));
-                            // Same-poll cancellation/revocation wins over a ready
-                            // observer, its decline, or its captured panic.
+                        if terminal.is_some() {
+                            decoder.admit_terminal_tail(frame.as_bytes())?;
                             check(idle)?;
-                            match observed {
-                                Ok(true) => {}
-                                Ok(false) => return Err(DpopStreamError::ObserverStopped),
-                                Err(_) => return Err(DpopStreamError::ObserverPanicked),
+                            return Ok(());
+                        }
+                        let event = decoder.admit(frame.as_bytes(), true)?;
+                        // Decoder work cannot revive a deadline it exhausted.
+                        check(idle)?;
+                        match event {
+                            StreamEvent::Result(result) => *terminal = Some(result),
+                            StreamEvent::Notification(notification) => {
+                                if reset_idle_on_progress && notification.is_progress() {
+                                    idle.progress(cx.now());
+                                }
+                                let observed = catch_unwind(AssertUnwindSafe(|| observer(&notification)));
+                                // Same-poll cancellation/revocation wins over a
+                                // ready observer, its decline or captured panic.
+                                check(idle)?;
+                                match observed {
+                                    Ok(true) => {}
+                                    Ok(false) => return Err(DpopStreamError::ObserverStopped),
+                                    Err(_) => return Err(DpopStreamError::ObserverPanicked),
+                                }
                             }
                         }
+                        Ok(())
+                    })();
+                    accepted.map_err(Some)?;
+                    if terminal.is_some() && decoder.completes_on_terminal() {
+                        return Err(None);
                     }
                     Ok(())
-                }).map_err(|error| match error {
-                    SsePushError::Parse(_) => ManagedCoreError::InvalidResponse.into(),
-                    SsePushError::Consumer(error) => error,
-                })?;
+                });
+                match pushed {
+                    Ok(_) | Err(SsePushError::Consumer(None)) => {}
+                    Err(SsePushError::Parse(_)) => return Err(ManagedCoreError::InvalidResponse.into()),
+                    Err(SsePushError::Consumer(Some(error))) => return Err(error),
+                }
             }
         }
         check(idle)?;
-        if exceeded {
+        if exceeded && !self.complete() {
             return Err(DpopHttpError::BodyTooLarge.into());
         }
         Ok(())
+    }
+
+    fn complete(&self) -> bool {
+        self.terminal.is_some() && self.decoder.completes_on_terminal()
     }
 
     fn finish(self, lifetime: &Lifetime<'_>, idle: &Idle) -> Result<CompletedStream<D::Terminal>, DpopStreamError> {
@@ -555,19 +574,23 @@ where
         C: FnMut(&Idle) -> Result<(), DpopHttpError>,
     {
         check(idle)?;
-        let result = match self.body {
-            WireBody::Json(bytes) => match self.decoder.admit(&bytes, false)? {
-                StreamEvent::Result(result) => result,
-                StreamEvent::Notification(_) => {
-                    return Err(ManagedCoreError::UnexpectedNotification.into());
+        let result = if self.complete() {
+            self.terminal.take().ok_or(ManagedCoreError::MissingTerminal)?
+        } else {
+            match self.body {
+                WireBody::Json(bytes) => match self.decoder.admit(&bytes, false)? {
+                    StreamEvent::Result(result) => result,
+                    StreamEvent::Notification(_) => {
+                        return Err(ManagedCoreError::UnexpectedNotification.into());
+                    }
+                },
+                WireBody::Sse(parser) => {
+                    let end = parser.finish().map_err(|_| ManagedCoreError::InvalidResponse)?;
+                    if end.discarded_pending_event || end.discarded_partial_line {
+                        return Err(ManagedCoreError::InvalidResponse.into());
+                    }
+                    self.terminal.ok_or(ManagedCoreError::MissingTerminal)?
                 }
-            },
-            WireBody::Sse(parser) => {
-                let end = parser.finish().map_err(|_| ManagedCoreError::InvalidResponse)?;
-                if end.discarded_pending_event || end.discarded_partial_line {
-                    return Err(ManagedCoreError::InvalidResponse.into());
-                }
-                self.terminal.ok_or(ManagedCoreError::MissingTerminal)?
             }
         };
         check(idle)?;
@@ -623,6 +646,9 @@ where
             with_caller(lifetime.cx, || {
                 reader.push(&bytes[..consumed], lifetime, &mut idle, observer)
             })?;
+            if reader.complete() {
+                return with_caller(lifetime.cx, || reader.finish(lifetime, &idle));
+            }
             data.advance(consumed);
             bytes_left -= consumed;
         }

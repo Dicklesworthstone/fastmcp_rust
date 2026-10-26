@@ -6,7 +6,7 @@ use fastmcp_protocol::{
 };
 
 use super::super::{DpopStreamError, ManagedCoreError, ManagedCoreLimits, StreamDecoder, StreamEvent};
-use super::super::subscription_end::{SubscriptionEnd, admit_cancelled};
+use super::super::subscription_end::admit_cancelled;
 use crate::http_auth::rpc::ManagedCoreEvent;
 use crate::http_auth::rpc::subscription::SubscriptionDecoder;
 
@@ -19,14 +19,13 @@ pub(super) struct TerminalDecoder {
     acknowledged: bool,
     terminal: bool,
     control_bytes: usize,
-    end: SubscriptionEnd,
 }
 
 impl TerminalDecoder {
     pub(super) fn new(inner: SubscriptionDecoder, id: RequestId, limits: ManagedCoreLimits) -> Self {
         Self {
             inner, id, limits, acknowledged: false, terminal: false,
-            control_bytes: 0, end: SubscriptionEnd::default(),
+            control_bytes: 0,
         }
     }
 
@@ -44,6 +43,8 @@ impl TerminalDecoder {
 impl StreamDecoder for TerminalDecoder {
     type Terminal = Terminal;
 
+    fn completes_on_terminal(&self) -> bool { true }
+
     fn admit(&mut self, frame: &[u8], allow_notification: bool)
         -> Result<StreamEvent<Terminal>, DpopStreamError>
     {
@@ -59,7 +60,6 @@ impl StreamDecoder for TerminalDecoder {
             admit_cancelled(frame, &self.id, maximum)?;
             self.control_bytes += frame.len();
             self.terminal = true;
-            self.end.cancel();
             return Ok(StreamEvent::Result(Err(DpopStreamError::SubscriptionCancelled)));
         }
         // All ACK subset, URI, metadata, category, exact result and notification
@@ -73,18 +73,9 @@ impl StreamDecoder for TerminalDecoder {
             }
             ManagedCoreEvent::Result(result) => {
                 self.terminal = true;
-                self.end.complete();
                 Ok(StreamEvent::Result(Ok(*result)))
             }
         }
-    }
-
-    fn admit_terminal_tail(&mut self, frame: &[u8]) -> Result<(), DpopStreamError> {
-        if !self.terminal { return Err(ManagedCoreError::InvalidResponse.into()); }
-        let maximum = self.maximum(frame)?;
-        self.end.admit_tail(frame, &self.id, maximum)?;
-        self.control_bytes += frame.len();
-        Ok(())
     }
 
     fn usage(&self) -> (usize, usize) {

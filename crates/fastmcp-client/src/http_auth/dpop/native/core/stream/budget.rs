@@ -113,6 +113,8 @@ where
     }
 
     fn usage(&self) -> (usize, usize) { self.inner.usage() }
+
+    fn completes_on_terminal(&self) -> bool { self.inner.completes_on_terminal() }
 }
 
 #[cfg(test)]

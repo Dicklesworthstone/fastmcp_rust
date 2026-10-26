@@ -271,7 +271,7 @@ fn reader(kind: ModernHttpResponseKind) -> Reader<TaskSubscriptionDecoder, DpopT
 }
 
 #[test]
-fn shared_reader_delivers_live_events_at_every_byte_split_and_waits_for_clean_eof() {
+fn shared_reader_delivers_live_events_at_every_byte_split_and_finishes_at_its_terminal() {
     fixture(|life| {
         let acknowledgement = event(&ack(json!(2), json!({"taskIds":["task-one"]})));
         let changed = event(&status(json!(2), "task-one"));
@@ -289,6 +289,7 @@ fn shared_reader_delivers_live_events_at_every_byte_split_and_waits_for_clean_eo
             assert_eq!(seen, [true, false]);
             assert_eq!(idle.deadline, initial_idle, "Task events are not progress");
             assert!(reader.terminal.is_some());
+            assert!(reader.complete());
             assert!(reader.finish(life, &idle).is_ok());
         }
         let mut reader = reader(ModernHttpResponseKind::Sse);
@@ -301,7 +302,7 @@ fn shared_reader_delivers_live_events_at_every_byte_split_and_waits_for_clean_eo
 }
 
 #[test]
-fn shared_reader_withholds_provisional_completion_after_bad_tail_or_premature_eof() {
+fn shared_reader_discards_post_terminal_data_but_refuses_premature_eof() {
     fixture(|life| {
         let acknowledgement = event(&ack(json!(2), json!({"taskIds":["task-one"]})));
         let complete = event(COMPLETE.as_bytes());
@@ -311,7 +312,8 @@ fn shared_reader_withholds_provisional_completion_after_bad_tail_or_premature_eo
             reader.push(&acknowledgement, life, &mut idle, &mut |_| true).unwrap();
             reader.push(&complete, life, &mut idle, &mut |_| true).unwrap();
             let pushed = reader.push(&tail, life, &mut idle, &mut |_| panic!("post-terminal event escaped"));
-            assert!(pushed.is_err() || reader.finish(life, &idle).is_err());
+            pushed.unwrap();
+            assert!(reader.finish(life, &idle).is_ok());
         }
         let mut reader = reader(ModernHttpResponseKind::Sse);
         let mut idle = Idle::new(life.cx.now(), limits(8).idle);

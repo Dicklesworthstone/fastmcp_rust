@@ -430,7 +430,7 @@ fn resolver_panics_are_redacted_and_constructor_revocation_prevents_first_future
 }
 
 #[test]
-fn either_clean_peer_teardown_order_hands_final_input_back_without_a_new_update() {
+fn completion_hands_input_back_but_peer_cancellation_stops_without_an_update_or_get() {
     for order in 0..3 {
         run(async {
             let cx = Cx::current().unwrap();
@@ -450,7 +450,8 @@ fn either_clean_peer_teardown_order_hands_final_input_back_without_a_new_update(
                 event(&mut listen, &watch_ack("ending", true)).await;
                 peer.watch_snapshot_reply("ending", 1, "working").await;
                 let cancelled = serde_json::to_vec(&json!({"jsonrpc":"2.0", "method":"notifications/cancelled",
-                    "params":{"requestId":"ending.listen"}})).unwrap();
+                    "params":{"requestId":"ending.listen",
+                        "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:"ending.listen"}}})).unwrap();
                 let complete = watch_terminal("ending");
                 let mut tail = if order == 2 { event_chunk(&complete) } else { Vec::new() };
                 tail.extend_from_slice(&event_chunk(&cancelled));
@@ -460,12 +461,18 @@ fn either_clean_peer_teardown_order_hands_final_input_back_without_a_new_update(
                 let _ = listen.shutdown().await;
                 // There is unused snapshot/update capacity. Only the completed
                 // listen, not an exhausted budget, must prohibit automatic input.
-                get_reply(&mut peer, "ending", 2, &input_task(&["one"]), true).await;
+                if order == 2 {
+                    get_reply(&mut peer, "ending", 2, &input_task(&["one"]), true).await;
+                }
             };
             let (result, ()) = pair(application, server).await;
-            assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::InputRequired(_)));
+            if order == 2 {
+                assert!(matches!(result.unwrap(), DpopTaskWaitOutcome::InputRequired(_)));
+            } else {
+                assert!(matches!(result, Err(DpopTaskWatchError::Stream(DpopStreamError::SubscriptionCancelled))));
+            }
             assert_eq!(resolutions, 0);
-            peer.no_extra(4);
+            peer.no_extra(if order == 2 { 4 } else { 3 });
             assert!(cx.checkpoint().is_ok());
             assert!(!client.revocation_handle().is_revoked());
             followup(&mut peer, &mut client, &credential).await;
