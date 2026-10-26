@@ -87,8 +87,9 @@ use fastmcp_protocol::protocol_version::{
     admit_final_http_request,
 };
 use fastmcp_protocol::{
-    JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
-    JsonRpcResponseAdmission, RequestId, decode_strict_jsonrpc_response,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, JsonRpcAdmissionError,
+    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, JsonRpcResponseAdmission, RequestId,
+    decode_strict_jsonrpc_response,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -4220,8 +4221,8 @@ struct QueuedRequest {
 
 /// One JSON-RPC message emitted through a request-owned modern SSE body.
 ///
-/// A body may carry any number of server-to-client notifications and exactly
-/// one terminal response. Notifications retain the request body that owns
+/// A body may carry server-to-client notifications followed by one terminal
+/// response or subscription cancellation. Notifications retain the request body that owns
 /// their delivery, so independent modern requests cannot observe, consume, or
 /// cancel one another's outbound messages.
 #[derive(Debug, Clone)]
@@ -4238,6 +4239,7 @@ struct QueuedResponse {
     request_id: Option<RequestId>,
     message: StreamableHttpRequestResponseMessage,
     serialized_bytes: usize,
+    terminal: bool,
 }
 
 struct StreamableResponseMailbox {
@@ -4542,10 +4544,8 @@ impl StreamableHttpResponseStream {
     fn pop_request_message(
         &self,
         request_id: &RequestId,
-    ) -> Result<Option<StreamableHttpRequestResponseMessage>, TransportError> {
-        Ok(self
-            .pop_matching(|queued| queued.request_id.as_ref() == Some(request_id))?
-            .map(|queued| queued.message))
+    ) -> Result<Option<QueuedResponse>, TransportError> {
+        self.pop_matching(|queued| queued.request_id.as_ref() == Some(request_id))
     }
 
     fn pop_request_response(
@@ -4609,6 +4609,7 @@ impl StreamableHttpResponseStream {
         cx: &Cx,
         cancellation: &StreamableHttpRequestCancellation,
         message: StreamableHttpRequestResponseMessage,
+        terminal: bool,
     ) -> Result<(), TransportError> {
         if !self.owner_open.load(Ordering::Acquire) || !self.admissions_open.load(Ordering::Acquire)
         {
@@ -4657,6 +4658,7 @@ impl StreamableHttpResponseStream {
             request_id: Some(cancellation.request_id().clone()),
             message,
             serialized_bytes,
+            terminal,
         });
         mailbox.retained_bytes = prospective;
         self.pending_count.fetch_add(1, Ordering::Release);
@@ -4687,6 +4689,7 @@ impl StreamableHttpResponseStream {
                 cx,
                 cancellation,
                 StreamableHttpRequestResponseMessage::Response(response),
+                true,
             )
         })
     }
@@ -4715,6 +4718,7 @@ impl StreamableHttpResponseStream {
                 cx,
                 cancellation,
                 StreamableHttpRequestResponseMessage::Notification(notification),
+                false,
             )
         })
     }
@@ -4743,6 +4747,7 @@ impl StreamableHttpResponseStream {
                 cx,
                 cancellation,
                 StreamableHttpRequestResponseMessage::Request(request),
+                false,
             )
         })
     }
@@ -4977,7 +4982,7 @@ impl StreamableHttpRequestCancellation {
         self.state.cancelled.load(Ordering::Acquire)
     }
 
-    /// Returns whether a terminal response has already been committed.
+    /// Returns whether a terminal response or subscription cancellation has committed.
     #[must_use]
     pub fn is_terminal_committed(&self) -> bool {
         self.state.terminal_committed.load(Ordering::Acquire)
@@ -5026,7 +5031,7 @@ pub struct StreamableHttpRequestResponseStream {
 
 /// Cloneable producer for one request-owned Streamable HTTP response body.
 ///
-/// Producers can emit ordered notifications and the one terminal response
+/// Producers can emit ordered notifications and one terminal response or cancellation
 /// without owning the body itself. Once the body is dropped, the paired
 /// cancellation state rejects every later producer effect.
 #[derive(Clone)]
@@ -5055,8 +5060,12 @@ impl StreamableHttpRequestResponseStream {
             {
                 request_states.remove(&self.request_id);
             }
-            drop(request_states);
+            // Retirement and queued-output removal share the registry lock.
+            // Reusing the same ID must not let this old owner discard a new
+            // owner's output between registry removal and mailbox cleanup.
+            // Registration already takes these locks in this same order.
             self.responses.discard_request_messages(&self.request_id);
+            drop(request_states);
         }
     }
 
@@ -5095,7 +5104,9 @@ impl StreamableHttpRequestResponseStream {
     /// without blocking.
     ///
     /// Messages are emitted in commit order for this exact request. Receiving
-    /// the terminal response finishes the body; subsequent calls fail closed.
+    /// a committed terminal response or subscription cancellation finishes the
+    /// body; subsequent calls fail closed. The terminal bit belongs to the
+    /// admitted queue entry rather than being inferred from arbitrary payloads.
     pub fn pop_message(
         &self,
     ) -> Result<Option<StreamableHttpRequestResponseMessage>, TransportError> {
@@ -5107,13 +5118,10 @@ impl StreamableHttpRequestResponseStream {
         }
 
         let message = self.responses.pop_request_message(&self.request_id)?;
-        if matches!(
-            message,
-            Some(StreamableHttpRequestResponseMessage::Response(_))
-        ) {
+        if message.as_ref().is_some_and(|queued| queued.terminal) {
             self.finish();
         }
-        Ok(message)
+        Ok(message.map(|queued| queued.message))
     }
 
     /// Waits for the next notification or terminal response while observing
@@ -5186,6 +5194,59 @@ impl StreamableHttpRequestResponseSender {
     ) -> Result<(), TransportError> {
         self.responses
             .send_notification_for_request(cx, &self.cancellation, notification)
+    }
+
+    /// Commits this subscription's sole terminal cancellation notification.
+    ///
+    /// Both `params.requestId` and subscription metadata must identify this
+    /// response owner. Queue admission and the terminal election share the
+    /// response commit gate: backpressure leaves the request open for retry,
+    /// while success prevents every producer clone from appending more output.
+    /// Consuming the control releases this request's registry slot.
+    pub fn send_subscription_cancellation(
+        &self,
+        cx: &Cx,
+        notification: JsonRpcRequest,
+    ) -> Result<(), TransportError> {
+        let invalid_control = || {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "subscription cancellation must identify its exact HTTP response owner",
+            ))
+        };
+        if !notification.is_notification()
+            || notification.jsonrpc != fastmcp_protocol::JSONRPC_VERSION
+            || notification.method != "notifications/cancelled"
+        {
+            return Err(invalid_control());
+        }
+        let params: FinalCancelledNotificationParams = serde_json::from_value(
+            notification.params.clone().ok_or_else(invalid_control)?,
+        )
+        .map_err(|_| invalid_control())?;
+        let subscription_id = params
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|value| serde_json::from_value::<RequestId>(value.clone()).ok())
+            .ok_or_else(invalid_control)?;
+        if !params.request_id.correlates_with(self.cancellation.request_id())
+            || !subscription_id.correlates_with(self.cancellation.request_id())
+        {
+            return Err(invalid_control());
+        }
+        self.cancellation.checkpoint(cx)?;
+        if !self.responses.request_response_guard_is_active(&self.cancellation)? {
+            return Err(invalid_control());
+        }
+        self.cancellation.with_message_commit(cx, true, || {
+            self.responses.enqueue_request_message(
+                cx,
+                &self.cancellation,
+                StreamableHttpRequestResponseMessage::Notification(notification),
+                true,
+            )
+        })
     }
 
     /// Commits one reverse request before this body's terminal response.
@@ -5932,6 +5993,7 @@ impl StreamableHttpTransport {
             })?;
         mailbox.queue.push_back(QueuedResponse {
             request_id,
+            terminal: matches!(&message, StreamableHttpRequestResponseMessage::Response(_)),
             message,
             serialized_bytes,
         });
@@ -11028,6 +11090,230 @@ Content-Length: {}\r\n\
             .expect("the second body receives the response retained for its request ID");
         assert_eq!(other_response.id, Some(other_request_id));
         assert_eq!(response_stream.pending_responses(), 0);
+    }
+
+    fn subscription_cancellation(request_id: serde_json::Value, owner: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest::notification(
+            "notifications/cancelled",
+            Some(serde_json::json!({
+                "requestId": request_id,
+                "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: owner},
+            })),
+        )
+    }
+
+    #[test]
+    fn streamable_http_subscription_cancellation_is_one_terminal_for_its_owner() {
+        let mut transport = StreamableHttpTransport::new();
+        let responses = transport.response_stream().unwrap();
+        let first = responses.for_request(RequestId::Number(704)).unwrap();
+        let sibling = responses.for_request(RequestId::Number(705)).unwrap();
+        let sender = first.sender();
+        let clone = sender.clone();
+        let cancellation = first.cancellation();
+        let sibling_cancellation = sibling.cancellation();
+        let cx = Cx::for_testing();
+        sender.send_notification(
+            &cx,
+            JsonRpcRequest::notification(
+                "notifications/subscriptions/acknowledged",
+                Some(serde_json::json!({
+                    "notifications": {},
+                    "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: 704},
+                })),
+            ),
+        ).unwrap();
+        sender.send_subscription_cancellation(
+            &cx,
+            subscription_cancellation(
+                serde_json::from_str("704e0").unwrap(),
+                serde_json::from_str("704.0").unwrap(),
+            ),
+        ).unwrap();
+        assert!(cancellation.is_terminal_committed());
+        assert!(!cancellation.is_cancelled(), "the winning control remains drainable");
+        assert!(matches!(
+            clone.send_response(&cx, JsonRpcResponse::success(704_i64, serde_json::json!({}))),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            clone.send_subscription_cancellation(
+                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+            ),
+            Err(TransportError::Closed)
+        ));
+        assert!(matches!(
+            first.pop_message().unwrap(),
+            Some(StreamableHttpRequestResponseMessage::Notification(notification))
+                if notification.method == "notifications/subscriptions/acknowledged"
+        ));
+        assert!(!first.is_finished(), "the earlier ACK is not the terminal entry");
+        assert!(matches!(
+            first.pop_message().unwrap(),
+            Some(StreamableHttpRequestResponseMessage::Notification(notification))
+                if notification.method == "notifications/cancelled"
+        ));
+        assert!(first.is_finished());
+        assert!(cancellation.is_cancelled());
+        assert!(matches!(first.pop_message(), Err(TransportError::Closed)));
+        assert!(!sibling.is_finished());
+        assert!(!sibling_cancellation.is_cancelled());
+        assert!(!sibling_cancellation.is_terminal_committed());
+        sibling.sender().send_response(
+            &cx, JsonRpcResponse::success(705_i64, serde_json::json!({"sibling": true})),
+        ).unwrap();
+        assert!(sibling.pop_response().unwrap().is_some());
+        assert_eq!(responses.pending_responses(), 0);
+        let replacement = responses.for_request(RequestId::Number(704)).unwrap();
+        assert!(matches!(
+            clone.send_notification(&cx, JsonRpcRequest::notification("notifications/tools/list_changed", None)),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(replacement.pop_message().unwrap().is_none());
+        assert!(!replacement.cancellation().is_cancelled());
+    }
+
+    #[test]
+    fn streamable_http_subscription_cancellation_refuses_invalid_owners_without_mutation() {
+        for invalid in [
+            subscription_cancellation(serde_json::json!(705), serde_json::json!(704)),
+            subscription_cancellation(serde_json::json!(704), serde_json::json!(705)),
+            subscription_cancellation(serde_json::json!(705), serde_json::json!(705)),
+            subscription_cancellation(serde_json::json!("704"), serde_json::json!(704)),
+            subscription_cancellation(serde_json::json!(704), serde_json::json!("704")),
+            subscription_cancellation(serde_json::json!(704), serde_json::Value::Null),
+            JsonRpcRequest::notification("notifications/cancelled", Some(serde_json::json!({"requestId":704}))),
+            JsonRpcRequest::notification("notifications/cancelled", Some(serde_json::json!({
+                "requestId":704, "reason":null, "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:704},
+            }))),
+            JsonRpcRequest::new("notifications/cancelled", Some(serde_json::json!({
+                "requestId":704, "_meta":{FINAL_SUBSCRIPTION_ID_META_KEY:704},
+            })), 704_i64),
+        ] {
+            let mut transport = StreamableHttpTransport::new();
+            let responses = transport.response_stream().unwrap();
+            let body = responses.for_request(RequestId::Number(704)).unwrap();
+            let sender = body.sender();
+            let guard = body.cancellation();
+            let cx = Cx::for_testing();
+            assert!(matches!(
+                sender.send_subscription_cancellation(&cx, invalid),
+                Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidInput
+            ));
+            assert_eq!(responses.pending_responses(), 0);
+            assert_eq!(responses.mailbox.lock().unwrap().retained_bytes, 0);
+            assert!(!guard.is_terminal_committed());
+            assert!(!guard.is_cancelled());
+            assert!(!body.is_finished());
+            sender.send_subscription_cancellation(
+                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+            ).unwrap();
+            assert!(body.pop_message().unwrap().is_some());
+            assert!(body.is_finished());
+        }
+    }
+
+    #[test]
+    fn streamable_http_subscription_cancellation_backpressure_does_not_elect_a_terminal() {
+        let mut transport = StreamableHttpTransport::with_capacity(1).unwrap();
+        let responses = transport.response_stream().unwrap();
+        let body = responses.for_request(RequestId::Number(704)).unwrap();
+        let sender = body.sender();
+        let guard = body.cancellation();
+        let cx = Cx::for_testing();
+        sender.send_notification(
+            &cx, JsonRpcRequest::notification("notifications/tools/list_changed", None),
+        ).unwrap();
+        let retained = responses.mailbox.lock().unwrap().retained_bytes;
+        assert!(matches!(
+            sender.send_subscription_cancellation(
+                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+            ),
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(responses.pending_responses(), 1);
+        assert_eq!(responses.mailbox.lock().unwrap().retained_bytes, retained);
+        assert!(!guard.is_terminal_committed());
+        assert!(body.pop_message().unwrap().is_some());
+        assert!(!body.is_finished());
+        sender.send_subscription_cancellation(
+            &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+        ).unwrap();
+        assert!(body.pop_message().unwrap().is_some());
+        assert!(body.is_finished());
+        assert_eq!(responses.pending_responses(), 0);
+        assert_eq!(responses.mailbox.lock().unwrap().retained_bytes, 0);
+    }
+
+    #[test]
+    fn streamable_http_subscription_cancellation_after_peer_close_cannot_reach_reused_id() {
+        let mut transport = StreamableHttpTransport::new();
+        let responses = transport.response_stream().unwrap();
+        let body = responses.for_request(RequestId::Number(704)).unwrap();
+        let sender = body.sender();
+        drop(body);
+        let replacement = responses.for_request(RequestId::Number(704)).unwrap();
+        assert!(matches!(
+            sender.send_subscription_cancellation(
+                &Cx::for_testing(),
+                subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert!(replacement.pop_message().unwrap().is_none());
+        assert!(!replacement.is_finished());
+        assert!(!replacement.cancellation().is_terminal_committed());
+    }
+
+    #[test]
+    fn streamable_http_request_retirement_keeps_reuse_out_of_queued_output_cleanup() {
+        let mut transport = StreamableHttpTransport::new();
+        let responses = transport.response_stream().unwrap();
+        let body = responses.for_request(RequestId::Number(704)).unwrap();
+        let cancellation = body.cancellation();
+        let retained_sender = body.sender();
+        // Hold the mailbox at the retirement boundary, so ID reuse cannot
+        // race past the old body's queued-output cleanup.
+        let mailbox = responses.mailbox.lock().unwrap();
+        let retiring = std::thread::spawn(move || drop(body));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let serialized = loop {
+            if Instant::now() >= deadline {
+                break false;
+            }
+            if cancellation.is_cancelled() {
+                match responses.request_states.try_lock() {
+                    Err(TryLockError::WouldBlock) => break true,
+                    Ok(states) if !states.contains_key(&RequestId::Number(704)) => break false,
+                    Ok(_) => {}
+                    Err(TryLockError::Poisoned(_)) => break false,
+                }
+            }
+            std::thread::yield_now();
+        };
+        let reuse_while_cleaning = responses.for_request(RequestId::Number(704));
+        drop(mailbox);
+        retiring.join().unwrap();
+        assert!(serialized, "ID reuse must wait until old-owner cleanup is complete");
+        assert!(matches!(
+            reuse_while_cleaning,
+            Err(TransportError::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        let replacement = responses.for_request(RequestId::Number(704)).unwrap();
+        let cx = Cx::for_testing();
+        replacement.sender().send_response(
+            &cx, JsonRpcResponse::success(704_i64, serde_json::json!({"replacement": true})),
+        ).unwrap();
+        assert!(matches!(
+            retained_sender.send_subscription_cancellation(
+                &cx, subscription_cancellation(serde_json::json!(704), serde_json::json!(704)),
+            ),
+            Err(TransportError::Cancelled)
+        ));
+        assert_eq!(
+            replacement.pop_response().unwrap().unwrap().result,
+            Some(serde_json::json!({"replacement": true}))
+        );
     }
 
     #[test]
