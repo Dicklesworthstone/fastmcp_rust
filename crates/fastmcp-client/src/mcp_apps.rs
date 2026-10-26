@@ -640,6 +640,12 @@ impl std::error::Error for McpAppsHostError {
     }
 }
 
+impl From<McpError> for McpAppsHostError {
+    fn from(error: McpError) -> Self {
+        Self::Core(error)
+    }
+}
+
 /// Host side of the bounded in-memory carrier used by tests and native embeds.
 pub struct McpAppsInMemoryHostTransport {
     to_view: Sender<McpAppsHostToView>,
@@ -958,6 +964,24 @@ pub trait McpAppsWireHostPolicy {
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<Value, McpAppsHostError>;
+
+    /// Forwards with this View's own server-input consent policy.
+    ///
+    /// The ready HTTP and Unix stdio policies use this hook to finish bounded
+    /// core MRTR continuations before projecting a terminal Apps response.
+    /// Custom forwarding policies keep their existing dispatch behavior unless
+    /// they explicitly implement this composition seam.
+    async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: McpAppsRoutedMethod,
+        params: Option<Value>,
+        _effects: &mut E,
+    ) -> Result<Value, McpAppsHostError> {
+        self.dispatch_reused_request(cx, cancellation, method, params)
+            .await
+    }
 }
 
 /// Embedder effects for a Host that already owns its MCP forwarding policy.
@@ -1004,6 +1028,39 @@ pub trait McpAppsWireHostEffects {
         _cancellation: &McpRequestCancellation,
         _params: &McpAppsSamplingParams,
     ) -> Result<McpAppsSamplingResult, McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
+    /// Resolves one server-input round belonging to this View's admitted
+    /// `tools/call` or `resources/read` operation.
+    ///
+    /// The ready HTTP and Unix stdio forwarding policies call this only after
+    /// every embedded request has passed the capabilities actually advertised
+    /// by the MCP client. Configure those capabilities with
+    /// [`crate::ClientBuilder::capabilities`]. Advertising a capability grants
+    /// no consent: the default refuses every round, including state-only
+    /// continuations. Connection-wide reverse handlers are never invoked here.
+    ///
+    /// `params` is the original admitted Apps payload. The server's opaque
+    /// continuation state and embedded requests remain between this Host and
+    /// its MCP peer; neither is sent to the View. Apply this View's origin,
+    /// principal, context-disclosure and user-consent policy to the complete
+    /// batch before performing effects. Return exactly the requested keys and
+    /// response kinds, or an empty map for a state-only continuation. A result
+    /// authorizes disclosure to this operation's MCP peer only.
+    ///
+    /// All rounds share one absolute deadline, cancellation owner, four-round
+    /// limit, 128-response limit and 1 MiB encoded response budget. Work must
+    /// remain in this future: matching View cancellation drops it, and a late
+    /// result cannot authorize a retry. Task results are still unsupported.
+    async fn resolve_server_input(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _method: McpAppsRoutedMethod,
+        _params: &Value,
+        _input_required: &fastmcp_protocol::InputRequiredResult,
+    ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
         Err(wire_policy_denied())
     }
 
@@ -1180,7 +1237,29 @@ impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
         params: Option<Value>,
     ) -> Result<Value, McpAppsHostError> {
         self.forwarding
-            .dispatch_reused_request(cx, cancellation, method, params)
+            .dispatch_reused_request_with_effects(
+                cx,
+                cancellation,
+                method,
+                params,
+                &mut self.effects,
+            )
+            .await
+    }
+
+    async fn dispatch_reused_request_with_effects<E2: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: McpAppsRoutedMethod,
+        params: Option<Value>,
+        effects: &mut E2,
+    ) -> Result<Value, McpAppsHostError> {
+        // As with the other effect hooks, the outermost composition owns
+        // consent. An earlier wrapper must not answer for a replacement Host
+        // policy merely because both wrappers retain the same MCP client.
+        self.forwarding
+            .dispatch_reused_request_with_effects(cx, cancellation, method, params, effects)
             .await
     }
 }
@@ -3878,6 +3957,190 @@ pub(crate) fn project_reused_core_result(
     Ok(result)
 }
 
+// This adapter keeps the composition on the existing client request paths:
+// they own fresh IDs, exact selected-era decoding, and transport cleanup on
+// drop. The Host owns only its consent callback and one bounded MRTR operation.
+#[allow(async_fn_in_trait)]
+trait McpAppsServerInputClient {
+    fn prepare_apps_server_input(
+        &self,
+        cx: &Cx,
+        params: Value,
+    ) -> McpResult<(std::time::Instant, Value)>;
+
+    async fn request_apps_server_input(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        method: &str,
+        params: Value,
+    ) -> McpResult<CoreResult>;
+}
+
+#[cfg(unix)]
+impl McpAppsServerInputClient for crate::Client {
+    fn prepare_apps_server_input(
+        &self,
+        cx: &Cx,
+        params: Value,
+    ) -> McpResult<(std::time::Instant, Value)> {
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "MCP Apps reused methods require the current bilateral activation receipt",
+            ));
+        }
+        Ok((
+            crate::mrtr_operation_deadline(cx, self.timeout_policy)?,
+            self.prepare_request_parameters(params)?,
+        ))
+    }
+
+    async fn request_apps_server_input(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        method: &str,
+        params: Value,
+    ) -> McpResult<CoreResult> {
+        self.request_core_with_cx_until(cx, cancellation, method, params, Some(deadline))
+            .await
+    }
+}
+
+impl McpAppsServerInputClient for crate::HttpClient {
+    fn prepare_apps_server_input(
+        &self,
+        cx: &Cx,
+        params: Value,
+    ) -> McpResult<(std::time::Instant, Value)> {
+        if !self.mcp_apps_active() {
+            return Err(McpError::invalid_request(
+                "MCP Apps reused methods require the current bilateral activation receipt",
+            ));
+        }
+        Ok((
+            crate::mrtr_operation_deadline(cx, self.request_timeout_policy)?,
+            self.core_request_parameters(&params)
+                .map_err(|error| McpError::invalid_request(error.to_string()))?,
+        ))
+    }
+
+    async fn request_apps_server_input(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        _deadline: std::time::Instant,
+        method: &str,
+        params: Value,
+    ) -> McpResult<CoreResult> {
+        // The enclosing operation watchdog bounds every POST and callback.
+        // Dropping the existing HTTP execution owns its cancellation cleanup.
+        self.request_final_core_with_cancellation(cx, cancellation, method, params)
+            .await
+            .map_err(|error| McpError::invalid_request(error.to_string()))
+    }
+}
+
+async fn dispatch_apps_server_input<C: McpAppsServerInputClient, E: McpAppsWireHostEffects>(
+    client: &mut C,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    method: McpAppsRoutedMethod,
+    params: Option<Value>,
+    effects: &mut E,
+) -> Result<Value, McpAppsHostError> {
+    wire_policy_checkpoint(cx, cancellation)?;
+    let params = params.ok_or_else(|| McpError::invalid_params("Apps request needs parameters"))?;
+    let invalid = || McpError::invalid_params("Invalid Apps server-input request parameters");
+    let core_method = match method {
+        McpAppsRoutedMethod::ToolsCall => {
+            serde_json::from_value::<fastmcp_protocol::McpAppsToolCallParams>(params.clone())
+                .map_err(|_| invalid())?;
+            "tools/call"
+        }
+        McpAppsRoutedMethod::ResourcesRead => {
+            serde_json::from_value::<fastmcp_protocol::McpAppsResourceReadParams>(params.clone())
+                .map_err(|_| invalid())?;
+            "resources/read"
+        }
+        _ => return Err(invalid().into()),
+    };
+    let (deadline, original_parameters) = client.prepare_apps_server_input(cx, params.clone())?;
+    let capabilities =
+        original_parameters["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
+    let mut driver = crate::MrtrDriver::new(
+        cx,
+        deadline,
+        crate::MrtrDriverLimits::new(
+            crate::MAX_MRTR_CONTINUATION_ROUNDS,
+            crate::MAX_MRTR_TOTAL_INPUT_RESPONSES,
+        )?,
+    )?;
+    crate::wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
+        let mut parameters = original_parameters.clone();
+        let mut response_bytes = 0_usize;
+        loop {
+            driver.before_request()?;
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            let result = client
+                .request_apps_server_input(cx, cancellation, deadline, core_method, parameters)
+                .await?;
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            let Some(input_required) = crate::mrtr_input_required_for_method(core_method, &result)
+            else {
+                return project_reused_core_result(method, result).map_err(McpAppsHostError::Core);
+            };
+            driver.begin_continuation()?;
+            driver.admit_input_responses(
+                input_required
+                    .input_requests()
+                    .map_or(0, |requests| requests.members().len()),
+            )?;
+            // Admit the entire batch before any consent or model effect. This
+            // uses the same capability/sub-capability checks as core MRTR,
+            // without invoking a connection-wide callback for this View.
+            crate::ReverseRequestHandlers::admit_input_required(&capabilities, input_required)?;
+            let responses = effects
+                .resolve_server_input(cx, cancellation, method, &params, input_required)
+                .await?;
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            if input_required.input_requests().is_some() {
+                responses
+                    .validate_against_input_required(input_required)
+                    .map_err(|_| {
+                        McpError::invalid_params(
+                            "Apps server input responses do not match the admitted round",
+                        )
+                    })?;
+            } else if !responses.is_empty() {
+                return Err(McpError::invalid_params(
+                    "Apps state-only continuation cannot carry input responses",
+                )
+                .into());
+            }
+            let encoded = serde_json::to_vec(&responses)
+                .map_err(|_| McpError::invalid_params("Apps server input could not serialize"))?;
+            response_bytes = response_bytes.saturating_add(encoded.len());
+            if response_bytes > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES {
+                return Err(McpError::invalid_params(
+                    "Apps server input response byte budget exceeded",
+                )
+                .into());
+            }
+            let responses: crate::MrtrInputResponses = serde_json::from_slice(&encoded)
+                .map_err(|_| McpError::invalid_params("Invalid Apps server input responses"))?;
+            parameters = crate::mrtr_retry_parameters(
+                original_parameters.clone(),
+                input_required,
+                responses,
+            )?;
+        }
+    })
+    .await
+}
+
 /// Concrete policy that forwards only standard-reused View methods through a
 /// fresh selected-era core request on one live [`crate::Client`].
 pub struct McpAppsClientWirePolicy<'client> {
@@ -3918,6 +4181,26 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
             .await
             .map_err(McpAppsHostError::Core)
     }
+
+    #[cfg(unix)]
+    async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: McpAppsRoutedMethod,
+        params: Option<Value>,
+        effects: &mut E,
+    ) -> Result<Value, McpAppsHostError> {
+        if matches!(
+            method,
+            McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
+        ) {
+            dispatch_apps_server_input(self.client, cx, cancellation, method, params, effects).await
+        } else {
+            self.dispatch_reused_request(cx, cancellation, method, params)
+                .await
+        }
+    }
 }
 
 /// HTTP counterpart to [`McpAppsClientWirePolicy`]. Its forwarding path uses
@@ -3944,6 +4227,25 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
             .forward_mcp_apps_reused_core(cx, cancellation, method, params)
             .await
             .map_err(McpAppsHostError::Core)
+    }
+
+    async fn dispatch_reused_request_with_effects<E: McpAppsWireHostEffects>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: McpAppsRoutedMethod,
+        params: Option<Value>,
+        effects: &mut E,
+    ) -> Result<Value, McpAppsHostError> {
+        if matches!(
+            method,
+            McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
+        ) {
+            dispatch_apps_server_input(self.client, cx, cancellation, method, params, effects).await
+        } else {
+            self.dispatch_reused_request(cx, cancellation, method, params)
+                .await
+        }
     }
 }
 
@@ -4414,16 +4716,14 @@ mod tests {
                 let mut page = catalog_page(method, Some("never-exposed"));
                 match invalid {
                     "number" => {
-                        page["resources"][0]["_meta"] =
-                            json!({"unsafe":9_007_199_254_740_992_u64});
+                        page["resources"][0]["_meta"] = json!({"unsafe":9_007_199_254_740_992_u64});
                     }
                     "prompt-title" => {
                         page["prompts"][0]["arguments"] =
                             json!([{"name":"argument","title":"SDK would strip"}]);
                     }
                     "annotation" => {
-                        page["resources"][0]["annotations"] =
-                            json!({"example.com/custom":true});
+                        page["resources"][0]["annotations"] = json!({"example.com/custom":true});
                     }
                     _ => {
                         page["resources"][0]["annotations"] =
@@ -4750,6 +5050,594 @@ exec sleep 10
             public_catalog_pages(&cx, &mut host, &mut view).await;
         });
         server.join().unwrap();
+    }
+
+    fn server_input_required(state: &str) -> Value {
+        json!({
+            "resultType": "input_required", "requestState": state,
+            "inputRequests": {"sample": {"method": "sampling/createMessage", "params": {
+                "messages": [{"role": "user", "content": {"type": "text", "text": "Review this View's input"}}],
+                "maxTokens": 32
+            }}}
+        })
+    }
+
+    fn server_input_response() -> Value {
+        json!({"sample": {
+            "role": "assistant", "model": "host-approved-model",
+            "content": {"type": "text", "text": "host-approved answer"},
+            "stopReason": "endTurn"
+        }})
+    }
+
+    fn server_input_complete() -> Value {
+        json!({"resultType": "complete", "content": [{"type": "text", "text": "completed core operation"}]})
+    }
+
+    fn server_input_http_peer(
+        results: Vec<Value>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Value>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peer = std::thread::spawn(move || {
+            let discovery = json!({
+                "resultType":"complete", "supportedVersions":["2026-07-28"],
+                "capabilities":{"tools":{},"resources":{},"extensions":{"io.modelcontextprotocol/ui":{}}},
+                "ttlMs":0, "cacheScope":"private",
+                "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-server-input-peer","version":"1"}}
+            });
+            let mut requests = Vec::new();
+            for result in std::iter::once(discovery).chain(results) {
+                let accept_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < accept_deadline,
+                                "expected Apps core request was never sent"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("Apps test peer could not accept: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                let header_end = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0, "peer must receive a complete request");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                    assert!(bytes.len() < 64 * 1024);
+                };
+                let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                assert!(length < 2 * fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES);
+                while bytes.len() < header_end + length {
+                    let count = stream.read(&mut buffer).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let request: Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                assert_eq!(
+                    request["id"],
+                    requests.len() + 1,
+                    "every continuation needs a fresh core ID"
+                );
+                if requests.is_empty() {
+                    assert_eq!(request["method"], "server/discover");
+                }
+                let body = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                stream.flush().unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        (address, peer)
+    }
+
+    async fn server_input_http_client(cx: &Cx, address: std::net::SocketAddr) -> crate::HttpClient {
+        let plan = crate::ClientProtocolPlan::http(
+            fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            Some(crate::CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+            None,
+            None,
+            "credential".into(),
+            "security".into(),
+            "transport".into(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        crate::ClientBuilder::new()
+            .protocol_plan(plan)
+            .capabilities(fastmcp_protocol::ClientCapabilities {
+                sampling: Some(fastmcp_protocol::SamplingCapability::default()),
+                ..fastmcp_protocol::ClientCapabilities::default()
+            })
+            .mcp_apps(
+                fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.into(),
+                ])
+                .unwrap(),
+            )
+            .request_timeout_policy(
+                crate::RequestTimeoutPolicy::new(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_secs(5),
+                )
+                .unwrap(),
+            )
+            .connect_http_client_with_cx(cx)
+            .await
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum ServerInputDecision {
+        Respond,
+        Refuse,
+        Pending,
+        CancelBeforeReturn,
+    }
+
+    struct ServerInputDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ServerInputDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct ServerInputEffects {
+        decision: ServerInputDecision,
+        responses: fastmcp_protocol::FinalInputResponses,
+        calls: Arc<Mutex<Vec<Value>>>,
+        cancellation: Arc<Mutex<Option<McpRequestCancellation>>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ServerInputEffects {
+        fn new(response: Value, decision: ServerInputDecision) -> Self {
+            Self {
+                decision,
+                responses: serde_json::from_value(response).unwrap(),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                cancellation: Arc::new(Mutex::new(None)),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl McpAppsWireHostEffects for ServerInputEffects {
+        async fn resolve_server_input(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            method: McpAppsRoutedMethod,
+            params: &Value,
+            input_required: &fastmcp_protocol::InputRequiredResult,
+        ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
+            wire_policy_checkpoint(cx, cancellation)?;
+            assert!(matches!(
+                method,
+                McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
+            ));
+            self.calls.lock().unwrap().push(json!({
+                "params": params, "state": input_required.request_state()
+            }));
+            *self.cancellation.lock().unwrap() = Some(cancellation.clone());
+            let _drop = ServerInputDrop(Arc::clone(&self.dropped));
+            match self.decision {
+                ServerInputDecision::Respond => {}
+                ServerInputDecision::Refuse => return Err(wire_policy_denied()),
+                ServerInputDecision::Pending => std::future::pending::<()>().await,
+                ServerInputDecision::CancelBeforeReturn => {
+                    cancellation.cancel();
+                }
+            }
+            Ok(if input_required.input_requests().is_some() {
+                self.responses.clone()
+            } else {
+                fastmcp_protocol::FinalInputResponses::default()
+            })
+        }
+    }
+
+    #[test]
+    fn public_http_apps_server_input_completes_tool_and_resource_with_fresh_core_ids() {
+        let (address, peer) = server_input_http_peer(vec![
+            server_input_required("tool-state"),
+            server_input_complete(),
+            server_input_required("resource-state"),
+            json!({"resultType":"complete","contents":[{"uri":"test://private","text":"read completed"}]}),
+        ]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let effects = ServerInputEffects::new(server_input_response(), ServerInputDecision::Respond);
+            let calls = Arc::clone(&effects.calls);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let tool = stateful_wire_request(&mut host, &mut view, &cx, "view-tool", "tools/call", json!({
+                "name":"server_echo", "arguments":{"value":7}, "_meta":{"progressToken":"view-progress"}
+            })).await;
+            assert_eq!(tool["result"], json!({"content":[{"type":"text","text":"completed core operation"}]}));
+            let read = stateful_wire_request(&mut host, &mut view, &cx, "view-read", "resources/read", json!({"uri":"test://private"})).await;
+            assert_eq!(read["result"], json!({"contents":[{"uri":"test://private","text":"read completed"}]}));
+            assert_eq!(*calls.lock().unwrap(), vec![
+                json!({"params":{"name":"server_echo","arguments":{"value":7}},"state":"tool-state"}),
+                json!({"params":{"uri":"test://private"},"state":"resource-state"}),
+            ]);
+            // The next response is this independent request, proving both
+            // composed operations emitted exactly one terminal Apps response.
+            assert_eq!(stateful_wire_request(&mut host, &mut view, &cx, "alive", "ping", json!({})).await["result"], json!({}));
+        });
+        let requests = peer.join().unwrap();
+        for (initial, retry, state) in [
+            (&requests[1], &requests[2], "tool-state"),
+            (&requests[3], &requests[4], "resource-state"),
+        ] {
+            assert_eq!(initial["method"], retry["method"]);
+            assert_eq!(initial["params"]["_meta"], retry["params"]["_meta"]);
+            assert_eq!(retry["params"]["requestState"], state);
+            assert_eq!(retry["params"]["inputResponses"], server_input_response());
+            let mut retried = retry["params"].clone();
+            retried.as_object_mut().unwrap().remove("requestState");
+            retried.as_object_mut().unwrap().remove("inputResponses");
+            assert_eq!(
+                retried, initial["params"],
+                "retry preserves the admitted arguments and core metadata"
+            );
+            assert!(
+                !retry.to_string().contains("view-"),
+                "View IDs and progress must remain on the Apps carrier"
+            );
+        }
+    }
+
+    #[test]
+    fn public_http_apps_server_input_requires_host_consent_and_exact_round_responses() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (response, decision, unadvertised, expected_calls) in [
+                (json!({"other":server_input_response()["sample"]}), ServerInputDecision::Respond, false, 1),
+                (json!({"sample":{"roots":[]}}), ServerInputDecision::Respond, false, 1),
+                (json!({}), ServerInputDecision::Respond, false, 1),
+                (server_input_response(), ServerInputDecision::Refuse, false, 1),
+                (server_input_response(), ServerInputDecision::CancelBeforeReturn, false, 1),
+                (server_input_response(), ServerInputDecision::Respond, true, 0),
+            ] {
+                let cx = Cx::current().unwrap();
+                let mut input = server_input_required("private-state");
+                if unadvertised {
+                    input["inputRequests"]["unadvertised-roots"] = json!({"method":"roots/list"});
+                }
+                let (address, peer) = server_input_http_peer(vec![input, server_input_complete()]);
+                let mut client = server_input_http_client(&cx, address).await;
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let effects = ServerInputEffects::new(response, decision);
+                let calls = Arc::clone(&effects.calls);
+                let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let rejected = stateful_wire_request(&mut host, &mut view, &cx, "view-call", "tools/call", json!({"name":"needs-input"})).await;
+                assert_eq!(rejected, json!({"jsonrpc":"2.0","id":"view-call","error":{"code":-32_000,"message":"MCP Apps request rejected"}}));
+                assert_eq!(calls.lock().unwrap().len(), expected_calls);
+                let healthy = stateful_wire_request(&mut host, &mut view, &cx, "view-call", "tools/call", json!({"name":"healthy"})).await;
+                assert!(healthy.get("result").is_some(), "a rejected round must release its Apps correlation");
+                drop(host);
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[2]["params"]["name"], "healthy", "denial must not send a continuation");
+                assert!(requests[2]["params"].get("requestState").is_none());
+                assert!(requests[2]["params"].get("inputResponses").is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn public_http_apps_server_input_default_denies_even_after_other_effect_composition() {
+        let (address, peer) = server_input_http_peer(vec![
+            server_input_required("private-state"),
+            server_input_complete(),
+        ]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let earlier =
+                ServerInputEffects::new(server_input_response(), ServerInputDecision::Respond);
+            let earlier_calls = Arc::clone(&earlier.calls);
+            let mut host = client
+                .mcp_apps_wire_host(transport, wire_configuration())
+                .unwrap()
+                .with_effects(earlier)
+                .with_effects(());
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let rejected = stateful_wire_request(
+                &mut host,
+                &mut view,
+                &cx,
+                "view-call",
+                "tools/call",
+                json!({"name":"needs-input"}),
+            )
+            .await;
+            assert!(rejected.get("error").is_some());
+            assert!(
+                earlier_calls.lock().unwrap().is_empty(),
+                "replaced effects cannot supply another Host's consent"
+            );
+            assert!(
+                stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "healthy",
+                    "tools/call",
+                    json!({"name":"healthy"})
+                )
+                .await
+                .get("result")
+                .is_some()
+            );
+        });
+        let requests = peer.join().unwrap();
+        assert_eq!(requests[2]["params"]["name"], "healthy");
+    }
+
+    #[test]
+    fn public_http_apps_server_input_bounds_rounds_and_cumulative_response_bytes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for byte_limit in [false, true] {
+                let cx = Cx::current().unwrap();
+                let rounds = if byte_limit {
+                    2
+                } else {
+                    crate::MAX_MRTR_CONTINUATION_ROUNDS + 1
+                };
+                let mut results: Vec<Value> = (0..rounds)
+                    .map(|round| server_input_required(&format!("round-{round}")))
+                    .collect();
+                results.push(server_input_complete());
+                let (address, peer) = server_input_http_peer(results);
+                let mut client = server_input_http_client(&cx, address).await;
+                let mut response = server_input_response();
+                if byte_limit {
+                    response["sample"]["content"]["text"] = json!("x".repeat(600 * 1024));
+                }
+                let effects = ServerInputEffects::new(response, ServerInputDecision::Respond);
+                let calls = Arc::clone(&effects.calls);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let rejected = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "bounded",
+                    "tools/call",
+                    json!({"name":"needs-input","arguments":{"value":7}}),
+                )
+                .await;
+                assert!(rejected.get("error").is_some());
+                assert_eq!(
+                    calls.lock().unwrap().len(),
+                    if byte_limit {
+                        2
+                    } else {
+                        crate::MAX_MRTR_CONTINUATION_ROUNDS
+                    }
+                );
+                assert!(
+                    stateful_wire_request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "healthy",
+                        "tools/call",
+                        json!({"name":"healthy"})
+                    )
+                    .await
+                    .get("result")
+                    .is_some()
+                );
+                drop(host);
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), rounds + 2);
+                assert_eq!(requests.last().unwrap()["params"]["name"], "healthy");
+                for (index, request) in requests.iter().enumerate().take(rounds + 1).skip(2) {
+                    assert_eq!(
+                        request["params"]["requestState"],
+                        format!("round-{}", index - 2)
+                    );
+                    assert_eq!(request["params"]["arguments"], json!({"value":7}));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn public_http_apps_server_input_cancellation_drops_only_its_owner_and_never_retries() {
+        let (address, peer) = server_input_http_peer(vec![
+            server_input_required("cancelled-state"),
+            server_input_complete(),
+        ]);
+        let (sibling_address, sibling_peer) = server_input_http_peer(vec![
+            server_input_required("sibling-state"),
+            server_input_complete(),
+            server_input_complete(),
+        ]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let effects = ServerInputEffects::new(server_input_response(), ServerInputDecision::Pending);
+            let calls = Arc::clone(&effects.calls);
+            let dropped = Arc::clone(&effects.dropped);
+            let cancellation = Arc::clone(&effects.cancellation);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"same-view-id","method":"tools/call","params":{"name":"needs-input"}}).to_string()).await.unwrap();
+            let mut pending = Box::pin(host.process_next(&cx));
+            poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                if calls.lock().unwrap().is_empty() { Poll::Pending } else { Poll::Ready(()) }
+            }).await;
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            let mut sibling_client = server_input_http_client(&cx, sibling_address).await;
+            let (sibling_transport, mut sibling_view) = mcp_apps_in_memory_wire_pair(8);
+            let sibling_effects = ServerInputEffects::new(server_input_response(), ServerInputDecision::Respond);
+            let sibling_calls = Arc::clone(&sibling_effects.calls);
+            let mut sibling_host = sibling_client.mcp_apps_wire_host(sibling_transport, wire_configuration()).unwrap().with_effects(sibling_effects);
+            activate_stateful_wire_host(&mut sibling_host, &mut sibling_view, &cx, None).await;
+            assert!(stateful_wire_request(&mut sibling_host, &mut sibling_view, &cx, "same-view-id", "tools/call", json!({"name":"sibling-input"})).await.get("result").is_some());
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(!cancellation.lock().unwrap().as_ref().unwrap().is_cancel_requested());
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"same-view-id"}}).to_string()).await.unwrap();
+            pending.await.unwrap();
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(cancellation.lock().unwrap().as_ref().unwrap().is_cancel_requested());
+            // No cancelled terminal may precede this new response, and reuse
+            // of the same View ID must not inherit the abandoned core round.
+            let healthy = stateful_wire_request(&mut host, &mut view, &cx, "same-view-id", "tools/call", json!({"name":"healthy"})).await;
+            assert_eq!(healthy["result"], json!({"content":[{"type":"text","text":"completed core operation"}]}));
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            assert!(stateful_wire_request(&mut sibling_host, &mut sibling_view, &cx, "same-view-id", "tools/call", json!({"name":"sibling-healthy"})).await.get("result").is_some());
+            assert_eq!(sibling_calls.lock().unwrap().len(), 1);
+        });
+        let requests = peer.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["params"]["name"], "healthy");
+        assert!(requests[2]["params"].get("requestState").is_none());
+        let sibling_requests = sibling_peer.join().unwrap();
+        assert_eq!(sibling_requests.len(), 4);
+        assert_eq!(
+            sibling_requests[2]["params"]["requestState"],
+            "sibling-state"
+        );
+        assert_eq!(sibling_requests[3]["params"]["name"], "sibling-healthy");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_apps_server_input_completes_sampling_and_state_only_rounds() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let script = r#"
+IFS= read -r discovery || exit 91
+case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-mrtr-stdio","version":"1"}}}}'
+IFS= read -r first || exit 93
+case "$first" in *'"id":2'*) ;; *) exit 94 ;; esac
+case "$first" in *'"method":"tools/call"'*) ;; *) exit 94 ;; esac
+case "$first" in *'"arguments":{"value":7}'*) ;; *) exit 94 ;; esac
+case "$first" in *'"name":"server_echo"'*) ;; *) exit 94 ;; esac
+case "$first" in *requestState*|*inputResponses*|*view-tool*) exit 95 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","requestState":"stdio-sampling-state","inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
+IFS= read -r retry || exit 96
+case "$retry" in *'"id":3'*) ;; *) exit 97 ;; esac
+case "$retry" in *'"method":"tools/call"'*) ;; *) exit 97 ;; esac
+case "$retry" in *'"arguments":{"value":7}'*) ;; *) exit 97 ;; esac
+case "$retry" in *'"inputResponses":{"sample":'*) ;; *) exit 98 ;; esac
+case "$retry" in *'host-approved answer'*) ;; *) exit 98 ;; esac
+case "$retry" in *'"name":"server_echo"'*) ;; *) exit 98 ;; esac
+case "$retry" in *'"requestState":"stdio-sampling-state"'*) ;; *) exit 98 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"stdio completed"}]}}'
+IFS= read -r read || exit 99
+case "$read" in *'"id":4'*) ;; *) exit 100 ;; esac
+case "$read" in *'"method":"resources/read"'*) ;; *) exit 100 ;; esac
+case "$read" in *'"uri":"test://private"'*) ;; *) exit 100 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"input_required","requestState":"stdio-state-only"}}'
+IFS= read -r resumed || exit 101
+case "$resumed" in *'"id":5'*) ;; *) exit 102 ;; esac
+case "$resumed" in *'"method":"resources/read"'*) ;; *) exit 102 ;; esac
+case "$resumed" in *'"requestState":"stdio-state-only"'*) ;; *) exit 102 ;; esac
+case "$resumed" in *'"uri":"test://private"'*) ;; *) exit 102 ;; esac
+case "$resumed" in *inputResponses*|*stdio-sampling-state*|*view-read*) exit 103 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","contents":[{"uri":"test://private","text":"stdio read completed"}]}}'
+IFS= read -r ping || exit 104
+case "$ping" in *'"id":6'*) ;; *) exit 105 ;; esac
+case "$ping" in *'"method":"server/discover"'*) ;; *) exit 105 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{}}'
+exec sleep 10
+"#;
+            let mut client = crate::ClientBuilder::new()
+                .protocol_plan(crate::ClientProtocolPlan::stdio(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly))
+                .capabilities(fastmcp_protocol::ClientCapabilities {
+                    sampling: Some(fastmcp_protocol::SamplingCapability::default()),
+                    ..fastmcp_protocol::ClientCapabilities::default()
+                })
+                .mcp_apps(fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![
+                    fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.into(),
+                ]).unwrap())
+                .request_timeout_policy(crate::RequestTimeoutPolicy::new(
+                    std::time::Duration::from_secs(5), std::time::Duration::from_secs(5),
+                ).unwrap())
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script]).await.unwrap();
+            let effects = ServerInputEffects::new(server_input_response(), ServerInputDecision::Respond);
+            let calls = Arc::clone(&effects.calls);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let tool = stateful_wire_request(&mut host, &mut view, &cx, "view-tool", "tools/call", json!({"name":"server_echo","arguments":{"value":7}})).await;
+            assert_eq!(tool["result"]["content"][0]["text"], "stdio completed");
+            let read = stateful_wire_request(&mut host, &mut view, &cx, "view-read", "resources/read", json!({"uri":"test://private"})).await;
+            assert_eq!(read["result"]["contents"][0]["text"], "stdio read completed");
+            assert_eq!(*calls.lock().unwrap(), vec![
+                json!({"params":{"name":"server_echo","arguments":{"value":7}},"state":"stdio-sampling-state"}),
+                json!({"params":{"uri":"test://private"},"state":"stdio-state-only"}),
+            ]);
+            assert_eq!(stateful_wire_request(&mut host, &mut view, &cx, "alive", "ping", json!({})).await["result"], json!({}));
+            drop(host);
+            client.ping_with_cx(&cx, &McpRequestCancellation::default()).await.unwrap();
+            client.close_with_cx(&cx).await.unwrap();
+        });
     }
 
     struct ComposedEffects {
@@ -7299,7 +8187,8 @@ exec sleep 10
                 let cx = Cx::for_testing();
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
                 let mut configuration = wire_configuration();
-                configuration.host_capabilities.sampling = Some(McpAppsSamplingCapability::default());
+                configuration.host_capabilities.sampling =
+                    Some(McpAppsSamplingCapability::default());
                 let mut effects = sampling_effects();
                 effects.allow = allow;
                 let events = Arc::clone(&effects.events);
@@ -7616,7 +8505,8 @@ exec sleep 10
                 let cx = Cx::current().unwrap();
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                 let mut configuration = wire_configuration();
-                configuration.host_capabilities.sampling = Some(McpAppsSamplingCapability::default());
+                configuration.host_capabilities.sampling =
+                    Some(McpAppsSamplingCapability::default());
                 let mut effects = sampling_effects();
                 effects.yield_once = true;
                 let events = Arc::clone(&effects.events);
