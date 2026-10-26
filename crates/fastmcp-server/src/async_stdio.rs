@@ -169,11 +169,64 @@ impl ConnectionBinding {
 struct OutputOwner {
     reservation: ModernDispatchReservation,
     log_level: Option<LoggingLevel>,
+    subscription_terminal: Option<Arc<FinalSubscriptionTerminalDelivery>>,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy: Option<Mutex<LegacyOutputState>>,
 }
 
 impl OutputOwner {
+    fn subscription_drain_delivery(
+        &self,
+        message: &JsonRpcMessage,
+    ) -> Option<&FinalSubscriptionTerminalDelivery> {
+        let delivery = self.subscription_terminal.as_deref()?;
+        let JsonRpcMessage::Request(notification) = message else {
+            return None;
+        };
+        if notification.method == "notifications/cancelled" {
+            return self.subscription_cancellation_delivery(message);
+        }
+        if notification.id.is_some() {
+            return None;
+        }
+        let subscription_id = notification
+            .params
+            .as_ref()?
+            .get("_meta")?
+            .get(FINAL_SUBSCRIPTION_ID_META_KEY)
+            .cloned()
+            .and_then(|id| serde_json::from_value::<RequestId>(id).ok())?;
+        self.reservation
+            .request_id
+            .as_ref()
+            .is_some_and(|expected| expected.correlates_with(&subscription_id))
+            .then_some(delivery)
+    }
+
+    fn subscription_cancellation_delivery(
+        &self,
+        message: &JsonRpcMessage,
+    ) -> Option<&FinalSubscriptionTerminalDelivery> {
+        let delivery = self.subscription_terminal.as_deref()?;
+        let JsonRpcMessage::Request(notification) = message else {
+            return None;
+        };
+        if !final_subscription_terminal_notification(notification) {
+            return None;
+        }
+        let request_id = notification
+            .params
+            .as_ref()?
+            .get("requestId")
+            .cloned()
+            .and_then(|id| serde_json::from_value::<RequestId>(id).ok())?;
+        self.reservation
+            .request_id
+            .as_ref()
+            .is_some_and(|expected| expected.correlates_with(&request_id))
+            .then_some(delivery)
+    }
+
     fn cancelled(&self) -> bool {
         #[cfg(feature = "legacy-2024-11-05")]
         if self.legacy.is_some() {
@@ -187,6 +240,19 @@ impl OutputOwner {
     }
 
     fn suppresses_message(&self, message: &JsonRpcMessage) -> bool {
+        if self.subscription_terminal.as_ref().is_some_and(|delivery| delivery.is_settled()) {
+            return true;
+        }
+        if let Some(delivery) = self.subscription_drain_delivery(message)
+            && delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+        {
+            // Server shutdown withdraws ordinary output but must retain the
+            // elected control and its already-queued acknowledgement/events
+            // in FIFO order. A peer winner, failed delivery or post-terminal
+            // frame never gains that authority.
+            return self.reservation.cancellation.is_peer_cancel_requested()
+                || delivery.state.load(Ordering::Acquire) != FINAL_TERMINAL_ENQUEUED;
+        }
         if self.cancelled() {
             return true;
         }
@@ -231,6 +297,46 @@ struct OutputFrame {
     message: JsonRpcMessage,
     owner: Option<Arc<OutputOwner>>,
     bytes: usize,
+    subscription_control: bool,
+}
+
+impl OutputFrame {
+    fn terminal_delivery(&self) -> Option<&FinalSubscriptionTerminalDelivery> {
+        self.subscription_control.then_some(())?;
+        self.owner.as_ref()?.subscription_cancellation_delivery(&self.message)
+    }
+
+    fn drain_delivery(&self) -> Option<&FinalSubscriptionTerminalDelivery> {
+        if matches!(&self.message, JsonRpcMessage::Request(notification)
+            if notification.method == "notifications/cancelled")
+            && !self.subscription_control
+        {
+            return None;
+        }
+        self.owner.as_ref()?.subscription_drain_delivery(&self.message)
+    }
+
+    fn suppressed(&self) -> bool {
+        self.owner.as_ref().is_some_and(|owner| {
+            owner.suppresses_message(&self.message)
+                || (!self.subscription_control
+                    && owner.subscription_cancellation_delivery(&self.message)
+                        .is_some_and(|delivery| {
+                            delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+                        }))
+        })
+    }
+}
+
+impl Drop for OutputFrame {
+    fn drop(&mut self) {
+        // Discard, queue stop and an abandoned writer all relinquish the
+        // exact queued control. A successful flush already marked it drained;
+        // generic cancellation-shaped frames carry no settlement authority.
+        if let Some(delivery) = self.terminal_delivery() {
+            delivery.mark_failed();
+        }
+    }
 }
 
 /// Count encoded bytes without allocating another maximum-sized payload.
@@ -264,6 +370,7 @@ struct OutputState {
     candidates: HashMap<u64, Weak<OutputOwner>>,
     failure: Option<&'static str>,
     stopped: bool,
+    subscription_drain_deadline: Option<asupersync::Time>,
 }
 
 #[derive(Default)]
@@ -273,6 +380,31 @@ struct OutputQueue {
 }
 
 impl OutputQueue {
+    fn begin_subscription_drain(&self, deadline: asupersync::Time) {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.subscription_drain_deadline = Some(
+            state.subscription_drain_deadline.map_or(deadline, |old| old.min(deadline)),
+        );
+    }
+
+    fn write_deadline(&self, frame_deadline: asupersync::Time) -> asupersync::Time {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .subscription_drain_deadline.map_or(frame_deadline, |drain| drain.min(frame_deadline))
+    }
+
+    fn has_subscription_drain(&self) -> bool {
+        let candidates = {
+            let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.candidates.values().cloned().collect::<Vec<_>>()
+        };
+        candidates.iter().filter_map(Weak::upgrade).any(|owner| {
+            owner.subscription_terminal.as_ref().is_some_and(|delivery| {
+                delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+                    && delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+            })
+        })
+    }
+
     fn register(&self, owner: &Arc<OutputOwner>) {
         let mut state = self
             .state
@@ -287,6 +419,25 @@ impl OutputQueue {
     }
 
     fn enqueue(&self, message: JsonRpcMessage, owner: Option<Arc<OutputOwner>>) -> bool {
+        self.enqueue_frame(message, owner, false)
+    }
+
+    fn enqueue_subscription_control(&self, message: JsonRpcMessage, owner: Arc<OutputOwner>) -> bool {
+        if owner.subscription_cancellation_delivery(&message).is_none_or(|delivery| {
+            delivery.state.load(Ordering::Acquire) != FINAL_TERMINAL_ENQUEUED
+                || delivery.completion_state.load(Ordering::Acquire) != FINAL_TERMINAL_DRAINED
+        }) {
+            return false;
+        }
+        self.enqueue_frame(message, Some(owner), true)
+    }
+
+    fn enqueue_frame(
+        &self,
+        message: JsonRpcMessage,
+        owner: Option<Arc<OutputOwner>>,
+        subscription_control: bool,
+    ) -> bool {
         if owner
             .as_ref()
             .is_some_and(|owner| owner.suppresses_message(&message))
@@ -323,6 +474,7 @@ impl OutputQueue {
                 message,
                 owner,
                 bytes,
+                subscription_control,
             });
             true
         } else {
@@ -386,10 +538,7 @@ impl OutputQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         !state.stopped
             && state.failure.is_none()
-            && !frame
-                .owner
-                .as_ref()
-                .is_some_and(|owner| owner.suppresses_message(&frame.message))
+            && !frame.suppressed()
             && Self::log_has_owner(&state, &frame.message, frame.owner.as_ref())
     }
 
@@ -479,6 +628,18 @@ impl OutputQueue {
     /// writer alone decides whether suppression is safe or partial output
     /// requires terminating the connection.
     fn discard_cancelled(&self) -> usize {
+        self.discard_frames(|frame| {
+            frame.suppressed()
+        })
+    }
+
+    fn retain_subscription_drain(&self) {
+        self.discard_frames(|frame| {
+            frame.drain_delivery().is_none() || frame.suppressed()
+        });
+    }
+
+    fn discard_frames(&self, discard: impl Fn(&OutputFrame) -> bool) -> usize {
         let discarded = {
             let mut state = self
                 .state
@@ -490,11 +651,7 @@ impl OutputQueue {
             // additional storage is a bounded list of frames being retired.
             for _ in 0..state.frames.len() {
                 let frame = state.frames.pop_front().expect("counted queued frame");
-                if frame
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.suppresses_message(&frame.message))
-                {
+                if discard(&frame) {
                     state.retained_frames = state.retained_frames.saturating_sub(1);
                     state.retained_bytes = state.retained_bytes.saturating_sub(frame.bytes);
                     discarded.push(frame);
@@ -582,7 +739,9 @@ async fn send_frame<W: ConnectionWriter>(
     writer: &mut W,
     cx: &Cx,
     frame: &OutputFrame,
+    output: &OutputQueue,
     mut timeout: Pin<&mut Sleep>,
+    write_deadline: asupersync::Time,
     #[cfg(feature = "legacy-2024-11-05")] observe_legacy_deadline: bool,
 ) -> WriteAttempt {
     let mut sending = pin!(writer.send(cx, &frame.message));
@@ -605,11 +764,14 @@ async fn send_frame<W: ConnectionWriter>(
         .flatten()
         .map(|deadline| Box::pin(Sleep::new(deadline)));
     poll_fn(|task| {
-        if frame
-            .owner
-            .as_ref()
-            .is_some_and(|owner| owner.suppresses_message(&frame.message))
-        {
+        let terminal_control = frame.drain_delivery().is_some_and(|delivery| {
+                delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+                    && delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+        });
+        if frame.suppressed() {
+            if let Some(delivery) = frame.terminal_delivery() {
+                delivery.mark_failed();
+            }
             return Poll::Ready(WriteAttempt::Complete(Ok(())));
         }
         if cancelled
@@ -620,11 +782,10 @@ async fn send_frame<W: ConnectionWriter>(
             // Consume this wake once instead of rearming an already-ready
             // cancellation future on every subsequent writer poll.
             cancelled = None;
-            if frame
-                .owner
-                .as_ref()
-                .is_some_and(|owner| owner.suppresses_message(&frame.message))
-            {
+            if frame.suppressed() {
+                if let Some(delivery) = frame.terminal_delivery() {
+                    delivery.mark_failed();
+                }
                 return Poll::Ready(WriteAttempt::Complete(Ok(())));
             }
         }
@@ -642,10 +803,35 @@ async fn send_frame<W: ConnectionWriter>(
         }
         // Keep this absolute timeout across a timeout-response replacement;
         // starting another send must never extend the connection's drain.
-        if timeout.as_mut().poll(task).is_ready() {
+        let timed_out = if terminal_control {
+            cx.masked(|| timeout.as_mut().poll(task)).is_ready()
+        } else {
+            timeout.as_mut().poll(task).is_ready()
+        };
+        if timed_out || cx.now() >= output.write_deadline(write_deadline) {
             return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Timeout)));
         }
-        sending.as_mut().poll(task).map(WriteAttempt::Complete)
+        if terminal_control {
+            // Retain the caller's absolute ceiling even while masking its
+            // cancellation for this elected, bounded terminal write only.
+            if cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline) {
+                return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Timeout)));
+            }
+            let sent = cx.masked(|| sending.as_mut().poll(task));
+            if sent.is_ready() {
+                if cx.now() >= output.write_deadline(write_deadline)
+                    || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+                {
+                    return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Timeout)));
+                }
+                if frame.suppressed() {
+                    return Poll::Ready(WriteAttempt::Complete(Err(TransportError::Cancelled)));
+                }
+            }
+            sent.map(WriteAttempt::Complete)
+        } else {
+            sending.as_mut().poll(task).map(WriteAttempt::Complete)
+        }
     })
     .await
 }
@@ -660,17 +846,22 @@ fn write<W: ConnectionWriter>(
         #[cfg(feature = "legacy-2024-11-05")]
         let mut frame = frame;
         if !output.admits_write(&frame) {
+            if let Some(delivery) = frame.terminal_delivery() {
+                delivery.mark_failed();
+            }
             return (writer, Ok(()), frame.bytes);
         }
-        let mut timeout = pin!(asupersync::time::sleep(
-            cx.now(),
-            STDIO_OUTPUT_COMMIT_TIMEOUT
-        ));
+        let write_deadline = cx.now().saturating_add_nanos(
+            u64::try_from(STDIO_OUTPUT_COMMIT_TIMEOUT.as_nanos()).unwrap_or(u64::MAX),
+        );
+        let mut timeout = pin!(Sleep::new(write_deadline));
         let attempt = send_frame(
             &mut writer,
             &cx,
             &frame,
+            &output,
             timeout.as_mut(),
+            write_deadline,
             #[cfg(feature = "legacy-2024-11-05")]
             true,
         )
@@ -689,7 +880,7 @@ fn write<W: ConnectionWriter>(
                         Ok(keep_response) => {
                             output.discard_cancelled();
                             if keep_response {
-                                match send_frame(&mut writer, &cx, &frame, timeout.as_mut(), false)
+                                match send_frame(&mut writer, &cx, &frame, &output, timeout.as_mut(), write_deadline, false)
                                     .await
                                 {
                                     WriteAttempt::Complete(result) => result,
@@ -713,6 +904,17 @@ fn write<W: ConnectionWriter>(
         } else {
             result
         };
+        if let Some(owner) = &frame.owner {
+            if result.is_err() {
+                if let Some(delivery) = &owner.subscription_terminal {
+                    delivery.mark_failed();
+                }
+            } else if let Some(delivery) = frame.terminal_delivery() {
+                // Queue admission is not delivery: only a fully flushed
+                // control settles the shutdown receipt.
+                delivery.mark_drained();
+            }
+        }
         if result.is_ok() && matches!(frame.message, JsonRpcMessage::Response(_)) {
             if let Some(owner) = &frame.owner {
                 let _ = owner.reservation.cancellation.begin_finalization();
@@ -833,6 +1035,8 @@ fn prepare_request(
     reservation.serialized_bytes += raw_bytes;
     let owner = Arc::new(OutputOwner {
         log_level: lifetime.server.final_request_log_level(&request),
+        subscription_terminal: (request.method == SUBSCRIPTIONS_LISTEN)
+            .then(|| Arc::new(FinalSubscriptionTerminalDelivery::default())),
         reservation,
         #[cfg(feature = "legacy-2024-11-05")]
         legacy: None,
@@ -889,11 +1093,23 @@ fn prepare_request(
         let dispatch_cancellation = McpRequestCancellation::new();
         let notification_output = Arc::clone(&output);
         let notification_owner = Arc::clone(&owner);
+        let notification_cancellation = dispatch_cancellation.clone();
         let notifications: NotificationSender = Arc::new(move |notification| {
-            notification_output.enqueue(
-                JsonRpcMessage::Request(notification),
-                Some(Arc::clone(&notification_owner)),
-            );
+            let message = JsonRpcMessage::Request(notification);
+            let scoped = notification_owner.subscription_drain_delivery(&message).is_some();
+            let terminal = notification_owner.subscription_cancellation_delivery(&message)
+                .is_some_and(|delivery| delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED);
+            let queued = if terminal {
+                notification_output.enqueue_subscription_control(message, Arc::clone(&notification_owner))
+            } else {
+                notification_output.enqueue(message, Some(Arc::clone(&notification_owner)))
+            };
+            if !queued && (scoped || notification_output.failure().is_some()) {
+                if let Some(delivery) = &notification_owner.subscription_terminal {
+                    delivery.mark_failed();
+                    notification_cancellation.cancel();
+                }
+            }
         });
         let response_id = request.id.clone();
         let mut interrupted = false;
@@ -912,7 +1128,7 @@ fn prepare_request(
                 None,
                 None,
                 dispatch_cancellation.clone(),
-                None,
+                owner.subscription_terminal.clone(),
                 notifications,
             ));
             let admitted = owner
@@ -1311,6 +1527,7 @@ impl LegacyIngress {
         let owner = Arc::new(OutputOwner {
             reservation,
             log_level: None,
+            subscription_terminal: None,
             legacy: Some(Mutex::new(LegacyOutputState {
                 budget: Some(budget),
                 active: None,
@@ -1759,6 +1976,12 @@ enum Event<R, W> {
     DrainExpired,
 }
 
+struct NativeSubscriptionShutdown {
+    receipt: FinalSubscriptionTerminationReceipt,
+    deadline: asupersync::Time,
+    admission_stopped: bool,
+}
+
 /// Rotate the first eligible work lane after every selected event. Merely
 /// alternating ingress-first and ingress-last leaves requests ahead of egress
 /// in both orders: a replenished set of ready handlers can then starve the
@@ -2149,11 +2372,13 @@ impl Server {
     /// deadline and output retention shares the dispatch count/byte ceilings.
     /// Saturation is a connection failure, never silent loss of a final frame.
     ///
-    /// Input EOF permits a five-second response drain, including graceful
-    /// subscription completion. At that bound, cancellation, or failure, all
-    /// remaining request regions are cancelled and closed before the shutdown
-    /// hook runs. A configured Task supervisor is ready before ingress starts
-    /// and is settled before that hook runs, including after transport failure
+    /// Input EOF permits a five-second response drain, including subscription
+    /// cancellation controls. Local cancellation preserves only the elected
+    /// subscription controls and their queued event prefixes, under the same
+    /// finite drain bound and the original caller deadline. At that bound or
+    /// on failure, remaining request regions are cancelled and closed before
+    /// the shutdown hook runs. A configured Task supervisor is ready before
+    /// ingress starts and is settled before that hook runs, including after transport failure
     /// or caller cancellation. Non-cooperative spawned children remain owned
     /// and awaited; this API never detaches them merely to report a timeout.
     /// Dropping this future closes I/O and transfers region cleanup to the
@@ -2406,16 +2631,36 @@ impl Server {
         // response drains: dropping native stdio's reader closes the shared
         // transport terminal and would otherwise suppress the queued error.
         let mut dormant_reader: Option<R> = None;
+        // A pending receive owns the live read half. Keep it without polling
+        // during local shutdown: dropping it would also close the writer
+        // before the elected subscription controls can flush.
+        let mut suspended_read: Option<ReadWork<R>> = None;
         let mut available_writer = Some(writer);
         let mut writing: Option<WriteWork<W>> = None;
         let mut requests: Vec<RequestWork> = Vec::new();
         let mut drain: Option<Pin<Box<Sleep>>> = None;
         let mut stopping = false;
+        let mut subscription_shutdown: Option<NativeSubscriptionShutdown> = None;
         let mut error = None;
         let mut request_regions_quiescent = true;
         let mut schedule = ConnectionSchedule::default();
         loop {
-            if !stopping && writing.is_none() && lifetime.output.has_frames() {
+            if let Some(shutdown) = &mut subscription_shutdown
+                && shutdown.receipt.elections_settled()
+            {
+                if !shutdown.admission_stopped {
+                    // The won callbacks must publish their outcome before
+                    // generic request cancellation can retire their leases.
+                    lifetime.admission.stop();
+                    shutdown.admission_stopped = true;
+                }
+                lifetime.output.retain_subscription_drain();
+            }
+            if !stopping
+                && subscription_shutdown.as_ref().is_none_or(|shutdown| shutdown.admission_stopped)
+                && writing.is_none()
+                && lifetime.output.has_frames()
+            {
                 if let Some(frame) = lifetime.output.pop() {
                     writing = Some(write(
                         available_writer.take().expect("one owned async writer"),
@@ -2430,6 +2675,7 @@ impl Server {
                 && writing.is_none()
                 && !lifetime.output.has_frames()
                 && (stopping || lifetime.output.failure().is_none())
+                && (stopping || subscription_shutdown.is_none())
             {
                 break;
             }
@@ -2445,11 +2691,13 @@ impl Server {
                             "Native connection output capacity exhausted",
                         ))));
                     }
-                    if cx.checkpoint().is_err() {
+                    if subscription_shutdown.is_none() && cx.checkpoint().is_err() {
                         return Poll::Ready(Event::Stop(None));
                     }
                     #[cfg(feature = "tasks")]
-                    if let Some(hosted_tasks) = hosted_tasks.as_ref() {
+                    if subscription_shutdown.is_none()
+                        && let Some(hosted_tasks) = hosted_tasks.as_ref()
+                    {
                         if let Err(failure) = hosted_tasks.check_running() {
                             return Poll::Ready(Event::Stop(Some(failure)));
                         }
@@ -2462,11 +2710,31 @@ impl Server {
                             return Poll::Ready(Event::TaskServiceCheck);
                         }
                     }
-                    if drain
-                        .as_mut()
-                        .is_some_and(|drain| drain.as_mut().poll(task).is_ready())
-                    {
+                    let drain_expired = if let Some(shutdown) = &subscription_shutdown {
+                        cx.now() >= shutdown.deadline
+                            || drain.as_mut().is_some_and(|drain| {
+                                cx.masked(|| drain.as_mut().poll(task)).is_ready()
+                            })
+                    } else {
+                        drain.as_mut().is_some_and(|drain| drain.as_mut().poll(task).is_ready())
+                    };
+                    if drain_expired {
                         return Poll::Ready(Event::DrainExpired);
+                    }
+                    if let Some(shutdown) = &subscription_shutdown {
+                        if !shutdown.admission_stopped {
+                            // A callback on another thread may still own the
+                            // exact election. Yield, bounded by the same drain
+                            // deadline, without polling request cancellation
+                            // or discarding its queued acknowledgement.
+                            return Poll::Ready(Event::Output);
+                        }
+                        if writing.is_none()
+                            && !lifetime.output.has_frames()
+                            && shutdown.receipt.is_settled()
+                        {
+                            return Poll::Ready(Event::Stop(None));
+                        }
                     }
                 }
                 if let Poll::Ready(event) =
@@ -2550,7 +2818,10 @@ impl Server {
                                 stop = true;
                             }
                         }
-                        Err(TransportError::Cancelled) => stop = true,
+                        Err(TransportError::Cancelled) => {
+                            dormant_reader = Some(reader);
+                            stop = true;
+                        }
                         Err(failure) => {
                             #[cfg(feature = "legacy-2024-11-05")]
                             let terminal_opening = protocol.needs_opening();
@@ -2642,6 +2913,38 @@ impl Server {
                 }
             }
             if stop && !stopping {
+                #[cfg(feature = "legacy-2024-11-05")]
+                let modern = matches!(protocol, NativeProtocol::Modern);
+                #[cfg(not(feature = "legacy-2024-11-05"))]
+                let modern = true;
+                if subscription_shutdown.is_none()
+                    && error.is_none()
+                    && modern
+                    && matches!(lifetime.binding.transport, InboundRequestTransport::Stdio)
+                    && cx.checkpoint().is_err()
+                {
+                    let maximum = cx.now().saturating_add_nanos(
+                        u64::try_from(DISPATCH_WORKER_SHUTDOWN_TIMEOUT.as_nanos())
+                            .unwrap_or(u64::MAX),
+                    );
+                    let deadline = cx.budget().deadline.map_or(maximum, |original| original.min(maximum));
+                    let receipt = server.final_subscriptions.terminate_with_receipt();
+                    if receipt.terminated != 0 || lifetime.output.has_subscription_drain() {
+                        lifetime.output.begin_subscription_drain(deadline);
+                        suspended_read = reading.take();
+                        drain = Some(Box::pin(Sleep::new(deadline)));
+                        subscription_shutdown = Some(NativeSubscriptionShutdown {
+                            receipt,
+                            deadline,
+                            admission_stopped: false,
+                        });
+                        asupersync::runtime::yield_now().await;
+                        continue;
+                    }
+                }
+                if let Some(shutdown) = &subscription_shutdown {
+                    shutdown.receipt.fail_pending();
+                }
                 stopping = true;
                 lifetime.admission.stop();
                 #[cfg(feature = "legacy-2024-11-05")]
@@ -2651,6 +2954,7 @@ impl Server {
                 reading = None;
                 writing = None;
                 available_writer = None;
+                drop(suspended_read.take());
                 drop(dormant_reader.take());
                 drain = None;
             }
@@ -2709,6 +3013,7 @@ mod tests {
                     .admit_modern_request(&request, Arc::new(AtomicBool::new(false)))
                     .expect("one bounded request reservation"),
                 log_level: None,
+                subscription_terminal: None,
                 #[cfg(feature = "legacy-2024-11-05")]
                 legacy: None,
             })
@@ -3815,6 +4120,238 @@ mod tests {
             assert!(io.response(50).is_none());
             assert!(io.response(51).unwrap().error.is_none());
         });
+    }
+
+    mod subscription_shutdown_tests {
+        use super::*;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        fn owner() -> Arc<OutputOwner> {
+            let admission = Arc::new(DispatchQueueState::default());
+            let JsonRpcMessage::Request(request) = request(
+                50, SUBSCRIPTIONS_LISTEN, serde_json::json!({"notifications":{}}),
+            ) else { unreachable!() };
+            Arc::new(OutputOwner {
+                reservation: admission.admit_modern_request(
+                    &request, Arc::new(AtomicBool::new(false)),
+                ).unwrap(),
+                log_level: None,
+                subscription_terminal: Some(Arc::new(FinalSubscriptionTerminalDelivery::default())),
+                #[cfg(feature = "legacy-2024-11-05")]
+                legacy: None,
+            })
+        }
+
+        fn control() -> JsonRpcMessage {
+            JsonRpcMessage::Request(subscription_cancellation_notification(&RequestId::Number(50)).unwrap())
+        }
+
+        #[test]
+        fn only_the_elected_queued_control_can_settle_or_fail_its_receipt() {
+            for withdrawal in 0..3 {
+                let owner = owner();
+                let delivery = owner.subscription_terminal.as_ref().unwrap();
+                let output = OutputQueue::default();
+                assert!(output.enqueue(control(), Some(Arc::clone(&owner))));
+                assert!(delivery.mark_cancellation_enqueued());
+                assert!(output.enqueue_subscription_control(control(), Arc::clone(&owner)));
+                let generic = output.pop().unwrap();
+                assert!(generic.terminal_delivery().is_none());
+                assert!(!output.admits_write(&generic));
+                output.finish(generic.bytes);
+                drop(generic);
+                assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_ENQUEUED);
+                assert!(!delivery.is_settled());
+                match withdrawal {
+                    0 => output.stop(),
+                    1 => {
+                        owner.reservation.cancellation.cancel_by_peer();
+                        assert_eq!(output.discard_cancelled(), 1);
+                    }
+                    _ => {
+                        let elected = output.pop().unwrap();
+                        assert!(elected.terminal_delivery().is_some());
+                        output.finish(elected.bytes);
+                        drop(elected);
+                    }
+                }
+                assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_FAILED);
+                assert!(delivery.is_settled());
+                assert!(!delivery.is_drained());
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum GuardCase { Live, CallerDeadline, DrainDeadline, PeerCancellation, ReceiptFailure }
+
+        struct ReadyWriter {
+            clock: Arc<VirtualClock>,
+            case: GuardCase,
+            owner: Arc<OutputOwner>,
+            sends: usize,
+        }
+
+        impl ConnectionWriter for ReadyWriter {
+            async fn send(&mut self, cx: &Cx, _: &JsonRpcMessage) -> Result<(), TransportError> {
+                assert!(cx.checkpoint().is_ok(), "the elected write poll has bounded cancellation masking");
+                self.sends += 1;
+                match self.case {
+                    GuardCase::Live => {}
+                    GuardCase::CallerDeadline => { self.clock.advance(10); }
+                    GuardCase::DrainDeadline => { self.clock.advance(5); }
+                    GuardCase::PeerCancellation => { self.owner.reservation.cancellation.cancel_by_peer(); }
+                    GuardCase::ReceiptFailure => self.owner.subscription_terminal.as_ref().unwrap().mark_failed(),
+                }
+                Ok(())
+            }
+            async fn close(&mut self, _: &Cx) -> Result<(), TransportError> { Ok(()) }
+            fn is_closed(&self) -> bool { false }
+        }
+
+        #[test]
+        fn ready_terminal_write_rechecks_original_and_whole_drain_authority_after_poll() {
+            for case in [GuardCase::Live, GuardCase::CallerDeadline, GuardCase::DrainDeadline,
+                GuardCase::PeerCancellation, GuardCase::ReceiptFailure]
+            {
+                let clock = Arc::new(VirtualClock::new());
+                let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+                let runtime = RuntimeBuilder::current_thread().blocking_threads(0, 0)
+                    .with_timer_driver(timer.clone()).build().unwrap();
+                let cx = runtime.request_cx_with_budget(
+                    Budget::new().with_deadline(asupersync::Time::from_nanos(10)),
+                );
+                let owner = owner();
+                let delivery = Arc::clone(owner.subscription_terminal.as_ref().unwrap());
+                assert!(delivery.mark_cancellation_enqueued());
+                if !matches!(case, GuardCase::PeerCancellation) {
+                    owner.reservation.cancellation.cancel();
+                }
+                let output = Arc::new(OutputQueue::default());
+                output.begin_subscription_drain(asupersync::Time::from_nanos(
+                    if matches!(case, GuardCase::DrainDeadline) { 5 } else { 100 },
+                ));
+                assert!(output.enqueue_subscription_control(control(), Arc::clone(&owner)));
+                cx.set_cancel_requested(true);
+                let mut writing = write(
+                    ReadyWriter { clock: Arc::clone(&clock), case, owner, sends: 0 },
+                    cx.clone(), output.pop().unwrap(), Arc::clone(&output),
+                );
+                let caller = Cx::set_current(Some(cx.clone()));
+                let Poll::Ready((writer, result, bytes)) = writing.as_mut().poll(
+                    &mut Context::from_waker(Waker::noop()),
+                ) else { panic!("the ready writer must settle in one poll: {case:?}") };
+                output.finish(bytes);
+                assert_eq!(writer.sends, 1);
+                assert_eq!(result.is_ok(), matches!(case, GuardCase::Live), "{case:?}");
+                assert_eq!(delivery.state.load(Ordering::Acquire),
+                    if matches!(case, GuardCase::Live) { FINAL_TERMINAL_DRAINED } else { FINAL_TERMINAL_FAILED });
+                assert!(cx.is_cancel_requested(), "masking never clears the caller cancellation");
+                drop(writing);
+                drop(caller);
+                drop(cx);
+                assert_eq!(timer.pending_count(), 0);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+
+        #[test]
+        fn local_shutdown_retains_a_partial_acknowledgement_and_control_until_flush() {
+            for partial_acknowledgement in [false, true] {
+                run(|cx| async move {
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                        let gate = Arc::new(Gate::default());
+                        let io = Arc::new(IoProbe::default());
+                        io.allow(if partial_acknowledgement { 1 } else { usize::MAX });
+                        let service = server(&gate);
+                        let registry = Arc::clone(&service.final_subscriptions);
+                        let stream = Arc::clone(&io);
+                        let (context_tx, context_rx) = std::sync::mpsc::sync_channel(1);
+                        let mut serving = cx.spawn(move |server_cx| async move {
+                            context_tx.send(server_cx.clone()).unwrap();
+                            service.serve_stdio_io(&server_cx,
+                                ProbeReader(Arc::clone(&stream)), ProbeWriter(stream)).await
+                        }).unwrap();
+                        io.feed(&encoded(&request(50, SUBSCRIPTIONS_LISTEN,
+                            serde_json::json!({"notifications":{}}))));
+                        until(&cx, || if partial_acknowledgement {
+                            io.0.lock().unwrap().outbound.len() == 1
+                        } else {
+                            io.messages().len() == 1
+                        }).await;
+                        let before = io.0.lock().unwrap().outbound.len();
+                        if !partial_acknowledgement { io.allow(1); }
+                        context_rx.try_recv().unwrap().cancel_with(
+                            CancelKind::User, Some("subscription shutdown drain regression"),
+                        );
+                        until(&cx, || registry.is_terminating()
+                            && (partial_acknowledgement || io.0.lock().unwrap().outbound.len() == before + 1)).await;
+                        {
+                            let state = io.0.lock().unwrap();
+                            assert!(!state.reader_dropped && !state.writer_dropped,
+                                "the partial frame still owns both native halves");
+                        }
+                        io.allow(usize::MAX);
+                        serving.join(&cx).await.unwrap().unwrap();
+                        let messages = io.messages();
+                        assert_eq!(messages.len(), 2, "only acknowledgement and cancellation may be written");
+                        assert!(matches!(&messages[0], JsonRpcMessage::Request(request)
+                            if request.method == "notifications/subscriptions/acknowledged"));
+                        let JsonRpcMessage::Request(control) = &messages[1] else {
+                            panic!("shutdown must emit a cancellation notification");
+                        };
+                        assert!(control.id.is_none());
+                        assert_eq!(control.method, "notifications/cancelled");
+                        let params = control.params.as_ref().unwrap();
+                        assert_eq!(params["requestId"], 50);
+                        assert_eq!(params["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY], 50);
+                        let state = io.0.lock().unwrap();
+                        assert!(state.outbound.ends_with(b"\n"));
+                        assert!(state.reader_dropped && state.writer_dropped);
+                        assert!(cx.checkpoint().is_ok());
+                    }).await.expect("partial subscription frames must drain within the owned shutdown bound");
+                });
+            }
+        }
+
+        #[test]
+        fn an_ordinary_partial_frame_cannot_be_relabelled_as_subscription_drain() {
+            for subscribed in [false, true] {
+                run(|cx| async move {
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                        let gate = Arc::new(Gate::default());
+                        let io = Arc::new(IoProbe::default());
+                        io.allow(usize::MAX);
+                        let service = server(&gate);
+                        let stream = Arc::clone(&io);
+                        let (context_tx, context_rx) = std::sync::mpsc::sync_channel(1);
+                        let mut serving = cx.spawn(move |server_cx| async move {
+                            context_tx.send(server_cx.clone()).unwrap();
+                            service.serve_stdio_io(&server_cx,
+                                ProbeReader(Arc::clone(&stream)), ProbeWriter(stream)).await
+                        }).unwrap();
+                        if subscribed {
+                            io.feed(&encoded(&request(50, SUBSCRIPTIONS_LISTEN,
+                                serde_json::json!({"notifications":{}}))));
+                            until(&cx, || io.messages().len() == 1).await;
+                        }
+                        let before = io.0.lock().unwrap().outbound.len();
+                        io.allow(1);
+                        io.feed(&encoded(&call(51, false)));
+                        until(&cx, || io.0.lock().unwrap().outbound.len() == before + 1).await;
+                        context_rx.try_recv().unwrap().cancel_with(
+                            CancelKind::User, Some("ordinary partial output shutdown regression"),
+                        );
+                        let result = serving.join(&cx).await.unwrap();
+                        assert_eq!(result.is_err(), subscribed,
+                            "ordinary-only shutdown stays unchanged; a required control behind a poisoned frame fails");
+                        let state = io.0.lock().unwrap();
+                        assert_eq!(state.outbound.len(), before + 1);
+                        assert!(state.reader_dropped && state.writer_dropped);
+                        assert!(cx.checkpoint().is_ok());
+                    }).await.expect("a cancelled partial ordinary frame must stop without further output");
+                });
+            }
+        }
     }
 
     #[test]

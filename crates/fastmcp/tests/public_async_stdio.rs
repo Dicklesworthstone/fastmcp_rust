@@ -225,6 +225,129 @@ fn modern_facade_native_stdio_runs_on_caller_runtime() {
     run_facade(Facade::Modern, PeerEra::Modern);
 }
 
+fn run_subscription_shutdown(cancel_first: bool) {
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+            let (server_input, peer_output) = create_native_pipe(&cx).unwrap();
+            let (peer_input, server_output) = create_native_pipe(&cx).unwrap();
+            let mut peer = AsyncStdioTransport::from_io(peer_input, peer_output);
+            let stopped = Arc::new(AtomicBool::new(false));
+            let server_stopped = Arc::clone(&stopped);
+            let (server_cx_tx, server_cx_rx) = std::sync::mpsc::sync_channel(1);
+            let mut serving = cx
+                .spawn(move |serve_cx| async move {
+                    server_cx_tx.send(serve_cx.clone()).unwrap();
+                    Facade::Modern
+                        .serve(&serve_cx, server_input, server_output, server_stopped)
+                        .await
+                })
+                .unwrap();
+            PeerEra::Modern.open(&cx, &mut peer).await;
+            for id in [41, 42] {
+                peer.send_async(
+                    &cx,
+                    &PeerEra::Modern.request(
+                        id,
+                        "subscriptions/listen",
+                        json!({"notifications": {}}),
+                    ),
+                )
+                .await
+                .unwrap();
+                let JsonRpcMessage::Request(acknowledgement) =
+                    peer.recv_async(&cx).await.unwrap()
+                else {
+                    panic!("an empty-filter listen must receive acknowledgement first");
+                };
+                assert!(acknowledgement.id.is_none());
+                assert_eq!(
+                    acknowledgement.method,
+                    "notifications/subscriptions/acknowledged"
+                );
+                let params = acknowledgement.params.unwrap();
+                assert_eq!(params["notifications"], json!({}));
+                assert_eq!(params["_meta"]["io.modelcontextprotocol/subscriptionId"], id);
+            }
+
+            if cancel_first {
+                // Client cancellation identifies its request without inventing
+                // the server-only subscription metadata marker.
+                peer.send_async(
+                    &cx,
+                    &JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(json!({"requestId": 41})),
+                    )),
+                )
+                .await
+                .unwrap();
+            }
+            peer.send_async(
+                &cx,
+                &PeerEra::Modern.request(
+                    99,
+                    "tools/call",
+                    json!({"name": "facade_echo", "arguments": {"value": "still live"}}),
+                ),
+            )
+            .await
+            .unwrap();
+            let result = response(&cx, &mut peer, 99).await;
+            assert_eq!(result["content"], json!([{"type": "text", "text": "still live"}]));
+            assert!(!stopped.load(Ordering::Acquire));
+
+            server_cx_rx.try_recv().unwrap().cancel_with(
+                asupersync::types::CancelKind::User,
+                Some("public native stdio subscription shutdown"),
+            );
+            let mut cancelled = Vec::new();
+            loop {
+                match peer.recv_async(&cx).await {
+                    Ok(JsonRpcMessage::Request(control)) => {
+                        assert!(control.id.is_none());
+                        assert_eq!(control.method, "notifications/cancelled");
+                        let params = control.params.unwrap();
+                        assert_eq!(
+                            params["requestId"],
+                            params["_meta"]["io.modelcontextprotocol/subscriptionId"]
+                        );
+                        cancelled.push(params["requestId"].as_i64().unwrap());
+                    }
+                    Ok(JsonRpcMessage::Response(response)) => {
+                        panic!("server teardown must not fabricate a complete result: {response:?}");
+                    }
+                    Err(error) if error.is_closed() => break,
+                    Err(error) => panic!("native stdio teardown must close cleanly: {error}"),
+                }
+            }
+            cancelled.sort_unstable();
+            assert_eq!(cancelled, if cancel_first { vec![42] } else { vec![41, 42] });
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(stopped.load(Ordering::Acquire));
+            assert!(cx.checkpoint().is_ok());
+        })
+        .await
+        .expect("subscription teardown must finish on the caller's native-pipe runtime");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+}
+
+#[test]
+fn modern_facade_native_stdio_shutdown_emits_only_subscription_cancellation() {
+    run_subscription_shutdown(false);
+}
+
+#[test]
+fn modern_facade_native_stdio_peer_cancel_preserves_sibling_without_a_response() {
+    run_subscription_shutdown(true);
+}
+
 #[cfg(feature = "legacy-2024-11-05")]
 #[test]
 fn auto_facade_native_stdio_selects_modern() {
