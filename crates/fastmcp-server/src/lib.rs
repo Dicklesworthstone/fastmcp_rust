@@ -648,6 +648,9 @@ const HTTP_ACCEPT_CANCEL_POLL: Duration = Duration::from_millis(20);
 /// peer that connects and then sends nothing, or trickles bytes, would
 /// otherwise hold one of the listener's `max_connections` slots forever.
 const DEFAULT_HTTP_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound one response commit, including all partial writes and its flush. SSE
+/// gets a fresh budget for each frame, not a lifetime limit on its stream.
+const DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound the public HTTP lifecycle's cooperative connection drain.  A
 /// synchronous handler which ignores cancellation cannot be preempted, so a
 /// timeout returns a caller-owned handle retaining its still-live child.
@@ -4018,6 +4021,14 @@ pub struct HttpServerConfig {
     /// expires even while bytes are still arriving. Raise it for deployments
     /// that accept large request bodies over slow links.
     pub request_read_timeout: Duration,
+    /// Time allowed to write and flush one response (default: 15 seconds).
+    ///
+    /// For SSE this budget applies separately to the response head, each
+    /// complete event, and the closing trailer. It does not limit the stream's
+    /// lifetime or time spent waiting for the next application event. A peer
+    /// that stops reading loses its connection and the requests it owns when
+    /// an outstanding write reaches this deadline.
+    pub response_write_timeout: Duration,
     /// Inner HTTP handler configuration (endpoint path, CORS, and body size).
     pub handler_config: HttpHandlerConfig,
     /// Maximum requests buffered for one live HTTP session.
@@ -4102,6 +4113,7 @@ impl Default for HttpServerConfig {
             health_path: "/health".to_string(),
             max_connections: 64,
             request_read_timeout: DEFAULT_HTTP_REQUEST_READ_TIMEOUT,
+            response_write_timeout: DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT,
             handler_config: HttpHandlerConfig {
                 base_path: "/mcp".to_string(),
                 ..HttpHandlerConfig::default()
@@ -4152,6 +4164,17 @@ impl HttpServerConfig {
     #[must_use]
     pub fn request_read_timeout(mut self, timeout: Duration) -> Self {
         self.request_read_timeout = timeout;
+        self
+    }
+
+    /// Sets the time allowed to write and flush a response or one SSE frame.
+    ///
+    /// Partial writes share the same deadline. Choose a budget long enough
+    /// for the largest response or event at the slowest tolerated download
+    /// rate. Idle SSE streams can stay open longer than this budget.
+    #[must_use]
+    pub fn response_write_timeout(mut self, timeout: Duration) -> Self {
+        self.response_write_timeout = timeout;
         self
     }
 
@@ -7441,6 +7464,7 @@ fn take_unsettled_retired_modern_http_dispatches(
 struct HttpListenerShutdown {
     listener_cx: Cx,
     requested: Arc<AtomicBool>,
+    response_write_timeout: Duration,
 }
 
 impl HttpListenerShutdown {
@@ -7448,7 +7472,13 @@ impl HttpListenerShutdown {
         Self {
             listener_cx: listener_cx.clone(),
             requested: Arc::new(AtomicBool::new(false)),
+            response_write_timeout: DEFAULT_HTTP_RESPONSE_WRITE_TIMEOUT,
         }
+    }
+
+    fn with_response_write_timeout(mut self, timeout: Duration) -> Self {
+        self.response_write_timeout = timeout;
+        self
     }
 
     fn request(&self) {
@@ -7519,7 +7549,8 @@ impl BoundHttpServer {
             };
 
             let connection_scope = cx.scope();
-            let connection_shutdown = HttpListenerShutdown::new(cx);
+            let connection_shutdown = HttpListenerShutdown::new(cx)
+                .with_response_write_timeout(server.http_config.response_write_timeout);
             // Expired modern sessions are reaped from this accept loop, which
             // already wakes every HTTP_ACCEPT_CANCEL_POLL. A dedicated reaper
             // task had to be aborted and joined during shutdown, and that join
@@ -11141,6 +11172,92 @@ fn h1_response(mut response: HttpResponse) -> Http1Response {
     h1
 }
 
+/// Own one complete response write through its flush. The pinned operation
+/// survives cancellation polls: restarting `write_all` after a poll interval
+/// could repeat the prefix of a partially committed HTTP or SSE frame.
+async fn bounded_native_http_response_write<F>(
+    cx: &Cx,
+    listener_shutdown: &HttpListenerShutdown,
+    terminal_delivery: Option<&FinalSubscriptionTerminalDelivery>,
+    write: F,
+) -> Result<(), ()>
+where
+    F: Future<Output = Result<(), ()>>,
+{
+    let deadline = cx.now().saturating_add_nanos(
+        u64::try_from(listener_shutdown.response_write_timeout.as_nanos()).unwrap_or(u64::MAX),
+    );
+    let write_authority = || {
+        // Read cancellation before the receipt so an election published
+        // before shutdown is visible even if this write started earlier.
+        let cancelled = listener_shutdown.is_requested() || cx.checkpoint().is_err();
+        if let Some(delivery) = terminal_delivery {
+            let control = delivery.state.load(Ordering::Acquire);
+            let completion = delivery.completion_state.load(Ordering::Acquire);
+            if control == FINAL_TERMINAL_FAILED || completion == FINAL_TERMINAL_FAILED {
+                return Err(());
+            }
+            if matches!(completion, FINAL_TERMINAL_ENQUEUED | FINAL_TERMINAL_DRAINED) {
+                return Ok(true);
+            }
+        }
+        if cancelled { Err(()) } else { Ok(false) }
+    };
+    let mut write = std::pin::pin!(write);
+    loop {
+        write_authority()?;
+        let now = cx.now();
+        if now >= deadline {
+            return Err(());
+        }
+        let wait = HTTP_ACCEPT_CANCEL_POLL.min(Duration::from_nanos(deadline.duration_since(now)));
+        let next = std::future::poll_fn(|task_cx| {
+            let authority = write_authority();
+            // TimeoutFuture prefers ready work at exact deadline equality.
+            // Recheck our frame deadline at every poll before committing any
+            // more bytes, including polls resumed at that boundary.
+            if cx.now() >= deadline {
+                return std::task::Poll::Ready(Err(()));
+            }
+            match authority {
+                Err(()) => std::task::Poll::Ready(Err(())),
+                // Socket writes observe the ambient Cx too. Mask only this
+                // poll; no mask crosses an await or the write deadline.
+                Ok(true) => cx.masked(|| write.as_mut().poll(task_cx)),
+                Ok(false) => write.as_mut().poll(task_cx),
+            }
+        });
+        if let Ok(result) = asupersync::time::timeout(now, wait, next).await {
+            return result;
+        }
+        if cx.is_cancel_requested() {
+            // Cancelled timer waits can be immediately ready. Preserve the
+            // terminal's deadline without starving the sibling dispatches
+            // that must also settle during listener shutdown.
+            asupersync::runtime::yield_now().await;
+        }
+    }
+}
+
+async fn write_native_http_response_parts<W>(
+    cx: &Cx,
+    listener_shutdown: &HttpListenerShutdown,
+    terminal_delivery: Option<&FinalSubscriptionTerminalDelivery>,
+    writer: &mut W,
+    parts: &[&[u8]],
+) -> Result<(), ()>
+where
+    W: asupersync::io::AsyncWrite + Unpin,
+{
+    bounded_native_http_response_write(cx, listener_shutdown, terminal_delivery, async {
+        for part in parts {
+            writer.write_all(part).await.map_err(|_| ())?;
+        }
+        writer.flush().await.map_err(|_| ())
+    })
+    .await
+}
+
 async fn send_h1_response<T>(
     cx: &Cx,
     listener_shutdown: &HttpListenerShutdown,
@@ -11158,23 +11275,15 @@ where
     }
     cx.checkpoint().map_err(|_| ())?;
     framed.send(h1_response(response)).map_err(|_| ())?;
-    // `Framed::send` only accepts the response into its codec buffer; the
-    // socket commit happens while closing. Re-check so a shutdown that wins
-    // between encoding and that commit suppresses the buffered response.
-    if listener_shutdown.is_requested() {
-        return Err(());
-    }
-    cx.checkpoint().map_err(|_| ())?;
-    std::future::poll_fn(|task_cx| {
-        if listener_shutdown.is_requested() || cx.is_cancel_requested() {
-            // Drop the framed connection with its buffered response rather
-            // than allowing a shutdown-cancelled task to commit it.
-            return std::task::Poll::Ready(Ok(()));
-        }
-        framed.poll_close(task_cx)
+    // `Framed::send` only encodes; bounded closing owns the actual socket
+    // commit. Cancellation drops any remaining buffered bytes, while a peer
+    // that stops reading can no longer retain a connection slot forever.
+    bounded_native_http_response_write(cx, listener_shutdown, None, async {
+        std::future::poll_fn(|task_cx| framed.poll_close(task_cx))
+            .await
+            .map_err(|_| ())
     })
     .await
-    .map_err(|_| ())
 }
 
 /// Writes the one pre-representation rejection that a modern SSE request can
@@ -11216,12 +11325,7 @@ where
     head.extend_from_slice(format!("content-length: {}\r\n", response.body.len()).as_bytes());
     head.extend_from_slice(b"connection: close\r\n\r\n");
     head.extend_from_slice(&response.body);
-    if listener_shutdown.is_requested() {
-        return Err(());
-    }
-    cx.checkpoint().map_err(|_| ())?;
-    writer.write_all(&head).await.map_err(|_| ())?;
-    writer.flush().await.map_err(|_| ())
+    write_native_http_response_parts(cx, listener_shutdown, None, writer, &[&head]).await
 }
 
 fn sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
@@ -11249,6 +11353,7 @@ fn sse_response_head(response: &HttpResponse) -> Result<Vec<u8>, ()> {
 #[cfg(feature = "legacy-2024-11-05")]
 async fn send_legacy_sse_stream(
     cx: &Cx,
+    listener_shutdown: &HttpListenerShutdown,
     stream: AsyncTcpStream,
     response: DualEraHttpLegacySseResponse,
 ) -> Result<(), ()> {
@@ -11266,11 +11371,9 @@ async fn send_legacy_sse_stream(
         })
         .map_err(|_| ())?;
     let result = async {
-        stream
-            .write_all(&sse_response_head(response.response())?)
-            .await
-            .map_err(|_| ())?;
-        stream.flush().await.map_err(|_| ())?;
+        let head = sse_response_head(response.response())?;
+        write_native_http_response_parts(cx, listener_shutdown, None, &mut stream, &[&head])
+            .await?;
         // Park on the channel's registered receive waker so publication wakes
         // this writer directly. Race peer closure through its own wake-driven
         // signal so an idle stream still tears down promptly.
@@ -11299,14 +11402,17 @@ async fn send_legacy_sse_stream(
             };
             let bytes = event.to_bytes().map_err(|_| ())?;
             let prefix = format!("{:X}\r\n", bytes.len());
-            stream.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
-            stream.write_all(&bytes).await.map_err(|_| ())?;
-            stream.write_all(b"\r\n").await.map_err(|_| ())?;
-            stream.flush().await.map_err(|_| ())?;
+            write_native_http_response_parts(
+                cx,
+                listener_shutdown,
+                None,
+                &mut stream,
+                &[prefix.as_bytes(), &bytes, b"\r\n"],
+            )
+            .await?;
         }
-        let _ = stream.write_all(b"0\r\n\r\n").await;
-        let _ = stream.flush().await;
-        Ok(())
+        write_native_http_response_parts(cx, listener_shutdown, None, &mut stream, &[b"0\r\n\r\n"])
+            .await
     }
     .await;
     peer_watch.abort();
@@ -11861,8 +11967,14 @@ async fn send_modern_sse_stream(
             ModernSseDispatchElection::Failed => return Err(()),
         }
         let response_head = sse_response_head(response.response())?;
-        writer.write_all(&response_head).await.map_err(|_| ())?;
-        writer.flush().await.map_err(|_| ())?;
+        write_native_http_response_parts(
+            cx,
+            listener_shutdown,
+            Some(&terminal_delivery),
+            &mut writer,
+            &[&response_head],
+        )
+        .await?;
         let mut last_frame_write = cx.now();
         loop {
             // A failed request-scoped progress/log/terminal commit retires
@@ -11877,10 +11989,18 @@ async fn send_modern_sse_stream(
                     let terminal_response = final_subscription_terminal_response_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
-                    writer.write_all(prefix.as_bytes()).await.map_err(|_| ())?;
-                    writer.write_all(&bytes).await.map_err(|_| ())?;
-                    writer.write_all(b"\r\n").await.map_err(|_| ())?;
-                    writer.flush().await.map_err(|_| ())?;
+                    // An elected terminal response keeps its bounded drain
+                    // authority through listener cancellation, including
+                    // already-queued frames before that terminal. It still
+                    // cannot wait forever on a peer that has stopped reading.
+                    write_native_http_response_parts(
+                        cx,
+                        listener_shutdown,
+                        Some(&terminal_delivery),
+                        &mut writer,
+                        &[prefix.as_bytes(), &bytes, b"\r\n"],
+                    )
+                    .await?;
                     last_frame_write = cx.now();
                     if terminal_control {
                         terminal_delivery.mark_drained();
@@ -11933,8 +12053,14 @@ async fn send_modern_sse_stream(
                             // ordinary response's progress-based idle deadline.
                             // Subscriptions retain their separate long-lived
                             // activity and keepalive policies.
-                            writer.write_all(b"2\r\n:\n\r\n").await.map_err(|_| ())?;
-                            writer.flush().await.map_err(|_| ())?;
+                            write_native_http_response_parts(
+                                cx,
+                                listener_shutdown,
+                                Some(&terminal_delivery),
+                                &mut writer,
+                                &[b"2\r\n:\n\r\n"],
+                            )
+                            .await?;
                             last_frame_write = cx.now();
                         }
                         asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
@@ -11948,8 +12074,14 @@ async fn send_modern_sse_stream(
                 Err(_) => return Err(()),
             }
         }
-        writer.write_all(b"0\r\n\r\n").await.map_err(|_| ())?;
-        writer.flush().await.map_err(|_| ())
+        write_native_http_response_parts(
+            cx,
+            listener_shutdown,
+            Some(&terminal_delivery),
+            &mut writer,
+            &[b"0\r\n\r\n"],
+        )
+        .await
     }
     .await;
 
@@ -12915,7 +13047,7 @@ async fn serve_http_connection(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(session_id.clone(), Arc::clone(&session));
     let stream = framed.into_inner();
-    let _ = send_legacy_sse_stream(cx, stream, response).await;
+    let _ = send_legacy_sse_stream(cx, &listener_shutdown, stream, response).await;
     // Peer close must revoke active exact-2024 requests before acquiring the
     // serialized session slot below. Mark the detached shell first so an
     // in-flight handler closes its owned session instead of restoring it
@@ -45941,6 +46073,747 @@ mod lib_unit_tests {
                     startup.load(Ordering::Acquire),
                     shutdown.load(Ordering::Acquire),
                 ));
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    const NATIVE_HTTP_WRITE_PROBE_BYTES: usize = 6 * 1024 * 1024;
+    #[cfg(unix)]
+    const NATIVE_HTTP_WRITE_PROBE_END: &[u8] = b"response-write-payload-end";
+    #[cfg(unix)]
+    const NATIVE_HTTP_WRITE_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct NativeHttpWriteProbeControl {
+        started: AtomicUsize,
+        cancelled: AtomicUsize,
+        release: AtomicBool,
+    }
+
+    #[cfg(unix)]
+    struct NativeHttpWriteProbeTool(Arc<NativeHttpWriteProbeControl>);
+
+    #[cfg(unix)]
+    impl ToolHandler for NativeHttpWriteProbeTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: "response_write_probe".to_owned(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.0.started.fetch_add(1, Ordering::AcqRel);
+            let mut payload = "x".repeat(NATIVE_HTTP_WRITE_PROBE_BYTES);
+            payload.push_str(std::str::from_utf8(NATIVE_HTTP_WRITE_PROBE_END).unwrap());
+            if arguments["stream"].as_bool() != Some(true) {
+                return Ok(vec![Content::text(payload)]);
+            }
+            ctx.report_progress(0.5, Some(&payload));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.0.release.load(Ordering::Acquire) && !ctx.is_cancelled() {
+                if Instant::now() >= deadline {
+                    return Err(McpError::internal_error("write probe was never released"));
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            if ctx.is_cancelled() {
+                self.0.cancelled.fetch_add(1, Ordering::AcqRel);
+                return Err(McpError::request_cancelled());
+            }
+            Ok(vec![Content::text("response-write-complete")])
+        }
+    }
+
+    #[cfg(unix)]
+    struct NativeHttpWriteProbeCancellation(Cx);
+
+    #[cfg(unix)]
+    impl Drop for NativeHttpWriteProbeCancellation {
+        fn drop(&mut self) {
+            self.0
+                .cancel_with(CancelKind::User, Some("response write probe finished"));
+        }
+    }
+
+    #[cfg(unix)]
+    fn native_http_write_probe_wait(
+        description: &str,
+        ready: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            if Instant::now() >= deadline {
+                return Err(format!("response write probe timed out: {description}"));
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn native_http_write_probe_connect(address: SocketAddr) -> Result<std::net::TcpStream, String> {
+        let stream = std::net::TcpStream::connect(address).map_err(|error| error.to_string())?;
+        rustix::net::sockopt::set_socket_recv_buffer_size(&stream, 64 * 1024)
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|error| error.to_string())?;
+        Ok(stream)
+    }
+
+    #[cfg(unix)]
+    fn native_http_write_probe_exchange(
+        address: SocketAddr,
+        request: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let mut stream = native_http_write_probe_connect(address)?;
+        std::io::Write::write_all(&mut stream, request).map_err(|error| error.to_string())?;
+        let mut response = Vec::new();
+        std::io::Read::read_to_end(&mut stream, &mut response)
+            .map_err(|error| error.to_string())?;
+        Ok(response)
+    }
+
+    #[cfg(unix)]
+    fn native_http_write_probe_read_until(
+        stream: &mut std::net::TcpStream,
+        received: &mut Vec<u8>,
+        marker: &[u8],
+    ) -> Result<(), String> {
+        let mut search_from = 0;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            if received[search_from..]
+                .windows(marker.len())
+                .any(|window| window == marker)
+            {
+                return Ok(());
+            }
+            search_from = received.len().saturating_sub(marker.len());
+            let count =
+                std::io::Read::read(stream, &mut buffer).map_err(|error| error.to_string())?;
+            if count == 0 {
+                return Err(format!(
+                    "response write stream ended before {}",
+                    String::from_utf8_lossy(marker)
+                ));
+            }
+            received.extend_from_slice(&buffer[..count]);
+        }
+    }
+
+    #[cfg(unix)]
+    fn native_http_write_probe_request(stream: bool) -> Vec<u8> {
+        let mut meta = serde_json::json!({
+            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+        });
+        if stream {
+            meta["progressToken"] = serde_json::json!("write-probe");
+        }
+        let request = JsonRpcRequest::new(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "response_write_probe", "arguments": {"stream": stream}, "_meta": meta,
+            })),
+            859_i64,
+        );
+        live_http_post(
+            "/mcp",
+            &serde_json::to_vec(&request).unwrap(),
+            &[
+                (
+                    "Accept",
+                    if stream {
+                        "application/json, text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                ),
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", "response_write_probe"),
+            ],
+        )
+    }
+
+    #[cfg(unix)]
+    fn native_http_write_probe_health(address: SocketAddr) -> Result<(), String> {
+        let response = native_http_write_probe_exchange(
+            address,
+            b"GET /health HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n",
+        )?;
+        if !response.starts_with(b"HTTP/1.1 200") {
+            return Err("a healthy peer could not use the listener capacity".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_http_response_write_timeout_releases_stalled_json_peer() {
+        run_live_http_test(|cx| async move {
+            let control = Arc::new(NativeHttpWriteProbeControl::default());
+            let bound = Server::new("write-timeout-json", "1.0.0")
+                .tool(NativeHttpWriteProbeTool(Arc::clone(&control)))
+                .http_config(
+                    HttpServerConfig::new()
+                        .max_connections(1)
+                        .response_write_timeout(NATIVE_HTTP_WRITE_PROBE_TIMEOUT),
+                )
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let _cancel = NativeHttpWriteProbeCancellation(caller_cx);
+                let request = native_http_write_probe_request(false);
+                let response = native_http_write_probe_exchange(address, &request)?;
+                let response: JsonRpcResponse =
+                    serde_json::from_slice(live_http_response_body(&response)?)
+                        .map_err(|error| error.to_string())?;
+                let text_len = response
+                    .result
+                    .as_ref()
+                    .and_then(|value| value["content"][0]["text"].as_str())
+                    .map(str::len);
+                if response.error.is_some()
+                    || text_len
+                        != Some(NATIVE_HTTP_WRITE_PROBE_BYTES + NATIVE_HTTP_WRITE_PROBE_END.len())
+                {
+                    return Err(
+                        "a reading JSON peer did not receive the complete large response".into(),
+                    );
+                }
+                native_http_write_probe_wait("positive JSON slot release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                })?;
+                let mut stalled = native_http_write_probe_connect(address)?;
+                let started = Instant::now();
+                std::io::Write::write_all(&mut stalled, &request)
+                    .map_err(|error| error.to_string())?;
+                native_http_write_probe_wait("stalled JSON handler admission", || {
+                    control.started.load(Ordering::Acquire) == 2
+                })?;
+                native_http_write_probe_wait("unread JSON slot release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                })?;
+                if started.elapsed() < NATIVE_HTTP_WRITE_PROBE_TIMEOUT {
+                    return Err("large unread JSON did not reach the write deadline".into());
+                }
+                // The unread socket is deliberately retained while a fresh
+                // peer reuses the listener's only connection slot.
+                native_http_write_probe_health(address)?;
+                drop(stalled);
+                Ok(())
+            });
+            let shutdown = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            controller
+                .join()
+                .map_err(|_| "JSON write controller panicked")??;
+            require_quiescent_http_shutdown(shutdown, "JSON write timeout").await
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_http_response_write_timeout_releases_stalled_modern_sse_peer() {
+        run_live_http_test(|cx| async move {
+            let control = Arc::new(NativeHttpWriteProbeControl::default());
+            let bound = Server::new("write-timeout-modern-sse", "1.0.0")
+                .tool(NativeHttpWriteProbeTool(Arc::clone(&control)))
+                .http_config(
+                    HttpServerConfig::new()
+                        .max_connections(2)
+                        .response_write_timeout(NATIVE_HTTP_WRITE_PROBE_TIMEOUT),
+                )
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let sessions = Arc::clone(&bound.modern_sessions);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let _cancel = NativeHttpWriteProbeCancellation(caller_cx);
+                let request = native_http_write_probe_request(true);
+                let mut reading = native_http_write_probe_connect(address)?;
+                std::io::Write::write_all(&mut reading, &request)
+                    .map_err(|error| error.to_string())?;
+                let mut received = Vec::new();
+                native_http_write_probe_read_until(
+                    &mut reading,
+                    &mut received,
+                    NATIVE_HTTP_WRITE_PROBE_END,
+                )?;
+                thread::sleep(NATIVE_HTTP_WRITE_PROBE_TIMEOUT + Duration::from_millis(100));
+                if control.cancelled.load(Ordering::Acquire) != 0
+                    || limiter.active.load(Ordering::Acquire) != 1
+                {
+                    return Err("an idle healthy SSE stream was limited to one write budget".into());
+                }
+                control.release.store(true, Ordering::Release);
+                std::io::Read::read_to_end(&mut reading, &mut received)
+                    .map_err(|error| error.to_string())?;
+                let response = live_http_sse_jsonrpc_response(&received)?;
+                if response.id != Some(859_i64.into()) || response.error.is_some() {
+                    return Err("a reading SSE peer lost its terminal response".into());
+                }
+                native_http_write_probe_wait("positive modern body release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                })?;
+                control.release.store(false, Ordering::Release);
+                let mut stalled = native_http_write_probe_connect(address)?;
+                std::io::Write::write_all(&mut stalled, &request)
+                    .map_err(|error| error.to_string())?;
+                native_http_write_probe_wait("stalled modern handler admission", || {
+                    control.started.load(Ordering::Acquire) == 2
+                })?;
+                native_http_write_probe_health(address)?;
+                native_http_write_probe_wait(
+                    "stalled modern cancellation and owner release",
+                    || {
+                        control.cancelled.load(Ordering::Acquire) == 1
+                            && limiter.active.load(Ordering::Acquire) == 0
+                            && sessions.sessions.lock().unwrap().is_empty()
+                    },
+                )?;
+                native_http_write_probe_health(address)?;
+                drop(stalled);
+                Ok(())
+            });
+            let shutdown = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            controller
+                .join()
+                .map_err(|_| "modern SSE write controller panicked")??;
+            require_quiescent_http_shutdown(shutdown, "modern SSE write timeout").await
+        });
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    fn native_http_write_probe_legacy_session(
+        address: SocketAddr,
+    ) -> Result<(std::net::TcpStream, String, Vec<u8>), String> {
+        let mut stream = native_http_write_probe_connect(address)?;
+        std::io::Write::write_all(
+            &mut stream,
+            format!("GET /sse HTTP/1.1\r\nHost: {address}\r\nAccept: text/event-stream\r\n\r\n")
+                .as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
+        let mut received = Vec::new();
+        native_http_write_probe_read_until(&mut stream, &mut received, b"\n\n")?;
+        let session_id = std::str::from_utf8(&received)
+            .map_err(|error| error.to_string())?
+            .split_once("/messages?session_id=")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .ok_or_else(|| "legacy endpoint event omitted its session".to_owned())?
+            .to_owned();
+        let path = format!("/messages?session_id={session_id}");
+        let initialize = JsonRpcRequest::new(
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION, "capabilities": {},
+                "clientInfo": {"name": "response-write-probe", "version": "1.0.0"},
+            })),
+            858_i64,
+        );
+        for message in [
+            initialize,
+            JsonRpcRequest::notification("notifications/initialized", None),
+        ] {
+            let response = native_http_write_probe_exchange(
+                address,
+                &live_http_post(&path, &serde_json::to_vec(&message).unwrap(), &[]),
+            )?;
+            if !response.starts_with(b"HTTP/1.1 202") {
+                return Err("legacy write probe lifecycle POST was not accepted".into());
+            }
+        }
+        native_http_write_probe_read_until(&mut stream, &mut received, b"2024-11-05")?;
+        Ok((stream, session_id, received))
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn live_http_response_write_timeout_releases_stalled_legacy_sse_peer() {
+        run_live_http_test(|cx| async move {
+            let control = Arc::new(NativeHttpWriteProbeControl::default());
+            let bound = Server::new("write-timeout-legacy-sse", "1.0.0")
+                .tool(NativeHttpWriteProbeTool(Arc::clone(&control)))
+                .http_config(
+                    HttpServerConfig::new()
+                        .max_connections(3)
+                        .response_write_timeout(NATIVE_HTTP_WRITE_PROBE_TIMEOUT),
+                )
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let address = bound.local_addr().map_err(|error| error.to_string())?;
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let sessions = Arc::clone(&bound.legacy_sessions);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                let _cancel = NativeHttpWriteProbeCancellation(caller_cx);
+                let call = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "response_write_probe", "arguments": {"stream": true},
+                        "_meta": {"progressToken": "legacy-write-probe"},
+                    })),
+                    859_i64,
+                );
+                let call_body = serde_json::to_vec(&call).unwrap();
+                let (mut reading, session_id, mut received) =
+                    native_http_write_probe_legacy_session(address)?;
+                let request = live_http_post(
+                    &format!("/messages?session_id={session_id}"),
+                    &call_body,
+                    &[],
+                );
+                let post =
+                    thread::spawn(move || native_http_write_probe_exchange(address, &request));
+                native_http_write_probe_read_until(
+                    &mut reading,
+                    &mut received,
+                    NATIVE_HTTP_WRITE_PROBE_END,
+                )?;
+                thread::sleep(NATIVE_HTTP_WRITE_PROBE_TIMEOUT + Duration::from_millis(100));
+                if control.cancelled.load(Ordering::Acquire) != 0
+                    || !sessions.lock().unwrap().contains_key(&session_id)
+                {
+                    return Err("a healthy legacy stream was limited to one write budget".into());
+                }
+                control.release.store(true, Ordering::Release);
+                native_http_write_probe_read_until(
+                    &mut reading,
+                    &mut received,
+                    b"response-write-complete",
+                )?;
+                let accepted = post.join().map_err(|_| "legacy positive POST panicked")??;
+                if !accepted.starts_with(b"HTTP/1.1 202") {
+                    return Err("legacy positive tool POST was not accepted".into());
+                }
+                drop(reading);
+                native_http_write_probe_wait("positive legacy session release", || {
+                    limiter.active.load(Ordering::Acquire) == 0
+                        && sessions.lock().unwrap().is_empty()
+                })?;
+
+                control.release.store(false, Ordering::Release);
+                let (stalled, session_id, _) = native_http_write_probe_legacy_session(address)?;
+                let path = format!("/messages?session_id={session_id}");
+                let request = live_http_post(&path, &call_body, &[]);
+                let post =
+                    thread::spawn(move || native_http_write_probe_exchange(address, &request));
+                native_http_write_probe_wait("stalled legacy handler admission", || {
+                    control.started.load(Ordering::Acquire) == 2
+                })?;
+                native_http_write_probe_health(address)?;
+                native_http_write_probe_wait(
+                    "stalled legacy cancellation and session release",
+                    || {
+                        control.cancelled.load(Ordering::Acquire) == 1
+                            && limiter.active.load(Ordering::Acquire) == 0
+                            && sessions.lock().unwrap().is_empty()
+                    },
+                )?;
+                let _ = post
+                    .join()
+                    .map_err(|_| "legacy cancelled POST panicked")??;
+                let rejected = native_http_write_probe_exchange(
+                    address,
+                    &live_http_post(&path, &call_body, &[]),
+                )?;
+                if !rejected.starts_with(b"HTTP/1.1 404") {
+                    return Err(
+                        "a timed-out legacy session retained its POST admission route".into(),
+                    );
+                }
+                native_http_write_probe_health(address)?;
+                drop(stalled);
+                Ok(())
+            });
+            let shutdown = bound.serve(&cx).await.map_err(|error| error.to_string())?;
+            controller
+                .join()
+                .map_err(|_| "legacy SSE write controller panicked")??;
+            require_quiescent_http_shutdown(shutdown, "legacy SSE write timeout").await
+        });
+    }
+
+    #[test]
+    fn native_http_response_write_deadline_preserves_progress_and_bounds_stalls() {
+        // Drive virtual timers explicitly: the same operation commits one
+        // millisecond before its budget but cannot commit at that budget.
+        {
+            let config = asupersync::lab::LabConfig::new(859)
+                .with_auto_advance()
+                .max_steps(128);
+            let mut lab = asupersync::lab::LabRuntime::new(config);
+            let budget = asupersync::types::Budget::INFINITE;
+            let region = lab.state.create_root_region(budget);
+            let (task, mut result) = lab
+                .state
+                .create_task(region, budget, async {
+                    let cx = Cx::current().expect("lab task installs its caller context");
+                    let shutdown = HttpListenerShutdown::new(&cx)
+                        .with_response_write_timeout(Duration::from_millis(40));
+                    let commits = AtomicUsize::new(0);
+                    let mut completed = [false; 2];
+                    for (index, delay_ms) in [39, 40].into_iter().enumerate() {
+                        completed[index] =
+                            bounded_native_http_response_write(&cx, &shutdown, None, async {
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(delay_ms))
+                                    .await;
+                                commits.fetch_add(1, Ordering::AcqRel);
+                                Ok(())
+                            })
+                            .await
+                            .is_ok();
+                    }
+                    (completed, commits.load(Ordering::Acquire))
+                })
+                .expect("deadline boundary task is admitted");
+            lab.scheduler.lock().schedule(task, budget.priority);
+            let report = lab.run_with_auto_advance();
+            assert_eq!(
+                report.termination,
+                asupersync::lab::AutoAdvanceTermination::Quiescent
+            );
+            let (completed, commits) = result
+                .try_join()
+                .expect("deadline boundary task succeeds")
+                .expect("deadline boundary task finishes");
+            assert_eq!(completed, [true, false]);
+            assert_eq!(commits, 1);
+        }
+
+        struct PartialWriter {
+            bytes: Vec<u8>,
+            ready_at: Instant,
+            pause: Duration,
+            stall_after: usize,
+            stall_flush: bool,
+        }
+
+        impl AsyncWrite for PartialWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                // Real asupersync socket halves also observe ambient
+                // cancellation. A terminal drain must mask its actual poll.
+                if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::Interrupted.into()));
+                }
+                if Instant::now() < self.ready_at || self.bytes.len() >= self.stall_after {
+                    return std::task::Poll::Pending;
+                }
+                let count = bytes.len().min(2).min(self.stall_after - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                self.ready_at = Instant::now() + self.pause;
+                std::task::Poll::Ready(Ok(count))
+            }
+
+            fn poll_flush(
+                mut self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::Interrupted.into()));
+                }
+                if self.stall_flush || Instant::now() < self.ready_at {
+                    return std::task::Poll::Pending;
+                }
+                self.ready_at = Instant::now() + self.pause;
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                self.poll_flush(cx)
+            }
+        }
+
+        run_live_http_test(|cx| async move {
+            const WRITE_TIMEOUT: Duration = Duration::from_millis(400);
+            let shutdown =
+                HttpListenerShutdown::new(&cx).with_response_write_timeout(WRITE_TIMEOUT);
+            let writer = |stall_after, stall_flush| PartialWriter {
+                bytes: Vec::new(),
+                ready_at: Instant::now() + Duration::from_millis(90),
+                pause: Duration::from_millis(90),
+                stall_after,
+                stall_flush,
+            };
+            let mut progressing = writer(usize::MAX, false);
+            let started = Instant::now();
+            for parts in [[b"ab".as_slice(), b"cd".as_slice()], [b"ef", b"gh"]] {
+                write_native_http_response_parts(&cx, &shutdown, None, &mut progressing, &parts)
+                    .await
+                    .map_err(|_| "partial writes were prematurely cut off".to_owned())?;
+            }
+            if progressing.bytes != b"abcdefgh" || started.elapsed() <= WRITE_TIMEOUT {
+                return Err("frame budgets restarted bytes or limited the stream lifetime".into());
+            }
+            // The same partial writer now stops after two bytes; a flush
+            // stall is independently bounded after all bytes were accepted.
+            for (stall_after, stall_flush, expected) in [(2, false, 2), (usize::MAX, true, 4)] {
+                let mut stalled = writer(stall_after, stall_flush);
+                let started = Instant::now();
+                if write_native_http_response_parts(&cx, &shutdown, None, &mut stalled, &[b"abcd"])
+                    .await
+                    .is_ok()
+                    || stalled.bytes.len() != expected
+                    || started.elapsed() < WRITE_TIMEOUT
+                    || started.elapsed() > Duration::from_secs(3)
+                {
+                    return Err("a stalled partial write/flush escaped its deadline".into());
+                }
+            }
+
+            let pending_shutdown =
+                HttpListenerShutdown::new(&cx).with_response_write_timeout(Duration::from_secs(5));
+            let cancel = pending_shutdown.clone();
+            let cancellation = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                cancel.request();
+            });
+            let mut pending = writer(0, false);
+            let started = Instant::now();
+            let stopped = write_native_http_response_parts(
+                &cx,
+                &pending_shutdown,
+                None,
+                &mut pending,
+                &[b"abcd"],
+            )
+            .await;
+            cancellation
+                .join()
+                .map_err(|_| "write canceller panicked")?;
+            if stopped.is_ok() || !pending.bytes.is_empty() || started.elapsed() >= WRITE_TIMEOUT {
+                return Err("listener shutdown did not interrupt a pending write".into());
+            }
+
+            // Begin a progress write before any terminal is elected, then
+            // elect while it is parked and cancel the listener. The original
+            // pinned write must finish under the newly published receipt.
+            let elected = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            elected.mark_control_not_required();
+            let election_shutdown =
+                HttpListenerShutdown::new(&cx).with_response_write_timeout(WRITE_TIMEOUT);
+            let election_receipt = Arc::clone(&elected);
+            let election_cancel = election_shutdown.clone();
+            let election = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                election_receipt.mark_completion_enqueued();
+                election_cancel.request();
+            });
+            let mut progress = writer(usize::MAX, false);
+            let completed = write_native_http_response_parts(
+                &cx,
+                &election_shutdown,
+                Some(&elected),
+                &mut progress,
+                &[b"abcd"],
+            )
+            .await;
+            election
+                .join()
+                .map_err(|_| "terminal election thread panicked")?;
+            if completed.is_err() || progress.bytes != b"abcd" {
+                return Err("a newly elected terminal lost its preceding partial frame".into());
+            }
+
+            // The global terminal drain can revoke the receipt while the
+            // writer is parked. That must override the longer write budget.
+            let revoke_receipt = Arc::clone(&elected);
+            let revocation = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                revoke_receipt.mark_failed();
+            });
+            let mut revoked = writer(0, false);
+            let started = Instant::now();
+            let result = write_native_http_response_parts(
+                &cx,
+                &election_shutdown,
+                Some(&elected),
+                &mut revoked,
+                &[b"done"],
+            )
+            .await;
+            revocation
+                .join()
+                .map_err(|_| "terminal revocation thread panicked")?;
+            if result.is_ok() || started.elapsed() >= WRITE_TIMEOUT {
+                return Err("a failed terminal receipt retained write authority".into());
+            }
+
+            // Cancel the real caller context, not only the listener flag.
+            // PartialWriter now rejects unmasked polls like a TCP write half.
+            let terminal_receipt = FinalSubscriptionTerminalDelivery::default();
+            terminal_receipt.mark_control_not_required();
+            terminal_receipt.mark_completion_enqueued();
+            cx.cancel_with(CancelKind::User, Some("terminal drain cancellation probe"));
+            let mut ordinary = writer(usize::MAX, false);
+            if write_native_http_response_parts(&cx, &shutdown, None, &mut ordinary, &[b"nope"])
+                .await
+                .is_ok()
+                || !ordinary.bytes.is_empty()
+            {
+                return Err("caller cancellation allowed an ordinary response write".into());
+            }
+            let mut terminal = writer(usize::MAX, false);
+            write_native_http_response_parts(
+                &cx,
+                &shutdown,
+                Some(&terminal_receipt),
+                &mut terminal,
+                &[b"done"],
+            )
+            .await
+            .map_err(|_| "ambient cancellation suppressed an elected terminal".to_owned())?;
+            if terminal.bytes != b"done" {
+                return Err("elected terminal drain changed its bytes".into());
+            }
+            let mut stalled_terminal = writer(0, false);
+            let started = Instant::now();
+            if write_native_http_response_parts(
+                &cx,
+                &shutdown,
+                Some(&terminal_receipt),
+                &mut stalled_terminal,
+                &[b"done"],
+            )
+            .await
+            .is_ok()
+                || started.elapsed() < WRITE_TIMEOUT
+                || started.elapsed() > Duration::from_secs(3)
+            {
+                return Err("terminal drain bypassed the write deadline".into());
             }
             Ok(())
         });

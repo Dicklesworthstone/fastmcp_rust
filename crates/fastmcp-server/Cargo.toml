@@ -87,6 +87,11 @@ ring = { workspace = true }
 # Test-only context construction and deterministic lab exercises.
 asupersync = { workspace = true, features = ["test-internals"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Real-socket backpressure probes fix the peer receive buffer through safe
+# sockopts instead of depending on a host's TCP autotuning defaults.
+rustix = { workspace = true, features = ["net", "std"] }
+
 [[test]]
 name = "pxy_leg_01_dual_era"
 path = "tests/pxy_leg_01_dual_era.rs"
