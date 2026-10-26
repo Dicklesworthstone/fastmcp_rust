@@ -11793,7 +11793,7 @@ impl ProxyClient {
         Self::resource_final_outcome(result)
     }
 
-    async fn read_resource_final_outcome_async(
+    pub(crate) async fn read_resource_final_outcome_async(
         &self,
         ctx: &McpContext,
         uri: &str,
@@ -11866,7 +11866,7 @@ impl ProxyClient {
         Self::prompt_final_outcome(result)
     }
 
-    async fn get_prompt_final_outcome_async(
+    pub(crate) async fn get_prompt_final_outcome_async(
         &self,
         ctx: &McpContext,
         name: &str,
@@ -15083,6 +15083,241 @@ IFS= read -r end
     #[test]
     fn proxy_custom_async_request_caller_runtime_planted_negative() {
         proxy_custom_async_request_caller_runtime_probe(true);
+    }
+
+    fn proxy_final_catalog_dispatch_caller_runtime_probe(cancel: bool) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        for target in ["resource", "template", "prompt"] {
+            for input_required in [false, true] {
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+                let state = Arc::new(Mutex::new(OwnedAsyncState {
+                    hold: true,
+                    ..OwnedAsyncState::default()
+                }));
+                let proxy = ProxyClient::from_backend_with_upstream_binding(
+                    OwnedAsyncBackend {
+                        state: Arc::clone(&state),
+                        cancel_preparation: None,
+                        disabled: false,
+                        input_required,
+                        fault: OwnedAsyncFault::None,
+                    },
+                    proxy_binding(ProtocolEra::Modern2026),
+                    "2026-07-28",
+                )
+                .unwrap();
+                let catalog = ProxyCatalog {
+                    tool_catalog_era: Some(ProtocolEra::Modern2026),
+                    final_resources: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "uri": "db://owned", "name": "owned",
+                            "title": "Exact resource", "_meta": {"peer": "resource"}
+                        }))
+                        .unwrap(),
+                    ],
+                    final_resource_templates: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "uriTemplate": "db://owned/{key}", "name": "owned-template",
+                            "title": "Exact template", "_meta": {"peer": "template"}
+                        }))
+                        .unwrap(),
+                    ],
+                    final_prompts: vec![
+                        serde_json::from_value(serde_json::json!({
+                            "name": "owned", "title": "Exact prompt",
+                            "arguments": [{"name": "subject", "required": true}],
+                            "_meta": {"peer": "prompt"}
+                        }))
+                        .unwrap(),
+                    ],
+                    ..ProxyCatalog::default()
+                };
+                let server = Arc::new(
+                    crate::ServerBuilder::new("exact-adapter-gateway", "1")
+                        .proxy(proxy.clone(), catalog)
+                        .unwrap()
+                        .build(),
+                );
+                let connection = crate::ModernConnection::new();
+                let cancellation = McpRequestCancellation::new();
+                let method = if target == "prompt" {
+                    "prompts/get"
+                } else {
+                    "resources/read"
+                };
+                let mut parameters = match target {
+                    "resource" => serde_json::json!({"uri": "db://owned"}),
+                    "template" => serde_json::json!({"uri": "db://owned/child"}),
+                    _ => serde_json::json!({
+                        "name": "owned", "arguments": {"subject": "owned"}
+                    }),
+                };
+                parameters["_meta"] = serde_json::json!({
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {"roots": {}}
+                });
+                runtime.block_on(async {
+                    let sibling_state = Arc::clone(&state);
+                    let sibling_proxy = proxy.clone();
+                    let sibling_cancel = cancellation.clone();
+                    let mut sibling = cx
+                        .spawn(move |sibling_cx| async move {
+                            let deadline = sibling_cx.now().saturating_add_nanos(2_000_000_000);
+                            while sibling_state.lock().unwrap().executed == 0 {
+                                assert!(
+                                    sibling_cx.now() < deadline,
+                                    "exact-final adapter must enter the owned async request"
+                                );
+                                asupersync::runtime::yield_now().await;
+                            }
+                            assert!(
+                                sibling_proxy.inner.try_lock().is_ok(),
+                                "waiting adapter releases its upstream route"
+                            );
+                            assert!(sibling_proxy.supports_completion().unwrap());
+                            assert!(!sibling_cx.is_cancel_requested());
+                            if cancel {
+                                assert!(sibling_cancel.cancel());
+                            } else {
+                                let wake = {
+                                    let mut state = sibling_state.lock().unwrap();
+                                    state.hold = false;
+                                    state.waker.take()
+                                };
+                                if let Some(wake) = wake {
+                                    wake.wake();
+                                }
+                            }
+                        })
+                        .unwrap();
+                    let request = fastmcp_protocol::JsonRpcRequest::new(
+                        method,
+                        Some(parameters.clone()),
+                        4410_i64,
+                    );
+                    let inbound = crate::InboundRequestContext::with_modern_connection(
+                        cx.clone(),
+                        crate::request_id_to_u64(request.id.as_ref()),
+                        crate::InboundRequestTransport::Memory,
+                        &connection,
+                    );
+                    let response = asupersync::time::timeout_at(
+                        cx.now().saturating_add_nanos(3_000_000_000),
+                        Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                            ProtocolPolicy::ModernOnly,
+                            &inbound,
+                            request,
+                            None,
+                            None,
+                            None,
+                            None,
+                            cancellation.clone(),
+                            None,
+                            Arc::new(|_| {}),
+                        ),
+                    )
+                    .await
+                    .expect("exact-final proxy dispatch must complete within its bound")
+                    .expect("request has a response ID");
+                    sibling.join(&cx).await.unwrap();
+                    assert_eq!(response.id, Some(4410_i64.into()));
+                    if cancel {
+                        assert!(response.result.is_none());
+                        assert_eq!(
+                            response.error.unwrap().code,
+                            i32::from(McpErrorCode::RequestCancelled).into()
+                        );
+                    } else {
+                        assert!(response.error.is_none(), "{:?}", response.error);
+                        let result = response.result.unwrap();
+                        if input_required {
+                            assert_eq!(result["resultType"], "input_required");
+                            assert_eq!(result["inputRequests"]["roots"]["method"], "roots/list");
+                            assert!(
+                                result["requestState"].is_string(),
+                                "the gateway must issue its own continuation"
+                            );
+                            assert_ne!(result["requestState"], "owned-state");
+                        } else {
+                            assert_eq!(result["resultType"], "complete");
+                            assert_eq!(
+                                result["peerExtra"]["exact"].to_string(),
+                                "1.20e+4",
+                                "the final result retains exact unknown number spelling"
+                            );
+                            if target == "prompt" {
+                                assert_eq!(result["messages"][0]["content"]["text"], "owned");
+                            } else {
+                                assert_eq!(result["contents"][0]["text"], "owned");
+                                assert_eq!(result["ttlMs"], 123);
+                                assert_eq!(result["cacheScope"], "private");
+                            }
+                        }
+                    }
+                    {
+                        let state = state.lock().unwrap();
+                        assert_eq!(
+                            (
+                                state.prepared,
+                                state.executed,
+                                state.dropped,
+                                state.synchronous_calls,
+                            ),
+                            (1, 1, 1, 0),
+                            "final catalog dispatch never enters synchronous backend hooks"
+                        );
+                        assert_eq!(state.observed[0].1, method);
+                        if target == "template" {
+                            assert_eq!(state.observed[0].2["uri"], "db://owned/child");
+                        }
+                        if target == "prompt" {
+                            assert_eq!(state.observed[0].2["arguments"]["subject"], "owned");
+                        }
+                    }
+                    assert!(!cx.is_cancel_requested());
+                    if cancel {
+                        state.lock().unwrap().hold = false;
+                        let retry = fastmcp_protocol::JsonRpcRequest::new(
+                            method,
+                            Some(parameters.clone()),
+                            4411_i64,
+                        );
+                        let inbound = crate::InboundRequestContext::with_modern_connection(
+                            cx.clone(),
+                            crate::request_id_to_u64(retry.id.as_ref()),
+                            crate::InboundRequestTransport::Memory,
+                            &connection,
+                        );
+                        let next = asupersync::time::timeout_at(
+                            cx.now().saturating_add_nanos(3_000_000_000),
+                            server.dispatch_stateless(&inbound, &retry),
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap();
+                        assert!(
+                            next.error.is_none(),
+                            "request cancellation must leave the same gateway usable: {:?}",
+                            next.error
+                        );
+                        assert_eq!(state.lock().unwrap().dropped, 2);
+                    }
+                });
+            }
+        }
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn proxy_final_catalog_dispatch_caller_runtime_positive() {
+        proxy_final_catalog_dispatch_caller_runtime_probe(false);
+    }
+
+    #[test]
+    fn proxy_final_catalog_dispatch_caller_runtime_planted_negative() {
+        proxy_final_catalog_dispatch_caller_runtime_probe(true);
     }
 
     #[test]
