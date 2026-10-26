@@ -847,6 +847,7 @@ impl ClientBuilder {
             builder.client_info.clone(),
             client_capabilities,
             HttpConnectionSettings {
+                client_implementation,
                 mcp_apps: builder.mcp_apps_settings,
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
@@ -856,9 +857,6 @@ impl ClientBuilder {
             },
         )
         .await?;
-        if let Some(implementation) = client_implementation {
-            connection.set_client_implementation(implementation);
-        }
         match connection.selected_protocol_era() {
             fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
                 if reverse_request_handlers.has_modern_handlers() =>
@@ -935,12 +933,13 @@ impl ClientBuilder {
         // discovery-or-initialize flow and dominated this future's 16 KB, which
         // every caller of this public method paid at its own `.await`
         // (bd-y2xoc). Boxing the inner step keeps the public signature intact.
-        let mut client = Box::pin(HttpClient::connect_with_settings(
+        let client = Box::pin(HttpClient::connect_with_settings(
             cx,
             builder.protocol_plan,
             builder.client_info,
             client_capabilities,
             HttpConnectionSettings {
+                client_implementation,
                 mcp_apps: builder.mcp_apps_settings,
                 extensions: builder.client_extension_runtime,
                 bearer: builder.http_bearer_credential,
@@ -951,9 +950,6 @@ impl ClientBuilder {
             reverse_request_handlers,
         ))
         .await?;
-        if let Some(implementation) = client_implementation {
-            client.set_client_implementation(implementation);
-        }
         if cx.checkpoint().is_err() {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }

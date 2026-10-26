@@ -4290,6 +4290,7 @@ fn native_http_client() -> HttpClient {
 /// discovery and ready-client construction paths.
 #[derive(Default)]
 pub(crate) struct HttpConnectionSettings {
+    pub(crate) client_implementation: Option<fastmcp_protocol::common_types::Implementation>,
     pub(crate) mcp_apps: Option<McpAppsClientSettings>,
     pub(crate) extensions: Option<Arc<ClientExtensionRuntime>>,
     pub(crate) bearer: Option<crate::http_auth::BoundBearerCredential>,
@@ -7157,6 +7158,7 @@ impl ModernHttpClient {
         validate_protocol_plan_feature(&protocol_plan)
             .map_err(ModernHttpClientError::FeatureUnavailable)?;
         let HttpConnectionSettings {
+            client_implementation,
             mcp_apps: mcp_apps_settings,
             extensions: client_extension_runtime,
             bearer: bearer_credential,
@@ -7222,9 +7224,15 @@ impl ModernHttpClient {
                 .flatten(),
             configured_extensions.as_ref(),
         );
+        // Discovery is the first client-authored request. It must carry the
+        // same configured identity as every request made by the ready client,
+        // before the peer can make any identity-dependent discovery decision.
+        let probe_identity = client_implementation
+            .clone()
+            .unwrap_or_else(|| client_info.to_implementation());
         let probe_request = build_modern_request_with_extensions(
             &modern_post_target,
-            &client_info.to_implementation(),
+            &probe_identity,
             &client_capabilities,
             SERVER_DISCOVER,
             serde_json::json!({}),
@@ -7280,7 +7288,7 @@ impl ModernHttpClient {
                     protocol_plan,
                     modern_post_target,
                     client_info,
-                    client_implementation: None,
+                    client_implementation,
                     final_log_level: None,
                     client_capabilities,
                     mcp_apps_settings,
@@ -12256,6 +12264,7 @@ mod tests {
             },
             ClientCapabilities::default(),
             super::HttpConnectionSettings {
+                client_implementation: None,
                 mcp_apps: Some(
                     McpAppsClientSettings::new(vec![compatibility_mime_type.to_owned()])
                         .expect("compatibility Apps test MIME is valid"),
@@ -12424,6 +12433,123 @@ mod tests {
             0,
         )
         .expect("complete local HTTP plan must be accepted")
+    }
+
+    fn assert_builder_identity_stamped_from_first_http_request(with_extras: bool) {
+        for ready_client in [false, true] {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("bind configured-identity HTTP peer");
+            listener
+                .set_nonblocking(true)
+                .expect("bound configured-identity peer accepts");
+            let modern_target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let mut expected_identity = serde_json::json!({
+                "name": "configured-http-client",
+                "version": "2.3.4"
+            });
+            let mut builder = ClientBuilder::new()
+                .client_info("configured-http-client", "2.3.4")
+                .protocol_plan(plan(
+                    &modern_target,
+                    "http://127.0.0.1:9/unused-sse",
+                    "http://127.0.0.1:9/unused-messages",
+                    ProtocolPolicy::ModernOnly,
+                ));
+            if with_extras {
+                let icon = fastmcp_protocol::common_types::RawIcon::try_new(
+                    "https://client.example/icon.png",
+                )
+                .expect("valid local client icon");
+                builder = builder
+                    .title("Configured client")
+                    .description("Identity supplied before any network request")
+                    .website_url("https://client.example/")
+                    .icons(vec![icon]);
+                expected_identity["title"] = serde_json::json!("Configured client");
+                expected_identity["description"] =
+                    serde_json::json!("Identity supplied before any network request");
+                expected_identity["websiteUrl"] = serde_json::json!("https://client.example/");
+                expected_identity["icons"] =
+                    serde_json::json!([{"src":"https://client.example/icon.png"}]);
+            }
+            let peer = thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let mut identities = Vec::new();
+                for method in ["server/discover", "tools/list"] {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "missing {method} request");
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            Err(error) => panic!("identity peer accept failed: {error}"),
+                        }
+                    };
+                    let request = read_request(&mut stream);
+                    let document: serde_json::Value =
+                        serde_json::from_slice(&request.body).expect("valid client request");
+                    assert_eq!(document["method"], method);
+                    identities.push(
+                        document["params"]["_meta"][super::FINAL_CLIENT_INFO_META_KEY].clone(),
+                    );
+                    let result = if method == "server/discover" {
+                        serde_json::json!({
+                            "resultType":"complete", "supportedVersions":[MODERN_PROTOCOL_VERSION],
+                            "capabilities":{"tools":{}}, "ttlMs":0, "cacheScope":"private"
+                        })
+                    } else {
+                        serde_json::json!({
+                            "resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"
+                        })
+                    };
+                    let response = serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc":"2.0", "id":document["id"], "result":result
+                    }))
+                    .expect("encode identity peer response");
+                    write_response(&mut stream, 200, "application/json", &response);
+                }
+                identities
+            });
+            let cx = Cx::for_request();
+            if ready_client {
+                let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx))
+                    .expect("ready client completes discovery with configured identity");
+                assert!(matches!(
+                    runtime_block_on(client.list_tools(&cx, None)).unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+            } else {
+                let mut connection = runtime_block_on(builder.connect_http_with_cx(&cx))
+                    .expect("connection completes discovery with configured identity");
+                let response = runtime_block_on(connection.request_json(
+                    &cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    RequestId::Number(2),
+                    4096,
+                ))
+                .expect("connection sends its ordinary request");
+                assert!(response.error.is_none());
+            }
+            assert_eq!(
+                peer.join().expect("identity peer joins"),
+                vec![expected_identity.clone(), expected_identity],
+                "discovery and ready requests use one complete configured identity"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_http_builder_stamps_identity_before_discovery() {
+        assert_builder_identity_stamped_from_first_http_request(true);
+    }
+
+    #[test]
+    fn modern_http_builder_default_identity_remains_minimal() {
+        // Change only the builder's optional identity configuration. Neither
+        // connection entry point may invent presentation metadata.
+        assert_builder_identity_stamped_from_first_http_request(false);
     }
 
     #[cfg(not(feature = "legacy-2024-11-05"))]
@@ -12875,6 +13001,7 @@ mod tests {
                     ..ClientCapabilities::default()
                 },
                 super::HttpConnectionSettings {
+                    client_implementation: None,
                     mcp_apps: None,
                     extensions: Some(Arc::clone(&settings)),
                     bearer: None,
