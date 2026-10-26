@@ -812,6 +812,11 @@ impl McpAppsWireHostConfiguration {
 ///
 /// The default methods deliberately perform no embedder effect. Reused core
 /// methods have no default: a Host must provide fresh client-owned forwarding.
+///
+/// Every View request, including initialization, owns a bounded operation
+/// budget. A pending callback requires the caller's timer driver and is
+/// dropped when that request expires or matching View cancellation wins.
+/// Immediate callbacks remain usable without a timer driver.
 #[allow(async_fn_in_trait)]
 pub trait McpAppsWireHostPolicy {
     async fn initialize(
@@ -2866,6 +2871,14 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
         } else {
             None
         };
+        // Every admitted View request owns one bounded policy operation.
+        // Capture this clock once, before polling the callback: queued frames
+        // and repeated wakeups must never restart its budget. Catalog
+        // continuations retain the deadline of their original pagination chain.
+        let deadline = catalog.as_ref().map_or_else(
+            || WireHostDeadline::new(cx),
+            |request| request.deadline.clone(),
+        );
         let cancellation = McpRequestCancellation::new();
         let mut execution = Box::pin(async {
             let operation = Self::dispatch_view_request(
@@ -2879,10 +2892,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
                     .as_ref()
                     .map_or(params.as_ref(), |request| Some(&request.params)),
             );
-            match &catalog {
-                Some(request) => await_wire_operation(cx, &request.deadline, operation).await,
-                None => operation.await,
-            }
+            await_wire_operation(cx, &deadline, operation).await
         });
         let mut deferred_error = None;
         loop {
@@ -8111,6 +8121,413 @@ exec sleep 10
         response
     }
 
+    const VIEW_OPERATION_IDLE_NANOS: u64 = 60 * 1_000_000_000;
+
+    struct ViewOperationDrop(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Drop for ViewOperationDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct DeadlineWirePolicy {
+        delayed_method: McpAppsRoutedMethod,
+        delay_nanos: Option<u64>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+        committed: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DeadlineWirePolicy {
+        fn new(delayed_method: McpAppsRoutedMethod, delay_nanos: Option<u64>) -> Self {
+            Self {
+                delayed_method,
+                delay_nanos,
+                entered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                committed: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dropped: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        async fn before_commit(&self, method: McpAppsRoutedMethod) {
+            if method != self.delayed_method {
+                return;
+            }
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _drop = ViewOperationDrop(Arc::clone(&self.dropped));
+            if let Some(delay) = self.delay_nanos {
+                let cx = Cx::current().expect("policy runs in the caller's context");
+                Sleep::new(cx.now().saturating_add_nanos(delay)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+            self.committed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl McpAppsWireHostPolicy for DeadlineWirePolicy {
+        async fn initialize(
+            &mut self,
+            _params: &McpAppsPinnedInitializeParams,
+            configuration: &McpAppsWireHostConfiguration,
+        ) -> McpAppsPinnedInitializeResult {
+            self.before_commit(McpAppsRoutedMethod::Initialize).await;
+            configuration.initialize_result()
+        }
+
+        async fn operation(
+            &mut self,
+            method: McpAppsRoutedMethod,
+            _params: Option<&Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            self.before_commit(method).await;
+            Ok(json!({}))
+        }
+
+        async fn update_model_context(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            _params: &McpAppsUpdateModelContextParams,
+        ) -> Result<(), McpAppsHostError> {
+            self.before_commit(McpAppsRoutedMethod::UpdateModelContext)
+                .await;
+            Ok(())
+        }
+
+        async fn request_display_mode(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            params: McpAppsDisplayModeParams,
+            _current: Option<McpAppsDisplayMode>,
+        ) -> Result<McpAppsDisplayModeParams, McpAppsHostError> {
+            self.before_commit(McpAppsRoutedMethod::RequestDisplayMode)
+                .await;
+            Ok(params)
+        }
+
+        async fn dispatch_reused_request(
+            &mut self,
+            _cx: &Cx,
+            _cancellation: &McpRequestCancellation,
+            method: McpAppsRoutedMethod,
+            _params: Option<Value>,
+        ) -> Result<Value, McpAppsHostError> {
+            self.before_commit(method).await;
+            Ok(match method {
+                McpAppsRoutedMethod::ToolsCall => {
+                    json!({"content":[{"type":"text","text":"finished"}]})
+                }
+                McpAppsRoutedMethod::ResourcesRead => {
+                    json!({"contents":[{"uri":"test://deadline","text":"finished"}]})
+                }
+                _ => panic!("deadline fixture expected a reused core method"),
+            })
+        }
+    }
+
+    fn run_view_operation_deadline_lab(operation: impl Future<Output = ()> + Send + 'static) {
+        let mut lab = asupersync::lab::LabRuntime::new(
+            asupersync::lab::LabConfig::new(859_04)
+                .with_auto_advance()
+                .max_steps(512),
+        );
+        let budget = asupersync::Budget::INFINITE;
+        let region = lab.state.create_root_region(budget);
+        let (task, mut handle) = lab.state.create_task(region, budget, operation).unwrap();
+        lab.scheduler.lock().schedule(task, budget.priority);
+        let report = lab.run_with_auto_advance();
+        assert_eq!(
+            report.termination,
+            asupersync::lab::runtime::AutoAdvanceTermination::Quiescent
+        );
+        assert_eq!(handle.try_join().unwrap(), Some(()), "every wire row ran");
+    }
+
+    #[test]
+    fn closed_wire_view_operation_deadline_bounds_every_effect_and_reused_request() {
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
+            for (method, name, params) in [
+                (
+                    McpAppsRoutedMethod::UpdateModelContext,
+                    "ui/update-model-context",
+                    json!({"content":[{"type":"text","text":"new context"}]}),
+                ),
+                (
+                    McpAppsRoutedMethod::RequestDisplayMode,
+                    "ui/request-display-mode",
+                    json!({"mode":"fullscreen"}),
+                ),
+                (
+                    McpAppsRoutedMethod::OpenLink,
+                    "ui/open-link",
+                    json!({"url":"https://example.com/"}),
+                ),
+                (
+                    McpAppsRoutedMethod::DownloadFile,
+                    "ui/download-file",
+                    json!({"contents":[{"uri":"test://download","text":"download"}]}),
+                ),
+                (
+                    McpAppsRoutedMethod::Message,
+                    "ui/message",
+                    json!({"role":"user","content":[{"type":"text","text":"message"}]}),
+                ),
+                (
+                    McpAppsRoutedMethod::ToolsCall,
+                    "tools/call",
+                    json!({"name":"deadline_tool","arguments":{}}),
+                ),
+                (
+                    McpAppsRoutedMethod::ResourcesRead,
+                    "resources/read",
+                    json!({"uri":"test://deadline"}),
+                ),
+            ] {
+                for completes in [true, false] {
+                    let delay = VIEW_OPERATION_IDLE_NANOS - if completes { 1_000_000 } else { 0 };
+                    let policy = DeadlineWirePolicy::new(method, Some(delay));
+                    let entered = Arc::clone(&policy.entered);
+                    let committed = Arc::clone(&policy.committed);
+                    let dropped = Arc::clone(&policy.dropped);
+                    let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                    let mut host = McpAppsWireHost::new_negotiated(
+                        transport,
+                        stateful_wire_configuration(),
+                        policy,
+                        activation_proof(),
+                    );
+                    activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                    view.send_to_host(
+                        &cx,
+                        json!({
+                            "jsonrpc":"2.0","id":"bounded","method":name,"params":params
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .unwrap();
+                    // A queued sibling must not refresh the first request's
+                    // clock or lose its own correlation when that request expires.
+                    view.send_to_host(
+                        &cx,
+                        json!({
+                            "jsonrpc":"2.0","id":"sibling","method":"ping","params":{}
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .unwrap();
+                    let started = cx.now();
+                    host.process_next(&cx).await.unwrap();
+                    let response: Value =
+                        serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    assert_eq!(response["id"], "bounded");
+                    assert_eq!(
+                        response.get("result").is_some(),
+                        completes,
+                        "{name}: {response}"
+                    );
+                    if !completes {
+                        assert_eq!(response["error"]["code"], -32_000);
+                        assert_eq!(
+                            cx.now().as_nanos() - started.as_nanos(),
+                            VIEW_OPERATION_IDLE_NANOS
+                        );
+                    }
+                    assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    assert_eq!(
+                        committed.load(std::sync::atomic::Ordering::SeqCst),
+                        usize::from(completes)
+                    );
+                    assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+                    if method == McpAppsRoutedMethod::UpdateModelContext {
+                        assert_eq!(host.state.model_context.is_some(), completes);
+                    }
+                    if method == McpAppsRoutedMethod::RequestDisplayMode {
+                        assert_eq!(
+                            host.display_mode(),
+                            Some(if completes {
+                                McpAppsDisplayMode::Fullscreen
+                            } else {
+                                McpAppsDisplayMode::Inline
+                            })
+                        );
+                    }
+                    host.process_next(&cx).await.unwrap();
+                    let sibling: Value =
+                        serde_json::from_str(&view.receive_from_host(&cx).await.unwrap()).unwrap();
+                    assert_eq!(sibling, json!({"jsonrpc":"2.0","id":"sibling","result":{}}));
+                    assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                    assert_eq!(
+                        stateful_wire_request(
+                            &mut host,
+                            &mut view,
+                            &cx,
+                            "bounded",
+                            "ping",
+                            json!({})
+                        )
+                        .await["result"],
+                        json!({}),
+                        "the completed or expired correlation was released once",
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_operation_deadline_bounds_initialization_without_promoting_lifecycle() {
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
+            for completes in [true, false] {
+                let delay = VIEW_OPERATION_IDLE_NANOS - if completes { 1_000_000 } else { 0 };
+                let policy = DeadlineWirePolicy::new(McpAppsRoutedMethod::Initialize, Some(delay));
+                let committed = Arc::clone(&policy.committed);
+                let dropped = Arc::clone(&policy.dropped);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    wire_configuration(),
+                    policy,
+                    activation_proof(),
+                );
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "bounded-init",
+                    "ui/initialize",
+                    json!({
+                        "appInfo":{"name":"view","version":"1"}, "appCapabilities":{},
+                        "protocolVersion":MCP_APPS_HOST_VIEW_PROTOCOL_VERSION
+                    }),
+                )
+                .await;
+                assert_eq!(response.get("result").is_some(), completes);
+                assert_eq!(
+                    committed.load(std::sync::atomic::Ordering::SeqCst),
+                    usize::from(completes)
+                );
+                assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(host.state.capabilities.is_some(), completes);
+                assert_eq!(
+                    host.lifecycle() == McpAppsBridgeLifecycle::AwaitingInitialized,
+                    completes
+                );
+                assert_eq!(
+                    stateful_wire_request(&mut host, &mut view, &cx, "probe", "ping", json!({}))
+                        .await["result"],
+                    json!({}),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_operation_deadline_without_timer_refuses_pending_effect_only() {
+        block_on(async {
+            let cx = Cx::for_testing();
+            let policy = DeadlineWirePolicy::new(McpAppsRoutedMethod::UpdateModelContext, None);
+            let committed = Arc::clone(&policy.committed);
+            let dropped = Arc::clone(&policy.dropped);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                stateful_wire_configuration(),
+                policy,
+                activation_proof(),
+            );
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let response = stateful_wire_request(
+                &mut host,
+                &mut view,
+                &cx,
+                "no-timer",
+                "ui/update-model-context",
+                json!({"content":[{"type":"text","text":"must not commit"}]}),
+            )
+            .await;
+            assert_eq!(response["error"]["code"], -32_000);
+            assert_eq!(committed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(host.state.model_context.is_none());
+            assert_eq!(
+                stateful_wire_request(&mut host, &mut view, &cx, "no-timer", "ping", json!({}))
+                    .await["result"],
+                json!({}),
+            );
+        });
+    }
+
+    #[test]
+    fn closed_wire_view_operation_deadline_does_not_delay_matching_cancellation() {
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
+            let policy = DeadlineWirePolicy::new(McpAppsRoutedMethod::UpdateModelContext, None);
+            let entered = Arc::clone(&policy.entered);
+            let committed = Arc::clone(&policy.committed);
+            let dropped = Arc::clone(&policy.dropped);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = McpAppsWireHost::new_negotiated(
+                transport,
+                stateful_wire_configuration(),
+                policy,
+                activation_proof(),
+            );
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc":"2.0","id":"cancelled","method":"ui/update-model-context",
+                    "params":{"content":[{"type":"text","text":"must not commit"}]}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            let started = cx.now();
+            let mut pending = Box::pin(host.process_next(&cx));
+            poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                assert_eq!(entered.load(std::sync::atomic::Ordering::SeqCst), 1);
+                Poll::Ready(())
+            })
+            .await;
+            view.send_to_host(
+                &cx,
+                json!({
+                    "jsonrpc":"2.0","method":"notifications/cancelled",
+                    "params":{"requestId":"cancelled"}
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            pending.await.unwrap();
+            assert_eq!(
+                cx.now(),
+                started,
+                "cancellation must not wait for its deadline"
+            );
+            assert_eq!(committed.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(host.state.model_context.is_none());
+            assert_eq!(
+                stateful_wire_request(&mut host, &mut view, &cx, "cancelled", "ping", json!({}))
+                    .await,
+                json!({"jsonrpc":"2.0","id":"cancelled","result":{}}),
+                "matching cancellation emits no stale response and releases only its correlation",
+            );
+        });
+    }
+
     struct SamplingEffects {
         allow: bool,
         yield_once: bool,
@@ -8860,9 +9277,9 @@ exec sleep 10
 
     #[test]
     fn closed_wire_context_request_cancellation_suppresses_only_its_owned_effect() {
-        block_on(async {
+        run_view_operation_deadline_lab(async {
             for matching in [true, false] {
-                let cx = Cx::for_testing();
+                let cx = Cx::current().unwrap();
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                 let mut policy = state_recording_policy();
                 policy.context = ContextDecision::YieldOnce;
@@ -9361,8 +9778,8 @@ exec sleep 10
 
     #[test]
     fn closed_wire_process_next_cancels_a_yielding_view_request_without_a_response() {
-        block_on(async {
-            let cx = Cx::for_testing();
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
             let events = Arc::new(Mutex::new(Vec::new()));
             let mut host = McpAppsWireHost::new_negotiated(
@@ -9457,8 +9874,8 @@ exec sleep 10
 
     #[test]
     fn closed_wire_sync_cancellation_hook_releases_never_returning_view_request() {
-        block_on(async {
-            let cx = Cx::for_testing();
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
             let events = Arc::new(Mutex::new(Vec::new()));
             let mut host = McpAppsWireHost::new_negotiated(
@@ -9553,8 +9970,8 @@ exec sleep 10
 
     #[test]
     fn closed_wire_one_variable_wrong_cancellation_preserves_a_yielding_view_request() {
-        block_on(async {
-            let cx = Cx::for_testing();
+        run_view_operation_deadline_lab(async {
+            let cx = Cx::current().unwrap();
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
             let events = Arc::new(Mutex::new(Vec::new()));
             let mut host = McpAppsWireHost::new_negotiated(
