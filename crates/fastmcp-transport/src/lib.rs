@@ -112,6 +112,26 @@ pub const MAX_CLIENT_TRANSPORT_SOURCE_BYTES: usize = 10 * 1024 * 1024;
 /// Each operation receives an asupersync capability context (`Cx`). Concrete
 /// implementations document where they check cancellation or budget state.
 ///
+/// # Synchronous by design; the WebSocket transports deliberately do not implement it
+///
+/// `send` and `recv` below are plain `fn`, not `async fn`. Every implementor in
+/// this crate -- `AsyncStdioTransport`, `MemoryTransport`,
+/// `StreamableHttpTransport` -- is synchronous underneath, so satisfying them is
+/// a direct call.
+///
+/// `AsyncWsClientTransport` and `AsyncWsServerTransport` are not implementors
+/// and are not missing one. Their `send`, `recv` and `close` are `pub async fn`
+/// with otherwise identical signatures, so the only way to satisfy a
+/// synchronous `send` would be to drive an async body to completion inside it --
+/// a shipped `block_on`, which this project counts as a forbidden quantity in
+/// production code. The asymmetry is the trait's synchrony, not an oversight
+/// about WebSocket: `websocket.rs` imports this trait only under `cfg(test)`.
+///
+/// Closing it means an async transport trait rather than an impl on those two
+/// types. That is a decision about public API shape and belongs to the
+/// structure owner; until it is taken, callers drive the WebSocket transports
+/// through their inherent async methods.
+///
 /// # Cancel-Safety
 ///
 /// Implementations should:

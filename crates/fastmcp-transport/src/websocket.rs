@@ -23,6 +23,51 @@
 //! parsed request for the caller's route and authentication decision before
 //! it can complete that admission.
 //!
+//! # RFC 6455 invariants: which layer enforces each one
+//!
+//! This module's own frame codec -- the `WsFrame` opcode table, `WsReader`,
+//! `WsWriter`, `validate_outbound_frame` and `validate_peer_mask` -- is
+//! `#[cfg(test)]` and is in no release binary. The framing that ships is
+//! asupersync's. A green test against this module's codec therefore proves
+//! nothing about the shipped path, which is why the split is recorded here
+//! rather than left to be inferred from a passing test.
+//!
+//! Measured against the pinned `asupersync =0.5.0` registry archive, whose
+//! `Cargo.lock` checksum is
+//! `f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511`. Upstream
+//! paths are relative to that archive's `src/`.
+//!
+//! - **Mask direction** (client MUST mask, server MUST NOT): asupersync, in
+//!   `net/websocket/frame.rs:602-606`, keyed on the codec's `Role`. Both
+//!   production paths reach it with the correct role: the server transport
+//!   below builds `FrameCodec::server()` for each direction, and the client
+//!   path delegates to `WebSocket`, which builds `FrameCodec::client()` in
+//!   `net/websocket/client.rs:444`.
+//! - **126/127 extended payload length**: asupersync, `frame.rs:652` and
+//!   `:663`. Stricter than the RFC minimum -- a non-minimal length encoding and
+//!   a set most-significant bit on the 64-bit form are both refused
+//!   (`:697`, `:711`, `:718`).
+//! - **Control frame must not be fragmented and must be at most 125 bytes**:
+//!   asupersync, `frame.rs:609-613` on decode. The encode side asserts instead
+//!   (`frame.rs:247`), so an oversized control payload is a panic there rather
+//!   than a typed refusal.
+//! - **Close-code validity**: asupersync owns which codes are legal, through
+//!   `CloseReason::parse` (`net/websocket/close.rs:109`) and `wire_code`
+//!   (`:238`). This module never echoes a raw peer code: a peer may send a code
+//!   that is valid to receive but not to send, so the server reply is rebuilt
+//!   through `CloseReason`.
+//! - **Interleaved data frame during fragmentation**: **this module**, not
+//!   asupersync. The upstream codec is per-frame and carries no fragmentation
+//!   state, so message assembly is ours. The production dispatch refuses a
+//!   `Text` frame arriving inside a fragmented message and a `Continuation`
+//!   frame arriving outside one, and refuses `Binary` outright as unsupported
+//!   by MCP.
+//!
+//! That last invariant is the one with no upstream owner, so it is the one this
+//! repository has to prove on the production path; proving it against the
+//! `cfg(test)` codec above would demonstrate a property of code that does not
+//! ship.
+//!
 //! # Example
 //!
 //! ```ignore
