@@ -22,6 +22,7 @@ use super::super::{guard_response, scope};
 use super::{
     SecuredHttpIoLimits,
     ingress::{Ingress, SecuredCodec},
+    liveness::SubscriptionDrain,
     tls::ConnectionIo,
 };
 use crate::{
@@ -48,6 +49,7 @@ pub(super) async fn serve(
     shutdown: HttpListenerShutdown,
     policy: Arc<HttpSecurityPolicy>,
     io: SecuredHttpIoLimits,
+    subscription_drain: &SubscriptionDrain,
 ) {
     let body_limit = endpoint.server.http_config.handler_config.max_body_size;
     let mut framed = Framed::new(
@@ -330,6 +332,7 @@ pub(super) async fn serve(
                 &cors,
                 lease,
                 io,
+                subscription_drain,
             )
             .await;
         }
@@ -728,6 +731,7 @@ async fn sse(
     cors: &CorsResponseHeaders,
     mut lease: Option<SseAuthorizationLease>,
     io: SecuredHttpIoLimits,
+    subscription_drain: &SubscriptionDrain,
 ) -> Result<(), ()> {
     if let Some(lease) = lease.as_mut() {
         lease.check(cx).map_err(|_| ())?;
@@ -736,6 +740,13 @@ async fn sse(
     let cancellation = sender.request_cancellation();
     let terminal = Arc::new(FinalSubscriptionTerminalDelivery::default());
     let (gate, mut election) = ModernSseOutcomeGate::new();
+    if request.method == "subscriptions/listen" {
+        subscription_drain.register(
+            cancellation.clone(),
+            Arc::clone(&terminal),
+            Arc::clone(&gate),
+        );
+    }
     let (mut reader, mut writer) = stream.into_split();
     let task = spawn_modern_sse_dispatch(
         cx,
@@ -807,7 +818,8 @@ async fn sse(
             }
             match pop_sse_body_event(&response) {
                 Ok(Some(event)) => {
-                    let control = final_subscription_terminal_event(&event);
+                    let control = response.is_finished()
+                        && final_subscription_terminal_event(&event);
                     let complete = final_subscription_terminal_response_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
@@ -1010,6 +1022,312 @@ mod tests {
         fn drop(&mut self) {
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    fn elected_drain(
+        cancellation: &McpRequestCancellation,
+    ) -> (SubscriptionDrain, Arc<FinalSubscriptionTerminalDelivery>) {
+        let subscription = SubscriptionDrain::default();
+        let terminal = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        let (gate, _election) = ModernSseOutcomeGate::new();
+        assert!(gate.elect(ModernSseDispatchElection::Stream));
+        subscription.register(cancellation.clone(), Arc::clone(&terminal), gate);
+        assert!(terminal.mark_cancellation_enqueued());
+        (subscription, terminal)
+    }
+
+    #[test]
+    fn elected_shutdown_masks_ambient_read_cancellation_but_preserves_real_peer_refusal() {
+        for peer_result in 0..4 {
+            let cx = Cx::for_testing();
+            let shutdown = HttpListenerShutdown::new(&cx);
+            let request = McpRequestCancellation::new();
+            let sibling = McpRequestCancellation::new();
+            let (subscription, terminal) = elected_drain(&request);
+            let read_polls = AtomicUsize::new(0);
+            let write_polls = AtomicUsize::new(0);
+            let peer = poll_fn(|_| {
+                read_polls.fetch_add(1, Ordering::SeqCst);
+                assert!(cx.checkpoint().is_ok(), "ambient shutdown must not masquerade as peer EOF");
+                match peer_result {
+                    0 => Poll::Pending,
+                    1 => Poll::Ready(Ok(0)),
+                    2 => Poll::Ready(Err(io::Error::from(io::ErrorKind::ConnectionReset))),
+                    3 => Poll::Ready(Ok(1)),
+                    _ => unreachable!(),
+                }
+            });
+            let operation = async {
+                let result = monitor_response_peer(&request, peer, async {
+                    let mut authorization = None;
+                    guard_response(&cx, &mut authorization, async {
+                        write_polls.fetch_add(1, Ordering::SeqCst);
+                    })
+                    .await
+                    .map_err(|_| ())
+                })
+                .await;
+                if result.is_ok() {
+                    terminal.mark_drained();
+                } else {
+                    terminal.mark_failed();
+                }
+                result
+            };
+            cx.set_cancel_requested(true);
+            request.cancel();
+            let mut driving = Box::pin(super::super::liveness::drive_connection(
+                &cx, &shutdown, &subscription, Duration::from_secs(1), operation,
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            let result = driving.as_mut().poll(&mut task);
+            if peer_result == 0 {
+                assert!(matches!(result, Poll::Ready(Ok(Ok(())))));
+                assert_eq!(write_polls.load(Ordering::SeqCst), 1);
+                assert!(terminal.is_drained());
+            } else {
+                assert!(matches!(result, Poll::Ready(Err(_)) | Poll::Ready(Ok(Err(())))));
+                assert_eq!(write_polls.load(Ordering::SeqCst), 0);
+                assert_eq!(terminal.state.load(Ordering::Acquire), crate::FINAL_TERMINAL_FAILED);
+            }
+            assert_eq!(read_polls.load(Ordering::SeqCst), 1);
+            assert!(!sibling.is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn elected_shutdown_revalidates_original_credential_before_any_write() {
+        use crate::http_admission::security::endpoint::revalidation::{
+            SseAuthorizationError, SseRevalidationPolicy,
+        };
+        use crate::http_admission::security::scope_policy::{
+            RequiredScopes, ScopeImplicationPolicy,
+        };
+        const TOKEN: &str = "native-terminal-lease-token";
+
+        for refusal in 0..6 {
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                    Arc::clone(&clock),
+                ))
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let shutdown = HttpListenerShutdown::new(&cx);
+            let mut facts = fastmcp_core::AuthContext::with_subject("original-subscription-owner");
+            facts.scopes = vec!["read".to_owned()];
+            facts.claims = Some(serde_json::json!({"tenant":"original"}));
+            let verifier = crate::StaticTokenVerifier::new([(TOKEN, facts.clone())]).unwrap();
+            let server = Arc::new(Server::new("terminal-lease-test", "1")
+                .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly)
+                .unwrap()
+                .auth_provider(crate::TokenAuthProvider::new(verifier.clone()))
+                .build());
+            let request = JsonRpcRequest::new("subscriptions/listen", None, 701_i64);
+            let authorization = TransportAuthorization::from_singleton_header(Some(
+                "Bearer native-terminal-lease-token",
+            ));
+            let receipt = server.preauthenticate_http_request(&cx, &request, &authorization).unwrap();
+            let scopes = ScopeRequestPolicy::new(
+                1,
+                ScopeImplicationPolicy::exact(1).unwrap(),
+                vec![(
+                    "subscriptions/listen".to_owned(),
+                    RequiredScopes::new(vec!["read".to_owned()]).unwrap(),
+                )],
+            ).unwrap();
+            let mut lease = Some(SseAuthorizationLease::new(
+                &cx, server, &request, &authorization, &receipt, scopes,
+                SseRevalidationPolicy::new(Duration::from_millis(100), Duration::from_millis(100), 8).unwrap(),
+            ).unwrap());
+            match refusal {
+                0 => {}
+                1 => { assert!(verifier.revoke_token(TOKEN).unwrap()); }
+                2 => {
+                    verifier.replace_tokens_with_expiry([
+                        (TOKEN, facts.clone(), Some(std::time::Instant::now())),
+                    ]).unwrap();
+                }
+                3 => {
+                    let mut changed = facts.clone();
+                    changed.scopes = vec!["write".to_owned()];
+                    verifier.replace_tokens([(TOKEN, changed)]).unwrap();
+                }
+                4 => {
+                    let mut changed = facts.clone();
+                    changed.claims = Some(serde_json::json!({"tenant":"replacement"}));
+                    verifier.replace_tokens([(TOKEN, changed)]).unwrap();
+                }
+                5 => {
+                    let mut changed = facts.clone();
+                    changed.subject = Some("replacement-owner".to_owned());
+                    verifier.replace_tokens([(TOKEN, changed)]).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            clock.advance_to(asupersync::Time::from_nanos(100_000_000));
+            let cancellation = McpRequestCancellation::new();
+            let (subscription, terminal) = elected_drain(&cancellation);
+            let writes = AtomicUsize::new(0);
+            let operation = async {
+                let result = monitor_response_peer(&cancellation, pending::<io::Result<usize>>(), async {
+                    guard_response(&cx, &mut lease, async {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                    }).await.map_err(|_| ())
+                }).await;
+                if result.is_ok() {
+                    terminal.mark_drained();
+                } else {
+                    terminal.mark_failed();
+                }
+                result
+            };
+            cx.set_cancel_requested(true);
+            let mut driving = Box::pin(super::super::liveness::drive_connection(
+                &cx, &shutdown, &subscription, Duration::from_secs(1), operation,
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            let result = driving.as_mut().poll(&mut task);
+            if refusal == 0 {
+                assert!(matches!(result, Poll::Ready(Ok(Ok(())))));
+                assert_eq!(writes.load(Ordering::SeqCst), 1);
+                assert!(terminal.is_drained());
+            } else {
+                assert!(matches!(result, Poll::Ready(Err(_)) | Poll::Ready(Ok(Err(())))), "refusal={refusal}");
+                assert_eq!(writes.load(Ordering::SeqCst), 0);
+                assert_eq!(terminal.state.load(Ordering::Acquire), crate::FINAL_TERMINAL_FAILED);
+            }
+            drop(driving);
+            if refusal != 0 {
+                verifier.replace_tokens([(TOKEN, facts)]).unwrap();
+                assert_eq!(
+                    cx.masked(|| lease.as_mut().unwrap().check(&cx)),
+                    Err(SseAuthorizationError::Closed),
+                    "a refused lease must never adopt a restored credential"
+                );
+            }
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn secured_native_subscription_shutdown_flushes_one_owned_cancellation() {
+        use crate::http_admission::{HttpAdmissionLimits, HttpEndpointConfig};
+        use crate::http_admission::security::endpoint::revalidation::SseRevalidationPolicy;
+        use crate::http_admission::security::scope_policy::{
+            RequiredScopes, ScopeImplicationPolicy,
+        };
+        const TOKEN: &str = "native-shutdown-transcript-token";
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(1, 4)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut facts = fastmcp_core::AuthContext::with_subject("native-transcript-owner");
+                facts.scopes = vec!["read".to_owned()];
+                let verifier = crate::StaticTokenVerifier::new([(TOKEN, facts)]).unwrap();
+                let scopes = ScopeRequestPolicy::new(
+                    1,
+                    ScopeImplicationPolicy::exact(1).unwrap(),
+                    vec![(
+                        "subscriptions/listen".to_owned(),
+                        RequiredScopes::new(vec!["read".to_owned()]).unwrap(),
+                    )],
+                ).unwrap();
+                let policy = HttpSecurityPolicy::new(
+                    HttpEndpointConfig::new("/mcp", HttpAdmissionLimits::new(32, 8192, 4096).unwrap()).unwrap(),
+                    "https://service.example", vec![],
+                ).unwrap()
+                    .with_scope_authorization(scopes).unwrap()
+                    .with_sse_revalidation(SseRevalidationPolicy::new(
+                        Duration::from_millis(100), Duration::from_millis(100), 64,
+                    ).unwrap()).unwrap();
+                let bound = Box::pin(Server::new("secured-native-transcript", "1")
+                    .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly).unwrap()
+                    .auth_provider(crate::TokenAuthProvider::new(verifier))
+                    .build()
+                    .bind_secured_http(&cx, "127.0.0.1:0", policy))
+                    .await.unwrap()
+                    .with_io_limits(SecuredHttpIoLimits::new(
+                        Duration::from_secs(5), Duration::from_secs(1),
+                    ).unwrap());
+                let address = bound.local_addr().unwrap();
+                let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+                let mut serving = cx.spawn(move |server_cx| async move {
+                    let _ = sender.send_blocking(server_cx.clone());
+                    Box::pin(bound.serve(&server_cx)).await
+                }).unwrap();
+                let server_cx = receiver.recv(&cx).await.unwrap();
+                let transcript = asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                    let mut socket = asupersync::net::TcpStream::connect(address).await.map_err(|_| "connect")?;
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0", "id": 702, "method": "subscriptions/listen",
+                        "params": {
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            },
+                            "notifications": {},
+                        },
+                    })).unwrap();
+                    let mut request = format!(
+                        "POST /mcp HTTP/1.1\r\nhost: service.example\r\nauthorization: Bearer {TOKEN}\r\ncontent-type: application/json\r\naccept: text/event-stream\r\nmcp-protocol-version: {}\r\nmcp-method: subscriptions/listen\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        fastmcp_protocol::FINAL_PROTOCOL_VERSION, body.len(),
+                    ).into_bytes();
+                    request.extend_from_slice(&body);
+                    socket.write_all(&request).await.map_err(|_| "write")?;
+                    socket.flush().await.map_err(|_| "flush")?;
+                    let mut received = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    loop {
+                        let count = socket.read(&mut buffer).await.map_err(|_| "ACK read")?;
+                        if count == 0 { return Err("closed before ACK"); }
+                        received.extend_from_slice(&buffer[..count]);
+                        if received.len() > 65536 { return Err("response bound"); }
+                        if String::from_utf8_lossy(&received).contains("notifications/subscriptions/acknowledged") {
+                            break;
+                        }
+                    }
+                    server_cx.cancel_with(asupersync::types::CancelKind::User, Some("native subscription shutdown"));
+                    loop {
+                        let count = socket.read(&mut buffer).await.map_err(|_| "terminal read")?;
+                        if count == 0 { break; }
+                        received.extend_from_slice(&buffer[..count]);
+                        if received.len() > 65536 { return Err("response bound"); }
+                    }
+                    Ok::<_, &str>(received)
+                }).await;
+                // Always retain and settle the listener, including a failed
+                // transcript, before interpreting the wire assertions.
+                server_cx.cancel_with(asupersync::types::CancelKind::User, Some("native transcript settled"));
+                let shutdown = asupersync::time::timeout(cx.now(), Duration::from_secs(8), serving.join(&cx))
+                    .await.expect("listener shutdown bound").unwrap().unwrap();
+                if let crate::HttpServerShutdown::Nonquiescent(shutdown) = shutdown {
+                    asupersync::time::timeout(cx.now(), Duration::from_secs(8), shutdown.settle(&cx))
+                        .await.expect("listener settlement bound").unwrap();
+                }
+                let received = String::from_utf8(transcript.expect("transcript bound").expect("native transcript")).unwrap();
+                assert!(received.starts_with("HTTP/1.1 200"));
+                assert!(received.ends_with("0\r\n\r\n"), "terminal flush must include the closing chunk");
+                let messages = received.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|json| serde_json::from_str::<serde_json::Value>(json).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(messages.len(), 2, "ACK plus one cancellation, with no response tail");
+                assert_eq!(messages[0]["method"], "notifications/subscriptions/acknowledged");
+                assert_eq!(messages[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 702);
+                assert_eq!(messages[1]["method"], "notifications/cancelled");
+                assert_eq!(messages[1]["params"]["requestId"], 702);
+                assert_eq!(messages[1]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"], 702);
+                assert!(messages.iter().all(|message| message.get("id").is_none()
+                    && message.get("result").is_none() && message.get("error").is_none()));
+                assert!(cx.checkpoint().is_ok());
+            });
     }
 
     async fn registered_body(cx: &Cx) -> (crate::BoundHttpServer, Arc<LiveModernHttpSession>, u64) {

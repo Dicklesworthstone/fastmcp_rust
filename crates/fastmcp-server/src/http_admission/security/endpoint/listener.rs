@@ -404,21 +404,30 @@ impl BoundSecuredHttpServer {
                         None => tls::ConnectionIo::Plain(stream),
                     };
                     let close = stream.tls_close_handle();
+                    let subscription_drain = liveness::SubscriptionDrain::default();
                     let connection: std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> =
                         Box::pin(connection::serve(
                             &connection_cx,
                             stream,
                             endpoint,
                             sessions,
-                            stopping,
+                            stopping.clone(),
                             policy,
                             io,
+                            &subscription_drain,
                         ));
                     // Per-I/O limits cannot bound a silent response wait or
                     // a handler that ignores its deadline. Keep the caller's
                     // cancellation and absolute deadline armed for the whole
                     // owned connection, not just individual writes.
-                    let served = liveness::drive(&connection_cx, connection).await;
+                    let served = liveness::drive_connection(
+                        &connection_cx,
+                        &stopping,
+                        &subscription_drain,
+                        io.write_timeout,
+                        connection,
+                    )
+                    .await;
                     if let Some(mut close) = close
                         && served.is_ok()
                         && connection_cx.checkpoint().is_ok()
