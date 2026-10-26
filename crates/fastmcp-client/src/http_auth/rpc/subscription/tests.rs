@@ -120,7 +120,11 @@ fn acknowledgement_changes_and_terminal_are_delivered_in_order() {
 #[test]
 fn notification_or_success_before_acknowledgement_cannot_advance_state() {
     let mut state = decoder(json!({"toolsListChanged":true}));
-    for frame in [changed(json!(7), "tools"), complete(json!(7), json!(7))] {
+    for frame in [
+        changed(json!(7), "tools"),
+        complete(json!(7), json!(7)),
+        notification(json!(7), "notifications/cancelled", json!({"requestId":7})),
+    ] {
         let before = snapshot(&state);
         assert!(matches!(
             state.admit(&frame),
@@ -257,6 +261,63 @@ fn terminal_requires_both_owning_response_id_and_subscription_metadata_id() {
 }
 
 #[test]
+fn peer_cancellation_is_terminal_control_after_the_notification_quota_is_spent() {
+    let mut state = decoder(json!({}));
+    state.limits.notifications = 1;
+    let acknowledgement = ack(json!(7), json!({}));
+    state.admit(&acknowledgement).unwrap();
+    let frame = notification(
+        serde_json::from_str("7e0").unwrap(),
+        "notifications/cancelled",
+        json!({"requestId":serde_json::from_str::<Value>("7.0").unwrap(),
+            "reason":"subscription maintenance", "x-peer":"retained"}),
+    );
+    let event = state.admit(&frame).unwrap();
+    let ManagedCoreEvent::Notification(notification) = event else {
+        panic!("cancellation must not fabricate a complete result");
+    };
+    let ServerNotification::Cancelled(params) = *notification else {
+        panic!("typed cancellation expected");
+    };
+    assert!(params.request_id.correlates_with(&RequestId::Number(7)));
+    assert_eq!(params.reason.as_deref(), Some("subscription maintenance"));
+    assert_eq!(params.additional.get("x-peer"), Some(&json!("retained")));
+    assert_eq!(state.usage(), (acknowledgement.len() + frame.len(), 1));
+    assert!(state.terminal);
+    let before = snapshot(&state);
+    assert!(state.admit(&complete(json!(7), json!(7))).is_err());
+    assert_eq!(snapshot(&state), before);
+}
+
+#[test]
+fn cancellation_requires_both_exact_owning_ids_and_retains_byte_bounds() {
+    let good = notification(json!(7), "notifications/cancelled", json!({"requestId":7}));
+    for bad in [
+        notification(json!(8), "notifications/cancelled", json!({"requestId":7})),
+        notification(json!(7), "notifications/cancelled", json!({"requestId":8})),
+        notification(json!("7"), "notifications/cancelled", json!({"requestId":7})),
+        notification(json!(7), "notifications/cancelled", json!({"requestId":"7"})),
+        br#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#.to_vec(),
+        notification(Value::Null, "notifications/cancelled", json!({"requestId":7})),
+    ] {
+        let mut state = decoder(json!({}));
+        state.admit(&ack(json!(7), json!({}))).unwrap();
+        let before = snapshot(&state);
+        assert!(state.admit(&bad).is_err());
+        assert_eq!(snapshot(&state), before);
+        assert!(state.admit(&good).is_ok());
+    }
+    let mut state = decoder(json!({}));
+    state.admit(&ack(json!(7), json!({}))).unwrap();
+    state.limits.total_bytes = state.bytes + good.len() - 1;
+    let before = snapshot(&state);
+    assert!(matches!(state.admit(&good), Err(ManagedCoreError::ResponseByteLimit)));
+    assert_eq!(snapshot(&state), before);
+    state.limits.total_bytes += 1;
+    assert!(state.admit(&good).is_ok());
+}
+
+#[test]
 fn reverse_requests_batches_duplicate_members_and_noncore_events_are_refused() {
     let mut state = decoder(json!({"toolsListChanged":true}));
     state
@@ -272,7 +333,7 @@ fn reverse_requests_batches_duplicate_members_and_noncore_events_are_refused() {
             "notifications/progress",
             json!({"progressToken":"unowned","progress":1}),
         ),
-        notification(json!(7), "notifications/cancelled", json!({"requestId":7})),
+        notification(json!(7), "notifications/cancelled", json!({"requestId":8})),
     ] {
         let before = snapshot(&state);
         assert!(state.admit(&frame).is_err());

@@ -29,6 +29,8 @@ use serde_json::{Value, json};
 
 #[path = "oauth_managed_sse_completion/revocation.rs"]
 mod revocation;
+#[path = "oauth_managed_sse_completion/subscription_termination.rs"]
+mod subscription_termination;
 
 // TEST ONLY: the existing oauth_core_rpc fixture, inlined so remote workers
 // need no transfer-excluded PEM/key files. Never installed in system trust.

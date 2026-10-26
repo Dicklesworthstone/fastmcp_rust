@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use super::{
     BoundedWriter, ManagedCoreError, ManagedCoreEvent, ManagedCoreLimits, bounded_wait,
-    call_deadline, check_call, finish_finite_sse,
+    call_deadline, check_call,
 };
 use crate::http_auth::managed::{ManagedOAuthSession, ManagedOAuthSseStream};
 use crate::http_executor::{ModernHttpRequest, ModernHttpResponseKind};
@@ -152,8 +152,9 @@ pub(crate) fn json_subscription_error(
 
 /// One bounded, incremental subscription. Notifications retain their typed
 /// protocol payload, including acknowledgement metadata and unknown members.
-/// A graceful complete result is published only after clean HTTP body EOF.
-/// EOF without that result, malformed input, or a foreign ID fails the stream.
+/// The first correlated complete result or cancellation notification ends the
+/// subscription and releases its HTTP body. Later signals are not delivered.
+/// EOF before either terminal, malformed input, or a foreign ID fails the stream.
 ///
 /// A dropped, already-polled `next_event` future retires the stream: partial
 /// framing state cannot be reused. Drop/close is local; no modern HTTP
@@ -188,8 +189,9 @@ impl ManagedSubscription {
     }
 
     /// Delivers the acknowledgement first, then only matching core changes.
-    /// The final result is followed by `None`; other premature termination is
-    /// an error. A refusal releases the body and cannot advance stream state.
+    /// A complete result or `Notification(ServerNotification::Cancelled(_))`
+    /// is the single terminal, followed by `None`. Cancellation ends only this
+    /// subscription. A refusal releases the body and cannot be retried in place.
     pub async fn next_event(
         &mut self,
         cx: &Cx,
@@ -206,16 +208,15 @@ impl ManagedSubscription {
         .ok_or(ManagedCoreError::MissingTerminal)?;
         let event = self.decoder.admit(frame.as_bytes())?;
         check_call(cx, &self.cancellation, self.deadline)?;
-        match &event {
-            ManagedCoreEvent::Result(_) => {
-                finish_finite_sse(cx, &self.cancellation, self.deadline, async {
-                    body.next_event(cx).await.map_err(ManagedCoreError::from)
-                })
-                .await?;
-                check_call(cx, &self.cancellation, self.deadline)?;
-                self.finished = true;
-            }
-            ManagedCoreEvent::Notification(_) => self.body = Some(body),
+        if self.decoder.terminal {
+            // Subscription control is authoritative before an indefinitely
+            // open HTTP body ends. Preserve the credential check formerly
+            // performed by the EOF read without consuming any later signal.
+            body.check_authorization(cx).await?;
+            check_call(cx, &self.cancellation, self.deadline)?;
+            self.finished = true;
+        } else {
+            self.body = Some(body);
         }
         Ok(Some(event))
     }
@@ -406,7 +407,9 @@ impl SubscriptionDecoder {
                 if request.id.is_some() {
                     return Err(ManagedCoreError::UnexpectedNotification);
                 }
-                if self.notifications >= self.limits.notifications {
+                if request.method != "notifications/cancelled"
+                    && self.notifications >= self.limits.notifications
+                {
                     return Err(ManagedCoreError::NotificationLimit);
                 }
                 let subscription_id = request
@@ -428,7 +431,14 @@ impl SubscriptionDecoder {
                 let notification =
                     ServerNotification::decode_with_raw_params(&request, raw.params.get())
                         .map_err(|_| ManagedCoreError::UnexpectedNotification)?;
-                if let ServerNotification::SubscriptionsAcknowledged(acknowledgement) =
+                if let ServerNotification::Cancelled(params) = &notification {
+                    if self.accepted.is_none() {
+                        return Err(ManagedCoreError::UnexpectedNotification);
+                    }
+                    if !params.request_id.correlates_with(&self.request_id) {
+                        return Err(ManagedCoreError::ResponseIdMismatch);
+                    }
+                } else if let ServerNotification::SubscriptionsAcknowledged(acknowledgement) =
                     &notification
                 {
                     if self.accepted.is_some()
@@ -480,6 +490,11 @@ impl SubscriptionDecoder {
             self.accepted = Some(accepted);
         }
         match &event {
+            ManagedCoreEvent::Notification(notification)
+                if matches!(notification.as_ref(), ServerNotification::Cancelled(_)) =>
+            {
+                self.terminal = true;
+            }
             ManagedCoreEvent::Notification(_) => self.notifications += 1,
             ManagedCoreEvent::Result(_) => self.terminal = true,
         }

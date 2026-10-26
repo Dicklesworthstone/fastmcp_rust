@@ -709,6 +709,23 @@ impl ManagedOAuthSseStream {
         self.stream = None;
     }
 
+    /// Rechecks the original response authority without reading or renewing it.
+    /// Subscription owners use this after decoding their winning terminal,
+    /// before releasing a long-lived body that need not have reached HTTP EOF.
+    pub(crate) async fn check_authorization(&mut self, cx: &Cx) -> Result<(), OAuthSessionError> {
+        let deadline = cx.budget().deadline.unwrap_or(Time::from_nanos(u64::MAX));
+        self.session
+            .await_credential(
+                cx,
+                &self.cancellation,
+                deadline,
+                self.expires_at,
+                &self.revocation,
+                async { Ok(()) },
+            )
+            .await
+    }
+
     /// Delivers one event while preserving the native parser's bounds and
     /// idle/absolute deadlines. Abandoning a polled read closes the stream:
     /// partially consumed framing cannot later be replayed as a fresh read.
