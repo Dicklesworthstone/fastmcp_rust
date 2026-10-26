@@ -12684,6 +12684,160 @@ fn spawn_modern_subscription_http_server() -> HttpServerFixture {
     }
 }
 
+fn public_http_subscription_shutdown_transcript(close_first: bool) {
+    use fastmcp_rust::http_executor::{ModernHttpExecutor, ModernHttpRequest};
+
+    let cx = Cx::for_request();
+    let server = spawn_modern_subscription_http_server();
+    runtime_block_on_bounded(&cx, async {
+        let executor = ModernHttpExecutor::new();
+        let listen_request = |id| {
+            ModernHttpRequest::new(
+                format!("http://{}/mcp", server.address()),
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "subscriptions/listen",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": modern::PROTOCOL_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "notifications": {},
+                    },
+                }))
+                .expect("the exact empty-filter listen serializes"),
+                modern::PROTOCOL_VERSION,
+                "subscriptions/listen",
+                None,
+            )
+            .expect("the listen request has valid routing metadata")
+        };
+        let mut streams = Vec::new();
+        for id in [41, 42] {
+            let response = executor
+                .execute(&cx, &listen_request(id))
+                .await
+                .expect("the public server opens an independent listen response");
+            assert_eq!(response.metadata().kind(), ModernHttpResponseKind::Sse);
+            let mut stream = response
+                .into_sse_stream(SseLimits::new(65_536, 1 << 20, 16).unwrap())
+                .expect("the listen response uses the shipped SSE decoder");
+            let acknowledgement: serde_json::Value = serde_json::from_str(
+                &stream.next_event(&cx).await.unwrap().expect("acknowledgement"),
+            )
+            .unwrap();
+            assert_eq!(
+                acknowledgement["method"],
+                "notifications/subscriptions/acknowledged"
+            );
+            assert_eq!(acknowledgement["params"]["notifications"], json!({}));
+            assert_eq!(
+                acknowledgement["params"]["_meta"]
+                    ["io.modelcontextprotocol/subscriptionId"],
+                id
+            );
+            streams.push((id, stream));
+        }
+
+        if close_first {
+            // Only this response is abandoned. Its sibling and ordinary
+            // requests keep their own transport and cancellation authority.
+            drop(streams.remove(0));
+        }
+        let mut client = modern::ClientBuilder::new()
+            .client_info("subscription-teardown-sibling", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp"))
+            .await
+            .expect("an ordinary client connects alongside active listens");
+        let tools = client.list_tools(&cx, None).await.unwrap();
+        assert!(tools.tools.iter().any(|tool| tool.name == PUBLIC_HTTP_TOUCH_TOOL_NAME));
+        drop(client);
+
+        server.server_cx.set_cancel_requested(true);
+        for (id, mut stream) in streams {
+            let terminal: serde_json::Value = serde_json::from_str(
+                &stream.next_event(&cx).await.unwrap().expect("server cancellation"),
+            )
+            .unwrap();
+            assert_eq!(terminal["method"], "notifications/cancelled");
+            assert!(terminal.get("id").is_none(), "control is a notification");
+            assert_eq!(terminal["params"]["requestId"], id);
+            assert_eq!(
+                terminal["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                id
+            );
+            // Read the raw SSE response to HTTP EOF. A typed subscription
+            // client intentionally ignores a second terminal and therefore
+            // cannot establish the server's cancellation-only wire contract.
+            assert!(
+                stream.next_event(&cx).await.unwrap().is_none(),
+                "local teardown must emit no complete result or second control"
+            );
+            let end = stream.end_of_stream().expect("the response reached HTTP EOF");
+            assert!(
+                !end.discarded_pending_event && !end.discarded_partial_line,
+                "shutdown must not hide an unfinished response after its terminal control"
+            );
+        }
+        assert!(cx.checkpoint().is_ok());
+    });
+    server.shutdown();
+}
+
+#[test]
+fn e2e_public_http_shutdown_emits_only_correlated_subscription_cancellation() {
+    public_http_subscription_shutdown_transcript(false);
+}
+
+#[test]
+fn e2e_public_http_closed_listen_preserves_sibling_until_server_teardown() {
+    public_http_subscription_shutdown_transcript(true);
+}
+
+#[test]
+fn e2e_public_http_client_observes_server_shutdown_as_subscription_cancellation() {
+    let cx = Cx::for_request();
+    let server = spawn_modern_subscription_http_server();
+    let mut client = runtime_block_on_bounded(
+        &cx,
+        modern::ClientBuilder::new()
+            .client_info("typed-subscription-teardown", "1.0.0")
+            .connect_http_with_cx(&cx, public_http_target(server.address(), "/mcp")),
+    )
+    .unwrap();
+    runtime_block_on_bounded(
+        &cx,
+        client.start_subscriptions_listener(
+            &cx,
+            modern::SubscriptionFilter::default(),
+            SseLimits::new(65_536, 1 << 20, 16).unwrap(),
+        ),
+    )
+    .unwrap();
+    let acknowledgement = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .unwrap()
+        .expect("acknowledgement");
+    assert!(matches!(
+        acknowledgement,
+        modern::ModernHttpSubscriptionListenEvent::Acknowledged { .. }
+    ));
+    server.server_cx.set_cancel_requested(true);
+    let terminal = runtime_block_on_bounded(&cx, client.next_http_subscription_event(&cx))
+        .unwrap()
+        .expect("peer cancellation is a typed terminal");
+    assert!(matches!(
+        terminal,
+        modern::ModernHttpSubscriptionListenEvent::Cancelled {
+            subscription_id: actual,
+            params,
+        } if params.request_id.correlates_with(&actual)
+    ));
+    assert!(cx.checkpoint().is_ok());
+    drop(client);
+    server.shutdown();
+}
+
 #[test]
 fn e2e_public_http_resource_updated_is_retained_on_incremental_listen() {
     let cx = Cx::for_request();

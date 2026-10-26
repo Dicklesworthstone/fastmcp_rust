@@ -92,7 +92,8 @@ impl SecuredHttpSseResponse {
     /// Delivers one native SSE event after checking the opening credential.
     /// Idle waits also revalidate. A dropped, polled read owns and drops the
     /// native response rather than leaving a partially consumed body reusable.
-    /// Only a delivered terminal response permits a later successful None.
+    /// Only a delivered terminal response or committed, exactly correlated
+    /// subscription cancellation permits a later successful None.
     /// The host must close on error; an already-written 200 head cannot become
     /// a new authentication challenge, and no success terminal is fabricated.
     pub async fn next_event(
@@ -123,7 +124,23 @@ impl SecuredHttpSseResponse {
             }
         })
         .await??;
-        self.finished = crate::final_subscription_terminal_response_event(&event);
+        // A generic notification cannot elect EOF merely by spelling the
+        // cancellation method. The transport must have committed its terminal
+        // control, and that control must belong to this exact response owner.
+        // Authorization above still runs before either terminal is delivered.
+        let terminal_control = stream.inner.is_finished()
+            && crate::final_subscription_terminal_event(&event)
+            && serde_json::from_str::<fastmcp_protocol::JsonRpcRequest>(&event.data)
+                .ok()
+                .and_then(|request| fastmcp_protocol::ServerNotification::decode(&request).ok())
+                .is_some_and(|notification| {
+                    matches!(
+                        notification,
+                        fastmcp_protocol::ServerNotification::Cancelled(params)
+                            if params.request_id.correlates_with(stream.cancellation().request_id())
+                    )
+                });
+        self.finished = terminal_control || crate::final_subscription_terminal_response_event(&event);
         self.stream = Some(stream);
         self.authorization = authorization;
         Ok(Some(event))
@@ -437,6 +454,274 @@ mod tests {
             vec!["https://app.example".to_owned()],
         )
         .unwrap()
+    }
+
+    const TERMINAL_TEST_TOKEN: &str = "secured-subscription-terminal-token";
+
+    fn run_secured_subscription<F, Fut>(scenario: F)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .blocking_threads(1, 4)
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let cx = Cx::current().unwrap();
+                let mut task = cx.spawn(scenario).unwrap();
+                task.join(&cx).await.unwrap();
+            });
+    }
+
+    async fn secured_listen_fixture(
+        cx: &Cx,
+    ) -> (
+        ServerHttpEndpoint,
+        SecuredHttpSseResponse,
+        crate::StaticTokenVerifier,
+    ) {
+        use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
+        use crate::http_admission::security::scope_policy::{
+            RequiredScopes, ScopeImplicationPolicy,
+        };
+
+        let mut facts = fastmcp_core::AuthContext::with_subject("secured-subscription-owner");
+        facts.scopes = vec!["read".to_owned()];
+        let verifier =
+            crate::StaticTokenVerifier::new([(TERMINAL_TEST_TOKEN.to_owned(), facts)]).unwrap();
+        let server = crate::Server::new("secured-subscription-terminal", "1")
+            .protocol_policy(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly)
+            .unwrap()
+            .auth_provider(crate::TokenAuthProvider::new(verifier.clone()))
+            .build();
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let endpoint = server.into_http_endpoint().unwrap();
+        #[cfg(feature = "legacy-2024-11-05")]
+        let endpoint = server.into_http_endpoint("https://service.example").unwrap();
+        let scopes = ScopeRequestPolicy::new(
+            1,
+            ScopeImplicationPolicy::exact(1).unwrap(),
+            vec![(
+                "subscriptions/listen".to_owned(),
+                RequiredScopes::new(vec!["read".to_owned()]).unwrap(),
+            )],
+        )
+        .unwrap();
+        let policy = policy()
+            .with_scope_authorization(scopes)
+            .unwrap()
+            .with_sse_revalidation(
+                revalidation::SseRevalidationPolicy::new(
+                    Duration::from_millis(100),
+                    Duration::from_millis(100),
+                    64,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+            .with_header("host", "service.example")
+            .with_header("authorization", format!("Bearer {TERMINAL_TEST_TOKEN}"))
+            .with_header("content-type", "application/json")
+            .with_header("accept", "text/event-stream")
+            .with_header("mcp-protocol-version", fastmcp_protocol::FINAL_PROTOCOL_VERSION)
+            .with_header("mcp-method", "subscriptions/listen")
+            .with_body(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "subscriptions/listen",
+                    "params": {
+                        "_meta": {
+                            "io.modelcontextprotocol/protocolVersion": fastmcp_protocol::FINAL_PROTOCOL_VERSION,
+                            "io.modelcontextprotocol/clientCapabilities": {},
+                        },
+                        "notifications": {},
+                    },
+                }))
+                .unwrap(),
+            );
+        let response = Box::pin(endpoint.handle_secured_async(cx, &policy, request))
+            .await
+            .unwrap();
+        assert_eq!(response.response().status.0, 200);
+        let mut stream = response.into_parts().1.unwrap();
+        assert!(stream.stream().is_none(), "revalidation must retain raw body custody");
+        let acknowledgement = next_secured_event(cx, &mut stream).await.unwrap().unwrap();
+        let acknowledgement: serde_json::Value =
+            serde_json::from_str(&acknowledgement.data).unwrap();
+        assert_eq!(
+            acknowledgement["method"],
+            "notifications/subscriptions/acknowledged"
+        );
+        assert_eq!(
+            acknowledgement["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+            7
+        );
+        (endpoint, stream, verifier)
+    }
+
+    async fn next_secured_event(
+        cx: &Cx,
+        stream: &mut SecuredHttpSseResponse,
+    ) -> Result<Option<SseEvent>, SecuredHttpEndpointError> {
+        asupersync::time::timeout(cx.now(), Duration::from_secs(3), stream.next_event(cx))
+            .await
+            .expect("secured subscription event must settle within its caller bound")
+    }
+
+    #[test]
+    fn secured_subscription_cancellation_is_delivered_once_then_finishes() {
+        run_secured_subscription(|cx| async move {
+            for equivalent_numeric in [false, true] {
+                let (endpoint, mut stream, _) = secured_listen_fixture(&cx).await;
+                if equivalent_numeric {
+                    stream
+                        .stream
+                        .as_ref()
+                        .unwrap()
+                        .sender()
+                        .send_subscription_cancellation(
+                            &cx,
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/cancelled",
+                                Some(serde_json::json!({
+                                    "requestId": serde_json::from_str::<serde_json::Value>("7e0").unwrap(),
+                                    "_meta": {
+                                        "io.modelcontextprotocol/subscriptionId": serde_json::from_str::<serde_json::Value>("7.0").unwrap(),
+                                    },
+                                })),
+                            ),
+                        )
+                        .unwrap();
+                } else {
+                    assert_eq!(endpoint.server.terminate_subscription_streams(), 1);
+                }
+                let control = next_secured_event(&cx, &mut stream).await.unwrap().unwrap();
+                let control: serde_json::Value = serde_json::from_str(&control.data).unwrap();
+                assert_eq!(control["method"], "notifications/cancelled");
+                assert!(control.get("id").is_none());
+                let request_id: fastmcp_protocol::RequestId =
+                    serde_json::from_value(control["params"]["requestId"].clone()).unwrap();
+                let subscription_id: fastmcp_protocol::RequestId = serde_json::from_value(
+                    control["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"].clone(),
+                )
+                .unwrap();
+                assert!(request_id.correlates_with(&fastmcp_protocol::RequestId::Number(7)));
+                assert!(subscription_id.correlates_with(&request_id));
+                assert!(stream.finished);
+                assert!(next_secured_event(&cx, &mut stream).await.unwrap().is_none());
+                stream.close(&cx).await;
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn generic_subscription_controls_cannot_finish_a_secured_response() {
+        run_secured_subscription(|cx| async move {
+            let (endpoint, mut stream, _) = secured_listen_fixture(&cx).await;
+            let sender = stream.stream.as_ref().unwrap().sender();
+            for params in [
+                serde_json::json!({"requestId": 8, "_meta": {"io.modelcontextprotocol/subscriptionId": 8}}),
+                serde_json::json!({"requestId": 7, "_meta": {"io.modelcontextprotocol/subscriptionId": 8}}),
+                serde_json::json!({"requestId": 8, "_meta": {"io.modelcontextprotocol/subscriptionId": 7}}),
+                serde_json::json!({"requestId": "7", "_meta": {"io.modelcontextprotocol/subscriptionId": "7"}}),
+                serde_json::json!({"requestId": 7}),
+                serde_json::json!({"requestId": 7, "_meta": {"io.modelcontextprotocol/subscriptionId": null}}),
+                serde_json::json!({"requestId": 7, "_meta": {"io.modelcontextprotocol/subscriptionId": 7}}),
+            ] {
+                sender
+                    .send_notification(
+                        &cx,
+                        fastmcp_protocol::JsonRpcRequest::notification(
+                            "notifications/cancelled",
+                            Some(params.clone()),
+                        ),
+                    )
+                    .unwrap();
+                let event = next_secured_event(&cx, &mut stream).await.unwrap().unwrap();
+                let event: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                assert_eq!(event["params"], params);
+                assert!(!stream.finished, "generic control has no terminal commit authority");
+                assert!(!stream.stream.as_ref().unwrap().is_finished());
+                assert!(stream.stream().is_none());
+            }
+            // A queued generic control must not drain the registry's terminal
+            // receipt when the real cancellation is committed behind it.
+            sender
+                .send_notification(
+                    &cx,
+                    fastmcp_protocol::JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(serde_json::json!({
+                            "requestId": 7,
+                            "reason": "generic control queued before termination",
+                            "_meta": {"io.modelcontextprotocol/subscriptionId": 7},
+                        })),
+                    ),
+                )
+                .unwrap();
+            assert_eq!(endpoint.server.terminate_subscription_streams(), 1);
+            let generic = next_secured_event(&cx, &mut stream).await.unwrap().unwrap();
+            let generic: serde_json::Value = serde_json::from_str(&generic.data).unwrap();
+            assert_eq!(
+                generic["params"]["reason"],
+                "generic control queued before termination"
+            );
+            assert!(!stream.finished, "only the following committed control ends the body");
+            assert!(next_secured_event(&cx, &mut stream).await.unwrap().is_some());
+            assert!(next_secured_event(&cx, &mut stream).await.unwrap().is_none());
+            stream.close(&cx).await;
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn revoked_credential_withholds_committed_and_generic_subscription_controls() {
+        run_secured_subscription(|cx| async move {
+            for committed in [false, true] {
+                let (endpoint, mut stream, verifier) = secured_listen_fixture(&cx).await;
+                if committed {
+                    assert_eq!(endpoint.server.terminate_subscription_streams(), 1);
+                } else {
+                    stream
+                        .stream
+                        .as_ref()
+                        .unwrap()
+                        .sender()
+                        .send_notification(
+                            &cx,
+                            fastmcp_protocol::JsonRpcRequest::notification(
+                                "notifications/cancelled",
+                                Some(serde_json::json!({
+                                    "requestId": 7,
+                                    "_meta": {"io.modelcontextprotocol/subscriptionId": 7},
+                                })),
+                            ),
+                        )
+                        .unwrap();
+                }
+                assert!(verifier.revoke_token(TERMINAL_TEST_TOKEN).unwrap());
+                asupersync::time::sleep(cx.now(), Duration::from_millis(150)).await;
+                assert!(matches!(
+                    next_secured_event(&cx, &mut stream).await,
+                    Err(SecuredHttpEndpointError::Revalidation(
+                        SseAuthorizationError::Rejected
+                    ))
+                ));
+                assert!(!stream.finished, "a withheld terminal cannot authorize clean EOF");
+                assert!(matches!(
+                    next_secured_event(&cx, &mut stream).await,
+                    Err(SecuredHttpEndpointError::BodyClosed)
+                ));
+                assert!(stream.stream().is_none());
+                stream.close(&cx).await;
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
     }
 
     #[test]
