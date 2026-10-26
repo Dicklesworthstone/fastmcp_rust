@@ -1719,6 +1719,7 @@ fn subscription_tools_changed_event() -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "method": "notifications/tools/list_changed",
+        "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 2}},
     })
 }
 

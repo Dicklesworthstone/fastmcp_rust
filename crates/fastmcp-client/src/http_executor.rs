@@ -1515,6 +1515,10 @@ impl ModernHttpSubscriptionListener {
                                 ModernHttpSubscriptionListenError::EventBeforeAcknowledgement,
                             );
                         };
+                        validate_http_subscription_notification_id(
+                            &notification,
+                            &self.request_id,
+                        )?;
                         validate_http_subscription_notification_filter(
                             &notification,
                             accepted_filter,
@@ -3325,6 +3329,17 @@ pub enum ModernHttpSubscriptionListenError {
     EventBeforeAcknowledgement,
     /// A subscription event was outside the accepted filter.
     EventOutsideAcceptedFilter,
+    /// A subscription event omitted its required subscription ID metadata.
+    EventMissingId,
+    /// A subscription event ID could not form a JSON-RPC correlation key.
+    EventInvalidId,
+    /// A subscription event was bound to a different listener.
+    EventIdMismatch {
+        /// The immutable ID assigned to the outgoing listen request.
+        expected: RequestId,
+        /// The subscription ID decoded from the event metadata.
+        actual: RequestId,
+    },
     /// A Tasks event carried a subscription ID other than this listener's ID.
     TaskEventSubscriptionIdMismatch,
     /// A Tasks event named a task outside the acknowledged exact-ID set.
@@ -3410,6 +3425,14 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
                 .write_str("subscriptions/listen received a subscription event before acknowledgement"),
             Self::EventOutsideAcceptedFilter => formatter
                 .write_str("subscriptions/listen received an event outside its accepted filter"),
+            Self::EventMissingId => formatter
+                .write_str("subscriptions/listen event is missing its subscription ID"),
+            Self::EventInvalidId => formatter
+                .write_str("subscriptions/listen event has an invalid subscription ID"),
+            Self::EventIdMismatch { expected, actual } => write!(
+                formatter,
+                "subscriptions/listen event ID {actual:?} did not match request {expected:?}"
+            ),
             Self::TaskEventSubscriptionIdMismatch => formatter.write_str(
                 "subscriptions/listen Tasks event named a different subscription",
             ),
@@ -3455,6 +3478,9 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             | Self::AcknowledgementExtensionFilterNotRequested
             | Self::EventBeforeAcknowledgement
             | Self::EventOutsideAcceptedFilter
+            | Self::EventMissingId
+            | Self::EventInvalidId
+            | Self::EventIdMismatch { .. }
             | Self::TaskEventSubscriptionIdMismatch
             | Self::TaskEventOutsideAcceptedFilter
             | Self::CallerCancelled { .. }
@@ -3680,6 +3706,22 @@ fn validate_http_subscription_acknowledgement_filter(
         return Err(ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested);
     }
 
+    Ok(())
+}
+
+fn validate_http_subscription_notification_id(
+    notification: &ServerNotification,
+    expected_id: &RequestId,
+) -> Result<(), ModernHttpSubscriptionListenError> {
+    let subscription_id = crate::subscription_notification_request_id(notification)
+        .map_err(|_| ModernHttpSubscriptionListenError::EventInvalidId)?
+        .ok_or(ModernHttpSubscriptionListenError::EventMissingId)?;
+    if !subscription_id.correlates_with(expected_id) {
+        return Err(ModernHttpSubscriptionListenError::EventIdMismatch {
+            expected: expected_id.clone(),
+            actual: subscription_id,
+        });
+    }
     Ok(())
 }
 
@@ -13142,8 +13184,8 @@ mod tests {
             format!(
                 "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{acknowledgement_id}}},\"notifications\":{{\"toolsListChanged\":true,\"promptsListChanged\":true}}}}}}\n\n"
             ),
-            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n".to_owned(),
-            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\"}\n\n".to_owned(),
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n\n".to_owned(),
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/prompts/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2.0}}}\n\n".to_owned(),
             "data: {\"jsonrpc\":\"2.0\",\"id\":2e0,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2.0}}}\n\n".to_owned(),
         ]
     }
@@ -15853,10 +15895,16 @@ mod tests {
         assert!(matches!(
             collector.notifications.as_slice(),
             [
-                ServerNotification::ToolsListChanged(None),
-                ServerNotification::PromptsListChanged(None)
+                ServerNotification::ToolsListChanged(Some(_)),
+                ServerNotification::PromptsListChanged(Some(_))
             ]
         ));
+        for notification in &collector.notifications {
+            let owner = crate::subscription_notification_request_id(notification)
+                .expect("typed notification metadata is valid")
+                .expect("every delivered notification retains its subscription owner");
+            assert!(owner.correlates_with(&RequestId::Number(2)));
+        }
         assert!(matches!(
             collector.terminal.payload,
             fastmcp_protocol::FinalSubscriptionsListenResult {}
@@ -15864,6 +15912,169 @@ mod tests {
         server
             .join()
             .expect("final subscriptions/listen server must join");
+    }
+
+    fn public_http_subscription_event_owner_case(
+        method: &'static str,
+        event_id: Option<serde_json::Value>,
+        accepted: bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind subscription event ownership peer");
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (sent, received) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept discovery");
+            let _ = read_request(&mut discovery);
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                modern_discovery_body(),
+            );
+
+            let (mut stream, _) = listener.accept().expect("accept owned subscription");
+            let request = read_request(&mut stream);
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "subscriptions/listen");
+            let mut params = serde_json::json!({});
+            if method == "notifications/resources/updated" {
+                params["uri"] = serde_json::json!("test://owned/resource");
+            }
+            if let Some(event_id) = event_id {
+                params["_meta"] = serde_json::json!({
+                    "io.modelcontextprotocol/subscriptionId": event_id
+                });
+            }
+            let acknowledgement = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    "notifications": request["params"]["notifications"]
+                }
+            });
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0", "method": method, "params": params
+            });
+            let body = format!("data: {acknowledgement}\n\ndata: {notification}\n\n");
+            write_response(&mut stream, 200, "text/event-stream", body.as_bytes());
+            sent.send(()).expect("report completed event bytes");
+
+            let (mut next, _) = listener.accept().expect("accept independent ordinary request");
+            let request = read_request(&mut next);
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "tools/list");
+            write_response(
+                &mut next,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+        });
+
+        let cx = Cx::for_request();
+        let mut client = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_client_with_cx(&cx),
+        )
+        .expect("connect public HTTP client");
+        let filter: SubscriptionFilter = serde_json::from_value(serde_json::json!({
+            "toolsListChanged": true,
+            "promptsListChanged": true,
+            "resourcesListChanged": true,
+            "resourceSubscriptions": ["test://owned/resource"]
+        }))
+        .unwrap();
+        runtime_block_on(client.start_subscriptions_listener(
+            &cx,
+            filter,
+            SseLimits::new(2_048, 8_192, 16).unwrap(),
+        ))
+        .expect("open public subscription");
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("peer finished before any refusal closes its response");
+        assert!(matches!(
+            runtime_block_on(client.next_http_subscription_event(&cx)).unwrap(),
+            Some(super::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+        ));
+        let event = runtime_block_on(client.next_http_subscription_event(&cx));
+        if accepted {
+            let Some(super::ModernHttpSubscriptionListenEvent::Notification(notification)) =
+                event.expect("matching event owner is admitted")
+            else {
+                panic!("matching catalog event must reach the caller");
+            };
+            assert!(
+                crate::subscription_notification_request_id(&notification)
+                    .unwrap()
+                    .unwrap()
+                    .correlates_with(&RequestId::Number(2))
+            );
+            assert!(client.final_result_cache_stats().invalidations > 0);
+            assert!(client.cancel_http_subscription(&RequestId::Number(2)));
+        } else {
+            assert!(matches!(
+                event,
+                Err(crate::HttpClientError::Connection(
+                    ClientHttpConnectionError::SubscriptionsListen(
+                        ModernHttpSubscriptionListenError::EventMissingId
+                            | ModernHttpSubscriptionListenError::EventInvalidId
+                            | ModernHttpSubscriptionListenError::EventIdMismatch { .. }
+                    )
+                ))
+            ));
+            assert_eq!(client.final_result_cache_stats().invalidations, 0);
+            assert!(client.active_http_subscription_request_id().is_none());
+            assert!(!client.cancel_http_subscription(&RequestId::Number(2)));
+        }
+        assert!(cx.checkpoint().is_ok(), "listener retirement cannot cancel its caller");
+        runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
+            .expect("retiring one subscription preserves independent ordinary requests");
+        server.join().expect("subscription ownership peer joins");
+    }
+
+    #[test]
+    fn public_http_subscription_catalog_events_require_their_exact_owner() {
+        for method in [
+            "notifications/tools/list_changed",
+            "notifications/prompts/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/resources/updated",
+        ] {
+            public_http_subscription_event_owner_case(
+                method,
+                Some(serde_json::from_str("2e0").unwrap()),
+                true,
+            );
+            public_http_subscription_event_owner_case(method, Some(serde_json::json!(3)), false);
+            public_http_subscription_event_owner_case(method, None, false);
+        }
+    }
+
+    #[test]
+    fn public_http_subscription_rejects_invalid_and_string_lookalike_event_owners() {
+        for event_id in [
+            serde_json::json!("2"),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(2.5),
+        ] {
+            public_http_subscription_event_owner_case(
+                "notifications/tools/list_changed",
+                Some(event_id),
+                false,
+            );
+        }
     }
 
     #[test]

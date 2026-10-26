@@ -41015,7 +41015,7 @@ mod tests {
             };
             let terminal = r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#;
             let sse = format!(
-                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{acknowledgement_filter}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\n{}",
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{acknowledgement_filter}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}}}}}}\n\n{}",
                 acknowledges_tools_list_changes
                     .then_some(format!("data: {terminal}\n\n"))
                     .unwrap_or_default(),
@@ -41077,8 +41077,10 @@ mod tests {
                 http_test_runtime_block_on(listener.next_event(&cx))
                     .expect("accepted HTTP change event is yielded live"),
                 Some(ModernHttpSubscriptionListenEvent::Notification(
-                    ServerNotification::ToolsListChanged(None)
+                    ServerNotification::ToolsListChanged(Some(ref params))
                 ))
+                    if params.meta.as_ref().and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                        == Some(&serde_json::json!(3))
             ));
             assert_eq!(listener.final_result_cache_stats().invalidations, 1);
             drop(listener);
@@ -41177,7 +41179,7 @@ mod tests {
             let _ = read_http_cache_test_request(&mut listen);
             let terminal = r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#;
             let sse = format!(
-                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{{\"toolsListChanged\":true}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {terminal}\n\n"
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{{\"toolsListChanged\":true}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}}}}}}\n\ndata: {terminal}\n\n"
             );
             write_http_cache_test_response(&mut listen, "text/event-stream", sse.as_bytes());
 
@@ -41223,8 +41225,10 @@ mod tests {
             http_test_runtime_block_on(client.next_http_subscription_event(&cx))
                 .expect("incremental catalog event is accepted"),
             Some(ModernHttpSubscriptionListenEvent::Notification(
-                ServerNotification::ToolsListChanged(None)
+                ServerNotification::ToolsListChanged(Some(ref params))
             ))
+                if params.meta.as_ref().and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                    == Some(&serde_json::json!(3))
         ));
         let refreshed_result = http_test_runtime_block_on(client.request_final_core(
             &cx,
