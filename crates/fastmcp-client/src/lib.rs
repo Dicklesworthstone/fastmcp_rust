@@ -4687,6 +4687,8 @@ where
                 "WebSocket handshake method was not supported by the peer",
             ),
             WebSocketHandshakeError::Mcp(error) => error,
+            #[cfg(feature = "websocket-experimental")]
+            WebSocketHandshakeError::UncommittedSend(error) => error,
         })?;
 
         if matches!(initialization, WebSocketInitialization::Legacy(_)) {
@@ -4870,6 +4872,10 @@ enum WebSocketInitialization {
 enum WebSocketHandshakeError {
     MethodNotFound,
     Mcp(McpError),
+    /// A failed or interrupted send may have left a partial native frame.
+    /// Its halves must retire without Close flushing the abandoned suffix.
+    #[cfg(feature = "websocket-experimental")]
+    UncommittedSend(McpError),
 }
 
 #[cfg(test)]
@@ -5795,6 +5801,90 @@ struct RetiredWebSocketRequest {
     subscription: bool,
 }
 
+/// One caller-clock lifetime for discovery, a possible fresh legacy leg, and
+/// its initialized notification. A committed request starts its idle wait;
+/// neither a transport factory nor fallback restarts the absolute deadline.
+#[cfg(feature = "websocket-experimental")]
+#[derive(Clone, Copy)]
+pub(crate) struct WebSocketConnectDeadline {
+    absolute: asupersync::types::Time,
+    policy: RequestTimeoutPolicy,
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl WebSocketConnectDeadline {
+    pub(crate) fn new(cx: &Cx, policy: RequestTimeoutPolicy) -> McpResult<Self> {
+        policy.validate()?;
+        Ok(Self {
+            absolute: cx.now() + policy.absolute_timeout(),
+            policy,
+        })
+    }
+
+    fn check(self, cx: &Cx, idle: Option<asupersync::types::Time>) -> McpResult<()> {
+        if cx.checkpoint().is_err()
+            || cx
+                .budget()
+                .deadline
+                .is_some_and(|deadline| cx.now() >= deadline)
+        {
+            return Err(McpError::request_cancelled());
+        }
+        let deadline = idle.map_or(self.absolute, |idle| idle.min(self.absolute));
+        if cx.now() >= deadline {
+            return Err(request_timeout_error(
+                if idle.is_some_and(|idle| idle < self.absolute) {
+                    RequestTimeoutSource::Idle
+                } else {
+                    RequestTimeoutSource::Absolute
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    async fn wait<F>(
+        self,
+        cx: &Cx,
+        idle: Option<asupersync::types::Time>,
+        future: F,
+    ) -> McpResult<F::Output>
+    where
+        F: Future,
+    {
+        let deadline = idle.map_or(self.absolute, |idle| idle.min(self.absolute));
+        let mut future = std::pin::pin!(future);
+        loop {
+            self.check(cx, idle)?;
+            // A caller's factory need not register for Cx cancellation. Keep
+            // its one future pinned while periodically observing its owner.
+            let wake = cx
+                .now()
+                .saturating_add_nanos(WEBSOCKET_CANCELLED_RECV_POLL_NANOS)
+                .min(deadline);
+            let wake = cx.budget().deadline.map_or(wake, |caller| caller.min(wake));
+            let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(wake));
+            let output = std::future::poll_fn(|task_cx| {
+                let _current = Cx::set_current(Some(cx.clone()));
+                if let Err(error) = self.check(cx, idle) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                if let std::task::Poll::Ready(output) = future.as_mut().poll(task_cx) {
+                    return std::task::Poll::Ready(self.check(cx, idle).map(|()| Some(output)));
+                }
+                if elapsed.as_mut().poll(task_cx).is_ready() {
+                    return std::task::Poll::Ready(Ok(None));
+                }
+                std::task::Poll::Pending
+            })
+            .await?;
+            if let Some(output) = output {
+                return Ok(output);
+            }
+        }
+    }
+}
+
 /// Caller-`Cx` asynchronous MCP client over a native WebSocket transport.
 ///
 /// The client owns one source-preserving receive half and one independently
@@ -5898,6 +5988,7 @@ where
             reverse_request_handlers,
             None,
             None,
+            WebSocketConnectDeadline::new(cx, RequestTimeoutPolicy::default())?,
             transport,
         )
         .await
@@ -5912,6 +6003,7 @@ where
         reverse_request_handlers: ReverseRequestHandlers,
         mcp_apps_settings: Option<McpAppsClientSettings>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        deadline: WebSocketConnectDeadline,
         transport: AsyncWsClientTransport<IO>,
     ) -> McpResult<Self> {
         validate_protocol_plan_feature(&protocol_plan)?;
@@ -5944,6 +6036,7 @@ where
                     &mut receiver,
                     &mut sender,
                     cx,
+                    deadline,
                     &client_info,
                     &client_capabilities,
                     mcp_apps_settings.as_ref(),
@@ -5956,6 +6049,7 @@ where
                 &mut receiver,
                 &mut sender,
                 cx,
+                deadline,
                 &client_info,
                 &client_capabilities,
                 1,
@@ -5966,12 +6060,13 @@ where
         };
         let initialization = match handshake {
             Ok(initialization) => initialization,
+            Err(WebSocketHandshakeError::UncommittedSend(error)) => {
+                // Closing would flush a possibly partial application frame.
+                // Dropping both owned halves retires the I/O without replay.
+                return Err(error);
+            }
             Err(error) => {
-                // The split connection is owned from this point onward. Every
-                // handshake failure therefore closes both halves before its
-                // original semantic error is returned to the caller.
-                let _ = close_async_websocket_halves(&mut receiver, &mut sender, cx).await;
-                return Err(match (protocol_plan.policy(), error) {
+                let error = match (protocol_plan.policy(), error) {
                     (ProtocolPolicy::ModernOnly, WebSocketHandshakeError::MethodNotFound) => {
                         McpError::method_not_found(SERVER_DISCOVER_METHOD)
                     }
@@ -5981,23 +6076,38 @@ where
                         )
                     }
                     (_, WebSocketHandshakeError::Mcp(error)) => error,
+                    (_, WebSocketHandshakeError::UncommittedSend(_)) => {
+                        unreachable!("uncommitted sends retire without a wire close")
+                    }
                     (ProtocolPolicy::Auto, _) => {
                         unreachable!("Auto was rejected before transport ownership")
                     }
-                });
+                };
+                return combine_operation_with_cleanup_async(
+                    Err(error),
+                    async {
+                        close_async_websocket_halves(&mut receiver, &mut sender, cx)
+                            .await
+                            .map_err(transport_error_to_mcp)
+                    },
+                )
+                .await;
             }
         };
 
         if matches!(initialization, WebSocketInitialization::Legacy(_)) {
-            if let Err(error) = sender
-                .send(
+            let initialized = JsonRpcMessage::Request(JsonRpcRequest::initialized_notification());
+            match deadline
+                .wait(
                     cx,
-                    &JsonRpcMessage::Request(JsonRpcRequest::initialized_notification()),
+                    None,
+                    sender.send(cx, &initialized),
                 )
                 .await
             {
-                let _ = close_async_websocket_halves(&mut receiver, &mut sender, cx).await;
-                return Err(transport_error_to_mcp(error));
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(transport_error_to_mcp(error)),
+                Err(error) => return Err(error),
             }
         }
 
@@ -6048,6 +6158,7 @@ where
                 McpError::internal_error("Configured protocol policy rejects the negotiated era")
             })
         })();
+        let session = deadline.check(cx, None).and(session);
         let session =
             admit_websocket_session_or_close(&mut receiver, &mut sender, cx, session).await?;
 
@@ -6062,7 +6173,7 @@ where
             session,
             reverse_request_handlers,
             reverse_callback_pool,
-            request_timeout_policy: RequestTimeoutPolicy::default(),
+            request_timeout_policy: deadline.policy,
             subscription_timeout_policy: SubscriptionTimeoutPolicy::default(),
             final_server_notifications: VecDeque::new(),
             final_progress_notifications: VecDeque::new(),
@@ -6128,6 +6239,7 @@ where
             reverse_request_handlers,
             None,
             None,
+            RequestTimeoutPolicy::default(),
             fresh_transport,
         )
         .await
@@ -6140,6 +6252,7 @@ where
         reverse_request_handlers: ReverseRequestHandlers,
         mcp_apps_settings: Option<McpAppsClientSettings>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        timeout_policy: RequestTimeoutPolicy,
         mut fresh_transport: F,
     ) -> McpResult<Self>
     where
@@ -6148,7 +6261,8 @@ where
     {
         let auto_plan = ClientProtocolPlan::websocket(ProtocolPolicy::Auto);
         validate_protocol_plan_feature(&auto_plan)?;
-        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let deadline = WebSocketConnectDeadline::new(cx, timeout_policy)?;
+        deadline.check(cx, None)?;
         // Modern MRTR callbacks belong to the selected modern connection.
         // Keep exact-2024 reverse RPC handlers out of that constructor while
         // retaining the original configuration for a fresh legacy fallback.
@@ -6157,7 +6271,7 @@ where
             roots_list: None,
             ..reverse_request_handlers.clone()
         };
-        let first = fresh_transport(cx).await?;
+        let first = deadline.wait(cx, None, fresh_transport(cx)).await??;
         match Self::connect_with_builder_configuration_with_cx(
             cx,
             ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
@@ -6167,6 +6281,7 @@ where
             modern_handlers,
             mcp_apps_settings.clone(),
             client_extension_runtime.clone(),
+            deadline,
             first,
         )
         .await
@@ -6175,9 +6290,11 @@ where
                 client.session.set_protocol_plan(auto_plan.clone());
                 Ok(client)
             }
-            Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
-                let fresh_legacy = fresh_transport(cx).await?;
+            Err(error)
+                if error.code == McpErrorCode::MethodNotFound && !is_cleanup_unverified(&error) =>
+            {
+                deadline.check(cx, None)?;
+                let fresh_legacy = deadline.wait(cx, None, fresh_transport(cx)).await??;
                 let mut client = Self::connect_with_builder_configuration_with_cx(
                     cx,
                     ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly),
@@ -6187,6 +6304,7 @@ where
                     reverse_request_handlers,
                     mcp_apps_settings,
                     client_extension_runtime,
+                    deadline,
                     fresh_legacy,
                 )
                 .await?;
@@ -11148,6 +11266,7 @@ async fn async_websocket_discover<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
     cx: &Cx,
+    deadline: WebSocketConnectDeadline,
     client_info: &ClientInfo,
     client_capabilities: &ClientCapabilities,
     mcp_apps_settings: Option<&McpAppsClientSettings>,
@@ -11241,6 +11360,7 @@ where
         receiver,
         sender,
         cx,
+        deadline,
         JsonRpcRequest::new(SERVER_DISCOVER_METHOD, Some(params), id),
     )
     .await?;
@@ -11282,6 +11402,7 @@ async fn async_websocket_initialize<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
     cx: &Cx,
+    deadline: WebSocketConnectDeadline,
     client_info: &ClientInfo,
     client_capabilities: &ClientCapabilities,
     id: i64,
@@ -11293,6 +11414,7 @@ where
         receiver,
         sender,
         cx,
+        deadline,
         JsonRpcRequest::new(
             "initialize",
             Some(
@@ -11330,6 +11452,7 @@ async fn async_websocket_exchange<IO>(
     receiver: &mut AsyncWsClientRecvHalf<IO>,
     sender: &mut AsyncWsClientSendHalf<IO>,
     cx: &Cx,
+    deadline: WebSocketConnectDeadline,
     request: JsonRpcRequest,
 ) -> Result<WebSocketHandshakeResponse, WebSocketHandshakeError>
 where
@@ -11340,10 +11463,20 @@ where
             "WebSocket handshake request requires an ID",
         ))
     })?;
-    if let Err(error) = sender.send(cx, &JsonRpcMessage::Request(request)).await {
-        return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error)));
-    }
-    let frame = match receiver.recv_with_source(cx).await {
+    let request = JsonRpcMessage::Request(request);
+    deadline
+        .wait(cx, None, sender.send(cx, &request))
+        .await
+        .map_err(WebSocketHandshakeError::UncommittedSend)?
+        .map_err(|error| {
+            WebSocketHandshakeError::UncommittedSend(transport_error_to_mcp(error))
+        })?;
+    let idle = cx.now() + deadline.policy.idle_timeout();
+    let frame = match deadline
+        .wait(cx, Some(idle), receiver.recv_with_source(cx))
+        .await
+        .map_err(WebSocketHandshakeError::Mcp)?
+    {
         Ok(frame) => frame,
         Err(error) => return Err(WebSocketHandshakeError::Mcp(transport_error_to_mcp(error))),
     };
@@ -11385,9 +11518,32 @@ async fn close_async_websocket_halves<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
-    let sender_result = sender.close(cx).await;
-    let receiver_result = receiver.close(cx).await;
-    sender_result.and(receiver_result)
+    // Handshake teardown has no client value to retain it for a later retry.
+    // Give it the same bounded wire-close allowance as an established client;
+    // the owning constructor drops both halves when this attempt terminates.
+    let deadline = cx.now().saturating_add_nanos(WEBSOCKET_CLOSE_TIMEOUT_NANOS);
+    let mut close = std::pin::pin!(async {
+        let sender_result = sender.close(cx).await;
+        let receiver_result = receiver.close(cx).await;
+        sender_result.and(receiver_result)
+    });
+    let mut elapsed = std::pin::pin!(asupersync::time::sleep_until(deadline));
+    std::future::poll_fn(|task_cx| {
+        let _current = Cx::set_current(Some(cx.clone()));
+        cx.masked(|| {
+            if cx.now() >= deadline {
+                return std::task::Poll::Ready(Err(TransportError::Timeout));
+            }
+            if let std::task::Poll::Ready(result) = close.as_mut().poll(task_cx) {
+                return std::task::Poll::Ready(result);
+            }
+            if elapsed.as_mut().poll(task_cx).is_ready() {
+                return std::task::Poll::Ready(Err(TransportError::Timeout));
+            }
+            std::task::Poll::Pending
+        })
+    })
+    .await
 }
 
 /// Completes session admission while this connection still owns both halves.
@@ -11408,8 +11564,12 @@ where
     match session {
         Ok(session) => Ok(session),
         Err(error) => {
-            let _ = close_async_websocket_halves(receiver, sender, cx).await;
-            Err(error)
+            combine_operation_with_cleanup_async(Err(error), async {
+                close_async_websocket_halves(receiver, sender, cx)
+                    .await
+                    .map_err(transport_error_to_mcp)
+            })
+            .await
         }
     }
 }
@@ -34293,6 +34453,326 @@ mod tests {
                 1,
                 "discovery validation failure elects exactly one shared split close"
             );
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn websocket_connect_policy_bounds_discovery_and_initialize() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for policy in [ProtocolPolicy::ModernOnly, ProtocolPolicy::LegacyOnly] {
+                for answer in [true, false] {
+                    let (client_io, server_io, close_frames) = close_counting_async_websocket_pair();
+                    let mut peer = cx
+                        .spawn(move |peer_cx| async move {
+                            let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                            let JsonRpcMessage::Request(opening) = server
+                                .recv(&peer_cx)
+                                .await
+                                .expect("peer receives the selected-era opening")
+                            else {
+                                panic!("opening must be a request");
+                            };
+                            assert_eq!(
+                                opening.method,
+                                if policy == ProtocolPolicy::ModernOnly {
+                                    SERVER_DISCOVER_METHOD
+                                } else {
+                                    "initialize"
+                                }
+                            );
+                            if answer {
+                                let result = if policy == ProtocolPolicy::ModernOnly {
+                                    async_modern_discovery_result()
+                                } else {
+                                    serde_json::json!({
+                                        "protocolVersion": PROTOCOL_VERSION,
+                                        "capabilities": {},
+                                        "serverInfo": {"name": "bounded-connect", "version": "1"}
+                                    })
+                                };
+                                server
+                                    .send(
+                                        &peer_cx,
+                                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                            opening.id.expect("opening has an ID"),
+                                            result,
+                                        )),
+                                    )
+                                    .await
+                                    .expect("peer completes the bounded handshake");
+                                if policy == ProtocolPolicy::LegacyOnly {
+                                    let JsonRpcMessage::Request(initialized) =
+                                        server.recv(&peer_cx).await.expect("initialized arrives")
+                                    else {
+                                        panic!("initialized must be a notification");
+                                    };
+                                    assert_eq!(initialized.method, "notifications/initialized");
+                                    assert!(initialized.id.is_none());
+                                }
+                            }
+                            assert!(matches!(
+                                server.recv(&peer_cx).await,
+                                Err(TransportError::Closed)
+                            ));
+                        })
+                        .expect("spawn selected-era handshake peer");
+                    let connect = ClientBuilder::new()
+                        .protocol_plan(ClientProtocolPlan::websocket(policy))
+                        .request_timeout_policy(
+                            RequestTimeoutPolicy::new(
+                                Duration::from_millis(100),
+                                Duration::from_secs(1),
+                            )
+                            .unwrap(),
+                        )
+                        .connect_websocket_with_cx(
+                            &cx,
+                            AsyncWsClientTransport::from_upgraded(client_io),
+                        );
+                    let result = asupersync::time::timeout(cx.now(), Duration::from_secs(3), connect)
+                        .await
+                        .expect("configured handshake bound precedes the test watchdog");
+                    if answer {
+                        let mut client = result.expect("responsive peer negotiates successfully");
+                        assert_eq!(
+                            client.selected_protocol_era(),
+                            if policy == ProtocolPolicy::ModernOnly {
+                                ProtocolEra::Modern2026
+                            } else {
+                                ProtocolEra::Legacy2024
+                            }
+                        );
+                        client.close(&cx).await.expect("close established client");
+                    } else {
+                        let error = result.expect_err("silence alone reaches the configured idle bound");
+                        assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "idle");
+                        assert!(!is_cleanup_unverified(&error));
+                    }
+                    peer.join(&cx).await.expect("peer observes owned cleanup");
+                    assert_eq!(close_frames.load(Ordering::SeqCst), 1);
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_connect_absolute_deadline_retires_partial_send_without_flushing() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, _peer_io, probe) = probed_async_websocket_pair();
+            probe.arm(0x01, 3, false);
+            let connect = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(
+                        Duration::from_millis(10),
+                        Duration::from_millis(50),
+                    )
+                    .unwrap(),
+                )
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io));
+            let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
+                .await
+                .expect("partial send is bounded before the watchdog")
+                .expect_err("an uncommitted native frame cannot establish a connection");
+            assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+            assert!(probe.started.load(Ordering::Acquire));
+            assert!(probe.dropped.load(Ordering::Acquire));
+            assert_eq!(probe.accepted.lock().unwrap().len(), 3,
+                "cleanup must not flush the abandoned text frame or append Close");
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn websocket_connect_absolute_deadline_covers_initialized_notification() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io, probe) = probed_async_websocket_pair();
+            let peer_probe = Arc::clone(&probe);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(initialize) =
+                        server.recv(&peer_cx).await.expect("initialize commits")
+                    else {
+                        panic!("initialize must be a request");
+                    };
+                    assert_eq!(initialize.method, "initialize");
+                    peer_probe.arm(0x01, 2, false);
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                initialize.id.expect("initialize ID"),
+                                serde_json::json!({
+                                    "protocolVersion": PROTOCOL_VERSION,
+                                    "capabilities": {},
+                                    "serverInfo": {"name": "blocked-initialized", "version": "1"}
+                                }),
+                            )),
+                        )
+                        .await
+                        .expect("initialize result commits before blocking initialized");
+                    assert!(server.recv(&peer_cx).await.is_err(),
+                        "partial initialized frame is retired without completing it");
+                })
+                .expect("spawn initialized-notification peer");
+            let connect = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::LegacyOnly))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(
+                        Duration::from_secs(1),
+                        Duration::from_millis(200),
+                    )
+                    .unwrap(),
+                )
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io));
+            let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
+                .await
+                .expect("initialized send is bounded before the watchdog")
+                .expect_err("uncommitted initialized notification cannot return a ready client");
+            assert_eq!(error.data.as_ref().unwrap()["timeoutSource"], "absolute");
+            assert!(probe.dropped.load(Ordering::Acquire));
+            assert_eq!(probe.accepted.lock().unwrap().len(), 2);
+            peer.join(&cx).await.expect("peer observes retired stream");
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn websocket_connect_auto_factory_is_bounded_and_timeout_never_falls_back() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            for stall_factory in [true, false] {
+                let (client_io, _peer_io, close_frames) = close_counting_async_websocket_pair();
+                let mut first = Some(client_io);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let factory_calls = Arc::clone(&calls);
+                let connect = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::Auto))
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(
+                            Duration::from_millis(50),
+                            Duration::from_millis(200),
+                        )
+                        .unwrap(),
+                    )
+                    .connect_websocket_auto_with_cx(&cx, move |_| {
+                        factory_calls.fetch_add(1, Ordering::SeqCst);
+                        let io = first.take().expect("timeout must never open a fallback transport");
+                        async move {
+                            if stall_factory {
+                                std::future::pending::<()>().await;
+                            }
+                            Ok(AsyncWsClientTransport::from_upgraded(io))
+                        }
+                    });
+                let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
+                    .await
+                    .expect("Auto factory and discovery each have a bounded lifetime")
+                    .expect_err("silent Auto connection times out");
+                assert_eq!(error.data.as_ref().unwrap()["timeoutSource"],
+                    if stall_factory { "absolute" } else { "idle" });
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(close_frames.load(Ordering::SeqCst), usize::from(!stall_factory));
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_connect_caller_cancellation_wins_before_response_timeout() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let caller_region = cx
+                .open_child_region(asupersync::cx::child_region::ChildRegionSpec::inherit())
+                .await
+                .expect("independent caller cancellation region");
+            let caller = caller_region.cx();
+            let (client_io, _peer_io, close_frames) = close_counting_async_websocket_pair();
+            let mut connect = Box::pin(
+                ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                    .connect_websocket_with_cx(
+                        caller,
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    ),
+            );
+            assert!(std::future::poll_fn(|task_cx| Poll::Ready(connect.as_mut().poll(task_cx)))
+                .await
+                .is_pending(), "discovery is committed and awaits its silent peer");
+            caller.set_cancel_requested(true);
+            let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
+                .await
+                .expect("caller cancellation does not wait for the 30-second idle policy")
+                .expect_err("cancelled negotiation cannot return a client");
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert!(!is_cleanup_unverified(&error));
+            assert_eq!(close_frames.load(Ordering::SeqCst), 1);
+            caller_region.close().await.expect("caller region settles");
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", feature = "legacy-2024-11-05"))]
+    #[test]
+    fn websocket_connect_failed_close_is_bounded_and_prevents_auto_fallback() {
+        run_test(|| async {
+            let cx = Cx::current().expect("test runtime installs caller context");
+            let (client_io, server_io, probe) = probed_async_websocket_pair();
+            let peer_probe = Arc::clone(&probe);
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) =
+                        server.recv(&peer_cx).await.expect("discovery commits")
+                    else {
+                        panic!("discovery must be a request");
+                    };
+                    peer_probe.arm(0x08, 1, false);
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::error(
+                                discover.id,
+                                JsonRpcError {
+                                    code: (-32601).into(),
+                                    message: "discovery unavailable".to_owned(),
+                                    data: None,
+                                },
+                            )),
+                        )
+                        .await
+                        .expect("peer sends otherwise eligible fallback refusal");
+                    assert!(server.recv(&peer_cx).await.is_err(),
+                        "bounded close retires its partial control frame");
+                })
+                .expect("spawn peer that cannot accept a complete Close");
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls = Arc::clone(&calls);
+            let mut first = Some(client_io);
+            let connect = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::Auto))
+                .connect_websocket_auto_with_cx(&cx, move |_| {
+                    factory_calls.fetch_add(1, Ordering::SeqCst);
+                    let io = first.take().expect("unverified teardown cannot authorize fallback");
+                    async move { Ok(AsyncWsClientTransport::from_upgraded(io)) }
+                });
+            let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), connect)
+                .await
+                .expect("handshake failure cleanup has its own bounded allowance")
+                .expect_err("failed Close cannot silently become a legacy connection");
+            assert_eq!(error.code, McpErrorCode::MethodNotFound);
+            assert!(is_cleanup_unverified(&error));
+            assert!(error.data.as_ref().unwrap().get("operation").is_some());
+            assert!(error.data.as_ref().unwrap().get("cleanup").is_some());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(probe.dropped.load(Ordering::Acquire));
+            assert_eq!(probe.accepted.lock().unwrap().len(), 1);
+            peer.join(&cx).await.expect("peer observes owned stream retirement");
         });
     }
 

@@ -57,7 +57,7 @@ use fastmcp_transport::websocket::AsyncWsClientTransport;
 #[cfg(all(test, unix, feature = "legacy-2024-11-05"))]
 use crate::ReverseRequestCancellation;
 #[cfg(feature = "websocket-experimental")]
-use crate::WebSocketClient;
+use crate::{WebSocketClient, WebSocketConnectDeadline};
 use crate::http_executor::{HttpConnectionSettings, ModernHttpExecutorError};
 use crate::{
     AutoStdioFallbackSignal, ChildGuard, ChildOwnership, Client, ClientExtensionRuntime,
@@ -1098,6 +1098,9 @@ impl ClientBuilder {
     /// The caller establishes the real `ws://` or `wss://` transport with
     /// [`AsyncWsClientTransport`] and passes its owned value here. This method
     /// never blocks, creates a runtime, or accepts synthetic transport halves.
+    /// The configured request policy bounds negotiation before the client is
+    /// returned: absolute time includes writes, and idle time starts after
+    /// the discovery or initialize request commits.
     #[cfg(feature = "websocket-experimental")]
     pub async fn connect_websocket_with_cx<IO>(
         self,
@@ -1110,6 +1113,7 @@ impl ClientBuilder {
         self.validate_feature_configuration()?;
         self.validate_websocket_configuration()?;
         let client_implementation = self.client_implementation_for_session();
+        let deadline = WebSocketConnectDeadline::new(cx, self.timeout_policy)?;
         // Negotiation owns several protocol states. Pin it separately so
         // wrapping this connection in a caller deadline keeps a small future.
         let mut client = Box::pin(WebSocketClient::connect_with_builder_configuration_with_cx(
@@ -1121,6 +1125,7 @@ impl ClientBuilder {
             self.reverse_request_handlers,
             self.mcp_apps_settings,
             self.client_extension_runtime,
+            deadline,
             transport,
         ))
         .await?;
@@ -1131,6 +1136,8 @@ impl ClientBuilder {
 
     /// Negotiates Auto with a caller-owned factory that creates a fresh
     /// upgraded transport for the sole permitted exact-legacy retry.
+    /// Both factory calls and both negotiation legs share the configured
+    /// absolute timeout. A timeout never authorizes a legacy fallback.
     #[cfg(feature = "websocket-experimental")]
     pub async fn connect_websocket_auto_with_cx<IO, F, Fut>(
         self,
@@ -1156,6 +1163,7 @@ impl ClientBuilder {
             self.reverse_request_handlers,
             self.mcp_apps_settings,
             self.client_extension_runtime,
+            self.timeout_policy,
             fresh_transport,
         )
         .await?;
