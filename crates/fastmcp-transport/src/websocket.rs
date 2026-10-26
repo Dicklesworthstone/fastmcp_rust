@@ -5520,6 +5520,76 @@ mod tests {
         run_test(|| async { assert_server_split_masked_fragment_source(false).await });
     }
 
+    /// The one RFC 6455 invariant with no upstream owner, proven on the shipped
+    /// path (bd-websocket-framing-claim-f2d33 item 2).
+    ///
+    /// asupersync's frame codec is per-frame and carries no fragmentation
+    /// state, so refusing a data frame interleaved into a fragmented message is
+    /// this crate's own rule, enforced in `AsyncWsServerTransport`'s dispatch
+    /// rather than upstream. Every other fragmentation test in this module
+    /// drives the `cfg(test)` `WsTransport`, which does not ship, so none of
+    /// them reaches that dispatch.
+    ///
+    /// The two rows below differ in exactly one byte -- the second data frame's
+    /// opcode, `0x00` versus `0x01` -- so a regression that stopped tracking
+    /// fragmentation state would turn the negative green while the positive
+    /// still passed.
+    async fn assert_server_second_data_frame_opcode(continuation: bool) {
+        let cx = Cx::current().expect("runtime root context");
+        let (mut peer, server_socket) = virtual_socket_pair();
+        let source = br#"{"jsonrpc":"2.0","id":905,"result":{"interleaved":false}}"#;
+        let midpoint = source.len() / 2;
+        let mut inbound = build_masked_frame(0x01, false, &source[..midpoint]);
+        // 0x00 Continuation completes the fragmented message; a second 0x01
+        // Text frame is a data frame arriving inside it, which RFC 6455 §5.4
+        // forbids.
+        inbound.extend(build_masked_frame(
+            if continuation { 0x00 } else { 0x01 },
+            true,
+            &source[midpoint..],
+        ));
+        let server = AsyncWsServerTransport::from_upgraded_with_initial_bytes(
+            server_socket,
+            inbound.into_boxed_slice(),
+        )
+        .expect("bounded initial frames");
+        let (mut receiver, mut sender) = server.into_split();
+        let received = receiver.recv_with_source(&cx).await;
+        if continuation {
+            assert_eq!(
+                received
+                    .expect("a continuation frame completes the fragmented message")
+                    .source(),
+                source
+            );
+            assert!(!receiver.is_closed());
+            assert!(!sender.is_closed());
+        } else {
+            assert!(matches!(
+                received,
+                Err(TransportError::Io(ref error)) if error.kind() == io::ErrorKind::InvalidData
+            ));
+            assert!(receiver.is_closed());
+            assert!(sender.is_closed());
+            let mut close = [0; 4];
+            peer.read_exact(&mut close)
+                .await
+                .expect("read protocol-error Close");
+            // CloseCode::ProtocolError is 1002 == 0x03EA.
+            assert_eq!(close, [0x88, 0x02, 0x03, 0xEA]);
+        }
+    }
+
+    #[test]
+    fn async_server_assembles_a_continuation_completed_fragmented_message() {
+        run_test(|| async { assert_server_second_data_frame_opcode(true).await });
+    }
+
+    #[test]
+    fn async_server_refuses_a_text_frame_interleaved_into_a_fragmented_message() {
+        run_test(|| async { assert_server_second_data_frame_opcode(false).await });
+    }
+
     async fn assert_server_split_dropped_write(prefix: usize) {
         let cx = Cx::current().expect("runtime root context");
         let released = Arc::new(AtomicBool::new(false));
