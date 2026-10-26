@@ -29,6 +29,8 @@ enum RecoveryCase {
     DropRead,
     Deadline,
     InvalidWire,
+    PeerCancellation,
+    ForeignCancellation,
 }
 
 fn isolated_recovery(name: &str, case: RecoveryCase) {
@@ -178,7 +180,7 @@ fn run_recovery(case: RecoveryCase) {
             let selection = if matches!(case, RecoveryCase::TerminalSelection) { vec!["task-one", "task-two"] } else { vec!["task-one"] };
             let task_ids = selection.iter().map(|id| TaskId::parse(*id).unwrap()).collect();
             let (mut original, watch) = pair(
-                Box::pin(listen(&peer, 0, &selection, &selection, !matches!(case, RecoveryCase::InvalidWire))),
+                Box::pin(listen(&peer, 0, &selection, &selection, !matches!(case, RecoveryCase::InvalidWire | RecoveryCase::PeerCancellation | RecoveryCase::ForeignCancellation))),
                 Box::pin(client.watch_tasks_recovering_with_cancellation(
                     &cx, &cancellation, task_ids, "recovery".to_owned(), watch_policy, policy,
                 )),
@@ -194,6 +196,12 @@ fn run_recovery(case: RecoveryCase) {
                 // An admitted stream followed by bad protocol data is NOT a
                 // transient interruption and must not reopen a clean stream.
                 event(&mut original, "{not-json", true).await;
+            }
+            if matches!(case, RecoveryCase::PeerCancellation | RecoveryCase::ForeignCancellation) {
+                event(&mut original, &json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{
+                    "requestId":identifier(1), "reason":"watch maintenance",
+                    "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):identifier(if matches!(case, RecoveryCase::ForeignCancellation) { 99 } else { 1 })}
+                }}).to_string(), true).await;
             }
             drop(original);
             match case {
@@ -307,6 +315,18 @@ fn run_recovery(case: RecoveryCase) {
                     assert_eq!(watch.reconnection_attempts(), 0);
                     assert_eq!(peer.posts.load(Ordering::SeqCst), 4);
                 }
+                RecoveryCase::PeerCancellation | RecoveryCase::ForeignCancellation => {
+                    let result = watch.next_snapshot(&cx).await;
+                    if matches!(case, RecoveryCase::PeerCancellation) {
+                        assert!(matches!(result, Err(ManagedTaskRecoveryError::Watch(ManagedTaskWatchError::SubscriptionEnded))));
+                    } else {
+                        assert!(matches!(result, Err(ManagedTaskRecoveryError::Watch(ManagedTaskWatchError::Subscription(ManagedSubscriptionError::InvalidResponse)))));
+                    }
+                    assert!(matches!(*initial.task, Task::Working(_)), "ending observation cannot change durable Task state");
+                    assert_eq!(watch.reconnection_attempts(), 0);
+                    assert_eq!(peer.posts.load(Ordering::SeqCst), 4, "peer terminal cannot trigger another get, reconnect, or Task mutation");
+                    assert!(cx.checkpoint().is_ok());
+                }
             }
             if !matches!(case, RecoveryCase::Complete | RecoveryCase::TerminalSelection) {
                 assert!(matches!(watch.next_snapshot(&cx).await, Err(ManagedTaskRecoveryError::Watch(ManagedTaskWatchError::Closed))),
@@ -390,6 +410,20 @@ fn invalid_live_protocol_is_not_reclassified_as_a_recoverable_disconnect() {
     isolated_recovery(
         "invalid_live_protocol_is_not_reclassified_as_a_recoverable_disconnect",
         RecoveryCase::InvalidWire,
+    );
+}
+#[test]
+fn peer_subscription_cancellation_stops_task_recovery_without_reconciliation() {
+    isolated_recovery(
+        "peer_subscription_cancellation_stops_task_recovery_without_reconciliation",
+        RecoveryCase::PeerCancellation,
+    );
+}
+#[test]
+fn foreign_subscription_cancellation_is_rejected_without_task_recovery() {
+    isolated_recovery(
+        "foreign_subscription_cancellation_is_rejected_without_task_recovery",
+        RecoveryCase::ForeignCancellation,
     );
 }
 

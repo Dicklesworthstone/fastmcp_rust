@@ -15,6 +15,7 @@ const SUB_CHILD: &str = "FASTMCP_TEST_MACHINE_TASK_SUBSCRIPTION_CASE";
 #[derive(Clone, Copy)]
 enum SubCase {
     Live,
+    PeerCancellation,
     MissingTasks,
     MalformedAuth,
     WrongAck,
@@ -98,8 +99,14 @@ fn task_notice(subscription: i64, task_id: &str, status: &str) -> String {
     }})
     .to_string()
 }
-fn resource_notice(uri: &str) -> String {
-    json!({"jsonrpc":"2.0", "method":"notifications/resources/updated", "params":{"uri":uri}})
+fn catalog_notice(subscription: i64) -> String {
+    json!({"jsonrpc":"2.0", "method":"notifications/tools/list_changed",
+        "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):subscription}}})
+    .to_string()
+}
+fn resource_notice(subscription: i64, uri: &str) -> String {
+    json!({"jsonrpc":"2.0", "method":"notifications/resources/updated",
+        "params":{"uri":uri,"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):subscription}}})
         .to_string()
 }
 async fn stream(
@@ -236,8 +243,8 @@ fn run_subscription(case: SubCase) {
                             let mut tls = stream(&peer, 1, "access-one", &selected()).await;
                             event(&mut tls, &ack(2, &selected()), false).await;
                             rx.recv(&cx).await.unwrap();
-                            event(&mut tls, NOTICE, false).await;
-                            event(&mut tls, &resource_notice("file:///watched"), false).await;
+                            event(&mut tls, &catalog_notice(2), false).await;
+                            event(&mut tls, &resource_notice(2, "file:///watched"), false).await;
                             event(&mut tls, &task_notice(2, "machine-task", "working"), false).await;
                             event(&mut tls, &task_notice(2, "machine-task", "cancelled"), false).await;
                             event(&mut tls, &terminal_listen(2), true).await;
@@ -260,6 +267,46 @@ fn run_subscription(case: SubCase) {
                         };
                         Box::pin(pair(server, application)).await;
                         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2, "events cause no polling or mutation");
+                    }
+                    SubCase::PeerCancellation => {
+                        for (index, foreign_owner) in [false, true].into_iter().enumerate() {
+                            let base = 1 + 2 * index as i64;
+                            let listen_id = base + 1;
+                            let server = async {
+                                let mut tls = stream(&peer, base, "access-one", &selected()).await;
+                                let cancellation = json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{
+                                    "requestId":listen_id, "reason":"subscription maintenance",
+                                    "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):if foreign_owner { 99 } else { listen_id }}
+                                }}).to_string();
+                                let body = [ack(listen_id, &selected()), cancellation,
+                                    task_notice(listen_id, "machine-task", "cancelled"), terminal_listen(listen_id)]
+                                    .iter().map(|value| format!("data: {value}\n\n")).collect::<String>();
+                                tls.write_all(format!("{:X}\r\n{body}\r\n", body.len()).as_bytes()).await.unwrap();
+                                tls.flush().await.unwrap();
+                                let mut byte = [0];
+                                assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
+                            };
+                            let application = async {
+                                let mut subscription = open(&tasks, &cx, base).await;
+                                receive_ack(&mut subscription, &cx, &selected()).await;
+                                if foreign_owner {
+                                    assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::InvalidResponse))));
+                                    assert!(matches!(subscription.next_event(&cx).await, Err(TaskError::Protocol(ManagedTasksError::Closed))));
+                                } else {
+                                    let Some(ListenEvent::Cancelled { subscription_id, params }) = subscription.next_event(&cx).await.unwrap()
+                                        else { panic!("the selected cancellation must remain typed"); };
+                                    assert!(subscription_id.correlates_with(&RequestId::Number(listen_id)));
+                                    assert!(params.request_id.correlates_with(&subscription_id));
+                                    assert_eq!(params.reason.as_deref(), Some("subscription maintenance"));
+                                    assert!(subscription.next_event(&cx).await.unwrap().is_none(), "late Task mutation and complete remain suppressed");
+                                }
+                                assert!(cx.checkpoint().is_ok());
+                            };
+                            Box::pin(pair(server, application)).await;
+                            peer.quiet();
+                        }
+                        assert_eq!(peer.rpcs.load(Ordering::SeqCst), 4, "peer cancellation cannot poll or replay task mutations");
+                        healthy_listen(&peer, &tasks, &cx, 5, "access-one", 1).await;
                     }
                     SubCase::MissingTasks | SubCase::MalformedAuth => {
                         let mut document = discovery();
@@ -298,7 +345,7 @@ fn run_subscription(case: SubCase) {
                                 SubCase::BeforeAck => task_notice(2, "machine-task", "working"),
                                 SubCase::WrongTask => task_notice(2, "foreign-task", "working"),
                                 SubCase::WrongSubscription => task_notice(99, "machine-task", "working"),
-                                SubCase::WrongResource => resource_notice("file:///not-watched"),
+                                SubCase::WrongResource => resource_notice(2, "file:///not-watched"),
                                 SubCase::DuplicateAck => ack(2, &selected()),
                                 SubCase::RemoteError => r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32603,"message":"private-peer-secret","data":"private-peer-secret"}}"#.to_owned(),
                                 _ => return,
@@ -464,6 +511,13 @@ fn machine_subscriptions_deliver_live_task_catalog_and_resource_events() {
     isolated_subscription(
         "tasks::subscriptions::machine_subscriptions_deliver_live_task_catalog_and_resource_events",
         SubCase::Live,
+    );
+}
+#[test]
+fn machine_subscription_peer_cancellation_is_correlated_and_terminal() {
+    isolated_subscription(
+        "tasks::subscriptions::machine_subscription_peer_cancellation_is_correlated_and_terminal",
+        SubCase::PeerCancellation,
     );
 }
 #[test]

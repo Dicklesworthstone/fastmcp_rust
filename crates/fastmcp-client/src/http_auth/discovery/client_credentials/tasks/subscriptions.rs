@@ -337,7 +337,11 @@ impl ClientCredentialsTaskSubscription {
             self.accepted_filter = Some(accepted_filter.clone());
         }
         self.records += 1;
-        if matches!(&event, ModernHttpSubscriptionListenEvent::Terminal { .. }) {
+        if matches!(
+            &event,
+            ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. }
+        ) {
             self.finished = true;
         } else {
             self.listener = Some(listener);

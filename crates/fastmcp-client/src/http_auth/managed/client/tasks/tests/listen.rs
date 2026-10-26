@@ -133,11 +133,105 @@ fn managed_task_listen_delivers_before_eof_and_retains_exact_requested_ids() {
             },
         )
         .await;
-        assert!(result.unwrap().is_some());
+        assert!(matches!(
+            result.unwrap(),
+            Some(crate::ModernHttpSubscriptionTermination::Complete(_))
+        ));
         assert_eq!(observed, ["ack", "working", "completed"]);
         assert_eq!(client.cached_credential_generation(), Some(1));
         peer.no_more(&cx).await;
     });
+}
+
+#[test]
+fn managed_core_and_task_listens_preserve_peer_cancellation_without_replay() {
+    for tasks in [false, true] {
+        for foreign_control in [false, true] {
+            run(async {
+                let cx = Cx::current().unwrap();
+                let peer = Peer::new().await;
+                let session = peer.login(&cx).await;
+                let client = peer.client(session);
+                let mut client = if tasks { client.with_tasks() } else { client };
+                let mut observations = 0;
+                let mut observer = |event: &Event| {
+                    assert!(matches!(event, Event::Acknowledged { .. }));
+                    observations += 1;
+                    ControlFlow::Continue(())
+                };
+                let operation = async {
+                    if tasks {
+                        client.listen_task_events(
+                            &cx, vec![id()], 1, PAYLOAD_BYTES, &mut observer,
+                        ).await
+                    } else {
+                        client.listen_core_events(
+                            &cx,
+                            fastmcp_protocol::SubscriptionFilter {
+                                tools_list_changed: Some(true),
+                                ..fastmcp_protocol::SubscriptionFilter::default()
+                            },
+                            1,
+                            PAYLOAD_BYTES,
+                            &mut observer,
+                        ).await
+                    }
+                };
+                let (result, ()) = pair(operation, async {
+                    peer.discovery("access-one", tasks).await;
+                    let (mut stream, request) = if tasks {
+                        peer.request("subscriptions/listen", "access-one").await
+                    } else {
+                        // This fixture's Tasks request helper requires a Tasks
+                        // declaration. Keep that assertion intact while also
+                        // exercising the core-only client with no Tasks opt-in.
+                        let (stream, target, headers, bytes) = peer.next().await;
+                        assert_eq!(target, "/mcp");
+                        assert_eq!(headers["authorization"], "Bearer access-one");
+                        assert!(!headers.contains_key("cookie"));
+                        let request: Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(request["method"], "subscriptions/listen");
+                        assert_eq!(request["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"], FINAL_PROTOCOL_VERSION);
+                        assert!(request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]["extensions"].get(TASKS_EXTENSION).is_none());
+                        (stream, request)
+                    };
+                    let acknowledgement = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/subscriptions/acknowledged",
+                        "params": {
+                            "_meta": {SUB_ID: request["id"]},
+                            "notifications": request["params"]["notifications"]
+                        }
+                    });
+                    let cancellation = json!({
+                        "jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {
+                            "requestId": request["id"],
+                            "reason": "subscription maintenance",
+                            "_meta": {SUB_ID: if foreign_control { json!("foreign") } else { request["id"].clone() }}
+                        }
+                    });
+                    finite_stream(&mut stream, &[
+                        acknowledgement,
+                        cancellation,
+                        terminal(&request["id"]),
+                    ]).await;
+                }).await;
+                if foreign_control {
+                    assert!(result.is_err());
+                } else {
+                    assert!(matches!(
+                        result.unwrap(),
+                        Some(crate::ModernHttpSubscriptionTermination::Cancelled(params))
+                            if params.reason.as_deref() == Some("subscription maintenance")
+                    ));
+                }
+                assert_eq!(observations, 1, "terminal control is not an observer notification");
+                assert!(cx.checkpoint().is_ok());
+                peer.no_more(&cx).await;
+            });
+        }
+    }
 }
 
 #[test]

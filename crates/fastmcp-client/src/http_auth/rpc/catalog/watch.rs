@@ -300,7 +300,10 @@ impl ManagedCatalogClient {
                                     return Ok(ManagedCatalogWatchOutcome::StoppedByHost);
                                 }
                             }
-                            Some(ManagedSubscriptionEvent::Terminal { .. }) => {
+                            Some(
+                                ManagedSubscriptionEvent::Terminal { .. }
+                                | ManagedSubscriptionEvent::Cancelled { .. },
+                            ) => {
                                 return Ok(ManagedCatalogWatchOutcome::SubscriptionEnded);
                             }
                             _ => return Err(ManagedCatalogWatchError::UnexpectedEvent),

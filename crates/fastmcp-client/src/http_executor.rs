@@ -61,7 +61,8 @@ use fastmcp_protocol::{CancellationSender, CancellationWireMessage, CorrelationK
 use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, CompleteResult, CoreDispatchError, CoreRequest, CoreResult,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
-    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCoreResult, FinalNotificationError,
+    FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreResult,
+    FinalNotificationError,
     FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
@@ -1247,6 +1248,28 @@ pub enum ModernHttpSubscriptionListenEvent {
         /// The terminal complete result.
         result: CompleteResult<FinalSubscriptionsListenResult>,
     },
+    /// The server cancelled this exact acknowledged subscription.
+    ///
+    /// This is a terminal control, independent of the accepted event filter.
+    /// It closes only this response and does not cancel the caller's context.
+    Cancelled {
+        /// The JSON-RPC ID that owns the cancelled subscription.
+        subscription_id: RequestId,
+        /// The admitted cancellation, including its reason and metadata.
+        params: FinalCancelledNotificationParams,
+    },
+}
+
+/// The first valid terminal signal received from an HTTP subscription peer.
+///
+/// Cancellation and completion remain distinct. A cancellation-only peer does
+/// not supply a complete result, and a later second terminal is discarded.
+#[derive(Debug, Clone)]
+pub enum ModernHttpSubscriptionTermination {
+    /// The peer supplied a correlated final complete result.
+    Complete(CompleteResult<FinalSubscriptionsListenResult>),
+    /// The peer supplied a correlated server cancellation control.
+    Cancelled(FinalCancelledNotificationParams),
 }
 
 /// A live, request-owned final HTTP `subscriptions/listen` response stream.
@@ -1292,7 +1315,8 @@ impl ModernHttpSubscriptionListener {
 
     /// Reads and validates one record from this live listener.
     ///
-    /// `None` is returned only after the terminal record was already yielded.
+    /// `None` is returned only after the complete or cancellation terminal
+    /// record was already yielded.
     pub async fn next_event(
         &mut self,
         cx: &Cx,
@@ -1356,7 +1380,10 @@ impl ModernHttpSubscriptionListener {
         if result.is_err()
             || matches!(
                 result,
-                Ok(Some(ModernHttpSubscriptionListenEvent::Terminal { .. }))
+                Ok(Some(
+                    ModernHttpSubscriptionListenEvent::Terminal { .. }
+                        | ModernHttpSubscriptionListenEvent::Cancelled { .. }
+                ))
             )
         {
             self.stream.close();
@@ -1393,7 +1420,11 @@ impl ModernHttpSubscriptionListener {
         event: String,
     ) -> Result<ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListenError> {
         let admitted = self.admit_listen_payload(event)?;
-        if !matches!(admitted, ModernHttpSubscriptionListenEvent::Terminal { .. }) {
+        if !matches!(
+            admitted,
+            ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. }
+        ) {
             self.stream
                 .observe_subscription_activity()
                 .map_err(ModernHttpSubscriptionListenError::Executor)?;
@@ -1503,8 +1534,29 @@ impl ModernHttpSubscriptionListener {
                         self.accepted_filter = Some(accepted_filter.clone());
                         Ok(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter })
                     }
-                    ServerNotification::Cancelled(_) => {
-                        Err(ModernHttpSubscriptionListenError::ServerCancellationOnHttp)
+                    ServerNotification::Cancelled(ref params) => {
+                        if self.accepted_filter.is_none() {
+                            return Err(
+                                ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement,
+                            );
+                        }
+                        validate_http_subscription_notification_id(
+                            &notification,
+                            &self.request_id,
+                        )?;
+                        if !params.request_id.correlates_with(&self.request_id) {
+                            return Err(
+                                ModernHttpSubscriptionListenError::CancellationRequestIdMismatch {
+                                    expected: self.request_id.clone(),
+                                    actual: params.request_id.clone(),
+                                },
+                            );
+                        }
+                        self.terminal_received = true;
+                        Ok(ModernHttpSubscriptionListenEvent::Cancelled {
+                            subscription_id: self.request_id.clone(),
+                            params: params.clone(),
+                        })
                     }
                     notification @ (ServerNotification::ResourcesListChanged(_)
                     | ServerNotification::ToolsListChanged(_)
@@ -1582,7 +1634,24 @@ impl ModernHttpSubscriptionListener {
                         notifications,
                         #[cfg(feature = "tasks")]
                         task_notifications,
-                        terminal,
+                        terminal: ModernHttpSubscriptionTermination::Complete(terminal),
+                    });
+                }
+                ModernHttpSubscriptionListenEvent::Cancelled {
+                    subscription_id,
+                    params,
+                } => {
+                    let accepted_filter = self
+                        .accepted_filter
+                        .clone()
+                        .ok_or(ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement)?;
+                    return Ok(ModernHttpSubscriptionListenCollector {
+                        subscription_id,
+                        accepted_filter,
+                        notifications,
+                        #[cfg(feature = "tasks")]
+                        task_notifications,
+                        terminal: ModernHttpSubscriptionTermination::Cancelled(params),
                     });
                 }
             }
@@ -3257,8 +3326,8 @@ pub struct ModernHttpSubscriptionListenCollector {
     /// Request-owned typed Tasks events admitted by the exact acknowledged IDs.
     #[cfg(feature = "tasks")]
     pub task_notifications: Vec<FinalTaskStatusNotification>,
-    /// The final complete result terminating the subscription stream.
-    pub terminal: CompleteResult<FinalSubscriptionsListenResult>,
+    /// The first complete result or server cancellation terminating this stream.
+    pub terminal: ModernHttpSubscriptionTermination,
 }
 
 /// Errors raised while consuming one final HTTP `subscriptions/listen` SSE
@@ -3346,10 +3415,14 @@ pub enum ModernHttpSubscriptionListenError {
     TaskEventOutsideAcceptedFilter,
     /// The caller cancelled this request-owned listener context.
     CallerCancelled { request_id: RequestId },
-    /// Server cancellation notifications are invalid on a modern HTTP SSE
-    /// response stream; response-body closure is the only cancellation signal.
-    ServerCancellationOnHttp,
-    /// The SSE stream reached EOF without a complete terminal result.
+    /// A server cancellation named another request despite its stream metadata.
+    CancellationRequestIdMismatch {
+        /// The immutable ID assigned to the outgoing listen request.
+        expected: RequestId,
+        /// The request ID supplied in the cancellation parameters.
+        actual: RequestId,
+    },
+    /// The SSE stream reached EOF without a complete or cancellation terminal.
     EndOfStream {
         /// The parser's exact report of discarded framing at EOF.
         framing: Option<SseEndOfStream>,
@@ -3443,11 +3516,12 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
                 formatter,
                 "subscriptions/listen request {request_id:?} was cancelled by the caller"
             ),
-            Self::ServerCancellationOnHttp => formatter.write_str(
-                "subscriptions/listen received an invalid server cancellation notification over HTTP",
+            Self::CancellationRequestIdMismatch { expected, actual } => write!(
+                formatter,
+                "subscriptions/listen cancellation ID {actual:?} did not match request {expected:?}"
             ),
             Self::EndOfStream { .. } => formatter.write_str(
-                "subscriptions/listen SSE reached EOF before terminal complete result",
+                "subscriptions/listen SSE reached EOF before a terminal signal",
             ),
         }
     }
@@ -3484,7 +3558,7 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             | Self::TaskEventSubscriptionIdMismatch
             | Self::TaskEventOutsideAcceptedFilter
             | Self::CallerCancelled { .. }
-            | Self::ServerCancellationOnHttp
+            | Self::CancellationRequestIdMismatch { .. }
             | Self::EndOfStream { .. } => None,
         }
     }
@@ -16181,8 +16255,11 @@ mod tests {
             assert!(owner.correlates_with(&RequestId::Number(2)));
         }
         assert!(matches!(
-            collector.terminal.payload,
-            fastmcp_protocol::FinalSubscriptionsListenResult {}
+            collector.terminal,
+            super::ModernHttpSubscriptionTermination::Complete(fastmcp_protocol::CompleteResult {
+                payload: fastmcp_protocol::FinalSubscriptionsListenResult {},
+                ..
+            })
         ));
         server
             .join()
@@ -16422,7 +16499,7 @@ mod tests {
     }
 
     #[test]
-    fn public_http_modern_subscriptions_listen_rejects_server_cancellation_frames() {
+    fn public_http_modern_subscriptions_listen_rejects_cancellation_before_acknowledgement() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .expect("bind final subscriptions/listen cancellation listener");
         let address = listener
@@ -16485,10 +16562,10 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("cancellation response and trailer must finish before rejection");
         let error = runtime_block_on(subscription.next_event(&cx))
-            .expect_err("server cancellation notifications are invalid on final HTTP SSE");
+            .expect_err("a server cancellation cannot terminate an unacknowledged subscription");
         assert!(matches!(
             error,
-            ModernHttpSubscriptionListenError::ServerCancellationOnHttp
+            ModernHttpSubscriptionListenError::TerminalBeforeAcknowledgement
         ));
         assert!(
             subscription.stream.response.is_none(),
@@ -16501,6 +16578,239 @@ mod tests {
         server
             .join()
             .expect("final subscriptions/listen cancellation server must join");
+    }
+
+    fn public_http_subscription_first_terminal_case(
+        cancellation_first: bool,
+        second_terminal: bool,
+        collect: bool,
+    ) {
+        const CANCELLED: &str = r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2e0,"reason":"server maintenance","_meta":{"io.modelcontextprotocol/subscriptionId":2.0}}}"#;
+        const COMPLETE: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind terminal election peer");
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (sent, received) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut discovery, _) = listener.accept().expect("accept discovery");
+            let _ = read_request(&mut discovery);
+            write_response(&mut discovery, 200, "application/json", modern_discovery_body());
+            let (mut first, _) = listener.accept().expect("accept first subscription");
+            let _ = read_request(&mut first);
+            begin_chunked_sse(&mut first);
+            let first_terminal = if cancellation_first { CANCELLED } else { COMPLETE };
+            let late_terminal = if second_terminal {
+                format!("data: {}\n\n", if cancellation_first { COMPLETE } else { CANCELLED })
+            } else {
+                String::new()
+            };
+            let frames = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}},\"notifications\":{{}}}}}}\n\ndata: {first_terminal}\n\n{late_terminal}"
+            );
+            write_chunked_sse_event(&mut first, &frames);
+            // Keep this body open without a chunk terminator: a terminal
+            // control must settle the listener without waiting for EOF.
+            let (mut sibling, _) = listener.accept().expect("accept independent sibling");
+            let request = read_request(&mut sibling);
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["id"], 3);
+            write_response(
+                &mut sibling,
+                200,
+                "text/event-stream",
+                b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3},\"notifications\":{\"toolsListChanged\":true}}}\n\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":3}}}\n\n",
+            );
+            sent.send(()).expect("report terminal bytes sent");
+            first.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut byte = [0];
+            match first.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("first terminal must close its still-open body: {other:?}"),
+            }
+        });
+        let cx = Cx::for_request();
+        let connection = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx),
+        )
+        .expect("connect public subscription client");
+        let limits = SseLimits::new(2_048, 16_384, 16).unwrap();
+        let mut first = runtime_block_on(connection.open_subscriptions_listener(
+            &cx,
+            RequestId::Number(2),
+            SubscriptionFilter::default(),
+            limits,
+        ))
+        .expect("open first subscription");
+        let sibling = runtime_block_on(connection.open_subscriptions_listener(
+            &cx,
+            RequestId::Number(3),
+            SubscriptionFilter {
+                tools_list_changed: Some(true),
+                ..SubscriptionFilter::default()
+            },
+            limits,
+        ))
+        .expect("open independent sibling subscription");
+        received.recv_timeout(Duration::from_secs(2)).unwrap();
+        if collect {
+            let collected = runtime_block_on(first.collect(&cx)).expect("collect terminal outcome");
+            assert!(collected.notifications.is_empty());
+            assert_eq!(collected.subscription_id, RequestId::Number(2));
+            match collected.terminal {
+                super::ModernHttpSubscriptionTermination::Cancelled(params) => {
+                    assert!(cancellation_first);
+                    assert_eq!(params.reason.as_deref(), Some("server maintenance"));
+                    assert!(params.request_id.correlates_with(&RequestId::Number(2)));
+                }
+                super::ModernHttpSubscriptionTermination::Complete(_) => {
+                    assert!(!cancellation_first);
+                }
+            }
+        } else {
+            assert!(matches!(
+                runtime_block_on(first.next_event(&cx)).unwrap(),
+                Some(super::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+            ));
+            match runtime_block_on(first.next_event(&cx)).expect("admit the first terminal") {
+                Some(super::ModernHttpSubscriptionListenEvent::Cancelled {
+                    subscription_id,
+                    params,
+                }) => {
+                    assert!(cancellation_first);
+                    assert_eq!(subscription_id, RequestId::Number(2));
+                    assert_eq!(params.reason.as_deref(), Some("server maintenance"));
+                }
+                Some(super::ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
+                    assert!(!cancellation_first);
+                }
+                other => panic!("first signal must be a typed terminal: {other:?}"),
+            }
+            assert!(first.stream.response.is_none());
+            assert!(first.stream.parser.is_none());
+            assert!(first.stream.pending_events.is_empty());
+            assert!(runtime_block_on(first.next_event(&cx)).unwrap().is_none());
+        }
+        assert!(cx.checkpoint().is_ok(), "server cancellation must preserve caller context");
+        let sibling = runtime_block_on(sibling.collect(&cx))
+            .expect("the first listener's terminal cannot terminate its sibling");
+        assert_eq!(sibling.subscription_id, RequestId::Number(3));
+        assert_eq!(sibling.notifications.len(), 1);
+        assert!(matches!(
+            sibling.terminal,
+            super::ModernHttpSubscriptionTermination::Complete(_)
+        ));
+        server.join().expect("terminal election peer joins");
+    }
+
+    #[test]
+    fn public_http_subscription_cancellation_and_completion_first_terminal_wins() {
+        for cancellation_first in [true, false] {
+            for second_terminal in [false, true] {
+                public_http_subscription_first_terminal_case(
+                    cancellation_first,
+                    second_terminal,
+                    false,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_http_subscription_collect_preserves_cancellation_without_complete_result() {
+        for cancellation_first in [true, false] {
+            for second_terminal in [false, true] {
+                public_http_subscription_first_terminal_case(
+                    cancellation_first,
+                    second_terminal,
+                    true,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn public_http_subscription_cancellation_requires_matching_request_and_stream_ids() {
+        for (request_id, metadata_id, expected_error) in [
+            (serde_json::json!(2), None, "missing"),
+            (serde_json::json!(2), Some(serde_json::json!(true)), "invalid"),
+            (serde_json::json!(2), Some(serde_json::json!(3)), "foreign"),
+            (serde_json::json!(3), Some(serde_json::json!(2)), "request"),
+            (serde_json::json!("2"), Some(serde_json::json!(2)), "request"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let (sent, received) = mpsc::sync_channel(1);
+            let server = thread::spawn(move || {
+                let (mut discovery, _) = listener.accept().unwrap();
+                let _ = read_request(&mut discovery);
+                write_response(&mut discovery, 200, "application/json", modern_discovery_body());
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                let mut params = serde_json::json!({"requestId": request_id});
+                if let Some(metadata_id) = metadata_id {
+                    params["_meta"] = serde_json::json!({
+                        "io.modelcontextprotocol/subscriptionId": metadata_id
+                    });
+                }
+                let control = serde_json::json!({
+                    "jsonrpc": "2.0", "method": "notifications/cancelled", "params": params
+                });
+                let body = format!(
+                    "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}},\"notifications\":{{}}}}}}\n\ndata: {control}\n\n"
+                );
+                write_response(&mut stream, 200, "text/event-stream", body.as_bytes());
+                sent.send(()).unwrap();
+            });
+            let cx = Cx::for_request();
+            let connection = runtime_block_on(
+                ClientBuilder::new()
+                    .protocol_plan(plan(
+                        &target,
+                        "http://127.0.0.1:9/legacy-sse",
+                        "http://127.0.0.1:9/legacy-message",
+                        ProtocolPolicy::ModernOnly,
+                    ))
+                    .connect_http_with_cx(&cx),
+            )
+            .unwrap();
+            let mut subscription = runtime_block_on(connection.open_subscriptions_listener(
+                &cx,
+                RequestId::Number(2),
+                SubscriptionFilter::default(),
+                SseLimits::new(2_048, 8_192, 8).unwrap(),
+            ))
+            .unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                runtime_block_on(subscription.next_event(&cx)).unwrap(),
+                Some(super::ModernHttpSubscriptionListenEvent::Acknowledged { .. })
+            ));
+            let error = runtime_block_on(subscription.next_event(&cx))
+                .expect_err("a cancellation may only end its exact subscription");
+            assert!(matches!(
+                (expected_error, error),
+                ("missing", ModernHttpSubscriptionListenError::EventMissingId)
+                    | ("invalid", ModernHttpSubscriptionListenError::EventInvalidId)
+                    | ("foreign", ModernHttpSubscriptionListenError::EventIdMismatch { .. })
+                    | ("request", ModernHttpSubscriptionListenError::CancellationRequestIdMismatch { .. })
+            ));
+            assert!(!subscription.terminal_received);
+            assert!(subscription.stream.response.is_none());
+            assert!(subscription.stream.parser.is_none());
+            assert!(cx.checkpoint().is_ok());
+            server.join().unwrap();
+        }
     }
 
     #[test]

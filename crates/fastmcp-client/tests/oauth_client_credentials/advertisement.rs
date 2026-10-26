@@ -273,6 +273,12 @@ fn listen_terminal(id: i64) -> String {
     )
 }
 
+fn listen_notice(id: i64) -> String {
+    json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed",
+        "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):id}}})
+    .to_string()
+}
+
 #[test]
 fn typed_machine_tool_resource_and_prompt_streams_work_without_auth_advertisements() {
     for post in [false, true] {
@@ -521,11 +527,11 @@ fn core_machine_subscriptions_admit_absence_but_recheck_the_next_advertisement()
                 );
                 stream_head(&mut socket).await;
                 event(&mut socket, &acknowledged(2, &filter), false).await;
-                event(&mut socket, NOTICE, false).await;
+                event(&mut socket, &listen_notice(2), false).await;
                 event(
                     &mut socket,
                     &json!({"jsonrpc":"2.0","method":"notifications/resources/updated",
-                    "params":{"uri":"file:///watched"}})
+                    "params":{"uri":"file:///watched","_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):2}}})
                     .to_string(),
                     false,
                 )
@@ -774,7 +780,7 @@ mod task_composition {
                     );
                     stream_head(&mut socket).await;
                     event(&mut socket, &acknowledged(2, &filter), false).await;
-                    event(&mut socket, NOTICE, false).await;
+                    event(&mut socket, &listen_notice(2), false).await;
                     let mut notification = task("cancelled", "complete");
                     notification.as_object_mut().unwrap().remove("resultType");
                     notification["_meta"] = json!({(FINAL_SUBSCRIPTION_ID_META_KEY):2});

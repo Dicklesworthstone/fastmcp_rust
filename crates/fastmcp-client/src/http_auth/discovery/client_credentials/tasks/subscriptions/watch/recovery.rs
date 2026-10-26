@@ -738,6 +738,7 @@ mod tests {
             }
             .into(),
             ManagedTasksError::InvalidResponse.into(),
+            ClientCredentialsTaskWatchError::SubscriptionEnded,
             ClientCredentialsTaskWatchError::IncompleteAcknowledgement,
             ClientCredentialsTaskWatchError::SnapshotLimit,
         ] {

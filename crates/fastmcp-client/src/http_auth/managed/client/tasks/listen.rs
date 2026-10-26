@@ -15,7 +15,7 @@ use serde::Serialize;
 use super::{
     ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult, checkpoint, task_sse_limits,
 };
-use crate::http_executor::ModernHttpSubscriptionListenEvent;
+use crate::http_executor::{ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionTermination};
 use crate::{ClientHttpConnectionError, FinalTaskId, HttpClient, HttpClientError};
 
 pub(super) mod watch;
@@ -100,6 +100,9 @@ impl EventBudget {
             }
             ModernHttpSubscriptionListenEvent::Terminal { result, .. } => {
                 self.charge_terminal(result)
+            }
+            ModernHttpSubscriptionListenEvent::Cancelled { params, .. } => {
+                self.charge(params, false)
             }
             ModernHttpSubscriptionListenEvent::Notification(_) => {
                 // This facade requests taskIds only, never catalog categories.
@@ -189,8 +192,18 @@ impl<'a> ListenRequest<'a> {
             // This also bounds application callbacks to one per executor turn.
             asupersync::runtime::yield_now().await;
             checkpoint(cx, cancellation)?;
-            if let ModernHttpSubscriptionListenEvent::Terminal { result, .. } = event {
-                return Ok(TaskResult::Listen(Some(Box::new(result))));
+            match event {
+                ModernHttpSubscriptionListenEvent::Terminal { result, .. } => {
+                    return Ok(TaskResult::Listen(Some(Box::new(
+                        ModernHttpSubscriptionTermination::Complete(result),
+                    ))));
+                }
+                ModernHttpSubscriptionListenEvent::Cancelled { params, .. } => {
+                    return Ok(TaskResult::Listen(Some(Box::new(
+                        ModernHttpSubscriptionTermination::Cancelled(params),
+                    ))));
+                }
+                _ => {}
             }
             let decision = (self.observer)(&event);
             checkpoint(cx, cancellation)?;
@@ -220,7 +233,8 @@ impl ManagedHttpClient {
     /// The observer sees the acknowledgement and each task notification in wire
     /// order, including exact task result payloads. Return `ControlFlow::Break(())`
     /// to stop locally. `Ok(None)` means this explicit local stop; `Ok(Some(_))`
-    /// is the native listener's correlated terminal complete result. A terminal
+    /// is the native listener's correlated complete or cancellation terminal.
+    /// Peer cancellation remains distinct from local stop. A terminal
     /// event is returned, not passed to the observer. EOF without a terminal,
     /// malformed input and limits exceeded are errors, not partial success.
     /// This retains the native listener's terminal-admission semantics; it does
@@ -248,7 +262,7 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError>
+    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError>
     {
         self.listen_task_events_with_cancellation(
             cx,
@@ -272,7 +286,7 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError>
+    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError>
     {
         self.admit_tasks(cx, cancellation)?;
         let request = ListenRequest::new(task_ids, max_notifications, max_payload_bytes, observer)?;

@@ -28,7 +28,8 @@ use fastmcp_protocol::tasks_extension::{
 };
 use fastmcp_protocol::{
     CompleteResult, CoreRequest, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
-    FinalSubscriptionsListenResult, JsonInteger, RequestId, ServerNotification, SubscriptionFilter,
+    FinalCancelledNotificationParams, FinalSubscriptionsListenResult, JsonInteger, RequestId,
+    ServerNotification, SubscriptionFilter,
     decode_strict_jsonrpc_response,
 };
 #[cfg(feature = "tasks")]
@@ -163,6 +164,11 @@ pub enum ManagedSubscriptionEvent {
     Terminal {
         subscription_id: RequestId,
         result: Box<CompleteResult<FinalSubscriptionsListenResult>>,
+    },
+    /// The server ended this subscription, without cancelling a durable Task.
+    Cancelled {
+        subscription_id: RequestId,
+        params: Box<FinalCancelledNotificationParams>,
     },
 }
 
@@ -571,7 +577,10 @@ impl ManagedSubscription {
             self.accepted_filter = Some(accepted_filter.clone());
         }
         self.records += 1;
-        if matches!(record, ManagedSubscriptionEvent::Terminal { .. }) {
+        if matches!(
+            record,
+            ManagedSubscriptionEvent::Terminal { .. } | ManagedSubscriptionEvent::Cancelled { .. }
+        ) {
             self.finished = true;
         } else {
             self.listener = Some(listener);
@@ -629,6 +638,13 @@ fn select_record(
         } => Ok(ManagedSubscriptionEvent::Terminal {
             subscription_id,
             result: Box::new(result),
+        }),
+        ModernHttpSubscriptionListenEvent::Cancelled {
+            subscription_id,
+            params,
+        } => Ok(ManagedSubscriptionEvent::Cancelled {
+            subscription_id,
+            params: Box::new(params),
         }),
         #[cfg(feature = "tasks")]
         ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {

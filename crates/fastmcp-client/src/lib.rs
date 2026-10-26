@@ -157,6 +157,7 @@ pub use http_executor::{
     ModernHttpClientError, ModernHttpRequestControl, ModernHttpRequestExecution,
     ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+    ModernHttpSubscriptionTermination,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 pub use http_executor::{
@@ -13527,7 +13528,26 @@ impl HttpSubscriptionListener<'_> {
                         notifications,
                         #[cfg(feature = "tasks")]
                         task_notifications,
-                        terminal,
+                        terminal: ModernHttpSubscriptionTermination::Complete(terminal),
+                    });
+                }
+                ModernHttpSubscriptionListenEvent::Cancelled {
+                    subscription_id,
+                    params,
+                } => {
+                    let accepted_filter =
+                        self.listener.accepted_filter().cloned().ok_or_else(|| {
+                            HttpClientError::CoreResult(McpError::invalid_request(
+                                "HTTP subscriptions listener cancelled before acknowledgement",
+                            ))
+                        })?;
+                    return Ok(ModernHttpSubscriptionListenCollector {
+                        subscription_id,
+                        accepted_filter,
+                        notifications,
+                        #[cfg(feature = "tasks")]
+                        task_notifications,
+                        terminal: ModernHttpSubscriptionTermination::Cancelled(params),
                     });
                 }
             }
@@ -13743,6 +13763,15 @@ pub enum FinalTaskWatchEvent {
         /// The typed final subscription result.
         result: CompleteResult<FinalSubscriptionsListenResult>,
     },
+    /// The server ended the subscription without changing the retained Task.
+    ///
+    /// This does not mean that the durable Task itself was cancelled.
+    Cancelled {
+        /// The JSON-RPC ID that owns the cancelled subscription.
+        subscription_id: RequestId,
+        /// The admitted server cancellation control.
+        params: FinalCancelledNotificationParams,
+    },
 }
 
 /// A live task-only HTTP subscription bound to one mutable task handle.
@@ -13868,6 +13897,16 @@ impl FinalTaskWatch<'_, '_> {
                     return Ok(Some(FinalTaskWatchEvent::Terminal {
                         subscription_id,
                         result,
+                    }));
+                }
+                Some(ModernHttpSubscriptionListenEvent::Cancelled {
+                    subscription_id,
+                    params,
+                }) => {
+                    self.listener = None;
+                    return Ok(Some(FinalTaskWatchEvent::Cancelled {
+                        subscription_id,
+                        params,
                     }));
                 }
                 Some(ModernHttpSubscriptionListenEvent::Notification(_)) => {
@@ -16351,7 +16390,10 @@ impl HttpClient {
         }
         if matches!(
             event,
-            None | Some(ModernHttpSubscriptionListenEvent::Terminal { .. })
+            None | Some(
+                ModernHttpSubscriptionListenEvent::Terminal { .. }
+                    | ModernHttpSubscriptionListenEvent::Cancelled { .. }
+            )
         ) {
             self.live_subscription = None;
         }
@@ -16460,7 +16502,11 @@ impl HttpClient {
                     self.final_result_cache
                         .invalidate_notification(&notification);
                 }
-                Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) | None => {
+                Some(
+                    ModernHttpSubscriptionListenEvent::Terminal { .. }
+                    | ModernHttpSubscriptionListenEvent::Cancelled { .. },
+                )
+                | None => {
                     self.live_task_subscription = None;
                     return Ok(StdioTaskSubscriptionEvent::Terminal);
                 }
@@ -41245,6 +41291,98 @@ mod tests {
         server
             .join()
             .expect("incremental HTTP subscription server must join");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_http_final_task_watch_cancellation_preserves_the_durable_task() {
+        for foreign_control in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let (sent, received) = mpsc::sync_channel(1);
+            let (done, finished) = mpsc::sync_channel(1);
+            let server = std::thread::spawn(move || {
+                let (mut discovery, _) = listener.accept().unwrap();
+                let _ = read_http_cache_test_request(&mut discovery);
+                let body = modern_tasks_discovery_response(
+                    "task-cancellation-peer",
+                    serde_json::json!({}),
+                );
+                write_http_cache_test_response(&mut discovery, "application/json", body.as_bytes());
+                let (mut get, _) = listener.accept().unwrap();
+                let request = read_http_cache_test_request(&mut get);
+                assert_eq!(request["method"], "tasks/get");
+                write_http_cache_test_response(
+                    &mut get,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","taskId":"task-watch","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null}}"#,
+                );
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], 3);
+                assert_eq!(request["method"], "subscriptions/listen");
+                let metadata_id = if foreign_control { 4 } else { 3 };
+                let body = format!(
+                    "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"notifications\":{{\"taskIds\":[\"task-watch\"]}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":3,\"reason\":\"watch closed\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{metadata_id}}}}}}}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tasks\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":3}},\"taskId\":\"task-watch\",\"status\":\"cancelled\",\"createdAt\":\"2026-07-28T12:00:00Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:01Z\",\"ttlMs\":null}}}}\n\n"
+                );
+                write_http_cache_test_response(&mut stream, "text/event-stream", body.as_bytes());
+                sent.send(()).unwrap();
+                finished.recv_timeout(Duration::from_secs(2)).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ), "watch termination must not poll or cancel the durable Task automatically");
+            });
+            let cx = Cx::for_request();
+            let mut client = http_test_runtime_block_on(HttpClient::connect(
+                &cx,
+                http_cache_test_plan(&target),
+                ClientInfo { name: "task-cancellation-client".to_owned(), version: "1".to_owned() },
+                ClientCapabilities::default(),
+            ))
+            .unwrap();
+            let mut handle = http_test_runtime_block_on(client.attach_final_task(
+                &cx,
+                FinalTaskId::parse("task-watch").unwrap(),
+            ))
+            .unwrap();
+            let before = serde_json::to_vec(handle.task()).unwrap();
+            let mut watch = http_test_runtime_block_on(handle.watch(
+                &cx,
+                &mut client,
+                sse::SseLimits::new(2_048, 8_192, 8).unwrap(),
+            ))
+            .unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(matches!(
+                http_test_runtime_block_on(watch.next_event(&cx)).unwrap(),
+                Some(FinalTaskWatchEvent::Acknowledged { .. })
+            ));
+            let terminal = http_test_runtime_block_on(watch.next_event(&cx));
+            if foreign_control {
+                assert!(matches!(
+                    terminal,
+                    Err(HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
+                        http_executor::ModernHttpSubscriptionListenError::EventIdMismatch { .. }
+                    )))
+                ));
+            } else {
+                assert!(matches!(
+                    terminal.unwrap(),
+                    Some(FinalTaskWatchEvent::Cancelled { subscription_id, params })
+                        if subscription_id == RequestId::Number(3)
+                            && params.reason.as_deref() == Some("watch closed")
+                ));
+            }
+            assert!(http_test_runtime_block_on(watch.next_event(&cx)).unwrap().is_none());
+            drop(watch);
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+            assert!(matches!(handle.task(), FinalTask::Working(_)));
+            assert!(cx.checkpoint().is_ok());
+            done.send(()).unwrap();
+            server.join().unwrap();
+        }
     }
 
     #[cfg(unix)]

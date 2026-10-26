@@ -580,6 +580,7 @@ mod tests {
             .into()
         ));
         for error in [
+            ManagedTaskWatchError::SubscriptionEnded,
             ManagedTaskWatchError::IncompleteAcknowledgement,
             ManagedTaskWatchError::SnapshotLimit,
             ManagedTaskWatchError::Closed,

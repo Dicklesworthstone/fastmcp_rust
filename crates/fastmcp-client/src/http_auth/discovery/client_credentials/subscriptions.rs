@@ -294,7 +294,7 @@ impl ClientCredentialsCoreSubscription {
     }
 
     /// Returns `None` only after a validated terminal was delivered. EOF,
-    /// cancellation, exhausted limits and malformed streams are errors, not
+    /// caller cancellation, exhausted limits and malformed streams are errors, not
     /// successful completion. Native acknowledgment/filter state is published
     /// only after the opening credential and both cancellation domains pass
     /// the post-poll lifetime checks.
@@ -344,7 +344,11 @@ impl ClientCredentialsCoreSubscription {
             self.accepted_filter = Some(accepted_filter.clone());
         }
         self.records += 1;
-        if matches!(&event, ModernHttpSubscriptionListenEvent::Terminal { .. }) {
+        if matches!(
+            &event,
+            ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. }
+        ) {
             self.finished = true;
         } else {
             self.listener = Some(listener);

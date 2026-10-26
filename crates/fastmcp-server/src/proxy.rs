@@ -552,7 +552,9 @@ impl ProxyHttpCatalogListener {
             Some(ModernHttpSubscriptionListenEvent::TaskNotification(_)) => Err(
                 McpError::invalid_request("Proxy catalog listener received a Tasks event"),
             ),
-            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) | None => {
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. })
+            | None => {
                 Ok(ProxyCatalogListenerEvent::Terminal)
             }
         }
@@ -8160,7 +8162,8 @@ impl ProxyBackend for ProxyHttpClient {
                     "Proxy incremental catalog listener received a Tasks event",
                 ))
             }
-            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. }) => {
                 self.live_catalog_listener = None;
                 Ok(Some(StdioSubscriptionEvent::Terminal))
             }
@@ -8280,7 +8283,8 @@ impl ProxyBackend for ProxyHttpClient {
                     "Proxy incremental official Tasks listener received a catalog event",
                 ))
             }
-            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. }) => {
                 self.live_task_listener = None;
                 Ok(ProxyFinalTaskListenerEvent::Terminal)
             }
@@ -8333,7 +8337,8 @@ impl ProxyBackend for ProxyHttpClient {
                     "Proxy incremental official Tasks listener received a catalog event",
                 ))
             }
-            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => {
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. }) => {
                 self.live_task_listener = None;
                 Ok(Some(ProxyFinalTaskListenerEvent::Terminal))
             }
@@ -8359,7 +8364,9 @@ impl ProxyHttpFinalTaskListener {
             Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
                 Ok(ProxyFinalTaskListenerEvent::Notification(notification))
             }
-            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) | None => {
+            Some(ModernHttpSubscriptionListenEvent::Terminal { .. }
+                | ModernHttpSubscriptionListenEvent::Cancelled { .. })
+            | None => {
                 Ok(ProxyFinalTaskListenerEvent::Terminal)
             }
             Some(ModernHttpSubscriptionListenEvent::Notification(_)) => Err(
@@ -21692,6 +21699,18 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn proxy_mixed_http_peer_cancellation_retires_both_upstream_streams() {
+        proxy_mixed_http_subscription_probe(MixedHttpFinish::PeerCancellation);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_mixed_http_foreign_peer_cancellation_is_refused() {
+        proxy_mixed_http_subscription_probe(MixedHttpFinish::ForeignPeerCancellation);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn proxy_mixed_http_subscription_narrow_acknowledgement_has_no_partial_delivery() {
         proxy_mixed_http_subscription_probe(MixedHttpFinish::NarrowAcknowledgement);
     }
@@ -21713,6 +21732,8 @@ IFS= read -r end
     enum MixedHttpFinish {
         Terminal,
         Cancel,
+        PeerCancellation,
+        ForeignPeerCancellation,
         NarrowAcknowledgement,
         DuplicateAcknowledgement,
         UnselectedEvent,
@@ -21877,6 +21898,36 @@ IFS= read -r end
                             );
                             catalog_stream.write_all(b"0\r\n\r\n").unwrap();
                             catalog_stream.flush().unwrap();
+                        } else if matches!(
+                            finish,
+                            MixedHttpFinish::PeerCancellation
+                                | MixedHttpFinish::ForeignPeerCancellation
+                        ) {
+                            let subscription_id = if finish
+                                == MixedHttpFinish::ForeignPeerCancellation
+                            {
+                                serde_json::json!("unrelated-listen")
+                            } else {
+                                catalog["id"].clone()
+                            };
+                            send(
+                                &mut catalog_stream,
+                                &serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/cancelled",
+                                    "params": {
+                                        "requestId": catalog["id"],
+                                        "reason": "upstream retired its catalog listener",
+                                        "_meta": {
+                                            fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY:
+                                                subscription_id
+                                        }
+                                    }
+                                }),
+                            );
+                            // The peer deliberately withholds HTTP EOF. The
+                            // admitted control must retire both upstream
+                            // families without waiting for a complete result.
                         }
                     }
                 }
@@ -22038,7 +22089,10 @@ IFS= read -r end
             .expect("mixed native HTTP operation has a finite deadline")
         });
         let (tasks_wire, _) = peer.join().expect("both native upstream sockets quiesced");
-        if finish == MixedHttpFinish::Terminal {
+        if matches!(
+            finish,
+            MixedHttpFinish::Terminal | MixedHttpFinish::PeerCancellation
+        ) {
             let response = response.unwrap();
             assert!(
                 response.error.is_none(),

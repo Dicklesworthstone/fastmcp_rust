@@ -5,7 +5,7 @@
 //! they are not used to roll a newer snapshot back to an older task state.
 
 use asupersync::Cx;
-use fastmcp_core::McpRequestCancellation;
+use fastmcp_core::{McpError, McpRequestCancellation};
 use fastmcp_protocol::tasks_extension::task_subscription_ids;
 use fastmcp_protocol::{RequestId, SubscriptionFilter};
 
@@ -135,6 +135,11 @@ impl WatchRequest {
                     refusal("Managed task watch ended without a terminal result")
                 })?;
             self.budget.admit(&event)?;
+            if matches!(event, ModernHttpSubscriptionListenEvent::Cancelled { .. }) {
+                // The peer ended the observation stream, not the durable Task.
+                // Do not turn this explicit terminal into another tasks/get.
+                return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+            }
             let ended = match &event {
                 ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }
                     if !acknowledged =>

@@ -278,7 +278,8 @@ pub mod client {
         ModernHttpResponseKind, ModernHttpResponseMetadata, ModernHttpResponseStream,
         ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-        ModernHttpSubscriptionListener, ServerConfig, SseEndOfStream, SseLimits, SseParseError,
+        ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination, ServerConfig,
+        SseEndOfStream, SseLimits, SseParseError,
         claude_desktop_config_path, default_config_paths, validate_response_head,
     };
     pub use crate::{
@@ -1103,7 +1104,7 @@ pub use fastmcp_client::http_executor::{
     ModernHttpRequestExecution, ModernHttpResponseKind, ModernHttpResponseMetadata,
     ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-    ModernHttpSubscriptionListener, validate_response_head,
+    ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination, validate_response_head,
 };
 pub use fastmcp_client::mcp_config::{
     ConfigError, ConfigLoader, HttpEndpointConfig, HttpEndpointConfigError, McpConfig,
@@ -1133,7 +1134,7 @@ pub mod auto {
         ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequestControl,
         ModernHttpRequestExecution, ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
-        ModernHttpSubscriptionListener,
+        ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination,
     };
     pub use fastmcp_client::sse::{SseEndOfStream, SseLimits, SseParseError};
     pub use fastmcp_client::{
@@ -2845,6 +2846,7 @@ pub mod modern {
         ModernHttpFinalCoreListenError, ModernHttpRequestControl, ModernHttpRequestExecution,
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
         ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
+        ModernHttpSubscriptionTermination,
     };
     pub use fastmcp_client::sse::SseLimits;
     pub use fastmcp_client::{
@@ -10959,6 +10961,7 @@ pub mod prelude {
         ModernHttpSubscriptionListenError,
         ModernHttpSubscriptionListenEvent,
         ModernHttpSubscriptionListener,
+        ModernHttpSubscriptionTermination,
         NegotiatedExtensionSet,
         // Outcome types (4-valued result)
         Outcome,
@@ -13343,6 +13346,11 @@ mod tests {
         let _: Option<auto::ClientHttpConnection> = None;
         let _: Option<auto::ModernHttpSubscriptionListenCollector> = None;
         let _: Option<auto::ModernHttpSubscriptionListenError> = None;
+        let _: Option<super::ModernHttpSubscriptionTermination> = None;
+        let _: Option<super::client::ModernHttpSubscriptionTermination> = None;
+        let _: Option<auto::ModernHttpSubscriptionTermination> = None;
+        let _: Option<modern::ModernHttpSubscriptionTermination> = None;
+        let _: Option<super::prelude::ModernHttpSubscriptionTermination> = None;
         let _: Option<auto::SseLimits> = None;
         let _: Option<modern::HttpServer> = None;
     }

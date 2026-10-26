@@ -8,14 +8,12 @@ use std::ops::ControlFlow;
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpRequestCancellation};
-use fastmcp_protocol::{
-    CompleteResult, FinalSubscriptionsListenResult, SubscriptionFilter, encode_complete_result,
-};
+use fastmcp_protocol::{SubscriptionFilter, encode_complete_result};
 use serde::Serialize;
 
 use super::callbacks::CallbackBoundary;
 use super::{Call, CallResult, ManagedHttpClient, ManagedHttpClientError};
-use crate::http_executor::ModernHttpSubscriptionListenEvent;
+use crate::http_executor::{ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionTermination};
 use crate::sse::SseLimits;
 use crate::{ClientHttpConnectionError, HttpClient, HttpClientError, catch_client_callback_unwind};
 
@@ -24,7 +22,7 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_NOTIFICATIONS: usize = 4_096;
 const MAX_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
-pub(super) type ListenResult = Option<Box<CompleteResult<FinalSubscriptionsListenResult>>>;
+pub(super) type ListenResult = Option<Box<ModernHttpSubscriptionTermination>>;
 type Observer<'a> =
     &'a mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send);
 
@@ -102,6 +100,13 @@ impl EventBudget {
                     .ok_or_else(|| refusal("Managed core subscription payload limit exceeded"))?;
                 Ok(())
             }
+            ModernHttpSubscriptionListenEvent::Cancelled { params, .. } => {
+                let mut remaining = ByteBudget(self.bytes);
+                serde_json::to_writer(&mut remaining, params)
+                    .map_err(|_| refusal("Managed core subscription payload limit exceeded"))?;
+                self.bytes = remaining.0;
+                Ok(())
+            }
             #[cfg(feature = "tasks")]
             ModernHttpSubscriptionListenEvent::TaskNotification(_) => {
                 Err(refusal("Task notification on a managed core subscription"))
@@ -172,8 +177,14 @@ impl<'a> ListenRequest<'a> {
                 .ok_or_else(|| refusal("Managed core subscription ended without a terminal"))?;
             self.budget.admit(&event)?;
             boundary.check(cx).map_err(HttpClientError::CoreResult)?;
-            if let ModernHttpSubscriptionListenEvent::Terminal { result, .. } = event {
-                return Ok(Some(Box::new(result)));
+            match event {
+                ModernHttpSubscriptionListenEvent::Terminal { result, .. } => {
+                    return Ok(Some(Box::new(ModernHttpSubscriptionTermination::Complete(result))));
+                }
+                ModernHttpSubscriptionListenEvent::Cancelled { params, .. } => {
+                    return Ok(Some(Box::new(ModernHttpSubscriptionTermination::Cancelled(params))));
+                }
+                _ => {}
             }
             let observed = catch_client_callback_unwind(|| (self.observer)(&event));
             // Check even a panic or Break: a callback can close its login or
@@ -207,7 +218,8 @@ impl ManagedHttpClient {
     ///
     /// The observer receives the ACK and subsequent notifications, not the
     /// terminal result. `Break(())` stops locally and returns `Ok(None)`;
-    /// `Ok(Some(result))` is the peer's correlated terminal. EOF without that
+    /// `Ok(Some(result))` is the peer's correlated complete or cancellation
+    /// terminal. Peer cancellation remains distinct from the local stop. EOF without that
     /// terminal is an error. This preserves native terminal admission and does
     /// not add a separate trailing-body/EOF verification after the terminal.
     ///
@@ -237,7 +249,7 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError> {
+    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError> {
         self.listen_core_events_with_cancellation(
             cx,
             &McpRequestCancellation::new(),
@@ -259,7 +271,7 @@ impl ManagedHttpClient {
         max_notifications: usize,
         max_payload_bytes: usize,
         observer: &mut (dyn FnMut(&ModernHttpSubscriptionListenEvent) -> ControlFlow<()> + Send),
-    ) -> Result<Option<CompleteResult<FinalSubscriptionsListenResult>>, ManagedHttpClientError> {
+    ) -> Result<Option<ModernHttpSubscriptionTermination>, ManagedHttpClientError> {
         if self.closed {
             return Err(ManagedHttpClientError::Closed);
         }
@@ -278,7 +290,10 @@ impl ManagedHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastmcp_protocol::{JsonRpcRequest, RequestId, ResultMeta, ServerNotification};
+    use fastmcp_protocol::{
+        CompleteResult, FinalSubscriptionsListenResult, JsonRpcRequest, RequestId, ResultMeta,
+        ServerNotification,
+    };
     use serde_json::json;
 
     #[test]

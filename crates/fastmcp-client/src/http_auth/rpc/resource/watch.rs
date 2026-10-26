@@ -288,7 +288,10 @@ impl ManagedResourceClient {
                                     return Ok(ManagedResourceWatchOutcome::StoppedByHost);
                                 }
                             }
-                            Some(ManagedSubscriptionEvent::Terminal { .. }) => {
+                            Some(
+                                ManagedSubscriptionEvent::Terminal { .. }
+                                | ManagedSubscriptionEvent::Cancelled { .. },
+                            ) => {
                                 return Ok(ManagedResourceWatchOutcome::SubscriptionEnded);
                             }
                             _ => return Err(ManagedResourceWatchError::UnexpectedEvent),

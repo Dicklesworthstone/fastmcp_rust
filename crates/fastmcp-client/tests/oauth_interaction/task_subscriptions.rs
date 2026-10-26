@@ -220,7 +220,8 @@ fn run_watch(case: WatchCase) {
                         let mut tls = begin_watch(&peer, 1, DISCOVER).await;
                         event(&mut tls, &ack(2, filter()), false).await;
                         event(&mut tls, &task_event(2, "task-one", "working"), false).await;
-                        event(&mut tls, CHANGED, false).await;
+                        event(&mut tls, &json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed",
+                            "params":{"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):2}}}).to_string(), false).await;
                         event(&mut tls, &task_event(2, "task-one", "input_required"), false).await;
                         // Keep the watch live while the host answers its input
                         // using a separate authenticated Task update operation.

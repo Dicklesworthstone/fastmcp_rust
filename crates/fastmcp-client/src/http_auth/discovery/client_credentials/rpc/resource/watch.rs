@@ -283,7 +283,7 @@ impl ClientCredentialsResourceClient {
                                         check_binding(cx, cancellation, deadline, owner, Some(&binding))?;
                                         if !continuing { return Ok(ClientCredentialsResourceWatchOutcome::StoppedByHost); }
                                     }
-                                    Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) => return Ok(ClientCredentialsResourceWatchOutcome::SubscriptionEnded),
+                                    Some(ModernHttpSubscriptionListenEvent::Terminal { .. } | ModernHttpSubscriptionListenEvent::Cancelled { .. }) => return Ok(ClientCredentialsResourceWatchOutcome::SubscriptionEnded),
                                     _ => return Err(ClientCredentialsResourceWatchError::UnexpectedEvent),
                                 }
                             }

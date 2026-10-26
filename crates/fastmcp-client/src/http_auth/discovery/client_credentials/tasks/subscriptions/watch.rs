@@ -96,6 +96,8 @@ pub enum ClientCredentialsTaskWatchError {
     SnapshotLimit,
     UnexpectedEvent,
     Interrupted,
+    /// The peer explicitly ended the subscription; automatic recovery is not authorized.
+    SubscriptionEnded,
     Closed,
     Task(ClientCredentialsTasksError),
 }
@@ -113,6 +115,9 @@ impl fmt::Display for ClientCredentialsTaskWatchError {
             Self::UnexpectedEvent => f.write_str("unexpected machine Task watch event"),
             Self::Interrupted => {
                 f.write_str("machine Task subscription ended before all tasks were terminal")
+            }
+            Self::SubscriptionEnded => {
+                f.write_str("machine Task subscription was cancelled by the peer")
             }
             Self::Closed => f.write_str("machine Task watch is closed"),
             Self::Task(error) => fmt::Display::fmt(error, f),
@@ -299,6 +304,9 @@ impl ClientCredentialsTaskWatch {
                                     }
                                 }
                                 Some(ModernHttpSubscriptionListenEvent::Notification(_)) => {}
+                                Some(ModernHttpSubscriptionListenEvent::Cancelled { .. }) => {
+                                    return Err(ClientCredentialsTaskWatchError::SubscriptionEnded);
+                                }
                                 Some(ModernHttpSubscriptionListenEvent::Terminal { .. }) | None => {
                                     return Err(ClientCredentialsTaskWatchError::Interrupted);
                                 }

@@ -9,14 +9,14 @@ use asupersync::Cx;
 use asupersync::time::Sleep;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
 use fastmcp_protocol::tasks_extension::TaskInputLedger;
-use fastmcp_protocol::{CompleteResult, FinalCoreResult, FinalSubscriptionsListenResult};
+use fastmcp_protocol::FinalCoreResult;
 use serde_json::Value;
 
 use super::{Call, CallResult, ManagedHttpClient, ManagedHttpClientError};
 use crate::{
     ClientHttpConnectionError, FinalCancelTaskResult, FinalGetTaskResult, FinalTask, FinalTaskId,
     FinalTaskInputResponses, FinalToolCallOutcome, FinalUpdateTaskResult, HttpClient,
-    HttpClientError,
+    HttpClientError, ModernHttpSubscriptionTermination,
 };
 
 mod listen;
@@ -76,7 +76,7 @@ pub(super) enum TaskResult {
     Get(Box<FinalGetTaskResult>),
     Update(FinalUpdateTaskResult),
     Cancel(FinalCancelTaskResult),
-    Listen(Option<Box<CompleteResult<FinalSubscriptionsListenResult>>>),
+    Listen(Option<Box<ModernHttpSubscriptionTermination>>),
 }
 
 fn invalid_input() -> ManagedHttpClientError {

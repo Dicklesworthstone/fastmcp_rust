@@ -13,6 +13,7 @@ use fastmcp_protocol::{FINAL_SUBSCRIPTION_ID_META_KEY, SubscriptionFilter};
 #[derive(Clone, Copy)]
 enum SubscriptionCase {
     Live,
+    PeerCancellation,
     BadAcknowledgement,
     BadEvent,
     Truncated,
@@ -105,8 +106,15 @@ fn subscription_terminal(id: i64) -> String {
     )
 }
 
-fn resource_updated(uri: &str) -> String {
-    json!({"jsonrpc": "2.0", "method": "notifications/resources/updated", "params": {"uri": uri}})
+fn catalog_changed(id: i64, method: &str) -> String {
+    json!({"jsonrpc": "2.0", "method": method,
+        "params": {"_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): id}}})
+    .to_string()
+}
+
+fn resource_updated(id: i64, uri: &str) -> String {
+    json!({"jsonrpc": "2.0", "method": "notifications/resources/updated",
+        "params": {"uri": uri, "_meta": {(FINAL_SUBSCRIPTION_ID_META_KEY): id}}})
         .to_string()
 }
 
@@ -206,7 +214,7 @@ fn run_subscription(case: SubscriptionCase) {
                         let mut tls = subscription_stream(&peer, 41).await;
                         chunk(&mut tls, &[acknowledged(41, selected_filter())], false).await;
                         release_rx.recv(&cx).await.unwrap();
-                        chunk(&mut tls, &[CHANGED.to_owned(), resource_updated("file:///watched"), subscription_terminal(41)], true).await;
+                        chunk(&mut tls, &[catalog_changed(41, "notifications/tools/list_changed"), resource_updated(41, "file:///watched"), subscription_terminal(41)], true).await;
                     };
                     let application = async {
                         let mut listener = session.subscribe_core(&cx, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default()).await.unwrap();
@@ -222,6 +230,44 @@ fn run_subscription(case: SubscriptionCase) {
                     };
                     Box::pin(pair(server, application)).await;
                 }
+                SubscriptionCase::PeerCancellation => {
+                    for foreign_owner in [false, true] {
+                        let server = async {
+                            let mut tls = subscription_stream(&peer, 41).await;
+                            let cancellation = json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{
+                                "requestId":41, "reason":"subscription maintenance",
+                                "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):if foreign_owner { 99 } else { 41 }}
+                            }}).to_string();
+                            chunk(&mut tls, &[
+                                acknowledged(41, selected_filter()), cancellation,
+                                catalog_changed(41, "notifications/tools/list_changed"),
+                                subscription_terminal(41),
+                            ], false).await;
+                            let mut byte = [0];
+                            assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0), "peer cancellation releases the stream without waiting for HTTP EOF");
+                        };
+                        let application = async {
+                            let mut listener = session.subscribe_core(&cx, listen_request(), RequestId::Number(41), ManagedSubscriptionLimits::default()).await.unwrap();
+                            consume_ack(&mut listener, &cx).await;
+                            if foreign_owner {
+                                assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::InvalidResponse)));
+                                assert!(matches!(listener.next_event(&cx).await, Err(ManagedSubscriptionError::Closed)));
+                            } else {
+                                let Some(ManagedSubscriptionEvent::Cancelled { subscription_id, params }) = listener.next_event(&cx).await.unwrap()
+                                    else { panic!("the selected cancellation must remain typed"); };
+                                assert!(subscription_id.correlates_with(&RequestId::Number(41)));
+                                assert!(params.request_id.correlates_with(&subscription_id));
+                                assert_eq!(params.reason.as_deref(), Some("subscription maintenance"));
+                                assert!(listener.next_event(&cx).await.unwrap().is_none(), "buffered events and the later complete cannot follow cancellation");
+                            }
+                            assert!(cx.checkpoint().is_ok());
+                        };
+                        Box::pin(pair(server, application)).await;
+                        peer.no_extra_connections();
+                    }
+                    assert_eq!(peer.mcp_posts.load(Ordering::SeqCst), 2);
+                    Box::pin(pair(peer.catalog(42), complete_catalog(&session, &cx, 42))).await;
+                }
                 SubscriptionCase::BadAcknowledgement => {
                     let mut widened = selected_filter();
                     widened.prompts_list_changed = Some(true);
@@ -236,7 +282,7 @@ fn run_subscription(case: SubscriptionCase) {
                         vec![acknowledged(41, extension)],
                         vec![acknowledged(41, selected_filter()), acknowledged(41, selected_filter())],
                         vec![subscription_terminal(41)],
-                        vec![CHANGED.to_owned()],
+                        vec![catalog_changed(41, "notifications/tools/list_changed")],
                     ] {
                         let server = async {
                             let mut tls = subscription_stream(&peer, 41).await;
@@ -255,13 +301,13 @@ fn run_subscription(case: SubscriptionCase) {
                 }
                 SubscriptionCase::BadEvent => {
                     for frame in [
-                        resource_updated("file:///not-requested"),
-                        r#"{"jsonrpc":"2.0","method":"notifications/prompts/list_changed"}"#.to_owned(),
+                        resource_updated(41, "file:///not-requested"),
+                        catalog_changed(41, "notifications/prompts/list_changed"),
                         PROGRESS.to_owned(),
                         r#"{"jsonrpc":"2.0","id":9,"method":"roots/list"}"#.to_owned(),
                         subscription_terminal(999),
-                        format!("[{}]", CHANGED),
-                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","method":"notifications/resources/list_changed"}"#.to_owned(),
+                        format!("[{}]", catalog_changed(41, "notifications/tools/list_changed")),
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","method":"notifications/resources/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":41}}}"#.to_owned(),
                     ] {
                         let server = async {
                             let mut tls = subscription_stream(&peer, 41).await;
@@ -342,7 +388,7 @@ fn run_subscription(case: SubscriptionCase) {
                 SubscriptionCase::RecordLimit => {
                     let server = async {
                         let mut tls = subscription_stream(&peer, 41).await;
-                        chunk(&mut tls, &[acknowledged(41, selected_filter()), CHANGED.to_owned(), subscription_terminal(41)], true).await;
+                        chunk(&mut tls, &[acknowledged(41, selected_filter()), catalog_changed(41, "notifications/tools/list_changed"), subscription_terminal(41)], true).await;
                     };
                     let application = async {
                         let limits = ManagedSubscriptionLimits::new(4096, 4096, 2, Duration::from_secs(15)).unwrap();
@@ -428,6 +474,13 @@ fn managed_subscription_delivers_incrementally() {
     isolated_subscription(
         "subscriptions::managed_subscription_delivers_incrementally",
         SubscriptionCase::Live,
+    );
+}
+#[test]
+fn managed_subscription_peer_cancellation_is_correlated_and_terminal() {
+    isolated_subscription(
+        "subscriptions::managed_subscription_peer_cancellation_is_correlated_and_terminal",
+        SubscriptionCase::PeerCancellation,
     );
 }
 #[test]

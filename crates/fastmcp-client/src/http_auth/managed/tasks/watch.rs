@@ -116,6 +116,8 @@ pub enum ManagedTaskWatchError {
     SnapshotLimit,
     UnexpectedEvent,
     Interrupted,
+    /// The peer explicitly ended the subscription; automatic recovery is not authorized.
+    SubscriptionEnded,
     Closed,
     Session(OAuthSessionError),
     Task(ManagedTasksError),
@@ -140,6 +142,7 @@ impl fmt::Display for ManagedTaskWatchError {
             Self::Interrupted => {
                 f.write_str("Task subscription ended before all tasks were terminal")
             }
+            Self::SubscriptionEnded => f.write_str("Task subscription was cancelled by the peer"),
             Self::Closed => f.write_str("managed Task watch is closed"),
         }
     }
@@ -342,6 +345,9 @@ impl ManagedTaskWatch {
                                     }
                                 }
                                 Some(ManagedSubscriptionEvent::Notification(_)) => {}
+                                Some(ManagedSubscriptionEvent::Cancelled { .. }) => {
+                                    return Err(ManagedTaskWatchError::SubscriptionEnded);
+                                }
                                 Some(ManagedSubscriptionEvent::Terminal { .. }) | None => {
                                     return Err(ManagedTaskWatchError::Interrupted);
                                 }

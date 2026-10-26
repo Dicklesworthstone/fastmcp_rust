@@ -329,9 +329,10 @@ impl ClientCredentialsCatalogClient {
                                             );
                                         }
                                     }
-                                    Some(ModernHttpSubscriptionListenEvent::Terminal {
-                                        ..
-                                    }) => {
+                                    Some(
+                                        ModernHttpSubscriptionListenEvent::Terminal { .. }
+                                        | ModernHttpSubscriptionListenEvent::Cancelled { .. },
+                                    ) => {
                                         return Ok(
                                             ClientCredentialsCatalogWatchOutcome::SubscriptionEnded,
                                         );

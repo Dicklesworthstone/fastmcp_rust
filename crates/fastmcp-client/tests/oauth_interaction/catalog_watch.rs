@@ -26,6 +26,8 @@ enum WatchCase {
     NarrowAck,
     Gap,
     Terminal,
+    PeerCancellation,
+    ForeignCancellation,
     Malformed,
     RebuildLimit,
     RepeatedId,
@@ -114,6 +116,12 @@ fn notification(method: &str) -> String {
         _ => unreachable!(),
     };
     json!({"jsonrpc":"2.0","method":name}).to_string()
+}
+
+fn subscription_notification(method: &str) -> String {
+    let mut value: Value = serde_json::from_str(&notification(method)).unwrap();
+    value["params"] = json!({"_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):1}});
+    value.to_string()
 }
 
 fn ack(accepted: Value) -> String {
@@ -263,7 +271,7 @@ fn run_watch(case: WatchCase) {
                 if matches!(case, WatchCase::DuringPage | WatchCase::RebuildLimit) {
                     serve_page(&peer, method, 2, None, "obsolete-one", Some("old-tail")).await;
                     let page = accept_page(&peer, method, 3, Some("old-tail")).await;
-                    event(&mut listen, &notification(method), false).await;
+                    event(&mut listen, &subscription_notification(method), false).await;
                     closed(page).await; // Invalidation must wake an idle list response.
                     if matches!(case, WatchCase::DuringPage) {
                         serve_page(&peer, method, 4, None, "fresh-one", Some("")).await;
@@ -297,12 +305,17 @@ fn run_watch(case: WatchCase) {
                 if matches!(case, WatchCase::Live | WatchCase::WholeLive | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts) {
                     // The first snapshot has already reached the host while the
                     // original pending listen read must remain open and usable.
-                    event(&mut listen, &notification(method), false).await;
+                    event(&mut listen, &subscription_notification(method), false).await;
                     serve_page(&peer, method, 3, None, "second", None).await;
                 } else if matches!(case, WatchCase::Terminal) {
                     event(&mut listen, &terminal(1, &json!({"resultType":"complete",
                         "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):1}}).to_string()), true).await;
                     return;
+                } else if matches!(case, WatchCase::PeerCancellation | WatchCase::ForeignCancellation) {
+                    event(&mut listen, &json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{
+                        "requestId":1, "reason":"watch maintenance",
+                        "_meta":{(FINAL_SUBSCRIPTION_ID_META_KEY):if matches!(case, WatchCase::ForeignCancellation) { 99 } else { 1 }}
+                    }}).to_string(), false).await;
                 }
                 closed(listen).await;
             });
@@ -384,7 +397,8 @@ fn run_watch(case: WatchCase) {
                     WatchCase::Live | WatchCase::WholeLive | WatchCase::Resources | WatchCase::Templates | WatchCase::Prompts | WatchCase::DuringPage | WatchCase::ChangeOnPage | WatchCase::StopAck | WatchCase::ScopedCache => {
                         assert_eq!(result.unwrap(), Outcome::StoppedByHost);
                     }
-                    WatchCase::Terminal => assert_eq!(result.unwrap(), Outcome::SubscriptionEnded),
+                    WatchCase::Terminal | WatchCase::PeerCancellation => assert_eq!(result.unwrap(), Outcome::SubscriptionEnded),
+                    WatchCase::ForeignCancellation => assert!(matches!(result, Err(WatchError::Subscription(fastmcp_client::http_auth::managed::subscriptions::ManagedSubscriptionError::InvalidResponse)))),
                     WatchCase::NarrowAck => assert!(matches!(result, Err(WatchError::CoverageRefused))),
                     WatchCase::RebuildLimit => assert!(matches!(result, Err(WatchError::CollectionLimit))),
                     WatchCase::RepeatedId => assert!(matches!(result, Err(WatchError::Catalog(ManagedCatalogError::RepeatedRequestId)))),
@@ -422,7 +436,7 @@ fn run_watch(case: WatchCase) {
                 let cached = Box::pin(client.collect(&cx, request("prompts/list"), || panic!("unrelated catalog was not cleared"), |_| Ok(()))).await.unwrap();
                 assert_eq!(cached.item_count(), 1);
             }
-            if matches!(case, WatchCase::Live | WatchCase::Terminal | WatchCase::Drop) {
+            if matches!(case, WatchCase::Live | WatchCase::Terminal | WatchCase::PeerCancellation | WatchCase::Drop) {
                 // Exit invalidates even on a graceful stop: no cached snapshot
                 // can bridge the gap until the caller explicitly fetches again.
                 let ((), result) = pair(Box::pin(serve_page(&peer, method, 80, None, "after-gap", None)),
@@ -497,6 +511,20 @@ fn graceful_subscription_end_does_not_bridge_cache_across_the_gap() {
     isolated_watch(
         "graceful_subscription_end_does_not_bridge_cache_across_the_gap",
         WatchCase::Terminal,
+    );
+}
+#[test]
+fn peer_subscription_cancellation_ends_catalog_watch_without_reconnect() {
+    isolated_watch(
+        "peer_subscription_cancellation_ends_catalog_watch_without_reconnect",
+        WatchCase::PeerCancellation,
+    );
+}
+#[test]
+fn foreign_subscription_cancellation_cannot_end_catalog_watch_successfully() {
+    isolated_watch(
+        "foreign_subscription_cancellation_cannot_end_catalog_watch_successfully",
+        WatchCase::ForeignCancellation,
     );
 }
 #[test]

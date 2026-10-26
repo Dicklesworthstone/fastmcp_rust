@@ -13576,7 +13576,8 @@ fn e2e_public_http_as_proxy_tasks_listen_retains_status_through_the_gateway_case
                     "the as_proxy relay publishes cancellation within the public bound"
                 );
             }
-            Some(FinalTaskWatchEvent::Terminal { .. }) | None => {
+            Some(FinalTaskWatchEvent::Terminal { .. } | FinalTaskWatchEvent::Cancelled { .. })
+            | None => {
                 panic!("the live as_proxy Tasks listener must retain cancellation before terminal")
             }
         }
@@ -14576,7 +14577,8 @@ fn e2e_public_http_as_proxy_stdio_tasks_listen_retains_status_through_the_gatewa
                     "the stdio as_proxy relay publishes cancellation within the public bound"
                 );
             }
-            Some(FinalTaskWatchEvent::Terminal { .. }) | None => {
+            Some(FinalTaskWatchEvent::Terminal { .. } | FinalTaskWatchEvent::Cancelled { .. })
+            | None => {
                 panic!(
                     "the live stdio as_proxy Tasks listener must retain cancellation before terminal"
                 )
