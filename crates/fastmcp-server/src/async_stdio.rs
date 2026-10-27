@@ -2486,9 +2486,13 @@ impl Server {
     /// drain, so the peer may continue receiving accepted results. Keeping its
     /// receive half alive until EOF avoids turning that drain into a delivery
     /// failure. Caller cancellation stops ingress and cancels request regions.
-    /// Startup precedes a configured Task supervisor; that service and request
-    /// regions settle before shutdown. Dropping this future leaves structured
-    /// region cleanup to the caller runtime rather than invoking shutdown early.
+    /// Active modern subscriptions drain their correlated cancellation controls
+    /// before output closes, within the same finite bound and caller deadline.
+    /// Peer-cancelled subscriptions stay silent; failed terminal writes remain
+    /// delivery errors. Startup precedes a configured Task supervisor; that
+    /// service and request regions settle before shutdown. Dropping this future
+    /// leaves structured region cleanup to the caller runtime rather than
+    /// invoking shutdown early.
     ///
     /// # Errors
     ///
@@ -2930,10 +2934,15 @@ impl Server {
                 let modern = matches!(protocol, NativeProtocol::Modern);
                 #[cfg(not(feature = "legacy-2024-11-05"))]
                 let modern = true;
+                // Stdio and Memory own this server's sole connection. A
+                // WebSocket connection must preserve other peers' subscriptions.
                 if subscription_shutdown.is_none()
                     && error.is_none()
                     && modern
-                    && matches!(lifetime.binding.transport, InboundRequestTransport::Stdio)
+                    && matches!(
+                        lifetime.binding.transport,
+                        InboundRequestTransport::Stdio | InboundRequestTransport::Memory
+                    )
                     && cx.checkpoint().is_err()
                 {
                     let maximum = cx.now().saturating_add_nanos(
@@ -6167,6 +6176,31 @@ mod tests {
             response
         }
 
+        async fn listen(cx: &Cx, peer: &mut MemoryTransport, id: i64) {
+            peer.send_async(
+                cx,
+                &request(
+                    id,
+                    SUBSCRIPTIONS_LISTEN,
+                    serde_json::json!({"notifications": {}}),
+                ),
+            )
+            .await
+            .unwrap();
+            let JsonRpcMessage::Request(ack) = peer.recv_async(cx).await.unwrap() else {
+                panic!("subscription {id} must acknowledge without completing");
+            };
+            assert!(ack.id.is_none());
+            assert_eq!(
+                ack.method,
+                fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED
+            );
+            assert_eq!(
+                ack.params.unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+                id
+            );
+        }
+
         async fn stop(cx: &Cx, peer: MemoryTransport, mut serving: Serving) {
             let (mut input, output) = peer.into_split();
             drop(output);
@@ -6287,6 +6321,160 @@ mod tests {
                 assert!(response(&cx, &mut peer, 32).await.error.is_none());
                 stop(&cx, peer, serving).await;
                 assert!(subscriptions.inner.lock().unwrap().entries.is_empty());
+            });
+        }
+
+        #[test]
+        fn memory_caller_shutdown_drains_active_subscriptions_and_preserves_peer_cancellation() {
+            for peer_cancels_first in [false, true] {
+                run_native(|cx| async move {
+                    let gate = Arc::new(Gate::default());
+                    let shutdown = Arc::new(AtomicBool::new(false));
+                    let stopped = Arc::clone(&shutdown);
+                    let service = Server::new("memory-subscription-shutdown", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .tool(ProbeTool(Arc::clone(&gate)))
+                        .on_shutdown(move || stopped.store(true, Ordering::Release))
+                        .build();
+                    let subscriptions = Arc::clone(&service.final_subscriptions);
+                    let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+                    let (context_tx, context_rx) = std::sync::mpsc::sync_channel(1);
+                    let finished = Arc::new(AtomicBool::new(false));
+                    let completed = Arc::clone(&finished);
+                    let mut serving = cx
+                        .spawn(move |serve_cx| async move {
+                            context_tx.send(serve_cx.clone()).unwrap();
+                            let result = service.serve_memory(&serve_cx, transport).await;
+                            completed.store(true, Ordering::Release);
+                            result
+                        })
+                        .unwrap();
+                    listen(&cx, &mut peer, 50).await;
+                    listen(&cx, &mut peer, 51).await;
+                    peer.send_async(&cx, &call(52, true)).await.unwrap();
+                    until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                    if peer_cancels_first {
+                        peer.send_async(&cx, &cancel(50)).await.unwrap();
+                    }
+                    // An independent result must still arrive while the other
+                    // call and live subscription request regions are parked.
+                    peer.send_async(&cx, &call(53, false)).await.unwrap();
+                    let result = response(&cx, &mut peer, 53).await;
+                    assert!(result.error.is_none());
+                    assert_eq!(result.result.unwrap()["content"][0]["text"], "executed");
+                    until(&cx, || {
+                        subscriptions.inner.lock().unwrap().entries.len()
+                            == if peer_cancels_first { 1 } else { 2 }
+                    })
+                    .await;
+                    let serve_cx = context_rx.try_recv().unwrap();
+                    serve_cx.cancel_with(CancelKind::User, Some("memory subscription shutdown"));
+                    until(&cx, || gate.dropped.load(Ordering::Acquire) == 2).await;
+                    assert!(subscriptions.is_terminating());
+                    if !peer_cancels_first {
+                        // With no reader yet and only one queue slot, both
+                        // controls cannot have committed. Shutdown must retain
+                        // the writer and must not run the application hook.
+                        assert!(!finished.load(Ordering::Acquire));
+                        assert!(!shutdown.load(Ordering::Acquire));
+                    }
+                    // Keep ingress open so this exercises caller cancellation,
+                    // independently of the input-EOF response-drain path.
+                    let (mut input, mut output) = peer.into_split();
+                    let mut terminated = Vec::new();
+                    loop {
+                        match input.recv_async(&cx).await {
+                            Ok(JsonRpcMessage::Request(control)) => {
+                                assert!(control.id.is_none());
+                                assert_eq!(control.method, "notifications/cancelled");
+                                let params = control.params.unwrap();
+                                let id = params["requestId"].as_i64().unwrap();
+                                assert_eq!(params["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY], id);
+                                terminated.push(id);
+                            }
+                            Err(TransportError::Closed) => break,
+                            other => panic!(
+                                "shutdown fabricated a completion or failed to drain: {other:?}"
+                            ),
+                        }
+                    }
+                    terminated.sort_unstable();
+                    assert_eq!(
+                        terminated,
+                        if peer_cancels_first {
+                            vec![51]
+                        } else {
+                            vec![50, 51]
+                        }
+                    );
+                    serving.join(&cx).await.unwrap().unwrap();
+                    assert!(finished.load(Ordering::Acquire));
+                    assert!(shutdown.load(Ordering::Acquire));
+                    assert!(subscriptions.inner.lock().unwrap().entries.is_empty());
+                    assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                    assert!(serve_cx.is_cancel_requested());
+                    assert!(cx.checkpoint().is_ok());
+                    assert!(matches!(
+                        output.send_async(&cx, &discover(54)).await,
+                        Err(TransportError::Closed)
+                    ));
+                });
+            }
+        }
+
+        #[test]
+        fn memory_caller_shutdown_reports_failed_subscription_delivery_after_owned_cleanup() {
+            run_native(|cx| async move {
+                let gate = Arc::new(Gate::default());
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let stopped = Arc::clone(&shutdown);
+                let observed = Arc::clone(&gate);
+                let service = Server::new("memory-subscription-disconnect", "1")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .unwrap()
+                    .tool(ProbeTool(Arc::clone(&gate)))
+                    .on_shutdown(move || {
+                        assert_eq!(
+                            observed.dropped.load(Ordering::Acquire),
+                            1,
+                            "application shutdown must follow owned request cleanup"
+                        );
+                        stopped.store(true, Ordering::Release);
+                    })
+                    .build();
+                let subscriptions = Arc::clone(&service.final_subscriptions);
+                let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+                let (context_tx, context_rx) = std::sync::mpsc::sync_channel(1);
+                let mut serving = cx
+                    .spawn(move |serve_cx| async move {
+                        context_tx.send(serve_cx.clone()).unwrap();
+                        service.serve_memory(&serve_cx, transport).await
+                    })
+                    .unwrap();
+                listen(&cx, &mut peer, 60).await;
+                peer.send_async(&cx, &call(61, true)).await.unwrap();
+                until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                let serve_cx = context_rx.try_recv().unwrap();
+                serve_cx.cancel_with(CancelKind::User, Some("memory terminal delivery failure"));
+                let (input, mut output) = peer.into_split();
+                // Only the terminal-control destination closes. Keeping the
+                // peer's send half open prevents the input-EOF shutdown path.
+                drop(input);
+                let error = serving.join(&cx).await.unwrap().unwrap_err();
+                let data = error.data.as_ref().unwrap();
+                assert_eq!(data["stage"], "send");
+                assert_eq!(data["kind"], "closed");
+                assert!(subscriptions.is_terminating());
+                assert!(subscriptions.inner.lock().unwrap().entries.is_empty());
+                assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                assert!(shutdown.load(Ordering::Acquire));
+                assert!(serve_cx.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+                assert!(matches!(
+                    output.send_async(&cx, &discover(62)).await,
+                    Err(TransportError::Closed)
+                ));
             });
         }
 
