@@ -27167,6 +27167,10 @@ impl Client {
         task: &FinalTask,
         input_responses: FinalTaskInputResponses,
     ) -> McpResult<FinalUpdateTaskResult> {
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        task_wait::admit_stdio_task_input(task, &input_responses)?;
         self.send_yielding_final_task_request(
             cx,
             cancellation,
@@ -27207,6 +27211,14 @@ impl Client {
     ) -> McpResult<R> {
         self.ensure_initialized_with_cancellation(cx, Some(cancellation))
             .await?;
+        if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        // Initialization can wait on the peer. Recheck retention before
+        // allocating an ID or committing an input update to the pipe.
+        if let Some(task) = task {
+            task_wait::admit_input_retention(task)?;
+        }
         let mut request = self.start_yielding_final_task_request(cx, method, parameters, task)?;
         loop {
             let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
