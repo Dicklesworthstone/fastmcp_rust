@@ -62,9 +62,17 @@ NAMESPACE = "refs/evidence/review-cited/"
 TOKEN = re.compile(r"(?<![0-9A-Za-z])([0-9a-f]{7,40})(?![0-9A-Za-z])")
 
 
+# Parallel lanes commit into this working tree constantly and hold index.lock
+# while they do. A gate that waits forever on a contended git is a gate that
+# blocks the verification cycle it was meant to protect, so every call is
+# bounded and a timeout fails closed.
+GIT_TIMEOUT = 180
+
+
 def repo_root() -> Path:
     out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
-                         capture_output=True, text=True, check=True)
+                         capture_output=True, text=True, check=True,
+                         timeout=GIT_TIMEOUT)
     return Path(out.stdout.strip())
 
 
@@ -73,8 +81,15 @@ class Git:
         self.root = root
 
     def __call__(self, *args: str, stdin: str | None = None) -> str:
-        done = subprocess.run(["git", *args], cwd=self.root, input=stdin,
-                              capture_output=True, text=True, check=False)
+        try:
+            done = subprocess.run(["git", *args], cwd=self.root, input=stdin,
+                                  capture_output=True, text=True, check=False,
+                                  timeout=GIT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            raise SystemExit(
+                f"git {' '.join(args[:3])} did not finish within "
+                f"{GIT_TIMEOUT}s; refusing to report a verdict from a partial "
+                f"read of the object graph") from None
         if done.returncode and stdin is None and args[0] != "ls-remote":
             print(f"git {' '.join(args)} -> {done.returncode}: "
                   f"{done.stderr.strip()[:200]}", file=sys.stderr)
@@ -88,11 +103,21 @@ def harvest(issues: Path) -> dict[str, set[str]]:
     """token -> set of bead ids citing it, over every text field in the tracker."""
     cites: dict[str, set[str]] = collections.defaultdict(set)
     with issues.open() as handle:
-        for line in handle:
+        for number, line in enumerate(handle, start=1):
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as problem:
+                # `br sync --flush-only` rewrites this 32MB file while other
+                # lanes work. Fail closed and name the line: a gate that cannot
+                # read the whole citation set must not report a clean sweep.
+                raise SystemExit(
+                    f"{issues}:{number} is not valid JSON ({problem}); the "
+                    f"citation set is incomplete, so no verdict is reported. "
+                    f"Re-run after `br sync --flush-only` finishes."
+                ) from None
             texts = [record.get("title") or "", record.get("description") or "",
                      record.get("close_reason") or ""]
             texts += [(c.get("text") or "") for c in (record.get("comments") or [])]
