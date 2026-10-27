@@ -304,7 +304,8 @@ pub mod client {
     #[cfg(feature = "tasks")]
     pub use crate::{
         FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
-        FinalTaskWatch, FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
+        FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
+        FinalToolCallOutcome, FinalUpdateTaskResult,
         StdioTaskSubscriptionEvent,
     };
     /// Exact-2024 client staging is present only with the legacy adapter.
@@ -1050,7 +1051,8 @@ pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
     FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
-    FinalTaskWatch, FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
+    FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
+    FinalToolCallOutcome, FinalUpdateTaskResult,
     StdioTaskSubscriptionEvent,
 };
 
@@ -1175,8 +1177,8 @@ pub mod auto {
 
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
-        FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification, FinalToolCallOutcome,
-        FinalUpdateTaskResult,
+        FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
+        FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalToolCallOutcome, FinalUpdateTaskResult,
     };
     #[cfg(all(feature = "apps", feature = "tasks"))]
     pub use fastmcp_client::McpAppsServerTaskPolicy;
@@ -3053,7 +3055,8 @@ pub mod modern {
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
         FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
-        FinalTaskWatch, FinalTaskWatchEvent, FinalToolCallOutcome, FinalUpdateTaskResult,
+        FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalTaskWatch, FinalTaskWatchEvent,
+        FinalToolCallOutcome, FinalUpdateTaskResult,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_protocol::extensions::{
@@ -4457,6 +4460,36 @@ pub mod modern {
             Self { inner }
         }
 
+        /// Attaches one Task through a caller-owned modern stdio request.
+        /// The retained handle is volatile and does not claim crash recovery.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn attach_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalTaskHandle> {
+            self.inner
+                .attach_final_task_with_cx(cx, cancellation, task_id)
+                .await
+        }
+
+        /// Waits for a terminal Task or input request under one finite budget.
+        /// The latest snapshot stays on `handle`; cancellation stops observation
+        /// without performing input effects or cancelling the remote Task.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn wait_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            handle: &mut FinalTaskHandle,
+            policy: FinalTaskWaitPolicy,
+        ) -> McpResult<FinalTaskWaitOutcome> {
+            handle
+                .wait_with_stdio(cx, &mut self.inner, cancellation, policy)
+                .await
+        }
+
         /// Returns the pinned final protocol version.
         #[must_use]
         pub const fn protocol_version(&self) -> &'static str {
@@ -5527,6 +5560,21 @@ pub mod modern {
             handle: &'handle mut FinalTaskHandle,
         ) -> Result<&'handle FinalTask, HttpClientError> {
             handle.poll(cx, &mut self.inner).await
+        }
+
+        /// Waits for completion or an input request without opening a subscription.
+        /// Each server polling suggestion is a minimum, and the original budget
+        /// bounds both waits and in-flight requests. Inspect `handle.task()` for
+        /// the exact retained result or outstanding input requests on return.
+        #[cfg(feature = "tasks")]
+        pub async fn wait_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &fastmcp_core::McpRequestCancellation,
+            handle: &mut FinalTaskHandle,
+            policy: FinalTaskWaitPolicy,
+        ) -> Result<FinalTaskWaitOutcome, HttpClientError> {
+            handle.wait(cx, &mut self.inner, cancellation, policy).await
         }
 
         /// Supplies input for an `input_required` task handle.

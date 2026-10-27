@@ -50,6 +50,10 @@
 mod builder;
 mod cache;
 mod execution;
+#[cfg(feature = "tasks")]
+mod task_wait;
+#[cfg(feature = "tasks")]
+pub use task_wait::{FinalTaskWaitOutcome, FinalTaskWaitPolicy};
 pub mod http_auth;
 #[cfg_attr(
     not(feature = "legacy-2024-11-05"),
