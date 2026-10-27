@@ -2470,9 +2470,15 @@ impl Server {
     /// The inbound transport remains `Memory`; this does not impersonate stdio
     /// or skip authentication because the peer happens to be in-process.
     ///
-    /// Select [`ProtocolPolicy::ModernOnly`] before building. The caller must
-    /// supply an asupersync runtime context with a timer driver. No reactor,
-    /// helper thread, or blocking pool is needed for asynchronous handlers.
+    /// With `legacy-2024-11-05`, the default [`ProtocolPolicy::Auto`] selects
+    /// the era once from the first complete request; [`ProtocolPolicy::LegacyOnly`]
+    /// requires exact MCP 2024-11-05 initialization. Modern requests run in
+    /// independent regions, while legacy lifecycle work stays ordered and
+    /// ingress continues routing cancellation and reverse-request responses.
+    /// Without that feature, select [`ProtocolPolicy::ModernOnly`].
+    ///
+    /// The caller must supply an asupersync runtime context with a timer driver.
+    /// No reactor, helper thread, or blocking pool is needed for asynchronous handlers.
     /// A pending output send has the native finite commit deadline. Successful
     /// channel publication is final and is never retroactively cancelled.
     ///
@@ -2489,11 +2495,12 @@ impl Server {
     /// Returns policy, missing-timer, startup, protocol-direction, transport,
     /// output-capacity, task-service, or graceful-drain failures to the caller.
     pub async fn serve_memory(self, cx: &Cx, transport: MemoryTransport) -> McpResult<()> {
+        #[cfg(not(feature = "legacy-2024-11-05"))]
         if self.protocol_policy != ProtocolPolicy::ModernOnly {
             return Err(server_run_error(
                 "startup",
                 "protocol_policy",
-                "Async memory serving requires ModernOnly policy",
+                "Async memory legacy policies require the legacy-2024-11-05 feature",
             ));
         }
         cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
@@ -2621,10 +2628,14 @@ impl Server {
         };
         #[cfg(feature = "legacy-2024-11-05")]
         let mut protocol = NativeProtocol::new(
-            if matches!(lifetime.binding.transport, InboundRequestTransport::Stdio) {
+            if matches!(
+                lifetime.binding.transport,
+                InboundRequestTransport::Stdio | InboundRequestTransport::Memory
+            ) {
                 server.protocol_policy
             } else {
-                // Memory and WebSocket retain their existing ModernOnly binding.
+                // WebSocket retains its existing ModernOnly native binding;
+                // its dual-era bridge owns separate upgrade authentication.
                 ProtocolPolicy::ModernOnly
             },
         );
@@ -6351,6 +6362,567 @@ mod tests {
             assert!(error.message.contains("timer driver"));
             assert!(!started.load(Ordering::Acquire));
             assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+        }
+
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        #[test]
+        fn memory_server_refuses_unavailable_legacy_policy_before_startup() {
+            run_native(|cx| async move {
+                for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                    let started = Arc::new(AtomicBool::new(false));
+                    let flag = Arc::clone(&started);
+                    let mut service = Server::new("memory-no-legacy", "1")
+                        .protocol_policy(ProtocolPolicy::ModernOnly)
+                        .unwrap()
+                        .on_startup(move || {
+                            flag.store(true, Ordering::Release);
+                            Ok::<(), io::Error>(())
+                        })
+                        .build();
+                    // Public construction already rejects these policies in
+                    // this profile. The serving boundary must enforce it too.
+                    service.protocol_policy = policy;
+                    let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+                    let error = service.serve_memory(&cx, transport).await.unwrap_err();
+                    assert!(error.message.contains("legacy-2024-11-05 feature"));
+                    assert!(!started.load(Ordering::Acquire));
+                    assert!(matches!(
+                        peer.recv_async(&cx).await,
+                        Err(TransportError::Closed)
+                    ));
+                }
+            });
+        }
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        mod dual_era {
+            use super::*;
+
+            fn configured(policy: ProtocolPolicy, gate: &Arc<Gate>) -> ServerBuilder {
+                ServerBuilder::try_new_with_fixed_protocol_policy("native-memory", "1", policy)
+                    .unwrap()
+                    .tool(ProbeTool(Arc::clone(gate)))
+            }
+
+            fn legacy_request(id: i64, method: &str, params: serde_json::Value) -> JsonRpcMessage {
+                JsonRpcMessage::Request(JsonRpcRequest::new(method, Some(params), id))
+            }
+
+            fn initialize(id: i64) -> JsonRpcMessage {
+                legacy_request(
+                    id,
+                    "initialize",
+                    serde_json::json!({
+                        "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                        "capabilities": {"roots": {}},
+                        "clientInfo": {"name": "memory-peer", "version": "1"},
+                    }),
+                )
+            }
+
+            fn initialized() -> JsonRpcMessage {
+                JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/initialized",
+                    None,
+                ))
+            }
+
+            fn legacy_call(id: i64, hold: bool) -> JsonRpcMessage {
+                legacy_request(
+                    id,
+                    "tools/call",
+                    serde_json::json!({
+                        "name": "async_probe", "arguments": {"hold": hold},
+                    }),
+                )
+            }
+
+            fn legacy_cancel(id: i64) -> JsonRpcMessage {
+                JsonRpcMessage::Request(JsonRpcRequest::notification(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({"requestId": id})),
+                ))
+            }
+
+            fn assert_legacy_result(response: JsonRpcResponse, text: &str) {
+                assert!(response.error.is_none(), "{response:?}");
+                let result = response.result.unwrap();
+                assert_eq!(result["content"][0]["text"], text);
+                assert!(result.get("resultType").is_none(), "{result}");
+            }
+
+            async fn handshake(cx: &Cx, peer: &mut MemoryTransport) {
+                peer.send_async(cx, &initialize(1)).await.unwrap();
+                let initialized_result = response(cx, peer, 1).await;
+                assert!(initialized_result.error.is_none(), "{initialized_result:?}");
+                assert_eq!(
+                    initialized_result.result.unwrap()["protocolVersion"],
+                    LEGACY_PROTOCOL_VERSION
+                );
+                peer.send_async(cx, &initialized()).await.unwrap();
+            }
+
+            async fn refused_connection(cx: &Cx, peer: &mut MemoryTransport, mut serving: Serving) {
+                assert!(matches!(
+                    peer.recv_async(cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(serving.join(cx).await.unwrap().is_err());
+            }
+
+            #[test]
+            fn memory_default_auto_selects_modern_and_cannot_downgrade() {
+                run_native(|cx| async move {
+                    let gate = Arc::new(Gate::default());
+                    // Exercise the real no-launch-override default without
+                    // consulting or changing process-global test environment.
+                    let service =
+                        ServerBuilder::from_launch_protocol_policy("default-memory", "1", Ok(None))
+                            .unwrap()
+                            .tool(ProbeTool(Arc::clone(&gate)))
+                            .build();
+                    assert_eq!(service.protocol_policy, ProtocolPolicy::Auto);
+                    let (mut peer, serving) = connect(&cx, service);
+                    peer.send_async(&cx, &discover(10)).await.unwrap();
+                    assert!(response(&cx, &mut peer, 10).await.error.is_none());
+                    peer.send_async(&cx, &call(11, false)).await.unwrap();
+                    let completed = response(&cx, &mut peer, 11).await;
+                    assert!(completed.error.is_none());
+                    assert_eq!(completed.result.unwrap()["resultType"], "complete");
+                    assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+
+                    peer.send_async(&cx, &initialize(12)).await.unwrap();
+                    assert_eq!(
+                        response(&cx, &mut peer, 12)
+                            .await
+                            .error
+                            .unwrap()
+                            .code
+                            .as_i32(),
+                        Some(-32601)
+                    );
+                    peer.send_async(&cx, &legacy_call(13, false)).await.unwrap();
+                    assert_eq!(
+                        response(&cx, &mut peer, 13)
+                            .await
+                            .error
+                            .unwrap()
+                            .code
+                            .as_i32(),
+                        Some(-32602)
+                    );
+                    assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                    peer.send_async(&cx, &call(14, false)).await.unwrap();
+                    assert!(response(&cx, &mut peer, 14).await.error.is_none());
+                    assert_eq!(gate.entered.load(Ordering::Acquire), 2);
+                    stop(&cx, peer, serving).await;
+                });
+            }
+
+            #[test]
+            fn memory_legacy_lifecycle_requires_initialized_before_catalog_and_tool() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let (mut peer, serving) = connect(&cx, configured(policy, &gate).build());
+                        peer.send_async(&cx, &initialize(20)).await.unwrap();
+                        let accepted = response(&cx, &mut peer, 20).await;
+                        assert!(accepted.error.is_none());
+                        assert_eq!(
+                            accepted.result.unwrap()["protocolVersion"],
+                            LEGACY_PROTOCOL_VERSION
+                        );
+                        peer.send_async(&cx, &legacy_call(21, false)).await.unwrap();
+                        assert!(response(&cx, &mut peer, 21).await.error.is_some());
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+
+                        peer.send_async(&cx, &initialized()).await.unwrap();
+                        peer.send_async(
+                            &cx,
+                            &legacy_request(22, "tools/list", serde_json::json!({})),
+                        )
+                        .await
+                        .unwrap();
+                        let listed = response(&cx, &mut peer, 22).await;
+                        assert!(listed.error.is_none());
+                        let listed = listed.result.unwrap();
+                        assert_eq!(listed["tools"][0]["name"], "async_probe");
+                        assert!(listed.get("resultType").is_none());
+                        peer.send_async(&cx, &legacy_call(23, false)).await.unwrap();
+                        assert_legacy_result(response(&cx, &mut peer, 23).await, "executed");
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                        stop(&cx, peer, serving).await;
+                        assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                    }
+                });
+            }
+
+            #[test]
+            fn memory_legacy_selection_refuses_modern_metadata_before_dispatch() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let (mut peer, serving) = connect(&cx, configured(policy, &gate).build());
+                        handshake(&cx, &mut peer).await;
+                        peer.send_async(&cx, &call(30, false)).await.unwrap();
+                        let refused = response(&cx, &mut peer, 30).await;
+                        assert_eq!(
+                            refused.error.unwrap().code.as_i32(),
+                            Some(if policy == ProtocolPolicy::LegacyOnly {
+                                -32601
+                            } else {
+                                -32600
+                            })
+                        );
+                        refused_connection(&cx, &mut peer, serving).await;
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                    }
+                });
+            }
+
+            #[test]
+            fn memory_wrong_legacy_version_does_not_initialize_or_reclassify() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let (mut peer, serving) = connect(&cx, configured(policy, &gate).build());
+                        let JsonRpcMessage::Request(mut opening) = initialize(40) else {
+                            unreachable!()
+                        };
+                        opening.params.as_mut().unwrap()["protocolVersion"] =
+                            serde_json::json!("2025-03-26");
+                        peer.send_async(&cx, &JsonRpcMessage::Request(opening))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            response(&cx, &mut peer, 40)
+                                .await
+                                .error
+                                .unwrap()
+                                .code
+                                .as_i32(),
+                            Some(-32600)
+                        );
+                        refused_connection(&cx, &mut peer, serving).await;
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                    }
+                });
+            }
+
+            struct RootsTool(Arc<Gate>);
+
+            impl ToolHandler for RootsTool {
+                fn definition(&self) -> Tool {
+                    let mut tool = ProbeTool(Arc::clone(&self.0)).definition();
+                    tool.name = "memory_roots".to_owned();
+                    tool.input_schema =
+                        serde_json::json!({"type": "object", "additionalProperties": false});
+                    tool
+                }
+
+                fn execution_mode(&self) -> ToolExecutionMode {
+                    ToolExecutionMode::Async
+                }
+
+                fn call(&self, _: &McpContext, _: serde_json::Value) -> McpResult<Vec<Content>> {
+                    panic!("memory reverse requests require the async handler");
+                }
+
+                fn call_async<'a>(
+                    &'a self,
+                    ctx: &'a McpContext,
+                    _: serde_json::Value,
+                ) -> BoxFuture<'a, fastmcp_core::McpOutcome<Vec<Content>>> {
+                    Box::pin(async move {
+                        struct Active<'a>(&'a Gate);
+                        impl Drop for Active<'_> {
+                            fn drop(&mut self) {
+                                self.0.dropped.fetch_add(1, Ordering::AcqRel);
+                            }
+                        }
+                        let _active = Active(&self.0);
+                        self.0.entered.fetch_add(1, Ordering::AcqRel);
+                        match ctx.list_roots().await {
+                            Ok(roots) => asupersync::Outcome::Ok(vec![Content::text(
+                                roots
+                                    .into_iter()
+                                    .map(|root| root.uri)
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            )]),
+                            Err(error) => asupersync::Outcome::Err(error),
+                        }
+                    })
+                }
+            }
+
+            fn roots_call(id: i64) -> JsonRpcMessage {
+                legacy_request(
+                    id,
+                    "tools/call",
+                    serde_json::json!({"name": "memory_roots", "arguments": {}}),
+                )
+            }
+
+            async fn roots_request(cx: &Cx, peer: &mut MemoryTransport) -> RequestId {
+                let JsonRpcMessage::Request(reverse) = peer.recv_async(cx).await.unwrap() else {
+                    panic!("expected a live roots/list reverse request");
+                };
+                assert_eq!(reverse.method, "roots/list");
+                assert!(
+                    reverse
+                        .params
+                        .as_ref()
+                        .is_none_or(|params| params.get("_meta").is_none())
+                );
+                let id = reverse.id.unwrap();
+                assert!(matches!(id, RequestId::Number(value) if value < 0));
+                id
+            }
+
+            #[test]
+            fn memory_legacy_reverse_roots_rejects_modern_reply_then_resumes_same_waiter() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let roots = Arc::new(Gate::default());
+                        let service = configured(policy, &gate)
+                            .tool(RootsTool(Arc::clone(&roots)))
+                            .build();
+                        let (mut peer, serving) = connect(&cx, service);
+                        handshake(&cx, &mut peer).await;
+                        peer.send_async(&cx, &roots_call(50)).await.unwrap();
+                        let reverse_id = roots_request(&cx, &mut peer).await;
+                        peer.send_async(&cx, &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            reverse_id.clone(), serde_json::json!({"roots": [{"uri": "file:///memory/root"}], "resultType": "complete"}),
+                        ))).await.unwrap();
+                        // Unknown-method admission remains live while the
+                        // lifecycle worker is suspended on the reverse reply.
+                        peer.send_async(
+                            &cx,
+                            &legacy_request(51, "memory/unknown", serde_json::json!({})),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            response(&cx, &mut peer, 51)
+                                .await
+                                .error
+                                .unwrap()
+                                .code
+                                .as_i32(),
+                            Some(-32601)
+                        );
+                        assert_eq!(roots.entered.load(Ordering::Acquire), 1);
+                        assert_eq!(roots.dropped.load(Ordering::Acquire), 0);
+                        peer.send_async(
+                            &cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                reverse_id,
+                                serde_json::json!({"roots": [{"uri": "file:///memory/root"}]}),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                        assert_legacy_result(
+                            response(&cx, &mut peer, 50).await,
+                            "file:///memory/root",
+                        );
+                        assert_eq!(roots.dropped.load(Ordering::Acquire), 1);
+                        stop(&cx, peer, serving).await;
+                    }
+                });
+            }
+
+            #[test]
+            fn memory_legacy_cancellation_targets_only_the_owned_request() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        for matching_id in [false, true] {
+                            let gate = Arc::new(Gate::default());
+                            let (mut peer, serving) =
+                                connect(&cx, configured(policy, &gate).build());
+                            handshake(&cx, &mut peer).await;
+                            peer.send_async(&cx, &legacy_call(60, true)).await.unwrap();
+                            until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                            peer.send_async(
+                                &cx,
+                                &legacy_cancel(if matching_id { 60 } else { 999 }),
+                            )
+                            .await
+                            .unwrap();
+                            peer.send_async(
+                                &cx,
+                                &legacy_request(61, "memory/unknown", serde_json::json!({})),
+                            )
+                            .await
+                            .unwrap();
+                            assert_eq!(
+                                response(&cx, &mut peer, 61)
+                                    .await
+                                    .error
+                                    .unwrap()
+                                    .code
+                                    .as_i32(),
+                                Some(-32601)
+                            );
+                            if matching_id {
+                                until(&cx, || gate.dropped.load(Ordering::Acquire) == 1).await;
+                            } else {
+                                assert_eq!(gate.dropped.load(Ordering::Acquire), 0);
+                                gate.release();
+                                assert_legacy_result(
+                                    response(&cx, &mut peer, 60).await,
+                                    "executed",
+                                );
+                            }
+                            peer.send_async(&cx, &legacy_call(62, false)).await.unwrap();
+                            // The exact ID assertion also rejects any response
+                            // incorrectly emitted for the cancelled request.
+                            assert_legacy_result(response(&cx, &mut peer, 62).await, "executed");
+                            stop(&cx, peer, serving).await;
+                            assert_eq!(gate.dropped.load(Ordering::Acquire), 2);
+                            assert!(cx.checkpoint().is_ok());
+                        }
+                    }
+                });
+            }
+
+            #[test]
+            fn memory_legacy_parent_cancellation_retires_reverse_reply_and_keeps_peer_usable() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let roots = Arc::new(Gate::default());
+                        let service = configured(policy, &gate)
+                            .tool(RootsTool(Arc::clone(&roots)))
+                            .build();
+                        let (mut peer, serving) = connect(&cx, service);
+                        handshake(&cx, &mut peer).await;
+                        peer.send_async(&cx, &roots_call(70)).await.unwrap();
+                        let reverse_id = roots_request(&cx, &mut peer).await;
+                        peer.send_async(&cx, &legacy_cancel(70)).await.unwrap();
+                        let JsonRpcMessage::Request(cancelled) =
+                            peer.recv_async(&cx).await.unwrap()
+                        else {
+                            panic!("parent cancellation must retire the peer's reverse waiter");
+                        };
+                        assert_eq!(cancelled.method, "notifications/cancelled");
+                        assert!(cancelled.id.is_none());
+                        assert_eq!(
+                            cancelled.params.as_ref().unwrap()["requestId"],
+                            serde_json::to_value(&reverse_id).unwrap()
+                        );
+                        assert!(cancelled.params.as_ref().unwrap().get("_meta").is_none());
+                        until(&cx, || roots.dropped.load(Ordering::Acquire) == 1).await;
+                        peer.send_async(
+                            &cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                reverse_id,
+                                serde_json::json!({"roots": [{"uri": "file:///memory/late"}]}),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                        peer.send_async(&cx, &legacy_cancel(70)).await.unwrap();
+                        peer.send_async(&cx, &legacy_call(71, false)).await.unwrap();
+                        assert_legacy_result(response(&cx, &mut peer, 71).await, "executed");
+                        stop(&cx, peer, serving).await;
+                        assert_eq!(roots.entered.load(Ordering::Acquire), 1);
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                    }
+                });
+            }
+
+            fn credential(mut message: JsonRpcMessage, token: &str) -> JsonRpcMessage {
+                let JsonRpcMessage::Request(request) = &mut message else {
+                    unreachable!()
+                };
+                request.params.get_or_insert_with(|| serde_json::json!({}))["_meta"]["token"] =
+                    serde_json::json!(token);
+                message
+            }
+
+            #[test]
+            fn memory_legacy_authentication_and_bound_principal_remain_mandatory() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let verifier = crate::auth::StaticTokenVerifier::new([
+                            (
+                                "memory-owner",
+                                fastmcp_core::AuthContext::with_subject("owner"),
+                            ),
+                            (
+                                "memory-foreign",
+                                fastmcp_core::AuthContext::with_subject("foreign"),
+                            ),
+                        ])
+                        .unwrap();
+                        let service = configured(policy, &gate)
+                            .auth_provider(crate::auth::TokenAuthProvider::new(verifier))
+                            .build();
+                        let (mut peer, serving) = connect(&cx, service);
+                        peer.send_async(&cx, &initialize(80)).await.unwrap();
+                        assert!(response(&cx, &mut peer, 80).await.error.is_some());
+                        peer.send_async(&cx, &credential(initialize(81), "memory-owner"))
+                            .await
+                            .unwrap();
+                        assert!(response(&cx, &mut peer, 81).await.error.is_none());
+                        peer.send_async(&cx, &credential(initialized(), "memory-owner"))
+                            .await
+                            .unwrap();
+                        for (id, token) in [
+                            (82, None),
+                            (83, Some("invalid")),
+                            (84, Some("memory-foreign")),
+                        ] {
+                            let mut request = legacy_call(id, false);
+                            if let Some(token) = token {
+                                request = credential(request, token);
+                            }
+                            peer.send_async(&cx, &request).await.unwrap();
+                            assert!(response(&cx, &mut peer, id).await.error.is_some());
+                            assert_eq!(gate.entered.load(Ordering::Acquire), 0);
+                        }
+                        peer.send_async(&cx, &credential(legacy_call(85, false), "memory-owner"))
+                            .await
+                            .unwrap();
+                        assert_legacy_result(response(&cx, &mut peer, 85).await, "executed");
+                        stop(&cx, peer, serving).await;
+                        assert_eq!(gate.entered.load(Ordering::Acquire), 1);
+                    }
+                });
+            }
+
+            #[test]
+            fn memory_legacy_input_half_close_drains_an_admitted_handler_result() {
+                run_native(|cx| async move {
+                    for policy in [ProtocolPolicy::Auto, ProtocolPolicy::LegacyOnly] {
+                        let gate = Arc::new(Gate::default());
+                        let (mut peer, mut serving) =
+                            connect(&cx, configured(policy, &gate).build());
+                        handshake(&cx, &mut peer).await;
+                        peer.send_async(&cx, &legacy_call(90, true)).await.unwrap();
+                        until(&cx, || gate.entered.load(Ordering::Acquire) == 1).await;
+                        let (mut input, output) = peer.into_split();
+                        drop(output);
+                        gate.release();
+                        let JsonRpcMessage::Response(result) = input.recv_async(&cx).await.unwrap()
+                        else {
+                            panic!("half-close must drain the admitted legacy result");
+                        };
+                        assert_eq!(result.id, Some(RequestId::Number(90)));
+                        assert_legacy_result(result, "executed");
+                        assert!(matches!(
+                            input.recv_async(&cx).await,
+                            Err(TransportError::Closed)
+                        ));
+                        serving.join(&cx).await.unwrap().unwrap();
+                        assert_eq!(gate.dropped.load(Ordering::Acquire), 1);
+                    }
+                });
+            }
         }
     }
 }

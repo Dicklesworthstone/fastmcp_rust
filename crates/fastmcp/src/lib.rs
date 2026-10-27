@@ -2690,6 +2690,24 @@ pub mod auto {
             self.inner.serve_websocket(cx, addr).await
         }
 
+        /// Serves Auto-selected MCP over one bounded in-process connection.
+        ///
+        /// The opening request selects modern or exact MCP 2024-11-05 once.
+        /// Receive, request execution, and response backpressure stay on the
+        /// caller's runtime. A timer driver is required; asynchronous handlers
+        /// need neither a reactor nor a blocking pool. Synchronous handlers
+        /// still require the caller's blocking facility.
+        ///
+        /// Closing the peer's send half starts a bounded response drain. Keep
+        /// its receive half alive to collect accepted results before EOF.
+        pub async fn serve_memory(
+            self,
+            cx: &Cx,
+            transport: crate::memory::MemoryTransport,
+        ) -> McpResult<()> {
+            self.inner.serve_memory(cx, transport).await
+        }
+
         /// Serves Auto-selected MCP over caller-owned asynchronous NDJSON I/O.
         ///
         /// The opening request selects modern or exact MCP 2024-11-05 once;
@@ -7468,6 +7486,24 @@ pub mod modern {
             self.inner.serve_websocket(cx, addr).await
         }
 
+        /// Serves final MCP over one bounded in-process connection.
+        ///
+        /// The modern era is fixed before input. Receive, request execution,
+        /// and response backpressure stay on the caller's runtime. A timer
+        /// driver is required; asynchronous handlers need neither a reactor
+        /// nor a blocking pool. Synchronous handlers still require the
+        /// caller's blocking facility.
+        ///
+        /// Closing the peer's send half starts a bounded response drain. Keep
+        /// its receive half alive to collect accepted results before EOF.
+        pub async fn serve_memory(
+            self,
+            cx: &Cx,
+            transport: crate::memory::MemoryTransport,
+        ) -> McpResult<()> {
+            self.inner.serve_memory(cx, transport).await
+        }
+
         /// Serves final MCP over caller-owned asynchronous NDJSON I/O.
         ///
         /// The modern protocol era is fixed before input. Ingress, request
@@ -8224,6 +8260,24 @@ pub mod legacy_2024 {
         #[must_use]
         pub const fn protocol_policy(&self) -> ProtocolPolicy {
             ProtocolPolicy::LegacyOnly
+        }
+
+        /// Serves exact MCP 2024-11-05 over one bounded in-process connection.
+        ///
+        /// Initialization, requests, reverse responses, and response
+        /// backpressure share the caller's async runtime. A timer driver is
+        /// required; asynchronous handlers need neither a reactor nor a
+        /// blocking pool. Synchronous handlers still require the caller's
+        /// blocking facility. The protocol era cannot change after selection.
+        ///
+        /// Closing the peer's send half starts a bounded response drain. Keep
+        /// its receive half alive to collect accepted results before EOF.
+        pub async fn serve_memory(
+            self,
+            cx: &Cx,
+            transport: crate::memory::MemoryTransport,
+        ) -> McpResult<()> {
+            self.inner.serve_memory(cx, transport).await
         }
 
         /// Serves exact MCP 2024-11-05 over caller-owned asynchronous NDJSON I/O.
