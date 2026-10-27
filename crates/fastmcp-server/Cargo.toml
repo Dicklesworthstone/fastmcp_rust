@@ -15,14 +15,17 @@ categories = ["network-programming", "development-tools"]
 exclude = ["src/docket.rs"]
 
 [features]
-default = ["legacy-2024-11-05"]
+default = ["legacy-2024-11-05", "console"]
+# Headless embeddings can omit terminal rendering without losing protocol
+# logging, statistics, or any selected transport/extension implementation.
+console = ["dep:fastmcp-console"]
 # Direct server consumers retain the historical dual-era default. The facade
 # disables dependency defaults and forwards this feature explicitly, so every
 # no-legacy facade profile excludes the dated runtime graph.
 legacy-2024-11-05 = [
     "fastmcp-protocol/legacy-2024-11-05",
     "fastmcp-transport/legacy-2024-11-05",
-    "fastmcp-console/legacy-2024-11-05",
+    "fastmcp-console?/legacy-2024-11-05",
     "fastmcp-client?/legacy-2024-11-05",
 ]
 # When proxy activates the optional client, keep its Tasks protocol surface in
@@ -30,10 +33,10 @@ legacy-2024-11-05 = [
 # server that enables Tasks without proxy support.
 tasks = [
     "fastmcp-protocol/tasks",
-    "fastmcp-console/tasks",
+    "fastmcp-console?/tasks",
     "fastmcp-client?/tasks",
 ]
-apps = ["fastmcp-protocol/apps", "fastmcp-console/apps", "dep:html5ever"]
+apps = ["fastmcp-protocol/apps", "fastmcp-console?/apps", "dep:html5ever"]
 enterprise-auth = ["fastmcp-protocol/jose"]
 oauth-client-credentials = ["fastmcp-protocol/jose"]
 builtin-auth-server = ["fastmcp-protocol/jose", "dep:argon2"]
@@ -57,7 +60,7 @@ jwt-resource-auth = ["fastmcp-protocol/jose"]
 [dependencies]
 fastmcp-core.workspace = true
 fastmcp-client = { workspace = true, default-features = false, optional = true }
-fastmcp-console.workspace = true
+fastmcp-console = { workspace = true, optional = true }
 fastmcp-protocol.workspace = true
 fastmcp-transport.workspace = true
 asupersync.workspace = true
@@ -122,7 +125,7 @@ required-features = ["proxy", "native-tls-roots"]
 # `InMemoryFinalTaskStore`, `FinalTaskSnapshot`, `FinalTaskWorkDescriptor` and
 # `FinalTaskRetentionDeadline` are all exported from `lib.rs` behind
 # `#[cfg(feature = "tasks")]`, and this package's default is
-# `["legacy-2024-11-05"]`. Without this stanza the target is always built and
+# `["legacy-2024-11-05", "console"]`. Without this stanza the target is always built and
 # always fails E0432, breaking every other test target here.
 #
 # As above: this stanza is exactly why the runner card must pass

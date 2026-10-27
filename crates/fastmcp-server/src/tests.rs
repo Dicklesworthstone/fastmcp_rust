@@ -4606,6 +4606,7 @@ mod session_state_tests {
 // Console Config Integration Tests
 // ============================================================================
 
+#[cfg(feature = "console")]
 mod console_config_tests {
     use crate::{BannerStyle, ConsoleConfig, Server, TrafficVerbosity};
 
@@ -7330,6 +7331,7 @@ mod handler_direct_tests {
 mod builder_tests {
     use super::*;
     use crate::{DuplicateBehavior, LoggingConfig, ServerBuilder};
+    #[cfg(feature = "console")]
     use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
     use fastmcp_protocol::ResourceTemplate;
     use log::Level;
@@ -7748,6 +7750,7 @@ mod builder_tests {
 
     // ── Console Configuration ────────────────────────────────────────
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_console_config_full() {
         let config = ConsoleConfig::new()
@@ -7760,6 +7763,7 @@ mod builder_tests {
         assert!(cc.force_plain);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_without_banner() {
         let server = ServerBuilder::new("s", "0.1").without_banner().build();
@@ -7768,6 +7772,7 @@ mod builder_tests {
         assert_eq!(cc.banner_style, BannerStyle::None);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_with_banner_compact() {
         let server = ServerBuilder::new("s", "0.1")
@@ -7776,6 +7781,7 @@ mod builder_tests {
         assert_eq!(server.info().name, "s");
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_traffic_logging() {
         let server = ServerBuilder::new("s", "0.1")
@@ -7784,12 +7790,14 @@ mod builder_tests {
         assert_eq!(server.info().name, "s");
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_plain_mode() {
         let server = ServerBuilder::new("s", "0.1").plain_mode().build();
         assert!(server.console_config().force_plain);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_force_color() {
         let server = ServerBuilder::new("s", "0.1").force_color().build();

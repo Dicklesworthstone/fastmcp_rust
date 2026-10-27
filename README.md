@@ -684,6 +684,34 @@ fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
 asupersync = "=0.5.0"
 ```
 
+### Headless server embeddings (current source tree)
+
+Direct `fastmcp-server` consumers can omit rich terminal output by disabling
+its default features. The `console` feature is default-on; an embedded
+modern server that supplies its own logger can use:
+
+```toml
+[dependencies]
+fastmcp-server = { git = "https://github.com/Dicklesworthstone/fastmcp_rust", default-features = false }
+```
+
+Enable `legacy-2024-11-05`, `tasks`, `apps`, or the supported transport features
+explicitly as needed. These selections do not activate the server's console
+dependency. Headless servers retain request dispatch, protocol logging,
+statistics collection, and `stats()` / `stats_collector()`; they do not install
+a global logger or render banners, traffic previews, or statistics panels.
+`ConsoleConfig`, banner/traffic controls, and `display_stats()` require
+`console`. The idempotent `without_banner()` and `plain_mode()` helpers work
+in both profiles.
+
+This removes the direct server's `fastmcp-console` / `rich_rust` rendering
+dependency. It does not promise a `chrono`-free graph: Tasks and OAuth use
+timestamps for protocol and security behavior. The `fastmcp-rust` facade
+retains its existing console-enabled behavior, so depend on `fastmcp-server`
+directly when that dependency boundary is required.
+This feature selection does not change the transport qualification boundaries
+described above.
+
 ### From Source
 
 ```bash

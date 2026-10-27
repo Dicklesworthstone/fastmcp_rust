@@ -2411,6 +2411,7 @@ impl Server {
                 "Async stdio requires the caller's timer driver",
             ));
         }
+        #[cfg(feature = "console")]
         self.init_rich_logging();
         let server = Arc::new(self);
         if !server.run_startup_hook() {
@@ -2503,6 +2504,7 @@ impl Server {
                 "Async memory serving requires the caller's timer driver",
             ));
         }
+        #[cfg(feature = "console")]
         self.init_rich_logging();
         let server = Arc::new(self);
         if !server.run_startup_hook() {

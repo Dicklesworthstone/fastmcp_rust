@@ -56,6 +56,7 @@ pub mod logging;
 pub mod partition;
 pub mod runtime;
 mod state;
+pub mod stats;
 pub mod uri;
 
 /// Immutable protocol-limit snapshots and cumulative logical-exchange admission.

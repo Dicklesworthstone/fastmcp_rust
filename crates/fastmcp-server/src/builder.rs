@@ -5,8 +5,9 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "console")]
 use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
-use fastmcp_console::stats::ServerStats;
+use fastmcp_core::stats::ServerStats;
 use fastmcp_core::McpError;
 use fastmcp_protocol::extensions::ExtensionSettingsCompatibilityResolver;
 #[cfg(feature = "apps")]
@@ -253,6 +254,7 @@ pub struct ServerBuilder {
     /// Logging configuration.
     logging: LoggingConfig,
     /// Console configuration for rich output.
+    #[cfg(feature = "console")]
     console_config: ConsoleConfig,
     /// Lifecycle hooks for startup/shutdown.
     lifespan: LifespanHooks,
@@ -313,7 +315,7 @@ impl ServerBuilder {
     /// to disable it for performance-critical scenarios.
     ///
     /// Console configuration defaults to environment-based settings. Use
-    /// [`with_console_config`](Self::with_console_config) for programmatic control.
+    /// `with_console_config` for programmatic control when `console` is enabled.
     #[must_use]
     pub fn new(name: impl Into<String>, version: impl Into<String>) -> Self {
         Self::try_new(name, version).unwrap_or_else(|error| {
@@ -381,8 +383,12 @@ impl ServerBuilder {
         protocol_policy: ProtocolPolicy,
         launch_protocol_policy: Option<ProtocolPolicy>,
     ) -> Self {
+        #[cfg(feature = "console")]
         let console_config = ConsoleConfig::from_env();
+        #[cfg(feature = "console")]
         let logging = LoggingConfig::from(&console_config);
+        #[cfg(not(feature = "console"))]
+        let logging = LoggingConfig::from_env();
         Self {
             info: ServerInfo {
                 name: name.into(),
@@ -402,6 +408,7 @@ impl ServerBuilder {
             stats_enabled: true,
             mask_error_details: false, // Disabled by default for development
             logging,
+            #[cfg(feature = "console")]
             console_config,
             lifespan: LifespanHooks::default(),
             auth_provider: None,
@@ -2708,7 +2715,10 @@ impl ServerBuilder {
     pub fn log_level(mut self, level: Level) -> Self {
         let filter = level.to_level_filter();
         self.logging.level = filter;
-        self.console_config.log_level = filter;
+        #[cfg(feature = "console")]
+        {
+            self.console_config.log_level = filter;
+        }
         self
     }
 
@@ -2716,7 +2726,10 @@ impl ServerBuilder {
     #[must_use]
     pub fn log_level_filter(mut self, filter: LevelFilter) -> Self {
         self.logging.level = filter;
-        self.console_config.log_level = filter;
+        #[cfg(feature = "console")]
+        {
+            self.console_config.log_level = filter;
+        }
         self
     }
 
@@ -2726,7 +2739,10 @@ impl ServerBuilder {
     #[must_use]
     pub fn log_timestamps(mut self, show: bool) -> Self {
         self.logging.timestamps = show;
-        self.console_config.log_timestamps = show;
+        #[cfg(feature = "console")]
+        {
+            self.console_config.log_timestamps = show;
+        }
         self
     }
 
@@ -2736,7 +2752,10 @@ impl ServerBuilder {
     #[must_use]
     pub fn log_targets(mut self, show: bool) -> Self {
         self.logging.targets = show;
-        self.console_config.log_targets = show;
+        #[cfg(feature = "console")]
+        {
+            self.console_config.log_targets = show;
+        }
         self
     }
 
@@ -2744,17 +2763,23 @@ impl ServerBuilder {
     #[must_use]
     pub fn log_file_line(mut self, show: bool) -> Self {
         self.logging.file_line = show;
-        self.console_config.log_file_line = show;
+        #[cfg(feature = "console")]
+        {
+            self.console_config.log_file_line = show;
+        }
         self
     }
 
     /// Sets the full logging configuration.
     #[must_use]
     pub fn logging(mut self, config: LoggingConfig) -> Self {
-        self.console_config.log_level = config.level;
-        self.console_config.log_timestamps = config.timestamps;
-        self.console_config.log_targets = config.targets;
-        self.console_config.log_file_line = config.file_line;
+        #[cfg(feature = "console")]
+        {
+            self.console_config.log_level = config.level;
+            self.console_config.log_timestamps = config.timestamps;
+            self.console_config.log_targets = config.targets;
+            self.console_config.log_file_line = config.file_line;
+        }
         self.logging = config;
         self
     }
@@ -2781,6 +2806,7 @@ impl ServerBuilder {
     ///     )
     ///     .build();
     /// ```
+    #[cfg(feature = "console")]
     #[must_use]
     pub fn with_console_config(mut self, config: ConsoleConfig) -> Self {
         self.logging = LoggingConfig::from(&config);
@@ -2792,6 +2818,7 @@ impl ServerBuilder {
     ///
     /// Controls how the startup banner is displayed.
     /// Default is `BannerStyle::Full`.
+    #[cfg(feature = "console")]
     #[must_use]
     pub fn with_banner(mut self, style: BannerStyle) -> Self {
         self.console_config = self.console_config.with_banner(style);
@@ -2799,10 +2826,22 @@ impl ServerBuilder {
     }
 
     /// Disables the startup banner.
+    ///
+    /// The banner is already absent in builds without `console`, so this can
+    /// be used in application builders shared by both feature profiles.
     #[must_use]
-    pub fn without_banner(mut self) -> Self {
-        self.console_config = self.console_config.without_banner();
-        self
+    pub fn without_banner(self) -> Self {
+        #[cfg(feature = "console")]
+        {
+            Self {
+                console_config: self.console_config.without_banner(),
+                ..self
+            }
+        }
+        #[cfg(not(feature = "console"))]
+        {
+            self
+        }
     }
 
     /// Enables request/response traffic logging.
@@ -2811,6 +2850,7 @@ impl ServerBuilder {
     /// - `None`: No traffic logging (default)
     /// - `Summary`: Method name and timing only
     /// - `Full`: Full request/response bodies
+    #[cfg(feature = "console")]
     #[must_use]
     pub fn with_traffic_logging(mut self, verbosity: TrafficVerbosity) -> Self {
         self.console_config = self.console_config.with_traffic(verbosity);
@@ -2822,13 +2862,24 @@ impl ServerBuilder {
     /// Useful for CI environments, logging to files, or when running
     /// as an MCP server where rich output might interfere with the
     /// JSON-RPC protocol.
+    /// Builds without `console` already produce no styled console output.
     #[must_use]
-    pub fn plain_mode(mut self) -> Self {
-        self.console_config = self.console_config.plain_mode();
-        self
+    pub fn plain_mode(self) -> Self {
+        #[cfg(feature = "console")]
+        {
+            Self {
+                console_config: self.console_config.plain_mode(),
+                ..self
+            }
+        }
+        #[cfg(not(feature = "console"))]
+        {
+            self
+        }
     }
 
     /// Forces color output even in non-TTY environments.
+    #[cfg(feature = "console")]
     #[must_use]
     pub fn force_color(mut self) -> Self {
         self.console_config = self.console_config.force_color(true);
@@ -2836,6 +2887,7 @@ impl ServerBuilder {
     }
 
     /// Returns a reference to the current console configuration.
+    #[cfg(feature = "console")]
     #[must_use]
     pub fn console_config(&self) -> &ConsoleConfig {
         &self.console_config
@@ -3030,6 +3082,7 @@ impl ServerBuilder {
         // Configure router with strict input validation setting
         self.router
             .set_strict_input_validation(self.strict_input_validation);
+        #[cfg(feature = "console")]
         let console = fastmcp_console::console::FastMcpConsole::with_enabled(
             self.console_config.should_use_rich(),
         );
@@ -3126,7 +3179,9 @@ impl ServerBuilder {
             },
             mask_error_details: self.mask_error_details,
             logging: self.logging,
+            #[cfg(feature = "console")]
             console_config: self.console_config,
+            #[cfg(feature = "console")]
             console,
             lifespan: Mutex::new(Some(self.lifespan)),
             auth_provider: self.auth_provider,
@@ -4714,6 +4769,7 @@ mod tests {
     fn builder_log_level() {
         let builder = ServerBuilder::new("srv", "1.0").log_level(Level::Debug);
         assert_eq!(builder.logging.level, LevelFilter::Debug);
+        #[cfg(feature = "console")]
         assert_eq!(builder.console_config.log_level, LevelFilter::Debug);
     }
 
@@ -4721,6 +4777,7 @@ mod tests {
     fn builder_log_level_filter() {
         let builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Warn);
         assert_eq!(builder.logging.level, LevelFilter::Warn);
+        #[cfg(feature = "console")]
         assert_eq!(builder.console_config.log_level, LevelFilter::Warn);
     }
 
@@ -4731,15 +4788,19 @@ mod tests {
             .log_targets(false)
             .log_file_line(true);
         assert!(!builder.logging.timestamps);
+        #[cfg(feature = "console")]
         assert!(!builder.console_config.log_timestamps);
         assert!(!builder.logging.targets);
+        #[cfg(feature = "console")]
         assert!(!builder.console_config.log_targets);
         assert!(builder.logging.file_line);
+        #[cfg(feature = "console")]
         assert!(builder.console_config.log_file_line);
     }
 
     // ── Console configuration ────────────────────────────────────────
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_without_banner() {
         let builder = ServerBuilder::new("srv", "1.0").without_banner();
@@ -4747,6 +4808,7 @@ mod tests {
         assert_eq!(config.banner_style, BannerStyle::None);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_with_banner_compact() {
         let builder = ServerBuilder::new("srv", "1.0").with_banner(BannerStyle::Compact);
@@ -4754,6 +4816,7 @@ mod tests {
         assert_eq!(config.banner_style, BannerStyle::Compact);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_plain_mode() {
         let builder = ServerBuilder::new("srv", "1.0").plain_mode();
@@ -4941,6 +5004,7 @@ mod tests {
 
     // ── Console config on built server ───────────────────────────────
 
+    #[cfg(feature = "console")]
     #[test]
     fn built_server_console_config_matches_builder() {
         let server = ServerBuilder::new("srv", "1.0").without_banner().build();
@@ -4972,6 +5036,7 @@ mod tests {
 
     // ── Console configuration extended ─────────────────────────────
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_with_console_config() {
         let mut config = ConsoleConfig::new().with_banner(BannerStyle::None);
@@ -4987,6 +5052,7 @@ mod tests {
         assert!(builder.logging.file_line);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn logging_and_console_setters_keep_one_effective_configuration() {
         let console = ConsoleConfig::new().with_log_level_filter(LevelFilter::Off);
@@ -5001,6 +5067,7 @@ mod tests {
         assert_eq!(builder.console_config.log_level, LevelFilter::Warn);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_with_traffic_logging() {
         let builder = ServerBuilder::new("srv", "1.0").with_traffic_logging(TrafficVerbosity::Full);
@@ -5008,6 +5075,7 @@ mod tests {
         assert_eq!(config.traffic_verbosity, TrafficVerbosity::Full);
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn builder_force_color() {
         let builder = ServerBuilder::new("srv", "1.0").force_color();
@@ -5026,6 +5094,102 @@ mod tests {
             file_line: true,
         };
         let _builder = ServerBuilder::new("srv", "1.0").logging(config);
+    }
+
+    #[test]
+    fn logging_environment_is_renderer_independent() {
+        let values = [
+            ("FASTMCP_LOG", "WARNING"),
+            ("FASTMCP_LOG_TIMESTAMPS", "false"),
+            ("FASTMCP_LOG_TARGETS", "NO"),
+            ("FASTMCP_LOG_FILE_LINE", "yes"),
+        ];
+        let config = LoggingConfig::from_lookup(|key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        });
+        let server = ServerBuilder::new("logging", "1.0").logging(config).build();
+        let effective = server.logging_config();
+        assert_eq!(effective.level, LevelFilter::Warn);
+        assert!(!effective.timestamps);
+        assert!(!effective.targets);
+        assert!(effective.file_line);
+
+        let defaults = LoggingConfig::from_lookup(|_| None);
+        assert_eq!(defaults.level, LevelFilter::Info);
+        assert!(defaults.timestamps);
+        assert!(defaults.targets);
+        assert!(!defaults.file_line);
+        let disabled = LoggingConfig::from_lookup(|key| {
+            (key == "FASTMCP_LOG").then(|| "off".to_owned())
+        });
+        assert_eq!(disabled.level, LevelFilter::Off);
+    }
+
+    #[cfg(not(feature = "console"))]
+    #[test]
+    fn headless_server_dispatches_tools_and_preserves_statistics() {
+        let server = ServerBuilder::try_new_with_fixed_protocol_policy(
+            "headless",
+            "1.0",
+            ProtocolPolicy::ModernOnly,
+        )
+        .expect("modern policy is always available")
+        .without_banner()
+        .plain_mode()
+        .tool(TestTool)
+        .build();
+        let collector = server
+            .stats_collector()
+            .expect("headless servers retain statistics")
+            .clone();
+        let connection = crate::ModernConnection::new();
+
+        for (id, name) in [(501_u64, "test_tool"), (502, "missing_tool")] {
+            let inbound = crate::InboundRequestContext::with_modern_connection(
+                asupersync::Cx::for_testing(),
+                id,
+                crate::InboundRequestTransport::Memory,
+                &connection,
+            );
+            let request = fastmcp_protocol::JsonRpcRequest::new(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": name,
+                    "arguments": {},
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {},
+                    },
+                })),
+                i64::try_from(id).expect("fixed headless test request id fits i64"),
+            );
+            let response = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &request))
+                .expect("the headless server responds to each request");
+            if name == "test_tool" {
+                assert!(response.error.is_none(), "{:?}", response.error);
+                let result = response.result.expect("the registered tool ran");
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(result["content"][0]["text"], "ok");
+            } else {
+                assert!(response.result.is_none());
+                assert!(response.error.is_some(), "an unknown tool must be rejected");
+            }
+        }
+
+        let snapshot = server.stats().expect("statistics remain available");
+        assert_eq!(snapshot.total_requests, 2);
+        assert_eq!(snapshot.successful_requests, 1);
+        assert_eq!(snapshot.failed_requests, 1);
+        assert_eq!(snapshot.tool_calls, 2);
+        assert_eq!(collector.snapshot().total_requests, 2);
+        let disabled = ServerBuilder::new("headless-no-stats", "1.0")
+            .without_stats()
+            .build();
+        assert!(disabled.stats().is_none());
+        assert!(disabled.stats_collector().is_none());
     }
 
     // ── List page size ─────────────────────────────────────────────
@@ -9699,6 +9863,7 @@ mod tests {
     fn builder_log_level_filter_off() {
         let builder = ServerBuilder::new("srv", "1.0").log_level_filter(LevelFilter::Off);
         assert_eq!(builder.logging.level, LevelFilter::Off);
+        #[cfg(feature = "console")]
         assert_eq!(builder.console_config.log_level, LevelFilter::Off);
     }
 

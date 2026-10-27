@@ -111,8 +111,9 @@ pub use extensions::{
     ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
     ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
 };
+#[cfg(feature = "console")]
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
-pub use fastmcp_console::stats::{ServerStats, StatsSnapshot};
+pub use fastmcp_core::stats::{ServerStats, StatsSnapshot};
 use fastmcp_protocol::{
     MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
 };
@@ -530,9 +531,13 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener as AsyncTcpListener, TcpStream as AsyncTcpStream};
 use asupersync::stream::StreamExt;
 use asupersync::{Budget, CancelKind, Cx, RegionId, channel::oneshot};
+#[cfg(feature = "console")]
 use fastmcp_console::RequestResponseRenderer;
+#[cfg(feature = "console")]
 use fastmcp_console::banner::StartupBanner;
+#[cfg(feature = "console")]
 use fastmcp_console::console::FastMcpConsole;
+#[cfg(feature = "console")]
 use fastmcp_console::logging::RichLoggerBuilder;
 #[cfg(test)]
 use fastmcp_core::block_on;
@@ -3946,10 +3951,33 @@ impl LoggingConfig {
     /// - `FASTMCP_LOG_FILE_LINE`: Show file:line (1/true to enable)
     #[must_use]
     pub fn from_env() -> Self {
-        Self::from(&ConsoleConfig::from_env())
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let mut config = Self::default();
+        if let Some(level) = lookup("FASTMCP_LOG") {
+            config.level = match level.to_ascii_lowercase().as_str() {
+                "off" => LevelFilter::Off,
+                "trace" => LevelFilter::Trace,
+                "debug" => LevelFilter::Debug,
+                "info" => LevelFilter::Info,
+                "warn" | "warning" => LevelFilter::Warn,
+                "error" => LevelFilter::Error,
+                _ => config.level,
+            };
+        }
+        config.timestamps = !lookup("FASTMCP_LOG_TIMESTAMPS")
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"));
+        config.targets = !lookup("FASTMCP_LOG_TARGETS")
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "no"));
+        config.file_line = lookup("FASTMCP_LOG_FILE_LINE")
+            .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+        config
     }
 }
 
+#[cfg(feature = "console")]
 impl From<&ConsoleConfig> for LoggingConfig {
     fn from(config: &ConsoleConfig) -> Self {
         Self {
@@ -7637,6 +7665,7 @@ impl BoundHttpServer {
     pub fn serve(self, cx: &Cx) -> impl Future<Output = McpResult<HttpServerShutdown>> + Send + '_ {
         async move {
             let server = Arc::clone(&self.endpoint.server);
+            #[cfg(feature = "console")]
             server.init_rich_logging();
             if let Some(stats) = &server.stats {
                 stats.connection_opened();
@@ -7965,6 +7994,7 @@ impl BoundWebSocketServer {
 
     /// Serves HTTP Upgrade and WebSocket MCP connections until `cx` is cancelled.
     pub async fn serve(self, cx: &Cx) -> McpResult<WebSocketServerShutdown> {
+        #[cfg(feature = "console")]
         self.server.init_rich_logging();
         if let Some(stats) = &self.server.stats {
             stats.connection_opened();
@@ -13558,8 +13588,10 @@ pub struct Server {
     /// Logging configuration.
     logging: LoggingConfig,
     /// Console configuration for rich output.
+    #[cfg(feature = "console")]
     console_config: ConsoleConfig,
     /// Server-owned console resolved from `console_config`.
+    #[cfg(feature = "console")]
     console: FastMcpConsole,
     /// Lifecycle hooks (wrapped in Option so they can be taken once).
     lifespan: Mutex<Option<LifespanHooks>>,
@@ -14520,6 +14552,7 @@ impl Server {
     }
 
     /// Renders a stats panel to stderr, if stats are enabled.
+    #[cfg(feature = "console")]
     pub fn display_stats(&self) {
         let Some(stats) = self.stats.as_ref() else {
             return;
@@ -14531,6 +14564,7 @@ impl Server {
         renderer.render_panel(&snapshot, &self.console);
     }
 
+    #[cfg(feature = "console")]
     fn configured_traffic_renderer(&self) -> Option<RequestResponseRenderer> {
         let show_bodies = match self.console_config.traffic_verbosity {
             TrafficVerbosity::None => return None,
@@ -14546,12 +14580,14 @@ impl Server {
     }
 
     /// Returns the console configuration.
+    #[cfg(feature = "console")]
     #[must_use]
     pub fn console_config(&self) -> &ConsoleConfig {
         &self.console_config
     }
 
     /// Renders the startup banner based on console configuration.
+    #[cfg(feature = "console")]
     fn render_startup_banner(&self, transport: &str) {
         let render = || {
             let mut banner = StartupBanner::new(&self.info.name, &self.info.version)
@@ -14587,6 +14623,7 @@ impl Server {
     /// This should be called early in the startup sequence, before any
     /// log output is generated. If initialization fails (e.g., logger
     /// already set), a warning is printed to stderr.
+    #[cfg(feature = "console")]
     fn init_rich_logging(&self) {
         let result = RichLoggerBuilder::new()
             .level_filter(self.logging.level)
@@ -14602,6 +14639,15 @@ impl Server {
             self.console
                 .print_plain("Note: Rich logging not initialized (logger already set)");
         }
+    }
+
+    /// Returns the configured server-managed logging settings.
+    ///
+    /// Without the `console` feature, the server uses the caller's logger
+    /// without installing or reconfiguring a global logger.
+    #[must_use]
+    pub fn logging_config(&self) -> &LoggingConfig {
+        &self.logging
     }
 
     /// Processes one modern request through the final dispatch surface.
@@ -16648,6 +16694,7 @@ impl Server {
 
     fn run_stdio_pump(self, cx: &Cx, dispatch_cx: &Cx) -> i32 {
         // Initialize rich logging first, before any log output
+        #[cfg(feature = "console")]
         self.init_rich_logging();
 
         let mut transport = StdioTransport::stdio();
@@ -16767,6 +16814,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        #[cfg(feature = "console")]
         self.init_rich_logging();
 
         let notification_failure = Arc::new(AtomicBool::new(false));
@@ -16883,6 +16931,7 @@ impl Server {
     where
         T: Transport + Send + 'static,
     {
+        #[cfg(feature = "console")]
         self.init_rich_logging();
 
         let notification_failure = Arc::new(AtomicBool::new(false));
@@ -16960,6 +17009,7 @@ impl Server {
         R: TransportRecvHalf + Send + 'static,
         S: TransportSendHalf + 'static,
     {
+        #[cfg(feature = "console")]
         self.init_rich_logging();
         let recv_half = SharedRecvHalf::new(recv_half);
         let send_half = SharedSendHalf::new(send_half);
@@ -17400,9 +17450,12 @@ impl Server {
     {
         let server = self;
         let auth_custody_generation = websocket_connection_generation;
+        #[cfg(not(feature = "console"))]
+        let _ = transport_label;
         if let Some(stats) = &server.stats {
             stats.connection_opened();
         }
+        #[cfg(feature = "console")]
         if server.console_config.show_banner && !banner_suppressed() {
             server.render_startup_banner(transport_label);
         }
@@ -17896,8 +17949,11 @@ impl Server {
         if let Some(ref stats) = self.stats {
             stats.connection_opened();
         }
+        #[cfg(not(feature = "console"))]
+        let _ = transport_label;
 
         let auth_custody_generation = websocket_connection_generation;
+        #[cfg(feature = "console")]
         if self.console_config.show_banner && !banner_suppressed() {
             self.render_startup_banner(transport_label);
         }
@@ -17917,6 +17973,7 @@ impl Server {
                 }
             };
 
+        #[cfg(feature = "console")]
         let traffic_renderer = self.configured_traffic_renderer();
 
         let server = self;
@@ -17965,6 +18022,7 @@ impl Server {
         let worker_queue_state = Arc::clone(&queue_state);
         let worker_failed_flag = Arc::clone(&worker_failed);
         let worker_cx = cx.clone();
+        #[cfg(feature = "console")]
         let worker_renderer = traffic_renderer.clone();
         let worker_session_principal = session_principal.clone();
         let worker_legacy_runtime = legacy_runtime.clone();
@@ -18102,6 +18160,7 @@ impl Server {
                 }
 
                 let start_time = Instant::now();
+                #[cfg(feature = "console")]
                 if let Some(renderer) = &worker_renderer {
                     renderer.render_request(&request, &worker_server.console);
                 }
@@ -18238,6 +18297,7 @@ impl Server {
                 });
                 drop(send_guard);
                 if let Ok(Some(response)) = &send_result {
+                    #[cfg(feature = "console")]
                     if let Some(renderer) = &worker_renderer {
                         renderer.render_response(response, Some(duration), &worker_server.console);
                     }
@@ -18751,6 +18811,7 @@ impl Server {
                         );
                         let request_server = Arc::clone(&server);
                         let request_send = Arc::clone(&send);
+                        #[cfg(feature = "console")]
                         let request_renderer = traffic_renderer.clone();
                         let task_principal_admission = Arc::clone(&principal_admission);
                         let task_modern_connection = dispatch_modern_connection.clone();
@@ -18773,6 +18834,7 @@ impl Server {
                             reservation.begin();
                             let dispatched = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
+                                    #[cfg(feature = "console")]
                                     if let Some(renderer) = &request_renderer {
                                         renderer.render_request(&request, &request_server.console);
                                     }
@@ -18956,6 +19018,7 @@ impl Server {
                                                     &request_cx,
                                                     &JsonRpcMessage::Response(response.clone()),
                                                 )?;
+                                                #[cfg(feature = "console")]
                                                 if let Some(renderer) = &request_renderer {
                                                     renderer.render_response(
                                                         &response,
@@ -19380,6 +19443,9 @@ impl Server {
         }
 
         // Render startup banner if enabled (respects both config and legacy env var)
+        #[cfg(not(feature = "console"))]
+        let _ = transport_label;
+        #[cfg(feature = "console")]
         if server.console_config.show_banner && !banner_suppressed() {
             server.render_startup_banner(transport_label);
         }
@@ -19405,6 +19471,7 @@ impl Server {
             }
 
             // Create traffic renderer if enabled
+            #[cfg(feature = "console")]
             let traffic_renderer = server.configured_traffic_renderer();
 
             // Main request loop
@@ -19500,6 +19567,7 @@ impl Server {
                 };
 
                 // Log request traffic
+                #[cfg(feature = "console")]
                 if let Some(renderer) = &traffic_renderer {
                     if let JsonRpcMessage::Request(req) = &message {
                         renderer.render_request(req, &server.console);
@@ -19852,6 +19920,7 @@ impl Server {
                         .map(|()| Some(response));
                     drop(guard);
                     if let Ok(Some(response)) = &send_result {
+                        #[cfg(feature = "console")]
                         if let Some(renderer) = &traffic_renderer {
                             renderer.render_response(response, Some(duration), &server.console);
                         }
@@ -22366,6 +22435,7 @@ impl HandledRequest {
 /// Checks if banner should be suppressed via environment variable.
 ///
 /// This is a legacy check. Prefer using `ConsoleConfig` for banner control.
+#[cfg(feature = "console")]
 fn banner_suppressed() -> bool {
     std::env::var("FASTMCP_NO_BANNER")
         .map(|value| matches!(value.to_lowercase().as_str(), "1" | "true" | "yes"))
