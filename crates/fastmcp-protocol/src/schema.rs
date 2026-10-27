@@ -6,7 +6,8 @@
 //! - Type checking (string, number, integer, boolean, object, array, null)
 //! - Required field validation
 //! - Enum validation
-//! - Property, pattern-property, dependency, property-name, and
+//! - Property, pattern-property, dependency (including the default dialect's
+//!   deprecated `dependencies` keyword), property-name, and
 //!   unevaluated-property validation
 //! - Items, tuple, contains, and unevaluated-items validation for arrays
 //! - Local `$id` resources, `$defs`/`definitions`/`$ref`/anchor/dynamic-reference
@@ -538,6 +539,7 @@ fn handwritten_schema_has_unscoped_reference(schema: &Value) -> bool {
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if object
@@ -641,6 +643,7 @@ fn check_generated_reference_resources(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(children) = object.get(keyword).and_then(Value::as_object) {
@@ -1035,6 +1038,7 @@ fn validate_final_form_schema(schema: &Value) -> Result<(), SchemaAdmissionError
             ));
         }
     }
+    validate_final_form_dependencies(root, "$")?;
     let properties = root.get("properties").map_or(Ok(None), |value| {
         value.as_object().map(Some).ok_or_else(|| {
             SchemaAdmissionError::new("$.properties", "final form properties must be an object")
@@ -1126,6 +1130,27 @@ fn validate_final_form_property_schema(
                 "final form property cannot contain nested or composed schemas",
             ));
         }
+    }
+    validate_final_form_dependencies(property, &path)
+}
+
+fn validate_final_form_dependencies(
+    schema: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    if schema
+        .get("dependencies")
+        .and_then(Value::as_object)
+        .is_some_and(|dependencies| {
+            dependencies
+                .values()
+                .any(|dependency| !dependency.is_array())
+        })
+    {
+        return Err(SchemaAdmissionError::new(
+            format!("{path}.dependencies"),
+            "final form schema cannot contain nested or composed schemas",
+        ));
     }
     Ok(())
 }
@@ -1229,6 +1254,7 @@ fn validate_final_schema_node(
     }
     validate_string_array_keyword(object, "required", path)?;
     validate_string_array_keyword(object, "dependentRequired", path)?;
+    validate_dependencies_keyword(object, path)?;
     validate_nonnegative_integer_keywords(
         object,
         path,
@@ -1286,6 +1312,7 @@ fn validate_final_schema_node(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword) {
@@ -1318,6 +1345,11 @@ fn validate_final_schema_node(
                 }
             }
             for (name, subschema) in subschemas {
+                // Property dependencies are bounded assertions, not schema
+                // locations. Only the object/boolean alternative recurses.
+                if keyword == "dependencies" && subschema.is_array() {
+                    continue;
+                }
                 validate_final_schema_node(
                     subschema,
                     root_schema,
@@ -1460,16 +1492,14 @@ fn validate_supported_schema_keywords(
         // Draft 2020-12 Core sections 4.3.1 and 6.5 define unknown
         // keywords as annotations. Their contents were bounded above and
         // remain opaque to reference, resource, and schema traversal.
-        // Validation Appendix A specifies that `definitions` behaves like
-        // `$defs` under the default meta-schema. Its entries are admitted and
-        // traversed as schemas below; it is deliberately absent from SUPPORTED
-        // so custom dialects retain their existing closed keyword contract.
-        // The other reserved deprecated keywords still require their own
-        // semantics and must not become unchecked extension annotations.
-        let unsupported_reserved = matches!(
-            keyword.as_str(),
-            "dependencies" | "$recursiveAnchor" | "$recursiveRef"
-        );
+        // The default meta-schema retains `definitions` and `dependencies`.
+        // Their schema-valued entries are admitted and traversed, and the
+        // latter's property lists are validated as bounded assertions. Both
+        // remain absent from SUPPORTED so custom dialects retain their closed
+        // keyword contract. The 2019 recursive keywords still require their
+        // own semantics and cannot become unchecked extension annotations.
+        let unsupported_reserved =
+            matches!(keyword.as_str(), "$recursiveAnchor" | "$recursiveRef");
         if unsupported_reserved || (!unknown_annotations && !SUPPORTED.contains(&keyword.as_str()))
         {
             return Err(SchemaAdmissionError::new(
@@ -1732,6 +1762,7 @@ fn is_admitted_schema_node(schema: &Value, target: &Value) -> bool {
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if object
@@ -1847,6 +1878,7 @@ fn validate_unique_local_anchors(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -1955,6 +1987,7 @@ fn validate_unique_local_resource_ids(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -2045,6 +2078,83 @@ fn validate_schema_type(value: &Value, path: &str) -> Result<(), SchemaAdmission
             "type must contain only JSON Schema primitive type names",
         )),
     }
+}
+
+// The default 2020-12 meta-schema reserves the deprecated `dependencies`
+// keyword with both of its original alternatives: a schema or a unique list
+// of property names. A list is an assertion payload, never a schema subtree.
+fn validate_dependencies_keyword(
+    object: &serde_json::Map<String, Value>,
+    path: &str,
+) -> Result<(), SchemaAdmissionError> {
+    let Some(value) = object.get("dependencies") else {
+        return Ok(());
+    };
+    let keyword_path = format!("{path}.dependencies");
+    let dependencies = value.as_object().ok_or_else(|| {
+        SchemaAdmissionError::new(&keyword_path, "dependencies must be an object")
+    })?;
+    if dependencies.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+        return Err(SchemaAdmissionError::new(
+            &keyword_path,
+            "dependencies exceeds entry limit",
+        ));
+    }
+    let mut validation_work = dependencies.len();
+    for (trigger, dependency) in dependencies {
+        if trigger.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+            return Err(SchemaAdmissionError::new(
+                &keyword_path,
+                "dependencies property name exceeds byte limit",
+            ));
+        }
+        let Some(members) = dependency.as_array() else {
+            if !dependency.is_object() && !dependency.is_boolean() {
+                return Err(SchemaAdmissionError::new(
+                    diagnostic_child_path(&keyword_path, trigger),
+                    "dependencies values must be schemas or arrays of strings",
+                ));
+            }
+            continue;
+        };
+        if members.len() > MAX_SCHEMA_ASSERTION_ENTRIES {
+            return Err(SchemaAdmissionError::new(
+                &keyword_path,
+                "dependencies property list exceeds entry limit",
+            ));
+        }
+        validation_work = validation_work.checked_add(members.len()).ok_or_else(|| {
+            SchemaAdmissionError::new(&keyword_path, "dependencies exceeds validation work budget")
+        })?;
+        if validation_work >= MAX_SCHEMA_VALIDATION_WORK {
+            return Err(SchemaAdmissionError::new(
+                &keyword_path,
+                "dependencies exceeds validation work budget",
+            ));
+        }
+        let mut seen = HashSet::with_capacity(members.len());
+        for member in members {
+            let Some(member) = member.as_str() else {
+                return Err(SchemaAdmissionError::new(
+                    &keyword_path,
+                    "dependencies property lists must contain bounded strings",
+                ));
+            };
+            if member.len() > MAX_SCHEMA_ASSERTION_STRING_BYTES {
+                return Err(SchemaAdmissionError::new(
+                    &keyword_path,
+                    "dependencies property lists must contain bounded strings",
+                ));
+            }
+            if !seen.insert(member) {
+                return Err(SchemaAdmissionError::new(
+                    &keyword_path,
+                    "dependencies property list entries must be unique",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_string_array_keyword(
@@ -2503,6 +2613,7 @@ fn make_strict_schema(schema: &Value) -> Value {
                 "properties",
                 "patternProperties",
                 "dependentSchemas",
+                "dependencies",
                 "$defs",
                 "definitions",
             ] {
@@ -3235,6 +3346,7 @@ fn find_schema_child_scope<'a>(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -3351,6 +3463,7 @@ fn find_local_schema_resource_child<'a>(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -3664,6 +3777,7 @@ fn find_resource_anchor_inner<'a>(
         "patternProperties",
         "$defs",
         "definitions",
+        "dependencies",
         "dependentSchemas",
     ] {
         if let Some(subschemas) = object.get(keyword).and_then(Value::as_object) {
@@ -4201,22 +4315,30 @@ fn mark_evaluated_object_properties_inner<'a>(
         }
     }
 
-    if let Some(dependent_schemas) = schema.get("dependentSchemas").and_then(Value::as_object) {
-        for (trigger, dependent_schema) in dependent_schemas {
-            if obj.contains_key(trigger)
-                && branch_is_valid(dependent_schema, value, path, context)
-                && let Some(dependent_schema) = dependent_schema.as_object()
-            {
-                mark_evaluated_object_properties(
-                    dependent_schema,
-                    value,
-                    obj,
-                    path,
-                    true,
-                    evaluated,
-                    errors,
-                    context,
-                );
+    for keyword in ["dependentSchemas", "dependencies"] {
+        if let Some(dependent_schemas) = schema.get(keyword).and_then(Value::as_object) {
+            for (trigger, dependent_schema) in dependent_schemas {
+                if !consume_validation_work(context, path, errors) {
+                    return;
+                }
+                // Property-list dependencies do not evaluate any properties.
+                // Only successful, triggered schema alternatives annotate.
+                if !dependent_schema.is_array()
+                    && obj.contains_key(trigger)
+                    && branch_is_valid(dependent_schema, value, path, context)
+                    && let Some(dependent_schema) = dependent_schema.as_object()
+                {
+                    mark_evaluated_object_properties(
+                        dependent_schema,
+                        value,
+                        obj,
+                        path,
+                        true,
+                        evaluated,
+                        errors,
+                        context,
+                    );
+                }
             }
         }
     }
@@ -4327,15 +4449,21 @@ fn validate_dependencies<'a>(
     errors: &mut Vec<ValidationError>,
     context: &mut ValidationContext<'a>,
 ) {
-    if let Some(dependent_required) = schema.get("dependentRequired").and_then(Value::as_object) {
-        for (trigger, required) in dependent_required {
+    for keyword in ["dependentRequired", "dependentSchemas", "dependencies"] {
+        let Some(dependencies) = schema.get(keyword).and_then(Value::as_object) else {
+            continue;
+        };
+        for (trigger, dependency) in dependencies {
             if !consume_validation_work(context, path, errors) {
                 return;
             }
             if !obj.contains_key(trigger) {
                 continue;
             }
-            if let Some(required) = required.as_array() {
+            if let Some(required) = dependency
+                .as_array()
+                .filter(|_| keyword != "dependentSchemas")
+            {
                 for required_property in required {
                     if !consume_validation_work(context, path, errors) {
                         return;
@@ -4345,19 +4473,17 @@ fn validate_dependencies<'a>(
                             push_error(
                                 errors,
                                 &diagnostic_child_path(path, required_property),
-                                "missing dependentRequired property",
+                                if keyword == "dependencies" {
+                                    "missing dependency property"
+                                } else {
+                                    "missing dependentRequired property"
+                                },
                             );
                         }
                     }
                 }
-            }
-        }
-    }
-
-    if let Some(dependent_schemas) = schema.get("dependentSchemas").and_then(Value::as_object) {
-        for (trigger, dependent_schema) in dependent_schemas {
-            if obj.contains_key(trigger) {
-                validate_internal(dependent_schema, value, path, errors, context);
+            } else if keyword != "dependentRequired" {
+                validate_internal(dependency, value, path, errors, context);
             }
         }
     }
@@ -6953,6 +7079,472 @@ mod tests {
             source[keyword] = json!(17);
             assert!(admit_final_schema(source).is_err());
         }
+    }
+
+    #[test]
+    fn admitted_dependencies_property_lists_preserve_default_dialect_semantics() {
+        // The default meta-schema retains the deprecated keyword. These
+        // cases exercise the optional official dependencies-compatibility
+        // corpus semantics without interpreting property lists as schemas:
+        // https://github.com/json-schema-org/JSON-Schema-Test-Suite/blob/main/tests/draft2020-12/optional/dependencies-compatibility.json
+        let source = json!({
+            "dependencies": {
+                "trigger": ["first", "second"],
+                "empty": [],
+                "line\nbreak": ["line\rbreak"],
+                "double\"quote": ["single'quote"]
+            }
+        });
+        for explicit_dialect in [false, true] {
+            let mut source = source.clone();
+            if explicit_dialect {
+                source["$schema"] = json!(FINAL_JSON_SCHEMA_DIALECT);
+            }
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            for value in [
+                json!({}),
+                json!({"first": 1, "second": 2}),
+                json!({"trigger": null, "first": 1, "second": 2}),
+                json!({"empty": null}),
+                json!({"line\nbreak": 1, "line\rbreak": 2}),
+                json!({"double\"quote": 1, "single'quote": 2}),
+                json!(["trigger"]),
+                json!("trigger"),
+                json!(12),
+                Value::Null,
+            ] {
+                assert!(admitted.validate(&value).is_ok(), "{value:?}");
+            }
+            for value in [
+                json!({"trigger": 1}),
+                json!({"trigger": 1, "first": 2}),
+                json!({"trigger": 1, "second": 2}),
+                json!({"line\nbreak": 1}),
+                json!({"double\"quote": 1}),
+            ] {
+                assert!(admitted.validate(&value).is_err(), "{value:?}");
+            }
+            assert_eq!(admitted.schema(), &source);
+        }
+    }
+
+    #[test]
+    fn admitted_dependencies_schema_alternatives_validate_the_containing_object() {
+        let source = json!({
+            "dependencies": {
+                "trigger": {
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"]
+                },
+                "allowed": true,
+                "forbidden": false,
+                "many": {"minProperties": 3}
+            },
+            "dependentRequired": {"trigger": ["other"]},
+            "dependentSchemas": {"trigger": {"properties": {"value": {"minimum": 2}}}}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        for value in [
+            json!({}),
+            json!({"allowed": 1}),
+            json!({"value": "not triggered"}),
+            json!({"trigger": false, "value": 2, "other": null}),
+            json!({"many": 1, "a": 2, "b": 3}),
+            json!(["trigger"]),
+            json!("trigger"),
+            json!(12),
+        ] {
+            assert!(admitted.validate(&value).is_ok(), "{value:?}");
+        }
+        for value in [
+            json!({"forbidden": 1}),
+            json!({"allowed": 1, "forbidden": 2}),
+            json!({"trigger": {"value": 2}, "other": null}),
+            json!({"trigger": false, "value": "2", "other": null}),
+            json!({"trigger": false, "value": 1, "other": null}),
+            json!({"trigger": false, "value": 2}),
+            json!({"many": 1, "a": 2}),
+        ] {
+            assert!(admitted.validate(&value).is_err(), "{value:?}");
+        }
+        assert_eq!(admitted.schema(), &source);
+    }
+
+    #[test]
+    fn admitted_dependencies_only_successful_schemas_evaluate_properties() {
+        let source = json!({
+            "anyOf": [
+                {
+                    "required": ["trigger"],
+                    "properties": {"trigger": true},
+                    "dependencies": {"trigger": {
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"]
+                    }}
+                },
+                {"properties": {"trigger": true}, "required": ["trigger"]}
+            ],
+            "unevaluatedProperties": false
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(
+            admitted
+                .validate(&json!({"trigger": 1, "value": 2}))
+                .is_ok()
+        );
+        assert!(admitted.validate(&json!({"trigger": 1})).is_ok());
+        for value in [
+            json!({"trigger": 1, "value": "2"}),
+            json!({"trigger": 1, "value": 2, "extra": true}),
+            json!({"value": 2}),
+        ] {
+            assert!(admitted.validate(&value).is_err(), "{value:?}");
+        }
+        let lists = admit_final_schema(json!({
+            "properties": {"trigger": true},
+            "dependencies": {"trigger": ["value"]},
+            "unevaluatedProperties": false
+        }))
+        .unwrap();
+        assert!(lists.validate(&json!({})).is_ok());
+        assert!(lists.validate(&json!({"trigger": 1, "value": 2})).is_err());
+        assert_eq!(admitted.schema(), &source);
+    }
+
+    #[test]
+    fn admitted_dependencies_preserve_reference_resource_and_anchor_scopes() {
+        let source = json!({
+            "$id": "https://schemas.example/root",
+            "dependencies": {"trigger": {
+                "$id": "rules/",
+                "$ref": "child#record",
+                "dependencies": {"unused": {
+                    "$id": "child",
+                    "$anchor": "record",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"]
+                }}
+            }}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(
+            admitted
+                .validate(&json!({"trigger": 1, "value": 2}))
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"trigger": 1, "value": "2"}))
+                .is_err()
+        );
+        let mut wrong_scope = source;
+        wrong_scope["dependencies"]["trigger"]["$ref"] = json!("#record");
+        assert_eq!(
+            admit_final_schema(wrong_scope).unwrap_err().reason(),
+            "unresolved local schema reference"
+        );
+
+        for reference in ["#/dependencies/rule", "#integer"] {
+            let admitted = admit_final_schema(json!({
+                "$ref": reference,
+                "dependencies": {"rule": {"$anchor": "integer", "type": "integer"}}
+            }))
+            .unwrap();
+            assert!(admitted.validate(&json!(2)).is_ok());
+            assert!(admitted.validate(&json!("2")).is_err());
+        }
+        let dynamic = admit_final_schema(json!({
+            "$dynamicRef": "#integer",
+            "dependencies": {"rule": {"$dynamicAnchor": "integer", "type": "integer"}}
+        }))
+        .unwrap();
+        assert!(dynamic.validate(&json!(2)).is_ok());
+        assert!(dynamic.validate(&json!("2")).is_err());
+
+        let recursive = admit_final_schema(json!({
+            "type": "object",
+            "properties": {"next": {"$ref": "#"}},
+            "dependencies": {"next": ["value"]}
+        }))
+        .unwrap();
+        assert!(
+            recursive
+                .validate(&json!({"next": {"value": 2}, "value": 1}))
+                .is_ok()
+        );
+        assert!(
+            recursive
+                .validate(&json!({"next": {"next": {}}, "value": 1}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn admitted_dependencies_reject_malformed_lists_schemas_and_authorities() {
+        for dependencies in [
+            Value::Null,
+            json!([]),
+            json!(true),
+            json!({"trigger": 17}),
+            json!({"trigger": "value"}),
+            json!({"trigger": [1]}),
+            json!({"trigger": ["value", "value"]}),
+            json!({"trigger": [{"$id": "https://schemas.example/hidden"}]}),
+            json!({"trigger": {"type": 17}}),
+        ] {
+            assert!(admit_final_schema(json!({"dependencies": dependencies})).is_err());
+        }
+        let invalid_reference = json!({
+            "$ref": "#/dependencies/trigger",
+            "dependencies": {"trigger": ["value"]}
+        });
+        assert_eq!(
+            admit_final_schema(invalid_reference).unwrap_err().reason(),
+            "local schema reference target must be an object or boolean"
+        );
+        for keyword in ["$ref", "$dynamicRef"] {
+            let unresolved = json!({"dependencies": {"unused": {
+                keyword: "https://unregistered.example/schema"
+            }}});
+            assert_eq!(
+                admit_final_schema(unresolved).unwrap_err().reason(),
+                "external schema reference is not allowed"
+            );
+        }
+        for keyword in ["$anchor", "$dynamicAnchor", "$id"] {
+            let (first, second) = if keyword == "$id" {
+                (
+                    "https://schemas.example/first",
+                    "https://schemas.example/second",
+                )
+            } else {
+                ("first", "second")
+            };
+            let source = json!({
+                "$defs": {"modern": {keyword: first}},
+                "dependencies": {"trigger": {keyword: second}}
+            });
+            assert!(admit_final_schema(source.clone()).is_ok());
+            let mut duplicate = source;
+            duplicate["dependencies"]["trigger"][keyword] = json!(first);
+            let error = admit_final_schema(duplicate).unwrap_err();
+            assert_eq!(error.path(), format!("$.dependencies.trigger.{keyword}"));
+            assert!(error.reason().starts_with("duplicate local schema"));
+        }
+    }
+
+    #[test]
+    fn admitted_dependencies_preserve_custom_dialect_and_form_boundaries() {
+        let source = json!({
+            "$id": "https://schemas.example/root",
+            "$schema": "https://schemas.example/meta",
+            "$defs": {"meta": {
+                "$id": "https://schemas.example/meta",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$vocabulary": {CORE_VOCABULARY_URI: true, VALIDATION_VOCABULARY_URI: true}
+            }},
+            "properties": {"value": {
+                "$id": "child",
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "dependencies": {"trigger": ["required"]}
+            }}
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(
+            admitted
+                .validate(&json!({"value": {"trigger": 1, "required": 2}}))
+                .is_ok()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"value": {"trigger": 1}}))
+                .is_err()
+        );
+        let mut inherited = source;
+        inherited["properties"]["value"]
+            .as_object_mut()
+            .unwrap()
+            .remove("$schema");
+        assert_eq!(
+            admit_final_schema(inherited).unwrap_err().path(),
+            "$.properties.value.dependencies"
+        );
+
+        let form = json!({
+            "type": "object",
+            "properties": {"trigger": {"type": "integer"}, "value": {"type": "integer"}},
+            "dependencies": {"trigger": ["value"]}
+        });
+        assert!(admit_final_form_schema(form.clone()).is_ok());
+        for at_root in [true, false] {
+            let mut nested = form.clone();
+            let target = if at_root {
+                &mut nested
+            } else {
+                &mut nested["properties"]["value"]
+            };
+            target["dependencies"] = json!({"trigger": {"required": ["value"]}});
+            assert!(admit_final_schema(nested.clone()).is_ok());
+            assert!(admit_final_form_schema(nested).is_err());
+        }
+    }
+
+    #[test]
+    fn admitted_dependencies_enforce_entry_string_and_aggregate_work_limits() {
+        let members: Vec<Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| json!(format!("field-{index}")))
+            .collect();
+        let source = json!({"dependencies": {"trigger": members}});
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        let mut instance = object_with_null_members(MAX_SCHEMA_ASSERTION_ENTRIES);
+        instance["trigger"] = Value::Null;
+        assert!(admitted.validate(&instance).is_ok());
+        let mut too_many = source;
+        too_many["dependencies"]["trigger"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("extra"));
+        assert_eq!(
+            admit_final_schema(too_many).unwrap_err().reason(),
+            "dependencies property list exceeds entry limit"
+        );
+
+        let entries: serde_json::Map<String, Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| (format!("trigger-{index}"), Value::Bool(true)))
+            .collect();
+        let mut source = json!({"dependencies": entries});
+        assert!(admit_final_schema(source.clone()).is_ok());
+        source["dependencies"]["extra"] = Value::Bool(true);
+        assert_eq!(
+            admit_final_schema(source).unwrap_err().reason(),
+            "dependencies exceeds entry limit"
+        );
+
+        for list_member in [false, true] {
+            let bounded = "x".repeat(MAX_SCHEMA_ASSERTION_STRING_BYTES);
+            let source = if list_member {
+                json!({"dependencies": {"trigger": [bounded]}})
+            } else {
+                json!({"dependencies": {bounded: []}})
+            };
+            assert!(admit_final_schema(source).is_ok());
+            let oversized = "x".repeat(MAX_SCHEMA_ASSERTION_STRING_BYTES + 1);
+            let source = if list_member {
+                json!({"dependencies": {"trigger": [oversized]}})
+            } else {
+                json!({"dependencies": {oversized: []}})
+            };
+            assert!(admit_final_schema(source).is_err());
+        }
+
+        let mut dependencies = serde_json::Map::new();
+        for index in 0..MAX_SCHEMA_ASSERTION_ENTRIES {
+            let count = if index == 0 {
+                MAX_SCHEMA_ASSERTION_ENTRIES - 2
+            } else {
+                MAX_SCHEMA_ASSERTION_ENTRIES - 1
+            };
+            dependencies.insert(
+                format!("trigger-{index}"),
+                Value::Array(
+                    (0..count)
+                        .map(|member| json!(format!("field-{member}")))
+                        .collect(),
+                ),
+            );
+        }
+        let mut source = json!({"dependencies": dependencies});
+        assert!(admit_final_schema(source.clone()).is_ok());
+        source["dependencies"]["trigger-0"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("extra"));
+        assert_eq!(
+            admit_final_schema(source).unwrap_err().reason(),
+            "dependencies exceeds validation work budget"
+        );
+    }
+
+    #[test]
+    fn admitted_dependencies_share_schema_node_and_runtime_work_budgets() {
+        let children: serde_json::Map<String, Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| (format!("child-{index}"), Value::Bool(true)))
+            .collect();
+        let entries: serde_json::Map<String, Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES - 1)
+            .map(|index| {
+                (
+                    format!("trigger-{index}"),
+                    json!({"dependencies": children}),
+                )
+            })
+            .collect();
+        let mut source = json!({"dependencies": entries});
+        assert!(admit_final_schema(source.clone()).is_ok());
+        source["dependencies"]["extra"] = json!({"dependencies": children});
+        assert_eq!(
+            admit_final_schema(source).unwrap_err().reason(),
+            "schema admission node limit exceeded"
+        );
+
+        let members: Vec<Value> = (0..MAX_SCHEMA_ASSERTION_ENTRIES)
+            .map(|index| json!(format!("field-{index}")))
+            .collect();
+        let dependency = json!({"dependencies": {"trigger": members}});
+        let mut instance = object_with_null_members(MAX_SCHEMA_ASSERTION_ENTRIES);
+        instance["trigger"] = Value::Null;
+        let bounded = admit_final_schema(json!({"allOf": vec![dependency.clone(); 16]})).unwrap();
+        assert!(bounded.validate(&instance).is_ok());
+        let excessive =
+            admit_final_schema(json!({"allOf": vec![dependency; MAX_COMPOSITION_BRANCHES]}))
+                .unwrap();
+        let errors = excessive.validate(&instance).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "schema validation work limit exceeded")
+        );
+    }
+
+    #[test]
+    fn dependencies_remain_safe_in_handwritten_generation_and_strict_validation() {
+        let source = json!({
+            "$id": "https://schemas.example/handwritten",
+            "dependencies": {"trigger": {
+                "type": "object",
+                "properties": {"trigger": true, "value": {"type": "integer"}},
+                "required": ["value"]
+            }}
+        });
+        assert_eq!(
+            SchemaGenerator::new().finish(source.clone()).unwrap(),
+            source
+        );
+        assert!(validate_strict(&source, &json!({"trigger": 1, "value": 2})).is_ok());
+        assert!(
+            validate_strict(&source, &json!({"trigger": 1, "value": 2, "extra": true})).is_err()
+        );
+
+        let mut generator = SchemaGenerator::new();
+        assert_eq!(
+            generator.inline_schema(json!({"dependencies": {"trigger": {"$ref": "#"}}})),
+            Value::Bool(false)
+        );
+        assert_eq!(
+            generator.finish(json!({})),
+            Err(SchemaGenerationError::ReferenceResourceBoundary)
+        );
+
+        let mut generator = SchemaGenerator::new();
+        let first = generator.subschema_for::<GeneratedText>();
+        let reused = generator.subschema_for::<GeneratedText>();
+        let root = json!({
+            "properties": {"first": first},
+            "dependencies": {"trigger": {"$id": "https://schemas.example/nested", "allOf": [reused]}}
+        });
+        assert_eq!(
+            generator.finish(root),
+            Err(SchemaGenerationError::ReferenceResourceBoundary)
+        );
     }
 
     #[test]
