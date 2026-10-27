@@ -43902,29 +43902,34 @@ mod live_websocket_bind {
             };
             let task_id = created.task.base().task_id.clone();
 
-            let input_deadline = Instant::now() + HTTP_OPERATION_BOUND;
-            let observed = loop {
-                let observed = websocket_client_bounded(
+            let cancellation = McpRequestCancellation::new();
+            let wait_policy = modern::FinalTaskWaitPolicy::new(
+                HTTP_OPERATION_BOUND,
+                128,
+                Duration::from_millis(10),
+            )
+            .expect("the public WebSocket Task wait policy has finite bounds");
+            let mut handle = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket Tasks attach",
+                client.attach_final_task(&cx, &cancellation, task_id.clone()),
+            )
+            .await
+            .expect("live bind_websocket must attach a retained handle to the created Task");
+            assert_eq!(
+                websocket_client_bounded(
                     &cx,
-                    "live modern WebSocket Tasks tasks/get",
-                    client.get_task(&cx, task_id.clone()),
+                    "live modern WebSocket Tasks wait for input",
+                    client.wait_final_task(&cx, &cancellation, &mut handle, wait_policy),
                 )
                 .await
-                .expect("live bind_websocket must serve tasks/get of the created Task");
-                if matches!(observed.task, FinalTask::InputRequired { .. }) {
-                    break observed;
-                }
-                if Instant::now() >= input_deadline {
-                    panic!(
-                        "live bind_websocket must observe the created input_required Task: {observed:?}"
-                    );
-                }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
-            };
+                .expect("live bind_websocket must observe the created Task's input request"),
+                modern::FinalTaskWaitOutcome::InputRequired,
+            );
             assert_eq!(
-                observed.task.base().task_id,
-                task_id,
-                "tasks/get must return the created Task: {observed:?}"
+                handle.task_id(),
+                &task_id,
+                "the retained handle must identify the created Task",
             );
 
             let missing = FinalTaskId::parse("missing-ws-direct-task")
@@ -43947,55 +43952,61 @@ mod live_websocket_bind {
             let wrong_update: FinalTaskInputResponses =
                 serde_json::from_value(json!({"roots": {"action": "accept"}}))
                     .expect("the planted-wrong Tasks update payload is typed");
+            let input_snapshot = serde_json::to_vec(handle.task())
+                .expect("the retained input-required Task snapshot serializes");
             websocket_client_bounded(
                 &cx,
                 "live modern WebSocket wrong-kind tasks/update",
-                client.update_task(&cx, &observed.task, wrong_update),
+                client.resume_final_task(&cx, &cancellation, &mut handle, wrong_update),
             )
             .await
             .expect_err("changing only the input response kind must not resume the created Task");
+            assert_eq!(
+                serde_json::to_vec(handle.task()).unwrap(),
+                input_snapshot,
+                "a rejected input batch must retain the last admitted Task snapshot",
+            );
             let still_waiting = websocket_client_bounded(
                 &cx,
                 "live modern WebSocket tasks/get after rejected update",
-                client.get_task(&cx, task_id.clone()),
+                client.poll_final_task(&cx, &cancellation, &mut handle),
             )
             .await
             .expect("a rejected tasks/update must leave the created Task in place");
             assert!(
-                matches!(still_waiting.task, FinalTask::InputRequired { .. }),
+                matches!(still_waiting, FinalTask::InputRequired { .. }),
                 "a rejected tasks/update must not leave the input_required Task: {still_waiting:?}"
             );
 
             let responses: FinalTaskInputResponses =
                 serde_json::from_value(json!({"roots": {"roots": []}}))
                     .expect("the public final roots response is typed");
+            let input_snapshot = serde_json::to_vec(handle.task())
+                .expect("the reconciled input-required Task snapshot serializes");
             websocket_client_bounded(
                 &cx,
                 "live modern WebSocket tasks/update",
-                client.update_task(&cx, &observed.task, responses),
+                client.resume_final_task(&cx, &cancellation, &mut handle, responses),
             )
             .await
             .expect("live bind_websocket must serve tasks/update of the created Task");
+            assert_eq!(
+                serde_json::to_vec(handle.task()).unwrap(),
+                input_snapshot,
+                "an empty update acknowledgement must not invent a new retained Task state",
+            );
 
-            let working_deadline = Instant::now() + HTTP_OPERATION_BOUND;
-            loop {
-                let observed = websocket_client_bounded(
-                    &cx,
-                    "live modern WebSocket tasks/get after update",
-                    client.get_task(&cx, task_id.clone()),
-                )
-                .await
-                .expect("live bind_websocket must keep serving tasks/get after update");
-                if matches!(observed.task, FinalTask::Working(_)) {
-                    break;
-                }
-                if Instant::now() >= working_deadline {
-                    panic!(
-                        "live bind_websocket must observe the working Task after a matching update: {observed:?}"
-                    );
-                }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
-            }
+            let working = websocket_client_bounded(
+                &cx,
+                "live modern WebSocket tasks/get after update",
+                client.poll_final_task(&cx, &cancellation, &mut handle),
+            )
+            .await
+            .expect("live bind_websocket must reconcile the acknowledged update");
+            assert!(
+                matches!(working, FinalTask::Working(_)),
+                "the matching input commits working state before its acknowledgement: {working:?}",
+            );
 
             websocket_client_bounded(
                 &cx,
@@ -44005,23 +44016,18 @@ mod live_websocket_bind {
             .await
             .expect("live bind_websocket must serve tasks/cancel of the created Task");
 
-            let cancel_deadline = Instant::now() + HTTP_OPERATION_BOUND;
-            loop {
-                let observed = websocket_client_bounded(
+            assert_eq!(
+                websocket_client_bounded(
                     &cx,
-                    "live modern WebSocket tasks/get after cancel",
-                    client.get_task(&cx, task_id.clone()),
+                    "live modern WebSocket Tasks wait after cancel",
+                    client.wait_final_task(&cx, &cancellation, &mut handle, wait_policy),
                 )
                 .await
-                .expect("live bind_websocket must keep serving tasks/get after cancel");
-                if matches!(observed.task, FinalTask::Cancelled(_)) {
-                    break;
-                }
-                if Instant::now() >= cancel_deadline {
-                    panic!("live bind_websocket must observe the cancelled Task: {observed:?}");
-                }
-                asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
-            }
+                .expect("live bind_websocket must observe the explicitly cancelled Task"),
+                modern::FinalTaskWaitOutcome::Cancelled,
+            );
+            assert!(matches!(handle.task(), FinalTask::Cancelled(_)));
+            assert_eq!(handle.task_id(), &task_id);
 
             websocket_client_bounded(&cx, "live modern WebSocket Tasks close", client.close(&cx))
                 .await

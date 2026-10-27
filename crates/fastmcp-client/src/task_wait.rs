@@ -1,6 +1,6 @@
 //! Caller-owned, bounded observation of an existing final Task.
 //!
-//! Waiting only reads Tasks. Explicit stdio input submission and reconciliation
+//! Waiting only reads Tasks. Explicit input submission and reconciliation
 //! use the same caller-owned request machinery; neither replays uncertain work.
 //! Remote cancellation, reconnects and persistence remain application actions.
 
@@ -9,13 +9,19 @@ use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
+#[cfg(feature = "websocket-experimental")]
+use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::types::Time;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
-use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 #[cfg(unix)]
-use crate::{Client, FinalTaskInputResponses, FinalUpdateTaskResult, TaskInputLedger};
+use crate::Client;
+#[cfg(feature = "websocket-experimental")]
+use crate::WebSocketClient;
+use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 use crate::{FinalTask, FinalTaskHandle, FinalTaskId, HttpClient, HttpClientError};
+#[cfg(any(unix, feature = "websocket-experimental"))]
+use crate::{FinalTaskInputResponses, FinalUpdateTaskResult, TaskInputLedger};
 
 /// Explicit finite limits for one observation of an already-created Task.
 ///
@@ -140,6 +146,26 @@ impl FinalTaskHandle {
         wait_for_task(self, cx, client, cancellation, policy).await
     }
 
+    /// The same bounded observation over the caller-owned WebSocket client.
+    ///
+    /// The existing request owner retires an abandoned response wait without
+    /// cancelling the remote Task or unrelated subscriptions. An interrupted
+    /// partial frame write makes the connection unusable rather than replaying
+    /// the request. This method never reconnects or submits input implicitly.
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn wait_with_websocket<IO>(
+        &mut self,
+        cx: &Cx,
+        client: &mut WebSocketClient<IO>,
+        cancellation: &McpRequestCancellation,
+        policy: FinalTaskWaitPolicy,
+    ) -> McpResult<FinalTaskWaitOutcome>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        wait_for_task(self, cx, client, cancellation, policy).await
+    }
+
     /// Reconciles this handle through one yielding Unix stdio `tasks/get`.
     ///
     /// Use this after an acknowledged input update, which deliberately does
@@ -157,12 +183,43 @@ impl FinalTaskHandle {
         if self.is_terminal() {
             return Ok(&self.task);
         }
-        checkpoint_stdio_input(cx, cancellation)?;
+        checkpoint_task_operation(cx, cancellation)?;
         let result = client
             .get_task_final_with_cx(cx, cancellation, self.task_id().clone())
             .await?;
         admit_identity(self.task(), &result.task)?;
-        checkpoint_stdio_input(cx, cancellation)?;
+        checkpoint_task_operation(cx, cancellation)?;
+        self.task = result.task;
+        Ok(&self.task)
+    }
+
+    /// Reconciles this handle through one cancellation-aware WebSocket read.
+    ///
+    /// Task identity, creation instant and retention must match before the
+    /// retained snapshot changes. A terminal snapshot returns without I/O.
+    /// Cancelling or dropping an in-flight read preserves the last snapshot
+    /// and follows the same request custody as [`Self::wait_with_websocket`].
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn poll_with_websocket<IO>(
+        &mut self,
+        cx: &Cx,
+        client: &mut WebSocketClient<IO>,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<&FinalTask>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        if self.is_terminal() {
+            return Ok(&self.task);
+        }
+        let result = guard_websocket_task_operation(
+            cx,
+            cancellation,
+            client.get_task_final(cx, self.task_id().clone()),
+        )
+        .await?;
+        admit_identity(self.task(), &result.task)?;
+        checkpoint_task_operation(cx, cancellation)?;
         self.task = result.task;
         Ok(&self.task)
     }
@@ -191,6 +248,45 @@ impl FinalTaskHandle {
             .update_task_final_with_cx(cx, cancellation, &self.task, input_responses)
             .await
     }
+
+    /// Submits one explicit input batch over the negotiated WebSocket client.
+    ///
+    /// Phase, response kinds, cancellation and finite retention are admitted
+    /// before allocating a request ID or sending input. An acknowledgement
+    /// leaves the retained snapshot unchanged; explicitly call
+    /// [`Self::poll_with_websocket`] before waiting for the next state.
+    /// Cancellation or dropping this future cannot undo a committed update.
+    /// No uncertain update is replayed: reconcile before deciding to resubmit.
+    #[cfg(feature = "websocket-experimental")]
+    pub async fn resume_input_with_websocket<IO>(
+        &mut self,
+        cx: &Cx,
+        client: &mut WebSocketClient<IO>,
+        cancellation: &McpRequestCancellation,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        checkpoint_task_operation(cx, cancellation)?;
+        admit_task_input(&self.task, &input_responses)?;
+        // Retiring a previous dropped read may await a bounded control write.
+        // Recheck retention before the new update can allocate its ID. The
+        // exclusive client borrow then leaves no other request to settle.
+        guard_websocket_task_operation(
+            cx,
+            cancellation,
+            client.settle_abandoned_websocket_request(),
+        )
+        .await?;
+        admit_input_retention(&self.task)?;
+        guard_websocket_task_operation(
+            cx,
+            cancellation,
+            client.update_task_final(cx, &self.task, input_responses),
+        )
+        .await
+    }
 }
 
 #[cfg(unix)]
@@ -210,8 +306,76 @@ impl Client {
     }
 }
 
-#[cfg(unix)]
-pub(super) fn admit_stdio_task_input(
+#[cfg(feature = "websocket-experimental")]
+impl<IO> WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    /// Attaches an existing Task through one negotiated, cancellable read.
+    ///
+    /// Attachment does not create, replay, persist or automatically resume any
+    /// work. Keep using this client for the returned handle's WebSocket methods.
+    pub async fn attach_final_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTaskHandle> {
+        guard_websocket_task_operation(cx, cancellation, self.get_task_final(cx, task_id))
+            .await
+            .map(|result| FinalTaskHandle::new(result.task))
+    }
+}
+
+/// Cancellation also guards a pending frame send or response read. Dropping
+/// the typed RPC future delegates its exact request to the transport's existing
+/// Drop owner; no separate receive loop, retry or connection owner is created.
+#[cfg(feature = "websocket-experimental")]
+async fn guard_websocket_task_operation<T>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    operation: impl Future<Output = McpResult<T>>,
+) -> McpResult<T> {
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(cancellation.cancelled());
+    // A backpressured send may have no I/O wake before the caller's deadline
+    // or independent Cx cancellation. Request-token wakes alone cannot make
+    // those checkpoints observable, and response timers start only after send.
+    let checkpoint_slice = Duration::from_millis(20);
+    let checkpoint_delay = || {
+        cx.budget().deadline.map_or(checkpoint_slice, |deadline| {
+            checkpoint_slice.min(Duration::from_nanos(deadline.duration_since(cx.now())))
+        })
+    };
+    let mut wake = cx
+        .timer_driver()
+        .map(|_| Box::pin(asupersync::time::sleep(cx.now(), checkpoint_delay())));
+    std::future::poll_fn(|task_cx| {
+        let _current = Cx::set_current(Some(cx.clone()));
+        if let Err(error) = checkpoint_task_operation(cx, cancellation) {
+            return Poll::Ready(Err(error));
+        }
+        if cancelled.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(Err(McpError::request_cancelled()));
+        }
+        let result = operation.as_mut().poll(task_cx);
+        if let Err(error) = checkpoint_task_operation(cx, cancellation) {
+            return Poll::Ready(Err(error));
+        }
+        if result.is_pending()
+            && let Some(wake) = wake.as_mut()
+            && wake.as_mut().poll(task_cx).is_ready()
+        {
+            wake.set(asupersync::time::sleep(cx.now(), checkpoint_delay()));
+            task_cx.waker().wake_by_ref();
+        }
+        result
+    })
+    .await
+}
+
+#[cfg(any(unix, feature = "websocket-experimental"))]
+pub(super) fn admit_task_input(
     task: &FinalTask,
     input_responses: &FinalTaskInputResponses,
 ) -> McpResult<()> {
@@ -230,15 +394,21 @@ pub(super) fn admit_stdio_task_input(
     admit_input_retention(task)
 }
 
-#[cfg(unix)]
-fn checkpoint_stdio_input(cx: &Cx, cancellation: &McpRequestCancellation) -> McpResult<()> {
-    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+#[cfg(any(unix, feature = "websocket-experimental"))]
+fn checkpoint_task_operation(cx: &Cx, cancellation: &McpRequestCancellation) -> McpResult<()> {
+    if cancellation.is_cancel_requested()
+        || cx
+            .budget()
+            .deadline
+            .is_some_and(|deadline| cx.now() >= deadline)
+        || cx.checkpoint().is_err()
+    {
         return Err(McpError::request_cancelled());
     }
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, feature = "websocket-experimental"))]
 pub(super) fn admit_input_retention(task: &FinalTask) -> McpResult<()> {
     if retention_deadline(task)?.is_some_and(|expires| wall_now_nanos() >= expires) {
         return Err(McpError::invalid_request(
@@ -283,6 +453,25 @@ impl TaskWaitTransport for Client {
         task_id: FinalTaskId,
     ) -> McpResult<FinalTask> {
         self.get_task_final_with_cx(cx, cancellation, task_id)
+            .await
+            .map(|result| result.task)
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> TaskWaitTransport for WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Error = McpError;
+
+    async fn read_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTask> {
+        guard_websocket_task_operation(cx, cancellation, self.get_task_final(cx, task_id))
             .await
             .map(|result| result.task)
     }

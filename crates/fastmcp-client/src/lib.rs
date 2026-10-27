@@ -13597,11 +13597,12 @@ impl HttpSubscriptionListener<'_> {
     }
 }
 
-/// A retained final Tasks snapshot attached to one HTTP client on demand.
+/// A retained final Tasks snapshot attached to one negotiated client on demand.
 ///
 /// The handle owns the latest admitted snapshot and preserves the first
-/// terminal outcome. Each operation receives the owning [`HttpClient`] so
-/// every wire request uses that client's sole monotonic JSON-RPC ID allocator.
+/// terminal outcome. Each operation receives the owning HTTP, Unix stdio or
+/// WebSocket client, so every wire request uses that client's sole monotonic
+/// JSON-RPC ID allocator.
 /// This in-process handle does not persist or resume Tasks across a restart.
 #[cfg(feature = "tasks")]
 #[derive(Clone, Debug)]
@@ -27170,7 +27171,7 @@ impl Client {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
-        task_wait::admit_stdio_task_input(task, &input_responses)?;
+        task_wait::admit_task_input(task, &input_responses)?;
         self.send_yielding_final_task_request(
             cx,
             cancellation,
@@ -33719,6 +33720,873 @@ mod tests {
                 client.next_id, next_id,
                 "terminal reuse makes no transport contact"
             );
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    fn websocket_handle_task(status: &str) -> serde_json::Value {
+        let mut task = serde_json::json!({
+            "taskId":"handle-task", "status":status,
+            "createdAt":"2026-07-28T00:00:00Z",
+            "lastUpdatedAt":"2026-07-28T00:00:01Z",
+            "ttlMs":null, "pollIntervalMs":1,
+        });
+        if status == "input_required" {
+            task["inputRequests"] = serde_json::json!({
+                "roots-a":{"method":"roots/list"},
+                "roots-b":{"method":"roots/list"},
+            });
+        }
+        task
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    fn websocket_handle_response(id: i64, mut task: serde_json::Value) -> String {
+        task["resultType"] = serde_json::json!("complete");
+        serde_json::json!({"jsonrpc":"2.0", "id":id, "result":task}).to_string()
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    async fn websocket_handle_client(
+        cx: &Cx,
+        task: serde_json::Value,
+    ) -> (
+        WebSocketClient<asupersync::net::tcp::VirtualTcpStream>,
+        FinalTaskHandle,
+        asupersync::net::tcp::VirtualTcpStream,
+    ) {
+        let (client_io, mut peer_io) = async_websocket_pair();
+        let mut discovery = async_modern_discovery_result();
+        discovery["capabilities"]["extensions"] =
+            serde_json::json!({"io.modelcontextprotocol/tasks":{}});
+        write_server_text_frame(
+            &mut peer_io,
+            &serde_json::json!({"jsonrpc":"2.0","id":1,"result":discovery}).to_string(),
+        )
+        .await;
+        write_server_text_frame(&mut peer_io, &websocket_handle_response(2, task)).await;
+        let mut client = WebSocketClient::connect_with_cx(
+            cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities {
+                roots: Some(Default::default()),
+                ..ClientCapabilities::default()
+            },
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .unwrap();
+        let handle = client
+            .attach_final_task(
+                cx,
+                &McpRequestCancellation::new(),
+                FinalTaskId::parse("handle-task").unwrap(),
+            )
+            .await
+            .unwrap();
+        (client, handle, peer_io)
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    async fn websocket_handle_trace(
+        cx: &Cx,
+        peer_io: asupersync::net::tcp::VirtualTcpStream,
+        expected: &[(&str, Option<i64>)],
+    ) -> Vec<JsonRpcRequest> {
+        let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+        let mut requests = Vec::new();
+        for (method, id) in expected {
+            let JsonRpcMessage::Request(request) = peer.recv(cx).await.unwrap() else {
+                panic!("the client must send only the expected requests and controls");
+            };
+            assert_eq!(request.method.as_str(), *method);
+            assert_eq!(request.id, id.map(RequestId::Number));
+            requests.push(request);
+        }
+        assert!(
+            matches!(peer.recv(cx).await, Err(TransportError::Closed)),
+            "no implicit Task creation, update, cancellation or retry may follow"
+        );
+        requests
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_waits_and_resumes_partial_inputs_with_exact_completion() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            let live = McpRequestCancellation::new();
+            let (mut client, mut handle, mut peer_io) =
+                websocket_handle_client(&cx, websocket_handle_task("working")).await;
+            write_server_text_frame(
+                &mut peer_io,
+                &websocket_handle_response(3, websocket_handle_task("input_required")),
+            )
+            .await;
+            let policy =
+                FinalTaskWaitPolicy::new(Duration::from_secs(1), 4, Duration::from_millis(1))
+                    .unwrap();
+            assert_eq!(
+                handle
+                    .wait_with_websocket(&cx, &mut client, &live, policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::InputRequired
+            );
+            assert_eq!(client.next_id, 4);
+
+            const EXACT_RESULT: &str = r#"{"x-first":1.20e+4,"content":[],"x-zero":-0,"x-last":123456789012345678901234567890}"#;
+            for (key, update_id, poll_id) in [("roots-a", 4, 5), ("roots-b", 6, 7)] {
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                write_server_text_frame(&mut peer_io,
+                    &serde_json::json!({"jsonrpc":"2.0","id":update_id,"result":{"resultType":"complete"}}).to_string(),
+                ).await;
+                handle
+                    .resume_input_with_websocket(
+                        &cx,
+                        &mut client,
+                        &live,
+                        serde_json::from_value(serde_json::json!({key:{"roots":[]}})).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_vec(handle.task()).unwrap(),
+                    before,
+                    "an empty acknowledgement cannot fabricate a new Task state"
+                );
+                assert_eq!(
+                    handle
+                        .wait_with_websocket(&cx, &mut client, &live, policy)
+                        .await
+                        .unwrap(),
+                    FinalTaskWaitOutcome::InputRequired
+                );
+                assert_eq!(client.next_id, u64::try_from(poll_id).unwrap());
+                if key == "roots-a" {
+                    let mut remaining = websocket_handle_task("input_required");
+                    remaining["inputRequests"] =
+                        serde_json::json!({"roots-b":{"method":"roots/list"}});
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_handle_response(poll_id, remaining),
+                    )
+                    .await;
+                } else {
+                    write_server_text_frame(&mut peer_io, &format!(
+                        r#"{{"jsonrpc":"2.0","id":{poll_id},"result":{{"resultType":"complete","taskId":"handle-task","status":"completed","createdAt":"2026-07-28T00:00:00+00:00","lastUpdatedAt":"2026-07-28T00:00:02Z","ttlMs":null,"result":{EXACT_RESULT}}}}}"#,
+                    )).await;
+                }
+                handle
+                    .poll_with_websocket(&cx, &mut client, &live)
+                    .await
+                    .unwrap();
+            }
+            let FinalTask::Completed { result, .. } = handle.task() else {
+                panic!("completed Task");
+            };
+            assert_eq!(result.exact_wire.as_deref(), Some(EXACT_RESULT));
+            let terminal = serde_json::to_vec(handle.task()).unwrap();
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            handle
+                .poll_with_websocket(&cx, &mut client, &cancelled)
+                .await
+                .unwrap();
+            assert_eq!(
+                handle
+                    .wait_with_websocket(&cx, &mut client, &cancelled, policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::Completed
+            );
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), terminal);
+            assert_eq!(
+                client.next_id, 8,
+                "terminal observation consumes no ID or I/O"
+            );
+            write_server_text_frame(
+                &mut peer_io,
+                &serde_json::to_string(&JsonRpcResponse::success(
+                    RequestId::Number(8),
+                    async_modern_tools_list_result(),
+                ))
+                .unwrap(),
+            )
+            .await;
+            client.list_tools(&cx, None).await.unwrap();
+            client.close(&cx).await.unwrap();
+            let sent = websocket_handle_trace(
+                &cx,
+                peer_io,
+                &[
+                    (SERVER_DISCOVER_METHOD, Some(1)),
+                    ("tasks/get", Some(2)),
+                    ("tasks/get", Some(3)),
+                    ("tasks/update", Some(4)),
+                    ("tasks/get", Some(5)),
+                    ("tasks/update", Some(6)),
+                    ("tasks/get", Some(7)),
+                    ("tools/list", Some(8)),
+                ],
+            )
+            .await;
+            for (index, key) in [(3, "roots-a"), (5, "roots-b")] {
+                let parameters = sent[index].params.as_ref().unwrap();
+                assert_eq!(parameters["taskId"], "handle-task");
+                assert_eq!(
+                    parameters["inputResponses"],
+                    serde_json::json!({key:{"roots":[]}})
+                );
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_preflight_rejects_without_spending_ids_or_sending_inputs() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for case in ["wrong-kind", "expired", "wrong-phase", "cancelled"] {
+                let mut initial = websocket_handle_task(if case == "wrong-phase" {
+                    "working"
+                } else {
+                    "input_required"
+                });
+                if case == "expired" {
+                    initial["ttlMs"] = serde_json::json!(1);
+                }
+                let (mut client, mut handle, mut peer_io) =
+                    websocket_handle_client(&cx, initial).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                if case == "cancelled" {
+                    cancellation.cancel();
+                }
+                let responses = if case == "wrong-kind" {
+                    serde_json::json!({"roots-a":{"action":"accept"}})
+                } else {
+                    serde_json::json!({"roots-a":{"roots":[]}})
+                };
+                let error = handle
+                    .resume_input_with_websocket(
+                        &cx,
+                        &mut client,
+                        &cancellation,
+                        serde_json::from_value(responses).unwrap(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    match case {
+                        "expired" => McpErrorCode::InvalidRequest,
+                        "cancelled" => McpErrorCode::RequestCancelled,
+                        _ => McpErrorCode::InvalidParams,
+                    }
+                );
+                let cancelled = McpRequestCancellation::new();
+                cancelled.cancel();
+                assert_eq!(
+                    handle
+                        .poll_with_websocket(&cx, &mut client, &cancelled)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    client
+                        .attach_final_task(&cx, &cancelled, handle.task_id().clone())
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                assert_eq!(
+                    client.next_id, 3,
+                    "all preflight failures preserve the next ID"
+                );
+                assert!(client.transient_request.is_none());
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(3),
+                        async_modern_tools_list_result(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                websocket_handle_trace(
+                    &cx,
+                    peer_io,
+                    &[
+                        (SERVER_DISCOVER_METHOD, Some(1)),
+                        ("tasks/get", Some(2)),
+                        ("tools/list", Some(3)),
+                    ],
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_reconciliation_rejects_rewritten_identity_and_retention() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for field in ["taskId", "createdAt", "ttlMs"] {
+                let initial = websocket_handle_task("working");
+                let (mut client, mut handle, mut peer_io) =
+                    websocket_handle_client(&cx, initial.clone()).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let mut changed = initial;
+                changed[field] = match field {
+                    "taskId" => serde_json::json!("another-task"),
+                    "createdAt" => serde_json::json!("2026-07-28T00:00:01Z"),
+                    _ => serde_json::json!(60_000),
+                };
+                write_server_text_frame(&mut peer_io, &websocket_handle_response(3, changed)).await;
+                assert_eq!(
+                    handle
+                        .poll_with_websocket(&cx, &mut client, &McpRequestCancellation::new())
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidRequest
+                );
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let mut expected = vec![
+                    (SERVER_DISCOVER_METHOD, Some(1)),
+                    ("tasks/get", Some(2)),
+                    ("tasks/get", Some(3)),
+                ];
+                if field == "taskId" {
+                    assert!(
+                        client.closed,
+                        "a foreign-ID response fails the typed decoder closed"
+                    );
+                } else {
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::to_string(&JsonRpcResponse::success(
+                            RequestId::Number(4),
+                            async_modern_tools_list_result(),
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                    client.list_tools(&cx, None).await.unwrap();
+                    expected.push(("tools/list", Some(4)));
+                }
+                client.close(&cx).await.unwrap();
+                websocket_handle_trace(&cx, peer_io, &expected).await;
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_failed_input_requires_explicit_reconciliation_without_replay() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for malformed in [false, true] {
+                let (mut client, mut handle, mut peer_io) =
+                    websocket_handle_client(&cx, websocket_handle_task("input_required")).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let response = if malformed {
+                    serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"resultType":"input_required","inputRequests":{}}})
+                } else {
+                    serde_json::json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"input was refused"}})
+                };
+                write_server_text_frame(&mut peer_io, &response.to_string()).await;
+                let live = McpRequestCancellation::new();
+                let error = handle
+                    .resume_input_with_websocket(
+                        &cx,
+                        &mut client,
+                        &live,
+                        serde_json::from_value(serde_json::json!({"roots-a":{"roots":[]}}))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    error.code,
+                    if malformed {
+                        McpErrorCode::InvalidRequest
+                    } else {
+                        McpErrorCode::InvalidParams
+                    }
+                );
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                assert_eq!(client.next_id, 4, "a failed update is sent once");
+                write_server_text_frame(
+                    &mut peer_io,
+                    &websocket_handle_response(4, websocket_handle_task("working")),
+                )
+                .await;
+                handle
+                    .poll_with_websocket(&cx, &mut client, &live)
+                    .await
+                    .unwrap();
+                assert!(matches!(handle.task(), FinalTask::Working(_)));
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(5),
+                        async_modern_tools_list_result(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                websocket_handle_trace(
+                    &cx,
+                    peer_io,
+                    &[
+                        (SERVER_DISCOVER_METHOD, Some(1)),
+                        ("tasks/get", Some(2)),
+                        ("tasks/update", Some(3)),
+                        ("tasks/get", Some(4)),
+                        ("tools/list", Some(5)),
+                    ],
+                )
+                .await;
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_cancelled_or_dropped_operations_preserve_catalog_and_sibling() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for operation in ["attach", "poll", "input"] {
+                for abandon in [false, true] {
+                    let initial = websocket_handle_task("input_required");
+                    let (mut client, mut handle, mut peer_io) =
+                        websocket_handle_client(&cx, initial.clone()).await;
+                    let before = serde_json::to_vec(handle.task()).unwrap();
+                    client
+                        .open_subscriptions_listener(&cx, websocket_catalog_test_filter())
+                        .await
+                        .unwrap();
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_subscription_test_ack(
+                            3,
+                            serde_json::json!({"toolsListChanged":true}),
+                        ),
+                    )
+                    .await;
+                    let cancellation = McpRequestCancellation::new();
+                    {
+                        let mut request = Box::pin(async {
+                            match operation {
+                                "attach" => client
+                                    .attach_final_task(
+                                        &cx,
+                                        &cancellation,
+                                        FinalTaskId::parse("handle-task").unwrap(),
+                                    )
+                                    .await
+                                    .map(|_| ()),
+                                "poll" => handle
+                                    .poll_with_websocket(&cx, &mut client, &cancellation)
+                                    .await
+                                    .map(|_| ()),
+                                _ => handle
+                                    .resume_input_with_websocket(
+                                        &cx,
+                                        &mut client,
+                                        &cancellation,
+                                        serde_json::from_value(
+                                            serde_json::json!({"roots-a":{"roots":[]}}),
+                                        )
+                                        .unwrap(),
+                                    )
+                                    .await
+                                    .map(|_| ()),
+                            }
+                        });
+                        assert!(
+                            std::future::poll_fn(|task_cx| Poll::Ready(
+                                request.as_mut().poll(task_cx)
+                            ))
+                            .await
+                            .is_pending(),
+                            "the request must commit and wait for the silent peer"
+                        );
+                        if !abandon {
+                            cancellation.cancel();
+                            assert_eq!(
+                                request.await.unwrap_err().code,
+                                McpErrorCode::RequestCancelled
+                            );
+                        }
+                    }
+                    assert_eq!(client.next_id, 5);
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                    assert!(!client.closed);
+                    assert!(client.live_catalog_subscription.is_some());
+                    let late = if operation == "input" {
+                        serde_json::json!({"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}).to_string()
+                    } else {
+                        websocket_handle_response(4, initial)
+                    };
+                    write_server_text_frame(&mut peer_io, &late).await;
+                    write_server_text_frame(&mut peer_io,
+                        r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
+                    ).await;
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &serde_json::to_string(&JsonRpcResponse::success(
+                            RequestId::Number(5),
+                            async_modern_tools_list_result(),
+                        ))
+                        .unwrap(),
+                    )
+                    .await;
+                    write_server_text_frame(&mut peer_io,
+                        r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","_meta":{"io.modelcontextprotocol/subscriptionId":3}}}"#,
+                    ).await;
+                    client.list_tools(&cx, None).await.unwrap();
+                    let live = McpRequestCancellation::new();
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &live).await.unwrap(),
+                        StdioSubscriptionEvent::Acknowledged(_)
+                    ));
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &live).await.unwrap(),
+                        StdioSubscriptionEvent::Notification(ServerNotification::ToolsListChanged(
+                            _
+                        ))
+                    ));
+                    assert!(matches!(
+                        client.next_subscription_event(&cx, &live).await.unwrap(),
+                        StdioSubscriptionEvent::Terminal
+                    ));
+                    assert!(client.transient_request.is_none());
+                    assert!(
+                        client.retired_requests.is_empty(),
+                        "the late result is drained only for its retired ID"
+                    );
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                    assert!(cx.checkpoint().is_ok());
+                    client.close(&cx).await.unwrap();
+                    let sent = websocket_handle_trace(
+                        &cx,
+                        peer_io,
+                        &[
+                            (SERVER_DISCOVER_METHOD, Some(1)),
+                            ("tasks/get", Some(2)),
+                            ("subscriptions/listen", Some(3)),
+                            (
+                                if operation == "input" {
+                                    "tasks/update"
+                                } else {
+                                    "tasks/get"
+                                },
+                                Some(4),
+                            ),
+                            ("notifications/cancelled", None),
+                            ("tools/list", Some(5)),
+                        ],
+                    )
+                    .await;
+                    assert_eq!(
+                        sent[4].params.as_ref().unwrap()["requestId"],
+                        4,
+                        "local cancellation belongs to the abandoned RPC, never the Task or live catalog"
+                    );
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_wait_deadline_cancellation_and_drop_retire_only_the_read() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for ending in ["deadline", "cancel", "drop"] {
+                let initial = websocket_handle_task("working");
+                let (mut client, mut handle, peer_io) =
+                    websocket_handle_client(&cx, initial.clone()).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                for method in [SERVER_DISCOVER_METHOD, "tasks/get"] {
+                    let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap() else {
+                        panic!("initial request");
+                    };
+                    assert_eq!(request.method, method);
+                }
+                let cancellation = McpRequestCancellation::new();
+                let policy = FinalTaskWaitPolicy::new(
+                    Duration::from_millis(200),
+                    8,
+                    Duration::from_millis(1),
+                )
+                .unwrap();
+                let mut wait =
+                    Box::pin(handle.wait_with_websocket(&cx, &mut client, &cancellation, policy));
+                let observed = {
+                    let mut next = Box::pin(peer.recv(&cx));
+                    std::future::poll_fn(|task_cx| {
+                        assert!(
+                            wait.as_mut().poll(task_cx).is_pending(),
+                            "the first read must start before the bound"
+                        );
+                        next.as_mut().poll(task_cx)
+                    })
+                    .await
+                    .unwrap()
+                };
+                let JsonRpcMessage::Request(request) = observed else {
+                    panic!("one wait read");
+                };
+                assert_eq!(request.method, "tasks/get");
+                assert_eq!(request.id, Some(RequestId::Number(3)));
+                if ending != "drop" {
+                    if ending == "cancel" {
+                        cancellation.cancel();
+                    }
+                    assert_eq!(
+                        wait.as_mut().await.unwrap(),
+                        if ending == "cancel" {
+                            FinalTaskWaitOutcome::ObservationCancelled
+                        } else {
+                            FinalTaskWaitOutcome::DeadlineElapsed
+                        }
+                    );
+                }
+                drop(wait);
+                assert_eq!(client.next_id, 4);
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let late: serde_json::Value =
+                    serde_json::from_str(&websocket_handle_response(3, initial)).unwrap();
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(3),
+                        late["result"].clone(),
+                    )),
+                )
+                .await
+                .unwrap();
+                peer.send(
+                    &cx,
+                    &JsonRpcMessage::Response(JsonRpcResponse::success(
+                        RequestId::Number(4),
+                        async_modern_tools_list_result(),
+                    )),
+                )
+                .await
+                .unwrap();
+                client.list_tools(&cx, None).await.unwrap();
+                assert!(client.retired_requests.is_empty());
+                client.close(&cx).await.unwrap();
+                for (method, id) in [("notifications/cancelled", None), ("tools/list", Some(4))] {
+                    let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap() else {
+                        panic!("read retirement or sibling");
+                    };
+                    assert_eq!(request.method, method);
+                    assert_eq!(request.id, id.map(RequestId::Number));
+                    if id.is_none() {
+                        assert_eq!(request.params.unwrap()["requestId"], 3);
+                    }
+                }
+                assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_caller_deadline_wakes_backpressured_sends_without_token_cancellation()
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for operation in ["attach", "poll", "input"] {
+                for stalled in [false, true] {
+                    let (client_io, mut peer_io, probe) = probed_async_websocket_pair();
+                    let mut discovery = async_modern_discovery_result();
+                    discovery["capabilities"]["extensions"] =
+                        serde_json::json!({"io.modelcontextprotocol/tasks":{}});
+                    write_server_text_frame(&mut peer_io,
+                        &serde_json::json!({"jsonrpc":"2.0","id":1,"result":discovery}).to_string(),
+                    ).await;
+                    let initial = websocket_handle_task("input_required");
+                    write_server_text_frame(&mut peer_io, &websocket_handle_response(2, initial.clone())).await;
+                    let mut client = WebSocketClient::connect_with_cx(
+                        &healthy,
+                        ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+                        async_websocket_client_info(),
+                        ClientCapabilities { roots: Some(Default::default()), ..ClientCapabilities::default() },
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    ).await.unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let mut handle = client.attach_final_task(
+                        &healthy, &cancellation, FinalTaskId::parse("handle-task").unwrap(),
+                    ).await.unwrap();
+                    let before = serde_json::to_vec(handle.task()).unwrap();
+                    let response = if operation == "input" {
+                        serde_json::json!({"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}}).to_string()
+                    } else { websocket_handle_response(3, initial) };
+                    write_server_text_frame(&mut peer_io, &response).await;
+                    // The paired cases differ only in whether this real frame
+                    // write can progress after accepting its first three bytes.
+                    probe.arm(0x01, 3, !stalled);
+                    let limited = runtime.request_cx_with_budget(
+                        asupersync::Budget::INFINITE.with_deadline(healthy.now() + Duration::from_millis(100)),
+                    );
+                    assert!(limited.timer_driver().is_some());
+                    let started = Instant::now();
+                    let result = asupersync::time::timeout(healthy.now(), Duration::from_secs(2), async {
+                        match operation {
+                            "attach" => client.attach_final_task(
+                                &limited, &cancellation, FinalTaskId::parse("handle-task").unwrap(),
+                            ).await.map(|_| ()),
+                            "poll" => handle.poll_with_websocket(&limited, &mut client, &cancellation).await.map(|_| ()),
+                            _ => handle.resume_input_with_websocket(
+                                &limited, &mut client, &cancellation,
+                                serde_json::from_value(serde_json::json!({"roots-a":{"roots":[]}})).unwrap(),
+                            ).await.map(|_| ()),
+                        }
+                    }).await.expect("the caller deadline must wake the pending send before the watchdog");
+                    assert!(started.elapsed() < Duration::from_secs(1),
+                        "a late watchdog poll must not substitute for the caller-deadline wake");
+                    assert!(!cancellation.is_cancel_requested(), "the request token never wakes this operation");
+                    assert!(healthy.checkpoint().is_ok());
+                    assert!(probe.started.load(Ordering::Acquire));
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                    if stalled {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        assert!(client.reverse_callback_pool.uncertain_writer.load(Ordering::Acquire));
+                        assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                        probe.release();
+                        assert_eq!(client.close(&healthy).await.unwrap_err().message,
+                            "WebSocket request send was dropped before commitment");
+                        assert!(client.closed);
+                        assert!(client.close_settled);
+                        assert!(probe.dropped.load(Ordering::Acquire));
+                        assert_eq!(probe.accepted.lock().unwrap().len(), 3,
+                            "cleanup cannot flush the uncommitted suffix or send another frame");
+                        let next_id = client.next_id;
+                        assert!(client.list_tools(&healthy, None).await.is_err());
+                        assert_eq!(client.next_id, next_id, "uncertain writes cannot be replayed or reused");
+                    } else {
+                        result.unwrap();
+                        client.close(&healthy).await.unwrap();
+                        websocket_handle_trace(&healthy, peer_io, &[
+                            (SERVER_DISCOVER_METHOD, Some(1)), ("tasks/get", Some(2)),
+                            (if operation == "input" { "tasks/update" } else { "tasks/get" }, Some(3)),
+                        ]).await;
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
+    #[test]
+    fn websocket_task_handle_wait_honors_retention_peer_floor_and_poll_limit() {
+        run_test(|| async {
+            let cx = Cx::current().unwrap();
+            for case in ["expired", "peer-floor", "poll-limit"] {
+                let mut initial = websocket_handle_task("working");
+                if case == "expired" {
+                    initial["ttlMs"] = serde_json::json!(1);
+                }
+                if case == "peer-floor" {
+                    initial["pollIntervalMs"] = serde_json::json!(60_000);
+                }
+                let (mut client, mut handle, mut peer_io) =
+                    websocket_handle_client(&cx, initial).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                if case == "poll-limit" {
+                    let mut replacement = websocket_handle_task("working");
+                    replacement["pollIntervalMs"] = serde_json::json!(2);
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_handle_response(3, replacement),
+                    )
+                    .await;
+                    let mut replacement = websocket_handle_task("working");
+                    replacement
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("pollIntervalMs");
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_handle_response(4, replacement),
+                    )
+                    .await;
+                    write_server_text_frame(
+                        &mut peer_io,
+                        &websocket_handle_response(5, websocket_handle_task("working")),
+                    )
+                    .await;
+                }
+                let outcome = handle
+                    .wait_with_websocket(
+                        &cx,
+                        &mut client,
+                        &McpRequestCancellation::new(),
+                        FinalTaskWaitPolicy::new(
+                            Duration::from_millis(100),
+                            3,
+                            Duration::from_millis(3),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    match case {
+                        "expired" => FinalTaskWaitOutcome::TaskExpired,
+                        "peer-floor" => FinalTaskWaitOutcome::DeadlineElapsed,
+                        _ => FinalTaskWaitOutcome::PollLimitReached,
+                    }
+                );
+                let mut expected = vec![(SERVER_DISCOVER_METHOD, Some(1)), ("tasks/get", Some(2))];
+                let sibling_id = if case == "poll-limit" {
+                    expected.extend([
+                        ("tasks/get", Some(3)),
+                        ("tasks/get", Some(4)),
+                        ("tasks/get", Some(5)),
+                    ]);
+                    6
+                } else {
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                    3
+                };
+                assert_eq!(client.next_id, u64::try_from(sibling_id).unwrap());
+                write_server_text_frame(
+                    &mut peer_io,
+                    &serde_json::to_string(&JsonRpcResponse::success(
+                        RequestId::Number(sibling_id),
+                        async_modern_tools_list_result(),
+                    ))
+                    .unwrap(),
+                )
+                .await;
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                expected.push(("tools/list", Some(sibling_id)));
+                websocket_handle_trace(&cx, peer_io, &expected).await;
+            }
         });
     }
 

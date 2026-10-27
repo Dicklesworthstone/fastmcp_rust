@@ -4265,6 +4265,77 @@ pub mod modern {
                 .await
         }
 
+        /// Attaches an existing Task through this modern WebSocket session.
+        /// Attachment is read-only and never repeats the creating operation.
+        #[cfg(feature = "tasks")]
+        pub async fn attach_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalTaskHandle>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .attach_final_task(cx, cancellation, task_id)
+                .await
+        }
+
+        /// Reconciles a retained Task without changing its identity or retention.
+        /// A terminal snapshot is returned without another request.
+        #[cfg(feature = "tasks")]
+        pub async fn poll_final_task<'handle>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &'handle mut FinalTaskHandle,
+        ) -> McpResult<&'handle FinalTask>
+        where
+            IO: Send + 'static,
+        {
+            handle
+                .poll_with_websocket(cx, &mut self.inner, cancellation)
+                .await
+        }
+
+        /// Waits for a terminal Task or input request under a finite local budget.
+        /// Cancelling observation neither cancels the Task nor submits input.
+        #[cfg(feature = "tasks")]
+        pub async fn wait_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &mut FinalTaskHandle,
+            policy: FinalTaskWaitPolicy,
+        ) -> McpResult<FinalTaskWaitOutcome>
+        where
+            IO: Send + 'static,
+        {
+            handle
+                .wait_with_websocket(cx, &mut self.inner, cancellation, policy)
+                .await
+        }
+
+        /// Submits explicit Task input without replaying an uncertain update.
+        /// The acknowledgement preserves the handle's snapshot; use
+        /// [`Self::poll_final_task`] to reconcile before waiting again.
+        #[cfg(feature = "tasks")]
+        pub async fn resume_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &mut FinalTaskHandle,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult>
+        where
+            IO: Send + 'static,
+        {
+            handle
+                .resume_input_with_websocket(cx, &mut self.inner, cancellation, input_responses)
+                .await
+        }
+
         /// Reads one task through the official final Tasks extension.
         #[cfg(feature = "tasks")]
         pub async fn get_task(
@@ -4505,6 +4576,36 @@ pub mod modern {
         ) -> McpResult<FinalTaskWaitOutcome> {
             handle
                 .wait_with_stdio(cx, &mut self.inner, cancellation, policy)
+                .await
+        }
+
+        /// Reconciles a retained Task through one yielding stdio request.
+        /// Rejected reads leave the snapshot intact; terminal data needs no I/O.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn poll_final_task<'handle>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &'handle mut FinalTaskHandle,
+        ) -> McpResult<&'handle FinalTask> {
+            handle
+                .poll_with_stdio(cx, &mut self.inner, cancellation)
+                .await
+        }
+
+        /// Submits explicit Task input through the caller-owned stdio request.
+        /// The acknowledgement preserves the snapshot; reconcile with
+        /// [`Self::poll_final_task`] before waiting for further progress.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn resume_final_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &mut FinalTaskHandle,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult> {
+            handle
+                .resume_input_with_stdio(cx, &mut self.inner, cancellation, input_responses)
                 .await
         }
 
@@ -14085,6 +14186,78 @@ mod tests {
             &Cx,
         ) -> Result<prelude::SseEvent, prelude::ServerHttpEndpointError> =
             prelude::ServerHttpSseResponse::recv_event;
+    }
+
+    #[test]
+    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    fn facade_closes_caller_owned_task_workflow_signatures() {
+        use super::{
+            Cx, FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses,
+            FinalTaskWaitOutcome, FinalTaskWaitPolicy, FinalUpdateTaskResult,
+            McpRequestCancellation, modern,
+        };
+
+        #[cfg(unix)]
+        async fn drive_stdio(
+            client: &mut modern::Client,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task_id: FinalTaskId,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<()> {
+            let mut handle: FinalTaskHandle =
+                client.attach_final_task(cx, cancellation, task_id).await?;
+            let _: FinalTaskWaitOutcome = client
+                .wait_final_task(
+                    cx,
+                    cancellation,
+                    &mut handle,
+                    FinalTaskWaitPolicy::default(),
+                )
+                .await?;
+            let _: FinalUpdateTaskResult = client
+                .resume_final_task(cx, cancellation, &mut handle, input_responses)
+                .await?;
+            let _: &FinalTask = client
+                .poll_final_task(cx, cancellation, &mut handle)
+                .await?;
+            Ok(())
+        }
+
+        #[cfg(feature = "websocket-experimental")]
+        async fn drive_websocket<IO>(
+            client: &mut modern::WebSocketClient<IO>,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task_id: FinalTaskId,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<()>
+        where
+            IO: asupersync::io::AsyncRead + asupersync::io::AsyncWrite + Unpin + Send + 'static,
+        {
+            let mut handle: FinalTaskHandle =
+                client.attach_final_task(cx, cancellation, task_id).await?;
+            let _: FinalTaskWaitOutcome = client
+                .wait_final_task(
+                    cx,
+                    cancellation,
+                    &mut handle,
+                    FinalTaskWaitPolicy::default(),
+                )
+                .await?;
+            let _: FinalUpdateTaskResult = client
+                .resume_final_task(cx, cancellation, &mut handle, input_responses)
+                .await?;
+            let _: &FinalTask = client
+                .poll_final_task(cx, cancellation, &mut handle)
+                .await?;
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        let _ = drive_stdio;
+        #[cfg(feature = "websocket-experimental")]
+        let _ = drive_websocket::<asupersync::net::TcpStream>;
     }
 
     #[test]
