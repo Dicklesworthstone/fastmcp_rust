@@ -12596,6 +12596,25 @@ impl ToolHandler for ProxyToolHandler {
         })
     }
 
+    fn call_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CallToolResult>> {
+        Box::pin(async move {
+            match self
+                .client
+                .call_tool_typed_async(ctx, &self.external_name, arguments)
+                .await
+            {
+                Ok(CoreResult::Legacy(LegacyCoreResult::ToolsCall(result))) => Outcome::Ok(result),
+                Ok(_) => Outcome::Err(unexpected_proxy_result("tools/call")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     fn call_final(
         &self,
         ctx: &McpContext,
@@ -12883,6 +12902,28 @@ impl ResourceHandler for ProxyResourceHandler {
         })
     }
 
+    fn read_legacy_result_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        uri: &'a str,
+        _params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<ReadResourceResult>> {
+        Box::pin(async move {
+            match self
+                .client
+                .read_resource_typed_async(ctx, self.upstream_uri(uri))
+                .await
+            {
+                Ok(CoreResult::Legacy(LegacyCoreResult::ResourcesRead(result))) => {
+                    Outcome::Ok(result)
+                }
+                Ok(_) => Outcome::Err(unexpected_proxy_result("resources/read")),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
     fn declares_final_mrtr(&self) -> bool {
         true
     }
@@ -13050,6 +13091,25 @@ impl PromptHandler for ProxyPromptHandler {
                 .await
             {
                 Ok(messages) => Outcome::Ok(messages),
+                Err(error) => Outcome::Err(error),
+            }
+        })
+    }
+
+    fn get_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        _request_cx: &'a Cx,
+        arguments: HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<GetPromptResult>> {
+        Box::pin(async move {
+            match self
+                .client
+                .get_prompt_typed_async(ctx, &self.external_name, arguments)
+                .await
+            {
+                Ok(CoreResult::Legacy(LegacyCoreResult::PromptsGet(result))) => Outcome::Ok(result),
+                Ok(_) => Outcome::Err(unexpected_proxy_result("prompts/get")),
                 Err(error) => Outcome::Err(error),
             }
         })
@@ -24512,6 +24572,166 @@ IFS= read -r end
             .expect_err("the broad legacy handler surface cannot erase exact open members");
         assert_eq!(error.code, McpErrorCode::InvalidRequest);
         assert!(error.message.contains("open fields"));
+    }
+
+    #[test]
+    fn proxy_legacy_result_hooks_preserve_complete_payloads() {
+        use crate::handler::{ResourceHandler, UriParams};
+        use fastmcp_core::Outcome;
+
+        let cases = [
+            (
+                "tools/call",
+                serde_json::json!({
+                    "content": [
+                        {"type": "text", "text": "tool error", "annotations": {"audience": ["assistant"]}},
+                        {"type": "resource", "resource": {"uri": "file:///details", "text": "details", "com.example/resource": 3}, "com.example/content": 7}
+                    ],
+                    "isError": true,
+                    "_meta": {"com.example/trace": "tool"},
+                    "com.example/result": [1, 2]
+                }),
+            ),
+            (
+                "resources/read",
+                serde_json::json!({
+                    "contents": [
+                        {"uri": "file:///exact", "text": "resource", "com.example/content": {"keep": true}},
+                        {"uri": "file:///image", "blob": "YQ==", "mimeType": "image/png", "_meta": {"com.example/blob": 1}}
+                    ],
+                    "_meta": {"com.example/trace": "resource"},
+                    "com.example/result": "retained"
+                }),
+            ),
+            (
+                "prompts/get",
+                serde_json::json!({
+                    "description": "dynamic upstream description",
+                    "messages": [{"role": "user", "content": {
+                        "type": "text", "text": "prompt", "annotations": {"audience": ["assistant"], "priority": 0.5}, "com.example/content": "retained"
+                    }, "com.example/message": {"keep": true}}],
+                    "_meta": {"com.example/trace": "prompt"},
+                    "com.example/result": false
+                }),
+            ),
+        ];
+
+        for (method, expected) in cases {
+            let result = match method {
+                "tools/call" => {
+                    LegacyCoreResult::ToolsCall(serde_json::from_value(expected.clone()).unwrap())
+                }
+                "resources/read" => LegacyCoreResult::ResourcesRead(
+                    serde_json::from_value(expected.clone()).unwrap(),
+                ),
+                "prompts/get" => {
+                    LegacyCoreResult::PromptsGet(serde_json::from_value(expected.clone()).unwrap())
+                }
+                _ => unreachable!(),
+            };
+            let proxy = ProxyClient::from_backend_with_upstream_binding(
+                TypedToolBackend {
+                    result: CoreResult::Legacy(result),
+                    final_progress: None,
+                },
+                proxy_binding(ProtocolEra::Legacy2024),
+                fastmcp_protocol::PROTOCOL_VERSION,
+            )
+            .expect("matching exact legacy binding");
+            let ctx = McpContext::new(Cx::for_testing(), 503);
+            let outcome = match method {
+                "tools/call" => {
+                    let handler = ProxyToolHandler::new(proxy_test_tool(), proxy);
+                    block_on(handler.call_legacy_result_async_in_request(
+                        &ctx,
+                        ctx.cx(),
+                        serde_json::json!({}),
+                    ))
+                    .map(|value| serde_json::to_value(value).unwrap())
+                }
+                "resources/read" => {
+                    let handler = super::ProxyResourceHandler::new(
+                        Resource {
+                            uri: "file:///exact".to_owned(),
+                            name: "exact-resource".to_owned(),
+                            description: None,
+                            mime_type: None,
+                            icon: None,
+                            version: None,
+                            tags: Vec::new(),
+                        },
+                        proxy,
+                    );
+                    block_on(handler.read_legacy_result_async_with_uri_in_request(
+                        &ctx,
+                        ctx.cx(),
+                        "file:///exact",
+                        &UriParams::new(),
+                    ))
+                    .map(|value| serde_json::to_value(value).unwrap())
+                }
+                "prompts/get" => {
+                    let handler = ProxyPromptHandler::new(
+                        Prompt {
+                            name: "exact-prompt".to_owned(),
+                            description: Some("catalog description".to_owned()),
+                            arguments: Vec::new(),
+                            icon: None,
+                            version: None,
+                            tags: Vec::new(),
+                        },
+                        proxy,
+                    );
+                    block_on(handler.get_legacy_result_async_in_request(
+                        &ctx,
+                        ctx.cx(),
+                        HashMap::new(),
+                    ))
+                    .map(|value| serde_json::to_value(value).unwrap())
+                }
+                _ => unreachable!(),
+            };
+            let Outcome::Ok(actual) = outcome else {
+                panic!("{method} must preserve the complete upstream legacy result: {outcome:?}");
+            };
+            assert_eq!(
+                actual, expected,
+                "{method} must retain every upstream member"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_legacy_result_hooks_reject_modern_substitution() {
+        use fastmcp_core::Outcome;
+
+        let proxy = ProxyClient::from_backend_with_upstream_binding(
+            TypedToolBackend {
+                result: final_tool_result_with_open_members(),
+                final_progress: None,
+            },
+            proxy_binding(ProtocolEra::Modern2026),
+            "2026-07-28",
+        )
+        .expect("matching final upstream binding");
+        let handler = ProxyToolHandler::new(proxy_test_tool(), proxy);
+        let ctx = McpContext::new(Cx::for_testing(), 504);
+
+        let Outcome::Err(error) = block_on(handler.call_legacy_result_async_in_request(
+            &ctx,
+            ctx.cx(),
+            serde_json::json!({}),
+        )) else {
+            panic!("a modern response cannot cross the exact legacy result surface");
+        };
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert!(
+            matches!(
+                block_on(handler.call_final_outcome_async(&ctx, serde_json::json!({}))),
+                Outcome::Ok(FinalToolOutcome::Complete(_))
+            ),
+            "the rejected legacy projection must leave the modern route usable"
+        );
     }
 
     #[derive(Default)]

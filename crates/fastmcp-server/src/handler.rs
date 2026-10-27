@@ -27,17 +27,18 @@ use fastmcp_protocol::common_types::{
 use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
-    AdmittedFinalFormSchema, CacheScope, CacheTtl, CompleteResult, CompletionValues, Content,
-    CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue, FinalCallToolResult,
-    FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
+    AdmittedFinalFormSchema, CacheScope, CacheTtl, CallToolResult, CompleteResult,
+    CompletionValues, Content, CoreResultDiscriminatorPolicy, DecodedResult, ExactJsonValue,
+    FinalCallToolResult, FinalCompletionParams, FinalCompletionReference, FinalCompletionValues,
     FinalEmbeddedCreateMessageParams, FinalEmbeddedElicitationParams,
     FinalEmbeddedFormElicitationParams, FinalEmbeddedInputRequest, FinalEmbeddedRootsListParams,
     FinalEmbeddedUrlElicitationParams, FinalGetPromptResult, FinalProgressNotificationParams,
     FinalPrompt, FinalPromptMessage, FinalReadResourceResult, FinalResource, FinalResourceTemplate,
-    FinalTool, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams,
-    LegacyCompletionReference, LogLevel, LogMessageParams, ProgressMarker, ProgressParams, Prompt,
-    PromptMessage, Resource, ResourceContent, ResourceTemplate, ResultMeta, ResultPeerEra, Tool,
-    ToolAnnotations, decode_peer_result, encode_result, exact_json_from_serde,
+    FinalTool, GetPromptResult, Icon, InputRequiredResult, JsonRpcRequest, LegacyCompletionParams,
+    LegacyCompletionReference, LegacyResourceContent, LogLevel, LogMessageParams, ProgressMarker,
+    ProgressParams, Prompt, PromptMessage, ReadResourceResult, Resource, ResourceContent,
+    ResourceTemplate, ResultMeta, ResultPeerEra, Tool, ToolAnnotations, decode_peer_result,
+    encode_result, exact_json_from_serde,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -1782,6 +1783,39 @@ pub trait ToolHandler: Send + Sync {
         self.call_async(ctx, arguments)
     }
 
+    /// Calls the tool through the exact MCP 2024-11-05 result surface.
+    ///
+    /// The default preserves the existing request-owned application hook and
+    /// converts its content into the legacy wire union. Override this hook to
+    /// return annotations, open metadata or an exact tool-error result without
+    /// projecting them through the narrower application content model. The
+    /// router retains the same cancellation, deadline and panic boundary.
+    fn call_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CallToolResult>> {
+        Box::pin(async move {
+            match self.call_async_in_request(ctx, request_cx, arguments).await {
+                Outcome::Ok(content) => {
+                    match crate::router::legacy_contents_from_handler(content) {
+                        Ok(content) => Outcome::Ok(CallToolResult {
+                            content,
+                            is_error: false,
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        }),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => Outcome::Panicked(payload),
+            }
+        })
+    }
+
     /// Calls the tool's final result hook from a request-owned child.
     ///
     /// Existing final async handlers keep their behavior through the default
@@ -2304,6 +2338,40 @@ pub trait ResourceHandler: Send + Sync {
         self.read_async_with_uri(ctx, uri, params)
     }
 
+    /// Reads the resource through the exact MCP 2024-11-05 result surface.
+    ///
+    /// The default retains URI-template matching and the existing request-owned
+    /// application hook. Exact upstream adapters can override it to preserve
+    /// resource and result metadata plus open members in the returned payload.
+    fn read_legacy_result_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<ReadResourceResult>> {
+        Box::pin(async move {
+            match self
+                .read_async_with_uri_in_request(ctx, request_cx, uri, params)
+                .await
+            {
+                Outcome::Ok(contents) => {
+                    match crate::router::legacy_resource_contents_from_handler(contents) {
+                        Ok(contents) => Outcome::Ok(ReadResourceResult {
+                            contents,
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        }),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => Outcome::Panicked(payload),
+            }
+        })
+    }
+
     /// Reads the resource's final result from a request-owned structured child.
     fn read_final_async_with_uri_in_request<'a>(
         &'a self,
@@ -2561,6 +2629,38 @@ pub trait PromptHandler: Send + Sync {
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.get_async(ctx, arguments)
+    }
+
+    /// Gets the prompt through the exact MCP 2024-11-05 result surface.
+    ///
+    /// Ordinary handlers keep their catalog description and request-owned
+    /// message hook. An exact adapter can instead retain the upstream result's
+    /// description, content annotations, metadata and open members.
+    fn get_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<GetPromptResult>> {
+        Box::pin(async move {
+            let description = self.definition().description;
+            match self.get_async_in_request(ctx, request_cx, arguments).await {
+                Outcome::Ok(messages) => {
+                    match crate::router::legacy_prompt_messages_from_handler(messages) {
+                        Ok(messages) => Outcome::Ok(GetPromptResult {
+                            description,
+                            messages,
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        }),
+                        Err(error) => Outcome::Err(error),
+                    }
+                }
+                Outcome::Err(error) => Outcome::Err(error),
+                Outcome::Cancelled(reason) => Outcome::Cancelled(reason),
+                Outcome::Panicked(payload) => Outcome::Panicked(payload),
+            }
+        })
     }
 
     /// Gets the prompt's final result from a request-owned structured child.
@@ -3285,6 +3385,16 @@ impl ToolHandler for MountedToolHandler {
         self.inner.call_async_in_request(ctx, request_cx, arguments)
     }
 
+    fn call_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CallToolResult>> {
+        self.inner
+            .call_legacy_result_async_in_request(ctx, request_cx, arguments)
+    }
+
     fn call_final(
         &self,
         ctx: &McpContext,
@@ -3429,6 +3539,24 @@ impl MountedResourceHandler {
             }
         }
         contents
+    }
+
+    fn translate_outgoing_legacy_result(
+        &self,
+        mut result: ReadResourceResult,
+    ) -> ReadResourceResult {
+        for content in &mut result.contents {
+            let uri = match content {
+                LegacyResourceContent::Text { uri, .. }
+                | LegacyResourceContent::Blob { uri, .. } => uri,
+            };
+            if let Some(prefix) = &self.mount_prefix {
+                *uri = format!("{prefix}{uri}");
+            } else if *uri == self.source_uri {
+                uri.clone_from(&self.mounted_uri);
+            }
+        }
+        result
     }
 
     fn translate_outgoing_final_uri(&self, uri: AbsoluteUri) -> McpResult<AbsoluteUri> {
@@ -3809,6 +3937,25 @@ impl ResourceHandler for MountedResourceHandler {
         })
     }
 
+    fn read_legacy_result_async_with_uri_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        uri: &'a str,
+        params: &'a UriParams,
+    ) -> BoxFuture<'a, McpOutcome<ReadResourceResult>> {
+        Box::pin(async move {
+            let source_uri = match self.translate_incoming_uri(uri) {
+                Ok(source_uri) => source_uri,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.inner
+                .read_legacy_result_async_with_uri_in_request(ctx, request_cx, &source_uri, params)
+                .await
+                .map(|result| self.translate_outgoing_legacy_result(result))
+        })
+    }
+
     fn read_final_async_with_uri_in_request<'a>(
         &'a self,
         ctx: &'a McpContext,
@@ -4003,6 +4150,16 @@ impl PromptHandler for MountedPromptHandler {
         arguments: std::collections::HashMap<String, String>,
     ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
         self.inner.get_async_in_request(ctx, request_cx, arguments)
+    }
+
+    fn get_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: std::collections::HashMap<String, String>,
+    ) -> BoxFuture<'a, McpOutcome<GetPromptResult>> {
+        self.inner
+            .get_legacy_result_async_in_request(ctx, request_cx, arguments)
     }
 
     fn get_final_async_in_request<'a>(
@@ -6542,6 +6699,331 @@ mod tests {
             Outcome::Ok(messages) => assert!(messages.is_empty()),
             other => panic!("expected Ok, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn legacy_result_defaults_preserve_request_hooks_and_reject_invalid_content() {
+        struct RequestOwnedApplication {
+            invalid_content: bool,
+        }
+
+        impl RequestOwnedApplication {
+            fn content(&self) -> Content {
+                if self.invalid_content {
+                    Content::Audio {
+                        data: "YQ==".to_owned(),
+                        mime_type: "audio/wav".to_owned(),
+                    }
+                } else {
+                    Content::text("request-owned content")
+                }
+            }
+        }
+
+        impl ToolHandler for RequestOwnedApplication {
+            fn definition(&self) -> Tool {
+                StubTool.definition()
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                panic!("the request-owned application hook must be used")
+            }
+
+            fn call_async_in_request<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                request_cx: &'a Cx,
+                args: serde_json::Value,
+            ) -> BoxFuture<'a, McpOutcome<Vec<Content>>> {
+                Box::pin(async move {
+                    assert!(std::ptr::eq(ctx.cx(), request_cx));
+                    assert_eq!(args, serde_json::json!({"query": 7}));
+                    Outcome::Ok(vec![self.content()])
+                })
+            }
+        }
+
+        impl ResourceHandler for RequestOwnedApplication {
+            fn definition(&self) -> Resource {
+                StubResource.definition()
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                panic!("the request-owned application hook must be used")
+            }
+
+            fn read_async_with_uri_in_request<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                request_cx: &'a Cx,
+                uri: &'a str,
+                params: &'a UriParams,
+            ) -> BoxFuture<'a, McpOutcome<Vec<ResourceContent>>> {
+                Box::pin(async move {
+                    assert!(std::ptr::eq(ctx.cx(), request_cx));
+                    assert_eq!(params.get("table").map(String::as_str), Some("users"));
+                    Outcome::Ok(vec![ResourceContent {
+                        uri: uri.to_owned(),
+                        mime_type: None,
+                        text: Some("request-owned resource".to_owned()),
+                        blob: self.invalid_content.then(|| "YQ==".to_owned()),
+                    }])
+                })
+            }
+        }
+
+        impl PromptHandler for RequestOwnedApplication {
+            fn definition(&self) -> Prompt {
+                StubPrompt.definition()
+            }
+
+            fn get(
+                &self,
+                _ctx: &McpContext,
+                _arguments: HashMap<String, String>,
+            ) -> McpResult<Vec<PromptMessage>> {
+                panic!("the request-owned application hook must be used")
+            }
+
+            fn get_async_in_request<'a>(
+                &'a self,
+                ctx: &'a McpContext,
+                request_cx: &'a Cx,
+                arguments: HashMap<String, String>,
+            ) -> BoxFuture<'a, McpOutcome<Vec<PromptMessage>>> {
+                Box::pin(async move {
+                    assert!(std::ptr::eq(ctx.cx(), request_cx));
+                    assert_eq!(arguments.get("name").map(String::as_str), Some("Ada"));
+                    Outcome::Ok(vec![PromptMessage {
+                        role: fastmcp_protocol::Role::User,
+                        content: self.content(),
+                    }])
+                })
+            }
+        }
+
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let params = UriParams::from([("table".to_owned(), "users".to_owned())]);
+        for invalid_content in [false, true] {
+            let handler = RequestOwnedApplication { invalid_content };
+            let tool = fastmcp_core::block_on(handler.call_legacy_result_async_in_request(
+                &ctx,
+                ctx.cx(),
+                serde_json::json!({"query": 7}),
+            ));
+            let resource =
+                fastmcp_core::block_on(handler.read_legacy_result_async_with_uri_in_request(
+                    &ctx,
+                    ctx.cx(),
+                    "db://users",
+                    &params,
+                ));
+            let prompt = fastmcp_core::block_on(handler.get_legacy_result_async_in_request(
+                &ctx,
+                ctx.cx(),
+                HashMap::from([("name".to_owned(), "Ada".to_owned())]),
+            ));
+
+            if invalid_content {
+                assert!(matches!(tool, Outcome::Err(_)), "legacy audio is refused");
+                assert!(
+                    matches!(resource, Outcome::Err(_)),
+                    "text and blob cannot coexist"
+                );
+                assert!(
+                    matches!(prompt, Outcome::Err(_)),
+                    "legacy prompt audio is refused"
+                );
+            } else {
+                let Outcome::Ok(tool) = tool else {
+                    panic!("valid tool content must remain accepted");
+                };
+                assert_eq!(
+                    serde_json::to_value(tool).unwrap(),
+                    serde_json::json!({
+                        "content": [{"type": "text", "text": "request-owned content"}]
+                    })
+                );
+                let Outcome::Ok(resource) = resource else {
+                    panic!("valid resource content must remain accepted");
+                };
+                assert_eq!(
+                    serde_json::to_value(resource).unwrap(),
+                    serde_json::json!({
+                        "contents": [{"uri": "db://users", "text": "request-owned resource"}]
+                    })
+                );
+                let Outcome::Ok(prompt) = prompt else {
+                    panic!("valid prompt content must remain accepted");
+                };
+                assert_eq!(
+                    serde_json::to_value(prompt).unwrap(),
+                    serde_json::json!({
+                        "description": "a stub prompt",
+                        "messages": [{"role": "user", "content": {
+                            "type": "text", "text": "request-owned content"
+                        }}]
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mounted_legacy_results_preserve_open_members_and_resource_namespaces() {
+        #[derive(Clone)]
+        struct ExactLegacyResults {
+            tool: CallToolResult,
+            resource: ReadResourceResult,
+            prompt: GetPromptResult,
+            resource_reads: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for ExactLegacyResults {
+            fn definition(&self) -> Tool {
+                StubTool.definition()
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                panic!("mounted exact results must not use broad content")
+            }
+
+            fn call_legacy_result_async_in_request<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                _request_cx: &'a Cx,
+                _args: serde_json::Value,
+            ) -> BoxFuture<'a, McpOutcome<CallToolResult>> {
+                Box::pin(async move { Outcome::Ok(self.tool.clone()) })
+            }
+        }
+
+        impl ResourceHandler for ExactLegacyResults {
+            fn definition(&self) -> Resource {
+                StubResource.definition()
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                panic!("mounted exact results must not use broad content")
+            }
+
+            fn read_legacy_result_async_with_uri_in_request<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                _request_cx: &'a Cx,
+                uri: &'a str,
+                params: &'a UriParams,
+            ) -> BoxFuture<'a, McpOutcome<ReadResourceResult>> {
+                Box::pin(async move {
+                    self.resource_reads.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(uri, "file:///stub");
+                    assert_eq!(params.get("table").map(String::as_str), Some("users"));
+                    Outcome::Ok(self.resource.clone())
+                })
+            }
+        }
+
+        impl PromptHandler for ExactLegacyResults {
+            fn definition(&self) -> Prompt {
+                StubPrompt.definition()
+            }
+
+            fn get(
+                &self,
+                _ctx: &McpContext,
+                _arguments: HashMap<String, String>,
+            ) -> McpResult<Vec<PromptMessage>> {
+                panic!("mounted exact results must not use broad content")
+            }
+
+            fn get_legacy_result_async_in_request<'a>(
+                &'a self,
+                _ctx: &'a McpContext,
+                _request_cx: &'a Cx,
+                _arguments: HashMap<String, String>,
+            ) -> BoxFuture<'a, McpOutcome<GetPromptResult>> {
+                Box::pin(async move { Outcome::Ok(self.prompt.clone()) })
+            }
+        }
+
+        let tool_wire = serde_json::json!({
+            "content": [{"type": "text", "text": "explanation", "com.example/content": 7}],
+            "isError": true,
+            "_meta": {"com.example/trace": "tool"},
+            "com.example/result": [1, 2]
+        });
+        let resource_wire = serde_json::json!({
+            "contents": [
+                {"uri": "file:///stub", "text": "resource", "com.example/source": {"uri": "leave me"}},
+                {"uri": "file:///attachment", "blob": "YQ==", "_meta": {"com.example/blob": true}}
+            ],
+            "_meta": {"com.example/trace": "resource"},
+            "com.example/result": {"uri": "also leave me"}
+        });
+        let prompt_wire = serde_json::json!({
+            "description": "dynamic upstream description",
+            "messages": [{"role": "user", "content": {
+                "type": "text", "text": "prompt", "annotations": {"audience": ["assistant"]}
+            }, "com.example/message": "retained"}],
+            "_meta": {"com.example/trace": "prompt"},
+            "com.example/result": false
+        });
+        let resource_reads = Arc::new(AtomicUsize::new(0));
+        let exact = ExactLegacyResults {
+            tool: serde_json::from_value(tool_wire.clone()).unwrap(),
+            resource: serde_json::from_value(resource_wire.clone()).unwrap(),
+            prompt: serde_json::from_value(prompt_wire.clone()).unwrap(),
+            resource_reads: resource_reads.clone(),
+        };
+        let tool = MountedToolHandler::new(Box::new(exact.clone()), "ns_stub".to_owned());
+        let resource = MountedResourceHandler::new(
+            Box::new(exact.clone()),
+            "file:///stub".to_owned(),
+            "ns/file:///stub".to_owned(),
+        );
+        let prompt = MountedPromptHandler::new(Box::new(exact), "ns_stub".to_owned());
+        let ctx = McpContext::new(Cx::for_testing(), 1);
+        let params = UriParams::from([("table".to_owned(), "users".to_owned())]);
+
+        let Outcome::Ok(tool_result) = fastmcp_core::block_on(
+            tool.call_legacy_result_async_in_request(&ctx, ctx.cx(), serde_json::json!({})),
+        ) else {
+            panic!("mounted tool must preserve the exact legacy result");
+        };
+        assert_eq!(serde_json::to_value(tool_result).unwrap(), tool_wire);
+        let Outcome::Ok(prompt_result) = fastmcp_core::block_on(
+            prompt.get_legacy_result_async_in_request(&ctx, ctx.cx(), HashMap::new()),
+        ) else {
+            panic!("mounted prompt must preserve the exact legacy result");
+        };
+        assert_eq!(serde_json::to_value(prompt_result).unwrap(), prompt_wire);
+        let Outcome::Ok(resource_result) =
+            fastmcp_core::block_on(resource.read_legacy_result_async_with_uri_in_request(
+                &ctx,
+                ctx.cx(),
+                "ns/file:///stub",
+                &params,
+            ))
+        else {
+            panic!("mounted resource must preserve the exact legacy result");
+        };
+        let mut expected_resource = resource_wire;
+        expected_resource["contents"][0]["uri"] = serde_json::json!("ns/file:///stub");
+        expected_resource["contents"][1]["uri"] = serde_json::json!("ns/file:///attachment");
+        assert_eq!(
+            serde_json::to_value(resource_result).unwrap(),
+            expected_resource
+        );
+        assert!(matches!(
+            fastmcp_core::block_on(resource.read_legacy_result_async_with_uri_in_request(
+                &ctx,
+                ctx.cx(),
+                "different/file:///stub",
+                &params,
+            )),
+            Outcome::Err(_)
+        ));
+        assert_eq!(resource_reads.load(Ordering::SeqCst), 1);
     }
 
     // ── Additional coverage ─────────────────────────────────────────

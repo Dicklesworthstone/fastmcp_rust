@@ -835,6 +835,17 @@ catalog. Stdio writes and individual receive turns retain their synchronous
 I/O limits. Backends without an upstream binding retain their synchronous
 catalog implementation.
 
+Exact-2024 proxy invocations preserve complete upstream `tools/call`,
+`resources/read`, and `prompts/get` results, including content annotations,
+metadata, open fields, tool error content, and the invocation's prompt
+description. Custom handlers can provide these results through
+`ToolHandler::call_legacy_result_async_in_request`,
+`ResourceHandler::read_legacy_result_async_with_uri_in_request`, and
+`PromptHandler::get_legacy_result_async_in_request`. Mounted handlers and tool
+transformations forward these hooks; mounted resources rewrite their known URI
+fields while retaining opaque extension data. Ordinary handlers retain the
+checked conversion from their existing application result types.
+
 Exact-2024 resource subscribe/unsubscribe hooks also have awaited variants:
 `ResourceHandler::on_subscribe_async` and `on_unsubscribe_async`. The live
 dispatcher and mounted resources forward these hooks on the caller runtime.

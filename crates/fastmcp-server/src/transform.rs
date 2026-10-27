@@ -31,7 +31,8 @@ use asupersync::Cx;
 use fastmcp_core::{McpContext, McpOutcome, McpResult, Outcome};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
 use fastmcp_protocol::{
-    CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool, ToolAnnotations,
+    CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, Tool,
+    ToolAnnotations,
 };
 
 use crate::bidirectional::MrtrCompletedInputs;
@@ -383,6 +384,23 @@ impl ToolHandler for TransformedTool {
     ) -> McpResult<CompleteResult<FinalCallToolResult>> {
         self.parent
             .call_final(ctx, self.transform_arguments(arguments)?)
+    }
+
+    fn call_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: serde_json::Value,
+    ) -> BoxFuture<'a, McpOutcome<CallToolResult>> {
+        Box::pin(async move {
+            let transformed_args = match self.transform_arguments(arguments) {
+                Ok(args) => args,
+                Err(error) => return Outcome::Err(error),
+            };
+            self.parent
+                .call_legacy_result_async_in_request(ctx, request_cx, transformed_args)
+                .await
+        })
     }
 
     fn call_final_async<'a>(

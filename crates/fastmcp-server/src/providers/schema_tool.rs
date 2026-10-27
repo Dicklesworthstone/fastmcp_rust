@@ -16,8 +16,8 @@ use fastmcp_core::{McpContext, McpOutcome, McpResult};
 use fastmcp_protocol::common_types::{OpenMetadata, RawIcon};
 use fastmcp_protocol::http_headers::NonSensitiveHeaderExposure;
 use fastmcp_protocol::{
-    CompleteResult, Content, FinalCallToolResult, FinalTool, Icon, SchemaRegistryError,
-    SchemaResourceRegistry, Tool, ToolAnnotations, admit_final_schema,
+    CallToolResult, CompleteResult, Content, FinalCallToolResult, FinalTool, Icon,
+    SchemaRegistryError, SchemaResourceRegistry, Tool, ToolAnnotations, admit_final_schema,
 };
 use serde_json::Value;
 
@@ -247,6 +247,15 @@ impl<H: ToolHandler> ToolHandler for RegisteredSchemaTool<H> {
     ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
         self.handler
             .call_final_async_in_request(ctx, request_cx, arguments)
+    }
+    fn call_legacy_result_async_in_request<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request_cx: &'a Cx,
+        arguments: Value,
+    ) -> BoxFuture<'a, McpOutcome<CallToolResult>> {
+        self.handler
+            .call_legacy_result_async_in_request(ctx, request_cx, arguments)
     }
     fn call_final_outcome(
         &self,

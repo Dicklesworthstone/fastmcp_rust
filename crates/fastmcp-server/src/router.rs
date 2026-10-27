@@ -88,6 +88,19 @@ pub(crate) struct ApplicationToolResult {
     is_error: bool,
 }
 
+/// The application-only adapter retains its closed content API, while exact
+/// legacy wire dispatch must retain the complete upstream response.
+enum LegacyToolDispatchResult {
+    Application(ApplicationToolResult),
+    Exact(CallToolResult),
+}
+
+#[derive(Clone, Copy)]
+enum LegacyToolResultMode {
+    Application,
+    Exact,
+}
+
 /// Allowlisted transport provenance attached to a sanitized inbound request.
 ///
 /// This deliberately contains no peer address, headers, cookies, or
@@ -1588,7 +1601,7 @@ fn legacy_content_from_handler(content: Content) -> McpResult<LegacyContent> {
     }
 }
 
-fn legacy_contents_from_handler(content: Vec<Content>) -> McpResult<Vec<LegacyContent>> {
+pub(crate) fn legacy_contents_from_handler(content: Vec<Content>) -> McpResult<Vec<LegacyContent>> {
     content
         .into_iter()
         .map(legacy_content_from_handler)
@@ -1618,7 +1631,7 @@ fn legacy_resource_content_from_handler(
     }
 }
 
-fn legacy_resource_contents_from_handler(
+pub(crate) fn legacy_resource_contents_from_handler(
     contents: Vec<ResourceContent>,
 ) -> McpResult<Vec<LegacyResourceContent>> {
     contents
@@ -1627,7 +1640,7 @@ fn legacy_resource_contents_from_handler(
         .collect()
 }
 
-fn legacy_prompt_messages_from_handler(
+pub(crate) fn legacy_prompt_messages_from_handler(
     messages: Vec<PromptMessage>,
 ) -> McpResult<Vec<LegacyPromptMessage>> {
     messages
@@ -5617,21 +5630,25 @@ impl Router {
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<CallToolResult> {
         let result = self
-            .handle_application_tools_call_in_request(
+            .dispatch_legacy_tools_call_in_request(
                 request_ctx,
                 request_cx,
                 params,
                 session_state,
                 notification_sender,
                 bidirectional_senders,
+                LegacyToolResultMode::Exact,
             )
             .await?;
-        Ok(CallToolResult {
-            content: legacy_contents_from_handler(result.content)?,
-            is_error: result.is_error,
-            meta: None,
-            additional: BTreeMap::new(),
-        })
+        match result {
+            LegacyToolDispatchResult::Exact(result) => Ok(result),
+            LegacyToolDispatchResult::Application(result) => Ok(CallToolResult {
+                content: legacy_contents_from_handler(result.content)?,
+                is_error: result.is_error,
+                meta: None,
+                additional: BTreeMap::new(),
+            }),
+        }
     }
 
     pub(crate) async fn handle_application_tools_call_in_request(
@@ -5643,6 +5660,35 @@ impl Router {
         notification_sender: Option<&NotificationSender>,
         bidirectional_senders: Option<&BidirectionalSenders>,
     ) -> McpResult<ApplicationToolResult> {
+        match self
+            .dispatch_legacy_tools_call_in_request(
+                request_ctx,
+                request_cx,
+                params,
+                session_state,
+                notification_sender,
+                bidirectional_senders,
+                LegacyToolResultMode::Application,
+            )
+            .await?
+        {
+            LegacyToolDispatchResult::Application(result) => Ok(result),
+            LegacyToolDispatchResult::Exact(_) => Err(McpError::internal_error(
+                "Application tool dispatch returned an exact wire response",
+            )),
+        }
+    }
+
+    async fn dispatch_legacy_tools_call_in_request(
+        &self,
+        request_ctx: &McpContext,
+        request_cx: &Cx,
+        params: CallToolParams,
+        session_state: SessionState,
+        notification_sender: Option<&NotificationSender>,
+        bidirectional_senders: Option<&BidirectionalSenders>,
+        result_mode: LegacyToolResultMode,
+    ) -> McpResult<LegacyToolDispatchResult> {
         debug!(
             target: targets::HANDLER,
             "calling modern tool; tool_key={}; arguments_present={}",
@@ -5709,32 +5755,48 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        let handler_ctx = &ctx;
         let outcome = run_handler_in_request(
             &ctx,
             request_cx,
             effective_budget,
             "tool",
             None,
-            |child_cx| handler.call_async_in_request(&ctx, child_cx, arguments),
+            |child_cx| {
+                Box::pin(async move {
+                    match result_mode {
+                        LegacyToolResultMode::Application => handler
+                            .call_async_in_request(handler_ctx, child_cx, arguments)
+                            .await
+                            .map(|content| {
+                                LegacyToolDispatchResult::Application(ApplicationToolResult {
+                                    content,
+                                    is_error: false,
+                                })
+                            }),
+                        LegacyToolResultMode::Exact => handler
+                            .call_legacy_result_async_in_request(handler_ctx, child_cx, arguments)
+                            .await
+                            .map(LegacyToolDispatchResult::Exact),
+                    }
+                })
+            },
         )
         .await?;
 
         match outcome {
-            Outcome::Ok(content) => Ok(ApplicationToolResult {
-                content,
-                is_error: false,
-            }),
+            Outcome::Ok(result) => Ok(result),
             Outcome::Err(error) => {
                 let error = sanitize_handler_error(request_ctx.cx(), "tool", error);
                 if is_framework_terminal_tool_error(error.code) {
                     return Err(error);
                 }
-                Ok(ApplicationToolResult {
+                Ok(LegacyToolDispatchResult::Application(ApplicationToolResult {
                     content: vec![Content::Text {
                         text: error.message,
                     }],
                     is_error: true,
-                })
+                }))
             }
             Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "tool")),
@@ -6128,7 +6190,7 @@ impl Router {
             "resource",
             None,
             |child_cx| {
-                resolved.handler.read_async_with_uri_in_request(
+                resolved.handler.read_legacy_result_async_with_uri_in_request(
                     &ctx,
                     child_cx,
                     &params.uri,
@@ -6138,22 +6200,14 @@ impl Router {
         )
         .await?;
 
-        let contents = match outcome {
-            Outcome::Ok(contents) => contents,
-            Outcome::Err(error) => {
-                return Err(sanitize_handler_error(request_ctx.cx(), "resource", error));
-            }
-            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
+        match outcome {
+            Outcome::Ok(result) => Ok(result),
+            Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "resource", error)),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
             Outcome::Panicked(_payload) => {
-                return Err(sanitized_handler_panic(request_ctx.cx(), "resource"));
+                Err(sanitized_handler_panic(request_ctx.cx(), "resource"))
             }
-        };
-
-        Ok(ReadResourceResult {
-            contents: legacy_resource_contents_from_handler(contents)?,
-            meta: None,
-            additional: BTreeMap::new(),
-        })
+        }
     }
 
     /// Handles one final MCP 2026-07-28 `resources/read` request.
@@ -6419,8 +6473,6 @@ impl Router {
                 format!("Prompt not found: {}", params.name),
             ));
         }
-        let description = crate::catch_extension_unwind(|| handler.definition().description)
-            .map_err(|_payload| sanitized_handler_panic(request_ctx.cx(), "prompt_definition"))?;
         let progress_marker = params
             .meta
             .as_ref()
@@ -6448,27 +6500,16 @@ impl Router {
             effective_budget,
             "prompt",
             None,
-            |child_cx| handler.get_async_in_request(&ctx, child_cx, arguments),
+            |child_cx| handler.get_legacy_result_async_in_request(&ctx, child_cx, arguments),
         )
         .await?;
 
-        let messages = match outcome {
-            Outcome::Ok(messages) => messages,
-            Outcome::Err(error) => {
-                return Err(sanitize_handler_error(request_ctx.cx(), "prompt", error));
-            }
-            Outcome::Cancelled(_) => return Err(McpError::request_cancelled()),
-            Outcome::Panicked(_payload) => {
-                return Err(sanitized_handler_panic(request_ctx.cx(), "prompt"));
-            }
-        };
-
-        Ok(GetPromptResult {
-            description,
-            messages: legacy_prompt_messages_from_handler(messages)?,
-            meta: None,
-            additional: BTreeMap::new(),
-        })
+        match outcome {
+            Outcome::Ok(result) => Ok(result),
+            Outcome::Err(error) => Err(sanitize_handler_error(request_ctx.cx(), "prompt", error)),
+            Outcome::Cancelled(_) => Err(McpError::request_cancelled()),
+            Outcome::Panicked(_payload) => Err(sanitized_handler_panic(request_ctx.cx(), "prompt")),
+        }
     }
 
     /// Handles one final MCP 2026-07-28 `prompts/get` request.
