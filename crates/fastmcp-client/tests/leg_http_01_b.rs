@@ -966,13 +966,12 @@ async fn open_configured_ready_legacy(
         0,
     )
     .expect("the selected legacy endpoint plan is valid");
-    let client = ClientBuilder::new()
+    let mut connection = ClientBuilder::new()
         .protocol_plan(protocol_plan)
         .request_timeout_policy(timeout)
         .connect_http_with_cx(cx)
         .await
         .expect("the public builder completes exact-2024 initialization");
-    let mut connection = client.into_connection();
     bounded_ready(poll_fn(|_| match connection.take_legacy_notification() {
         Some(notification) => {
             assert_eq!(notification.method, "notifications/resources/list_changed");

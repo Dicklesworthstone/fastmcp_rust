@@ -169,8 +169,6 @@ fn public_https_stream_delivers_before_terminal_and_never_replays_failed_calls()
 
 #[test]
 fn public_https_large_image_result_matches_json_and_sse_and_preserves_tighter_limits() {
-    use base64::Engine;
-
     #[derive(Clone, Copy)]
     enum ImageCase { Json, Sse, TightSse }
     let cases = [ImageCase::Json, ImageCase::Sse, ImageCase::TightSse];
@@ -200,7 +198,9 @@ fn public_https_large_image_result_matches_json_and_sse_and_preserves_tighter_li
 
                 // LIMIT-01 permits one 3 MiB decoded binary block, whose
                 // Base64 string occupies 4 MiB on a single JSON/SSE line.
-                let data = base64::engine::general_purpose::STANDARD.encode(vec![0; 3 * 1024 * 1024]);
+                // The known quantum "AAAA" encodes three zero bytes. A whole
+                // number of quanta needs no padding or fixture-side codec.
+                let data = "AAAA".repeat(1024 * 1024);
                 assert_eq!(data.len(), 4 * 1024 * 1024);
                 let result = json!({
                     "resultType":"complete", "isError":false,
@@ -244,14 +244,13 @@ fn public_https_large_image_result_matches_json_and_sse_and_preserves_tighter_li
                             let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = &outcome else {
                                 panic!("the image must retain its typed tools/call result");
                             };
-                            let [fastmcp_protocol::ContentBlock::Image { data, mime_type, .. }] = result.payload.content.as_slice() else {
+                            let [fastmcp_protocol::common_types::ContentBlock::Image { data, mime_type, .. }] = result.payload.content.as_slice() else {
                                 panic!("the result must contain exactly its original image");
                             };
                             assert_eq!(mime_type, "image/png");
                             assert_eq!(data.len(), 4 * 1024 * 1024);
-                            let decoded = base64::engine::general_purpose::STANDARD.decode(data).unwrap();
-                            assert_eq!(decoded.len(), 3 * 1024 * 1024);
-                            assert!(decoded.iter().all(|byte| *byte == 0));
+                            assert!(data.bytes().all(|byte| byte == b'A'),
+                                "the canonical encoding of all 3 MiB of zero bytes must be preserved");
                             accepted.push(outcome.encode().unwrap());
                         }
                     }
