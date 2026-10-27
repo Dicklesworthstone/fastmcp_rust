@@ -402,15 +402,222 @@ fn terminal_unavailable(terminal: &AtomicU8) -> bool {
     !WebSocketTerminalState::load(terminal).is_open()
 }
 
+/// Keeps the native reader's automatic Pong and Close writes behind the same
+/// irreversible failure boundary as application writes. Native split halves
+/// serialize their own writes, independently of our outer writer lock, and
+/// retain an unfinished frame suffix for the next native writer to flush.
+type ClientWriteContext = Arc<std::sync::Mutex<Option<Arc<Cx>>>>;
+
+struct ClientWriteFence<IO> {
+    io: IO,
+    terminal: Arc<AtomicU8>,
+    active_write: ClientWriteContext,
+}
+
+impl<IO> ClientWriteFence<IO> {
+    fn admit_write(&self) -> std::io::Result<()> {
+        self.admit_terminal_state()?;
+        // This slot contains only an owned context pointer. Its bounded lock
+        // never spans I/O, an await, or checkpoint/evidence callbacks.
+        let active = match self.active_write.lock() {
+            Ok(active) => active.clone(),
+            Err(_) => return Err(self.fail_context()),
+        };
+        if let Some(active) = active
+            && active.checkpoint().is_err()
+        {
+            let current = match self.active_write.lock() {
+                Ok(current) => current,
+                Err(_) => return Err(self.fail_context()),
+            };
+            if current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &active))
+            {
+                // Native cancellation can release its write permit before
+                // its caller receives the error. An already-queued Pong or
+                // Close must observe that owner's cancellation here.
+                self.terminal
+                    .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "WebSocket active write was cancelled",
+                ));
+            }
+        }
+        // A completed owner may have released the slot while its snapshot
+        // was checked. Its later cancellation cannot poison a new owner.
+        self.admit_terminal_state()
+    }
+
+    fn fail_context(&self) -> std::io::Error {
+        self.terminal
+            .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "WebSocket write context is unavailable",
+        )
+    }
+
+    fn admit_terminal_state(&self) -> std::io::Result<()> {
+        match WebSocketTerminalState::load(&self.terminal) {
+            WebSocketTerminalState::Open | WebSocketTerminalState::Closing => Ok(()),
+            WebSocketTerminalState::Closed | WebSocketTerminalState::Failed => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "WebSocket write commitment is terminal",
+                ))
+            }
+        }
+    }
+
+    fn record_result<T>(&self, result: Poll<std::io::Result<T>>) -> Poll<std::io::Result<T>> {
+        if matches!(&result, Poll::Ready(Err(_))) {
+            // This executes inside the native I/O poll, before its write
+            // permit can be released to an already-pending control reply.
+            self.terminal
+                .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+        }
+        result
+    }
+
+    fn record_write(
+        &self,
+        result: Poll<std::io::Result<usize>>,
+        nonempty: bool,
+    ) -> Poll<std::io::Result<usize>> {
+        if nonempty && matches!(&result, Poll::Ready(Ok(0))) {
+            return self.record_result(Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "WebSocket write returned zero",
+            ))));
+        }
+        self.record_result(result)
+    }
+}
+
+impl<IO: AsyncRead + Unpin> AsyncRead for ClientWriteFence<IO> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<IO: AsyncWrite + Unpin> AsyncWrite for ClientWriteFence<IO> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let Err(error) = this.admit_write() {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.io).poll_write(cx, buf);
+        this.record_write(result, !buf.is_empty())
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        if let Err(error) = this.admit_write() {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        this.record_write(result, bufs.iter().any(|buf| !buf.is_empty()))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Err(error) = this.admit_write() {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.io).poll_flush(cx);
+        this.record_result(result)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if let Err(error) = this.admit_write() {
+            return Poll::Ready(Err(error));
+        }
+        let result = Pin::new(&mut this.io).poll_shutdown(cx);
+        this.record_result(result)
+    }
+}
+
 const CLIENT_FAILURE_CLOSE_TIMEOUT_NANOS: u64 = 100_000_000;
 
-/// Publishes an uncertain native data write before dropping its future. The
-/// outer sender still owns the serialized writer, so a queued failure Close
-/// observes `Failed` before it can flush the abandoned frame suffix.
+/// Publishes an uncertain native write before dropping its future. Both the
+/// outer sender and the below-native I/O fence observe `Failed` before the
+/// native write permit can pass to a queued application or control write.
 struct ClientDataSend<F> {
     inner: Pin<Box<F>>,
     terminal: Arc<AtomicU8>,
+    active_write: ClientWriteContext,
+    context: Option<Arc<Cx>>,
     completed: bool,
+}
+
+impl<F> ClientDataSend<F> {
+    fn new(inner: F, cx: &Cx, terminal: &Arc<AtomicU8>, active_write: &ClientWriteContext) -> Self {
+        let context = Arc::new(cx.clone());
+        let admitted = match active_write.lock() {
+            Ok(mut active) if active.is_none() => {
+                *active = Some(Arc::clone(&context));
+                true
+            }
+            Ok(_) | Err(_) => false,
+        };
+        if !admitted {
+            terminal.store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+        }
+        Self {
+            inner: Box::pin(inner),
+            terminal: Arc::clone(terminal),
+            active_write: Arc::clone(active_write),
+            context: admitted.then_some(context),
+            completed: false,
+        }
+    }
+
+    fn release_context(&mut self) -> bool {
+        let Some(context) = self.context.take() else {
+            return false;
+        };
+        let released = match self.active_write.lock() {
+            Ok(mut active)
+                if active
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &context)) =>
+            {
+                let _ = active.take();
+                true
+            }
+            Ok(_) | Err(_) => false,
+        };
+        if !released {
+            self.terminal
+                .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+        }
+        released
+    }
 }
 
 impl<F> Future for ClientDataSend<F>
@@ -421,13 +628,27 @@ where
 
     fn poll(self: Pin<&mut Self>, task_cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
+        if this.context.is_none() {
+            this.completed = true;
+            return Poll::Ready(Err(WsError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "WebSocket write context is unavailable",
+            ))));
+        }
         match this.inner.as_mut().poll(task_cx) {
             Poll::Ready(result) => {
                 if result.is_err() {
                     this.terminal
                         .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
                 }
+                let released = this.release_context();
                 this.completed = true;
+                if !released && result.is_ok() {
+                    return Poll::Ready(Err(WsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "WebSocket write context is unavailable",
+                    ))));
+                }
                 Poll::Ready(result)
             }
             Poll::Pending => Poll::Pending,
@@ -440,6 +661,7 @@ impl<F> Drop for ClientDataSend<F> {
         if !self.completed {
             self.terminal
                 .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+            self.release_context();
         }
     }
 }
@@ -506,8 +728,9 @@ impl<F> Drop for ClientFailureClose<F> {
 /// path can be misreported as an already-successful later close.
 async fn close_split_connection<IO>(
     cx: &Cx,
-    writer: &Arc<Mutex<WebSocketWrite<IO>>>,
+    writer: &Arc<Mutex<WebSocketWrite<ClientWriteFence<IO>>>>,
     terminal: &Arc<AtomicU8>,
+    active_write: &ClientWriteContext,
     reason: CloseReason,
 ) -> Result<(), TransportError>
 where
@@ -527,7 +750,14 @@ where
     }
     terminal.store(WebSocketTerminalState::Closing.as_u8(), Ordering::Release);
 
-    match writer.send(cx, NativeWsMessage::Close(Some(reason))).await {
+    let result = ClientDataSend::new(
+        writer.send(cx, NativeWsMessage::Close(Some(reason))),
+        cx,
+        terminal,
+        active_write,
+    )
+    .await;
+    match result {
         Ok(()) => {
             terminal.store(WebSocketTerminalState::Closed.as_u8(), Ordering::Release);
             Ok(())
@@ -545,8 +775,9 @@ where
 /// application writes even if cancellation interrupts the best-effort reply.
 async fn terminate_split_connection<IO>(
     cx: &Cx,
-    writer: &Arc<Mutex<WebSocketWrite<IO>>>,
+    writer: &Arc<Mutex<WebSocketWrite<ClientWriteFence<IO>>>>,
     terminal: &Arc<AtomicU8>,
+    active_write: &ClientWriteContext,
     deadline: asupersync::types::Time,
     reason: CloseReason,
 ) where
@@ -575,10 +806,14 @@ async fn terminate_split_connection<IO>(
             if cx.now() >= deadline {
                 return Err(TransportError::Timeout);
             }
-            writer
-                .send(cx, NativeWsMessage::Close(Some(reason)))
-                .await
-                .map_err(|error| native_websocket_error(cx, error))
+            ClientDataSend::new(
+                writer.send(cx, NativeWsMessage::Close(Some(reason))),
+                cx,
+                terminal,
+                active_write,
+            )
+            .await
+            .map_err(|error| native_websocket_error(cx, error))
         }),
         terminal: Arc::clone(terminal),
         completed: false,
@@ -597,9 +832,10 @@ async fn terminate_split_connection<IO>(
 }
 
 pub struct AsyncWsClientTransport<IO> {
-    websocket: WebSocket<IO>,
+    websocket: WebSocket<ClientWriteFence<IO>>,
     codec: Codec,
-    terminal: WebSocketTerminalState,
+    terminal: Arc<AtomicU8>,
+    active_write: ClientWriteContext,
 }
 
 impl<IO> AsyncWsClientTransport<IO>
@@ -609,28 +845,46 @@ where
     /// Creates a cancellation-safe client transport from an upgraded owned I/O stream.
     #[must_use]
     pub fn from_upgraded(io: IO) -> Self {
+        Self::from_upgraded_with_entropy(io, Arc::new(asupersync::util::OsEntropy))
+    }
+
+    fn from_upgraded_with_entropy(
+        io: IO,
+        entropy: Arc<dyn asupersync::util::EntropySource>,
+    ) -> Self {
+        let terminal = Arc::new(AtomicU8::new(WebSocketTerminalState::Open.as_u8()));
+        let active_write = Arc::new(std::sync::Mutex::new(None));
         Self {
-            websocket: WebSocket::from_upgraded(io, fastmcp_websocket_config()),
+            websocket: WebSocket::from_upgraded_with_entropy(
+                ClientWriteFence {
+                    io,
+                    terminal: Arc::clone(&terminal),
+                    active_write: Arc::clone(&active_write),
+                },
+                fastmcp_websocket_config(),
+                entropy,
+            ),
             codec: Codec::new(),
-            terminal: WebSocketTerminalState::Open,
+            terminal,
+            active_write,
         }
     }
 
     /// Sends a JSON-RPC message through the owned native WebSocket.
     pub async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        if !self.terminal.is_open() {
+        if terminal_unavailable(&self.terminal) {
             return Err(TransportError::Closed);
         }
         websocket_checkpoint(cx)?;
         let message = encode_native_websocket_message(&mut self.codec, message)?;
-        match self.websocket.send(cx, message).await {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                let close_reason = native_websocket_close_reason(&error);
-                let error = native_websocket_error(cx, error);
-                Err(self.terminate(cx, close_reason, error).await)
-            }
-        }
+        ClientDataSend::new(
+            self.websocket.send(cx, message),
+            cx,
+            &self.terminal,
+            &self.active_write,
+        )
+        .await
+        .map_err(|error| native_websocket_error(cx, error))
     }
 
     /// Receives a JSON-RPC message, interrupting an idle owned-socket read on cancellation.
@@ -650,7 +904,7 @@ where
         &mut self,
         cx: &Cx,
     ) -> Result<ReceivedTransportFrame, TransportError> {
-        if !self.terminal.is_open() {
+        if terminal_unavailable(&self.terminal) {
             return Err(TransportError::Closed);
         }
         websocket_checkpoint(cx)?;
@@ -667,7 +921,7 @@ where
 
     /// Closes the native WebSocket and commits its terminal outcome.
     pub async fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
-        match self.terminal {
+        match WebSocketTerminalState::load(&self.terminal) {
             WebSocketTerminalState::Closed => return Ok(()),
             WebSocketTerminalState::Closing | WebSocketTerminalState::Failed => {
                 return Err(TransportError::Closed);
@@ -675,14 +929,24 @@ where
             WebSocketTerminalState::Open => {}
         }
         websocket_checkpoint(cx)?;
-        self.terminal = WebSocketTerminalState::Closing;
-        match self.websocket.close(cx, CloseReason::normal()).await {
+        self.terminal
+            .store(WebSocketTerminalState::Closing.as_u8(), Ordering::Release);
+        let result = ClientDataSend::new(
+            self.websocket.close(cx, CloseReason::normal()),
+            cx,
+            &self.terminal,
+            &self.active_write,
+        )
+        .await;
+        match result {
             Ok(()) => {
-                self.terminal = WebSocketTerminalState::Closed;
+                self.terminal
+                    .store(WebSocketTerminalState::Closed.as_u8(), Ordering::Release);
                 Ok(())
             }
             Err(error) => {
-                self.terminal = WebSocketTerminalState::Failed;
+                self.terminal
+                    .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
                 Err(native_websocket_error(cx, error))
             }
         }
@@ -694,7 +958,8 @@ where
         message: Option<NativeWsMessage>,
     ) -> Result<ReceivedTransportFrame, TransportError> {
         if matches!(message, Some(NativeWsMessage::Close(_)) | None) {
-            self.terminal = WebSocketTerminalState::Closed;
+            self.terminal
+                .store(WebSocketTerminalState::Closed.as_u8(), Ordering::Release);
             return Err(TransportError::Closed);
         }
 
@@ -718,8 +983,26 @@ where
         close_reason: CloseReason,
         error: TransportError,
     ) -> TransportError {
-        self.terminal = WebSocketTerminalState::Failed;
-        let _ = self.websocket.close(cx, close_reason).await;
+        if self
+            .terminal
+            .compare_exchange(
+                WebSocketTerminalState::Open.as_u8(),
+                WebSocketTerminalState::Closing.as_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _ = ClientDataSend::new(
+                self.websocket.close(cx, close_reason),
+                cx,
+                &self.terminal,
+                &self.active_write,
+            )
+            .await;
+            self.terminal
+                .store(WebSocketTerminalState::Failed.as_u8(), Ordering::Release);
+        }
         error
     }
 
@@ -736,12 +1019,13 @@ where
     pub fn into_split(self) -> (AsyncWsClientRecvHalf<IO>, AsyncWsClientSendHalf<IO>) {
         let (reader, writer) = self.websocket.split();
         let writer = Arc::new(Mutex::with_name("websocket-client-write", writer));
-        let terminal = Arc::new(AtomicU8::new(self.terminal.as_u8()));
+        let terminal = self.terminal;
         (
             AsyncWsClientRecvHalf {
                 reader,
                 writer: Arc::clone(&writer),
                 terminal: Arc::clone(&terminal),
+                active_write: Arc::clone(&self.active_write),
                 pending_error: None,
                 failure_close_deadline: None,
             },
@@ -749,6 +1033,7 @@ where
                 writer,
                 codec: self.codec,
                 terminal,
+                active_write: self.active_write,
             },
         )
     }
@@ -759,9 +1044,10 @@ where
 /// Keep this value with the connection's multiplexer. Its mutable receive API
 /// prevents two independent tasks from consuming and misrouting peer frames.
 pub struct AsyncWsClientRecvHalf<IO> {
-    reader: WebSocketRead<IO>,
-    writer: Arc<Mutex<WebSocketWrite<IO>>>,
+    reader: WebSocketRead<ClientWriteFence<IO>>,
+    writer: Arc<Mutex<WebSocketWrite<ClientWriteFence<IO>>>>,
     terminal: Arc<AtomicU8>,
+    active_write: ClientWriteContext,
     pending_error: Option<TransportError>,
     failure_close_deadline: Option<asupersync::types::Time>,
 }
@@ -834,7 +1120,7 @@ where
         cx: &Cx,
         reason: CloseReason,
     ) -> Result<(), TransportError> {
-        close_split_connection(cx, &self.writer, &self.terminal, reason).await
+        close_split_connection(cx, &self.writer, &self.terminal, &self.active_write, reason).await
     }
 
     async fn terminate(
@@ -848,7 +1134,15 @@ where
             cx.now()
                 .saturating_add_nanos(CLIENT_FAILURE_CLOSE_TIMEOUT_NANOS)
         });
-        terminate_split_connection(cx, &self.writer, &self.terminal, deadline, close_reason).await;
+        terminate_split_connection(
+            cx,
+            &self.writer,
+            &self.terminal,
+            &self.active_write,
+            deadline,
+            close_reason,
+        )
+        .await;
         self.pending_error.take().unwrap_or(TransportError::Closed)
     }
 }
@@ -859,9 +1153,10 @@ where
 /// writes therefore observe cancellation without coupling egress to the one
 /// connection reader.
 pub struct AsyncWsClientSendHalf<IO> {
-    writer: Arc<Mutex<WebSocketWrite<IO>>>,
+    writer: Arc<Mutex<WebSocketWrite<ClientWriteFence<IO>>>>,
     codec: Codec,
     terminal: Arc<AtomicU8>,
+    active_write: ClientWriteContext,
 }
 
 impl<IO> AsyncWsClientSendHalf<IO>
@@ -888,11 +1183,12 @@ where
         // A later Close would flush it before its own frame. Publish failure
         // while the writer is still exclusively owned, including when this
         // future is dropped, and never attempt cleanup after a returned error.
-        let result = ClientDataSend {
-            inner: Box::pin(writer.send(cx, message)),
-            terminal: Arc::clone(&self.terminal),
-            completed: false,
-        }
+        let result = ClientDataSend::new(
+            writer.send(cx, message),
+            cx,
+            &self.terminal,
+            &self.active_write,
+        )
         .await
         .map_err(|error| native_websocket_error(cx, error));
         drop(writer);
@@ -909,7 +1205,7 @@ where
         cx: &Cx,
         reason: CloseReason,
     ) -> Result<(), TransportError> {
-        close_split_connection(cx, &self.writer, &self.terminal, reason).await
+        close_split_connection(cx, &self.writer, &self.terminal, &self.active_write, reason).await
     }
 }
 
@@ -930,17 +1226,22 @@ impl AsyncWsClientTransport<TcpStream> {
             ));
         }
         websocket_checkpoint(cx)?;
-        let url = url.to_owned();
-        let websocket = await_with_caller_cx(cx, move |phase_cx| async move {
-            WebSocket::connect_with_config(&phase_cx, &url, fastmcp_websocket_config()).await
+        let address = websocket_socket_address(&parsed);
+        let config = fastmcp_websocket_config();
+        let timeout = config.connect_timeout;
+        let tcp = await_with_caller_cx(cx, move |_phase_cx| async move {
+            match timeout {
+                Some(timeout) => TcpStream::connect_timeout(address, timeout).await,
+                None => TcpStream::connect(address).await,
+            }
         })
         .await?
-        .map_err(|error| websocket_connect_error(cx, error))?;
-        Ok(Self {
-            websocket,
-            codec: Codec::new(),
-            terminal: WebSocketTerminalState::Open,
-        })
+        .map_err(|error| websocket_connect_error(cx, WsConnectError::Io(error)))?;
+        if config.nodelay {
+            let _ = tcp.set_nodelay(true);
+        }
+        websocket_checkpoint(cx)?;
+        client_upgrade(cx, url, tcp).await
     }
 }
 
@@ -1038,7 +1339,10 @@ where
         .validate_response(&response)
         .map_err(websocket_handshake_error)?;
     websocket_checkpoint(cx)?;
-    Ok(AsyncWsClientTransport::from_upgraded(io))
+    Ok(AsyncWsClientTransport::from_upgraded_with_entropy(
+        io,
+        cx.entropy_handle(),
+    ))
 }
 
 async fn write_all_with_checkpoint<IO>(
@@ -4228,6 +4532,160 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum ClientControlSendOutcome {
+        Dropped,
+        WriteError,
+        WriteZero,
+        FlushError,
+        Committed,
+    }
+
+    /// Arms a one-shot fault only after the peer's native control response is
+    /// already waiting behind an admitted application write. The underlying
+    /// stream becomes writable immediately when the fault is returned.
+    struct ClientControlRaceIo {
+        inner: ClientWriteFaultIo,
+        outcome: ClientControlSendOutcome,
+        fault_armed: Arc<AtomicBool>,
+        read_bytes: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ClientControlRaceIo {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            let before = buf.filled().len();
+            let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+            this.read_bytes
+                .fetch_add(buf.filled().len() - before, Ordering::AcqRel);
+            result
+        }
+    }
+
+    impl AsyncWrite for ClientControlRaceIo {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if matches!(
+                this.outcome,
+                ClientControlSendOutcome::WriteError | ClientControlSendOutcome::WriteZero
+            ) && this.fault_armed.load(Ordering::Acquire)
+                && !this.inner.returned_error.swap(true, Ordering::AcqRel)
+            {
+                this.inner.released.store(true, Ordering::Release);
+                return if matches!(this.outcome, ClientControlSendOutcome::WriteZero) {
+                    Poll::Ready(Ok(0))
+                } else {
+                    Poll::Ready(Err(io::Error::other(
+                        "injected native control-race write failure",
+                    )))
+                };
+            }
+            Pin::new(&mut this.inner).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if matches!(this.outcome, ClientControlSendOutcome::FlushError)
+                && !this
+                    .inner
+                    .output
+                    .lock()
+                    .expect("written native data")
+                    .is_empty()
+                && !this.inner.returned_error.load(Ordering::Acquire)
+            {
+                if !this.fault_armed.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+                this.inner.returned_error.store(true, Ordering::Release);
+                return Poll::Ready(Err(io::Error::other(
+                    "injected native control-race flush failure",
+                )));
+            }
+            Pin::new(&mut this.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    #[derive(Default)]
+    struct ClientControlWake(AtomicUsize);
+
+    impl std::task::Wake for ClientControlWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Re-polls the waiting public receiver directly from native permit
+    /// release, before the outer send future can observe its native result.
+    /// This makes the checkpoint-to-permit-release race deterministic.
+    struct ClientControlInlineWake<F: Future> {
+        future: std::sync::Mutex<Pin<Box<F>>>,
+        result: std::sync::Mutex<Option<F::Output>>,
+        completed: AtomicBool,
+        wakes: AtomicUsize,
+    }
+
+    impl<F> ClientControlInlineWake<F>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        fn new(future: F) -> Self {
+            Self {
+                future: std::sync::Mutex::new(Box::pin(future)),
+                result: std::sync::Mutex::new(None),
+                completed: AtomicBool::new(false),
+                wakes: AtomicUsize::new(0),
+            }
+        }
+
+        fn poll_once(self: &Arc<Self>) {
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            let mut future = self
+                .future
+                .try_lock()
+                .expect("control polling is not recursive");
+            let waker = std::task::Waker::from(Arc::clone(self));
+            if let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+                self.completed.store(true, Ordering::Release);
+                *self.result.lock().expect("completed native receive") = Some(result);
+            }
+        }
+    }
+
+    impl<F> std::task::Wake for ClientControlInlineWake<F>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::AcqRel);
+            self.poll_once();
+        }
+    }
+
     /// Commits a chosen prefix once, then remains pending until the test opens
     /// the gate. Capturing the bytes makes frame splicing observable.
     struct ServerPrefixWriteIo {
@@ -6299,6 +6757,590 @@ mod tests {
     #[test]
     fn async_client_split_queued_failure_close_follows_committed_data() {
         run_test(|| async { assert_client_split_failure_close_after_pending_send(true).await });
+    }
+
+    async fn assert_client_split_native_control_after_pending_send(
+        peer_close: bool,
+        outcome: ClientControlSendOutcome,
+    ) {
+        const RESPONSE: &[u8] = br#"{"jsonrpc":"2.0","id":745,"result":{"native":"still usable"}}"#;
+        let cx = Cx::current().expect("runtime root context");
+        for prefix in [3, 12] {
+            let (client_socket, mut peer) = virtual_socket_pair();
+            let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let released = Arc::new(AtomicBool::new(matches!(
+                outcome,
+                ClientControlSendOutcome::FlushError
+            )));
+            let returned_error = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let fault_armed = Arc::new(AtomicBool::new(false));
+            let read_bytes = Arc::new(AtomicUsize::new(0));
+            let client = AsyncWsClientTransport::from_upgraded(ClientControlRaceIo {
+                inner: ClientWriteFaultIo {
+                    inner: client_socket,
+                    prefix,
+                    fail_after_prefix: false,
+                    released: Arc::clone(&released),
+                    returned_error: Arc::clone(&returned_error),
+                    output: Arc::clone(&output),
+                    dropped: Arc::clone(&dropped),
+                },
+                outcome,
+                fault_armed: Arc::clone(&fault_armed),
+                read_bytes: Arc::clone(&read_bytes),
+            });
+            let (mut receiver, mut sender) = client.into_split();
+            let terminal = Arc::clone(&receiver.terminal);
+            let writer = Arc::clone(&sender.writer);
+            let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+                RequestId::Number(745),
+                serde_json::json!({"roots": [{"uri": "file:///private", "name": "host data"}]}),
+            ));
+            let mut send = Box::pin(sender.send(&cx, &message));
+            std::future::poll_fn(|task_cx| {
+                assert!(send.as_mut().poll(task_cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            let before_control = output.lock().expect("accepted native bytes").clone();
+            if matches!(outcome, ClientControlSendOutcome::FlushError) {
+                assert!(
+                    before_control.len() > prefix,
+                    "the entire data frame awaits flush"
+                );
+            } else {
+                assert_eq!(before_control.len(), prefix);
+            }
+
+            let control = if peer_close {
+                Frame::close(Some(u16::from(CloseCode::Normal)), None)
+            } else {
+                Frame::ping(Bytes::from_static(b"native-fence"))
+            };
+            let mut control_bytes = BytesMut::new();
+            FrameCodec::server()
+                .encode(control, &mut control_bytes)
+                .expect("encode native peer control");
+            peer.write_all(&control_bytes)
+                .await
+                .expect("peer triggers its native control reply");
+            let control_wake = Arc::new(ClientControlWake::default());
+            let waker = std::task::Waker::from(Arc::clone(&control_wake));
+            let mut receive = Box::pin(receiver.recv_with_source(&cx));
+            assert!(
+                receive
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(read_bytes.load(Ordering::Acquire), control_bytes.len());
+            assert_eq!(
+                writer.waiters(),
+                0,
+                "native controls bypass the outer writer lock"
+            );
+            assert_eq!(control_wake.0.load(Ordering::Acquire), 0);
+            assert_eq!(
+                *output.lock().expect("control is not yet writable"),
+                before_control
+            );
+
+            if matches!(outcome, ClientControlSendOutcome::Dropped) {
+                drop(send);
+                released.store(true, Ordering::Release);
+            } else {
+                if matches!(outcome, ClientControlSendOutcome::Committed) {
+                    released.store(true, Ordering::Release);
+                } else {
+                    fault_armed.store(true, Ordering::Release);
+                }
+                let result =
+                    asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(2), send)
+                        .await
+                        .expect("the admitted write reaches its chosen outcome");
+                match outcome {
+                    ClientControlSendOutcome::Committed => result.expect("healthy data commits"),
+                    ClientControlSendOutcome::WriteError => assert!(matches!(
+                        result,
+                        Err(TransportError::Io(ref error))
+                            if error.kind() == io::ErrorKind::Other
+                                && error.to_string() == "injected native control-race write failure"
+                    )),
+                    ClientControlSendOutcome::WriteZero => assert!(matches!(
+                        result,
+                        Err(TransportError::Io(ref error)) if error.kind() == io::ErrorKind::WriteZero
+                    )),
+                    ClientControlSendOutcome::FlushError => assert!(matches!(
+                        result,
+                        Err(TransportError::Io(ref error))
+                            if error.kind() == io::ErrorKind::Other
+                                && error.to_string() == "injected native control-race flush failure"
+                    )),
+                    ClientControlSendOutcome::Dropped => unreachable!("handled above"),
+                }
+            }
+            assert!(
+                control_wake.0.load(Ordering::Acquire) > 0,
+                "releasing the native write permit wakes the already-queued control reply",
+            );
+            assert!(
+                released.load(Ordering::Acquire),
+                "raw I/O is writable again"
+            );
+            let committed = matches!(outcome, ClientControlSendOutcome::Committed);
+            assert_eq!(
+                returned_error.load(Ordering::Acquire),
+                matches!(
+                    outcome,
+                    ClientControlSendOutcome::WriteError
+                        | ClientControlSendOutcome::WriteZero
+                        | ClientControlSendOutcome::FlushError
+                ),
+            );
+            if !committed {
+                assert_eq!(
+                    WebSocketTerminalState::load(&terminal),
+                    WebSocketTerminalState::Failed
+                );
+            }
+
+            if !peer_close {
+                let mut response = BytesMut::new();
+                FrameCodec::server()
+                    .encode(Frame::text(Bytes::from_static(RESPONSE)), &mut response)
+                    .expect("encode response after native Ping");
+                peer.write_all(&response)
+                    .await
+                    .expect("peer completes the pending receive");
+            }
+            let result =
+                asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(2), receive)
+                    .await
+                    .expect("the already-pending native control write settles");
+            if committed {
+                if peer_close {
+                    assert!(matches!(result, Err(TransportError::Closed)));
+                } else {
+                    assert_eq!(
+                        result.expect("healthy Ping preserves ingress").source(),
+                        RESPONSE
+                    );
+                }
+                sender
+                    .close(&cx)
+                    .await
+                    .expect("healthy Close commits or was already echoed");
+                receiver
+                    .close(&cx)
+                    .await
+                    .expect("healthy close remains idempotent");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(TransportError::Io(ref error)) if error.kind() == io::ErrorKind::BrokenPipe
+                ));
+                assert!(matches!(
+                    sender.send(&cx, &message).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(matches!(
+                    sender.close(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(matches!(
+                    receiver.close(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert!(matches!(
+                    receiver.recv_with_source(&cx).await,
+                    Err(TransportError::Closed)
+                ));
+                assert_eq!(
+                    *output
+                        .lock()
+                        .expect("no suffix, Pong, or Close after failure"),
+                    before_control,
+                );
+            }
+            drop(writer);
+            drop(sender);
+            drop(receiver);
+            assert!(
+                dropped.load(Ordering::Acquire),
+                "both halves release the owned socket"
+            );
+            let mut wire = Vec::new();
+            asupersync::time::timeout(
+                cx.now(),
+                std::time::Duration::from_secs(2),
+                peer.read_to_end(&mut wire),
+            )
+            .await
+            .expect("owned socket retirement reaches peer EOF")
+            .expect("read the actual native wire");
+            assert_eq!(wire, *output.lock().expect("captured native wire"));
+            if committed {
+                let mut bytes = BytesMut::from(wire.as_slice());
+                let mut codec = FrameCodec::server();
+                let data = codec
+                    .decode(&mut bytes)
+                    .unwrap()
+                    .expect("complete data frame");
+                assert_eq!(data.opcode, Opcode::Text);
+                let received = Codec::new().decode_complete_message(&data.payload).unwrap();
+                assert_eq!(
+                    serde_json::to_value(received).unwrap(),
+                    serde_json::to_value(&message).unwrap()
+                );
+                let reply = codec
+                    .decode(&mut bytes)
+                    .unwrap()
+                    .expect("native control reply");
+                if peer_close {
+                    assert_eq!(reply.opcode, Opcode::Close);
+                    assert_eq!(
+                        reply.payload.as_ref(),
+                        u16::from(CloseCode::Normal).to_be_bytes()
+                    );
+                } else {
+                    assert_eq!(reply.opcode, Opcode::Pong);
+                    assert_eq!(reply.payload.as_ref(), b"native-fence");
+                    assert_eq!(
+                        codec
+                            .decode(&mut bytes)
+                            .unwrap()
+                            .expect("one normal Close")
+                            .opcode,
+                        Opcode::Close
+                    );
+                }
+                assert!(bytes.is_empty(), "no duplicate native control reply");
+            } else {
+                assert_eq!(wire, before_control);
+            }
+        }
+    }
+
+    #[test]
+    fn async_client_split_native_ping_cannot_resume_dropped_data() {
+        run_test(|| async {
+            assert_client_split_native_control_after_pending_send(
+                false,
+                ClientControlSendOutcome::Dropped,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn async_client_split_native_peer_close_cannot_resume_dropped_data() {
+        run_test(|| async {
+            assert_client_split_native_control_after_pending_send(
+                true,
+                ClientControlSendOutcome::Dropped,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn async_client_split_native_ping_cannot_resume_failed_data() {
+        run_test(|| async {
+            for outcome in [
+                ClientControlSendOutcome::WriteError,
+                ClientControlSendOutcome::WriteZero,
+                ClientControlSendOutcome::FlushError,
+            ] {
+                assert_client_split_native_control_after_pending_send(false, outcome).await;
+            }
+        });
+    }
+
+    #[test]
+    fn async_client_split_native_peer_close_cannot_resume_failed_data() {
+        run_test(|| async {
+            for outcome in [
+                ClientControlSendOutcome::WriteError,
+                ClientControlSendOutcome::WriteZero,
+                ClientControlSendOutcome::FlushError,
+            ] {
+                assert_client_split_native_control_after_pending_send(true, outcome).await;
+            }
+        });
+    }
+
+    #[test]
+    fn async_client_split_native_ping_follows_committed_data() {
+        run_test(|| async {
+            assert_client_split_native_control_after_pending_send(
+                false,
+                ClientControlSendOutcome::Committed,
+            )
+            .await;
+        });
+    }
+
+    #[test]
+    fn async_client_split_native_peer_close_follows_committed_data() {
+        run_test(|| async {
+            assert_client_split_native_control_after_pending_send(
+                true,
+                ClientControlSendOutcome::Committed,
+            )
+            .await;
+        });
+    }
+
+    async fn assert_client_split_native_control_at_checkpoint_return(
+        peer_close: bool,
+        cancellation: Option<asupersync::types::CancelKind>,
+    ) {
+        const RESPONSE: &[u8] = br#"{"jsonrpc":"2.0","id":746,"result":{"owner":"current"}}"#;
+        let cx = Cx::current().expect("runtime root context");
+        let caller = Cx::for_testing();
+        let (client_socket, mut peer) = virtual_socket_pair();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let released = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let read_bytes = Arc::new(AtomicUsize::new(0));
+        let client = AsyncWsClientTransport::from_upgraded(ClientControlRaceIo {
+            inner: ClientWriteFaultIo {
+                inner: client_socket,
+                prefix: 3,
+                fail_after_prefix: false,
+                released: Arc::clone(&released),
+                returned_error: Arc::new(AtomicBool::new(false)),
+                output: Arc::clone(&output),
+                dropped: Arc::clone(&dropped),
+            },
+            outcome: ClientControlSendOutcome::Committed,
+            fault_armed: Arc::new(AtomicBool::new(false)),
+            read_bytes: Arc::clone(&read_bytes),
+        });
+        let (mut receiver, mut sender) = client.into_split();
+        let terminal = Arc::clone(&receiver.terminal);
+        let active_write = Arc::clone(&sender.active_write);
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            RequestId::Number(746),
+            serde_json::json!({"roots": [{"uri": "file:///private", "name": "caller data"}]}),
+        ));
+        let mut send = Box::pin(sender.send(&caller, &message));
+        std::future::poll_fn(|task_cx| {
+            assert!(send.as_mut().poll(task_cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        let accepted = output.lock().expect("accepted application prefix").clone();
+        assert_eq!(accepted.len(), 3);
+        assert!(active_write.lock().expect("active send owner").is_some());
+
+        let mut control = BytesMut::new();
+        FrameCodec::server()
+            .encode(
+                if peer_close {
+                    Frame::close(Some(u16::from(CloseCode::Normal)), None)
+                } else {
+                    Frame::ping(Bytes::from_static(b"checkpoint"))
+                },
+                &mut control,
+            )
+            .expect("encode native control for checkpoint race");
+        peer.write_all(&control).await.expect("send peer control");
+        let receive_cx = cx.clone();
+        let receive = Arc::new(ClientControlInlineWake::new(async move {
+            let result = receiver.recv_with_source(&receive_cx).await;
+            (receiver, result)
+        }));
+        receive.poll_once();
+        assert!(!receive.completed.load(Ordering::Acquire));
+        assert_eq!(read_bytes.load(Ordering::Acquire), control.len());
+        assert_eq!(receive.wakes.load(Ordering::Acquire), 0);
+        if !peer_close {
+            let mut response = BytesMut::new();
+            FrameCodec::server()
+                .encode(Frame::text(Bytes::from_static(RESPONSE)), &mut response)
+                .expect("encode healthy receive completion");
+            peer.write_all(&response)
+                .await
+                .expect("queue receive completion after control");
+        }
+        if let Some(kind) = cancellation {
+            caller.cancel_with(kind, Some("selected native write cancellation"));
+        }
+        released.store(true, Ordering::Release);
+        let result = asupersync::time::timeout(cx.now(), std::time::Duration::from_secs(2), send)
+            .await
+            .expect("native send checkpoint settles under the healthy driver");
+        assert!(receive.wakes.load(Ordering::Acquire) > 0);
+        assert!(
+            receive.completed.load(Ordering::Acquire),
+            "native permit wake drives the control before send returns"
+        );
+        assert!(
+            active_write
+                .lock()
+                .expect("released exact write owner")
+                .is_none()
+        );
+        assert!(
+            !cx.is_cancel_requested(),
+            "send cancellation does not cancel the reader context"
+        );
+        let (mut receiver, received) = receive
+            .result
+            .lock()
+            .expect("inline receive result")
+            .take()
+            .expect("one inline receive result");
+        drop(receive);
+        if let Some(kind) = cancellation {
+            if kind == asupersync::types::CancelKind::Deadline {
+                assert!(matches!(result, Err(TransportError::Timeout)));
+            } else {
+                assert!(matches!(result, Err(TransportError::Cancelled)));
+            }
+            assert!(matches!(
+                received,
+                Err(TransportError::Io(ref error)) if error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string() == "WebSocket active write was cancelled"
+            ));
+            assert_eq!(
+                WebSocketTerminalState::load(&terminal),
+                WebSocketTerminalState::Failed
+            );
+            assert!(matches!(
+                sender.send(&cx, &message).await,
+                Err(TransportError::Closed)
+            ));
+            assert!(matches!(
+                sender.close(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert!(matches!(
+                receiver.close(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            assert_eq!(
+                *output.lock().expect("no prefix resumed on cancellation"),
+                accepted
+            );
+        } else {
+            result.expect("uncancelled data commits before native control");
+            // The successful write's context has been released. Cancelling it
+            // later cannot govern a new native control or application write.
+            caller.cancel_with(asupersync::types::CancelKind::User, Some("finished owner"));
+            if peer_close {
+                assert!(matches!(received, Err(TransportError::Closed)));
+            } else {
+                assert_eq!(
+                    received
+                        .expect("healthy native Ping preserves ingress")
+                        .source(),
+                    RESPONSE
+                );
+                let mut next = BytesMut::new();
+                let mut codec = FrameCodec::server();
+                codec
+                    .encode(Frame::ping(Bytes::from_static(b"after-commit")), &mut next)
+                    .unwrap();
+                codec
+                    .encode(Frame::text(Bytes::from_static(RESPONSE)), &mut next)
+                    .unwrap();
+                peer.write_all(&next)
+                    .await
+                    .expect("next peer control after prior owner cancellation");
+                assert_eq!(
+                    receiver
+                        .recv_with_source(&cx)
+                        .await
+                        .expect("released owner cannot poison the next receive")
+                        .source(),
+                    RESPONSE
+                );
+                sender
+                    .send(&cx, &message)
+                    .await
+                    .expect("new writer owns its independent context");
+            }
+            sender
+                .close(&cx)
+                .await
+                .expect("healthy close commits or is already complete");
+            receiver
+                .close(&cx)
+                .await
+                .expect("healthy paired close is idempotent");
+        }
+        drop(sender);
+        drop(receiver);
+        assert!(dropped.load(Ordering::Acquire));
+        let mut wire = Vec::new();
+        asupersync::time::timeout(
+            cx.now(),
+            std::time::Duration::from_secs(2),
+            peer.read_to_end(&mut wire),
+        )
+        .await
+        .expect("checkpoint-race transport retirement reaches EOF")
+        .expect("read checkpoint-race wire");
+        assert_eq!(wire, *output.lock().expect("captured checkpoint-race wire"));
+        if cancellation.is_some() {
+            assert_eq!(wire, accepted);
+        } else {
+            let mut bytes = BytesMut::from(wire.as_slice());
+            let mut codec = FrameCodec::server();
+            let mut frames = Vec::new();
+            while let Some(frame) = codec
+                .decode(&mut bytes)
+                .expect("decode healthy native wire")
+            {
+                frames.push(frame);
+            }
+            assert!(bytes.is_empty());
+            assert_eq!(
+                frames.iter().map(|frame| frame.opcode).collect::<Vec<_>>(),
+                if peer_close {
+                    vec![Opcode::Text, Opcode::Close]
+                } else {
+                    vec![
+                        Opcode::Text,
+                        Opcode::Pong,
+                        Opcode::Pong,
+                        Opcode::Text,
+                        Opcode::Close,
+                    ]
+                }
+            );
+            if !peer_close {
+                assert_eq!(frames[1].payload.as_ref(), b"checkpoint");
+                assert_eq!(frames[2].payload.as_ref(), b"after-commit");
+            }
+        }
+    }
+
+    #[test]
+    fn async_client_split_native_control_fences_checkpoint_cancellation_before_send_returns() {
+        run_test(|| async {
+            for peer_close in [false, true] {
+                for kind in [
+                    asupersync::types::CancelKind::User,
+                    asupersync::types::CancelKind::Deadline,
+                ] {
+                    assert_client_split_native_control_at_checkpoint_return(peer_close, Some(kind))
+                        .await;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn async_client_split_native_control_releases_completed_write_context() {
+        run_test(|| async {
+            for peer_close in [false, true] {
+                assert_client_split_native_control_at_checkpoint_return(peer_close, None).await;
+            }
+        });
     }
 
     #[derive(Clone, Copy)]
