@@ -3904,8 +3904,17 @@ fn e2e_public_stdio_executor_execute_stamps_modern_meta() {
 #[cfg(unix)]
 #[test]
 fn e2e_public_stdio_final_resource_keeps_authored_cache_ttl() {
-    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
-        .expect("a ModernOnly facade client completes live modern discovery");
+    let mut client = connect_bounded_modern_stdio_with_mrtr(
+        "modern-only",
+        stdio_mrtr_capabilities(StdioMrtrCapabilities {
+            sampling: false,
+            roots: true,
+            form: false,
+            url: false,
+        }),
+        modern::ReverseRequestHandlers::new(),
+    )
+    .expect("a ModernOnly facade client advertises its manual roots responder");
     let resource = client
         .read_resource_with_mrtr_retry("info://mrtr-resource", |_| {
             Ok(std::collections::BTreeMap::from([(
@@ -3927,8 +3936,17 @@ fn e2e_public_stdio_final_resource_keeps_authored_cache_ttl() {
 #[cfg(unix)]
 #[test]
 fn e2e_public_stdio_modern_resource_and_prompt_mrtr_are_typed_and_bounded() {
-    let mut client = connect_bounded_modern_stdio_to_shipped_echo_server("modern-only")
-        .expect("a ModernOnly facade client completes live modern discovery");
+    let mut client = connect_bounded_modern_stdio_with_mrtr(
+        "modern-only",
+        stdio_mrtr_capabilities(StdioMrtrCapabilities {
+            sampling: false,
+            roots: true,
+            form: false,
+            url: false,
+        }),
+        modern::ReverseRequestHandlers::new(),
+    )
+    .expect("a ModernOnly facade client advertises its manual roots responder");
 
     let resource = client
         .read_resource_with_mrtr_retry("info://mrtr-resource", |_| {

@@ -497,7 +497,7 @@ impl ReverseRequestHandlers {
         capabilities: &serde_json::Value,
         input_required: &InputRequiredResult,
     ) -> McpResult<MrtrInputResponses> {
-        let requests = Self::admit_input_required(capabilities, input_required)?;
+        let requests = Self::prepare_input_required(capabilities, input_required)?;
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
             let value = self.invoke_embedded_input_request(cx, input_key, request)?;
@@ -516,7 +516,7 @@ impl ReverseRequestHandlers {
         checkpoint: impl Fn() -> McpResult<()>,
     ) -> McpResult<MrtrInputResponses> {
         checkpoint()?;
-        let requests = Self::admit_input_required(capabilities, input_required)?;
+        let requests = Self::prepare_input_required(capabilities, input_required)?;
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
             checkpoint()?;
@@ -565,41 +565,25 @@ impl ReverseRequestHandlers {
         Ok(responses)
     }
 
-    fn admit_input_required<'input>(
+    fn prepare_input_required<'input>(
         capabilities: &serde_json::Value,
         input_required: &'input InputRequiredResult,
     ) -> McpResult<Vec<(&'input str, FinalEmbeddedInputRequest)>> {
-        use crate::http_auth::rpc::interaction::{ManagedInteractionError, admit_embedded_input};
-
-        let Some(input_requests) = input_required.input_requests() else {
-            return Ok(Vec::new());
-        };
-        let invalid = || {
-            McpError::invalid_request(
-                "MRTR input-required result contains an invalid embedded input request",
-            )
-        };
-        // ExactJsonObject has already bounded this batch and rejected duplicate
-        // keys. Keep the admitted descriptors so no later conversion can erase
-        // presence or discover a forbidden sibling after an earlier host effect.
-        input_requests
-            .members()
-            .iter()
-            .map(|member| {
-                let wire = exact_json_to_serde(&member.value).map_err(|_| invalid())?;
-                let request = admit_embedded_input(capabilities, wire).map_err(|error| {
-                    match error {
-                        ManagedInteractionError::CapabilityNotAdvertised => {
-                            McpError::invalid_request(
-                                "MRTR input-required result requests an unadvertised client capability",
-                            )
-                        }
-                        _ => invalid(),
-                    }
-                })?;
-                Ok((member.name.as_str(), request))
-            })
-            .collect()
+        let mut requests = admit_mrtr_input_required(capabilities, input_required)?;
+        let mut context_ignored = false;
+        for (_, request) in &mut requests {
+            context_ignored |= crate::http_auth::rpc::interaction::normalize_embedded_input_context(
+                capabilities,
+                request,
+            );
+        }
+        // The complete batch passed admission before this bounded, fixed
+        // diagnostic or any host effect. Retain the peer's original result;
+        // only these owned effective descriptors omit the unsupported hint.
+        if context_ignored {
+            log::warn!("Ignoring unadvertised sampling context hint in MRTR input");
+        }
+        Ok(requests)
     }
 
     fn invoke_embedded_input_request(
@@ -950,6 +934,44 @@ pub const MAX_MRTR_TOTAL_INPUT_RESPONSES: usize = MAX_MRTR_INPUT_RESPONSES;
 enum MrtrResponderKind {
     Installed,
     CallerProvided,
+}
+
+/// Admits every embedded descriptor against the capabilities transmitted on
+/// the original request before any installed or caller-provided resolver runs.
+/// Caller-provided resolvers keep the original wire inputs and their own
+/// advisory-context policy; automatic handlers normalize owned copies later.
+pub(crate) fn admit_mrtr_input_required<'input>(
+    capabilities: &serde_json::Value,
+    input_required: &'input InputRequiredResult,
+) -> McpResult<Vec<(&'input str, FinalEmbeddedInputRequest)>> {
+    use crate::http_auth::rpc::interaction::{ManagedInteractionError, admit_embedded_input};
+
+    let Some(input_requests) = input_required.input_requests() else {
+        return Ok(Vec::new());
+    };
+    let invalid = || {
+        McpError::invalid_request(
+            "MRTR input-required result contains an invalid embedded input request",
+        )
+    };
+    // ExactJsonObject has already bounded this batch and rejected duplicate
+    // keys. Keep the admitted descriptors so no later conversion can erase
+    // presence or discover a forbidden sibling after an earlier host effect.
+    input_requests
+        .members()
+        .iter()
+        .map(|member| {
+            let wire = exact_json_to_serde(&member.value).map_err(|_| invalid())?;
+            let request =
+                admit_embedded_input(capabilities, wire).map_err(|error| match error {
+                    ManagedInteractionError::CapabilityNotAdvertised => McpError::invalid_request(
+                        "MRTR input-required result requests an unadvertised client capability",
+                    ),
+                    _ => invalid(),
+                })?;
+            Ok((member.name.as_str(), request))
+        })
+        .collect()
 }
 
 fn mrtr_operation_deadline(cx: &Cx, policy: RequestTimeoutPolicy) -> McpResult<Instant> {
@@ -8815,7 +8837,9 @@ where
     ///
     /// The supplied deadline caps every response wait and is checked after
     /// each synchronous responder returns. A retry cannot restart the caller's
-    /// absolute time budget.
+    /// absolute time budget. Each complete input batch must satisfy the
+    /// original request's advertised capabilities before `respond` runs;
+    /// advisory sampling context is retained for the caller's policy.
     pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -8836,6 +8860,8 @@ where
             "name": name,
             "arguments": arguments,
         });
+        let original_parameters = self.with_modern_request_metadata(original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original_parameters.clone();
 
         loop {
@@ -8853,6 +8879,8 @@ where
                 return require_terminal_websocket_mrtr_result("tools/call", result);
             };
             driver.begin_continuation()?;
+            let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_responses = respond(input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
@@ -8885,6 +8913,8 @@ where
             MrtrDriverLimits::new(MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_TOTAL_INPUT_RESPONSES)?;
         let mut driver = MrtrDriver::new(cx, deadline, limits)?;
         let original_parameters = serde_json::json!({ "uri": uri });
+        let original_parameters = self.with_modern_request_metadata(original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original_parameters.clone();
 
         loop {
@@ -8909,6 +8939,8 @@ where
                 return require_terminal_websocket_mrtr_result("resources/read", result);
             };
             driver.begin_continuation()?;
+            let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_responses = respond(input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
@@ -8946,6 +8978,8 @@ where
             "name": name,
             "arguments": arguments,
         });
+        let original_parameters = self.with_modern_request_metadata(original_parameters)?;
+        let capabilities = original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
         let mut parameters = original_parameters.clone();
 
         loop {
@@ -8964,6 +8998,8 @@ where
                 return require_terminal_websocket_mrtr_result("prompts/get", result);
             };
             driver.begin_continuation()?;
+            let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+            check_mrtr_operation(cx, None, deadline)?;
             let input_responses = respond(input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
             let input_response_count = input_responses.len();
@@ -23742,6 +23778,9 @@ impl Client {
                         .input_requests()
                         .map_or(0, |requests| requests.members().len()),
                 )?;
+            } else {
+                let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+                driver.before_request()?;
             }
             let input_responses = respond(input_required, &capabilities)?;
             let input_response_count = input_responses.len();
@@ -23838,7 +23877,9 @@ impl Client {
     /// original parameters. Exact MCP 2024-11-05 results and final complete or
     /// Tasks results return without invoking `respond`. The operation shares
     /// one caller context, absolute deadline, continuation-round bound, and
-    /// total input-response bound.
+    /// total input-response bound. The complete peer batch is validated
+    /// against the original request's advertised capabilities before
+    /// `respond` receives its unchanged input and advisory context.
     pub fn call_tool_with_mrtr_retry<F>(
         &mut self,
         name: &str,
@@ -31119,7 +31160,7 @@ mod tests {
                 &cx,
                 ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
                 async_websocket_client_info(),
-                ClientCapabilities::default(),
+                serde_json::from_value(serde_json::json!({"roots":{}})).unwrap(),
                 AsyncWsClientTransport::from_upgraded(client_io),
             )
             .await
@@ -31165,7 +31206,7 @@ mod tests {
                 &cx,
                 ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
                 async_websocket_client_info(),
-                ClientCapabilities::default(),
+                serde_json::from_value(serde_json::json!({"roots":{}})).unwrap(),
                 AsyncWsClientTransport::from_upgraded(client_io),
             )
             .await
@@ -31235,7 +31276,7 @@ mod tests {
                 &cx,
                 ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
                 async_websocket_client_info(),
-                ClientCapabilities::default(),
+                serde_json::from_value(serde_json::json!({"roots":{}})).unwrap(),
                 AsyncWsClientTransport::from_upgraded(client_io),
             )
             .await
@@ -39624,6 +39665,10 @@ mod tests {
         sample_choice["params"]["toolChoice"] = serde_json::json!({});
         let mut sample_context = sample.clone();
         sample_context["params"]["includeContext"] = serde_json::json!("allServers");
+        let mut sample_this_context = sample.clone();
+        sample_this_context["params"]["includeContext"] = serde_json::json!("thisServer");
+        let mut sample_no_context = sample.clone();
+        sample_no_context["params"]["includeContext"] = serde_json::json!("none");
         let mut null_tools_params = sample["params"].clone();
         null_tools_params["tools"] = serde_json::Value::Null;
         let mut null_choice_params = sample["params"].clone();
@@ -39674,6 +39719,34 @@ mod tests {
                     serde_json::json!({"roots":{},"sampling":{"context":{}}}),
                     roots.clone(),
                     sample_context,
+                ),
+                (
+                    "sampling-this-context-advisory",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"sampling":{}}),
+                    roots.clone(),
+                    sample_this_context.clone(),
+                ),
+                (
+                    "sampling-this-context-declared",
+                    "tools/call",
+                    serde_json::json!({"roots":{},"sampling":{"context":{}}}),
+                    roots.clone(),
+                    sample_this_context,
+                ),
+                (
+                    "sampling-none-context-advisory",
+                    "resources/read",
+                    serde_json::json!({"roots":{},"sampling":{}}),
+                    roots.clone(),
+                    sample_no_context.clone(),
+                ),
+                (
+                    "sampling-none-context-declared",
+                    "prompts/get",
+                    serde_json::json!({"roots":{},"sampling":{"context":{}}}),
+                    roots.clone(),
+                    sample_no_context,
                 ),
                 (
                     "implicit-form-empty-parent",
@@ -39921,6 +39994,62 @@ mod tests {
             }
         }
 
+        fn respond_manually(
+            &self,
+            input_required: &InputRequiredResult,
+            observed: &mut Vec<serde_json::Value>,
+        ) -> MrtrInputResponses {
+            let mut snapshot = serde_json::json!({"resultType":"input_required"});
+            if let Some(state) = input_required.request_state() {
+                snapshot["requestState"] = serde_json::json!(state);
+            }
+            if let Some(requests) = input_required.input_requests() {
+                let inputs: serde_json::Map<_, _> = requests
+                    .members()
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.name.clone(),
+                            exact_json_to_serde(&member.value).unwrap(),
+                        )
+                    })
+                    .collect();
+                snapshot["inputRequests"] = serde_json::Value::Object(inputs);
+            }
+            observed.push(snapshot);
+            serde_json::from_value(self.responses()).unwrap()
+        }
+
+        fn assert_manual_outcome(
+            &self,
+            result: McpResult<CoreResult>,
+            observed: &[serde_json::Value],
+        ) {
+            if !self.accepted {
+                self.assert_outcome(result, &[]);
+                assert!(
+                    observed.is_empty(),
+                    "{}: the raw responder must not run",
+                    self.name
+                );
+                return;
+            }
+            let result = result.expect(self.name);
+            assert_eq!(result.method(), self.method, "{}", self.name);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&result.encode().unwrap()).unwrap(),
+                self.complete(),
+                "{}",
+                self.name
+            );
+            assert_eq!(
+                observed,
+                &[self.input_required()],
+                "{}: caller-owned advisory context and the complete peer input remain exact",
+                self.name
+            );
+        }
+
         fn assert_outcome(&self, result: McpResult<CoreResult>, observed: &[serde_json::Value]) {
             if !self.accepted {
                 let error = result.expect_err(self.name);
@@ -39967,11 +40096,25 @@ mod tests {
                                 "toolChoice",
                                 "includeContext",
                             ] {
-                                assert_eq!(
-                                    actual["params"][field], expected["params"][field],
-                                    "{}: {field}",
-                                    self.name
-                                );
+                                if field == "includeContext"
+                                    && !self.capabilities["sampling"]["context"].is_object()
+                                    && matches!(
+                                        expected["params"][field].as_str(),
+                                        Some("thisServer" | "allServers")
+                                    )
+                                {
+                                    assert!(
+                                        actual["params"].get(field).is_none(),
+                                        "{}: automatic sampling must omit an undeclared context hint",
+                                        self.name
+                                    );
+                                } else {
+                                    assert_eq!(
+                                        actual["params"][field], expected["params"][field],
+                                        "{}: {field}",
+                                        self.name
+                                    );
+                                }
                             }
                         }
                         "elicitation/create" => {
@@ -40216,10 +40359,11 @@ mod tests {
     }
 
     #[cfg(feature = "websocket-experimental")]
-    async fn public_websocket_installed_mrtr_capability_probe(
+    async fn public_websocket_mrtr_capability_probe(
         case: InstalledMrtrCapabilityCase,
         with_cancellation: bool,
         invalid_descriptor: bool,
+        caller_responder: bool,
     ) {
         let cx = Cx::current().unwrap();
         let (client_io, peer_io) = async_websocket_pair();
@@ -40333,10 +40477,11 @@ mod tests {
         let mut client = ClientBuilder::new()
             .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
             .capabilities(serde_json::from_value(case.capabilities.clone()).unwrap())
-            .reverse_request_handlers(installed_mrtr_capability_handlers(
-                &case.capabilities,
-                &observed,
-            ))
+            .reverse_request_handlers(if caller_responder {
+                ReverseRequestHandlers::new()
+            } else {
+                installed_mrtr_capability_handlers(&case.capabilities, &observed)
+            })
             .request_timeout_policy(
                 RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
             )
@@ -40344,54 +40489,100 @@ mod tests {
             .await
             .unwrap();
         let cancellation = McpRequestCancellation::new();
-        let result = match (case.method, with_cancellation) {
-            ("tools/call", false) => {
-                client
-                    .call_tool(&cx, "capability-tool", serde_json::json!({}))
-                    .await
+        let mut manual_observed = Vec::new();
+        let result = if caller_responder {
+            let mut respond = |input: &InputRequiredResult| {
+                Ok(case.respond_manually(input, &mut manual_observed))
+            };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            match case.method {
+                "tools/call" => {
+                    client
+                        .call_tool_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "capability-tool",
+                            serde_json::json!({}),
+                            &mut respond,
+                        )
+                        .await
+                }
+                "resources/read" => {
+                    client
+                        .read_resource_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "file:///capability-resource",
+                            &mut respond,
+                        )
+                        .await
+                }
+                "prompts/get" => {
+                    client
+                        .get_prompt_with_mrtr_retry(
+                            &cx,
+                            deadline,
+                            "capability-prompt",
+                            HashMap::new(),
+                            &mut respond,
+                        )
+                        .await
+                }
+                _ => unreachable!(),
             }
-            ("tools/call", true) => {
-                client
-                    .call_tool_with_cancellation(
-                        &cx,
-                        &cancellation,
-                        "capability-tool",
-                        serde_json::json!({}),
-                    )
-                    .await
+            .map(CoreResult::Final)
+        } else {
+            match (case.method, with_cancellation) {
+                ("tools/call", false) => {
+                    client
+                        .call_tool(&cx, "capability-tool", serde_json::json!({}))
+                        .await
+                }
+                ("tools/call", true) => {
+                    client
+                        .call_tool_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            "capability-tool",
+                            serde_json::json!({}),
+                        )
+                        .await
+                }
+                ("resources/read", false) => {
+                    client
+                        .read_resource(&cx, "file:///capability-resource")
+                        .await
+                }
+                ("resources/read", true) => {
+                    client
+                        .read_resource_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            "file:///capability-resource",
+                        )
+                        .await
+                }
+                ("prompts/get", false) => {
+                    client
+                        .get_prompt(&cx, "capability-prompt", HashMap::new())
+                        .await
+                }
+                ("prompts/get", true) => {
+                    client
+                        .get_prompt_with_cancellation(
+                            &cx,
+                            &cancellation,
+                            "capability-prompt",
+                            HashMap::new(),
+                        )
+                        .await
+                }
+                _ => unreachable!(),
             }
-            ("resources/read", false) => {
-                client
-                    .read_resource(&cx, "file:///capability-resource")
-                    .await
-            }
-            ("resources/read", true) => {
-                client
-                    .read_resource_with_cancellation(
-                        &cx,
-                        &cancellation,
-                        "file:///capability-resource",
-                    )
-                    .await
-            }
-            ("prompts/get", false) => {
-                client
-                    .get_prompt(&cx, "capability-prompt", HashMap::new())
-                    .await
-            }
-            ("prompts/get", true) => {
-                client
-                    .get_prompt_with_cancellation(
-                        &cx,
-                        &cancellation,
-                        "capability-prompt",
-                        HashMap::new(),
-                    )
-                    .await
-            }
-            _ => unreachable!(),
         };
-        if invalid_descriptor {
+        if caller_responder {
+            case.assert_manual_outcome(result, &manual_observed);
+        } else if invalid_descriptor {
             let error = result.unwrap_err();
             assert_eq!(error.code, McpErrorCode::InvalidRequest);
             assert_eq!(
@@ -40425,7 +40616,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                public_websocket_installed_mrtr_capability_probe(case, index % 2 != 0, false).await;
+                public_websocket_mrtr_capability_probe(case, index % 2 != 0, false, false).await;
             }
         });
     }
@@ -40438,7 +40629,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
             {
-                public_websocket_installed_mrtr_capability_probe(case, index % 2 != 0, false).await;
+                public_websocket_mrtr_capability_probe(case, index % 2 != 0, false, false).await;
             }
         });
     }
@@ -40460,7 +40651,27 @@ mod tests {
                 case.accepted = false;
                 case.input_requests.as_mut().unwrap()["z-private-input-key"]["params"][field] =
                     value;
-                public_websocket_installed_mrtr_capability_probe(case, false, true).await;
+                public_websocket_mrtr_capability_probe(case, false, true, false).await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_caller_mrtr_refuses_unadvertised_or_malformed_inputs_before_responder() {
+        run_test(|| async {
+            for case in installed_mrtr_capability_cases(false) {
+                public_websocket_mrtr_capability_probe(case, false, false, true).await;
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_caller_mrtr_preserves_admitted_inputs_and_advisory_context() {
+        run_test(|| async {
+            for case in installed_mrtr_capability_cases(true) {
+                public_websocket_mrtr_capability_probe(case, false, false, true).await;
             }
         });
     }
@@ -40696,6 +40907,7 @@ mod tests {
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
                 .request_timeout_policy(policy)
+                .capabilities(serde_json::from_value(serde_json::json!({"roots":{}})).unwrap())
                 .reverse_request_handlers(if explicit_method.is_some() {
                     ReverseRequestHandlers::new()
                 } else {
@@ -54824,9 +55036,10 @@ IFS= read -r end
     }
 
     #[cfg(unix)]
-    fn public_stdio_installed_mrtr_capability_probe(
+    fn public_stdio_mrtr_capability_probe(
         case: InstalledMrtrCapabilityCase,
         asynchronous: bool,
+        caller_responder: bool,
     ) {
         let script = r#"
 IFS= read -r discover || exit 80
@@ -54875,10 +55088,11 @@ exit 0
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .capabilities(serde_json::from_value(case.capabilities.clone()).unwrap())
-                .reverse_request_handlers(installed_mrtr_capability_handlers(
-                    &case.capabilities,
-                    &observed,
-                ))
+                .reverse_request_handlers(if caller_responder {
+                    ReverseRequestHandlers::new()
+                } else {
+                    installed_mrtr_capability_handlers(&case.capabilities, &observed)
+                })
                 .auto_initialize(asynchronous)
                 .request_timeout_policy(
                     RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
@@ -54904,7 +55118,27 @@ exit 0
                 .await
                 .unwrap();
             assert_eq!(client.is_initialized(), !asynchronous);
-            let result = if asynchronous {
+            let mut manual_observed = Vec::new();
+            let result = if caller_responder {
+                let mut respond = |input: &InputRequiredResult| {
+                    Ok(case.respond_manually(input, &mut manual_observed))
+                };
+                match case.method {
+                    "tools/call" => client.call_tool_with_mrtr_retry(
+                        "capability-tool",
+                        serde_json::json!({}),
+                        &mut respond,
+                    ),
+                    "resources/read" => client
+                        .read_resource_with_mrtr_retry("file:///capability-resource", &mut respond),
+                    "prompts/get" => client.get_prompt_with_mrtr_retry(
+                        "capability-prompt",
+                        HashMap::new(),
+                        &mut respond,
+                    ),
+                    _ => unreachable!(),
+                }
+            } else if asynchronous {
                 match case.method {
                     "tools/call" => {
                         client
@@ -54947,7 +55181,11 @@ exit 0
                     _ => unreachable!(),
                 }
             };
-            case.assert_outcome(result, &observed.lock().unwrap());
+            if caller_responder {
+                case.assert_manual_outcome(result, &manual_observed);
+            } else {
+                case.assert_outcome(result, &observed.lock().unwrap());
+            }
             assert!(client.is_initialized());
             assert_eq!(
                 client.next_id.load(Ordering::SeqCst),
@@ -54976,7 +55214,7 @@ exit 0
     fn public_stdio_installed_mrtr_enforces_advertised_hard_capabilities_before_any_callback() {
         for asynchronous in [false, true] {
             for case in installed_mrtr_capability_cases(false) {
-                public_stdio_installed_mrtr_capability_probe(case, asynchronous);
+                public_stdio_mrtr_capability_probe(case, asynchronous, false);
             }
         }
     }
@@ -54986,8 +55224,24 @@ exit 0
     fn public_stdio_installed_mrtr_resolves_advertised_inputs_and_advisory_context() {
         for asynchronous in [false, true] {
             for case in installed_mrtr_capability_cases(true) {
-                public_stdio_installed_mrtr_capability_probe(case, asynchronous);
+                public_stdio_mrtr_capability_probe(case, asynchronous, false);
             }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_caller_mrtr_refuses_unadvertised_or_malformed_inputs_before_responder() {
+        for case in installed_mrtr_capability_cases(false) {
+            public_stdio_mrtr_capability_probe(case, false, true);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_caller_mrtr_preserves_admitted_inputs_and_advisory_context() {
+        for case in installed_mrtr_capability_cases(true) {
+            public_stdio_mrtr_capability_probe(case, false, true);
         }
     }
 
@@ -55811,6 +56065,22 @@ exec sleep 5
     }
 
     #[cfg(unix)]
+    fn configured_mrtr_stdio_client(
+        script: &str,
+        capabilities: serde_json::Value,
+    ) -> McpResult<Client> {
+        // Keep the connection context independent of the short-lived runtime
+        // used to configure the public builder; the assertions drive sync RPCs.
+        let cx = Cx::for_request();
+        http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .capabilities(serde_json::from_value(capabilities).unwrap())
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script]),
+        )
+    }
+
+    #[cfg(unix)]
     #[test]
     fn clt_01_mrtr_retry_replays_tools_resources_and_prompts_once() {
         let responses =
@@ -55820,13 +56090,8 @@ exec sleep 5
             "tools/call",
             r#"{"resultType":"complete","content":[],"isError":false}"#,
         );
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the MRTR tool client");
+        let mut client = configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{}}))
+            .expect("modern discovery initializes the MRTR tool client");
         assert!(matches!(
             client
                 .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {
@@ -55841,13 +56106,8 @@ exec sleep 5
             "resources/read",
             r#"{"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"}"#,
         );
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the MRTR resource client");
+        let mut client = configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{}}))
+            .expect("modern discovery initializes the MRTR resource client");
         assert!(matches!(
             client
                 .read_resource_with_mrtr_retry("file:///retry.txt", |_| Ok(responses()))
@@ -55860,13 +56120,8 @@ exec sleep 5
             "prompts/get",
             r#"{"resultType":"complete","messages":[]}"#,
         );
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the MRTR prompt client");
+        let mut client = configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{}}))
+            .expect("modern discovery initializes the MRTR prompt client");
         assert!(matches!(
             client
                 .get_prompt_with_mrtr_retry("retry-prompt", HashMap::new(), |_| Ok(responses()))
@@ -55956,13 +56211,9 @@ exec sleep 5
     #[test]
     fn clt_01_mrtr_retry_continues_only_after_every_requested_input_key() {
         let script = modern_mrtr_two_input_client_script(true);
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the two-input MRTR client");
+        let mut client =
+            configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{},"sampling":{}}))
+                .expect("modern discovery initializes the two-input MRTR client");
 
         let result = client
             .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {
@@ -55990,13 +56241,9 @@ exec sleep 5
     #[test]
     fn clt_01_mrtr_partial_input_map_rejects_without_a_retry_or_state_change() {
         let script = modern_mrtr_two_input_client_script(false);
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes before the partial MRTR map");
+        let mut client =
+            configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{},"sampling":{}}))
+                .expect("modern discovery initializes before the partial MRTR map");
         let mut callback_count = 0_usize;
 
         let error = client
@@ -56027,13 +56274,8 @@ exec sleep 5
     #[test]
     fn clt_01_mrtr_multi_round_rebuilds_original_params_and_allows_state_only() {
         let script = modern_mrtr_multi_round_client_script();
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the multi-round MRTR client");
+        let mut client = configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{}}))
+            .expect("modern discovery initializes the multi-round MRTR client");
 
         let mut callback_count = 0;
         let result = client
@@ -56076,13 +56318,8 @@ exec sleep 5
     #[test]
     fn clt_01_mrtr_round_bound_rejects_one_extra_continuation_before_callback_or_send() {
         let script = modern_mrtr_round_bound_client_script();
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes the bound MRTR client");
+        let mut client = configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{}}))
+            .expect("modern discovery initializes the bound MRTR client");
 
         let mut callback_count = 0;
         let error = client
@@ -56136,13 +56373,8 @@ exec sleep 5
             "tools/call",
             r#"{"resultType":"complete","content":[],"isError":false}"#,
         );
-        let mut client = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
-            "sh",
-            &["-c", script.as_str()],
-            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
-        )
-        .expect("modern discovery initializes before the planted MRTR response key");
+        let mut client = configured_mrtr_stdio_client(&script, serde_json::json!({"roots":{}}))
+            .expect("modern discovery initializes before the planted MRTR response key");
 
         let error = client
             .call_tool_with_mrtr_retry("retry-tool", serde_json::json!({}), |_| {

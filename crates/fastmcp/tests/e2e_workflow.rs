@@ -3581,6 +3581,10 @@ fn workflow_public_http_resource_and_prompt_mrtr_preserve_typed_state_and_bounds
         &cx,
         auto::client_builder()
             .client_info("public-resource-prompt-mrtr-client", "1.0.0")
+            .capabilities(
+                serde_json::from_value(json!({"roots": {}}))
+                    .expect("the manual roots responder capability is valid"),
+            )
             .protocol_plan(fixture.plan(ProtocolPolicy::ModernOnly))
             .connect_http_client_with_cx(&cx),
     )

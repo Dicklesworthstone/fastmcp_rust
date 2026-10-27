@@ -81,7 +81,8 @@ use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
     MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
-    ReverseRequestHandlers, SubscriptionTimeoutPolicy, validate_protocol_plan_feature,
+    ReverseRequestHandlers, SubscriptionTimeoutPolicy, admit_mrtr_input_required,
+    validate_protocol_plan_feature,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use crate::{ReverseCallbackState, ReverseRequestCancellation};
@@ -8301,7 +8302,9 @@ impl ModernHttpClient {
     /// has passed the shared continuation and input bounds. Every returned ID
     /// is validated and must differ from every earlier round before it can be
     /// sent. The operation uses the one supplied absolute `deadline` for its
-    /// initial request and every continuation.
+    /// initial request and every continuation. The entire input batch must
+    /// satisfy the capabilities sent on the initial request before `respond`
+    /// runs. The caller receives the original advisory sampling context.
     pub async fn call_tool_with_mrtr_retry<F, I>(
         &self,
         cx: &Cx,
@@ -8435,13 +8438,14 @@ impl ModernHttpClient {
             MrtrDriver::new(cx, deadline, limits).map_err(ModernHttpMrtrError::Driver)?;
         let mut used_request_ids = vec![initial_request_id.clone()];
         let mut request_id = initial_request_id;
-        let mut parameters = original_parameters.clone();
+        let mut parameters = original_parameters;
+        let mut original_parameters = None;
 
         loop {
             driver
                 .before_request()
                 .map_err(ModernHttpMrtrError::Driver)?;
-            let result = await_mrtr_until(
+            let (result, prepared_parameters) = await_mrtr_until(
                 cx,
                 driver.deadline(),
                 self.execute_mrtr_round(
@@ -8454,6 +8458,10 @@ impl ModernHttpClient {
                 ),
             )
             .await?;
+            // Retain the exact parameters that the request builder put on the
+            // first POST. In particular, resolver authority comes from those
+            // transmitted capabilities, not from a callback or peer descriptor.
+            let original_parameters = original_parameters.get_or_insert(prepared_parameters);
             // A response body can finish after the operation deadline. Do
             // not turn that late terminal into success or let it trigger a
             // caller callback for another continuation.
@@ -8468,6 +8476,14 @@ impl ModernHttpClient {
             // fifth continuation cannot create an effect or a sixth POST.
             driver
                 .begin_continuation()
+                .map_err(ModernHttpMrtrError::Driver)?;
+            admit_mrtr_input_required(
+                &original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                input_required,
+            )
+            .map_err(ModernHttpMrtrError::Driver)?;
+            driver
+                .before_request()
                 .map_err(ModernHttpMrtrError::Driver)?;
             let input_responses = respond(input_required).map_err(ModernHttpMrtrError::Driver)?;
             let input_response_count = input_responses.len();
@@ -8502,7 +8518,7 @@ impl ModernHttpClient {
         request_id: RequestId,
         sse_limits: SseLimits,
         maximum_response_bytes: usize,
-    ) -> Result<CoreResult, ModernHttpMrtrError> {
+    ) -> Result<(CoreResult, serde_json::Value), ModernHttpMrtrError> {
         let request = self
             .build_post_discovery_request(
                 cx,
@@ -8516,12 +8532,14 @@ impl ModernHttpClient {
         let wire_request: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
             ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
         })?;
-        let core_request = CoreRequest::decode(
-            ProtocolEra::Modern2026,
-            method,
-            wire_request.params.as_ref(),
-        )
-        .map_err(|error| ModernHttpMrtrError::Request(ModernHttpClientError::TypedResult(error)))?;
+        let prepared_parameters = wire_request.params.ok_or_else(|| {
+            ModernHttpMrtrError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let core_request =
+            CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&prepared_parameters))
+                .map_err(|error| {
+                    ModernHttpMrtrError::Request(ModernHttpClientError::TypedResult(error))
+                })?;
         let response = self
             .execute_post_discovery_request(cx, &request)
             .await
@@ -8557,7 +8575,7 @@ impl ModernHttpClient {
         if matches!(&result, FinalCoreResult::ToolsCallTask { .. }) {
             return Err(ModernHttpMrtrError::TasksResultRequiresNegotiatedOperation);
         }
-        Ok(CoreResult::Final(result))
+        Ok((CoreResult::Final(result), prepared_parameters))
     }
 
     /// Opens one typed final core response stream for an ordinary core request.
@@ -21276,7 +21294,8 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
                 name: "two-input-mrtr-client".to_owned(),
                 version: "1.0.0".to_owned(),
             },
-            ClientCapabilities::default(),
+            serde_json::from_value(serde_json::json!({"roots":{},"sampling":{}}))
+                .expect("the two-input fixture advertises both requested capabilities"),
         ))
         .expect("modern discovery selects two-input MRTR")
         .into_modern()
@@ -21343,6 +21362,282 @@ data: {"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"typ
     #[test]
     fn public_http_mrtr_partial_input_map_has_no_next_post_or_id_mutation() {
         assert_public_http_mrtr_requires_every_input_key(false);
+    }
+
+    fn assert_http_manual_mrtr_capability_admission(
+        method: &'static str,
+        declared_tools: bool,
+        malformed_tools: bool,
+    ) {
+        let capabilities = if declared_tools {
+            serde_json::json!({"roots":{},"sampling":{"tools":{}}})
+        } else {
+            serde_json::json!({"roots":{},"sampling":{}})
+        };
+        let mut sampling = serde_json::json!({
+            "method":"sampling/createMessage",
+            "params":{
+                "messages":[{"role":"user","content":{"type":"text","text":"sample"}}],
+                "maxTokens":8,"tools":[],"includeContext":"allServers"
+            }
+        });
+        if malformed_tools {
+            sampling["params"]["tools"] = serde_json::Value::Null;
+        }
+        let input_requests = serde_json::json!({
+            "a-valid":{"method":"roots/list"},
+            "z-private-input-key":sampling,
+        });
+        let responses = BTreeMap::from([
+            ("a-valid".to_owned(), serde_json::json!({"roots":[]})),
+            (
+                "z-private-input-key".to_owned(),
+                serde_json::json!({
+                    "role":"assistant","model":"test-model",
+                    "content":{"type":"text","text":"resolved"},
+                }),
+            ),
+        ]);
+        let accepted = declared_tools && !malformed_tools;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer_capabilities = capabilities.clone();
+        let peer_inputs = input_requests.clone();
+        let peer_responses = responses.clone();
+        let peer = thread::spawn(move || {
+            let mut probe = accept_notification_test_peer(&listener);
+            let probe_request = read_request(&mut probe);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&probe_request.body).unwrap()["method"],
+                SERVER_DISCOVER
+            );
+            write_response(&mut probe, 200, "application/json", modern_discovery_body());
+            drop(probe);
+
+            let mut original = accept_notification_test_peer(&listener);
+            let captured = read_request(&mut original);
+            let original_request: serde_json::Value =
+                serde_json::from_slice(&captured.body).unwrap();
+            assert_eq!(original_request["id"], 2);
+            assert_eq!(original_request["method"], method);
+            assert_eq!(
+                original_request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
+                peer_capabilities
+            );
+            assert!(original_request["params"].get("requestState").is_none());
+            assert!(original_request["params"].get("inputResponses").is_none());
+            let response = serde_json::json!({"jsonrpc":"2.0","id":2,"result":{
+                "resultType":"input_required","inputRequests":peer_inputs,
+                "requestState":"private-state-λ",
+            }});
+            if method == RESOURCES_READ {
+                // The same admission must apply after both JSON and SSE terminals.
+                let body = format!("event: message\ndata: {response}\n\n");
+                write_response(&mut original, 200, "text/event-stream", body.as_bytes());
+            } else {
+                write_response(
+                    &mut original,
+                    200,
+                    "application/json",
+                    &serde_json::to_vec(&response).unwrap(),
+                );
+            }
+            drop(original);
+
+            if accepted {
+                let mut retry = accept_notification_test_peer(&listener);
+                let captured = read_request(&mut retry);
+                let retry_request: serde_json::Value =
+                    serde_json::from_slice(&captured.body).unwrap();
+                let mut expected_parameters = original_request["params"].clone();
+                expected_parameters["requestState"] = serde_json::json!("private-state-λ");
+                expected_parameters["inputResponses"] =
+                    serde_json::to_value(peer_responses).unwrap();
+                assert_eq!(retry_request["id"], 3);
+                assert_eq!(retry_request["method"], method);
+                assert_eq!(retry_request["params"], expected_parameters);
+                let terminal = match method {
+                    TOOLS_CALL => serde_json::json!({"resultType":"complete","content":[]}),
+                    RESOURCES_READ => {
+                        serde_json::json!({"resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"})
+                    }
+                    PROMPTS_GET => serde_json::json!({"resultType":"complete","messages":[]}),
+                    _ => unreachable!(),
+                };
+                write_response(
+                    &mut retry,
+                    200,
+                    "application/json",
+                    &serde_json::to_vec(
+                        &serde_json::json!({"jsonrpc":"2.0","id":3,"result":terminal}),
+                    )
+                    .unwrap(),
+                );
+            }
+
+            let mut reused = accept_notification_test_peer(&listener);
+            let captured = read_request(&mut reused);
+            let reused_request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+            let next_id = if accepted { 4 } else { 3 };
+            assert_eq!(reused_request["id"], next_id);
+            assert_eq!(
+                reused_request["method"], "tools/list",
+                "a rejected round cannot send a retry"
+            );
+            assert!(reused_request["params"].get("requestState").is_none());
+            assert!(reused_request["params"].get("inputResponses").is_none());
+            write_response(
+                &mut reused,
+                200,
+                "application/json",
+                &serde_json::to_vec(&serde_json::json!({"jsonrpc":"2.0","id":next_id,"result":{
+                    "resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"
+                }}))
+                .unwrap(),
+            );
+        });
+
+        let cx = Cx::for_request();
+        let client = runtime_block_on(ModernHttpClient::connect(
+            &cx,
+            plan(
+                &target,
+                "http://127.0.0.1:9/sse",
+                "http://127.0.0.1:9/message",
+                ProtocolPolicy::ModernOnly,
+            ),
+            ClientInfo {
+                name: "manual-admission-client".to_owned(),
+                version: "1".to_owned(),
+            },
+            serde_json::from_value(capabilities).unwrap(),
+        ))
+        .unwrap()
+        .into_modern()
+        .unwrap();
+        let mut next_id = 3;
+        let mut callbacks = 0;
+        let mut allocate = || {
+            let allocated = RequestId::Number(next_id);
+            next_id += 1;
+            Ok(allocated)
+        };
+        let mut respond = |input: &fastmcp_protocol::InputRequiredResult| {
+            callbacks += 1;
+            assert_eq!(input.request_state(), Some("private-state-λ"));
+            let received: serde_json::Map<String, serde_json::Value> = input
+                .input_requests()
+                .unwrap()
+                .members()
+                .iter()
+                .map(|member| {
+                    (
+                        member.name.clone(),
+                        crate::exact_json_to_serde(&member.value).unwrap(),
+                    )
+                })
+                .collect();
+            // Caller-supplied responders retain their explicit advisory-context
+            // policy; the hard-capability gate must not rewrite their snapshot.
+            assert_eq!(serde_json::Value::Object(received), input_requests);
+            Ok(responses.clone())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let limits = SseLimits::new(4_096, 16_384, 8).unwrap();
+        let result = match method {
+            TOOLS_CALL => runtime_block_on(client.call_tool_with_mrtr_retry(
+                &cx,
+                RequestId::Number(2),
+                deadline,
+                "manual-capability-tool",
+                serde_json::json!({"input":"retain"}),
+                limits,
+                16_384,
+                &mut allocate,
+                &mut respond,
+            )),
+            RESOURCES_READ => runtime_block_on(client.read_resource_with_mrtr_retry(
+                &cx,
+                RequestId::Number(2),
+                deadline,
+                "file:///manual-capability.txt",
+                limits,
+                16_384,
+                &mut allocate,
+                &mut respond,
+            )),
+            PROMPTS_GET => runtime_block_on(client.get_prompt_with_mrtr_retry(
+                &cx,
+                RequestId::Number(2),
+                deadline,
+                "manual-capability-prompt",
+                HashMap::new(),
+                limits,
+                16_384,
+                &mut allocate,
+                &mut respond,
+            )),
+            _ => unreachable!(),
+        };
+        if accepted {
+            assert!(matches!(result, Ok(CoreResult::Final(_))), "{result:?}");
+            assert_eq!(callbacks, 1);
+            assert_eq!(next_id, 4);
+        } else {
+            let Err(ModernHttpMrtrError::Driver(error)) = result else {
+                panic!("the input round must fail locally: {result:?}");
+            };
+            assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.message,
+                if malformed_tools {
+                    "MRTR input-required result contains an invalid embedded input request"
+                } else {
+                    "MRTR input-required result requests an unadvertised client capability"
+                }
+            );
+            assert!(error.data.is_none());
+            assert_eq!(
+                callbacks, 0,
+                "no raw responder may see a forbidden later descriptor"
+            );
+            assert_eq!(next_id, 3, "rejection precedes the caller's ID allocator");
+        }
+        let reused = runtime_block_on(client.request(
+            &cx,
+            "tools/list",
+            serde_json::json!({}),
+            Some(RequestId::Number(next_id)),
+        ))
+        .unwrap();
+        let reused_body = runtime_block_on(reused.read_to_end(&cx, 4_096)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&reused_body).unwrap()["id"],
+            next_id
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn public_http_manual_mrtr_admits_declared_inputs_and_preserves_context() {
+        for method in [TOOLS_CALL, RESOURCES_READ, PROMPTS_GET] {
+            assert_http_manual_mrtr_capability_admission(method, true, false);
+        }
+    }
+
+    #[test]
+    fn public_http_manual_mrtr_rejects_missing_hard_leaf_before_callback_or_retry() {
+        for method in [TOOLS_CALL, RESOURCES_READ, PROMPTS_GET] {
+            assert_http_manual_mrtr_capability_admission(method, false, false);
+        }
+    }
+
+    #[test]
+    fn public_http_manual_mrtr_rejects_later_malformed_descriptor_before_callback_or_retry() {
+        for method in [TOOLS_CALL, RESOURCES_READ, PROMPTS_GET] {
+            assert_http_manual_mrtr_capability_admission(method, true, true);
+        }
     }
 
     #[test]

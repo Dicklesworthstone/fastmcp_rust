@@ -739,10 +739,9 @@ pub(crate) fn admit_embedded_input(
     Ok(descriptor)
 }
 
-/// Normalizes only a caller-owned effective descriptor. Task ledgers retain
-/// their original wire values. The caller exposes the returned diagnostic
-/// after whole-batch admission and before invoking any host input effects.
-#[cfg(feature = "tasks")]
+/// Normalizes only a caller-owned effective descriptor. Peer results and Task
+/// ledgers retain their original wire values. The caller exposes the returned
+/// diagnostic after whole-batch admission and before invoking any host effects.
 pub(crate) fn normalize_embedded_input_context(
     capabilities: &serde_json::Value,
     request: &mut FinalEmbeddedInputRequest,

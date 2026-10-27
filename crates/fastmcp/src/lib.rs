@@ -12138,6 +12138,10 @@ mod tests {
             .await;
 
             let mut client = super::modern::ClientBuilder::new()
+                .capabilities(
+                    serde_json::from_value(serde_json::json!({"roots": {}}))
+                        .expect("the manual roots responder capability is valid"),
+                )
                 .connect_websocket_with_cx(
                     &cx,
                     super::AsyncWsClientTransport::from_upgraded(client_io),
