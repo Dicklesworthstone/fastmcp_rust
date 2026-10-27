@@ -26,6 +26,9 @@ use crate::http_executor::parameter_headers::ReviewedToolHeaders;
 use crate::{ClientBuilder, HttpClient, HttpClientError, ProtocolPolicy};
 
 pub(crate) mod callbacks;
+/// Apps Hosts whose complete lifetime stays inside a managed OAuth grant.
+#[cfg(feature = "apps")]
+pub mod apps;
 mod catalog;
 mod core_listen;
 mod cursors;

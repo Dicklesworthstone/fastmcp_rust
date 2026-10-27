@@ -1348,3 +1348,6 @@ fn resource_template_and_prompt_calls_use_the_same_authenticated_client() {
         peer.no_more(&cx).await;
     });
 }
+
+#[cfg(feature = "apps")]
+mod apps;

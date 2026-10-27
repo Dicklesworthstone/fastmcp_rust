@@ -5920,7 +5920,11 @@ exec sleep 10
             "input_required" => {
                 task["inputRequests"] = server_input_required("unused")["inputRequests"].clone()
             }
-            "completed" => task["result"] = server_input_complete(),
+            "completed" => {
+                let mut result = server_input_complete();
+                result.as_object_mut().unwrap().remove("resultType");
+                task["result"] = result;
+            }
             "failed" => task["error"] = json!({"code":-32603,"message":"Host-private failure"}),
             _ => {}
         }
@@ -6729,7 +6733,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
 IFS= read -r final || exit 108
 case "$final" in *'"id":5'*) ;; *) exit 109 ;; esac
 case "$final" in *'"method":"tasks/get"'*) ;; *) exit 110 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","taskId":"private-server-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:02.000Z","ttlMs":null,"result":{"resultType":"complete","content":[{"type":"text","text":"stdio Task completed"}]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","taskId":"private-server-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:02.000Z","ttlMs":null,"result":{"content":[{"type":"text","text":"stdio Task completed"}]}}}'
 IFS= read -r ordinary || exit 111
 case "$ordinary" in *'"id":6'*) ;; *) exit 112 ;; esac
 case "$ordinary" in *'"method":"tools/call"'*) ;; *) exit 113 ;; esac
