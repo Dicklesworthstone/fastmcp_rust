@@ -312,6 +312,8 @@ pub mod client {
     pub use crate::{
         LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
     };
+    #[cfg(all(feature = "apps", feature = "tasks"))]
+    pub use crate::McpAppsServerTaskPolicy;
     /// MCP Apps client APIs are available only with the Apps extension.
     #[cfg(feature = "apps")]
     pub use crate::{
@@ -1052,6 +1054,8 @@ pub use fastmcp_client::{
     StdioTaskSubscriptionEvent,
 };
 
+#[cfg(all(feature = "apps", feature = "tasks"))]
+pub use fastmcp_client::McpAppsServerTaskPolicy;
 #[cfg(feature = "apps")]
 pub use fastmcp_client::{
     McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
@@ -1174,6 +1178,8 @@ pub mod auto {
         FinalTask, FinalTaskInputResponses, FinalTaskStatusNotification, FinalToolCallOutcome,
         FinalUpdateTaskResult,
     };
+    #[cfg(all(feature = "apps", feature = "tasks"))]
+    pub use fastmcp_client::McpAppsServerTaskPolicy;
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
         McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHostError,
@@ -3083,6 +3089,8 @@ pub mod modern {
         FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
     };
 
+    #[cfg(all(feature = "apps", feature = "tasks"))]
+    pub use fastmcp_client::McpAppsServerTaskPolicy;
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
         McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,

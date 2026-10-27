@@ -186,6 +186,8 @@ pub use leg_neg_stdio::{
     StdioClassificationRecord, StdioFirstWireSignal, TraceOutcome, case_input_digest,
     evaluate_stdio_case, leg_neg_01_a_manifest_digest,
 };
+#[cfg(all(feature = "apps", feature = "tasks"))]
+pub use mcp_apps::McpAppsServerTaskPolicy;
 #[cfg(feature = "apps")]
 pub use mcp_apps::{
     McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
@@ -21199,6 +21201,14 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         let parameters = self.prepare_request_parameters(parameters)?;
+        #[cfg(feature = "tasks")]
+        let parameters = {
+            let mut parameters = parameters;
+            // This fallback has no Host effect policy that can authorize a
+            // durable Task. Freeze that refusal before request admission.
+            remove_tasks_client_extension(&mut parameters);
+            parameters
+        };
         let core_request = self
             .prepared_core_request(core_method, &parameters)?
             .ok_or_else(|| {
@@ -21212,7 +21222,20 @@ impl Client {
             )
         })?;
         let executor = self.multiplexed_stdio_executor()?;
-        let mut execution = self.start_multiplexed_request(cx, core_method, parameters)?;
+        if let Some(error) = self.responses.terminal_error() {
+            return Err(error);
+        }
+        executor
+            .service(cx)
+            .map_err(|error| self.terminate_connection(error))?;
+        // The parameters are already admitted. Preparing them again would
+        // restore negotiated Tasks without this View's creation consent.
+        let mut execution = match executor.execute(cx, core_method, parameters) {
+            Err(error) if executor.executor.terminal_error().is_some() => {
+                return Err(self.terminate_connection(error));
+            }
+            result => result?,
+        };
 
         loop {
             if cancellation.is_cancel_requested() {

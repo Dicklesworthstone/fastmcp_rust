@@ -6297,7 +6297,7 @@ impl ClientHttpConnection {
         }
     }
 
-    async fn drain_modern_sse_json_response(
+    pub(crate) async fn drain_modern_sse_json_response(
         cx: &Cx,
         cancellation: Option<&McpRequestCancellation>,
         response: ModernHttpResponseStream,
@@ -7011,7 +7011,7 @@ async fn legacy_http_server_request_response(
     }
 }
 
-fn admit_modern_json_response_body(
+pub(crate) fn admit_modern_json_response_body(
     body: &[u8],
     request_id: &RequestId,
     maximum_response_bytes: usize,

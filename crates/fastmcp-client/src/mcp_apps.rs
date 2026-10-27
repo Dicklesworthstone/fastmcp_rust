@@ -989,6 +989,58 @@ pub trait McpAppsWireHostPolicy {
     }
 }
 
+/// Bounds for observing a server Task on behalf of one admitted View call.
+///
+/// Returning this policy from [`McpAppsWireHostEffects::server_task_policy`]
+/// authorizes advertising Tasks on that call. It does not authorize embedded
+/// input effects: those still require [`McpAppsWireHostEffects::resolve_server_input`].
+/// The original call's deadline and cancellation always take precedence.
+#[cfg(feature = "tasks")]
+#[derive(Clone, Copy, Debug)]
+pub struct McpAppsServerTaskPolicy {
+    minimum_poll_interval: std::time::Duration,
+    maximum_polls: usize,
+    maximum_snapshot_bytes: usize,
+}
+
+#[cfg(feature = "tasks")]
+impl McpAppsServerTaskPolicy {
+    /// Creates bounded observation policy. Polls must be at least 10 ms apart;
+    /// at most 1,024 reads and 8 MiB of cumulative encoded Task snapshots are
+    /// permitted. A server may request a longer interval, never a shorter one.
+    pub fn new(
+        minimum_poll_interval: std::time::Duration,
+        maximum_polls: usize,
+        maximum_snapshot_bytes: usize,
+    ) -> McpResult<Self> {
+        if minimum_poll_interval < std::time::Duration::from_millis(10)
+            || minimum_poll_interval > std::time::Duration::from_secs(60)
+            || !(1..=1_024).contains(&maximum_polls)
+            || !(1..=8 * 1024 * 1024).contains(&maximum_snapshot_bytes)
+        {
+            return Err(McpError::invalid_params(
+                "Invalid Apps server Task observation limits",
+            ));
+        }
+        Ok(Self {
+            minimum_poll_interval,
+            maximum_polls,
+            maximum_snapshot_bytes,
+        })
+    }
+}
+
+#[cfg(feature = "tasks")]
+impl Default for McpAppsServerTaskPolicy {
+    fn default() -> Self {
+        Self {
+            minimum_poll_interval: std::time::Duration::from_secs(1),
+            maximum_polls: 128,
+            maximum_snapshot_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
 /// Embedder effects for a Host that already owns its MCP forwarding policy.
 ///
 /// Attach these callbacks with [`McpAppsWireHost::with_effects`] to combine
@@ -1057,7 +1109,8 @@ pub trait McpAppsWireHostEffects {
     /// All rounds share one absolute deadline, cancellation owner, four-round
     /// limit, 128-response limit and 1 MiB encoded response budget. Work must
     /// remain in this future: matching View cancellation drops it, and a late
-    /// result cannot authorize a retry. Task results are still unsupported.
+    /// result cannot authorize a retry. Opted-in server Tasks use the same
+    /// callback and share these budgets with any preceding MRTR rounds.
     async fn resolve_server_input(
         &mut self,
         _cx: &Cx,
@@ -1066,6 +1119,43 @@ pub trait McpAppsWireHostEffects {
         _params: &Value,
         _input_required: &fastmcp_protocol::InputRequiredResult,
     ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
+        Err(wire_policy_denied())
+    }
+
+    /// Authorizes Task creation and observation before this View's `tools/call`
+    /// is sent. The default removes Tasks from this call's capabilities.
+    /// Returning `Some` requires the negotiated official Tasks extension and
+    /// keeps every Task handle private to this Host and its current MCP peer.
+    /// Apply the originating View's identity, authenticated principal and
+    /// creation consent here; a View cannot supply or override this policy.
+    ///
+    /// All observation stays inside the original request future. Cancelling
+    /// or timing out that future stops reads, updates and pending effects; it
+    /// does not implicitly cancel the durable server Task. Remote cancellation
+    /// requires separate Host authorization and is not performed by this API.
+    #[cfg(feature = "tasks")]
+    async fn server_task_policy(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: &Value,
+    ) -> Result<Option<McpAppsServerTaskPolicy>, McpAppsHostError> {
+        Ok(None)
+    }
+
+    /// Rechecks this View's consent for one exact retained Task snapshot.
+    /// Called before using every snapshot and again before a read or input
+    /// update, so a policy can revoke continuing observation or disclosure.
+    /// The default refuses. Server-provided Task fields are untrusted policy
+    /// input, never authority to switch the View, peer or authenticated client.
+    #[cfg(feature = "tasks")]
+    async fn approve_server_task(
+        &mut self,
+        _cx: &Cx,
+        _cancellation: &McpRequestCancellation,
+        _params: &Value,
+        _task: &crate::FinalTask,
+    ) -> Result<(), McpAppsHostError> {
         Err(wire_policy_denied())
     }
 
@@ -3969,7 +4059,7 @@ pub(crate) fn project_reused_core_result(
 
 // This adapter keeps the composition on the existing client request paths:
 // they own fresh IDs, exact selected-era decoding, and transport cleanup on
-// drop. The Host owns only its consent callback and one bounded MRTR operation.
+// drop. The Host owns consent and one bounded MRTR/Task observation operation.
 #[allow(async_fn_in_trait)]
 trait McpAppsServerInputClient {
     fn prepare_apps_server_input(
@@ -3985,7 +4075,46 @@ trait McpAppsServerInputClient {
         deadline: std::time::Instant,
         method: &str,
         params: Value,
+        allow_tasks: bool,
     ) -> McpResult<CoreResult>;
+
+    #[cfg(feature = "tasks")]
+    fn admit_apps_tasks(&self) -> McpResult<()>;
+
+    #[cfg(feature = "tasks")]
+    async fn get_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<crate::FinalTask>;
+
+    #[cfg(feature = "tasks")]
+    async fn update_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task: &crate::FinalTask,
+        responses: crate::FinalTaskInputResponses,
+    ) -> McpResult<()>;
+}
+
+#[cfg(feature = "tasks")]
+fn admit_apps_task_discovery(discovery: &fastmcp_protocol::ServerDiscoverResult) -> McpResult<()> {
+    crate::admit_final_tasks_result_discriminator(
+        discovery,
+        crate::OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
+    )?;
+    for method in [crate::TASK_GET, crate::TASK_UPDATE] {
+        crate::admit_final_tasks_discovery_surface(
+            discovery,
+            method,
+            crate::ExtensionDirection::ClientToServer,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -4013,9 +4142,82 @@ impl McpAppsServerInputClient for crate::Client {
         deadline: std::time::Instant,
         method: &str,
         params: Value,
+        allow_tasks: bool,
     ) -> McpResult<CoreResult> {
+        #[cfg(feature = "tasks")]
+        if allow_tasks {
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            self.admit_apps_tasks()?;
+            let parameters = self.with_final_tasks_client_capability(params)?;
+            let request = self
+                .prepared_core_request(method, &parameters)?
+                .ok_or_else(|| McpError::invalid_params("Unsupported Apps Task request"))?;
+            let parameters = request.encode_params().map_err(|_| {
+                McpError::invalid_params("Invalid selected-era Apps Task parameters")
+            })?;
+            self.last_core_result_receipt = None;
+            let received = self
+                .send_yielding_prepared_request_until(
+                    cx,
+                    cancellation,
+                    method,
+                    parameters,
+                    Some(deadline),
+                )
+                .await?;
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            let (result, diagnostic) = crate::decode_core_result_with_cache_ttl_from_source(
+                &request,
+                &received.result,
+                received.raw_result.as_deref(),
+            )
+            .map_err(|error| self.terminate_connection(error))?;
+            self.last_core_result_receipt = Some(received.receipt);
+            if let Some(diagnostic) = diagnostic {
+                self.retain_final_cache_ttl_diagnostic(diagnostic);
+            }
+            return Ok(result);
+        }
+        #[cfg(not(feature = "tasks"))]
+        let _ = allow_tasks;
         self.request_core_with_cx_until(cx, cancellation, method, params, Some(deadline))
             .await
+    }
+
+    #[cfg(feature = "tasks")]
+    fn admit_apps_tasks(&self) -> McpResult<()> {
+        admit_apps_task_discovery(self.server_discovery().ok_or_else(|| {
+            McpError::invalid_request("Apps server Tasks require current discovery")
+        })?)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn get_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<crate::FinalTask> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        self.get_task_final_with_cx(cx, cancellation, task_id)
+            .await
+            .map(|result| result.task)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn update_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task: &crate::FinalTask,
+        responses: crate::FinalTaskInputResponses,
+    ) -> McpResult<()> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        self.update_task_final_with_cx(cx, cancellation, task, responses)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -4041,16 +4243,382 @@ impl McpAppsServerInputClient for crate::HttpClient {
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
-        _deadline: std::time::Instant,
+        deadline: std::time::Instant,
         method: &str,
         params: Value,
+        allow_tasks: bool,
     ) -> McpResult<CoreResult> {
         // The enclosing operation watchdog bounds every POST and callback.
         // Dropping the existing HTTP execution owns its cancellation cleanup.
-        self.request_final_core_with_cancellation(cx, cancellation, method, params)
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        if method != "tools/call" {
+            return self
+                .request_final_core_with_cancellation(cx, cancellation, method, params)
+                .await
+                .map_err(|error| McpError::invalid_request(error.to_string()));
+        }
+        use crate::http_executor::{ClientHttpConnection, ModernHttpResponseKind};
+
+        let request_id = self
+            .next_request_id()
+            .map_err(|error| McpError::invalid_request(error.to_string()))?;
+        let client = match &self.connection {
+            ClientHttpConnection::Modern(client) => client,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {
+                return Err(McpError::invalid_request(
+                    "Apps server Tasks require modern HTTP",
+                ));
+            }
+        };
+        // Unlike the general convenience API, this stamps Tasks only when the
+        // originating View's Host has explicitly approved Task creation.
+        let (request, response) = client
+            .request_mrtr(cx, method, request_id.clone(), params, allow_tasks)
+            .await
+            .map_err(|error| McpError::invalid_request(error.to_string()))?;
+        let (mut response, result_source, _) = match response.metadata().kind() {
+            ModernHttpResponseKind::Json => {
+                let body = response
+                    .read_to_end_with_cancellation(
+                        cx,
+                        cancellation,
+                        crate::DEFAULT_FINAL_CACHE_MAX_BYTES,
+                    )
+                    .await
+                    .map_err(|error| McpError::invalid_request(error.to_string()))?;
+                crate::http_executor::admit_modern_json_response_body(
+                    &body,
+                    &request_id,
+                    crate::DEFAULT_FINAL_CACHE_MAX_BYTES,
+                )
+                .map_err(|error| McpError::invalid_request(error.to_string()))?
+            }
+            ModernHttpResponseKind::Sse => {
+                let mut observer = Self::final_http_notification_observer(
+                    &mut self.final_result_cache,
+                    &mut self.final_server_notifications,
+                    &mut self.final_progress_notifications,
+                );
+                let (response, source, receipt, _, _) =
+                    ClientHttpConnection::drain_modern_sse_json_response(
+                        cx,
+                        Some(cancellation),
+                        response,
+                        request_id,
+                        crate::DEFAULT_FINAL_CACHE_MAX_BYTES,
+                        Some(&mut observer),
+                    )
+                    .await
+                    .map_err(|error| McpError::invalid_request(error.to_string()))?;
+                (response, source, receipt)
+            }
+            _ => {
+                return Err(McpError::invalid_request(
+                    "Unexpected Apps core HTTP response",
+                ));
+            }
+        };
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        if let Some(error) = response.error.take() {
+            return Err(crate::json_rpc_error_to_mcp(error));
+        }
+        let raw = response
+            .result
+            .take()
+            .ok_or_else(|| McpError::invalid_request("Apps core HTTP response has no result"))?;
+        let (result, diagnostic) = crate::decode_core_result_with_cache_ttl_from_source(
+            &request,
+            &raw,
+            result_source.as_deref(),
+        )?;
+        #[cfg(feature = "tasks")]
+        if !allow_tasks
+            && matches!(
+                result,
+                CoreResult::Final(FinalCoreResult::ToolsCallTask { .. })
+            )
+        {
+            return Err(McpError::invalid_request(
+                "Unapproved Apps Task result rejected",
+            ));
+        }
+        if let Some(diagnostic) = diagnostic {
+            if self.final_cache_ttl_diagnostics.len() >= crate::MAX_FINAL_CACHE_TTL_DIAGNOSTICS {
+                self.final_cache_ttl_diagnostics.pop_front();
+            }
+            self.final_cache_ttl_diagnostics.push_back(diagnostic);
+        }
+        Ok(result)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn admit_apps_tasks(&self) -> McpResult<()> {
+        admit_apps_task_discovery(&self.server_discovery().ok_or_else(|| {
+            McpError::invalid_request("Apps server Tasks require current discovery")
+        })?)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn get_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task_id: crate::FinalTaskId,
+    ) -> McpResult<crate::FinalTask> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        self.get_final_task_snapshot(cx, task_id)
             .await
             .map_err(|error| McpError::invalid_request(error.to_string()))
     }
+
+    #[cfg(feature = "tasks")]
+    async fn update_apps_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        deadline: std::time::Instant,
+        task: &crate::FinalTask,
+        responses: crate::FinalTaskInputResponses,
+    ) -> McpResult<()> {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        self.submit_final_task_input(cx, task, responses)
+            .await
+            .map(|_| ())
+            .map_err(|error| McpError::invalid_request(error.to_string()))
+    }
+}
+
+struct AppsServerInputOperation<'operation, E> {
+    cx: &'operation Cx,
+    cancellation: &'operation McpRequestCancellation,
+    deadline: std::time::Instant,
+    method: McpAppsRoutedMethod,
+    params: &'operation Value,
+    capabilities: Value,
+    driver: crate::MrtrDriver<'operation>,
+    response_bytes: usize,
+    effects: &'operation mut E,
+}
+
+impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
+    fn checkpoint(&self) -> McpResult<()> {
+        crate::check_mrtr_operation(self.cx, Some(self.cancellation), self.deadline)
+    }
+
+    async fn resolve(
+        &mut self,
+        input_required: &fastmcp_protocol::InputRequiredResult,
+    ) -> Result<Vec<u8>, McpAppsHostError> {
+        self.checkpoint()?;
+        self.driver.begin_continuation()?;
+        self.driver.admit_input_responses(
+            input_required
+                .input_requests()
+                .map_or(0, |requests| requests.members().len()),
+        )?;
+        // Admit the complete batch before any consent or model effect. Never
+        // dispatch this View's embedded input to connection-wide callbacks.
+        crate::ReverseRequestHandlers::admit_input_required(&self.capabilities, input_required)?;
+        let responses = self
+            .effects
+            .resolve_server_input(
+                self.cx,
+                self.cancellation,
+                self.method,
+                self.params,
+                input_required,
+            )
+            .await?;
+        self.checkpoint()?;
+        if input_required.input_requests().is_some() {
+            responses
+                .validate_against_input_required(input_required)
+                .map_err(|_| {
+                    McpError::invalid_params(
+                        "Apps server input responses do not match the admitted round",
+                    )
+                })?;
+        } else if !responses.is_empty() {
+            return Err(McpError::invalid_params(
+                "Apps state-only continuation cannot carry input responses",
+            )
+            .into());
+        }
+        let encoded = serde_json::to_vec(&responses)
+            .map_err(|_| McpError::invalid_params("Apps server input could not serialize"))?;
+        self.response_bytes = self.response_bytes.saturating_add(encoded.len());
+        if self.response_bytes > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES {
+            return Err(McpError::invalid_params(
+                "Apps server input response byte budget exceeded",
+            )
+            .into());
+        }
+        Ok(encoded)
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn approve_task(&mut self, task: &crate::FinalTask) -> Result<(), McpAppsHostError> {
+        self.checkpoint()?;
+        self.effects
+            .approve_server_task(self.cx, self.cancellation, self.params, task)
+            .await?;
+        self.checkpoint()?;
+        Ok(())
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn observe_task<C: McpAppsServerInputClient>(
+        &mut self,
+        client: &mut C,
+        policy: McpAppsServerTaskPolicy,
+        mut task: crate::FinalTask,
+    ) -> Result<Value, McpAppsHostError> {
+        let task_id = task.base().task_id.clone();
+        let created_at = task.base().created_at.clone();
+        let mut snapshot_bytes = 0_usize;
+        let mut polls = 0_usize;
+        // Retain descriptors only after one acknowledged update. Re-observing
+        // the same input key cannot repeat an effect or resend its response.
+        let mut answered = BTreeMap::<String, Value>::new();
+        loop {
+            self.checkpoint()?;
+            if task.base().task_id != task_id || task.base().created_at != created_at {
+                return Err(McpError::invalid_request(
+                    "Apps Task identity changed during observation",
+                )
+                .into());
+            }
+            snapshot_bytes = snapshot_bytes.saturating_add(
+                serde_json::to_vec(&task)
+                    .map_err(|_| McpError::invalid_request("Invalid Apps Task snapshot"))?
+                    .len(),
+            );
+            if snapshot_bytes > policy.maximum_snapshot_bytes {
+                return Err(
+                    McpError::invalid_request("Apps Task snapshot byte budget exceeded").into(),
+                );
+            }
+            // Validate even terminal snapshots' peer hints before policy or
+            // publication. Huge/fractional wire integers cannot become waits.
+            let peer_interval = task
+                .base()
+                .poll_interval_ms
+                .as_ref()
+                .map(|interval| {
+                    interval
+                        .try_as_millis()
+                        .map(std::time::Duration::from_millis)
+                        .map_err(|_| {
+                            McpError::invalid_request(
+                                "Apps Task poll interval is not representable",
+                            )
+                        })
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let interval = peer_interval.max(policy.minimum_poll_interval);
+            let interval_nanos = u64::try_from(interval.as_nanos())
+                .map_err(|_| McpError::invalid_request("Apps Task poll interval is too large"))?;
+            let next_poll = self.cx.now().saturating_add_nanos(interval_nanos);
+            if let crate::FinalTask::InputRequired { input_requests, .. } = &task {
+                // Capability admission precedes even the Host consent hook;
+                // a forbidden sibling cannot hide behind an answered key.
+                let all = apps_task_input_required(input_requests)?;
+                crate::ReverseRequestHandlers::admit_input_required(&self.capabilities, &all)?;
+            }
+            self.approve_task(&task).await?;
+            match &task {
+                crate::FinalTask::Completed { result, .. } => {
+                    // The View receives only its ordinary Apps tool result,
+                    // never the Task wrapper, handle, status or private state.
+                    return serde_json::to_value(&result.result).map_err(|_| {
+                        McpError::internal_error("Apps Task result could not serialize").into()
+                    });
+                }
+                crate::FinalTask::Failed { .. } => {
+                    return Err(McpError::invalid_request("Apps server Task failed").into());
+                }
+                crate::FinalTask::Cancelled(_) => return Err(McpError::request_cancelled().into()),
+                crate::FinalTask::InputRequired { input_requests, .. } => {
+                    let mut pending = fastmcp_protocol::TaskInputRequests::new();
+                    let mut descriptors = BTreeMap::new();
+                    for (key, request) in input_requests {
+                        let descriptor = serde_json::to_value(request).map_err(|_| {
+                            McpError::invalid_request("Invalid Apps Task input descriptor")
+                        })?;
+                        match answered.get(key) {
+                            Some(previous) if previous != &descriptor => {
+                                return Err(McpError::invalid_request(
+                                    "Apps Task reused an answered input key",
+                                )
+                                .into());
+                            }
+                            Some(_) => {}
+                            None => {
+                                pending.insert(key.clone(), request.clone());
+                                descriptors.insert(key.clone(), descriptor);
+                            }
+                        }
+                    }
+                    if !pending.is_empty() {
+                        let input_required = apps_task_input_required(&pending)?;
+                        let encoded = self.resolve(&input_required).await?;
+                        let responses = serde_json::from_slice(&encoded).map_err(|_| {
+                            McpError::invalid_params("Invalid Apps Task input responses")
+                        })?;
+                        self.approve_task(&task).await?;
+                        client
+                            .update_apps_task(
+                                self.cx,
+                                self.cancellation,
+                                self.deadline,
+                                &task,
+                                responses,
+                            )
+                            .await?;
+                        self.checkpoint()?;
+                        answered.extend(descriptors);
+                    }
+                }
+                crate::FinalTask::Working(_) => {}
+            }
+            if polls >= policy.maximum_polls {
+                return Err(McpError::invalid_request("Apps Task poll budget exceeded").into());
+            }
+            if self.cx.now() < next_poll {
+                if self.cx.timer_driver().is_none() {
+                    return Err(McpAppsHostError::TimerUnavailable);
+                }
+                Sleep::new(next_poll).await;
+            }
+            self.approve_task(&task).await?;
+            polls += 1;
+            task = client
+                .get_apps_task(self.cx, self.cancellation, self.deadline, task_id.clone())
+                .await?;
+        }
+    }
+}
+
+#[cfg(feature = "tasks")]
+fn apps_task_input_required(
+    requests: &fastmcp_protocol::TaskInputRequests,
+) -> McpResult<fastmcp_protocol::InputRequiredResult> {
+    let invalid = || McpError::invalid_request("Invalid Apps Task input requests");
+    let wire = serde_json::to_value(requests).map_err(|_| invalid())?;
+    let fastmcp_protocol::ExactJsonValue::Object(requests) =
+        fastmcp_protocol::exact_json_from_serde(&wire).map_err(|_| invalid())?
+    else {
+        return Err(invalid());
+    };
+    fastmcp_protocol::InputRequiredResult::new(
+        Some(requests),
+        None,
+        fastmcp_protocol::ResultMeta::empty(),
+    )
+    .map_err(|_| invalid())
 }
 
 async fn dispatch_apps_server_input<C: McpAppsServerInputClient, E: McpAppsWireHostEffects>(
@@ -4080,7 +4648,7 @@ async fn dispatch_apps_server_input<C: McpAppsServerInputClient, E: McpAppsWireH
     let (deadline, original_parameters) = client.prepare_apps_server_input(cx, params.clone())?;
     let capabilities =
         original_parameters["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY].clone();
-    let mut driver = crate::MrtrDriver::new(
+    let driver = crate::MrtrDriver::new(
         cx,
         deadline,
         crate::MrtrDriverLimits::new(
@@ -4089,56 +4657,60 @@ async fn dispatch_apps_server_input<C: McpAppsServerInputClient, E: McpAppsWireH
         )?,
     )?;
     crate::wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
-        let mut parameters = original_parameters.clone();
-        let mut response_bytes = 0_usize;
-        loop {
-            driver.before_request()?;
-            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
-            let result = client
-                .request_apps_server_input(cx, cancellation, deadline, core_method, parameters)
+        let mut operation = AppsServerInputOperation {
+            cx,
+            cancellation,
+            deadline,
+            method,
+            params: &params,
+            capabilities,
+            driver,
+            response_bytes: 0,
+            effects,
+        };
+        #[cfg(feature = "tasks")]
+        let task_policy = if method == McpAppsRoutedMethod::ToolsCall {
+            let policy = operation
+                .effects
+                .server_task_policy(cx, cancellation, &params)
                 .await?;
-            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            operation.checkpoint()?;
+            if policy.is_some() {
+                client.admit_apps_tasks()?;
+            }
+            policy
+        } else {
+            None
+        };
+        #[cfg(feature = "tasks")]
+        let allow_tasks = task_policy.is_some();
+        #[cfg(not(feature = "tasks"))]
+        let allow_tasks = false;
+        let mut parameters = original_parameters.clone();
+        loop {
+            operation.driver.before_request()?;
+            operation.checkpoint()?;
+            let result = client
+                .request_apps_server_input(
+                    cx,
+                    cancellation,
+                    deadline,
+                    core_method,
+                    parameters,
+                    allow_tasks,
+                )
+                .await?;
+            operation.checkpoint()?;
+            #[cfg(feature = "tasks")]
+            if let CoreResult::Final(FinalCoreResult::ToolsCallTask { result }) = result {
+                let policy = task_policy.ok_or_else(wire_policy_denied)?;
+                return operation.observe_task(client, policy, result.task).await;
+            }
             let Some(input_required) = crate::mrtr_input_required_for_method(core_method, &result)
             else {
                 return project_reused_core_result(method, result).map_err(McpAppsHostError::Core);
             };
-            driver.begin_continuation()?;
-            driver.admit_input_responses(
-                input_required
-                    .input_requests()
-                    .map_or(0, |requests| requests.members().len()),
-            )?;
-            // Admit the entire batch before any consent or model effect. This
-            // uses the same capability/sub-capability checks as core MRTR,
-            // without invoking a connection-wide callback for this View.
-            crate::ReverseRequestHandlers::admit_input_required(&capabilities, input_required)?;
-            let responses = effects
-                .resolve_server_input(cx, cancellation, method, &params, input_required)
-                .await?;
-            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
-            if input_required.input_requests().is_some() {
-                responses
-                    .validate_against_input_required(input_required)
-                    .map_err(|_| {
-                        McpError::invalid_params(
-                            "Apps server input responses do not match the admitted round",
-                        )
-                    })?;
-            } else if !responses.is_empty() {
-                return Err(McpError::invalid_params(
-                    "Apps state-only continuation cannot carry input responses",
-                )
-                .into());
-            }
-            let encoded = serde_json::to_vec(&responses)
-                .map_err(|_| McpError::invalid_params("Apps server input could not serialize"))?;
-            response_bytes = response_bytes.saturating_add(encoded.len());
-            if response_bytes > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES {
-                return Err(McpError::invalid_params(
-                    "Apps server input response byte budget exceeded",
-                )
-                .into());
-            }
+            let encoded = operation.resolve(input_required).await?;
             let responses: crate::MrtrInputResponses = serde_json::from_slice(&encoded)
                 .map_err(|_| McpError::invalid_params("Invalid Apps server input responses"))?;
             parameters = crate::mrtr_retry_parameters(
@@ -4186,6 +4758,21 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<Value, McpAppsHostError> {
+        #[cfg(unix)]
+        if matches!(
+            method,
+            McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
+        ) {
+            return dispatch_apps_server_input(
+                self.client,
+                cx,
+                cancellation,
+                method,
+                params,
+                &mut (),
+            )
+            .await;
+        }
         self.client
             .forward_mcp_apps_reused_core(cx, cancellation, method, params)
             .await
@@ -4233,6 +4820,20 @@ impl McpAppsWireHostPolicy for McpAppsHttpClientWirePolicy<'_> {
         method: McpAppsRoutedMethod,
         params: Option<Value>,
     ) -> Result<Value, McpAppsHostError> {
+        if matches!(
+            method,
+            McpAppsRoutedMethod::ToolsCall | McpAppsRoutedMethod::ResourcesRead
+        ) {
+            return dispatch_apps_server_input(
+                self.client,
+                cx,
+                cancellation,
+                method,
+                params,
+                &mut (),
+            )
+            .await;
+        }
         self.client
             .forward_mcp_apps_reused_core(cx, cancellation, method, params)
             .await
@@ -5087,18 +5688,30 @@ exec sleep 10
     fn server_input_http_peer(
         results: Vec<Value>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Value>>) {
+        server_input_http_peer_with_extensions(results, false, false)
+    }
+
+    fn server_input_http_peer_with_extensions(
+        results: Vec<Value>,
+        tasks: bool,
+        sse: bool,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Value>>) {
         use std::io::{Read, Write};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let peer = std::thread::spawn(move || {
-            let discovery = json!({
+            let mut discovery = json!({
                 "resultType":"complete", "supportedVersions":["2026-07-28"],
                 "capabilities":{"tools":{},"resources":{},"extensions":{"io.modelcontextprotocol/ui":{}}},
                 "ttlMs":0, "cacheScope":"private",
                 "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-server-input-peer","version":"1"}}
             });
+            if tasks {
+                discovery["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"] =
+                    json!({});
+            }
             let mut requests = Vec::new();
             for result in std::iter::once(discovery).chain(results) {
                 let accept_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -5159,7 +5772,15 @@ exec sleep 10
                     assert_eq!(request["method"], "server/discover");
                 }
                 let body = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                let (body, content_type) = if sse && !requests.is_empty() {
+                    (
+                        format!("event: message\ndata: {body}\n\n"),
+                        "text/event-stream",
+                    )
+                } else {
+                    (body, "application/json")
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
                 stream.flush().unwrap();
                 requests.push(request);
             }
@@ -5169,6 +5790,14 @@ exec sleep 10
     }
 
     async fn server_input_http_client(cx: &Cx, address: std::net::SocketAddr) -> crate::HttpClient {
+        server_input_http_client_with_timeout(cx, address, std::time::Duration::from_secs(5)).await
+    }
+
+    async fn server_input_http_client_with_timeout(
+        cx: &Cx,
+        address: std::net::SocketAddr,
+        timeout: std::time::Duration,
+    ) -> crate::HttpClient {
         let plan = crate::ClientProtocolPlan::http(
             fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
             Some(crate::CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
@@ -5196,8 +5825,8 @@ exec sleep 10
             )
             .request_timeout_policy(
                 crate::RequestTimeoutPolicy::new(
-                    std::time::Duration::from_secs(5),
-                    std::time::Duration::from_secs(5),
+                    timeout,
+                    timeout,
                 )
                 .unwrap(),
             )
@@ -5275,6 +5904,502 @@ exec sleep 10
                 fastmcp_protocol::FinalInputResponses::default()
             })
         }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn server_task_snapshot(status: &str, creation: bool) -> Value {
+        let mut task = json!({
+            "resultType": if creation { "task" } else { "complete" },
+            "taskId": "private-server-task", "status": status,
+            "createdAt": "2026-07-28T12:00:00.000Z",
+            "lastUpdatedAt": "2026-07-28T12:00:01.000Z",
+            "ttlMs": null, "pollIntervalMs": 1,
+            "statusMessage": "Host-private status"
+        });
+        match status {
+            "input_required" => {
+                task["inputRequests"] = server_input_required("unused")["inputRequests"].clone()
+            }
+            "completed" => task["result"] = server_input_complete(),
+            "failed" => task["error"] = json!({"code":-32603,"message":"Host-private failure"}),
+            _ => {}
+        }
+        task
+    }
+
+    #[cfg(feature = "tasks")]
+    struct ServerTaskEffects {
+        policy: Option<McpAppsServerTaskPolicy>,
+        approve: bool,
+        revoke_after: Option<usize>,
+        snapshots: Arc<Mutex<Vec<Value>>>,
+        input: ServerInputEffects,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl ServerTaskEffects {
+        fn new() -> Self {
+            Self {
+                policy: Some(
+                    McpAppsServerTaskPolicy::new(
+                        std::time::Duration::from_millis(10),
+                        16,
+                        64 * 1024,
+                    )
+                    .unwrap(),
+                ),
+                approve: true,
+                revoke_after: None,
+                snapshots: Arc::new(Mutex::new(Vec::new())),
+                input: ServerInputEffects::new(
+                    server_input_response(),
+                    ServerInputDecision::Respond,
+                ),
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[allow(
+        clippy::unused_async_trait_impl,
+        reason = "test Host decisions use the public async effect hooks"
+    )]
+    impl McpAppsWireHostEffects for ServerTaskEffects {
+        async fn server_task_policy(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: &Value,
+        ) -> Result<Option<McpAppsServerTaskPolicy>, McpAppsHostError> {
+            wire_policy_checkpoint(cx, cancellation)?;
+            assert!(params.get("name").is_some());
+            Ok(self.policy)
+        }
+
+        async fn approve_server_task(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: &Value,
+            task: &crate::FinalTask,
+        ) -> Result<(), McpAppsHostError> {
+            wire_policy_checkpoint(cx, cancellation)?;
+            let mut snapshots = self.snapshots.lock().unwrap();
+            snapshots.push(
+                json!({"params":params,"taskId":task.base().task_id,"status":task.base().status}),
+            );
+            if !self.approve
+                || self
+                    .revoke_after
+                    .is_some_and(|limit| snapshots.len() > limit)
+            {
+                return Err(wire_policy_denied());
+            }
+            Ok(())
+        }
+
+        async fn resolve_server_input(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            method: McpAppsRoutedMethod,
+            params: &Value,
+            input_required: &fastmcp_protocol::InputRequiredResult,
+        ) -> Result<fastmcp_protocol::FinalInputResponses, McpAppsHostError> {
+            self.input
+                .resolve_server_input(cx, cancellation, method, params, input_required)
+                .await
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_apps_server_task_composes_mrtr_input_and_completion_without_replay() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for sse in [false, true] {
+                let (address, peer) = server_input_http_peer_with_extensions(vec![
+                    server_input_required("pre-task-state"),
+                    server_task_snapshot("working", true),
+                    server_task_snapshot("input_required", false),
+                    json!({"resultType":"complete"}),
+                    server_task_snapshot("input_required", false),
+                    server_task_snapshot("completed", false),
+                ], true, sse);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let effects = ServerTaskEffects::new();
+                let calls = Arc::clone(&effects.input.calls);
+                let snapshots = Arc::clone(&effects.snapshots);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let params = json!({"name":"server_task","arguments":{"value":7}});
+                let result = stateful_wire_request(&mut host, &mut view, &cx, "view-task-id", "tools/call", params.clone()).await;
+                assert_eq!(result["result"], json!({"content":[{"type":"text","text":"completed core operation"}]}));
+                assert!(!result.to_string().contains("private-server-task"));
+                assert!(!result.to_string().contains("Host-private"));
+                assert_eq!(*calls.lock().unwrap(), vec![
+                    json!({"params":params,"state":"pre-task-state"}),
+                    json!({"params":params,"state":null}),
+                ]);
+                assert!(snapshots.lock().unwrap().iter().all(|snapshot| snapshot["params"] == params));
+                assert_eq!(stateful_wire_request(&mut host, &mut view, &cx, "alive", "ping", json!({})).await["result"], json!({}));
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.iter().map(|request| request["method"].as_str().unwrap()).collect::<Vec<_>>(), vec![
+                    "server/discover", "tools/call", "tools/call", "tasks/get", "tasks/update", "tasks/get", "tasks/get",
+                ]);
+                assert_eq!(requests[1]["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"][fastmcp_protocol::TASKS_EXTENSION], json!({}));
+                assert_eq!(requests[2]["params"]["requestState"], "pre-task-state");
+                for request in &requests[3..] {
+                    assert_eq!(request["params"]["taskId"], "private-server-task");
+                    assert!(request["params"].get("requestState").is_none());
+                    assert!(!request.to_string().contains("view-task-id"));
+                }
+                assert_eq!(requests[4]["params"]["inputResponses"], server_input_response());
+            }
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_apps_server_task_requires_creation_and_snapshot_consent() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for opted_in in [false, true] {
+                let (address, peer) = server_input_http_peer_with_extensions(vec![server_task_snapshot("working", true), server_input_complete()], true, false);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let mut effects = ServerTaskEffects::new();
+                if !opted_in { effects.policy = None; }
+                effects.approve = false;
+                let snapshots = Arc::clone(&effects.snapshots);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                assert!(stateful_wire_request(&mut host, &mut view, &cx, "refused", "tools/call", json!({"name":"server_task"})).await.get("error").is_some());
+                assert_eq!(snapshots.lock().unwrap().len(), usize::from(opted_in));
+                assert!(stateful_wire_request(&mut host, &mut view, &cx, "healthy", "tools/call", json!({"name":"healthy"})).await.get("result").is_some());
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), 3, "refusal must not poll, update or cancel the Task");
+                assert_eq!(requests[2]["method"], "tools/call");
+                assert_eq!(requests[2]["params"]["name"], "healthy");
+                assert_eq!(requests[1]["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get(fastmcp_protocol::TASKS_EXTENSION).is_some(), opted_in);
+            }
+            // A plain Host grants no creation consent either; it must strip
+            // Tasks before the peer can create work, not just refuse a handle.
+            let (address, peer) = server_input_http_peer_with_extensions(vec![server_input_complete()], true, false);
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap();
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            assert!(stateful_wire_request(&mut host, &mut view, &cx, "plain", "tools/call", json!({"name":"ordinary"})).await.get("result").is_some());
+            let requests = peer.join().unwrap();
+            assert!(requests[1]["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get(fastmcp_protocol::TASKS_EXTENSION).is_none());
+
+            // The outer effects owner controls creation even if an inner
+            // wrapper would have granted it.
+            let (address, peer) = server_input_http_peer_with_extensions(vec![server_input_complete()], true, false);
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(ServerTaskEffects::new()).with_effects(());
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            assert!(stateful_wire_request(&mut host, &mut view, &cx, "ordinary", "tools/call", json!({"name":"server_task"})).await.get("result").is_some());
+            let requests = peer.join().unwrap();
+            assert!(requests[1]["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"].get(fastmcp_protocol::TASKS_EXTENSION).is_none());
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_apps_server_task_rejects_identity_input_and_observation_budget_violations() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for case in [
+                "identity",
+                "creation-time",
+                "polls",
+                "bytes",
+                "interval",
+                "capability",
+                "response-keys",
+                "response-kind",
+                "revoked-read",
+                "revoked-update",
+                "input-reuse",
+            ] {
+                let mut effects = ServerTaskEffects::new();
+                let mut results = match case {
+                    "identity" | "creation-time" => {
+                        let mut terminal = server_task_snapshot("completed", false);
+                        if case == "identity" {
+                            terminal["taskId"] = json!("foreign-task");
+                        } else {
+                            terminal["createdAt"] = json!("2026-07-28T11:00:00.000Z");
+                        }
+                        vec![server_task_snapshot("working", true), terminal]
+                    }
+                    "polls" => {
+                        effects.policy = Some(
+                            McpAppsServerTaskPolicy::new(
+                                std::time::Duration::from_millis(10),
+                                1,
+                                64 * 1024,
+                            )
+                            .unwrap(),
+                        );
+                        vec![
+                            server_task_snapshot("working", true),
+                            server_task_snapshot("working", false),
+                        ]
+                    }
+                    "bytes" => {
+                        effects.policy = Some(
+                            McpAppsServerTaskPolicy::new(
+                                std::time::Duration::from_millis(10),
+                                16,
+                                1,
+                            )
+                            .unwrap(),
+                        );
+                        vec![server_task_snapshot("working", true)]
+                    }
+                    "interval" => {
+                        let mut task = server_task_snapshot("working", true);
+                        task["pollIntervalMs"] = json!(u64::MAX);
+                        vec![task]
+                    }
+                    "capability" => {
+                        let mut task = server_task_snapshot("input_required", true);
+                        task["inputRequests"]["unadvertised"] = json!({"method":"roots/list"});
+                        vec![task]
+                    }
+                    "response-keys" | "response-kind" => {
+                        effects.input.responses =
+                            serde_json::from_value(if case == "response-keys" {
+                                json!({"foreign":server_input_response()["sample"]})
+                            } else {
+                                json!({"sample":{"roots":[]}})
+                            })
+                            .unwrap();
+                        vec![server_task_snapshot("input_required", true)]
+                    }
+                    "revoked-read" | "revoked-update" => {
+                        effects.revoke_after = Some(1);
+                        vec![server_task_snapshot(
+                            if case == "revoked-read" {
+                                "working"
+                            } else {
+                                "input_required"
+                            },
+                            true,
+                        )]
+                    }
+                    "input-reuse" => {
+                        let mut reused = server_task_snapshot("input_required", false);
+                        reused["inputRequests"]["sample"]["params"]["maxTokens"] = json!(64);
+                        vec![
+                            server_task_snapshot("input_required", true),
+                            json!({"resultType":"complete"}),
+                            reused,
+                        ]
+                    }
+                    _ => unreachable!(),
+                };
+                let expected_requests = results.len() + 2;
+                results.push(server_input_complete());
+                let (address, peer) = server_input_http_peer_with_extensions(results, true, false);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let calls = Arc::clone(&effects.input.calls);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let denied = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "denied",
+                    "tools/call",
+                    json!({"name":"server_task"}),
+                )
+                .await;
+                assert!(denied.get("error").is_some(), "case {case}: {denied}");
+                assert!(!denied.to_string().contains("private-server-task"));
+                assert!(
+                    stateful_wire_request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "healthy",
+                        "tools/call",
+                        json!({"name":"healthy"})
+                    )
+                    .await
+                    .get("result")
+                    .is_some(),
+                    "case {case}"
+                );
+                if case == "capability" {
+                    assert!(calls.lock().unwrap().is_empty());
+                }
+                if case == "input-reuse" {
+                    assert_eq!(calls.lock().unwrap().len(), 1);
+                }
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), expected_requests, "case {case}");
+                assert_eq!(
+                    requests.last().unwrap()["method"],
+                    "tools/call",
+                    "case {case}"
+                );
+                assert_eq!(
+                    requests.last().unwrap()["params"]["name"],
+                    "healthy",
+                    "case {case}"
+                );
+                assert!(
+                    !requests
+                        .iter()
+                        .any(|request| request["method"] == "tasks/cancel")
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_apps_server_task_cancellation_stays_with_its_view_and_drops_input() {
+        let (address, peer) = server_input_http_peer_with_extensions(
+            vec![
+                server_task_snapshot("input_required", true),
+                server_input_complete(),
+            ],
+            true,
+            false,
+        );
+        let (sibling_address, sibling_peer) = server_input_http_peer_with_extensions(
+            vec![server_task_snapshot("completed", true)],
+            true,
+            false,
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let mut effects = ServerTaskEffects::new();
+            effects.input.decision = ServerInputDecision::Pending;
+            let calls = Arc::clone(&effects.input.calls);
+            let dropped = Arc::clone(&effects.input.dropped);
+            let cancellation = Arc::clone(&effects.input.cancellation);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","id":"same-view-id","method":"tools/call","params":{"name":"needs-task-input"}}).to_string()).await.unwrap();
+            let mut pending = Box::pin(host.process_next(&cx));
+            poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                if calls.lock().unwrap().is_empty() { Poll::Pending } else { Poll::Ready(()) }
+            }).await;
+            let mut sibling_client = server_input_http_client(&cx, sibling_address).await;
+            let (sibling_transport, mut sibling_view) = mcp_apps_in_memory_wire_pair(8);
+            let mut sibling_host = sibling_client.mcp_apps_wire_host(sibling_transport, wire_configuration()).unwrap().with_effects(ServerTaskEffects::new());
+            activate_stateful_wire_host(&mut sibling_host, &mut sibling_view, &cx, None).await;
+            assert!(stateful_wire_request(&mut sibling_host, &mut sibling_view, &cx, "same-view-id", "tools/call", json!({"name":"sibling-task"})).await.get("result").is_some());
+            assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+            view.send_to_host(&cx, json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"same-view-id"}}).to_string()).await.unwrap();
+            pending.await.unwrap();
+            assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(cancellation.lock().unwrap().as_ref().unwrap().is_cancel_requested());
+            assert!(stateful_wire_request(&mut host, &mut view, &cx, "same-view-id", "tools/call", json!({"name":"healthy"})).await.get("result").is_some());
+            assert_eq!(calls.lock().unwrap().len(), 1);
+        });
+        let requests = peer.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["method"], "tools/call");
+        assert_eq!(requests[2]["params"]["name"], "healthy");
+        assert_eq!(sibling_peer.join().unwrap().len(), 2);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_apps_server_task_keeps_original_deadline_during_wait_and_input() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for status in ["working", "input_required"] {
+                let mut task = server_task_snapshot(status, true);
+                task["pollIntervalMs"] = json!(2_000);
+                let (address, peer) = server_input_http_peer_with_extensions(
+                    vec![task, server_input_complete()],
+                    true,
+                    false,
+                );
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client_with_timeout(
+                    &cx,
+                    address,
+                    std::time::Duration::from_millis(150),
+                )
+                .await;
+                let mut effects = ServerTaskEffects::new();
+                effects.input.decision = ServerInputDecision::Pending;
+                let dropped = Arc::clone(&effects.input.dropped);
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap()
+                    .with_effects(effects);
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                assert!(
+                    stateful_wire_request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "expired",
+                        "tools/call",
+                        json!({"name":"server_task"})
+                    )
+                    .await
+                    .get("error")
+                    .is_some()
+                );
+                if status == "input_required" {
+                    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                }
+                assert!(
+                    stateful_wire_request(
+                        &mut host,
+                        &mut view,
+                        &cx,
+                        "healthy",
+                        "tools/call",
+                        json!({"name":"healthy"})
+                    )
+                    .await
+                    .get("result")
+                    .is_some()
+                );
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), 3);
+                assert_eq!(requests[2]["method"], "tools/call");
+                assert_eq!(requests[2]["params"]["name"], "healthy");
+            }
+        });
     }
 
     #[test]
@@ -5569,6 +6694,93 @@ exec sleep 10
             "sibling-state"
         );
         assert_eq!(sibling_requests[3]["params"]["name"], "sibling-healthy");
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn public_stdio_apps_server_task_completes_with_host_input_and_per_call_creation_consent() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let script = r#"
+IFS= read -r discovery || exit 91
+case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/ui":{},"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-task-stdio","version":"1"}}}}'
+IFS= read -r first || exit 93
+case "$first" in *'"id":2'*) ;; *) exit 94 ;; esac
+case "$first" in *'"method":"tools/call"'*) ;; *) exit 95 ;; esac
+case "$first" in *'"io.modelcontextprotocol/tasks":{}'*) ;; *) exit 96 ;; esac
+case "$first" in *view-task-id*|*taskId*) exit 97 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"private-server-task","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"pollIntervalMs":1}}'
+IFS= read -r get || exit 98
+case "$get" in *'"id":3'*) ;; *) exit 99 ;; esac
+case "$get" in *'"method":"tasks/get"'*) ;; *) exit 100 ;; esac
+case "$get" in *'"taskId":"private-server-task"'*) ;; *) exit 101 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","taskId":"private-server-task","status":"input_required","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null,"pollIntervalMs":1,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
+IFS= read -r update || exit 102
+case "$update" in *'"id":4'*) ;; *) exit 103 ;; esac
+case "$update" in *'"method":"tasks/update"'*) ;; *) exit 104 ;; esac
+case "$update" in *'"taskId":"private-server-task"'*) ;; *) exit 105 ;; esac
+case "$update" in *'"inputResponses":{"sample":'*) ;; *) exit 106 ;; esac
+case "$update" in *host-approved*) ;; *) exit 107 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
+IFS= read -r final || exit 108
+case "$final" in *'"id":5'*) ;; *) exit 109 ;; esac
+case "$final" in *'"method":"tasks/get"'*) ;; *) exit 110 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","taskId":"private-server-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:02.000Z","ttlMs":null,"result":{"resultType":"complete","content":[{"type":"text","text":"stdio Task completed"}]}}}'
+IFS= read -r ordinary || exit 111
+case "$ordinary" in *'"id":6'*) ;; *) exit 112 ;; esac
+case "$ordinary" in *'"method":"tools/call"'*) ;; *) exit 113 ;; esac
+case "$ordinary" in *io.modelcontextprotocol/tasks*|*private-server-task*|*inputResponses*) exit 114 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","content":[{"type":"text","text":"ordinary call completed"}]}}'
+IFS= read -r fallback || exit 115
+case "$fallback" in *'"id":7'*) ;; *) exit 116 ;; esac
+case "$fallback" in *'"method":"tools/call"'*) ;; *) exit 117 ;; esac
+case "$fallback" in *'"name":"fallback"'*) ;; *) exit 118 ;; esac
+case "$fallback" in *io.modelcontextprotocol/tasks*|*private-server-task*|*inputResponses*) exit 119 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","content":[{"type":"text","text":"fallback call completed"}]}}'
+exec sleep 10
+"#;
+            let mut client = crate::ClientBuilder::new()
+                .protocol_plan(crate::ClientProtocolPlan::stdio(fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly))
+                .capabilities(fastmcp_protocol::ClientCapabilities {
+                    sampling: Some(fastmcp_protocol::SamplingCapability::default()),
+                    ..fastmcp_protocol::ClientCapabilities::default()
+                })
+                .mcp_apps(fastmcp_protocol::extensions::McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.into()]).unwrap())
+                .request_timeout_policy(crate::RequestTimeoutPolicy::new(std::time::Duration::from_secs(5), std::time::Duration::from_secs(5)).unwrap())
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script]).await.unwrap();
+            let effects = ServerTaskEffects::new();
+            let calls = Arc::clone(&effects.input.calls);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap().with_effects(effects);
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            let result = stateful_wire_request(&mut host, &mut view, &cx, "view-task-id", "tools/call", json!({"name":"server_task"})).await;
+            assert_eq!(result["result"], json!({"content":[{"type":"text","text":"stdio Task completed"}]}));
+            assert!(!result.to_string().contains("private-server-task"));
+            assert_eq!(*calls.lock().unwrap(), vec![json!({"params":{"name":"server_task"},"state":null})]);
+            drop(host);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client.mcp_apps_wire_host(transport, wire_configuration()).unwrap();
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            assert_eq!(stateful_wire_request(&mut host, &mut view, &cx, "ordinary", "tools/call", json!({"name":"ordinary"})).await["result"]["content"][0]["text"], "ordinary call completed");
+            drop(host);
+            // Exercise the portable fallback directly on Unix as well. It
+            // must not restore Tasks when admitting its prepared request.
+            let fallback = client
+                .forward_mcp_apps_reused_core(
+                    &cx,
+                    &McpRequestCancellation::default(),
+                    McpAppsRoutedMethod::ToolsCall,
+                    Some(json!({"name":"fallback"})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fallback["content"][0]["text"], "fallback call completed");
+            client.close_with_cx(&cx).await.unwrap();
+        });
     }
 
     #[cfg(unix)]
