@@ -1341,7 +1341,7 @@ where
     websocket_checkpoint(cx)?;
     Ok(AsyncWsClientTransport::from_upgraded_with_entropy(
         io,
-        cx.entropy_handle(),
+        cx.entropy().fork(cx.task_id()),
     ))
 }
 

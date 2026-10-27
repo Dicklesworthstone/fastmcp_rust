@@ -163,6 +163,10 @@ pub(super) async fn serve(
         raw_path,
         &request.headers,
         &request.body,
+        endpoint
+            .server
+            .extension_handler_registry()
+            .map(|registry| registry.descriptor_registry()),
     ) {
         buffered(cx, &shutdown, &mut framed, response, Some(&cors), io).await;
         return;
