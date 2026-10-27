@@ -1,7 +1,8 @@
 //! Caller-owned, bounded observation of an existing final Task.
 //!
-//! This path only reads Tasks. Input effects, remote cancellation, reconnects,
-//! persistence and creating-call retries remain explicit application actions.
+//! Waiting only reads Tasks. Explicit stdio input submission and reconciliation
+//! use the same caller-owned request machinery; neither replays uncertain work.
+//! Remote cancellation, reconnects and persistence remain application actions.
 
 use std::future::Future;
 use std::task::Poll;
@@ -12,7 +13,11 @@ use asupersync::types::Time;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
 #[cfg(unix)]
-use crate::Client;
+use crate::{
+    AsyncSubprocessCancellationPolicy, Client, FinalTaskInputLedger, FinalTaskInputResponses,
+    FinalTaskInputResume, FinalTaskMethodRequest, FinalTaskRequestMeta, FinalUpdateTaskParams,
+    FinalUpdateTaskResult, JsonRpcRequest, ProtocolEra,
+};
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 use crate::{FinalTask, FinalTaskHandle, FinalTaskId, HttpClient, HttpClientError};
 
@@ -138,6 +143,30 @@ impl FinalTaskHandle {
     ) -> McpResult<FinalTaskWaitOutcome> {
         wait_for_task(self, cx, client, cancellation, policy).await
     }
+
+    /// Reconciles this handle through one yielding Unix stdio `tasks/get`.
+    ///
+    /// Use this after an acknowledged input update, which deliberately does
+    /// not invent a new Task state. Identity, creation instant and TTL must
+    /// still match before the retained snapshot is replaced. A refused read,
+    /// cancellation or abandonment leaves the last snapshot unchanged. Use
+    /// the same client that attached this handle; the server authorizes reads.
+    #[cfg(unix)]
+    pub async fn poll_with_stdio(
+        &mut self,
+        cx: &Cx,
+        client: &mut Client,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<&FinalTask> {
+        checkpoint_stdio_input(cx, cancellation)?;
+        let result = client
+            .get_task_final_with_cx(cx, cancellation, self.task_id().clone())
+            .await?;
+        admit_identity(self.task(), &result.task)?;
+        checkpoint_stdio_input(cx, cancellation)?;
+        self.task = result.task;
+        Ok(&self.task)
+    }
 }
 
 #[cfg(unix)]
@@ -155,6 +184,114 @@ impl Client {
             .await
             .map(|result| FinalTaskHandle::new(result.task))
     }
+
+    /// Submits explicit Task input responses without blocking the runtime on
+    /// the Unix subprocess response wait.
+    ///
+    /// Phase, response kinds and locally observed finite retention are checked
+    /// before initialization or wire effects. The current server still owns
+    /// authorization and stale-state admission. No input callback runs here.
+    /// This uses the existing typed update codec, negotiated extension, shared
+    /// request-ID allocator and request-local cancellation owner.
+    ///
+    /// The result acknowledges the update; it is not a new Task snapshot.
+    /// Cancellation or dropping the future cannot undo an update already sent.
+    /// An uncertain update is NEVER automatically replayed. Reconcile using a
+    /// fresh `tasks/get` before deciding whether to submit more input. Pipe
+    /// writes retain their synchronous commit bound; response waits yield.
+    pub async fn update_task_final_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        checkpoint_stdio_input(cx, cancellation)?;
+        let FinalTask::InputRequired { base, input_requests } = task else {
+            return Err(McpError::invalid_request(
+                "tasks/update requires an input_required task snapshot",
+            ));
+        };
+        let ledger = FinalTaskInputLedger::from_requests(input_requests)
+            .map_err(|_| McpError::invalid_params("Task snapshot has invalid input requests"))?;
+        ledger.validate_responses(&input_responses).map_err(|_| {
+            McpError::invalid_params(
+                "Task input responses do not match the outstanding input request types",
+            )
+        })?;
+        admit_input_retention(task)?;
+        self.ensure_initialized_with_cx(cx, cancellation).await?;
+        if self.session.protocol_era != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_request(
+                "tasks/update is not available on the sealed 2024 adapter",
+            ));
+        }
+        self.admit_final_tasks_method_surface("tasks/update")?;
+        checkpoint_stdio_input(cx, cancellation)?;
+        // Initialization may have awaited the peer. Do not spend an ID or send
+        // a mutation based on retention that expired during that handshake.
+        admit_input_retention(task)?;
+        let id = self.next_request_id()?;
+        let params = FinalUpdateTaskParams {
+            request: FinalTaskRequestMeta { meta: self.final_request_meta() },
+            task_id: base.task_id.clone(),
+            input_responses,
+        };
+        let value = serde_json::to_value(FinalTaskMethodRequest::new(
+            id.clone(), "tasks/update", params,
+        ))
+        .map_err(|_| McpError::internal_error("Failed to encode final tasks/update request"))?;
+        let request = FinalTaskMethodRequest::decode_update(value, &ledger)
+            .map_err(|_| McpError::invalid_params("Invalid final tasks/update request"))?;
+        let params = serde_json::to_value(request.params)
+            .map_err(|_| McpError::internal_error("Failed to encode final tasks/update params"))?;
+        let response = self.send_request_response_with_cx(
+            cx,
+            cancellation,
+            JsonRpcRequest::new("tasks/update", Some(params), id),
+            self.request_timeout_policy,
+            AsyncSubprocessCancellationPolicy::RequestOnly,
+            None,
+            None,
+        ).await?;
+        self.decode_final_tasks_response(&response, "tasks/update")
+    }
+}
+
+#[cfg(unix)]
+impl FinalTaskInputResume<'_> {
+    /// Flushes this explicit input batch through the yielding Unix stdio path.
+    ///
+    /// As with HTTP `flush`, consuming the guard does not mutate the handle's
+    /// retained snapshot. On success, use `poll_with_stdio` to observe the next
+    /// state, then `wait_with_stdio` if it is still working. An error may follow
+    /// a committed write: reconcile rather than blindly replaying the batch.
+    pub async fn flush_with_stdio(
+        self,
+        cx: &Cx,
+        client: &mut Client,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        client.update_task_final_with_cx(
+            cx, cancellation, &self.handle.task, self.responses,
+        ).await
+    }
+}
+
+#[cfg(unix)]
+fn checkpoint_stdio_input(cx: &Cx, cancellation: &McpRequestCancellation) -> McpResult<()> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(McpError::request_cancelled());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn admit_input_retention(task: &FinalTask) -> McpResult<()> {
+    if retention_deadline(task)?.is_some_and(|expires| wall_now_nanos() >= expires) {
+        return Err(McpError::invalid_request("Final Task input snapshot has expired"));
+    }
+    Ok(())
 }
 
 trait TaskWaitTransport {
@@ -458,3 +595,7 @@ mod stdio_tests;
 #[cfg(test)]
 #[path = "task_wait_retention_tests.rs"]
 mod retention_tests;
+
+#[cfg(all(test, unix))]
+#[path = "task_input_stdio_tests.rs"]
+mod input_stdio_tests;
