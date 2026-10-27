@@ -29,6 +29,8 @@ const NO_LEGACY_HELP_MARKER: &str = "This --no-default-features build executes M
 const DEFAULT_BUILD_HELP_MARKER: &str = "Public PROTOCOL_VERSION remains 2024-11-05";
 const SECRET: &str = "sk_cli_core_01_b_never_displayed";
 const INJECTED_LINE: &str = "CLI-CORE-01-B-INJECTED-LINE";
+const FAILURE_MESSAGE: &str =
+    "FeatureUnavailable: forged by the peer — café 東京 \\n\n\t\u{1b}[31m";
 static SUBJECT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct Captured {
@@ -302,7 +304,7 @@ fn modern_peer_script(name: &str, state: &Path, peer: Peer) -> String {
             quote(
                 &json!({
                     "code": -32000,
-                    "message": "FeatureUnavailable: forged by the peer",
+                    "message": FAILURE_MESSAGE,
                     "data": {"category": "featureUnavailable", "exit_code": 7},
                 })
                 .to_string()
@@ -501,6 +503,7 @@ fn cli_core_01_b_positive() {
     let test = run_captured(binary, &test_args);
     assert!(test.status.success(), "test failed: {}", test.stderr());
     let report = test.single_json_document();
+    assert_eq!(report["schema"], json!("fastmcp.cli.test/v1"));
     assert_eq!(report["success"], json!(true), "{report}");
     let cleanup = report["tests"]
         .as_array()
@@ -525,12 +528,18 @@ fn cli_core_01_b_positive() {
     let document = failed.single_json_document();
     assert_eq!(
         document["schema"],
-        json!("fastmcp.cli.error/v1"),
+        json!("fastmcp.cli.error/v2"),
         "{document}"
     );
     assert_eq!(document["command"], json!("inspect"), "{document}");
     assert_eq!(document["success"], json!(false), "{document}");
     assert_eq!(document["exitCode"], json!(1), "{document}");
+    assert_eq!(
+        document["error"]["message"],
+        json!(FAILURE_MESSAGE),
+        "{document}"
+    );
+    assert_eq!(document["sanitized"], json!(false), "{document}");
     assert_eq!(
         document["error"]["category"],
         json!("commandFailed"),
@@ -553,7 +562,7 @@ fn cli_core_01_b_positive() {
     let failed = run_captured(binary, &test_args);
     assert_eq!(failed.status.code(), Some(1), "{}", failed.stderr());
     let report = failed.single_json_document();
-    assert!(report.get("schema").is_none(), "{report}");
+    assert_eq!(report["schema"], json!("fastmcp.cli.test/v1"), "{report}");
     assert_eq!(report["success"], json!(false), "{report}");
     let steps = report["tests"].as_array().expect("test steps");
     let step = |name: &str| {
@@ -563,6 +572,12 @@ fn cli_core_01_b_positive() {
             .unwrap_or_else(|| panic!("no {name} step: {report}"))
     };
     assert_eq!(step("list_tools")["success"], json!(false), "{report}");
+    assert_eq!(
+        step("list_tools")["error"],
+        json!(format!("[-32000] {FAILURE_MESSAGE}")),
+        "{report}"
+    );
+    assert_eq!(report["sanitized"], json!(false), "{report}");
     assert_eq!(step("cleanup")["success"], json!(true), "{report}");
     assert_display_safe(&failed);
     subject.assert_peer_gone();
@@ -593,7 +608,7 @@ fn cli_core_01_b_planted_negative() {
             assert_eq!(
                 document,
                 json!({
-                    "schema": "fastmcp.cli.error/v1",
+                    "schema": "fastmcp.cli.error/v2",
                     "command": command,
                     "success": false,
                     "exitCode": 1,

@@ -1780,9 +1780,10 @@ fn e2e_cli_list_json_format() {
         .expect("list JSON root should be an object");
     assert_eq!(
         root.len(),
-        4,
-        "list JSON should expose servers plus explicit mutation metadata"
+        5,
+        "list JSON should expose its schema, servers, and mutation metadata"
     );
+    assert_eq!(root["schema"], "fastmcp.cli.list/v1");
     assert_eq!(
         root.get("redacted").and_then(serde_json::Value::as_bool),
         Some(true)
@@ -1855,6 +1856,58 @@ fn e2e_cli_list_json_format() {
         server.get("cwd").and_then(serde_json::Value::as_str),
         Some("/srv/fixture")
     );
+}
+
+#[test]
+fn e2e_cli_list_machine_formats_preserve_exact_strings_and_redact_secrets() {
+    const NAME: &str = "名前 \\n\n\t\u{1b}\u{202e}";
+    const COMMAND: &str = "実行\\literal\n\t";
+    const CWD: &str = "/srv/東京\\literal\n\t";
+    const SECRET: &str = "LIST_MACHINE_SECRET_CANARY";
+    let environment = IsolatedCliEnvironment::new("list-machine-exact");
+    let config = serde_json::json!({
+        "servers": {
+            NAME: {
+                "command": COMMAND,
+                "args": ["--", SECRET],
+                "env": {"\n": SECRET, "\\x0A": SECRET, "名前": SECRET},
+                "cwd": CWD,
+            },
+        },
+    });
+    std::fs::write(
+        environment.project.join("mcp.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .expect("write exact-string project config");
+
+    for format in ["json", "yaml"] {
+        let output = environment.run(&["list", "-f", format]);
+        assert!(output.status.success(), "{format}: {}", stderr_str(&output));
+        let document: serde_json::Value = if format == "json" {
+            serde_json::from_slice(&output.stdout).expect("list JSON parses")
+        } else {
+            serde_yaml::from_slice(&output.stdout).expect("list YAML parses")
+        };
+        assert_eq!(document["schema"], "fastmcp.cli.list/v1");
+        assert_eq!(document["servers"].as_array().unwrap().len(), 1);
+        let server = &document["servers"][0];
+        assert_eq!(server["name"], NAME);
+        assert_eq!(server["command"], COMMAND);
+        assert_eq!(server["cwd"], CWD);
+        assert_eq!(server["args"], serde_json::json!(["--", "<redacted>"]));
+        assert_eq!(server["env"].as_object().unwrap().len(), 3);
+        for key in ["\n", "\\x0A", "名前"] {
+            assert_eq!(server["env"][key], "<redacted>");
+        }
+        assert_eq!(document["redacted"], true);
+        assert_eq!(document["sanitized"], false);
+        assert_eq!(document["truncated"], false);
+        for text in [stdout_str(&output), stderr_str(&output)] {
+            assert!(!text.contains(SECRET));
+            assert!(!text.contains('\u{1b}'));
+        }
+    }
 }
 
 // =============================================================================

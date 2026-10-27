@@ -23,7 +23,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::env;
 #[cfg(test)]
 use std::ffi::OsStr;
@@ -1354,7 +1354,7 @@ fn write_cli_error(error: &fastmcp_core::McpError) {
 const CLI_FAILURE_EXIT_CODE: u8 = 1;
 
 /// Schema of the machine-readable failure document.
-const CLI_ERROR_DOCUMENT_SCHEMA: &str = "fastmcp.cli.error/v1";
+const CLI_ERROR_DOCUMENT_SCHEMA: &str = "fastmcp.cli.error/v2";
 
 /// Set once this process has started writing to stdout. A machine output mode
 /// keeps stdout to exactly one JSON document, so a failure after a command
@@ -1382,7 +1382,7 @@ fn report_cli_failure(
             let document = cli_error_document(command, category, error);
             // Best effort: the stderr diagnostic above already reports the
             // failure if stdout itself is unwritable.
-            if let Ok(text) = serde_json::to_string_pretty(&document) {
+            if let Ok(text) = serialize_machine_json(&document, "CLI error document") {
                 let _ = write_stdout(&text, "CLI error document", true);
             }
         }
@@ -1395,7 +1395,8 @@ fn cli_error_document(
     category: CliFailureCategory,
     error: &fastmcp_core::McpError,
 ) -> serde_json::Value {
-    let (message, mutation) = sanitize_peer_text_with_metadata(&error.message, PEER_DETAIL_LIMIT);
+    let mut budget = InspectJsonBudget::default();
+    let message = bounded_json_string_with_limit(&error.message, PEER_DETAIL_LIMIT, &mut budget);
     let mut failure = serde_json::Map::new();
     match category {
         CliFailureCategory::FeatureUnavailable(
@@ -1410,16 +1411,16 @@ fn cli_error_document(
         }
     }
     failure.insert("code".to_owned(), i32::from(error.code).into());
-    failure.insert("message".to_owned(), message.into());
+    failure.insert("message".to_owned(), message);
     serde_json::json!({
         "schema": CLI_ERROR_DOCUMENT_SCHEMA,
         "command": command,
         "success": false,
         "exitCode": CLI_FAILURE_EXIT_CODE,
         "error": failure,
-        "redacted": mutation.redacted,
-        "sanitized": mutation.sanitized,
-        "truncated": mutation.truncated,
+        "redacted": budget.mutation.redacted,
+        "sanitized": budget.mutation.sanitized,
+        "truncated": budget.mutation.truncated,
     })
 }
 
@@ -1644,7 +1645,7 @@ impl OutputMutationMetadata {
 
 /// Renders untrusted text as bounded, single-line printable ASCII through the
 /// shared [`UntrustedDisplayText::ascii`] path, with the CLI's redaction and
-/// truncation markers. Inspect's machine JSON has a separate exact-string
+/// truncation markers. Machine JSON has a separate exact-string
 /// path; terminal previews report every redaction, sanitation, and truncation.
 fn sanitize_peer_text_with_metadata(value: &str, limit: usize) -> (String, OutputMutationMetadata) {
     let (rendered, mutation) = fastmcp_console::console::UntrustedDisplayText::ascii(
@@ -2896,18 +2897,18 @@ fn format_redacted_environment(environment: Option<&HashMap<String, String>>) ->
 /// List output for JSON/YAML serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BoundedServerEntry {
-    name: String,
-    source: String,
-    transport: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    command: String,
-    args: Vec<String>,
+    name: serde_json::Value,
+    source: serde_json::Value,
+    transport: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
-    env: Option<BTreeMap<String, String>>,
+    command: Option<serde_json::Value>,
+    args: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cwd: Option<String>,
+    env: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    endpoint: Option<String>,
+    cwd: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credentials_configured: Option<bool>,
     enabled: bool,
@@ -2916,16 +2917,58 @@ struct BoundedServerEntry {
 /// List output for JSON/YAML serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListOutput {
+    schema: String,
     servers: Vec<BoundedServerEntry>,
     #[serde(flatten)]
     mutation: OutputMutationMetadata,
 }
 
+/// Machine environment maps keep their original keys and redact every value.
+/// A key that cannot be disclosed exactly withholds the map rather than
+/// inventing a name or a collision suffix that could identify another key.
+fn bounded_json_environment(
+    environment: &HashMap<String, String>,
+    limit: usize,
+    budget: &mut InspectJsonBudget,
+) -> serde_json::Value {
+    budget.mutation.redacted |= !environment.is_empty();
+    budget.mutation.truncated |= environment.len() > limit;
+    if limit == 0 {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    let mut selected = BinaryHeap::with_capacity(limit.saturating_add(1));
+    for key in environment.keys() {
+        if key.len() > PEER_FIELD_LIMIT {
+            budget.mutation.truncated = true;
+            return serde_json::Value::Null;
+        }
+        if selected.len() < limit {
+            selected.push(key);
+        } else if selected.peek().is_some_and(|largest| key < *largest) {
+            let _ = selected.pop();
+            selected.push(key);
+        }
+    }
+    let mut keys = selected.into_vec();
+    keys.sort_unstable();
+    let mut rendered = serde_json::Map::new();
+    for key in keys {
+        if key.len() > budget.string_bytes_remaining {
+            budget.mutation.truncated = true;
+            return serde_json::Value::Null;
+        }
+        if redact_free_text_credentials_with(key, REDACTED_ENV_VALUE) != key.as_str() {
+            return serde_json::Value::Null;
+        }
+        budget.string_bytes_remaining -= key.len();
+        rendered.insert(key.clone(), bounded_json_string(REDACTED_ENV_VALUE, budget));
+    }
+    serde_json::Value::Object(rendered)
+}
+
 fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
-    let mut mutation = OutputMutationMetadata {
-        truncated: servers.len() > CLI_OUTPUT_MAX_ITEMS,
-        ..OutputMutationMetadata::default()
-    };
+    let mut budget = InspectJsonBudget::default();
+    budget.mutation.truncated = servers.len() > CLI_OUTPUT_MAX_ITEMS;
     let mut nested_items_remaining = CLI_OUTPUT_MAX_ITEMS;
     let mut bounded = Vec::with_capacity(servers.len().min(CLI_OUTPUT_MAX_ITEMS));
     for entry in servers.iter().take(CLI_OUTPUT_MAX_ITEMS) {
@@ -2936,62 +2979,52 @@ fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
             .iter()
             .take(argument_limit)
             .map(|argument| {
-                if after_end_of_options {
+                if argument.len() > JSON_PREVIEW_MAX_STRING_CHARS {
+                    budget.mutation.redacted = true;
+                    budget.mutation.truncated = true;
+                    return serde_json::Value::Null;
+                }
+                let rendered = if after_end_of_options {
                     REDACTED_ARGUMENT_VALUE.to_owned()
                 } else if argument == "--" {
                     after_end_of_options = true;
                     "--".to_owned()
                 } else {
                     redact_argument(argument)
-                }
+                };
+                budget.mutation.redacted |= argument != &rendered;
+                bounded_json_string(&rendered, &mut budget)
             })
             .collect::<Vec<_>>();
         nested_items_remaining = nested_items_remaining.saturating_sub(args.len());
-        mutation.truncated |= entry.args.len() > args.len();
-        mutation.redacted |= entry
-            .args
-            .iter()
-            .take(args.len())
-            .zip(&args)
-            .any(|(original, rendered)| original != rendered);
+        budget.mutation.truncated |= entry.args.len() > args.len();
 
         let env = entry.env.as_ref().map(|environment| {
             let environment_limit = environment.len().min(nested_items_remaining);
-            let (rendered_entries, environment_mutation) =
-                redacted_environment_entries_with_limit(environment, environment_limit);
-            mutation.merge(environment_mutation);
-            let bounded = rendered_entries.into_iter().collect::<BTreeMap<_, _>>();
-            nested_items_remaining = nested_items_remaining.saturating_sub(bounded.len());
-            bounded
+            nested_items_remaining = nested_items_remaining.saturating_sub(environment_limit);
+            bounded_json_environment(environment, environment_limit, &mut budget)
         });
 
-        let (name, name_mutation) = sanitize_peer_text_with_metadata(&entry.name, PEER_FIELD_LIMIT);
-        mutation.merge(name_mutation);
-        let (source, source_mutation) =
-            sanitize_peer_text_with_metadata(&entry.source, PEER_FIELD_LIMIT);
-        mutation.merge(source_mutation);
-        let (transport, transport_mutation) =
-            sanitize_peer_text_with_metadata(&entry.transport, PEER_FIELD_LIMIT);
-        mutation.merge(transport_mutation);
-        let (command, command_mutation) =
-            sanitize_peer_text_with_metadata(&entry.command, PEER_FIELD_LIMIT);
-        mutation.merge(command_mutation);
-        let cwd = entry.cwd.as_deref().map(|cwd| {
-            let (cwd, cwd_mutation) = sanitize_peer_text_with_metadata(cwd, PEER_FIELD_LIMIT);
-            mutation.merge(cwd_mutation);
-            cwd
+        let name = bounded_json_string_with_limit(&entry.name, PEER_FIELD_LIMIT, &mut budget);
+        let source = bounded_json_string_with_limit(&entry.source, PEER_FIELD_LIMIT, &mut budget);
+        let transport =
+            bounded_json_string_with_limit(&entry.transport, PEER_FIELD_LIMIT, &mut budget);
+        let command = (!entry.command.is_empty()).then(|| {
+            bounded_json_string_with_limit(&entry.command, PEER_FIELD_LIMIT, &mut budget)
         });
-        let endpoint = entry.endpoint.as_deref().map(|endpoint| {
-            let (endpoint, endpoint_mutation) =
-                sanitize_peer_text_with_metadata(endpoint, PEER_FIELD_LIMIT);
-            mutation.merge(endpoint_mutation);
-            endpoint
-        });
-        mutation.redacted |= entry
+        let cwd = entry
+            .cwd
+            .as_deref()
+            .map(|cwd| bounded_json_string_with_limit(cwd, PEER_FIELD_LIMIT, &mut budget));
+        let endpoint = entry
+            .endpoint
+            .as_deref()
+            .map(|endpoint| bounded_json_string_with_limit(endpoint, PEER_FIELD_LIMIT, &mut budget));
+        budget.mutation.redacted |= entry
             .endpoint
             .as_deref()
             .is_some_and(|endpoint| endpoint.ends_with(REDACTED_REMOTE_ROUTE));
-        mutation.redacted |= entry.credentials_configured == Some(true);
+        budget.mutation.redacted |= entry.credentials_configured == Some(true);
 
         bounded.push(BoundedServerEntry {
             name,
@@ -3007,8 +3040,9 @@ fn bounded_server_entries(servers: &[ServerEntry]) -> ListOutput {
         });
     }
     ListOutput {
+        schema: "fastmcp.cli.list/v1".to_owned(),
         servers: bounded,
-        mutation,
+        mutation: budget.mutation,
     }
 }
 
@@ -3132,16 +3166,12 @@ fn cmd_list(
         }
         ListFormat::Json => {
             let output = bounded_server_entries(&servers);
-            let json = serde_json::to_string_pretty(&output).map_err(|e| {
-                fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
-            })?;
+            let json = serialize_machine_json(&output, "list JSON")?;
             write_stdout(&json, "list output", true)?;
         }
         ListFormat::Yaml => {
             let output = bounded_server_entries(&servers);
-            let yaml = serde_yaml::to_string(&output).map_err(|e| {
-                fastmcp_core::McpError::internal_error(format!("YAML serialization error: {e}"))
-            })?;
+            let yaml = serialize_machine_yaml(&output, "list YAML")?;
             write_stdout(&yaml, "list output", false)?;
         }
     }
@@ -3953,6 +3983,10 @@ struct TestResult {
     timeout_source: Option<TestTimeoutSource>,
     #[serde(skip)]
     mutation: OutputMutationMetadata,
+    /// Exact bounded detail/error text, captured before terminal rendering.
+    /// `Some(Null)` records an omitted oversized field without inventing text.
+    #[serde(skip)]
+    machine_text: Option<serde_json::Value>,
 }
 
 /// Full test report output.
@@ -3965,30 +3999,28 @@ struct TestReport {
 }
 
 fn bounded_test_report_value(report: &TestReport) -> serde_json::Value {
-    let mut mutation = OutputMutationMetadata {
-        truncated: report.tests.len() > CLI_OUTPUT_MAX_ITEMS,
-        ..OutputMutationMetadata::default()
-    };
+    let mut budget = InspectJsonBudget::default();
+    budget.mutation.truncated = report.tests.len() > CLI_OUTPUT_MAX_ITEMS;
     let mut tests = Vec::with_capacity(report.tests.len().min(CLI_OUTPUT_MAX_ITEMS));
     for result in report.tests.iter().take(CLI_OUTPUT_MAX_ITEMS) {
-        mutation.merge(result.mutation);
-        let (name, name_mutation) =
-            sanitize_peer_text_with_metadata(&result.name, PEER_FIELD_LIMIT);
-        mutation.merge(name_mutation);
-        let details = result.details.as_deref().map(|value| {
-            let (value, value_mutation) =
-                sanitize_peer_text_with_metadata(value, PEER_DETAIL_LIMIT);
-            mutation.merge(value_mutation);
-            value
-        });
-        let error = result.error.as_deref().map(|value| {
-            let (value, value_mutation) =
-                sanitize_peer_text_with_metadata(value, PEER_DETAIL_LIMIT);
-            mutation.merge(value_mutation);
-            value
-        });
+        budget.mutation.merge(result.mutation);
+        let name = bounded_json_string_with_limit(&result.name, PEER_FIELD_LIMIT, &mut budget);
+        let details = match result.machine_text.as_ref().filter(|_| result.success) {
+            Some(value) => Some(bounded_inspect_json_value(value, 0, &mut budget)),
+            None => result
+                .details
+                .as_deref()
+                .map(|value| bounded_json_string_with_limit(value, PEER_DETAIL_LIMIT, &mut budget)),
+        };
+        let error = match result.machine_text.as_ref().filter(|_| !result.success) {
+            Some(value) => Some(bounded_inspect_json_value(value, 0, &mut budget)),
+            None => result
+                .error
+                .as_deref()
+                .map(|value| bounded_json_string_with_limit(value, PEER_DETAIL_LIMIT, &mut budget)),
+        };
         let mut test = serde_json::Map::new();
-        test.insert("name".to_owned(), serde_json::Value::String(name));
+        test.insert("name".to_owned(), name);
         test.insert(
             "success".to_owned(),
             serde_json::Value::Bool(result.success),
@@ -4001,10 +4033,10 @@ fn bounded_test_report_value(report: &TestReport) -> serde_json::Value {
             serde_json::json!(result.duration_ms),
         );
         if let Some(details) = details {
-            test.insert("details".to_owned(), serde_json::Value::String(details));
+            test.insert("details".to_owned(), details);
         }
         if let Some(error) = error {
-            test.insert("error".to_owned(), serde_json::Value::String(error));
+            test.insert("error".to_owned(), error);
         }
         if let Some(timeout_source) = result.timeout_source {
             test.insert(
@@ -4014,26 +4046,22 @@ fn bounded_test_report_value(report: &TestReport) -> serde_json::Value {
         }
         tests.push(serde_json::Value::Object(test));
     }
-    let (server, server_mutation) =
-        sanitize_peer_text_with_metadata(&report.server, PEER_FIELD_LIMIT);
-    mutation.merge(server_mutation);
+    let server = bounded_json_string_with_limit(&report.server, PEER_FIELD_LIMIT, &mut budget);
     serde_json::json!({
+        "schema": "fastmcp.cli.test/v1",
         "server": server,
         "success": report.success,
         "tests": tests,
         "total_duration_ms": report.total_duration_ms,
-        "redacted": mutation.redacted,
-        "sanitized": mutation.sanitized,
-        "truncated": mutation.truncated,
+        "redacted": budget.mutation.redacted,
+        "sanitized": budget.mutation.sanitized,
+        "truncated": budget.mutation.truncated,
     })
 }
 
 fn write_test_report(report: &TestReport, json_output: bool) -> McpResult<()> {
     if json_output {
-        let json =
-            serde_json::to_string_pretty(&bounded_test_report_value(report)).map_err(|e| {
-                fastmcp_core::McpError::internal_error(format!("JSON serialization error: {e}"))
-            })?;
+        let json = serialize_machine_json(&bounded_test_report_value(report), "test JSON")?;
         write_stdout(&json, "test output", true)
     } else {
         let summary = if report.success {
@@ -4051,7 +4079,18 @@ fn failed_test_result(
     error: &fastmcp_core::McpError,
 ) -> TestResult {
     let prefix = format!("[{}] ", i32::from(error.code));
-    let (message, mutation) = sanitize_peer_text_with_metadata(
+    let mut budget = InspectJsonBudget::default();
+    let machine_text = match bounded_json_string_with_limit(
+        &error.message,
+        PEER_DETAIL_LIMIT.saturating_sub(prefix.len()),
+        &mut budget,
+    ) {
+        serde_json::Value::String(message) => {
+            serde_json::Value::String(format!("{prefix}{message}"))
+        }
+        omitted => omitted,
+    };
+    let message = sanitize_peer_text(
         &error.message,
         PEER_DETAIL_LIMIT.saturating_sub(prefix.len()),
     );
@@ -4063,7 +4102,8 @@ fn failed_test_result(
         details: None,
         error: Some(format!("{prefix}{message}")),
         timeout_source: allowlisted_test_timeout_source(error),
-        mutation,
+        mutation: budget.mutation,
+        machine_text: Some(machine_text),
     }
 }
 
@@ -4272,6 +4312,7 @@ async fn cmd_test(
         error: None,
         timeout_source: None,
         mutation: OutputMutationMetadata::default(),
+        machine_text: None,
     };
     if !json_output {
         finish_test_output(
@@ -4401,6 +4442,7 @@ async fn cmd_test(
             error: None,
             timeout_source: None,
             mutation: OutputMutationMetadata::default(),
+            machine_text: None,
         },
         Err(error) => failed_test_result("cleanup", cleanup_start.elapsed(), &error),
     };
@@ -4445,7 +4487,10 @@ where
     let start = std::time::Instant::now();
     match test_fn(cx).await {
         Ok(details) => {
-            let (details, mutation) = sanitize_peer_text_with_metadata(&details, PEER_DETAIL_LIMIT);
+            let mut budget = InspectJsonBudget::default();
+            let machine_text = (!details.is_empty())
+                .then(|| bounded_json_string_with_limit(&details, PEER_DETAIL_LIMIT, &mut budget));
+            let details = sanitize_peer_text(&details, PEER_DETAIL_LIMIT);
             TestResult {
                 name: name.to_string(),
                 success: true,
@@ -4454,7 +4499,8 @@ where
                 details: (!details.is_empty()).then_some(details),
                 error: None,
                 timeout_source: None,
-                mutation,
+                mutation: budget.mutation,
+                machine_text,
             }
         }
         Err(error) => failed_test_result(name, start.elapsed(), &error),
@@ -4471,6 +4517,7 @@ fn skipped_test(name: &str, reason: &str) -> TestResult {
         error: None,
         timeout_source: None,
         mutation: OutputMutationMetadata::default(),
+        machine_text: None,
     }
 }
 
@@ -8045,7 +8092,7 @@ fn write_inspect_stdout(output: &str) -> McpResult<()> {
     write_inspect_output(&mut stdout.lock(), output)
 }
 
-/// Inspect JSON never uses terminal escapes. Retained strings and object keys
+/// Machine JSON/YAML never uses terminal escapes. Retained strings and object keys
 /// keep their protocol spelling; only serde_json performs JSON escaping.
 /// Credential redaction remains a separate disclosure policy, and omitted
 /// strings are null rather than plausible truncated protocol identifiers.
@@ -8068,7 +8115,17 @@ impl Default for InspectJsonBudget {
 }
 
 fn bounded_json_string(value: &str, budget: &mut InspectJsonBudget) -> serde_json::Value {
-    let limit = JSON_PREVIEW_MAX_STRING_CHARS.min(budget.string_bytes_remaining);
+    bounded_json_string_with_limit(value, JSON_PREVIEW_MAX_STRING_CHARS, budget)
+}
+
+fn bounded_json_string_with_limit(
+    value: &str,
+    field_limit: usize,
+    budget: &mut InspectJsonBudget,
+) -> serde_json::Value {
+    let limit = field_limit
+        .min(JSON_PREVIEW_MAX_STRING_CHARS)
+        .min(budget.string_bytes_remaining);
     if value.len() > limit {
         budget.mutation.truncated = true;
         return serde_json::Value::Null;
@@ -8457,52 +8514,77 @@ fn format_inspect_json_for_capabilities_with_truncation(
         "truncated": budget.mutation.truncated,
     });
 
-    serialize_inspect_json(&output)
+    serialize_machine_json(&output, "inspect JSON")
 }
 
 /// Bound encoded bytes while serializing: control characters can expand to
 /// six JSON bytes each even when the retained UTF-8 strings fit their budget.
-fn serialize_inspect_json(value: &serde_json::Value) -> McpResult<String> {
-    struct BoundedWriter {
-        bytes: Vec<u8>,
-        overflow: Option<usize>,
+#[derive(Default)]
+struct BoundedMachineWriter {
+    bytes: Vec<u8>,
+    overflow: Option<usize>,
+}
+
+impl Write for BoundedMachineWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let total = self.bytes.len().saturating_add(bytes.len());
+        if total > CLI_OUTPUT_MAX_BYTES {
+            self.overflow = Some(total);
+            return Err(io::Error::other("machine output exceeds its byte limit"));
+        }
+        if total > self.bytes.capacity() {
+            let capacity = total
+                .max(self.bytes.capacity().saturating_mul(2))
+                .min(CLI_OUTPUT_MAX_BYTES);
+            self.bytes.reserve_exact(capacity - self.bytes.len());
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
     }
 
-    impl Write for BoundedWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            let total = self.bytes.len().saturating_add(bytes.len());
-            if total > CLI_OUTPUT_MAX_BYTES {
-                self.overflow = Some(total);
-                return Err(io::Error::other("inspect JSON exceeds its byte limit"));
-            }
-            if total > self.bytes.capacity() {
-                let capacity = total
-                    .max(self.bytes.capacity().saturating_mul(2))
-                    .min(CLI_OUTPUT_MAX_BYTES);
-                self.bytes.reserve_exact(capacity - self.bytes.len());
-            }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
+}
 
-    let mut writer = BoundedWriter {
-        bytes: Vec::new(),
-        overflow: None,
-    };
-    serde_json::to_writer_pretty(&mut writer, value).map_err(|error| {
-        writer.overflow.map_or_else(
-            || fastmcp_core::McpError::internal_error(format!("JSON serialization error: {error}")),
-            |bytes| output_too_large("inspect JSON", bytes),
+impl BoundedMachineWriter {
+    fn serialization_error(
+        &self,
+        format: &str,
+        context: &str,
+        error: impl std::fmt::Display,
+    ) -> fastmcp_core::McpError {
+        self.overflow.map_or_else(
+            || {
+                fastmcp_core::McpError::internal_error(format!(
+                    "{format} serialization error: {error}"
+                ))
+            },
+            |bytes| output_too_large(context, bytes),
         )
-    })?;
-    String::from_utf8(writer.bytes).map_err(|_| {
-        fastmcp_core::McpError::internal_error("inspect JSON serializer produced invalid UTF-8")
-    })
+    }
+
+    fn into_string(self, context: &str) -> McpResult<String> {
+        String::from_utf8(self.bytes).map_err(|_| {
+            fastmcp_core::McpError::internal_error(format!(
+                "{context} serializer produced invalid UTF-8"
+            ))
+        })
+    }
+}
+
+fn serialize_machine_json(value: &impl Serialize, context: &str) -> McpResult<String> {
+    let mut writer = BoundedMachineWriter::default();
+    serde_json::to_writer_pretty(&mut writer, value)
+        .map_err(|error| writer.serialization_error("JSON", context, error))?;
+    writer.into_string(context)
+}
+
+fn serialize_machine_yaml(value: &impl Serialize, context: &str) -> McpResult<String> {
+    let mut writer = BoundedMachineWriter::default();
+    serde_yaml::to_writer(&mut writer, value)
+        .map_err(|error| writer.serialization_error("YAML", context, error))?;
+    writer.into_string(context)
 }
 
 /// Install command: Generate configuration for MCP clients.
@@ -16528,9 +16610,11 @@ IFS= read -r end
             let json = serde_json::to_string(&output).unwrap();
 
             assert_eq!(output.servers.len(), CLI_OUTPUT_MAX_ITEMS);
+            assert_eq!(output.schema, "fastmcp.cli.list/v1");
             assert!(output.mutation.redacted);
-            assert!(output.mutation.sanitized);
+            assert!(!output.mutation.sanitized);
             assert!(output.mutation.truncated);
+            assert_eq!(output.servers[0].name, "[server]\u{1b}[31m");
             assert!(json.contains("[server]"));
             assert!(json.contains(REDACTED_ENV_VALUE));
             assert!(!json.contains(SECRET));
@@ -16539,25 +16623,34 @@ IFS= read -r end
         }
 
         #[test]
-        fn bounded_list_environment_keys_are_sanitized_exactly_once() {
+        fn bounded_list_environment_keys_round_trip_without_terminal_escapes() {
             let output = bounded_server_entries(&[ServerEntry {
                 name: "server".to_owned(),
                 source: "test".to_owned(),
                 transport: "stdio".to_owned(),
                 command: "command".to_owned(),
                 args: Vec::new(),
-                env: Some(HashMap::from([("\n".to_owned(), "secret".to_owned())])),
+                env: Some(HashMap::from([
+                    ("\n".to_owned(), "secret".to_owned()),
+                    ("\\x0A".to_owned(), "secret".to_owned()),
+                    ("名前".to_owned(), "secret".to_owned()),
+                ])),
                 cwd: None,
                 endpoint: None,
                 credentials_configured: None,
                 enabled: true,
             }]);
             let json = serde_json::to_string(&output).unwrap();
+            let document: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let environment = document["servers"][0]["env"].as_object().unwrap();
 
             assert!(output.mutation.redacted);
-            assert!(output.mutation.sanitized);
-            assert!(json.contains("\\\\x0A"));
-            assert!(!json.contains("\\\\x5Cx0A"));
+            assert!(!output.mutation.sanitized);
+            assert!(!output.mutation.truncated);
+            assert_eq!(environment.len(), 3);
+            for key in ["\n", "\\x0A", "名前"] {
+                assert_eq!(environment[key], REDACTED_ENV_VALUE);
+            }
         }
 
         #[test]
@@ -16576,7 +16669,7 @@ IFS= read -r end
                 enabled: true,
             }]);
 
-            let environment = output.servers[0].env.as_ref().unwrap();
+            let environment = output.servers[0].env.as_ref().unwrap().as_object().unwrap();
             assert!(environment.contains_key(&exact_key));
             assert!(output.mutation.redacted);
             assert!(!output.mutation.sanitized);
@@ -16605,8 +16698,9 @@ IFS= read -r end
 
             assert!(!serialized.contains(SECRET));
             assert!(!serialized.contains("value-secret"));
+            assert!(output.servers[0].env.as_ref().unwrap().is_null());
             assert!(output.mutation.redacted);
-            assert!(output.mutation.sanitized);
+            assert!(!output.mutation.sanitized);
         }
 
         #[test]
@@ -16656,14 +16750,7 @@ IFS= read -r end
                 credentials_configured: None,
                 enabled: true,
             }]);
-            let rendered_key = oversized.servers[0]
-                .env
-                .as_ref()
-                .unwrap()
-                .keys()
-                .next()
-                .unwrap();
-            assert!(rendered_key.len() <= PEER_FIELD_LIMIT);
+            assert!(oversized.servers[0].env.as_ref().unwrap().is_null());
             assert!(!oversized.mutation.sanitized);
             assert!(oversized.mutation.truncated);
 
@@ -16683,13 +16770,14 @@ IFS= read -r end
                 enabled: true,
             }]);
             let environment = colliding.servers[0].env.as_ref().unwrap();
-            let (redacted_key, _) = sanitize_display_key_with_metadata("token=FIRST_SECRET");
-            assert_eq!(environment.len(), 2);
-            assert!(environment.contains_key(&redacted_key));
-            assert!(environment.contains_key(&format!("{redacted_key}~2")));
+            assert!(environment.is_null());
             assert!(colliding.mutation.redacted);
-            assert!(colliding.mutation.sanitized);
+            assert!(!colliding.mutation.sanitized);
             assert!(!colliding.mutation.truncated);
+            let serialized = serde_json::to_string(&colliding).unwrap();
+            assert!(!serialized.contains("FIRST_SECRET"));
+            assert!(!serialized.contains("SECOND_SECRET"));
+            assert!(!serialized.contains("~2"));
         }
 
         #[test]
@@ -16712,7 +16800,7 @@ IFS= read -r end
 
             let server = &output.servers[0];
             assert_eq!(
-                server.args.len() + server.env.as_ref().unwrap().len(),
+                server.args.len() + server.env.as_ref().unwrap().as_object().unwrap().len(),
                 CLI_OUTPUT_MAX_ITEMS
             );
             assert!(output.mutation.truncated);
@@ -16724,6 +16812,214 @@ IFS= read -r end
 
             assert!(output.servers.is_empty());
             assert_eq!(output.mutation, OutputMutationMetadata::default());
+        }
+
+        #[test]
+        fn machine_list_json_and_yaml_preserve_exact_strings() {
+            const EXACT: &str = "名前 résumé \\n\n\t\0\u{1b}\u{202e}";
+            let output = bounded_server_entries(&[ServerEntry {
+                name: EXACT.to_owned(),
+                source: EXACT.to_owned(),
+                transport: "stdio".to_owned(),
+                command: EXACT.to_owned(),
+                args: vec!["--".to_owned(), EXACT.to_owned()],
+                env: Some(HashMap::from([
+                    ("\n".to_owned(), "first-secret".to_owned()),
+                    ("\\x0A".to_owned(), "second-secret".to_owned()),
+                    ("名前".to_owned(), "third-secret".to_owned()),
+                ])),
+                cwd: Some(EXACT.to_owned()),
+                endpoint: Some(EXACT.to_owned()),
+                credentials_configured: None,
+                enabled: true,
+            }]);
+            let json = serialize_machine_json(&output, "list JSON").unwrap();
+            let yaml = serialize_machine_yaml(&output, "list YAML").unwrap();
+            let json_value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let yaml_value: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(json_value, yaml_value);
+            assert_eq!(json_value["schema"], "fastmcp.cli.list/v1");
+            for field in ["name", "source", "command", "cwd", "endpoint"] {
+                assert_eq!(json_value["servers"][0][field], EXACT, "{field}");
+            }
+            assert_eq!(
+                json_value["servers"][0]["args"],
+                serde_json::json!(["--", REDACTED_ARGUMENT_VALUE])
+            );
+            for key in ["\n", "\\x0A", "名前"] {
+                assert_eq!(json_value["servers"][0]["env"][key], REDACTED_ENV_VALUE);
+            }
+            assert!(output.mutation.redacted);
+            assert!(!output.mutation.sanitized);
+            assert!(!output.mutation.truncated);
+            for serialized in [&json, &yaml] {
+                assert!(!serialized.contains("-secret"));
+                assert!(!serialized.contains('\u{1b}'));
+                assert!(!serialized.contains('\0'));
+            }
+        }
+
+        #[test]
+        fn machine_list_utf8_boundaries_omit_whole_fields() {
+            let exact = format!("{}xy", "名".repeat(PEER_FIELD_LIMIT / 3));
+            assert_eq!(exact.len(), PEER_FIELD_LIMIT);
+            for extra_byte in [false, true] {
+                let text = format!("{exact}{}", if extra_byte { "z" } else { "" });
+                let output = bounded_server_entries(&[ServerEntry {
+                    name: text.clone(),
+                    source: text.clone(),
+                    transport: "stdio".to_owned(),
+                    command: text.clone(),
+                    args: vec!["--token=LIST_SECRET".to_owned()],
+                    env: None,
+                    cwd: Some(text.clone()),
+                    endpoint: None,
+                    credentials_configured: None,
+                    enabled: true,
+                }]);
+                let json = serialize_machine_json(&output, "list JSON").unwrap();
+                let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+                for field in ["name", "source", "command", "cwd"] {
+                    if extra_byte {
+                        assert!(value["servers"][0][field].is_null(), "{field}");
+                    } else {
+                        assert_eq!(value["servers"][0][field], exact, "{field}");
+                    }
+                }
+                assert!(output.mutation.redacted);
+                assert!(!output.mutation.sanitized);
+                assert_eq!(output.mutation.truncated, extra_byte);
+                assert!(!json.contains("LIST_SECRET"));
+                assert!(!json.contains(TERMINAL_TRUNCATED));
+            }
+        }
+
+        #[test]
+        fn machine_error_document_preserves_exact_text_and_omits_oversized_messages() {
+            const EXACT: &str = "失敗 résumé \\n\n\t\0\u{1b}\u{202e}";
+            const SECRET: &str = "ERROR_DOCUMENT_SECRET_CANARY";
+            let mut error = fastmcp_core::McpError::invalid_params(EXACT);
+            let document = cli_error_document("inspect", CliFailureCategory::CommandFailed, &error);
+            let json = serialize_machine_json(&document, "CLI error document").unwrap();
+            let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded["schema"], "fastmcp.cli.error/v2");
+            assert_eq!(decoded["error"]["message"], EXACT);
+            assert_eq!(decoded["error"]["code"], -32602);
+            assert_eq!(decoded["error"]["category"], "commandFailed");
+            for flag in ["redacted", "sanitized", "truncated"] {
+                assert_eq!(decoded[flag], false, "{flag}");
+            }
+            assert!(!json.contains('\u{1b}'));
+            assert!(!json.contains('\0'));
+
+            error.message = format!("{EXACT} token={SECRET}");
+            let redacted = cli_error_document("inspect", CliFailureCategory::CommandFailed, &error);
+            assert!(
+                redacted["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(EXACT)
+            );
+            assert_eq!(redacted["redacted"], true);
+            assert_eq!(redacted["sanitized"], false);
+            assert_eq!(redacted["truncated"], false);
+            assert!(!redacted.to_string().contains(SECRET));
+
+            error.message = "é".repeat(PEER_DETAIL_LIMIT / 2);
+            let exact = cli_error_document("inspect", CliFailureCategory::CommandFailed, &error);
+            assert_eq!(exact["error"]["message"], error.message);
+            assert_eq!(exact["truncated"], false);
+            error.message.push('x');
+            let oversized =
+                cli_error_document("inspect", CliFailureCategory::CommandFailed, &error);
+            assert!(oversized["error"]["message"].is_null());
+            assert_eq!(oversized["truncated"], true);
+            error.message.push_str(&format!(" token={SECRET}"));
+            let oversized_secret =
+                cli_error_document("inspect", CliFailureCategory::CommandFailed, &error);
+            assert!(oversized_secret["error"]["message"].is_null());
+            assert_eq!(oversized_secret["truncated"], true);
+            assert!(!oversized_secret.to_string().contains(SECRET));
+            assert!(!oversized_secret.to_string().contains(TERMINAL_TRUNCATED));
+        }
+
+        #[test]
+        fn machine_test_report_keeps_failure_text_before_terminal_rendering() {
+            const EXACT: &str = "失敗 résumé \\n\n\t\0\u{1b}\u{202e}";
+            let error = fastmcp_core::McpError::invalid_params(EXACT);
+            let result = failed_test_result(EXACT, std::time::Duration::ZERO, &error);
+            let terminal = result.error.as_deref().unwrap();
+            for character in ['\n', '\t', '\0', '\u{1b}', '\u{202e}'] {
+                assert!(!terminal.contains(character));
+            }
+            let report = TestReport {
+                server: EXACT.to_owned(),
+                success: false,
+                tests: vec![result],
+                total_duration_ms: 0.0,
+            };
+            let json =
+                serialize_machine_json(&bounded_test_report_value(&report), "test JSON").unwrap();
+            let decoded: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded["schema"], "fastmcp.cli.test/v1");
+            assert_eq!(decoded["server"], EXACT);
+            assert_eq!(decoded["tests"][0]["name"], EXACT);
+            assert_eq!(decoded["tests"][0]["error"], format!("[-32602] {EXACT}"));
+            for flag in ["redacted", "sanitized", "truncated"] {
+                assert_eq!(decoded[flag], false, "{flag}");
+            }
+        }
+
+        #[test]
+        fn machine_test_report_failure_byte_boundary_and_secrets_are_explicit() {
+            const SECRET: &str = "TEST_REPORT_BOUNDARY_SECRET";
+            let prefix = "[-32602] ";
+            let exact = "x".repeat(PEER_DETAIL_LIMIT - prefix.len());
+            for extra_byte in [false, true] {
+                let message = format!("{exact}{}", if extra_byte { "é" } else { "" });
+                let error = fastmcp_core::McpError::invalid_params(message);
+                let result = failed_test_result("failure", std::time::Duration::ZERO, &error);
+                let report = TestReport {
+                    server: "server".to_owned(),
+                    success: false,
+                    tests: vec![result],
+                    total_duration_ms: 0.0,
+                };
+                let value = bounded_test_report_value(&report);
+                assert_eq!(value["truncated"], extra_byte);
+                assert_eq!(value["sanitized"], false);
+                if extra_byte {
+                    assert!(value["tests"][0]["error"].is_null());
+                } else {
+                    assert_eq!(value["tests"][0]["error"], format!("{prefix}{exact}"));
+                }
+            }
+            for message in [
+                format!("失敗 token={SECRET}"),
+                format!("{exact} token={SECRET}"),
+            ] {
+                let error = fastmcp_core::McpError::invalid_params(message);
+                let report = TestReport {
+                    server: "server".to_owned(),
+                    success: false,
+                    tests: vec![failed_test_result(
+                        "failure",
+                        std::time::Duration::ZERO,
+                        &error,
+                    )],
+                    total_duration_ms: 0.0,
+                };
+                let value = bounded_test_report_value(&report);
+                assert!(!value.to_string().contains(SECRET));
+                assert_eq!(value["sanitized"], false);
+                if error.message.len() > PEER_DETAIL_LIMIT - prefix.len() {
+                    assert!(value["tests"][0]["error"].is_null());
+                    assert_eq!(value["truncated"], true);
+                } else {
+                    assert_eq!(value["redacted"], true);
+                    assert_eq!(value["truncated"], false);
+                }
+            }
         }
 
         #[test]
@@ -16741,6 +17037,7 @@ IFS= read -r end
                     error: Some(format!("Authorization: Bearer {SECRET}")),
                     timeout_source: None,
                     mutation: OutputMutationMetadata::default(),
+                    machine_text: None,
                 }],
                 total_duration_ms: 1.0,
             };
@@ -16751,10 +17048,11 @@ IFS= read -r end
             assert!(json.contains("<redacted>"));
             assert!(!json.contains(SECRET));
             assert!(!json.contains('\u{1b}'));
-            assert!(!json.contains('\u{202e}'));
             let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(value["schema"], "fastmcp.cli.test/v1");
+            assert_eq!(value["tests"][0]["name"], "ping\u{1b}[31m\u{202e}");
             assert_eq!(value["redacted"], true);
-            assert_eq!(value["sanitized"], true);
+            assert_eq!(value["sanitized"], false);
             assert_eq!(value["truncated"], false);
             let test = value["tests"][0].as_object().expect("test object");
             assert!(!test.contains_key("skipped"));
@@ -16775,6 +17073,7 @@ IFS= read -r end
                     error: None,
                     timeout_source: None,
                     mutation: OutputMutationMetadata::default(),
+                    machine_text: None,
                 }],
                 total_duration_ms: 1.0,
             };
@@ -16890,25 +17189,26 @@ IFS= read -r end
         #[test]
         fn test_list_output_serialization() {
             let output = ListOutput {
+                schema: "fastmcp.cli.list/v1".to_owned(),
                 servers: vec![
                     BoundedServerEntry {
-                        name: "server1".to_string(),
-                        source: "Claude".to_string(),
-                        transport: "stdio".to_owned(),
-                        command: "cmd1".to_string(),
+                        name: "server1".into(),
+                        source: "Claude".into(),
+                        transport: "stdio".into(),
+                        command: Some("cmd1".into()),
                         args: vec![],
                         env: None,
-                        cwd: Some("/srv/server1".to_owned()),
+                        cwd: Some("/srv/server1".into()),
                         endpoint: None,
                         credentials_configured: None,
                         enabled: true,
                     },
                     BoundedServerEntry {
-                        name: "server2".to_string(),
-                        source: "Cursor".to_string(),
-                        transport: "stdio".to_owned(),
-                        command: "cmd2".to_string(),
-                        args: vec!["arg1".to_string()],
+                        name: "server2".into(),
+                        source: "Cursor".into(),
+                        transport: "stdio".into(),
+                        command: Some("cmd2".into()),
+                        args: vec!["arg1".into()],
                         env: None,
                         cwd: None,
                         endpoint: None,
@@ -16937,6 +17237,7 @@ IFS= read -r end
                 error: None,
                 timeout_source: None,
                 mutation: OutputMutationMetadata::default(),
+                machine_text: None,
             };
 
             let json = serde_json::to_string(&result).unwrap();
@@ -16959,6 +17260,7 @@ IFS= read -r end
                 error: Some("Connection refused".to_string()),
                 timeout_source: None,
                 mutation: OutputMutationMetadata::default(),
+                machine_text: None,
             };
 
             let json = serde_json::to_string(&result).unwrap();
@@ -16978,6 +17280,7 @@ IFS= read -r end
                 error: Some("Connection refused".to_owned()),
                 timeout_source: None,
                 mutation: OutputMutationMetadata::default(),
+                machine_text: None,
             };
 
             let rendered = render_test_result(&result, true);
@@ -16998,6 +17301,7 @@ IFS= read -r end
                     error: None,
                     timeout_source: None,
                     mutation: OutputMutationMetadata::default(),
+                    machine_text: None,
                 }],
                 total_duration_ms: 100.0,
             };
@@ -17722,9 +18026,9 @@ IFS= read -r end
         }
 
         #[test]
-        fn inspect_json_serializer_enforces_encoded_byte_boundary() {
+        fn machine_json_serializer_enforces_encoded_byte_boundary() {
             let exact = serde_json::Value::String("x".repeat(CLI_OUTPUT_MAX_BYTES - 2));
-            let output = serialize_inspect_json(&exact).expect("exact encoded fit");
+            let output = serialize_machine_json(&exact, "inspect JSON").expect("exact encoded fit");
             assert_eq!(output.len(), CLI_OUTPUT_MAX_BYTES);
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(&output).unwrap(),
@@ -17732,12 +18036,56 @@ IFS= read -r end
             );
 
             let overflow = serde_json::Value::String("x".repeat(CLI_OUTPUT_MAX_BYTES - 1));
-            let error = serialize_inspect_json(&overflow).expect_err("one extra encoded byte");
+            let error = serialize_machine_json(&overflow, "inspect JSON")
+                .expect_err("one extra encoded byte");
             assert!(error.message.contains("maximum"));
 
             // The raw source fits, but JSON's six-byte control escapes do not.
             let controls = serde_json::Value::String("\0".repeat(CLI_OUTPUT_MAX_BYTES / 6 + 1));
-            assert!(serialize_inspect_json(&controls).is_err());
+            assert!(serialize_machine_json(&controls, "inspect JSON").is_err());
+        }
+
+        #[test]
+        fn machine_list_and_test_serializers_bound_escape_expansion() {
+            let controls = "\u{1}".repeat(PEER_FIELD_LIMIT);
+            let entries = std::iter::repeat_with(|| ServerEntry {
+                name: controls.clone(),
+                source: controls.clone(),
+                transport: "stdio".to_owned(),
+                command: controls.clone(),
+                args: Vec::new(),
+                env: None,
+                cwd: Some(controls.clone()),
+                endpoint: None,
+                credentials_configured: None,
+                enabled: true,
+            })
+            .take(CLI_OUTPUT_MAX_ITEMS)
+            .collect::<Vec<_>>();
+            let output = bounded_server_entries(&entries);
+            assert!(output.mutation.truncated);
+            assert!(serialize_machine_json(&output, "list JSON").is_err());
+            assert!(serialize_machine_yaml(&output, "list YAML").is_err());
+
+            let result = TestResult {
+                name: "test".to_owned(),
+                success: true,
+                skipped: false,
+                duration_ms: 0.0,
+                details: Some("\u{1}".repeat(PEER_DETAIL_LIMIT)),
+                error: None,
+                timeout_source: None,
+                mutation: OutputMutationMetadata::default(),
+                machine_text: None,
+            };
+            let report = bounded_test_report_value(&TestReport {
+                server: "server".to_owned(),
+                success: true,
+                tests: vec![result; CLI_OUTPUT_MAX_ITEMS],
+                total_duration_ms: 0.0,
+            });
+            assert_eq!(report["truncated"], true);
+            assert!(serialize_machine_json(&report, "test JSON").is_err());
         }
 
         #[test]
@@ -20040,6 +20388,38 @@ IFS= read -r end
             assert_eq!(result.details, Some("details".to_string()));
             assert!(result.error.is_none());
             assert!(result.duration_ms >= 0.0);
+        }
+
+        #[test]
+        fn run_test_preserves_success_details_for_machine_output() {
+            const EXACT: &str = "成功 résumé \\n\n\t\0\u{1b}\u{202e}";
+            for details in [EXACT.to_owned(), "é".repeat(PEER_DETAIL_LIMIT / 2 + 1)] {
+                let result = build_cli_runtime().unwrap().block_on(async {
+                    run_test(&Cx::current().unwrap(), "test_success", async |_| {
+                        Ok(details.clone())
+                    })
+                    .await
+                });
+                assert!(result.success);
+                let terminal = result.details.as_deref().unwrap();
+                for character in ['\n', '\t', '\0', '\u{1b}', '\u{202e}'] {
+                    assert!(!terminal.contains(character));
+                }
+                let report = bounded_test_report_value(&TestReport {
+                    server: "server".to_owned(),
+                    success: true,
+                    tests: vec![result],
+                    total_duration_ms: 0.0,
+                });
+                if details.len() > PEER_DETAIL_LIMIT {
+                    assert!(report["tests"][0]["details"].is_null());
+                    assert_eq!(report["truncated"], true);
+                } else {
+                    assert_eq!(report["tests"][0]["details"], details);
+                    assert_eq!(report["truncated"], false);
+                }
+                assert_eq!(report["sanitized"], false);
+            }
         }
 
         #[test]
