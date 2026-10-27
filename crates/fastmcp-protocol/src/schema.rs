@@ -13,6 +13,8 @@
 //! - Local `$id` resources, `$defs`/`definitions`/`$ref`/anchor/dynamic-reference
 //!   resolution, composition, and conditional applicators
 //! - Declared Draft 2020-12 vocabularies and bounded content annotations
+//! - Bounded patterns with ECMAScript digit, word, and whitespace character
+//!   classes; constructs outside the linear regex engine remain unsupported
 //!
 //! External references are never resolved through network or filesystem I/O.
 
@@ -106,6 +108,11 @@ pub const MAX_PATTERN_PROPERTY_BYTES: usize = 4 * 1024;
 
 /// Maximum UTF-8 bytes in one locally compiled `pattern` expression.
 pub const MAX_PATTERN_BYTES: usize = 4 * 1024;
+
+// Preserve regex's existing source nesting limit. Normalization introduces
+// at most a bracket class and a union below an existing shorthand leaf.
+const SCHEMA_PATTERN_SOURCE_NEST_LIMIT: u32 = 250;
+const SCHEMA_PATTERN_NORMALIZED_NEST_LIMIT: u32 = SCHEMA_PATTERN_SOURCE_NEST_LIMIT + 2;
 
 /// Maximum entries accepted by one final-schema assertion payload.
 pub const MAX_SCHEMA_ASSERTION_ENTRIES: usize = 64;
@@ -1336,7 +1343,7 @@ fn validate_final_schema_node(
                             "patternProperties pattern exceeds byte limit",
                         ));
                     }
-                    if Regex::new(pattern).is_err() {
+                    if compile_schema_pattern(pattern).is_err() {
                         return Err(SchemaAdmissionError::new(
                             format!("{path}.{keyword}"),
                             "invalid patternProperties pattern",
@@ -2421,7 +2428,7 @@ fn validate_pattern_keyword(
             "pattern exceeds byte limit",
         ));
     }
-    if Regex::new(pattern).is_ok() {
+    if compile_schema_pattern(pattern).is_ok() {
         Ok(())
     } else {
         Err(SchemaAdmissionError::new(
@@ -2429,6 +2436,66 @@ fn validate_pattern_keyword(
             "invalid schema pattern",
         ))
     }
+}
+
+/// Compiles the bounded pattern subset without inheriting Rust regex's
+/// Unicode definitions of `\d`, `\w`, and `\s`.
+///
+/// ECMA-262's CharacterClassEscape productions define digits and word
+/// characters as ASCII, and whitespace as WhiteSpace plus LineTerminator.
+/// Explicit nested classes preserve those semantics inside bracket classes,
+/// including negated escapes, while retaining the linear-time matcher.
+/// Escapes are consumed in pairs so a literal `\\d` is never rewritten.
+/// Other syntax still goes through the existing regex parser and its limits;
+/// this is not a complete ECMAScript regular-expression implementation.
+/// Rust-only modes that disable Unicode are outside this schema pattern subset.
+fn compile_schema_pattern(source: &str) -> Result<Regex, regex::Error> {
+    if source.len() > MAX_PATTERN_BYTES {
+        return Err(regex::Error::Syntax(
+            "schema pattern exceeds byte limit".to_owned(),
+        ));
+    }
+
+    // The source bound applies before expansion. Each escape expands by a
+    // fixed factor, so both normalization and regex compilation stay bounded.
+    let mut normalized = String::with_capacity(source.len());
+    let mut characters = source.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            normalized.push(character);
+            continue;
+        }
+        let Some(escape) = characters.next() else {
+            normalized.push('\\');
+            break;
+        };
+        match escape {
+            'd' => normalized.push_str("[0-9]"),
+            'D' => normalized.push_str("[^0-9]"),
+            'w' => normalized.push_str("[A-Za-z0-9_]"),
+            'W' => normalized.push_str("[^A-Za-z0-9_]"),
+            's' => normalized.push_str(r"[\t\n\x0B\x0C\r\p{Zs}\u{2028}\u{2029}\u{FEFF}]"),
+            'S' => normalized.push_str(r"[^\t\n\x0B\x0C\r\p{Zs}\u{2028}\u{2029}\u{FEFF}]"),
+            _ => {
+                normalized.push('\\');
+                normalized.push(escape);
+            }
+        }
+    }
+    // Check the original syntax before replacing a class escape with a
+    // nested bracket class: otherwise invalid ranges such as `[\d-a]` could
+    // become valid unions. Release that bounded compilation before compiling
+    // the normalized form, which needs only its generated AST depth allowance.
+    let original = regex::RegexBuilder::new(source)
+        .nest_limit(SCHEMA_PATTERN_SOURCE_NEST_LIMIT)
+        .build()?;
+    if normalized == source {
+        return Ok(original);
+    }
+    drop(original);
+    regex::RegexBuilder::new(&normalized)
+        .nest_limit(SCHEMA_PATTERN_NORMALIZED_NEST_LIMIT)
+        .build()
 }
 
 fn validate_format_keyword(
@@ -4433,7 +4500,7 @@ fn compile_pattern_properties<'a>(
             push_error(errors, path, "patternProperties pattern exceeds byte limit");
             continue;
         }
-        match Regex::new(source) {
+        match compile_schema_pattern(source) {
             Ok(pattern) => patterns.push((pattern, pattern_schema)),
             Err(_) => push_error(errors, path, "invalid patternProperties pattern"),
         }
@@ -4926,7 +4993,11 @@ fn validate_string(
         if !consume_validation_work(context, path, errors) {
             return;
         }
-        match Regex::new(pattern) {
+        if pattern.len() > MAX_PATTERN_BYTES {
+            push_error(errors, path, "pattern exceeds byte limit");
+            return;
+        }
+        match compile_schema_pattern(pattern) {
             Ok(re) => {
                 let Some(matches) = charged_regex_is_match(&re, s, path, errors, context) else {
                     return;
@@ -9994,6 +10065,248 @@ mod tests {
         });
 
         assert!(validate(&schema, &json!("anything")).is_err());
+    }
+
+    #[test]
+    fn ecmascript_shorthand_patterns_distinguish_ascii_and_unicode() {
+        // ECMA-262 CharacterClassEscape semantics, also exercised by the
+        // official draft2020-12 optional/ecmascript-regex.json corpus.
+        let cases: [(&str, &[&str], &[&str]); 6] = [
+            (r"^\d+$", &["0", "42"], &["߀", "৪২", "a"]),
+            (r"^\D+$", &["߀", "৪২", "é"], &["0", "42"]),
+            (r"^\w+$", &["a", "Az_42"], &["é", "৪২", "K", "\u{200c}"]),
+            (r"^\W+$", &["é", "৪২", "K", "\u{200c}"], &["a", "Az_42"]),
+            (
+                r"^\s+$",
+                &[" \t\n", "\u{feff}", "\u{2029}"],
+                &["\u{85}", "a"],
+            ),
+            (
+                r"^\S+$",
+                &["\u{85}", "a"],
+                &[" \t\n", "\u{feff}", "\u{2029}"],
+            ),
+        ];
+        for (pattern, accepted, rejected) in cases {
+            let source = json!({"type": "string", "pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            for value in accepted {
+                assert!(
+                    admitted.validate(&json!(value)).is_ok(),
+                    "{pattern}: {value:?}"
+                );
+                assert!(
+                    validate(&source, &json!(value)).is_ok(),
+                    "{pattern}: {value:?}"
+                );
+            }
+            for value in rejected {
+                assert!(
+                    admitted.validate(&json!(value)).is_err(),
+                    "{pattern}: {value:?}"
+                );
+                assert!(
+                    validate(&source, &json!(value)).is_err(),
+                    "{pattern}: {value:?}"
+                );
+            }
+            assert_eq!(admitted.schema(), &source);
+        }
+    }
+
+    #[test]
+    fn ecmascript_shorthand_whitespace_uses_white_space_and_line_terminators() {
+        let whitespace = [
+            '\t', '\n', '\u{b}', '\u{c}', '\r', ' ', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}',
+            '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}',
+            '\u{2009}', '\u{200a}', '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+            '\u{feff}',
+        ];
+        let other = ['\u{1}', '\u{85}', '\u{180e}', '\u{200b}', '\u{2060}', 'a'];
+        for (pattern, inverted) in [(r"^\s$", false), (r"^\S$", true)] {
+            let admitted = admit_final_schema(json!({"pattern": pattern})).unwrap();
+            for character in whitespace {
+                assert_eq!(
+                    admitted.validate(&json!(character.to_string())).is_ok(),
+                    !inverted,
+                    "{pattern}: U+{:04X}",
+                    u32::from(character)
+                );
+            }
+            for character in other {
+                assert_eq!(
+                    admitted.validate(&json!(character.to_string())).is_ok(),
+                    inverted,
+                    "{pattern}: U+{:04X}",
+                    u32::from(character)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ecmascript_shorthand_classes_compose_inside_brackets() {
+        for (pattern, accepted, rejected) in [
+            (r"^[\dA-F]+$", "FACE42", "৪২"),
+            (r"^[^\d]+$", "৪২", "42"),
+            (r"^[\D_]+$", "৪২_", "42"),
+            (r"^[\w-]+$", "field_42-", "é"),
+            (r"^[^\w]+$", "é", "a"),
+            (r"^[\W\d]+$", "é42", "a"),
+            (r"^[\s_]+$", "\u{feff}_", "\u{85}"),
+            (r"^[^\s]+$", "\u{85}", "\u{feff}"),
+            (r"^[\S_]+$", "\u{85}_", "\u{feff}"),
+            (r"^[^\S]+$", "\u{feff}", "\u{85}"),
+            (r"^[\s\S]+$", "é\n\u{feff}\u{85}", ""),
+        ] {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!(accepted)).is_ok(), "{pattern}");
+            assert!(admitted.validate(&json!(rejected)).is_err(), "{pattern}");
+            assert!(validate(&source, &json!(accepted)).is_ok(), "{pattern}");
+            assert!(validate(&source, &json!(rejected)).is_err(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn ecmascript_shorthand_normalization_preserves_literals_and_unicode_properties() {
+        for (pattern, accepted, rejected) in [
+            (r"^\\d$", r"\d", "4"),
+            (r"^\\s$", r"\s", "\u{feff}"),
+            (r"^[\\dw]+$", "dw\\", "4"),
+            (r"^\\\\\d$", r"\\4", r"\\৪"),
+            (r"^\[\d\]$", "[4]", "[৪]"),
+            (r"^\u{00E9}\d$", "é4", "é৪"),
+            (r"^\p{Letter}+$", "école", "42"),
+            (r"\wcole", "l'ecole", "l'école"),
+        ] {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!(accepted)).is_ok(), "{pattern}");
+            assert!(admitted.validate(&json!(rejected)).is_err(), "{pattern}");
+            assert_eq!(admitted.schema(), &source);
+        }
+    }
+
+    #[test]
+    fn ecmascript_shorthand_pattern_properties_control_applicators_and_annotations() {
+        for (pattern, accepted, rejected) in [
+            (r"^\d+$", "42", "৪২"),
+            (r"^\D+$", "৪২", "42"),
+            (r"^[\w]+$", "field_42", "é"),
+            (r"^[\W]+$", "é", "field_42"),
+            (r"^\s+$", "\u{feff}", "\u{85}"),
+            (r"^\S+$", "\u{85}", "\u{feff}"),
+            (r"^\\d$", r"\d", "4"),
+        ] {
+            let source = json!({
+                "type": "object",
+                "patternProperties": {pattern: {"type": "integer"}},
+                "additionalProperties": false
+            });
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(
+                admitted.validate(&json!({accepted: 1})).is_ok(),
+                "{pattern}"
+            );
+            assert!(
+                admitted.validate(&json!({rejected: 1})).is_err(),
+                "{pattern}"
+            );
+            assert!(
+                admitted.validate(&json!({accepted: "1"})).is_err(),
+                "{pattern}"
+            );
+            assert!(
+                validate(&source, &json!({accepted: 1})).is_ok(),
+                "{pattern}"
+            );
+            assert!(
+                validate(&source, &json!({rejected: 1})).is_err(),
+                "{pattern}"
+            );
+
+            let evaluated = admit_final_schema(json!({
+                "allOf": [{"patternProperties": {pattern: {"type": "integer"}}}],
+                "unevaluatedProperties": false
+            }))
+            .unwrap();
+            assert!(
+                evaluated.validate(&json!({accepted: 1})).is_ok(),
+                "{pattern}"
+            );
+            assert!(
+                evaluated.validate(&json!({rejected: 1})).is_err(),
+                "{pattern}"
+            );
+            assert!(
+                evaluated.validate(&json!({accepted: "1"})).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn ecmascript_shorthand_patterns_bound_source_before_expansion_and_reject_malformed_syntax() {
+        let prefix = "a".repeat(MAX_PATTERN_BYTES - 2);
+        let source = json!({"pattern": format!("{prefix}\\s")});
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        let accepted = json!(format!("{prefix}\u{feff}"));
+        let rejected = json!(format!("{prefix}\u{85}"));
+        assert!(admitted.validate(&accepted).is_ok());
+        assert!(admitted.validate(&rejected).is_err());
+        assert!(validate(&source, &accepted).is_ok());
+
+        let oversized = json!({"pattern": format!("a{prefix}\\s")});
+        assert_eq!(
+            admit_final_schema(oversized.clone()).unwrap_err().reason(),
+            "pattern exceeds byte limit"
+        );
+        let errors = validate(&oversized, &accepted).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message == "pattern exceeds byte limit")
+        );
+        assert!(compile_schema_pattern(oversized["pattern"].as_str().unwrap()).is_err());
+
+        for pattern in [
+            "(",
+            r"[\d",
+            "\\",
+            r"[\d-a]",
+            r"[a-\s]",
+            r"[A-\d]",
+            r"[0-\s]",
+            r"[\D-\S]",
+            // Rust-only Unicode disabling cannot narrow ECMA whitespace.
+            r"(?-u:\s)",
+        ] {
+            let source = json!({"pattern": pattern});
+            assert!(admit_final_schema(source.clone()).is_err());
+            assert!(validate(&source, &json!("anything")).is_err());
+        }
+    }
+
+    #[test]
+    fn ecmascript_shorthand_normalization_preserves_the_source_nesting_limit() {
+        let depth = usize::try_from(SCHEMA_PATTERN_SOURCE_NEST_LIMIT).unwrap();
+        for (shorthand, accepted, rejected) in [
+            (r"\d", "4", "৪"),
+            (r"\w", "a", "é"),
+            (r"\s", "\u{feff}", "\u{85}"),
+        ] {
+            let bounded = format!("{}{shorthand}{}", "(".repeat(depth), ")".repeat(depth));
+            let source = json!({"pattern": bounded});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!(accepted)).is_ok());
+            assert!(admitted.validate(&json!(rejected)).is_err());
+            assert!(validate(&source, &json!(accepted)).is_ok());
+
+            let excessive = json!({"pattern": format!("({bounded})")});
+            assert!(admit_final_schema(excessive.clone()).is_err());
+            assert!(validate(&excessive, &json!(accepted)).is_err());
+        }
     }
 
     #[test]
