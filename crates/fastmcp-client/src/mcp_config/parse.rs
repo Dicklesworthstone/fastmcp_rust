@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Deserializer, de::Error as _};
 
-use super::{ConfigError, McpConfig, ServerConfig};
+use super::{ConfigError, HttpEndpointConfig, McpConfig, ServerConfig};
 
 // Collect maps without discarding an earlier definition or control before
 // validation. Keys are checked after deserialization, including JSON escapes.
@@ -78,11 +78,45 @@ where
 #[serde(rename_all = "camelCase")]
 struct ConfigWire {
     #[serde(default, alias = "mcp_servers", deserialize_with = "present")]
-    mcp_servers: Option<HashMap<String, ServerConfig>>,
+    mcp_servers: Option<HashMap<String, NativeServerConfig>>,
     #[serde(default, deserialize_with = "present")]
     servers: Option<HashMap<String, VscodeStdioServer>>,
     #[serde(flatten, deserialize_with = "extra_fields")]
     extra: HashMap<String, serde_json::Value>,
+}
+
+// Native entries are executable policy, not an extension bag. Silently
+// discarding an unknown field can turn a remote/sandboxed declaration into a
+// less-constrained local stdio launch. Keep the supported native surface exact;
+// the nested `http` object is the explicit remote-route configuration.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeServerConfig {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: HashMap<String, String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    http: Option<HttpEndpointConfig>,
+}
+
+impl NativeServerConfig {
+    fn into_config(self) -> ServerConfig {
+        let mut config = ServerConfig::new(self.command);
+        config.args = self.args;
+        config.env = self.env;
+        config.cwd = self.cwd;
+        config.disabled = self.disabled;
+        if let Some(http) = self.http {
+            config = config.with_http_endpoint_config(http);
+        }
+        config
+    }
 }
 
 // Do not silently discard VS Code controls that this client cannot enforce.
@@ -142,10 +176,15 @@ impl<'de> Deserialize<'de> for McpConfig {
     {
         let wire = ConfigWire::deserialize(deserializer)?;
         match (wire.mcp_servers, wire.servers) {
+            (Some(mcp_servers), None) => Ok(Self {
+                mcp_servers: mcp_servers
+                    .into_iter()
+                    .map(|(name, server)| (name, server.into_config()))
+                    .collect(),
+            }),
             (Some(_), Some(_)) => Err(D::Error::custom(
                 "configuration contains more than one server registry dialect",
             )),
-            (Some(mcp_servers), None) => Ok(Self { mcp_servers }),
             (None, Some(servers)) => {
                 for (name, value) in &wire.extra {
                     match (name.as_str(), value) {
@@ -395,6 +434,62 @@ mod tests {
         assert_eq!(config.mcp_servers.len(), 2);
         assert!(config.get_server("first").unwrap().disabled);
         assert_eq!(config.get_server("second").unwrap().command, "replacement");
+    }
+
+    #[test]
+    fn native_server_controls_cannot_be_silently_discarded() {
+        let baseline = r#"{"mcpServers":{"local":{"command":"server"}}}"#;
+        assert!(McpConfig::from_json(baseline).is_ok());
+        assert!(McpConfig::from_jsonc(baseline).is_ok());
+
+        for (field, value) in [
+            ("type", r#""http""#),
+            ("url", r#""https://example.test/mcp""#),
+            ("headers", r#"{"Authorization":"Bearer secret"}"#),
+            ("envFile", r#""/run/secrets/mcp.env""#),
+            ("sandbox", r#"{"enabled":true}"#),
+            ("dev", r#"{"watch":"**/*.rs"}"#),
+        ] {
+            let changed = format!(
+                r#"{{"mcpServers":{{"local":{{"command":"server","{field}":{value}}}}}}}"#
+            );
+            assert!(
+                McpConfig::from_json(&changed).is_err(),
+                "native server control {field} must not be discarded"
+            );
+            assert!(
+                McpConfig::from_jsonc(&changed).is_err(),
+                "JSONC native server control {field} must not be discarded"
+            );
+        }
+
+        for field in ["url", "headers", "envFile", "sandbox"] {
+            let toml = format!(
+                "[mcp_servers.local]\ncommand = \"server\"\n{field} = \"unsupported\"\n"
+            );
+            assert!(
+                McpConfig::from_toml(&toml).is_err(),
+                "TOML native server control {field} must not be discarded"
+            );
+        }
+    }
+
+    #[test]
+    fn native_server_supported_fields_keep_their_existing_semantics() {
+        let json = r#"{"mcpServers":{"local":{
+            "command":"server",
+            "args":["--literal"],
+            "env":{"EXAMPLE":"value"},
+            "cwd":"/workspace",
+            "disabled":true
+        }}}"#;
+        let config = McpConfig::from_json(json).unwrap();
+        let local = config.get_server("local").unwrap();
+        assert_eq!(local.command, "server");
+        assert_eq!(local.args, ["--literal"]);
+        assert_eq!(local.env.get("EXAMPLE").map(String::as_str), Some("value"));
+        assert_eq!(local.cwd.as_deref(), Some("/workspace"));
+        assert!(local.disabled);
     }
 
     #[test]
