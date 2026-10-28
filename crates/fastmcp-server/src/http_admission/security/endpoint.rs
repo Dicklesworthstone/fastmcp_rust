@@ -499,7 +499,7 @@ mod tests {
         #[cfg(not(feature = "legacy-2024-11-05"))]
         let endpoint = server.into_http_endpoint().unwrap();
         #[cfg(feature = "legacy-2024-11-05")]
-        let endpoint = server.into_http_endpoint("https://service.example").unwrap();
+        let endpoint = server.into_http_endpoint("http://service.example").unwrap();
         let scopes = ScopeRequestPolicy::new(
             1,
             ScopeImplicationPolicy::exact(1).unwrap(),
