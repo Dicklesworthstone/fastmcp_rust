@@ -453,7 +453,9 @@ pub mod server {
         FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
         FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskRetentionAdministrator,
+        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
+        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
     };
     /// WebSocket server listener and lifecycle APIs.
     #[cfg(feature = "websocket-experimental")]
@@ -922,7 +924,9 @@ pub use fastmcp_server::{
     FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
     FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot, FinalTaskStore,
     FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-    InMemoryFinalTaskStore,
+    InMemoryFinalTaskStore, TaskRetentionAdministrator, TaskRetentionAuditPage,
+    TaskRetentionAuthorization, TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt,
+    TaskRetentionReclamation, TaskRetentionTarget,
 };
 
 /// Proxy APIs are available only with the proxy profile.
@@ -3107,7 +3111,9 @@ pub mod modern {
         FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
         FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
         FinalTaskStore, FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff,
-        FinalTaskWorkDescriptor, InMemoryFinalTaskStore,
+        FinalTaskWorkDescriptor, InMemoryFinalTaskStore, TaskRetentionAdministrator,
+        TaskRetentionAuditPage, TaskRetentionAuthorization, TaskRetentionPolicy,
+        TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation, TaskRetentionTarget,
     };
 
     #[cfg(all(feature = "apps", feature = "tasks"))]
@@ -11263,7 +11269,9 @@ pub mod prelude {
         FinalTaskSupervisorHandoff, FinalTaskWatch, FinalTaskWatchEvent, FinalTaskWorkDescriptor,
         FinalToolCallOutcome, FinalUpdateTaskResult, InMemoryFinalTaskStore,
         OFFICIAL_TASKS_RESULT_DISCRIMINATOR, OfficialTasksNegotiationResolver, TASK_UPDATE,
-        official_tasks_descriptor, official_tasks_empty_settings,
+        TaskRetentionAdministrator, TaskRetentionAuditPage, TaskRetentionAuthorization,
+        TaskRetentionPolicy, TaskRetentionReason, TaskRetentionReceipt, TaskRetentionReclamation,
+        TaskRetentionTarget, official_tasks_descriptor, official_tasks_empty_settings,
         register_official_tasks_extension, tasks_extension,
     };
     #[cfg(feature = "websocket-experimental")]

@@ -27,6 +27,12 @@
 //! the original total lifetime. Deadline failure retains the task result through
 //! its existing TTL and releases the application handoff so other work can run.
 //!
+//! Unlimited retention additionally requires an installed
+//! [`TaskRetentionAdministrator`] and an atomically reclaiming store. Separate
+//! current administrative authorization can reclaim an inspected terminal
+//! generation and release its retained capacity. The built-in audit and
+//! idempotency journal is bounded and process-local, like the Tasks it tracks.
+//!
 //! The legacy `TaskManager` (Docket/SEP-1686) in this file is compiled only for
 //! tests and is not part of the shipped API.
 
@@ -1555,6 +1561,50 @@ fn validate_json_rpc_error(error: &serde_json::Value) -> McpResult<()> {
 /// dispatch-lease state. This history survives recovery and terminal
 /// transitions and is removed only when the task is reclaimed.
 pub trait FinalTaskStore: Send + Sync {
+    /// Attests immutable support for terminal retention administration.
+    /// The policy bounds the store's audit/idempotency journal independently
+    /// of retained task payload. Stores lacking atomic reclamation must keep
+    /// this default: a declaration allowing null TTL is not reclaim support.
+    fn retention_administration_policy(&self) -> McpResult<TaskRetentionPolicy> {
+        Err(McpError::internal_error(
+            "Final task store does not implement retention administration",
+        ))
+    }
+
+    /// Atomically reclaims only this exact terminal generation and records its
+    /// bounded audit/idempotency receipt before releasing retained quota once.
+    /// A missing, live, or changed record returns `NotCurrent` without mutation.
+    /// Repeating a retained tombstone returns its original receipt, including
+    /// its original reason; it must never remove a successor with the same ID.
+    /// This is the trusted backend boundary. Public administration must first
+    /// authorize the current caller through [`TaskRetentionAdministrator`].
+    fn reclaim_terminal_task_if_current(
+        &self,
+        _cx: &Cx,
+        _task_id: &FinalTaskId,
+        _generation: u64,
+        _reason: TaskRetentionReason,
+    ) -> McpResult<TaskRetentionReclamation> {
+        Err(McpError::internal_error(
+            "Final task store does not implement terminal reclamation",
+        ))
+    }
+
+    /// Returns an ordered bounded page of redacted retention receipts. The
+    /// cursor is a sequence, not an offset, and does not pin a store snapshot.
+    /// Expired receipts may disappear between pages; later receipts cannot be
+    /// skipped merely because an earlier receipt expired.
+    fn task_retention_audit(
+        &self,
+        _cx: &Cx,
+        _after: Option<u64>,
+        _limit: usize,
+    ) -> McpResult<TaskRetentionAuditPage> {
+        Err(McpError::internal_error(
+            "Final task store does not implement retention audit",
+        ))
+    }
+
     /// Attests finite, immutable execution limits for newly admitted tasks.
     /// Creation must stamp the total deadline atomically using backend time.
     /// Every claim spends one attempt and stamps a deadline no later than the
@@ -2414,6 +2464,37 @@ struct InMemoryFinalTaskState {
     expires_at: BTreeMap<FinalTaskId, Instant>,
     execution_budgets: BTreeMap<FinalTaskId, FinalTaskExecutionBudget>,
     payload_accounting: InMemoryFinalTaskPayloadAccounting,
+    retention_journal: InMemoryTaskRetentionJournal,
+}
+
+#[derive(Default)]
+struct InMemoryTaskRetentionJournal {
+    policy: TaskRetentionPolicy,
+    entries: BTreeMap<u64, InMemoryTaskRetentionEntry>,
+    by_target: BTreeMap<(FinalTaskId, u64), u64>,
+    next_sequence: u64,
+    retained_bytes: usize,
+}
+
+struct InMemoryTaskRetentionEntry {
+    task_id: FinalTaskId,
+    receipt: TaskRetentionReceipt,
+    expires_at: Instant,
+    charged_bytes: usize,
+}
+
+impl InMemoryTaskRetentionJournal {
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            if entry.expires_at > now {
+                return true;
+            }
+            self.by_target
+                .remove(&(entry.task_id.clone(), entry.receipt.generation));
+            self.retained_bytes -= entry.charged_bytes;
+            false
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, serde::Serialize)]
@@ -2763,6 +2844,23 @@ impl InMemoryFinalTaskStore {
     /// Maximum configurable aggregate compact-JSON payload capacity: 512 MiB.
     pub const HARD_MAX_PAYLOAD_BYTES: usize = 512 * 1_024 * 1_024;
 
+    /// Configures the separate bounded process-local reclamation journal.
+    /// This consumes an empty store, so policy cannot change underneath an
+    /// installed administrator or invalidate an existing idempotency window.
+    pub fn with_retention_policy(mut self, policy: TaskRetentionPolicy) -> McpResult<Self> {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.next_generation != 0 || state.retention_journal.next_sequence != 0 {
+            return Err(McpError::invalid_params(
+                "Retention policy requires an unused task store",
+            ));
+        }
+        state.retention_journal.policy = policy;
+        Ok(self)
+    }
+
     /// Creates a store with the system monotonic clock and bounded retention.
     pub fn new(max_tasks: usize) -> McpResult<Self> {
         Self::with_clock(max_tasks, Arc::new(Instant::now))
@@ -2981,6 +3079,152 @@ impl Default for InMemoryFinalTaskStore {
 }
 
 impl FinalTaskStore for InMemoryFinalTaskStore {
+    fn retention_administration_policy(&self) -> McpResult<TaskRetentionPolicy> {
+        Ok(self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retention_journal
+            .policy)
+    }
+
+    fn reclaim_terminal_task_if_current(
+        &self,
+        cx: &Cx,
+        task_id: &FinalTaskId,
+        generation: u64,
+        reason: TaskRetentionReason,
+    ) -> McpResult<TaskRetentionReclamation> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let key = (task_id.clone(), generation);
+        if let Some(entry) = state
+            .retention_journal
+            .by_target
+            .get(&key)
+            .and_then(|sequence| state.retention_journal.entries.get(sequence))
+            .filter(|entry| entry.expires_at > now)
+        {
+            return Ok(TaskRetentionReclamation::AlreadyReclaimed(
+                entry.receipt.clone(),
+            ));
+        }
+        if state.generations.get(task_id) != Some(&generation)
+            || !state.tasks.get(task_id).is_some_and(final_task_is_terminal)
+            || state.handoff_leases.contains_key(task_id)
+        {
+            return Ok(TaskRetentionReclamation::NotCurrent);
+        }
+        let released_payload_bytes = state
+            .payload_accounting
+            .records
+            .get(task_id)
+            .ok_or_else(|| McpError::internal_error("Task retention accounting is unavailable"))?
+            .total;
+        // Charge both exact ID copies plus the fixed receipt/expiry fields.
+        // Record count separately bounds collection overhead; this is not a
+        // claim about an allocator's decoded heap footprint.
+        let charged_bytes = task_id
+            .as_str()
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(96))
+            .ok_or_else(|| McpError::internal_error("Task retention accounting overflow"))?;
+        let journal = &state.retention_journal;
+        let policy = journal.policy;
+        let (live_count, live_bytes) = journal
+            .entries
+            .values()
+            .filter(|entry| entry.expires_at > now)
+            .fold((0_usize, 0_usize), |(count, bytes), entry| {
+                (count + 1, bytes + entry.charged_bytes)
+            });
+        let retained_bytes = live_bytes
+            .checked_add(charged_bytes)
+            .filter(|bytes| *bytes <= policy.max_bytes)
+            .ok_or_else(|| {
+                McpError::invalid_params("Task retention audit byte capacity is exhausted")
+            })?;
+        if live_count >= policy.max_records {
+            return Err(McpError::invalid_params(
+                "Task retention audit record capacity is exhausted",
+            ));
+        }
+        let sequence = journal.next_sequence.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("Task retention sequence space is exhausted")
+        })?;
+        let expires_at = now.checked_add(policy.lifetime).ok_or_else(|| {
+            McpError::invalid_params("Task retention audit lifetime is not representable")
+        })?;
+        let receipt = TaskRetentionReceipt::new(
+            sequence,
+            task_id,
+            generation,
+            reason,
+            released_payload_bytes,
+        )?;
+        let entry = InMemoryTaskRetentionEntry {
+            task_id: task_id.clone(),
+            receipt: receipt.clone(),
+            expires_at,
+            charged_bytes,
+        };
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        // All checked admission precedes this one locked mutation. Expired
+        // journal cleanup cannot turn a failed CAS into a hidden state change.
+        let journal = &mut state.retention_journal;
+        journal.prune(now);
+        journal.entries.insert(sequence, entry);
+        journal.by_target.insert(key, sequence);
+        journal.next_sequence = sequence;
+        journal.retained_bytes = retained_bytes;
+        remove_in_memory_final_task(&mut state, task_id);
+        // Publication of the successful receipt is final: do not turn a
+        // committed reclamation into a retryable cancellation afterwards.
+        Ok(TaskRetentionReclamation::Reclaimed(receipt))
+    }
+
+    fn task_retention_audit(
+        &self,
+        cx: &Cx,
+        after: Option<u64>,
+        limit: usize,
+    ) -> McpResult<TaskRetentionAuditPage> {
+        validate_task_retention_page_limit(limit)?;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let now = (self.clock)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let journal = &mut state.retention_journal;
+        journal.prune(now);
+        let mut remaining = journal.entries.range((
+            after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded),
+            std::ops::Bound::Unbounded,
+        ));
+        let records: Vec<_> = remaining
+            .by_ref()
+            .take(limit)
+            .map(|(_, entry)| entry.receipt.clone())
+            .collect();
+        let next_after = remaining
+            .next()
+            .and_then(|_| records.last().map(TaskRetentionReceipt::sequence));
+        TaskRetentionAuditPage::new(
+            records,
+            next_after,
+            journal.entries.len(),
+            journal.retained_bytes,
+        )
+    }
+
     fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
         Ok(self.execution_limits)
     }
@@ -4540,20 +4784,24 @@ fn reclaim_expired_in_memory_final_tasks(state: &mut InMemoryFinalTaskState, now
         .map(|(task_id, _)| task_id.clone())
         .collect::<Vec<_>>();
     for task_id in expired_task_ids {
-        state.payload_accounting.release_task(&task_id);
-        state.expires_at.remove(&task_id);
-        state.execution_budgets.remove(&task_id);
-        state.tasks.remove(&task_id);
-        state.authenticated_principals.remove(&task_id);
-        state.generations.remove(&task_id);
-        state.work_descriptors.remove(&task_id);
-        state.initial_work.remove(&task_id);
-        state.accepted_inputs.remove(&task_id);
-        state.input_key_history.remove(&task_id);
-        state.handoff_leases.remove(&task_id);
-        state.cancellation_requests.remove(&task_id);
-        state.latest_notifications.remove(&task_id);
+        remove_in_memory_final_task(state, &task_id);
     }
+}
+
+fn remove_in_memory_final_task(state: &mut InMemoryFinalTaskState, task_id: &FinalTaskId) {
+    state.payload_accounting.release_task(task_id);
+    state.expires_at.remove(task_id);
+    state.execution_budgets.remove(task_id);
+    state.tasks.remove(task_id);
+    state.authenticated_principals.remove(task_id);
+    state.generations.remove(task_id);
+    state.work_descriptors.remove(task_id);
+    state.initial_work.remove(task_id);
+    state.accepted_inputs.remove(task_id);
+    state.input_key_history.remove(task_id);
+    state.handoff_leases.remove(task_id);
+    state.cancellation_requests.remove(task_id);
+    state.latest_notifications.remove(task_id);
 }
 
 /// Converts an expired elected cancellation lease into a terminal task.
@@ -5150,13 +5398,308 @@ impl FinalTaskSupervisorHandoff {
     }
 }
 
+/// Closed, non-payload reasons for an explicitly authorized retention action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskRetentionReason {
+    RetentionPolicy,
+    OperatorRequest,
+    SubjectRemoved,
+}
+
+/// Current administrative action, authorized before any record or audit lookup.
+/// Task IDs and generations are untrusted selectors, never authority. The
+/// provider must inspect the supplied [`McpContext`]'s verified identity and
+/// current grants; ordinary Task ownership does not imply retention authority.
+pub enum TaskRetentionAuthorization<'a> {
+    Inspect {
+        task_id: &'a FinalTaskId,
+    },
+    Reclaim {
+        task_id: &'a FinalTaskId,
+        generation: u64,
+        reason: TaskRetentionReason,
+    },
+    Audit {
+        after: Option<u64>,
+        limit: usize,
+    },
+}
+
+/// Separately installed retention authority. Authorization runs outside every
+/// runtime/store lock and is repeated for inspection, reclamation and audit.
+/// The callback must be bounded, observe `ctx`, and revalidate its own current
+/// administrative policy. Provider diagnostics are not returned to callers.
+pub trait TaskRetentionAdministrator: Send + Sync {
+    fn authorize(&self, ctx: &McpContext, action: &TaskRetentionAuthorization<'_>)
+    -> McpResult<()>;
+}
+
+/// Finite process-local audit and idempotency retention policy.
+/// Count bounds collection overhead; bytes charge both exact task-ID copies
+/// and 96 bytes of fixed receipt/expiry metadata per retained tombstone.
+/// This is distinct from live-task payload accounting and is not an allocator
+/// heap bound. Saturation refuses reclamation before changing the task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TaskRetentionPolicy {
+    max_records: usize,
+    max_bytes: usize,
+    lifetime: StdDuration,
+}
+
+impl TaskRetentionPolicy {
+    pub const MAX_AUDIT_PAGE_SIZE: usize = 128;
+    pub const HARD_MAX_RECORDS: usize = 4_096;
+    pub const HARD_MAX_BYTES: usize = 4 * 1_024 * 1_024;
+    /// Enough capacity to reclaim any one valid Task ID.
+    pub const MIN_JOURNAL_BYTES: usize =
+        2 * fastmcp_protocol::tasks_extension::MAX_TASK_ID_BYTES + 96;
+
+    pub fn new(max_records: usize, max_bytes: usize, lifetime: StdDuration) -> McpResult<Self> {
+        if !(1..=Self::HARD_MAX_RECORDS).contains(&max_records)
+            || !(Self::MIN_JOURNAL_BYTES..=Self::HARD_MAX_BYTES).contains(&max_bytes)
+            || lifetime.is_zero()
+            || lifetime > StdDuration::from_hours(720)
+        {
+            return Err(McpError::invalid_params(
+                "Task retention policy exceeds its finite bounds",
+            ));
+        }
+        Ok(Self {
+            max_records,
+            max_bytes,
+            lifetime,
+        })
+    }
+
+    #[must_use]
+    pub const fn max_records(self) -> usize {
+        self.max_records
+    }
+    #[must_use]
+    pub const fn max_bytes(self) -> usize {
+        self.max_bytes
+    }
+    #[must_use]
+    pub const fn lifetime(self) -> StdDuration {
+        self.lifetime
+    }
+}
+
+impl Default for TaskRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_records: 128,
+            max_bytes: 256 * 1_024,
+            lifetime: StdDuration::from_hours(24),
+        }
+    }
+}
+
+struct InstalledTaskRetentionAdministrator {
+    administrator: Arc<dyn TaskRetentionAdministrator>,
+    policy: TaskRetentionPolicy,
+}
+
+#[derive(Default)]
+struct TaskRetentionAdministration {
+    installed: Mutex<Option<InstalledTaskRetentionAdministrator>>,
+}
+
+/// Exact terminal generation observed through an authorized runtime lookup.
+/// This is a nonserializable comparison target, not an authorization grant.
+/// A fresh authorization is required even when the target is cloned or retried.
+#[derive(Clone)]
+pub struct TaskRetentionTarget {
+    task_id: FinalTaskId,
+    generation: u64,
+    runtime: Arc<TaskRetentionAdministration>,
+}
+
+impl TaskRetentionTarget {
+    #[must_use]
+    pub const fn task_id(&self) -> &FinalTaskId {
+        &self.task_id
+    }
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl std::fmt::Debug for TaskRetentionTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TaskRetentionTarget")
+            .field("task_id", &"<redacted>")
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+/// Redacted audit receipt for one committed terminal reclamation.
+/// Neither application payload nor a raw Task ID, owner or free-form reason is
+/// retained here. Its digest correlates a task but is never authorization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRetentionReceipt {
+    sequence: u64,
+    task_digest: Sha256Digest,
+    generation: u64,
+    reason: TaskRetentionReason,
+    released_payload_bytes: usize,
+}
+
+impl TaskRetentionReceipt {
+    /// Constructs a receipt for a trusted backend implementation. This does
+    /// not attest that an external backend actually committed its transaction.
+    pub fn new(
+        sequence: u64,
+        task_id: &FinalTaskId,
+        generation: u64,
+        reason: TaskRetentionReason,
+        released_payload_bytes: usize,
+    ) -> McpResult<Self> {
+        if sequence == 0 || generation == 0 {
+            return Err(McpError::invalid_params(
+                "Task retention receipt requires nonzero generations",
+            ));
+        }
+        let task_digest = fastmcp_core::crypto::sha256_bounded(
+            task_id.as_str().as_bytes(),
+            fastmcp_protocol::tasks_extension::MAX_TASK_ID_BYTES,
+        )
+        .map_err(|_| McpError::invalid_params("Task retention receipt has an invalid identity"))?;
+        Ok(Self {
+            sequence,
+            task_digest,
+            generation,
+            reason,
+            released_payload_bytes,
+        })
+    }
+
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    #[must_use]
+    pub const fn task_digest(&self) -> Sha256Digest {
+        self.task_digest
+    }
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    #[must_use]
+    pub const fn reason(&self) -> TaskRetentionReason {
+        self.reason
+    }
+    #[must_use]
+    pub const fn released_payload_bytes(&self) -> usize {
+        self.released_payload_bytes
+    }
+}
+
+/// Result of comparing and reclaiming one terminal generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TaskRetentionReclamation {
+    Reclaimed(TaskRetentionReceipt),
+    AlreadyReclaimed(TaskRetentionReceipt),
+    NotCurrent,
+}
+
+impl TaskRetentionReclamation {
+    #[must_use]
+    pub const fn receipt(&self) -> Option<&TaskRetentionReceipt> {
+        match self {
+            Self::Reclaimed(receipt) | Self::AlreadyReclaimed(receipt) => Some(receipt),
+            Self::NotCurrent => None,
+        }
+    }
+}
+
+/// Bounded sequence-ordered audit page. Receipt expiry can shorten the retained
+/// history; this is not a durable audit trail or a snapshot across page calls.
+#[derive(Clone, Debug)]
+pub struct TaskRetentionAuditPage {
+    records: Vec<TaskRetentionReceipt>,
+    next_after: Option<u64>,
+    retained_records: usize,
+    retained_bytes: usize,
+}
+
+impl TaskRetentionAuditPage {
+    pub fn new(
+        records: Vec<TaskRetentionReceipt>,
+        next_after: Option<u64>,
+        retained_records: usize,
+        retained_bytes: usize,
+    ) -> McpResult<Self> {
+        if records.len() > TaskRetentionPolicy::MAX_AUDIT_PAGE_SIZE
+            || retained_records > TaskRetentionPolicy::HARD_MAX_RECORDS
+            || retained_records < records.len()
+            || retained_bytes > TaskRetentionPolicy::HARD_MAX_BYTES
+            || records
+                .windows(2)
+                .any(|pair| pair[0].sequence >= pair[1].sequence)
+            || next_after.is_some_and(|next| {
+                records.last().map(TaskRetentionReceipt::sequence) != Some(next)
+            })
+        {
+            return Err(McpError::invalid_params(
+                "Task retention audit page is invalid",
+            ));
+        }
+        Ok(Self {
+            records,
+            next_after,
+            retained_records,
+            retained_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn records(&self) -> &[TaskRetentionReceipt] {
+        &self.records
+    }
+    #[must_use]
+    pub const fn next_after(&self) -> Option<u64> {
+        self.next_after
+    }
+    #[must_use]
+    pub const fn retained_records(&self) -> usize {
+        self.retained_records
+    }
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+}
+
+fn validate_task_retention_page_limit(limit: usize) -> McpResult<()> {
+    if !(1..=TaskRetentionPolicy::MAX_AUDIT_PAGE_SIZE).contains(&limit) {
+        return Err(McpError::invalid_params(
+            "Task retention audit page size is out of bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn final_task_is_terminal(task: &FinalTask) -> bool {
+    matches!(
+        task,
+        FinalTask::Completed { .. } | FinalTask::Failed { .. } | FinalTask::Cancelled(_)
+    )
+}
+
 /// Application-owned admission authority for Tasks with unlimited retention.
 ///
 /// Supplying this authority is an explicit declaration that the embedding owns
 /// the task-retention policy for `ttlMs: null`. It is deliberately distinct
 /// from the process-local store: accepting unlimited retention without an
 /// application decision would make unbounded task retention an accidental
-/// default.
+/// default. This configuration declaration alone does not enable creation:
+/// the runtime also requires an installed [`TaskRetentionAdministrator`] and
+/// a backend implementing atomic terminal reclamation.
 pub trait FinalTaskRetentionAuthority: Send + Sync {
     /// Confirms that this application accepts responsibility for retaining one
     /// unlimited final Task according to its own retention policy.
@@ -5196,8 +5739,9 @@ impl FinalTaskRuntimeConfig {
         })
     }
 
-    /// Creates a `ttlMs: null` policy after the application authorizes its
-    /// own durable retention and reclamation path.
+    /// Declares a `ttlMs: null` policy. Before creation the runtime must also
+    /// install a [`TaskRetentionAdministrator`] over a reclaim-capable store;
+    /// this declaration alone grants neither creation nor deletion authority.
     pub fn with_unlimited_ttl(
         retention_authority: &dyn FinalTaskRetentionAuthority,
         poll_interval_ms: Option<u64>,
@@ -5470,6 +6014,7 @@ pub struct FinalTaskRuntime {
     notification_emitters: Arc<Mutex<Vec<OwnedTaskNotificationEmitter>>>,
     service_signal: Arc<Mutex<Option<FinalTaskServiceSignal>>>,
     next_task_service_id: Arc<AtomicU64>,
+    retention_administration: Arc<TaskRetentionAdministration>,
 }
 
 impl FinalTaskRuntime {
@@ -5488,7 +6033,185 @@ impl FinalTaskRuntime {
             )])),
             service_signal: Arc::new(Mutex::new(None)),
             next_task_service_id: Arc::new(AtomicU64::new(0)),
+            retention_administration: Arc::new(TaskRetentionAdministration::default()),
         }
+    }
+
+    /// Installs a separate administrator after the backend attests bounded
+    /// atomic reclaim support. Runtime clones share this one installation.
+    /// Installation is a trusted embedding operation; every later action
+    /// reauthorizes its own current [`McpContext`] before any record lookup.
+    pub fn install_retention_administrator(
+        &self,
+        cx: &Cx,
+        administrator: Arc<dyn TaskRetentionAdministrator>,
+    ) -> McpResult<()> {
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let policy = self.store.retention_administration_policy()?;
+        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        let mut installed = self
+            .retention_administration
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if installed.is_some() {
+            return Err(McpError::invalid_params(
+                "A Task retention administrator is already installed",
+            ));
+        }
+        *installed = Some(InstalledTaskRetentionAdministrator {
+            administrator,
+            policy,
+        });
+        Ok(())
+    }
+
+    fn authorize_task_retention(
+        &self,
+        ctx: &McpContext,
+        action: &TaskRetentionAuthorization<'_>,
+    ) -> McpResult<TaskRetentionPolicy> {
+        ctx.ensure_live()?;
+        ctx.cx()
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        let (administrator, policy) = self
+            .retention_administration
+            .installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|installed| (Arc::clone(&installed.administrator), installed.policy))
+            .ok_or_else(|| {
+                McpError::invalid_request("Task retention administration is not authorized")
+            })?;
+        // No provider runs under the installation lock or the store lock.
+        let authorized = catch_unwind(AssertUnwindSafe(|| administrator.authorize(ctx, action)))
+            .is_ok_and(|result| result.is_ok());
+        ctx.ensure_live()?;
+        ctx.cx()
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        if !authorized {
+            return Err(McpError::invalid_request(
+                "Task retention administration is not authorized",
+            ));
+        }
+        Ok(policy)
+    }
+
+    /// Obtains an exact terminal comparison target after current admin
+    /// authorization. No Task payload is returned or retained in the target.
+    pub fn inspect_task_retention(
+        &self,
+        ctx: &McpContext,
+        task_id: &FinalTaskId,
+    ) -> McpResult<TaskRetentionTarget> {
+        self.authorize_task_retention(ctx, &TaskRetentionAuthorization::Inspect { task_id })?;
+        let snapshot = self.store.get_task_snapshot(task_id)?.ok_or_else(|| {
+            McpError::invalid_params("Task has no reclaimable terminal generation")
+        })?;
+        let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
+        if snapshot.generation() == 0 || !final_task_is_terminal(snapshot.task()) {
+            return Err(McpError::invalid_params(
+                "Task has no reclaimable terminal generation",
+            ));
+        }
+        ctx.ensure_live()?;
+        ctx.cx()
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        Ok(TaskRetentionTarget {
+            task_id: task_id.clone(),
+            generation: snapshot.generation(),
+            runtime: Arc::clone(&self.retention_administration),
+        })
+    }
+
+    /// Reclaims exactly the inspected terminal generation under fresh admin
+    /// authorization. Retained idempotency receipts prevent repeating the
+    /// action. A repeated request retains its first committed reason even if
+    /// the caller supplies a different reason. After the finite receipt expiry
+    /// a retry can return `NotCurrent`, but
+    /// can never reclaim a successor task that reused the ID.
+    ///
+    /// The built-in store is process-local. Neither this API nor its audit
+    /// receipts claim persistence, restore protection or cross-process safety.
+    pub fn reclaim_task_retention(
+        &self,
+        ctx: &McpContext,
+        target: &TaskRetentionTarget,
+        reason: TaskRetentionReason,
+    ) -> McpResult<TaskRetentionReclamation> {
+        self.authorize_task_retention(
+            ctx,
+            &TaskRetentionAuthorization::Reclaim {
+                task_id: &target.task_id,
+                generation: target.generation,
+                reason,
+            },
+        )?;
+        if !Arc::ptr_eq(&target.runtime, &self.retention_administration) {
+            return Err(McpError::invalid_params(
+                "Task retention target belongs to another runtime",
+            ));
+        }
+        let outcome = self.store.reclaim_terminal_task_if_current(
+            ctx.cx(),
+            &target.task_id,
+            target.generation,
+            reason,
+        )?;
+        if let Some(receipt) = outcome.receipt() {
+            if matches!(&outcome, TaskRetentionReclamation::Reclaimed(_))
+                && receipt.reason != reason
+            {
+                return Err(McpError::internal_error(
+                    "Task retention backend substituted the committed reason",
+                ));
+            }
+            let expected = TaskRetentionReceipt::new(
+                receipt.sequence,
+                &target.task_id,
+                target.generation,
+                receipt.reason,
+                receipt.released_payload_bytes,
+            )?;
+            if *receipt != expected {
+                return Err(McpError::internal_error(
+                    "Task retention backend returned an unrelated receipt",
+                ));
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Reads bounded redacted audit receipts under independent current
+    /// administrative authorization. This never exposes Task payload or IDs.
+    pub fn task_retention_audit(
+        &self,
+        ctx: &McpContext,
+        after: Option<u64>,
+        limit: usize,
+    ) -> McpResult<TaskRetentionAuditPage> {
+        validate_task_retention_page_limit(limit)?;
+        let policy = self
+            .authorize_task_retention(ctx, &TaskRetentionAuthorization::Audit { after, limit })?;
+        let page = self.store.task_retention_audit(ctx.cx(), after, limit)?;
+        ctx.ensure_live()?;
+        ctx.cx()
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())?;
+        if page.records.len() > limit
+            || page.retained_records > policy.max_records
+            || page.retained_bytes > policy.max_bytes
+            || after.is_some_and(|after| page.records.iter().any(|record| record.sequence <= after))
+        {
+            return Err(McpError::internal_error(
+                "Task retention backend exceeded its audit bounds",
+            ));
+        }
+        Ok(page)
     }
 
     /// Creates a usable bounded process-local final Tasks runtime.
@@ -5946,6 +6669,18 @@ impl FinalTaskRuntime {
         status_message: Option<String>,
         principal: Option<Sha256Digest>,
     ) -> McpResult<CreateTaskResult> {
+        if self.config.ttl_ms.is_none()
+            && self
+                .retention_administration
+                .installed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        {
+            return Err(McpError::invalid_params(
+                "Null-TTL Task creation requires an installed retention administrator and reclaim-capable store",
+            ));
+        }
         let task_id = generate_final_task_id()?;
         let now = final_task_timestamp()?;
         let task = FinalTask::Working(FinalTaskBase {
@@ -10623,6 +11358,21 @@ mod tests {
         }
     }
 
+    impl TaskRetentionAdministrator for AllowUnlimitedFinalTaskRetention {
+        fn authorize(&self, ctx: &McpContext, _: &TaskRetentionAuthorization<'_>) -> McpResult<()> {
+            if ctx.auth().is_some_and(|auth| {
+                auth.subject.as_deref() == Some("retention-admin")
+                    && auth.scopes.iter().any(|scope| scope == "tasks:retention")
+            }) {
+                Ok(())
+            } else {
+                Err(McpError::invalid_request(
+                    "Retention administration requires its own scope",
+                ))
+            }
+        }
+    }
+
     struct TerminalTransitionThenFailingFinalTaskSupervisor {}
 
     impl ApplicationTaskSupervisor for TerminalTransitionThenFailingFinalTaskSupervisor {
@@ -14030,6 +14780,12 @@ mod tests {
                 .expect("explicit authority admits null TTL retention"),
             Arc::new(|_| {}),
         );
+        runtime
+            .install_retention_administrator(
+                &Cx::for_testing(),
+                Arc::new(AllowUnlimitedFinalTaskRetention),
+            )
+            .expect("install the required independent retention administration");
         let service_runner = runtime
             .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
             .expect("install caller-owned service runner for task creation");
@@ -14056,6 +14812,745 @@ mod tests {
             "only null TTL differs from the finite deadline case, so it remains retained"
         );
         assert_eq!(store.task_count(), 1);
+    }
+
+    mod retention_administration {
+        use super::*;
+
+        #[derive(Default)]
+        struct Administrator {
+            revoked: AtomicBool,
+            cancel_after_authorization: AtomicBool,
+            calls: AtomicUsize,
+            registry: Mutex<Option<std::sync::Weak<TaskRetentionAdministration>>>,
+            store: Mutex<Option<std::sync::Weak<InMemoryFinalTaskStore>>>,
+        }
+
+        impl TaskRetentionAdministrator for Administrator {
+            fn authorize(
+                &self,
+                ctx: &McpContext,
+                action: &TaskRetentionAuthorization<'_>,
+            ) -> McpResult<()> {
+                self.calls.fetch_add(1, AtomicOrdering::SeqCst);
+                if let Some(registry) = self
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    assert!(
+                        registry.installed.try_lock().is_ok(),
+                        "provider must run outside the installation lock"
+                    );
+                }
+                if let Some(store) = self
+                    .store
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(std::sync::Weak::upgrade)
+                {
+                    assert!(
+                        store.state.try_lock().is_ok(),
+                        "provider must run before acquiring store state"
+                    );
+                }
+                if self
+                    .cancel_after_authorization
+                    .swap(false, AtomicOrdering::SeqCst)
+                {
+                    ctx.cx()
+                        .cancel_with(CancelKind::User, Some("retention authorization cancelled"));
+                }
+                if self.revoked.load(AtomicOrdering::SeqCst) {
+                    return Err(McpError::invalid_request(
+                        "private provider revocation detail",
+                    ));
+                }
+                AllowUnlimitedFinalTaskRetention.authorize(ctx, action)
+            }
+        }
+
+        fn context(subject: &str, administrative_scope: bool) -> McpContext {
+            let mut auth = fastmcp_core::AuthContext::with_subject(subject);
+            if administrative_scope {
+                auth.scopes.push("tasks:retention".to_owned());
+            }
+            McpContext::new(Cx::for_testing(), 1).with_auth(auth)
+        }
+
+        fn store(
+            policy: TaskRetentionPolicy,
+            maximum_tasks: usize,
+        ) -> (
+            Arc<InMemoryFinalTaskStore>,
+            Arc<Mutex<Instant>>,
+            Arc<AtomicUsize>,
+        ) {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let clock = Arc::clone(&now);
+            let observed = Arc::clone(&reads);
+            let store = InMemoryFinalTaskStore::with_clock(
+                maximum_tasks,
+                Arc::new(move || {
+                    observed.fetch_add(1, AtomicOrdering::SeqCst);
+                    *clock.lock().unwrap()
+                }),
+            )
+            .unwrap()
+            .with_retention_policy(policy)
+            .unwrap();
+            (Arc::new(store), now, reads)
+        }
+
+        fn runtime(store: &Arc<InMemoryFinalTaskStore>) -> (FinalTaskRuntime, Arc<Administrator>) {
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let administrator = Arc::new(Administrator::default());
+            *administrator.registry.lock().unwrap() =
+                Some(Arc::downgrade(&runtime.retention_administration));
+            *administrator.store.lock().unwrap() = Some(Arc::downgrade(store));
+            runtime
+                .install_retention_administrator(&Cx::for_testing(), administrator.clone())
+                .unwrap();
+            (runtime, administrator)
+        }
+
+        fn terminal(
+            store: &InMemoryFinalTaskStore,
+            name: &str,
+            status: FinalTaskStatus,
+        ) -> FinalTaskId {
+            let working = final_working_task_without_ttl(name);
+            let task_id = working.base().task_id.clone();
+            let initial = store
+                .create_task_with_authenticated_work(
+                    working.clone(),
+                    final_task_notification(&working),
+                    final_test_work_descriptor(),
+                    task_request_principal(&context("owner", true))
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+            let base =
+                transition_terminal_final_task_base(working.base().clone(), status, None).unwrap();
+            let task = match status {
+                FinalTaskStatus::Completed => FinalTask::Completed {
+                    base,
+                    result: serde_json::from_value(serde_json::json!({"content": [
+                        {"type": "text", "text": "retained-private-result"}
+                    ]}))
+                    .unwrap(),
+                },
+                FinalTaskStatus::Failed => FinalTask::Failed {
+                    base,
+                    error: serde_json::from_value(serde_json::json!({"code": -32000,
+                        "message": "retained-private-error"}))
+                    .unwrap(),
+                },
+                FinalTaskStatus::Cancelled => FinalTask::Cancelled(base),
+                _ => panic!("test helper requires a terminal status"),
+            };
+            store
+                .replace_task_and_clear_input_if_current(
+                    &initial,
+                    task.clone(),
+                    final_task_notification(&task),
+                )
+                .unwrap()
+                .unwrap();
+            task_id
+        }
+
+        fn snapshot(store: &InMemoryFinalTaskStore, task_id: &FinalTaskId) -> serde_json::Value {
+            let (record, expires, lease) = final_task_restoration_snapshot(store, task_id);
+            let state = store.state.lock().unwrap();
+            let journal = &state.retention_journal;
+            serde_json::json!({
+                "record": record, "expires": format!("{expires:?}"), "lease": format!("{lease:?}"),
+                "taskCount": state.tasks.len(), "execution": format!("{:?}", state.execution_budgets),
+                "auditBytes": journal.retained_bytes, "auditSequence": journal.next_sequence,
+                "auditIndex": journal.by_target.iter().map(|((id, generation), sequence)|
+                    (id.as_str(), *generation, *sequence)).collect::<Vec<_>>(),
+                "audit": journal.entries.values().map(|entry| serde_json::json!({
+                    "id": entry.task_id.as_str(), "sequence": entry.receipt.sequence,
+                    "digest": entry.receipt.task_digest.as_bytes(), "generation": entry.receipt.generation,
+                    "reason": format!("{:?}", entry.receipt.reason), "released": entry.receipt.released_payload_bytes,
+                    "expires": format!("{:?}", entry.expires_at), "charge": entry.charged_bytes,
+                })).collect::<Vec<_>>(),
+            })
+        }
+
+        #[test]
+        fn terminal_reclamation_releases_capacity_once_and_keeps_a_redacted_receipt() {
+            for status in [
+                FinalTaskStatus::Completed,
+                FinalTaskStatus::Failed,
+                FinalTaskStatus::Cancelled,
+            ] {
+                let (store, _, _) = store(TaskRetentionPolicy::default(), 1);
+                let (runtime, _) = runtime(&store);
+                let admin = context("retention-admin", true);
+                let task_id = terminal(&store, "private-task-id", status);
+                let retained = store.retained_payload_bytes();
+                assert!(retained > 0);
+                let target = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+                let successor = final_working_task_without_ttl("capacity-successor");
+                assert!(
+                    store
+                        .create_task(successor.clone(), final_task_notification(&successor))
+                        .is_err()
+                );
+                let outcome = runtime
+                    .reclaim_task_retention(&admin, &target, TaskRetentionReason::RetentionPolicy)
+                    .unwrap();
+                let TaskRetentionReclamation::Reclaimed(receipt) = outcome else {
+                    panic!("exact terminal must reclaim");
+                };
+                assert_eq!(receipt.released_payload_bytes(), retained);
+                assert_eq!(store.task_count(), 0);
+                assert_eq!(store.retained_payload_bytes(), 0);
+                {
+                    let state = store.state.lock().unwrap();
+                    assert!(
+                        state.authenticated_principals.is_empty() && state.generations.is_empty()
+                    );
+                    assert!(state.work_descriptors.is_empty() && state.initial_work.is_empty());
+                    assert!(state.accepted_inputs.is_empty() && state.input_key_history.is_empty());
+                    assert!(
+                        state.handoff_leases.is_empty() && state.cancellation_requests.is_empty()
+                    );
+                    assert!(
+                        state.latest_notifications.is_empty() && state.execution_budgets.is_empty()
+                    );
+                    assert!(
+                        state.expires_at.is_empty() && state.payload_accounting.records.is_empty()
+                    );
+                    assert_eq!(state.payload_accounting.reserved, 0);
+                }
+                store
+                    .create_task(successor.clone(), final_task_notification(&successor))
+                    .unwrap();
+                let before = snapshot(&store, &successor.base().task_id);
+                let repeated = runtime
+                    .reclaim_task_retention(&admin, &target, TaskRetentionReason::SubjectRemoved)
+                    .unwrap();
+                assert_eq!(
+                    repeated,
+                    TaskRetentionReclamation::AlreadyReclaimed(receipt.clone())
+                );
+                assert_eq!(snapshot(&store, &successor.base().task_id), before);
+                let page = runtime.task_retention_audit(&admin, None, 1).unwrap();
+                assert_eq!(page.records(), &[receipt]);
+                assert_eq!(page.retained_records(), 1);
+                assert!(page.next_after().is_none());
+                let diagnostic = format!("{page:?} {target:?}");
+                assert!(
+                    !diagnostic.contains("private-task-id")
+                        && !diagnostic.contains("retained-private")
+                );
+                assert_final_task_payload_accounting(&store);
+            }
+        }
+
+        #[test]
+        fn current_admin_authorization_precedes_every_lookup_and_rechecks_revocation() {
+            let (store, _, clock_reads) = store(TaskRetentionPolicy::default(), 1);
+            let (runtime, administrator) = runtime(&store);
+            let task_id = terminal(
+                &store,
+                "owner-cannot-administer",
+                FinalTaskStatus::Completed,
+            );
+            assert!(
+                runtime
+                    .task_for_request(&context("owner", true), &task_id)
+                    .is_ok(),
+                "this caller really owns the task and may perform its ordinary lookup"
+            );
+            let admin = context("retention-admin", true);
+            let target = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+            let before = snapshot(&store, &task_id);
+            for caller in [
+                context("owner", true),
+                context("retention-admin", false),
+                McpContext::new(Cx::for_testing(), 2),
+            ] {
+                clock_reads.store(0, AtomicOrdering::SeqCst);
+                assert!(runtime.inspect_task_retention(&caller, &task_id).is_err());
+                assert!(
+                    runtime
+                        .reclaim_task_retention(
+                            &caller,
+                            &target,
+                            TaskRetentionReason::OperatorRequest
+                        )
+                        .is_err()
+                );
+                assert!(runtime.task_retention_audit(&caller, None, 1).is_err());
+                assert_eq!(
+                    clock_reads.load(AtomicOrdering::SeqCst),
+                    0,
+                    "denied administration must not enter a real store read or mutation"
+                );
+                assert_eq!(snapshot(&store, &task_id), before);
+            }
+            administrator.revoked.store(true, AtomicOrdering::SeqCst);
+            clock_reads.store(0, AtomicOrdering::SeqCst);
+            let error = runtime
+                .reclaim_task_retention(&admin, &target, TaskRetentionReason::OperatorRequest)
+                .unwrap_err();
+            assert!(!error.message.contains("private provider"));
+            assert_eq!(clock_reads.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(snapshot(&store, &task_id), before);
+            administrator.revoked.store(false, AtomicOrdering::SeqCst);
+            assert!(matches!(
+                runtime
+                    .reclaim_task_retention(&admin, &target, TaskRetentionReason::OperatorRequest)
+                    .unwrap(),
+                TaskRetentionReclamation::Reclaimed(_)
+            ));
+        }
+
+        #[test]
+        fn cancellation_before_or_during_authorization_prevents_store_access() {
+            for during_authorization in [false, true] {
+                let (store, _, clock_reads) = store(TaskRetentionPolicy::default(), 1);
+                let (runtime, administrator) = runtime(&store);
+                let task_id = terminal(&store, "cancelled-admin", FinalTaskStatus::Completed);
+                let target = runtime
+                    .inspect_task_retention(&context("retention-admin", true), &task_id)
+                    .unwrap();
+                let caller = context("retention-admin", true);
+                let before = snapshot(&store, &task_id);
+                let calls = administrator.calls.load(AtomicOrdering::SeqCst);
+                if during_authorization {
+                    administrator
+                        .cancel_after_authorization
+                        .store(true, AtomicOrdering::SeqCst);
+                } else {
+                    caller
+                        .cx()
+                        .cancel_with(CancelKind::User, Some("pre-cancelled administrator"));
+                }
+                clock_reads.store(0, AtomicOrdering::SeqCst);
+                assert!(
+                    runtime
+                        .reclaim_task_retention(
+                            &caller,
+                            &target,
+                            TaskRetentionReason::OperatorRequest
+                        )
+                        .is_err()
+                );
+                assert_eq!(
+                    administrator.calls.load(AtomicOrdering::SeqCst),
+                    calls + usize::from(during_authorization)
+                );
+                assert_eq!(clock_reads.load(AtomicOrdering::SeqCst), 0);
+                assert_eq!(snapshot(&store, &task_id), before);
+            }
+        }
+
+        #[test]
+        fn stale_generation_never_reclaims_a_reused_id_before_or_after_receipt_expiry() {
+            let policy = TaskRetentionPolicy::new(1, 4_096, Duration::from_secs(1)).unwrap();
+            let (store, now, _) = store(policy, 1);
+            let (runtime, _) = runtime(&store);
+            let admin = context("retention-admin", true);
+            let task_id = terminal(&store, "reused-opaque-id", FinalTaskStatus::Completed);
+            let old = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+            let receipt = runtime
+                .reclaim_task_retention(&admin, &old, TaskRetentionReason::RetentionPolicy)
+                .unwrap()
+                .receipt()
+                .unwrap()
+                .clone();
+            terminal(&store, task_id.as_str(), FinalTaskStatus::Failed);
+            let successor = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+            assert!(successor.generation() > old.generation());
+            let before = snapshot(&store, &task_id);
+            assert_eq!(
+                runtime
+                    .reclaim_task_retention(&admin, &old, TaskRetentionReason::SubjectRemoved)
+                    .unwrap(),
+                TaskRetentionReclamation::AlreadyReclaimed(receipt.clone())
+            );
+            assert_eq!(snapshot(&store, &task_id), before);
+            *now.lock().unwrap() += Duration::from_secs(1);
+            assert_eq!(
+                runtime
+                    .reclaim_task_retention(&admin, &old, TaskRetentionReason::SubjectRemoved)
+                    .unwrap(),
+                TaskRetentionReclamation::NotCurrent
+            );
+            assert_eq!(
+                snapshot(&store, &task_id),
+                before,
+                "a failed generation CAS cannot even prune unrelated audit state"
+            );
+            let successor_receipt = runtime
+                .reclaim_task_retention(&admin, &successor, TaskRetentionReason::SubjectRemoved)
+                .unwrap()
+                .receipt()
+                .unwrap()
+                .clone();
+            assert!(successor_receipt.sequence() > receipt.sequence());
+            let page = runtime.task_retention_audit(&admin, None, 1).unwrap();
+            assert_eq!(page.records(), &[successor_receipt]);
+        }
+
+        #[test]
+        fn active_tasks_and_foreign_runtime_targets_remain_unchanged() {
+            let (store, _, _) = store(TaskRetentionPolicy::default(), 2);
+            let (runtime, _) = runtime(&store);
+            let admin = context("retention-admin", true);
+            let active = final_working_task_without_ttl("active-retention-negative");
+            store
+                .create_task_with_work(
+                    active.clone(),
+                    final_task_notification(&active),
+                    final_test_work_descriptor(),
+                )
+                .unwrap();
+            let current = store
+                .get_task_snapshot(&active.base().task_id)
+                .unwrap()
+                .unwrap();
+            let before = snapshot(&store, &active.base().task_id);
+            assert!(
+                runtime
+                    .inspect_task_retention(&admin, &active.base().task_id)
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .reclaim_terminal_task_if_current(
+                        admin.cx(),
+                        &active.base().task_id,
+                        current.generation(),
+                        TaskRetentionReason::OperatorRequest
+                    )
+                    .unwrap(),
+                TaskRetentionReclamation::NotCurrent
+            );
+            assert_eq!(snapshot(&store, &active.base().task_id), before);
+            let task_id = terminal(
+                &store,
+                "terminal-target-runtime",
+                FinalTaskStatus::Completed,
+            );
+            let target = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+            let other = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(|_| {}),
+            );
+            other
+                .install_retention_administrator(
+                    admin.cx(),
+                    Arc::new(AllowUnlimitedFinalTaskRetention),
+                )
+                .unwrap();
+            let before = snapshot(&store, &task_id);
+            assert!(
+                other
+                    .reclaim_task_retention(&admin, &target, TaskRetentionReason::OperatorRequest)
+                    .is_err()
+            );
+            assert_eq!(snapshot(&store, &task_id), before);
+        }
+
+        #[test]
+        fn audit_saturation_and_expiry_preserve_task_quota_until_reclamation_commits() {
+            let policy = TaskRetentionPolicy::new(1, 4_096, Duration::from_secs(1)).unwrap();
+            let (store, now, _) = store(policy, 2);
+            let (runtime, _) = runtime(&store);
+            let admin = context("retention-admin", true);
+            let first = terminal(&store, "audit-first", FinalTaskStatus::Completed);
+            let second = terminal(&store, "audit-second", FinalTaskStatus::Completed);
+            let first = runtime.inspect_task_retention(&admin, &first).unwrap();
+            let second = runtime.inspect_task_retention(&admin, &second).unwrap();
+            runtime
+                .reclaim_task_retention(&admin, &first, TaskRetentionReason::OperatorRequest)
+                .unwrap();
+            let before = snapshot(&store, second.task_id());
+            assert!(
+                runtime
+                    .reclaim_task_retention(&admin, &second, TaskRetentionReason::OperatorRequest)
+                    .is_err()
+            );
+            assert_eq!(snapshot(&store, second.task_id()), before);
+            *now.lock().unwrap() += Duration::from_secs(1);
+            assert!(matches!(
+                runtime
+                    .reclaim_task_retention(&admin, &second, TaskRetentionReason::OperatorRequest)
+                    .unwrap(),
+                TaskRetentionReclamation::Reclaimed(_)
+            ));
+            assert_eq!(store.task_count(), 0);
+            assert_eq!(store.retained_payload_bytes(), 0);
+            assert_eq!(
+                runtime
+                    .task_retention_audit(&admin, None, 1)
+                    .unwrap()
+                    .retained_records(),
+                1
+            );
+        }
+
+        #[test]
+        fn audit_byte_limit_is_inclusive_and_refuses_before_any_mutation() {
+            let first_name = "a".repeat(fastmcp_protocol::tasks_extension::MAX_TASK_ID_BYTES);
+            let second_name = "b".repeat(fastmcp_protocol::tasks_extension::MAX_TASK_ID_BYTES);
+            let charged = first_name.len() * 2 + 96;
+            assert!(
+                TaskRetentionPolicy::new(1, charged - 1, Duration::from_secs(1)).is_err(),
+                "a configured administrator must have room to reclaim at least one arbitrary valid ID"
+            );
+            for one_byte_short in [true, false] {
+                let policy = TaskRetentionPolicy::new(
+                    2,
+                    2 * charged - usize::from(one_byte_short),
+                    Duration::from_secs(1),
+                )
+                .unwrap();
+                let (store, _, _) = store(policy, 2);
+                let (runtime, _) = runtime(&store);
+                let admin = context("retention-admin", true);
+                let first = terminal(&store, &first_name, FinalTaskStatus::Completed);
+                let first = runtime.inspect_task_retention(&admin, &first).unwrap();
+                runtime
+                    .reclaim_task_retention(&admin, &first, TaskRetentionReason::OperatorRequest)
+                    .unwrap();
+                let task_id = terminal(&store, &second_name, FinalTaskStatus::Completed);
+                let target = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+                let before = snapshot(&store, &task_id);
+                let outcome = runtime.reclaim_task_retention(
+                    &admin,
+                    &target,
+                    TaskRetentionReason::OperatorRequest,
+                );
+                if one_byte_short {
+                    assert!(outcome.is_err());
+                    assert_eq!(snapshot(&store, &task_id), before);
+                } else {
+                    assert!(matches!(
+                        outcome.unwrap(),
+                        TaskRetentionReclamation::Reclaimed(_)
+                    ));
+                    assert_eq!(
+                        runtime
+                            .task_retention_audit(&admin, None, 1)
+                            .unwrap()
+                            .retained_bytes(),
+                        2 * charged
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn audit_pages_are_bounded_ordered_and_independent_of_record_removal() {
+            let (store, _, _) = store(TaskRetentionPolicy::default(), 1);
+            let (runtime, _) = runtime(&store);
+            let admin = context("retention-admin", true);
+            for index in 0..3 {
+                let task_id = terminal(
+                    &store,
+                    &format!("audit-page-{index}"),
+                    FinalTaskStatus::Completed,
+                );
+                let target = runtime.inspect_task_retention(&admin, &task_id).unwrap();
+                runtime
+                    .reclaim_task_retention(&admin, &target, TaskRetentionReason::RetentionPolicy)
+                    .unwrap();
+            }
+            let first = runtime.task_retention_audit(&admin, None, 2).unwrap();
+            assert_eq!(
+                first
+                    .records()
+                    .iter()
+                    .map(TaskRetentionReceipt::sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(first.next_after(), Some(2));
+            let second = runtime
+                .task_retention_audit(&admin, first.next_after(), 2)
+                .unwrap();
+            assert_eq!(
+                second
+                    .records()
+                    .iter()
+                    .map(TaskRetentionReceipt::sequence)
+                    .collect::<Vec<_>>(),
+                vec![3]
+            );
+            assert!(second.next_after().is_none());
+            assert!(
+                runtime
+                    .task_retention_audit(&admin, Some(u64::MAX), 1)
+                    .unwrap()
+                    .records()
+                    .is_empty()
+            );
+            assert!(runtime.task_retention_audit(&admin, None, 0).is_err());
+            assert!(
+                runtime
+                    .task_retention_audit(
+                        &admin,
+                        None,
+                        TaskRetentionPolicy::MAX_AUDIT_PAGE_SIZE + 1
+                    )
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn concurrent_reclamation_has_one_quota_release_and_one_audit_receipt() {
+            let (store, _, _) = store(TaskRetentionPolicy::default(), 1);
+            let (runtime, administrator) = runtime(&store);
+            let task_id = terminal(&store, "concurrent-retention", FinalTaskStatus::Completed);
+            let target = runtime
+                .inspect_task_retention(&context("retention-admin", true), &task_id)
+                .unwrap();
+            // The single-thread cases prove callbacks hold no locks. Here
+            // another thread may legitimately own a lock while we authorize.
+            *administrator.registry.lock().unwrap() = None;
+            *administrator.store.lock().unwrap() = None;
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let threads = (0..2)
+                .map(|_| {
+                    let runtime = runtime.clone();
+                    let target = target.clone();
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        runtime
+                            .reclaim_task_retention(
+                                &context("retention-admin", true),
+                                &target,
+                                TaskRetentionReason::RetentionPolicy,
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let outcomes = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, TaskRetentionReclamation::Reclaimed(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(
+                        outcome,
+                        TaskRetentionReclamation::AlreadyReclaimed(_)
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(outcomes[0].receipt(), outcomes[1].receipt());
+            assert_eq!(store.task_count(), 0);
+            assert_eq!(store.retained_payload_bytes(), 0);
+            assert_eq!(
+                runtime
+                    .task_retention_audit(&context("retention-admin", true), None, 1)
+                    .unwrap()
+                    .retained_records(),
+                1
+            );
+        }
+
+        #[test]
+        fn null_ttl_creation_requires_installed_administration_and_backend_reclaim_support() {
+            let (store, _, _) = store(TaskRetentionPolicy::default(), 1);
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::with_unlimited_ttl(&AllowUnlimitedFinalTaskRetention, None)
+                    .unwrap(),
+                Arc::new(|_| {}),
+            );
+            let runner = runtime
+                .install_task_service(1, Arc::new(FailingFinalTaskSupervisor))
+                .unwrap();
+            let cx = Cx::for_testing();
+            let _running = enter_task_service_runner(runner, &cx);
+            let error = runtime
+                .create_task_with_work(final_test_work_descriptor(), None)
+                .unwrap_err();
+            assert!(error.message.contains("installed retention administrator"));
+            assert_eq!(store.task_count(), 0);
+            runtime
+                .install_retention_administrator(&cx, Arc::new(AllowUnlimitedFinalTaskRetention))
+                .unwrap();
+            assert!(
+                runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .unwrap()
+                    .task
+                    .base()
+                    .ttl_ms
+                    .is_none()
+            );
+            assert_eq!(store.task_count(), 1);
+            assert!(
+                runtime
+                    .install_retention_administrator(
+                        &cx,
+                        Arc::new(AllowUnlimitedFinalTaskRetention)
+                    )
+                    .is_err()
+            );
+
+            let unsupported = Arc::new(RuntimeBoundaryProbeFinalTaskStore::new(
+                final_working_task_without_ttl("unsupported-retention"),
+            ));
+            let runtime = FinalTaskRuntime::new(
+                unsupported.clone(),
+                FinalTaskRuntimeConfig::with_unlimited_ttl(&AllowUnlimitedFinalTaskRetention, None)
+                    .unwrap(),
+                Arc::new(|_| {}),
+            );
+            let before = unsupported.snapshot();
+            assert!(
+                runtime
+                    .install_retention_administrator(
+                        &cx,
+                        Arc::new(AllowUnlimitedFinalTaskRetention)
+                    )
+                    .is_err()
+            );
+            assert!(
+                runtime
+                    .create_task_with_work(final_test_work_descriptor(), None)
+                    .is_err()
+            );
+            assert_eq!(
+                unsupported
+                    .transition_write_calls
+                    .load(AtomicOrdering::SeqCst),
+                0
+            );
+            assert!(
+                final_tasks_match_exactly(before.task(), unsupported.snapshot().task()).unwrap()
+            );
+        }
     }
 
     #[test]
@@ -21731,6 +23226,12 @@ mod tests {
                 .expect("explicit authority admits unlimited retained handoffs"),
             Arc::new(|_| {}),
         );
+        runtime
+            .install_retention_administrator(
+                &Cx::for_testing(),
+                Arc::new(AllowUnlimitedFinalTaskRetention),
+            )
+            .expect("install the required independent retention administration");
         let input_responses: FinalTaskInputResponses = serde_json::from_value(
             serde_json::json!({"roots": {"roots": [{"uri": "file:///uncancelled-error"}]}}),
         )
@@ -21801,6 +23302,12 @@ mod tests {
                 .expect("explicit authority admits unlimited retained handoffs"),
             Arc::new(|_| {}),
         );
+        runtime
+            .install_retention_administrator(
+                &Cx::for_testing(),
+                Arc::new(AllowUnlimitedFinalTaskRetention),
+            )
+            .expect("install the required independent retention administration");
         let input_responses: FinalTaskInputResponses = serde_json::from_value(
             serde_json::json!({"roots": {"roots": [{"uri": "file:///cancelled-error"}]}}),
         )
@@ -21889,6 +23396,12 @@ mod tests {
                 .expect("explicit authority admits unlimited retained handoffs"),
             Arc::new(|_| {}),
         );
+        runtime
+            .install_retention_administrator(
+                &Cx::for_testing(),
+                Arc::new(AllowUnlimitedFinalTaskRetention),
+            )
+            .expect("install the required independent retention administration");
         let input_responses: FinalTaskInputResponses = serde_json::from_value(
             serde_json::json!({"roots": {"roots": [{"uri": "file:///cancelled-drop"}]}}),
         )
