@@ -26165,6 +26165,8 @@ mod lib_unit_tests {
 
     #[test]
     fn http_extension_notification_deadline_and_drop_prevent_late_effects() {
+        use std::task::Poll;
+
         let mut lab = asupersync::lab::LabRuntime::new(
             asupersync::lab::LabConfig::new(1254)
                 .with_auto_advance()
@@ -26251,6 +26253,8 @@ mod lib_unit_tests {
 
     #[test]
     fn http_extension_notification_settles_children_before_status_and_after_drop() {
+        use std::task::Poll;
+
         fn child_request(value: u64, hold: bool) -> HttpRequest {
             let mut request = http_extension_notification_request(value, 0, hold);
             let mut body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
@@ -47807,6 +47811,9 @@ mod lib_unit_tests {
 
     #[test]
     fn native_http_response_write_deadline_preserves_progress_and_bounds_stalls() {
+        use asupersync::io::AsyncWrite;
+        use std::pin::Pin;
+
         // Drive virtual timers explicitly: the same operation commits one
         // millisecond before its budget but cannot commit at that budget.
         {
