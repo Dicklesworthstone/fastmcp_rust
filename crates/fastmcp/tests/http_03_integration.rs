@@ -874,7 +874,7 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
         let first = match connection
             .request_json(
                 &cx,
-                "ping",
+                "tools/list",
                 serde_json::json!({}),
                 RequestId::Number(41),
                 65_536,
@@ -899,7 +899,7 @@ fn observe_lane(stall_then_hold: bool, idle_timeout: Duration) -> LaneObservatio
         let followup = match connection
             .request_json(
                 &cx,
-                "ping",
+                "tools/list",
                 serde_json::json!({}),
                 RequestId::Number(43),
                 65_536,
@@ -1343,7 +1343,7 @@ fn observe_extension_notification() -> NotificationObservation {
             connection
                 .request_json(
                     &cx,
-                    "ping",
+                    "tools/list",
                     serde_json::json!({}),
                     RequestId::Number(72),
                     65_536,
@@ -2113,7 +2113,7 @@ fn run_fixture(plant_case_04: bool) -> WireObservations {
         let b_json_outcome = match b_connection
             .request_json(
                 &cx,
-                "ping",
+                "tools/list",
                 serde_json::json!({}),
                 RequestId::Number(11),
                 65_536,
@@ -2133,8 +2133,18 @@ fn run_fixture(plant_case_04: bool) -> WireObservations {
 
         // A second JSON terminal, converted through the SSE lane entrypoint.
         // Only the requested lane differs from the accepted JSON consumption.
+        // The method is incidental to the lane property under test. It is
+        // `tools/list` and not `ping` because MCP 2026-07-28 removed `ping`:
+        // the modern final-request union refuses it in the client before the
+        // fixture is ever consulted, so a ping here cannot reach a response
+        // head at all. See bd-jqo2j.
         let b_lane_refusal = match b_connection
-            .request(&cx, "ping", serde_json::json!({}), RequestId::Number(12))
+            .request(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                RequestId::Number(12),
+            )
             .await
             .expect("the second /mcp-b JSON exchange must reach a response head")
         {
@@ -2696,7 +2706,7 @@ fn case_one_post_exact_body(builder: &mut CaseBuilder, wire: &WireObservations) 
     // Request stamping on the other two client request bodies.
     for (label, request, method) in [
         ("mcp-a-probe", &wire.a_probe, "server/discover"),
-        ("mcp-b-ping", &wire.b_ping, "ping"),
+        ("mcp-b-ping", &wire.b_ping, "tools/list"),
     ] {
         let body = request.json_body();
         assert_eq!(body["jsonrpc"], "2.0");
@@ -2939,7 +2949,7 @@ fn case_routing_headers(builder: &mut CaseBuilder, wire: &WireObservations) {
         ("mcp-a-probe", &wire.a_probe, "server/discover"),
         ("mcp-a-call", &wire.a_call, "tools/call"),
         ("mcp-b-probe", &wire.b_probe, "server/discover"),
-        ("mcp-b-ping", &wire.b_ping, "ping"),
+        ("mcp-b-ping", &wire.b_ping, "tools/list"),
     ] {
         let observed = request
             .header("Mcp-Method")
@@ -2975,7 +2985,7 @@ fn case_routing_headers(builder: &mut CaseBuilder, wire: &WireObservations) {
     );
     builder.positive("mcp-a-call", &call_name);
 
-    // `ping` is not a name-bearing method, so the header must be absent.
+    // `tools/list` is not a name-bearing method, so the header must be absent.
     assert!(wire.b_ping.header("Mcp-Name").is_none());
     builder.positive("mcp-b-ping", "<absent>");
 
