@@ -5,6 +5,7 @@
 //! - Tool invocation
 //! - Resource reading
 //! - Prompt fetching
+//! - Asynchronous modern requests over bounded in-process memory connections
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
 //! public stdio constructor starts with a modern `server/discover` probe and
@@ -50,6 +51,7 @@
 mod builder;
 mod cache;
 mod execution;
+mod memory;
 #[cfg(feature = "tasks")]
 mod task_wait;
 #[cfg(feature = "tasks")]
@@ -126,6 +128,7 @@ pub use fastmcp_protocol::common_types::LoggingLevel;
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_transport::websocket::AsyncWsClientTransport;
+pub use memory::{MemoryClient, MemoryRequestEvent, MemoryRequestExecution};
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is
 // absent. Keep the private name available in feature-off builds.

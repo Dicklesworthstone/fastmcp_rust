@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
-use fastmcp_core::{McpError, McpErrorCode, McpResult, Sha256Digest, sha256_bounded};
+use fastmcp_core::{
+    McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, sha256_bounded,
+};
 #[cfg(any(feature = "tasks", test))]
 use fastmcp_protocol::FinalCoreResult;
 use fastmcp_protocol::common_types::ExactNonNegativeJsonNumber;
@@ -901,6 +903,7 @@ struct PendingExecution {
     /// Retain the real context so its clock, masks and cancellation state
     /// cannot be replaced by a later observer's more permissive context.
     caller: Cx,
+    request_cancellation: Option<McpRequestCancellation>,
     owner_dropped: OwnerDropped,
     timeout_policy: ExecutionTimeoutPolicy,
     /// Canonical identity of the optional marker advertised in `_meta`.
@@ -1199,6 +1202,9 @@ struct PendingCancellationControl {
 #[derive(Debug)]
 struct ExecutorState<T> {
     transport: T,
+    // An asynchronous connection owner commits writes itself. Its bounded
+    // controls remain here until an actual channel/transport commit succeeds.
+    external_writes: bool,
     receive_frame: Option<fn(&mut T, &Cx) -> Result<ReceivedTransportFrame, TransportError>>,
     ingress_owner: IngressOwner,
     pending: HashMap<CorrelationKey, PendingExecution>,
@@ -1213,6 +1219,9 @@ struct ExecutorState<T> {
     terminal_expirations: HashMap<(RequestId, u64), Instant>,
     cancellation_events: VecDeque<CancellationRequested>,
     deferred_cancellations: VecDeque<PendingCancellationControl>,
+    // Opposite-direction request IDs do not own a client execution. Keep
+    // their external-driver responses separate from cancellation receipts.
+    deferred_rejections: VecDeque<JsonRpcMessage>,
     #[cfg(feature = "tasks")]
     task_subscriptions: HashMap<(RequestId, u64), TaskSubscription>,
     next_generation: u64,
@@ -1300,12 +1309,28 @@ impl<T> ExecutorState<T> {
     }
 
     fn defer_cancellation(&mut self, cancellation: PendingCancellationControl) -> McpResult<()> {
-        if self.deferred_cancellations.len() >= DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
+        if self.deferred_control_count() >= DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
             let error = McpError::internal_error("Client cancellation control queue is full");
             self.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
             return Err(error);
         }
         self.deferred_cancellations.push_back(cancellation);
+        Ok(())
+    }
+
+    fn deferred_control_count(&self) -> usize {
+        self.deferred_cancellations
+            .len()
+            .saturating_add(self.deferred_rejections.len())
+    }
+
+    fn defer_rejection(&mut self, rejection: JsonRpcMessage) -> McpResult<()> {
+        if self.deferred_control_count() >= DEFAULT_MAX_IN_FLIGHT_EXECUTIONS {
+            let error = McpError::internal_error("Client rejection control queue is full");
+            self.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
+            return Err(error);
+        }
+        self.deferred_rejections.push_back(rejection);
         Ok(())
     }
 
@@ -1365,6 +1390,7 @@ impl<T> ExecutorState<T> {
         #[cfg(feature = "tasks")]
         self.task_subscriptions.clear();
         self.deferred_cancellations.clear();
+        self.deferred_rejections.clear();
         let pending = std::mem::take(&mut self.pending);
         for (_, pending) in pending {
             let request_id = pending.record.request_id.clone();
@@ -1372,7 +1398,11 @@ impl<T> ExecutorState<T> {
             // ordinary service turn. Do not let that path replace a stopped
             // origin's local cancellation with its live sibling's I/O error.
             // Observe the retained origin's clock and mask, not an ambient Cx.
-            let caller_stopped = pending.caller.checkpoint().is_err();
+            let caller_stopped = pending.caller.checkpoint().is_err()
+                || pending.request_cancellation.as_ref().is_some_and(|cancellation| {
+                    cancellation.is_cancel_requested()
+                        || pending.caller.budget().deadline.is_some_and(|deadline| pending.caller.now() >= deadline)
+                });
             let (terminal_state, terminal_reason, outcome_error) = if caller_stopped {
                 (
                     ExecutionTerminalState::Cancelled,
@@ -1490,6 +1520,7 @@ where
         Self {
             state: SharedExecutorState::new(ExecutorState {
                 transport,
+                external_writes: false,
                 receive_frame,
                 ingress_owner: IngressOwner::Unclaimed,
                 pending: HashMap::new(),
@@ -1504,6 +1535,7 @@ where
                 terminal_expirations: HashMap::new(),
                 cancellation_events: VecDeque::new(),
                 deferred_cancellations: VecDeque::new(),
+                deferred_rejections: VecDeque::new(),
                 #[cfg(feature = "tasks")]
                 task_subscriptions: HashMap::new(),
                 next_generation: 0,
@@ -1522,6 +1554,86 @@ where
     #[must_use]
     pub fn result_peer_era(&self) -> ResultPeerEra {
         self.state.borrow().result_peer_era
+    }
+
+    /// Selects externally owned ingress and writes before any execution exists.
+    /// The connection must commit requests and deferred controls through the
+    /// corresponding callbacks; no queued message counts as a successful send.
+    pub(crate) fn with_external_driver(transport: T, era: ProtocolEra) -> Self {
+        let executor = Self::with_protocol_era(transport, era);
+        {
+            let mut state = executor.state.borrow_mut();
+            state.external_writes = true;
+            state.ingress_owner = IngressOwner::ExternalDriver;
+        }
+        executor
+    }
+
+    /// Commits a request through an already reserved, synchronous publication.
+    /// `None` means newly retired owners have controls that must precede it.
+    /// That outcome performs no publication or request/generation allocation.
+    pub(crate) fn execute_external(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: Request,
+        timeout_policy: RequestTimeoutPolicy,
+        commit: impl FnOnce(&JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<Option<RequestExecution<T>>> {
+        timeout_policy.validate()?;
+        if !self.state.borrow().external_writes {
+            return Err(McpError::invalid_request(
+                "Executor does not own external writes",
+            ));
+        }
+        self.execute_with_commit(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Request(timeout_policy),
+            Some(cancellation.clone()),
+            |_, _, message| commit(message),
+        )
+    }
+
+    /// Services original caller lifetimes without attempting transport I/O.
+    pub(crate) fn has_external_controls(&self, cx: &Cx) -> McpResult<bool> {
+        self.poll_timeouts_at(cx, Instant::now())?;
+        Ok(self.state.borrow().deferred_control_count() != 0)
+    }
+
+    /// Publishes the front control without removing it on known-unsent failure.
+    /// The callback must be an atomic nonblocking commit, never an async wait.
+    pub(crate) fn commit_external_control(
+        &self,
+        commit: impl FnOnce(&JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<bool> {
+        let mut state = self.state.borrow_mut();
+        if !state.external_writes {
+            return Err(McpError::invalid_request(
+                "Executor does not own external writes",
+            ));
+        }
+        if let Some(control) = state.deferred_cancellations.front() {
+            commit(&control.message).map_err(transport_error_to_mcp)?;
+            let control = state
+                .deferred_cancellations
+                .pop_front()
+                .expect("committed control");
+            if let Some(record) = state
+                .terminal_records
+                .get_mut(&(control.request_id, control.generation))
+            {
+                record.cancellation_transport_attempts =
+                    record.cancellation_transport_attempts.saturating_add(1);
+            }
+            return Ok(true);
+        }
+        if let Some(rejection) = state.deferred_rejections.front() {
+            commit(rejection).map_err(transport_error_to_mcp)?;
+            state.deferred_rejections.pop_front();
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Returns the immutable MCP era selected before this executor was built.
@@ -1699,9 +1811,41 @@ where
         request: Request,
         timeout_policy: ExecutionTimeoutPolicy,
     ) -> McpResult<RequestExecution<T>> {
+        if self.state.borrow().external_writes {
+            return Err(McpError::invalid_request(
+                "External executor requires a committed publication callback",
+            ));
+        }
+        self.execute_with_commit(
+            cx,
+            request,
+            timeout_policy,
+            None,
+            |transport, cx, message| transport.send(cx, message),
+        )?
+        .ok_or_else(|| McpError::internal_error("Synchronous executor deferred its own send"))
+    }
+
+    fn execute_with_commit(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: ExecutionTimeoutPolicy,
+        request_cancellation: Option<McpRequestCancellation>,
+        commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<Option<RequestExecution<T>>> {
         let turn = ExecutionTurn::new(cx);
         let cx = &turn;
-        if cx.checkpoint().is_err() {
+        if cx.checkpoint().is_err()
+            || request_cancellation
+                .as_ref()
+                .is_some_and(McpRequestCancellation::is_cancel_requested)
+            || (request_cancellation.is_some()
+                && cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline))
+        {
             return Err(McpError::request_cancelled());
         }
         let request_id = request.id.clone().ok_or_else(|| {
@@ -1720,6 +1864,9 @@ where
         // application work. Its fresh Cx is transport authority, not a way
         // to extend another execution's original lifetime.
         self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
+        if state.external_writes && state.deferred_control_count() != 0 {
+            return Ok(None);
+        }
         // Servicing a deferred control can exhaust this caller's remaining
         // budget. Do not admit another application write after that local
         // stop, even when a custom transport omits its own checkpoint.
@@ -1766,7 +1913,7 @@ where
         if state
             .pending
             .len()
-            .saturating_add(state.deferred_cancellations.len())
+            .saturating_add(state.deferred_control_count())
             >= self.max_in_flight
         {
             return Err(McpError::internal_error(
@@ -1789,12 +1936,22 @@ where
             .next_generation
             .checked_add(1)
             .ok_or_else(|| McpError::internal_error("Client execution generation exhausted"))?;
-        state.next_generation = generation;
-
-        state
-            .transport
-            .send(cx, &JsonRpcMessage::Request(request.clone()))
+        let message = JsonRpcMessage::Request(request.clone());
+        // External publication is the ownership boundary. Maintenance and
+        // admission above cannot extend the original caller's authority.
+        if request_cancellation.as_ref().is_some_and(|cancellation| {
+            cancellation.is_cancel_requested()
+                || cx
+                    .budget()
+                    .deadline
+                    .is_some_and(|deadline| cx.now() >= deadline)
+                || cx.checkpoint().is_err()
+        }) {
+            return Err(McpError::request_cancelled());
+        }
+        commit(&mut state.transport, cx, &message)
             .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
+        state.next_generation = generation;
 
         let committed_at = Instant::now();
         let idle_deadline = committed_at
@@ -1814,6 +1971,7 @@ where
             correlation_key.clone(),
             PendingExecution {
                 caller: cx.cx.clone(),
+                request_cancellation,
                 record: PendingRequestRecord {
                     correlation_key,
                     request_id: request_id.clone(),
@@ -1834,7 +1992,7 @@ where
             },
         );
 
-        Ok(RequestExecution {
+        Ok(Some(RequestExecution {
             request_id,
             generation,
             owner_dropped,
@@ -1847,7 +2005,7 @@ where
             task_operation: None,
             tombstone_retention: self.tombstone_retention,
             completed: false,
-        })
+        }))
     }
 
     #[cfg(feature = "tasks")]
@@ -2929,6 +3087,7 @@ where
         // Their owners are already terminal and the transport has had its one
         // close attempt; no later maintenance turn may write those controls.
         state.deferred_cancellations.clear();
+        state.deferred_rejections.clear();
         state.shutdown_error = cleanup_error;
         state.terminal_error.get_or_insert_with(|| {
             McpError::internal_error("Client request executor is shut down")
@@ -2983,6 +3142,9 @@ where
         let request_id = request.id.expect("reverse request has an ID");
         let rejection =
             JsonRpcMessage::Response(JsonRpcResponse::error(Some(request_id), error.into()));
+        if state.external_writes {
+            return state.defer_rejection(rejection);
+        }
         state
             .transport
             .send(cx, &rejection)
@@ -3165,6 +3327,9 @@ where
         cx: &ExecutionTurn<'_>,
         state: &mut ExecutorState<T>,
     ) -> McpResult<()> {
+        if state.external_writes {
+            return Ok(());
+        }
         while !state.deferred_cancellations.is_empty() {
             // Keep both maintenance and write admission inside this turn.
             // If maintenance spends the last poll, leave the front control
@@ -3187,7 +3352,7 @@ where
         state: &mut ExecutorState<T>,
         cancellation: PendingCancellationControl,
     ) -> McpResult<()> {
-        if cx.checkpoint().is_err() {
+        if state.external_writes || cx.checkpoint().is_err() {
             return state.defer_cancellation(cancellation);
         }
         self.write_admitted_cancellation_control_locked(cx, state, cancellation)
@@ -3690,7 +3855,12 @@ where
                 // A frame may be driven by a sibling or by connection-owned
                 // ingress. Always reconcile the original caller before that
                 // frame can extend progress or win this request's terminal.
-                let reason = if pending.caller.checkpoint().is_err() {
+                let reason = if pending.caller.checkpoint().is_err()
+                    || pending.request_cancellation.as_ref().is_some_and(|cancellation| {
+                        cancellation.is_cancel_requested()
+                            || pending.caller.budget().deadline.is_some_and(|deadline| pending.caller.now() >= deadline)
+                    })
+                {
                     Some(ExecutionTerminalReason::CallerCancelled)
                 } else if observed_at >= pending.record.absolute_deadline {
                     Some(ExecutionTerminalReason::AbsoluteTimeout)
@@ -5667,6 +5837,103 @@ mod tests {
             Some(i32::from(McpErrorCode::MethodNotFound))
         );
         assert_eq!(error.message, "Method not found");
+    }
+
+    #[test]
+    fn external_reverse_rejection_retains_unsent_control_and_precedes_application_admission() {
+        let cx = Cx::for_testing();
+        let cancellation = McpRequestCancellation::new();
+        let executor = RequestExecutor::with_external_driver(
+            ScriptedTransport::new([]),
+            ProtocolEra::Modern2026,
+        );
+        let mut committed = Vec::new();
+        let first = executor
+            .execute_external(
+                &cx,
+                &cancellation,
+                request(42),
+                RequestTimeoutPolicy::default(),
+                |message| {
+                    committed.push(message.clone());
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let before = executor.pending_records();
+        let source = serde_json::to_vec(&legacy_reverse_request(42)).unwrap();
+        executor
+            .drive_frame(&cx, ReceivedTransportFrame::admit(source).unwrap())
+            .unwrap();
+        assert!(executor.has_external_controls(&cx).unwrap());
+        assert_eq!(executor.pending_records(), before);
+        assert!(
+            executor
+                .commit_external_control(|_| {
+                    Err(TransportError::Io(std::io::Error::from(
+                        std::io::ErrorKind::WouldBlock,
+                    )))
+                })
+                .is_err()
+        );
+        assert!(executor.has_external_controls(&cx).unwrap());
+        assert!(executor.terminal_error().is_none());
+        assert_eq!(executor.pending_records(), before);
+        assert!(
+            executor
+                .execute_external(
+                    &cx,
+                    &cancellation,
+                    request(43),
+                    RequestTimeoutPolicy::default(),
+                    |_| panic!("new application work cannot pass an uncommitted control"),
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.state.borrow().next_generation, first.generation());
+
+        assert!(
+            executor
+                .commit_external_control(|message| {
+                    committed.push(message.clone());
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(!executor.has_external_controls(&cx).unwrap());
+        let JsonRpcMessage::Response(rejection) = &committed[1] else {
+            panic!("external driver commits the exact queued rejection");
+        };
+        assert_eq!(rejection.id, Some(RequestId::Number(42)));
+        assert_eq!(
+            rejection.error.as_ref().unwrap().code.as_i32(),
+            Some(-32601)
+        );
+        assert_eq!(
+            rejection.error.as_ref().unwrap().message,
+            "Method not found"
+        );
+        assert!(rejection.error.as_ref().unwrap().data.is_none());
+        let second = executor
+            .execute_external(
+                &cx,
+                &cancellation,
+                request(43),
+                RequestTimeoutPolicy::default(),
+                |message| {
+                    committed.push(message.clone());
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.generation(), first.generation() + 1);
+        assert_eq!(committed.len(), 3);
+        assert!(executor.state.borrow().transport.sent.is_empty());
+        assert!(executor.take_cancellation_events().is_empty());
+        assert!(executor.terminal_records().is_empty());
     }
 
     #[test]

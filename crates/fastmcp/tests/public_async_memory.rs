@@ -260,6 +260,189 @@ fn legacy_facade_async_memory_runs_without_reactor_or_blocking_pool() {
     run_facade(Facade::Legacy, PeerEra::Legacy);
 }
 
+mod typed_client {
+    use super::*;
+    use fastmcp_rust::{
+        ClientCapabilities, ClientInfo, ContentBlock, CoreResult, FinalCoreResult, McpErrorCode,
+        McpRequestCancellation, MemoryRequestEvent, MemoryRequestExecution,
+    };
+
+    fn assert_echo(result: CoreResult, expected: &str) {
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = result else {
+            panic!("memory client must retain a typed modern tool result");
+        };
+        assert!(!result.payload.is_error);
+        assert_eq!(result.payload.content.len(), 1);
+        assert!(matches!(
+            &result.payload.content[0],
+            ContentBlock::Text { text, .. } if text == expected
+        ));
+    }
+
+    async fn finish(
+        cx: &Cx,
+        client: &mut fastmcp_rust::client::MemoryClient,
+        cancellation: &McpRequestCancellation,
+        execution: &mut MemoryRequestExecution,
+    ) -> CoreResult {
+        loop {
+            match client
+                .next_event(cx, cancellation, execution)
+                .await
+                .unwrap()
+            {
+                Some(MemoryRequestEvent::Result(result)) => {
+                    assert!(
+                        client
+                            .next_event(cx, cancellation, execution)
+                            .await
+                            .unwrap()
+                            .is_none()
+                    );
+                    return *result;
+                }
+                Some(MemoryRequestEvent::Notification(_)) => {}
+                None => panic!("memory execution must publish its result exactly once"),
+            }
+        }
+    }
+
+    fn run(facade: Facade) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert!(cx.blocking_pool_handle().is_none());
+            asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                let (transport, server_transport) = create_memory_transport_pair_with_capacity(1);
+                let stopped = Arc::new(AtomicBool::new(false));
+                let server_stopped = Arc::clone(&stopped);
+                let mut serving = cx
+                    .spawn(move |serve_cx| async move {
+                        facade
+                            .serve(&serve_cx, server_transport, server_stopped)
+                            .await
+                    })
+                    .unwrap();
+                let mut client: fastmcp_rust::prelude::MemoryClient =
+                    modern::MemoryClient::connect(
+                        &cx,
+                        transport,
+                        ClientInfo {
+                            name: "public-memory-client".to_owned(),
+                            version: "1".to_owned(),
+                        },
+                        ClientCapabilities::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    client
+                        .server_discovery()
+                        .supported_versions()
+                        .iter()
+                        .any(|version| version == modern::PROTOCOL_VERSION)
+                );
+                let cancellation = McpRequestCancellation::new();
+                let CoreResult::Final(FinalCoreResult::ToolsList {
+                    result: catalog, ..
+                }) = client.list_tools(&cx, &cancellation, None).await.unwrap()
+                else {
+                    panic!("memory catalog must retain its typed result and cache metadata");
+                };
+                assert_eq!(catalog.payload.tools.len(), 1);
+                assert_eq!(catalog.payload.tools[0].name, "memory_echo");
+                assert_eq!(
+                    catalog.payload.tools[0].input_schema["properties"]["value"]["type"],
+                    "string"
+                );
+
+                // Refusal happens before publication and consumes no ID.
+                assert_eq!(
+                    client
+                        .execute_core(&cx, &cancellation, "tools/call", json!({}))
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                let first_value = "first résumé 東京\\literal\nline";
+                let second_value = "second independent request";
+                let mut first = client
+                    .execute_core(
+                        &cx,
+                        &cancellation,
+                        "tools/call",
+                        json!({
+                            "name": "memory_echo", "arguments": {"value": first_value},
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let mut second = client
+                    .execute_core(
+                        &cx,
+                        &cancellation,
+                        "tools/call",
+                        json!({
+                            "name": "memory_echo", "arguments": {"value": second_value},
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(first.request_id(), &RequestId::Number(3));
+                assert_eq!(second.request_id(), &RequestId::Number(4));
+                // Driving the second owner must preserve the first result,
+                // including when its response arrives during send admission.
+                assert_echo(
+                    finish(&cx, &mut client, &cancellation, &mut second).await,
+                    second_value,
+                );
+                assert_echo(
+                    finish(&cx, &mut client, &cancellation, &mut first).await,
+                    first_value,
+                );
+                assert_echo(
+                    client
+                        .call_tool(
+                            &cx,
+                            &cancellation,
+                            "memory_echo",
+                            json!({
+                                "value": "same connection remains usable",
+                            }),
+                        )
+                        .await
+                        .unwrap(),
+                    "same connection remains usable",
+                );
+
+                assert!(!stopped.load(Ordering::Acquire));
+                client.close(&cx).unwrap();
+                serving.join(&cx).await.unwrap().unwrap();
+                assert!(stopped.load(Ordering::Acquire));
+                assert!(cx.checkpoint().is_ok());
+            })
+            .await
+            .expect("typed memory client and server must progress on their caller runtime");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn modern_memory_client_drives_real_server_without_reactor_or_blocking_pool() {
+        run(Facade::Modern);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn modern_memory_client_drives_auto_server_on_one_slot_channels() {
+        run(Facade::Auto);
+    }
+}
+
 #[cfg(feature = "tasks")]
 mod retention_administration {
     use super::*;
