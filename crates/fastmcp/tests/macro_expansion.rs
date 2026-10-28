@@ -5551,6 +5551,402 @@ fn json_schema_transparent_tool_input_and_output_reach_registered_modern_dispatc
     });
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+struct FlattenedSchemaFields {
+    /// The user-visible name retained by every flattened envelope.
+    user_name: String,
+    #[serde(default)]
+    retry_count: u8,
+    optional_count: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedSchemaEnvelope {
+    request_id: String,
+    #[serde(flatten)]
+    fields: FlattenedSchemaFields,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedSchemaLayer {
+    version: u8,
+    #[serde(flatten)]
+    fields: FlattenedSchemaFields,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct NestedFlattenedSchemaEnvelope {
+    tenant: String,
+    #[serde(flatten)]
+    layer: FlattenedSchemaLayer,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedSchemaNode {
+    depth: u8,
+    next: Option<Box<Self>>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct RepeatedFlattenedSchemaEnvelope {
+    sample: FlattenedSchemaNode,
+    #[serde(flatten)]
+    current: FlattenedSchemaNode,
+}
+
+fn assert_flatten_round_trip<T>(
+    schema: &fastmcp_rust::schema::AdmittedSchema,
+    value: serde_json::Value,
+) where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    schema
+        .validate(&value)
+        .expect("the flattened wire value validates");
+    let decoded: T = serde_json::from_value(value).expect("Serde admits the same flattened value");
+    let serialized = serde_json::to_value(&decoded).expect("the flattened value serializes");
+    schema
+        .validate(&serialized)
+        .expect("Serde output validates against the same schema");
+    assert_eq!(serde_json::from_value::<T>(serialized).unwrap(), decoded);
+}
+
+#[test]
+fn json_schema_flattened_names_defaults_and_optional_fields_follow_serde() {
+    let generated = FlattenedSchemaEnvelope::try_json_schema()
+        .expect("named object composition generates a complete schema");
+    assert_eq!(generated, FlattenedSchemaEnvelope::json_schema());
+    assert_eq!(generated["required"], json!(["request_id", "userName"]));
+    assert!(generated["properties"].get("fields").is_none());
+    assert!(
+        generated["properties"]["userName"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("user-visible name")
+    );
+    let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+    for valid in [
+        json!({"request_id":"one", "userName":"Ada"}),
+        json!({"request_id":"two", "userName":"Grace", "retryCount":7, "optionalCount":null}),
+        json!({"request_id":"three", "userName":"Lin", "optionalCount":65_535}),
+    ] {
+        assert_flatten_round_trip::<FlattenedSchemaEnvelope>(&schema, valid);
+    }
+    for invalid in [
+        json!({"request_id":"one"}),
+        json!({"request_id":"one", "user_name":"Ada"}),
+        json!({"request_id":"one", "userName":false}),
+        json!({"request_id":"one", "userName":"Ada", "retryCount":256}),
+        json!({"request_id":"one", "userName":"Ada", "optionalCount":65_536}),
+        json!({"request_id":"one", "fields":{"userName":"Ada"}}),
+    ] {
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<FlattenedSchemaEnvelope>(invalid).is_err());
+    }
+}
+
+#[test]
+fn json_schema_nested_flattening_retains_each_required_field() {
+    let schema = fastmcp_rust::schema::admit_final_schema(
+        NestedFlattenedSchemaEnvelope::try_json_schema().unwrap(),
+    )
+    .unwrap();
+    let valid = json!({"tenant":"team", "version":2, "userName":"Ada"});
+    assert_flatten_round_trip::<NestedFlattenedSchemaEnvelope>(&schema, valid.clone());
+    for field in ["tenant", "version", "userName"] {
+        let mut invalid = valid.clone();
+        invalid.as_object_mut().unwrap().remove(field);
+        assert!(schema.validate(&invalid).is_err(), "missing {field}");
+        assert!(serde_json::from_value::<NestedFlattenedSchemaEnvelope>(invalid).is_err());
+    }
+    let mut invalid = valid;
+    invalid["version"] = json!(256);
+    assert!(schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<NestedFlattenedSchemaEnvelope>(invalid).is_err());
+}
+
+#[test]
+fn json_schema_flattening_reuses_completed_bodies_without_losing_recursive_references() {
+    let generated = RepeatedFlattenedSchemaEnvelope::try_json_schema().unwrap();
+    assert!(
+        generated["$defs"].is_object(),
+        "recursive children retain local definitions"
+    );
+    let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+    let valid = json!({
+        "sample":{"depth":1,"next":{"depth":2}},
+        "depth":3,"next":{"depth":4,"next":{"depth":5}},
+    });
+    assert_flatten_round_trip::<RepeatedFlattenedSchemaEnvelope>(&schema, valid.clone());
+    for pointer in ["/sample/next/depth", "/next/next/depth"] {
+        let mut invalid = valid.clone();
+        *invalid.pointer_mut(pointer).unwrap() = json!(256);
+        assert!(schema.validate(&invalid).is_err(), "{pointer}");
+        assert!(serde_json::from_value::<RepeatedFlattenedSchemaEnvelope>(invalid).is_err());
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedTypedMapEnvelope {
+    request_id: String,
+    #[serde(flatten)]
+    fields: FlattenedSchemaFields,
+    #[serde(flatten)]
+    extensions: BTreeMap<String, RecursiveSchemaNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedHashMapEnvelope {
+    #[serde(flatten)]
+    extensions: HashMap<String, Option<FlattenedSchemaNode>>,
+    // Ordinary fields are claimed before flattened maps even when declared later.
+    label: String,
+}
+
+fn flattened_typed_map_payload() -> serde_json::Value {
+    json!({
+        "request_id":"typed-map", "userName":"Ada", "retryCount":2,
+        "x-tree":{"value":1,"children":[{"value":2,"children":[]}]},
+    })
+}
+
+#[test]
+fn json_schema_flattened_typed_maps_validate_only_unclaimed_members() {
+    let schema = fastmcp_rust::schema::admit_final_schema(
+        FlattenedTypedMapEnvelope::try_json_schema().unwrap(),
+    )
+    .unwrap();
+    // Strings and integers are valid named fields even though every catch-all
+    // value must be a closed recursive object. An allOf of whole-map schemas
+    // would incorrectly reject this real Serde representation.
+    let valid = flattened_typed_map_payload();
+    assert_flatten_round_trip::<FlattenedTypedMapEnvelope>(&schema, valid.clone());
+    assert_flatten_round_trip::<FlattenedTypedMapEnvelope>(
+        &schema,
+        json!({"request_id":"empty-map", "userName":"Grace"}),
+    );
+    for replacement in [
+        json!(false),
+        json!({"value":"one","children":[]}),
+        json!({"value":1,"children":[{"value":2,"children":[],"extra":true}]}),
+    ] {
+        let mut invalid = valid.clone();
+        invalid["x-tree"] = replacement;
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<FlattenedTypedMapEnvelope>(invalid).is_err());
+    }
+
+    let hash_schema = fastmcp_rust::schema::admit_final_schema(
+        FlattenedHashMapEnvelope::try_json_schema().unwrap(),
+    )
+    .unwrap();
+    let hash_value = json!({"label":"index", "absent":null, "node":{"depth":3,"next":{"depth":4}}});
+    assert_flatten_round_trip::<FlattenedHashMapEnvelope>(&hash_schema, hash_value.clone());
+    let mut invalid = hash_value;
+    invalid["node"]["next"]["depth"] = json!(256);
+    assert!(hash_schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<FlattenedHashMapEnvelope>(invalid).is_err());
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedResourceFields {
+    choice: IdentifiedChoice,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct FlattenedResourceEnvelope {
+    label: String,
+    #[serde(flatten)]
+    fields: FlattenedResourceFields,
+}
+
+#[test]
+fn json_schema_flatten_preserves_nested_handwritten_resource_scope() {
+    let generated = FlattenedResourceEnvelope::try_json_schema()
+        .expect("moving an ordinary property preserves its identified schema resource");
+    assert_eq!(
+        generated["properties"]["choice"]["$id"],
+        "https://schemas.example.test/nullable-choice"
+    );
+    assert_eq!(generated["properties"]["choice"]["$ref"], "#/$defs/choice");
+    let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+    assert_flatten_round_trip::<FlattenedResourceEnvelope>(
+        &schema,
+        json!({"label":"scoped", "choice":"Allowed"}),
+    );
+    let invalid = json!({"label":"scoped", "choice":"Denied"});
+    assert!(schema.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<FlattenedResourceEnvelope>(invalid).is_err());
+}
+
+#[derive(JsonSchema)]
+struct ConflictingFlattenedSchema {
+    #[serde(rename = "userName")]
+    own_name: String,
+    #[serde(flatten)]
+    fields: FlattenedSchemaFields,
+}
+
+#[derive(JsonSchema)]
+struct RepeatedConflictingFlattenedSchema {
+    #[serde(flatten)]
+    first: FlattenedSchemaFields,
+    #[serde(flatten)]
+    second: FlattenedSchemaFields,
+}
+
+#[derive(JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ClosedFlattenedSchemaFields {
+    count: u8,
+}
+
+#[derive(JsonSchema)]
+struct ClosedFlattenedSchemaEnvelope {
+    #[serde(flatten)]
+    fields: ClosedFlattenedSchemaFields,
+}
+
+#[derive(JsonSchema)]
+struct RecursiveFlattenedSchema {
+    #[serde(flatten)]
+    next: Box<Self>,
+}
+
+#[derive(JsonSchema)]
+struct NestedMapFlattenedSchema {
+    #[serde(flatten)]
+    fields: FlattenedHashMapEnvelope,
+}
+
+#[derive(JsonSchema)]
+struct MapAfterNestedFlattenedSchema {
+    #[serde(flatten)]
+    fields: NestedFlattenedSchemaEnvelope,
+    #[serde(flatten)]
+    extras: BTreeMap<String, bool>,
+}
+
+#[test]
+fn json_schema_flatten_refuses_ambiguous_or_unbounded_composition_without_partial_output() {
+    for (result, reason) in [
+        (
+            ConflictingFlattenedSchema::try_json_schema(),
+            "property names must be distinct",
+        ),
+        (
+            RepeatedConflictingFlattenedSchema::try_json_schema(),
+            "property names must be distinct",
+        ),
+        (
+            ClosedFlattenedSchemaEnvelope::try_json_schema(),
+            "deny_unknown_fields",
+        ),
+        (
+            RecursiveFlattenedSchema::try_json_schema(),
+            "recursive flatten expansion",
+        ),
+        (
+            NestedMapFlattenedSchema::try_json_schema(),
+            "nested catch-all maps",
+        ),
+        (
+            MapAfterNestedFlattenedSchema::try_json_schema(),
+            "catch-all map after a nested flattened object",
+        ),
+    ] {
+        let error = result.expect_err("unsupported flattening must not publish a weaker schema");
+        assert!(error.to_string().contains(reason), "{error}");
+    }
+    let mut generator = fastmcp_rust::schema::SchemaGenerator::with_limits(
+        fastmcp_rust::schema::SchemaGenerationLimits {
+            max_types: 1,
+            ..fastmcp_rust::schema::SchemaGenerationLimits::default()
+        },
+    );
+    let root = generator.subschema_for::<FlattenedSchemaEnvelope>();
+    assert!(matches!(
+        generator.finish(root),
+        Err(fastmcp_rust::schema::SchemaGenerationError::TypeLimit)
+    ));
+    assert!(
+        FlattenedSchemaEnvelope::try_json_schema().is_ok(),
+        "a refused context cannot poison a later generation"
+    );
+}
+
+static FLATTENED_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn flattened_schema_error(_kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    Some(json!({"request_id":"error", "userName":"unavailable"}))
+}
+
+#[tool(output_schema = FlattenedTypedMapEnvelope, error_mapper = flattened_schema_error)]
+async fn echo_flattened_schema(
+    ctx: &McpContext,
+    value: FlattenedTypedMapEnvelope,
+) -> McpResult<FlattenedTypedMapEnvelope> {
+    ctx.checkpoint()?;
+    FLATTENED_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(value)
+}
+
+#[test]
+fn json_schema_flattened_input_and_output_reach_registered_modern_dispatch() {
+    on_caller_runtime(async {
+        let server = Server::new("flattened-schema", "1.0.0")
+            .tool(EchoFlattenedSchema)
+            .try_build()
+            .expect("flattened input, typed map output, and mapped errors all admit");
+        let connection = ModernConnection::new();
+        let valid = flattened_typed_map_payload();
+        let expected = serde_json::to_value(
+            serde_json::from_value::<FlattenedTypedMapEnvelope>(valid.clone()).unwrap(),
+        )
+        .unwrap();
+        let before = FLATTENED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let accepted = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "echo_flattened_schema",
+                json!({"value":valid.clone()}),
+            )
+            .await,
+        );
+        assert_schema_bound_success(&accepted, &expected);
+        for (field, wrong) in [
+            ("userName", json!(false)),
+            ("retryCount", json!(256)),
+            ("x-tree", json!("not a tree")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = wrong;
+            let rejected = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_flattened_schema",
+                    json!({"value":invalid}),
+                )
+                .await,
+            );
+            assert_eq!(rejected["isError"], true);
+            assert_eq!(
+                rejected["structuredContent"],
+                json!({"request_id":"error", "userName":"unavailable"})
+            );
+        }
+        assert_eq!(
+            FLATTENED_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "invalid flattened fields cannot enter the registered handler",
+        );
+    });
+}
+
 fn serde_schema_default_retry_limit() -> u32 {
     3
 }

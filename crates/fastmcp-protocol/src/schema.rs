@@ -30,7 +30,11 @@ use std::{
     marker::PhantomData,
 };
 
+mod flatten;
 mod unique_items;
+
+#[doc(hidden)]
+pub use flatten::{FlattenableSchemaObject, FlattenedObjectSchema};
 
 /// The sole JSON Schema dialect accepted by the final core schema-admission
 /// boundary.

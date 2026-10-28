@@ -6287,9 +6287,14 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// diagnostics instead of silently advertising the Rust field layout.
 /// Serde transparent structs preserve their one payload's schema, including
 /// named wrappers, skipped local fields, and `PhantomData` markers. The same
-/// field must be the payload in both wire directions. Struct flattening,
-/// aliases, and custom wire conversions require an explicit schema and produce
-/// diagnostics instead of silently advertising the Rust field layout.
+/// field must be the payload in both wire directions. Named structs support
+/// `serde(flatten)` for derived named-object fields and one final flattened
+/// `HashMap<String, V>` or `BTreeMap<String, V>`. Ordinary nested references,
+/// renamed fields, defaults, and nullable child fields retain their constraints.
+/// Nested object flattening is supported without a following catch-all map.
+/// Optional flattened fields, closed flattened objects, collisions, recursive
+/// flatten expansion, and nested catch-all maps require an explicit schema.
+/// Aliases and custom wire conversions also require an explicit schema.
 ///
 /// Recursive and repeated derived types share bounded local `$defs` in each
 /// generated document. `Box`, `Rc`, `Arc`, and `Cow` retain their payload's
@@ -6349,6 +6354,28 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
 
+    let flatten_marker = if let syn::Data::Struct(data) = &input.data
+        && matches!(data.fields, syn::Fields::Named(_))
+        && !serde_attrs.transparent
+    {
+        let deny_unknown_fields = serde_attrs.deny_unknown_fields;
+        let has_flatten_fields = data.fields.iter().any(|field| {
+            SchemaSerdeAttrs::parse(&field.attrs).is_ok_and(|attrs| {
+                attrs.flatten && !attrs.skip && !has_json_schema_attr(&field.attrs, "skip")
+            })
+        });
+        quote! {
+            impl #schema_impl_generics fastmcp_protocol::schema::FlattenableSchemaObject
+                for #name #ty_generics #schema_where_clause
+            {
+                const DENY_UNKNOWN_FIELDS: bool = #deny_unknown_fields;
+                const HAS_FLATTEN_FIELDS: bool = #has_flatten_fields;
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
         #[doc(hidden)]
         #[allow(non_snake_case)]
@@ -6366,6 +6393,8 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
                     #schema_impl
                 }
             }
+
+            #flatten_marker
 
             impl #impl_generics #name #ty_generics #where_clause {
                 /// Returns the JSON Schema for this type.
@@ -6523,6 +6552,7 @@ struct SchemaSerdeAttrs {
     content: Option<String>,
     untagged: bool,
     transparent: bool,
+    flatten: bool,
 }
 
 impl SchemaSerdeAttrs {
@@ -6592,6 +6622,14 @@ impl SchemaSerdeAttrs {
                         ));
                     }
                     result.transparent = true;
+                } else if entry.path().is_ident("flatten") {
+                    if !matches!(entry, Meta::Path(_)) || result.flatten {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected one bare serde(flatten) attribute",
+                        ));
+                    }
+                    result.flatten = true;
                 }
             }
         }
@@ -6670,7 +6708,6 @@ fn validate_struct_schema_attributes(attrs: &[Attribute], container: bool) -> sy
             attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
         for entry in entries {
             if let Some(name) = [
-                "flatten",
                 "alias",
                 "with",
                 "serialize_with",
@@ -6692,6 +6729,12 @@ fn validate_struct_schema_attributes(attrs: &[Attribute], container: bool) -> sy
                     format!(
                         "JsonSchema cannot infer serde({name}) for a struct; implement json_schema() explicitly"
                     ),
+                ));
+            }
+            if container && entry.path().is_ident("flatten") {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    "serde flatten belongs on a named struct field, not its container",
                 ));
             }
             if !container && entry.path().is_ident("transparent") {
@@ -6772,6 +6815,12 @@ fn generate_struct_schema(
         let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
         if !attrs.skip && !has_json_schema_attr(&field.attrs, "skip") {
             validate_struct_schema_attributes(&field.attrs, false)?;
+            if attrs.flatten && !matches!(data.fields, syn::Fields::Named(_)) {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "JsonSchema supports serde(flatten) only on named struct fields",
+                ));
+            }
         }
     }
     generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs)
@@ -6803,6 +6852,12 @@ fn generate_transparent_struct_schema(
         let in_deserialized = !attrs.skip_deserializing && !attrs.default;
         if !in_serialized && !in_deserialized {
             continue;
+        }
+        if attrs.flatten {
+            return Err(syn::Error::new_spanned(
+                field,
+                "serde(flatten) cannot be combined with a transparent struct",
+            ));
         }
         validate_struct_schema_attributes(&field.attrs, false)?;
         if has_json_schema_attr(&field.attrs, "skip") {
@@ -6864,6 +6919,75 @@ fn schema_field_name(
     })
 }
 
+enum SchemaFlattenType<'a> {
+    Object(&'a Type),
+    MapValue(&'a Type),
+}
+
+/// The catch-all profile is deliberately syntactic: a named alias is an object
+/// only when its resolved type implements the derived object-shape marker.
+fn schema_flatten_type(ty: &Type) -> syn::Result<SchemaFlattenType<'_>> {
+    match ty {
+        Type::Paren(paren) => return schema_flatten_type(&paren.elem),
+        Type::Group(group) => return schema_flatten_type(&group.elem),
+        _ => {}
+    }
+    let Type::Path(path) = ty else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "serde(flatten) requires a derived named object or a String-keyed map",
+        ));
+    };
+    let segment = path.path.segments.last().expect("nonempty type path");
+    match segment.ident.to_string().as_str() {
+        "Box" | "Rc" | "Arc" | "Cow" => {
+            if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments
+                && let Some(inner) = arguments.args.iter().find_map(|argument| match argument {
+                    syn::GenericArgument::Type(inner) => Some(inner),
+                    _ => None,
+                })
+            {
+                return schema_flatten_type(inner);
+            }
+            Err(syn::Error::new_spanned(
+                ty,
+                "flattened wrappers require a payload type",
+            ))
+        }
+        "Option" => Err(syn::Error::new_spanned(
+            ty,
+            "optional serde(flatten) fields require an explicit schema; optional fields inside a flattened object are supported",
+        )),
+        "HashMap" | "BTreeMap" => {
+            if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments {
+                let mut types = arguments.args.iter().filter_map(|argument| match argument {
+                    syn::GenericArgument::Type(inner) => Some(inner),
+                    _ => None,
+                });
+                if let (Some(Type::Path(key)), Some(value)) = (types.next(), types.next())
+                    && key.qself.is_none()
+                    && key.path.segments.last().is_some_and(|part| {
+                        part.ident == "String" && matches!(part.arguments, syn::PathArguments::None)
+                    })
+                {
+                    return Ok(SchemaFlattenType::MapValue(value));
+                }
+            }
+            Err(syn::Error::new_spanned(
+                ty,
+                "flattened HashMap and BTreeMap fields require String keys and a value type",
+            ))
+        }
+        "String" | "str" | "char" | "bool" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize"
+        | "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "f32" | "f64" | "Vec" | "HashSet"
+        | "BTreeSet" | "Value" => Err(syn::Error::new_spanned(
+            ty,
+            "serde(flatten) requires a derived named object or a String-keyed map",
+        )),
+        _ => Ok(SchemaFlattenType::Object(ty)),
+    }
+}
+
 /// Shares field constraints between structs and enum payloads.
 fn generate_fields_schema(
     fields: &syn::Fields,
@@ -6874,11 +6998,55 @@ fn generate_fields_schema(
         syn::Fields::Named(fields) => {
             let mut property_entries = Vec::new();
             let mut required_fields = Vec::new();
+            let mut composed_properties = Vec::new();
+            let mut flattened_fields = Vec::new();
+            let mut catch_all_seen = false;
 
             for field in &fields.named {
                 let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
                 // Check for skip attribute
                 if has_json_schema_attr(&field.attrs, "skip") || field_attrs.skip {
+                    continue;
+                }
+
+                if field_attrs.flatten {
+                    if serde_attrs.deny_unknown_fields {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "serde(flatten) cannot be combined with deny_unknown_fields; use an explicit schema",
+                        ));
+                    }
+                    if field_attrs.default || field_attrs.skip_serializing_if {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "defaulted or conditionally skipped serde(flatten) fields require an explicit schema",
+                        ));
+                    }
+                    if field_attrs.rename.is_some() || get_json_schema_rename(&field.attrs).is_some() {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "a flattened field has no property name to rename; rename its inner fields instead",
+                        ));
+                    }
+                    if catch_all_seen {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "only one catch-all map is supported and it must be the final serde(flatten) field",
+                        ));
+                    }
+                    match schema_flatten_type(&field.ty)? {
+                        SchemaFlattenType::Object(ty) => flattened_fields.push(quote! {
+                            object.flatten::<#ty>(__fastmcp_schema_context);
+                        }),
+                        SchemaFlattenType::MapValue(ty) => {
+                            catch_all_seen = true;
+                            let schema = type_to_json_schema(ty);
+                            flattened_fields.push(quote! {
+                                let value_schema = #schema;
+                                object.catch_all(__fastmcp_schema_context, value_schema);
+                            });
+                        }
+                    }
                     continue;
                 }
 
@@ -6920,11 +7088,31 @@ fn generate_fields_schema(
                 property_entries.push(quote! {
                     (#schema_name.to_string(), #property_value)
                 });
+                let required = !is_optional;
+                composed_properties.push(quote! {
+                    let property_schema = #property_value;
+                    object.property(__fastmcp_schema_context, #schema_name, property_schema, #required);
+                });
 
                 // Add to required if not optional
                 if !is_optional {
                     required_fields.push(schema_name);
                 }
+            }
+
+            if !flattened_fields.is_empty() {
+                return Ok(quote! {
+                    {
+                        let mut object = fastmcp_protocol::schema::FlattenedObjectSchema::new();
+                        #(#composed_properties)*
+                        #(#flattened_fields)*
+                        let mut schema = object.finish();
+                        if let Some(desc) = #type_desc_tokens {
+                            schema["description"] = serde_json::json!(desc);
+                        }
+                        schema
+                    }
+                });
             }
 
             let deny_unknown_fields = serde_attrs.deny_unknown_fields;
@@ -7445,7 +7633,7 @@ mod serde_schema_tests {
                 "remote",
             ),
             (
-                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: Payload } },
+                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: Option<Payload> } },
                 "flatten",
             ),
             (
@@ -7482,6 +7670,83 @@ mod serde_schema_tests {
             })
             .contains("flattened struct fields")
         );
+    }
+
+    #[test]
+    fn serde_schema_flatten_refuses_unmodeled_field_profiles() {
+        for (input, expected) in [
+            (
+                syn::parse_quote! { #[serde(flatten)] struct Invalid { value: u8 } },
+                "belongs on a named struct field",
+            ),
+            (
+                syn::parse_quote! { struct Invalid(#[serde(flatten)] Payload); },
+                "only on named struct fields",
+            ),
+            (
+                syn::parse_quote! { #[serde(transparent)] struct Invalid { #[serde(flatten)] value: Payload } },
+                "cannot be combined with a transparent struct",
+            ),
+            (
+                syn::parse_quote! { #[serde(deny_unknown_fields)] struct Invalid { #[serde(flatten)] value: Payload } },
+                "cannot be combined with deny_unknown_fields",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: Option<Payload> } },
+                "optional serde(flatten) fields require an explicit schema",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten, default)] value: Payload } },
+                "defaulted or conditionally skipped",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten, skip_serializing_if = "empty")] value: Payload } },
+                "defaulted or conditionally skipped",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten, rename = "unused")] value: Payload } },
+                "no property name to rename",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: BTreeMap<u32, String> } },
+                "require String keys",
+            ),
+            (
+                syn::parse_quote! { struct Invalid { #[serde(flatten)] value: Vec<String> } },
+                "requires a derived named object or a String-keyed map",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid {
+                        #[serde(flatten)] extra: BTreeMap<String, bool>,
+                        #[serde(flatten)] data: Payload,
+                    }
+                },
+                "must be the final serde(flatten) field",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid {
+                        #[serde(flatten)] first: BTreeMap<String, bool>,
+                        #[serde(flatten)] second: HashMap<String, bool>,
+                    }
+                },
+                "only one catch-all map",
+            ),
+        ] {
+            let error = struct_representation_error(input);
+            assert!(error.contains(expected), "{error}");
+        }
+        for attribute in [
+            syn::parse_quote! { #[serde(flatten = true)] },
+            syn::parse_quote! { #[serde(flatten, flatten)] },
+        ] {
+            let error = SchemaSerdeAttrs::parse(&[attribute]).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "expected one bare serde(flatten) attribute"
+            );
+        }
     }
 
     fn enum_representation_error(input: syn::DeriveInput) -> String {
