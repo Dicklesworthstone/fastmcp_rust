@@ -4420,7 +4420,7 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
         )?;
         // Admit the complete batch before any consent or model effect. Never
         // dispatch this View's embedded input to connection-wide callbacks.
-        crate::ReverseRequestHandlers::admit_input_required(&self.capabilities, input_required)?;
+        crate::admit_mrtr_input_required(&self.capabilities, input_required)?;
         let responses = self
             .effects
             .resolve_server_input(
@@ -4526,7 +4526,7 @@ impl<E: McpAppsWireHostEffects> AppsServerInputOperation<'_, E> {
                 // Capability admission precedes even the Host consent hook;
                 // a forbidden sibling cannot hide behind an answered key.
                 let all = apps_task_input_required(input_requests)?;
-                crate::ReverseRequestHandlers::admit_input_required(&self.capabilities, &all)?;
+                crate::admit_mrtr_input_required(&self.capabilities, &all)?;
             }
             self.approve_task(&task).await?;
             match &task {
