@@ -11133,7 +11133,10 @@ Content-Length: {}\r\n\
         assert!(cancellation.is_terminal_committed());
         assert!(!cancellation.is_cancelled(), "the winning control remains drainable");
         assert!(matches!(
-            clone.send_response(&cx, JsonRpcResponse::success(704_i64, serde_json::json!({}))),
+            clone.send_response(
+                &cx,
+                JsonRpcResponse::success(704_i64.into(), serde_json::json!({}))
+            ),
             Err(TransportError::Closed)
         ));
         assert!(matches!(
@@ -11160,7 +11163,7 @@ Content-Length: {}\r\n\
         assert!(!sibling_cancellation.is_cancelled());
         assert!(!sibling_cancellation.is_terminal_committed());
         sibling.sender().send_response(
-            &cx, JsonRpcResponse::success(705_i64, serde_json::json!({"sibling": true})),
+            &cx, JsonRpcResponse::success(705_i64.into(), serde_json::json!({"sibling": true})),
         ).unwrap();
         assert!(sibling.pop_response().unwrap().is_some());
         assert_eq!(responses.pending_responses(), 0);
@@ -11302,7 +11305,7 @@ Content-Length: {}\r\n\
         let replacement = responses.for_request(RequestId::Number(704)).unwrap();
         let cx = Cx::for_testing();
         replacement.sender().send_response(
-            &cx, JsonRpcResponse::success(704_i64, serde_json::json!({"replacement": true})),
+            &cx, JsonRpcResponse::success(704_i64.into(), serde_json::json!({"replacement": true})),
         ).unwrap();
         assert!(matches!(
             retained_sender.send_subscription_cancellation(
