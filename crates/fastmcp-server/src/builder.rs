@@ -7622,24 +7622,30 @@ mod tests {
                             received.lock().unwrap().is_empty(),
                             "neither a partial acknowledgement nor data may escape refused admission"
                         );
-                        let listeners = controls.lock().unwrap();
-                        assert_eq!(listeners.len(), 1);
-                        assert!(listeners[0].dropped.load(Ordering::Acquire));
-                        let catalog = catalog.lock().unwrap();
-                        assert!(!catalog.active);
-                        assert_eq!(catalog.requested.len(), usize::from(!narrow_tasks));
-                        assert_eq!(catalog.cancellations, usize::from(!narrow_tasks));
-                        assert!(
-                            server
-                                .final_subscriptions
-                                .inner
-                                .lock()
-                                .unwrap()
-                                .entries
-                                .is_empty()
-                        );
-                        drop(catalog);
-                        drop(listeners);
+                        // Scope the guards lexically rather than dropping them:
+                        // `drop` ends the value, but generator layout keys on
+                        // STORAGE liveness, so only a closing brace guarantees
+                        // StorageDead before the yield below. Without it the
+                        // async block captures a !Send MutexGuard and
+                        // `run_async_under_lab` rejects it.
+                        {
+                            let listeners = controls.lock().unwrap();
+                            assert_eq!(listeners.len(), 1);
+                            assert!(listeners[0].dropped.load(Ordering::Acquire));
+                            let catalog = catalog.lock().unwrap();
+                            assert!(!catalog.active);
+                            assert_eq!(catalog.requested.len(), usize::from(!narrow_tasks));
+                            assert_eq!(catalog.cancellations, usize::from(!narrow_tasks));
+                            assert!(
+                                server
+                                    .final_subscriptions
+                                    .inner
+                                    .lock()
+                                    .unwrap()
+                                    .entries
+                                    .is_empty()
+                            );
+                        }
                         for _ in 0..4 {
                             asupersync::runtime::yield_now().await;
                         }
