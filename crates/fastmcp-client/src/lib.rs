@@ -33889,7 +33889,13 @@ mod tests {
             let FinalTask::Completed { result, .. } = handle.task() else {
                 panic!("completed Task");
             };
-            assert_eq!(result.exact_wire.as_deref(), Some(EXACT_RESULT));
+            // Observe exact-wire retention through the public Serialize surface
+            // rather than the private field: FinalTaskCallToolResult re-emits its
+            // retained wire verbatim via RawValue when it parses and canonically
+            // matches, so this pins the same member order and number lexemes
+            // (1.20e+4, -0, the 30-digit integer) and additionally proves they
+            // survive back onto the wire for a peer.
+            assert_eq!(serde_json::to_string(result).unwrap(), EXACT_RESULT);
             let terminal = serde_json::to_vec(handle.task()).unwrap();
             let cancelled = McpRequestCancellation::new();
             cancelled.cancel();
