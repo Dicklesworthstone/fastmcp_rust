@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use asupersync::{Cx, types::Time};
-use fastmcp_core::{AuthContext, Sha256Digest};
+use fastmcp_core::{AuthContext, McpContext, Sha256Digest};
 use fastmcp_protocol::JsonRpcRequest;
 
 use super::super::scope_policy::request::ScopeRequestPolicy;
@@ -202,9 +202,17 @@ impl SseAuthorizationLease {
         let caller_started = cx.now();
         let next_check = fresh_until(cx, caller_started, self.config.interval)?;
         let provider_deadline = fresh_until(cx, caller_started, self.config.check_timeout)?;
-        let receipt =
+        let facts = if cx.is_cancel_requested() {
+            // check_context admitted this poll only under the already-elected
+            // connection drain's runtime mask. Revalidation checks the original
+            // credential; it does not admit another application request.
+            self.authenticate_retained_credential_during_drain(cx)
+        } else {
             self.server
-                .preauthenticate_http_request(cx, &self.request, &self.authorization);
+                .preauthenticate_http_request(cx, &self.request, &self.authorization)
+                .map(|receipt| (receipt.fingerprint, receipt.authenticated))
+                .map_err(|_| SseAuthorizationError::Rejected)
+        };
         // Local cancellation/deadlines and work bounds win over either a late
         // success or a provider refusal. Neither can extend the freshness window.
         check_context(cx)?;
@@ -214,20 +222,66 @@ impl SseAuthorizationLease {
             started.elapsed(),
             self.config.check_timeout,
         )?;
-        let receipt = receipt.map_err(|_| SseAuthorizationError::Rejected)?;
-        if receipt.fingerprint != self.principal
-            || !same_facts(self.facts.as_ref(), receipt.authenticated.as_ref())
-        {
+        let (principal, facts) = facts?;
+        if principal != self.principal || !same_facts(self.facts.as_ref(), facts.as_ref()) {
             return Err(SseAuthorizationError::FactsChanged);
         }
         self.scopes
-            .authorize_request_verified(&self.request, receipt.authenticated.as_ref())
+            .authorize_request_verified(&self.request, facts.as_ref())
             .map_err(|_| SseAuthorizationError::Rejected)?;
         self.next_check = next_check;
         self.wall_expiry = started
             .checked_add(self.config.interval)
             .ok_or(SseAuthorizationError::InvalidPolicy)?;
         Ok(())
+    }
+
+    /// Rechecks retained facts during an elected terminal drain without minting
+    /// a new ingress receipt or relaxing ordinary request admission. The outer
+    /// connection owner supplies the cancellation mask; this helper cannot
+    /// manufacture that permission from a raw cancellation flag.
+    fn authenticate_retained_credential_during_drain(
+        &self,
+        cx: &Cx,
+    ) -> Result<(Sha256Digest, Option<AuthContext>), SseAuthorizationError> {
+        check_context(cx)?;
+        let budget = cx.budget().meet(self.server.create_request_budget(cx));
+        if budget.is_past_deadline(cx.now()) {
+            return Err(SseAuthorizationError::TimedOut);
+        }
+        if budget.is_exhausted() {
+            return Err(SseAuthorizationError::Cancelled);
+        }
+        let (context, _lease) = McpContext::new(
+            cx.clone(),
+            crate::request_id_to_u64(self.request.id.as_ref()),
+        )
+        .with_budget_ceiling(budget)
+        .begin_request_scope()
+        .ok_or(SseAuthorizationError::Rejected)?;
+        let auth_request = self.authorization.auth_request(
+            &self.request.method,
+            self.request.params.as_ref(),
+            crate::request_id_to_u64(self.request.id.as_ref()),
+        );
+        // McpContext has a separate framework cancellation mask. Mirror the
+        // owner's existing runtime permission only around the synchronous
+        // provider call so its checkpoints can revalidate an elected frame.
+        let facts = context
+            .masked(|| {
+                self.server
+                    .authenticate_request_without_commit(&context, auth_request)
+            })
+            .map_err(|_| SseAuthorizationError::Cancelled)?;
+        check_context(cx)?;
+        let remaining = context.budget();
+        if remaining.is_past_deadline(cx.now()) {
+            return Err(SseAuthorizationError::TimedOut);
+        }
+        if remaining.is_exhausted() || context.request_cancellation().is_cancel_requested() {
+            return Err(SseAuthorizationError::Cancelled);
+        }
+        facts.map_err(|_| SseAuthorizationError::Rejected)
     }
 }
 
@@ -443,6 +497,89 @@ mod tests {
         assert_eq!(lease.checks, 1);
         lease.check(&cx).unwrap();
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn due_revalidation_preserves_elected_drain_and_refuses_ordinary_cancellation() {
+        for elected in [false, true] {
+            with_virtual_clock(|runtime| {
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let (provider, mut lease) = fixture_on(&cx, SseRevalidationPolicy::default());
+                due(&mut lease, &cx);
+                let original_facts = lease.facts.clone();
+                let original_principal = lease.principal;
+                cx.set_cancel_requested(true);
+
+                let result = if elected {
+                    cx.masked(|| lease.check(&cx))
+                } else {
+                    lease.check(&cx)
+                };
+                if elected {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                    assert_eq!(lease.checks, 1);
+                    assert_eq!(lease.principal, original_principal);
+                    assert!(same_facts(lease.facts.as_ref(), original_facts.as_ref()));
+                    assert!(!lease.closed);
+                    assert!(
+                        cx.masked(|| lease.server.preauthenticate_http_request(
+                            &cx,
+                            &lease.request,
+                            &lease.authorization,
+                        ))
+                        .is_err(),
+                        "terminal revalidation must not reopen ordinary ingress"
+                    );
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                } else {
+                    assert_eq!(result, Err(SseAuthorizationError::Cancelled));
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(lease.checks, 0);
+                    assert!(lease.closed);
+                    assert!(lease.facts.is_none());
+                    assert_eq!(
+                        cx.masked(|| lease.check(&cx)),
+                        Err(SseAuthorizationError::Closed),
+                        "a later drain mask cannot revive a refused lease"
+                    );
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                }
+                assert!(cx.is_cancel_requested());
+            });
+        }
+    }
+
+    #[test]
+    fn elected_revalidation_keeps_the_original_absolute_deadline() {
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(Time::from_nanos(200_000_000)),
+        );
+        let (provider, mut lease) = fixture_on(&cx, SseRevalidationPolicy::default());
+        clock.advance_to(Time::from_nanos(100_000_000));
+        due(&mut lease, &cx);
+        cx.set_cancel_requested(true);
+        assert_eq!(cx.masked(|| lease.check(&cx)), Ok(()));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        clock.advance_to(Time::from_nanos(200_000_000));
+        assert_eq!(
+            cx.masked(|| lease.check(&cx)),
+            Err(SseAuthorizationError::TimedOut)
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert!(lease.closed);
+        assert!(lease.facts.is_none());
+        assert!(cx.is_cancel_requested());
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[test]
