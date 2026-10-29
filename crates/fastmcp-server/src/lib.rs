@@ -4479,6 +4479,11 @@ const FINAL_TERMINAL_FAILED: u8 = 3;
 struct FinalSubscriptionTerminalDelivery {
     state: AtomicU8,
     completion_state: AtomicU8,
+    // Cancellation claims both slots, while a response claims them in two
+    // steps. Serialize their transitions so a losing cancellation cannot
+    // consume the response slot or race a failed delivery back into service.
+    // Readers retain atomic snapshots; no callback or I/O runs under this lock.
+    election: Mutex<()>,
     // Only the request-owned SSE writer, after its Stream election, uses
     // this flag to retain an admitted listen across listener cancellation.
     subscription_request: AtomicBool,
@@ -4489,29 +4494,26 @@ impl FinalSubscriptionTerminalDelivery {
     /// Elects cancellation as the only terminal frame. Its body still belongs
     /// to the writer until the control has actually been consumed and flushed.
     fn mark_cancellation_enqueued(&self) -> bool {
-        if self
-            .completion_state
-            .compare_exchange(
-                FINAL_TERMINAL_OPEN,
-                FINAL_TERMINAL_DRAINED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
+        let _election = self
+            .election
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.state.load(Ordering::Acquire) != FINAL_TERMINAL_OPEN
+            || self.completion_state.load(Ordering::Acquire) != FINAL_TERMINAL_OPEN
         {
             return false;
         }
-        self.state
-            .compare_exchange(
-                FINAL_TERMINAL_OPEN,
-                FINAL_TERMINAL_ENQUEUED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.completion_state
+            .store(FINAL_TERMINAL_DRAINED, Ordering::Release);
+        self.state.store(FINAL_TERMINAL_ENQUEUED, Ordering::Release);
+        true
     }
 
     fn mark_drained(&self) {
+        let _election = self
+            .election
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = self.state.load(Ordering::Acquire);
         while state == FINAL_TERMINAL_ENQUEUED {
             match self.state.compare_exchange_weak(
@@ -4529,6 +4531,10 @@ impl FinalSubscriptionTerminalDelivery {
     /// Ordinary RPC responses and subscription admission failures end in a
     /// response rather than a subscription cancellation control.
     fn mark_control_not_required(&self) {
+        let _election = self
+            .election
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = self.state.compare_exchange(
             FINAL_TERMINAL_OPEN,
             FINAL_TERMINAL_DRAINED,
@@ -4538,6 +4544,10 @@ impl FinalSubscriptionTerminalDelivery {
     }
 
     fn mark_completion_enqueued(&self) {
+        let _election = self
+            .election
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = self.completion_state.compare_exchange(
             FINAL_TERMINAL_OPEN,
             FINAL_TERMINAL_ENQUEUED,
@@ -4547,6 +4557,10 @@ impl FinalSubscriptionTerminalDelivery {
     }
 
     fn mark_completion_drained(&self) {
+        let _election = self
+            .election
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = self.completion_state.load(Ordering::Acquire);
         // The writer must never settle a response merely because it can parse
         // it. Only the dispatcher marks a selected terminal response
@@ -4566,6 +4580,10 @@ impl FinalSubscriptionTerminalDelivery {
     }
 
     fn mark_failed(&self) {
+        let _election = self
+            .election
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = self.state.compare_exchange(
             FINAL_TERMINAL_OPEN,
             FINAL_TERMINAL_FAILED,
@@ -15544,6 +15562,13 @@ impl Server {
         if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
             return Err(McpError::request_cancelled());
         }
+        if !request_ctx.cx().capabilities().time
+            || Cx::current().is_some_and(|host| !host.capabilities().time)
+        {
+            return Err(McpError::internal_error(
+                "Subscriptions require caller time capability",
+            ));
+        }
 
         // Each event family owns a distinct upstream request. Admit both
         // projected filters before acknowledging their combined downstream
@@ -15643,6 +15668,18 @@ impl Server {
         };
         #[cfg(not(feature = "tasks"))]
         let task_principal = None;
+        // Upstream admission can suspend and resume under a narrower host
+        // scope. Recheck before registering or acknowledging this listener.
+        if request_cancellation.is_cancel_requested() || request_ctx.ensure_live().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if !request_ctx.cx().capabilities().time
+            || Cx::current().is_some_and(|host| !host.capabilities().time)
+        {
+            return Err(McpError::internal_error(
+                "Subscriptions require caller time capability",
+            ));
+        }
         let lease = self.final_subscriptions.open_with_task_principal(
             subscription_id.clone(),
             params.notifications,
@@ -15675,7 +15712,7 @@ impl Server {
                     && !request_cancellation.is_cancel_requested()
                 {
                     if Instant::now() >= deadline
-                        || request_ctx.cx().budget().deadline.is_some_and(|deadline| {
+                        || request_ctx.budget().deadline.is_some_and(|deadline| {
                             request_ctx.cx().now() >= deadline
                         })
                     {
@@ -15783,29 +15820,67 @@ impl Server {
             if request_ctx.ensure_live().is_err() {
                 asupersync::runtime::yield_now().await;
             } else {
-                let mut sleep = std::pin::pin!(asupersync::time::sleep(
-                    request_ctx.cx().now(),
-                    Duration::from_millis(1),
-                ));
+                let next_poll = request_ctx.cx().now().saturating_add_nanos(1_000_000);
+                let wake_at = request_ctx
+                    .budget()
+                    .deadline
+                    .map_or(next_poll, |deadline| deadline.min(next_poll));
+                let mut sleep = std::pin::pin!(asupersync::time::sleep_until(wake_at));
                 let cancellation = request_cancellation.clone();
                 let mut cancelled = std::pin::pin!(async move {
                     cancellation.cancelled().await;
                 });
-                std::future::poll_fn(|task_cx| {
+                let time_authorized = std::future::poll_fn(|task_cx| {
                     if self.final_subscriptions.is_terminating()
                         || request_cancellation.is_cancel_requested()
                     {
-                        return std::task::Poll::Ready(());
+                        return std::task::Poll::Ready(true);
                     }
                     if cancelled.as_mut().poll(task_cx).is_ready() {
-                        return std::task::Poll::Ready(());
+                        return std::task::Poll::Ready(true);
+                    }
+                    // Observe request liveness on every poll, including a
+                    // shared ceiling tightened after this timer was armed.
+                    if request_ctx.ensure_live().is_err() {
+                        return std::task::Poll::Ready(true);
+                    }
+                    // Sleep discovers its timer through the ambient Cx. The
+                    // deadline above belongs to this request, which may be
+                    // polled by an embedding with no ambient context or a
+                    // different clock. Check the host's time ceiling before
+                    // replacing it: set_current preserves the held Cx's mask,
+                    // not restrictions on the ambient context it replaces.
+                    // Sleep's driverless fallback must not supply denied time
+                    // authority. Recheck on every poll because the host may
+                    // resume a suspended listen in a narrower scope.
+                    if !request_ctx.cx().capabilities().time
+                        || Cx::current().is_some_and(|host| !host.capabilities().time)
+                    {
+                        return std::task::Poll::Ready(false);
+                    }
+                    // No application callback runs under this binding; the
+                    // prior ambient context is restored before yielding.
+                    let _current = Cx::set_current(Some(request_ctx.cx().clone()));
+                    // A still-future tightened ceiling must also move the
+                    // wake earlier. Never extend the already registered wait.
+                    if let Some(deadline) = request_ctx.budget().deadline
+                        && deadline < sleep.deadline()
+                    {
+                        sleep.as_mut().get_mut().reset(deadline);
                     }
                     if sleep.as_mut().poll(task_cx).is_ready() {
-                        return std::task::Poll::Ready(());
+                        return std::task::Poll::Ready(true);
                     }
                     std::task::Poll::Pending
                 })
                 .await;
+                if !time_authorized {
+                    if let Some(delivery) = &terminal_delivery {
+                        delivery.mark_failed();
+                    }
+                    request_cancellation.cancel();
+                    return Err(McpError::request_cancelled());
+                }
             }
         }
 
@@ -53703,6 +53778,7 @@ mod lib_unit_tests {
         let active_for_recv = Arc::clone(&active);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_for_send = Arc::clone(&sent);
+        let sent_for_notification = Arc::clone(&sent);
         let (acknowledged, acknowledgement) = sync_channel(1);
         runtime
             .block_on(async move {
@@ -53756,6 +53832,10 @@ mod lib_unit_tests {
                                 Ok(())
                             },
                             Arc::new(move |notification| {
+                                sent_for_notification
+                                    .lock()
+                                    .unwrap()
+                                    .push(JsonRpcMessage::Request(notification.clone()));
                                 if notification.method == "notifications/subscriptions/acknowledged" {
                                     acknowledged.send(()).expect("receive pump owns acknowledgement channel");
                                 }
@@ -54265,6 +54345,7 @@ mod lib_unit_tests {
         let registry_for_callback = Arc::clone(&registry);
         let sent = Arc::new(Mutex::new(Vec::new()));
         let sent_for_send = Arc::clone(&sent);
+        let sent_for_notification = Arc::clone(&sent);
         let forced = Arc::new(AtomicBool::new(false));
         let forced_by_callback = Arc::clone(&forced);
         let forced_by_recv = Arc::clone(&forced);
@@ -54307,6 +54388,10 @@ mod lib_unit_tests {
                                 Ok(())
                             },
                             Arc::new(move |notification| {
+                                sent_for_notification
+                                    .lock()
+                                    .unwrap()
+                                    .push(JsonRpcMessage::Request(notification.clone()));
                                 if notification.method != "notifications/subscriptions/acknowledged"
                                 {
                                     return;
@@ -59921,6 +60006,114 @@ mod lib_unit_tests {
     }
 
     #[test]
+    fn subscription_terminal_election_rejected_cancellation_preserves_response_slot() {
+        let delivery = FinalSubscriptionTerminalDelivery::default();
+        delivery.mark_control_not_required();
+
+        assert!(!delivery.mark_cancellation_enqueued());
+        assert_eq!(
+            delivery.completion_state.load(Ordering::Acquire),
+            FINAL_TERMINAL_OPEN,
+            "a losing cancellation must leave the response slot unchanged"
+        );
+        assert!(!delivery.is_settled());
+
+        delivery.mark_completion_enqueued();
+        assert_eq!(
+            delivery.completion_state.load(Ordering::Acquire),
+            FINAL_TERMINAL_ENQUEUED
+        );
+        delivery.mark_drained();
+        assert!(
+            !delivery.is_settled(),
+            "only consuming the response settles its receipt"
+        );
+        delivery.mark_completion_drained();
+        assert!(delivery.is_settled());
+        assert!(!delivery.mark_cancellation_enqueued());
+    }
+
+    #[test]
+    fn subscription_terminal_election_cancellation_excludes_response_slot() {
+        let delivery = FinalSubscriptionTerminalDelivery::default();
+        assert!(delivery.mark_cancellation_enqueued());
+
+        delivery.mark_control_not_required();
+        delivery.mark_completion_enqueued();
+        delivery.mark_completion_drained();
+        assert_eq!(
+            delivery.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_ENQUEUED
+        );
+        assert_eq!(
+            delivery.completion_state.load(Ordering::Acquire),
+            FINAL_TERMINAL_DRAINED
+        );
+        assert!(
+            !delivery.is_settled(),
+            "a losing response cannot consume the winning control"
+        );
+
+        delivery.mark_drained();
+        assert!(delivery.is_settled());
+    }
+
+    #[test]
+    fn subscription_terminal_election_races_keep_failure_and_one_winner() {
+        for fail_delivery in [false, true] {
+            for _ in 0..32 {
+                let delivery = FinalSubscriptionTerminalDelivery::default();
+                let start = std::sync::Barrier::new(if fail_delivery { 3 } else { 2 });
+                let cancellation_won = std::thread::scope(|scope| {
+                    let cancellation = scope.spawn(|| {
+                        start.wait();
+                        delivery.mark_cancellation_enqueued()
+                    });
+                    scope.spawn(|| {
+                        start.wait();
+                        delivery.mark_control_not_required();
+                        delivery.mark_completion_enqueued();
+                    });
+                    if fail_delivery {
+                        scope.spawn(|| {
+                            start.wait();
+                            delivery.mark_failed();
+                        });
+                    }
+                    cancellation.join().unwrap()
+                });
+                let control = delivery.state.load(Ordering::Acquire);
+                let completion = delivery.completion_state.load(Ordering::Acquire);
+                if fail_delivery {
+                    assert!(
+                        control == FINAL_TERMINAL_FAILED || completion == FINAL_TERMINAL_FAILED,
+                        "neither election may revive a failed delivery: {control}/{completion}"
+                    );
+                    assert!(delivery.is_settled());
+                    assert!(!delivery.mark_cancellation_enqueued());
+                } else {
+                    assert_eq!(
+                        (control, completion),
+                        if cancellation_won {
+                            (FINAL_TERMINAL_ENQUEUED, FINAL_TERMINAL_DRAINED)
+                        } else {
+                            (FINAL_TERMINAL_DRAINED, FINAL_TERMINAL_ENQUEUED)
+                        },
+                        "exactly the winning terminal must remain owed to its writer"
+                    );
+                    assert!(!delivery.is_settled());
+                    if cancellation_won {
+                        delivery.mark_drained();
+                    } else {
+                        delivery.mark_completion_drained();
+                    }
+                    assert!(delivery.is_settled());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn consumed_subscription_control_waits_for_its_sender_before_dispatch_retires() {
         let server = Arc::new(Server::new("terminal-consumption-race", "1.0.0").build());
         let cancellation = McpRequestCancellation::new();
@@ -60089,6 +60282,559 @@ mod lib_unit_tests {
         assert_eq!(server.terminate_subscription_streams(), 0);
         assert_eq!(wire.lock().unwrap().len(), 1);
         assert_eq!(delivery.state.load(Ordering::Acquire), FINAL_TERMINAL_FAILED);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn subscription_timer_wakes_at_the_effective_sub_millisecond_deadline() {
+        struct DeadlineCeiling(asupersync::Time);
+
+        impl Middleware for DeadlineCeiling {
+            fn on_request(
+                &self,
+                ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                let _ = ctx
+                    .clone()
+                    .with_budget_ceiling(Budget::INFINITE.with_deadline(self.0));
+                Ok(MiddlewareDecision::Continue)
+            }
+        }
+
+        for framework_ceiling in [false, true] {
+            let deadline = asupersync::Time::from_nanos(500_000);
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(if framework_ceiling {
+                Budget::INFINITE
+            } else {
+                Budget::INFINITE.with_deadline(deadline)
+            });
+            let server = Server::new("subscription-effective-deadline", "1.0.0");
+            let server = Arc::new(if framework_ceiling {
+                server.middleware(DeadlineCeiling(deadline)).build()
+            } else {
+                server.build()
+            });
+            let cancellation = McpRequestCancellation::new();
+            let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            let wire = Arc::new(Mutex::new(Vec::new()));
+            let wire_for_sender = Arc::clone(&wire);
+            let sender: NotificationSender = Arc::new(move |notification| {
+                wire_for_sender.lock().unwrap().push(notification);
+            });
+            let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(898) else {
+                unreachable!();
+            };
+            let inbound =
+                InboundRequestContext::new(cx.clone(), 898, InboundRequestTransport::Stdio);
+            let mut dispatch = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                ProtocolPolicy::ModernOnly,
+                &inbound,
+                request,
+                None,
+                None,
+                None,
+                Some(898),
+                cancellation.clone(),
+                Some(Arc::clone(&delivery)),
+                sender,
+            ));
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(timer.next_deadline(), Some(deadline));
+            assert_eq!(wire.lock().unwrap().len(), 1);
+            assert_eq!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .len(),
+                1
+            );
+
+            clock.advance_to(asupersync::Time::from_nanos(499_999));
+            assert_eq!(timer.process_timers(), 0);
+            assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+            assert!(!cancellation.is_cancel_requested());
+            clock.advance_to(deadline);
+            assert!(timer.process_timers() > 0);
+            assert!(matches!(
+                dispatch.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(None)
+            ));
+            drop(dispatch);
+            assert!(cancellation.is_cancel_requested());
+            assert_eq!(
+                delivery.state.load(Ordering::Acquire),
+                FINAL_TERMINAL_FAILED
+            );
+            assert!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert_eq!(server.terminate_subscription_streams(), 0);
+            assert_eq!(wire.lock().unwrap().len(), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(cx.budget().deadline.is_none(), framework_ceiling);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn subscription_timer_rearms_when_a_shared_deadline_tightens() {
+        struct CaptureContext(Arc<Mutex<Option<McpContext>>>);
+
+        impl Middleware for CaptureContext {
+            fn on_request(
+                &self,
+                ctx: &McpContext,
+                _request: &JsonRpcRequest,
+            ) -> McpResult<MiddlewareDecision> {
+                *self.0.lock().unwrap() = Some(ctx.clone());
+                Ok(MiddlewareDecision::Continue)
+            }
+        }
+
+        #[derive(Default)]
+        struct TimerWake(AtomicUsize);
+
+        impl std::task::Wake for TimerWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let captured = Arc::new(Mutex::new(None));
+        let server = Arc::new(
+            Server::new("subscription-tightened-deadline", "1.0.0")
+                .middleware(CaptureContext(Arc::clone(&captured)))
+                .build(),
+        );
+        let cancellation = McpRequestCancellation::new();
+        let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let wire_for_sender = Arc::clone(&wire);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            wire_for_sender.lock().unwrap().push(notification);
+        });
+        let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(899) else {
+            unreachable!();
+        };
+        let inbound = InboundRequestContext::new(cx.clone(), 899, InboundRequestTransport::Stdio);
+        let mut dispatch = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+            ProtocolPolicy::ModernOnly,
+            &inbound,
+            request,
+            None,
+            None,
+            None,
+            Some(899),
+            cancellation.clone(),
+            Some(Arc::clone(&delivery)),
+            sender,
+        ));
+        let wakes = Arc::new(TimerWake::default());
+        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(
+            timer.next_deadline(),
+            Some(asupersync::Time::from_nanos(1_000_000))
+        );
+        assert_eq!(timer.pending_count(), 1);
+        assert_eq!(wire.lock().unwrap().len(), 1);
+
+        let request_ctx = captured.lock().unwrap().as_ref().unwrap().clone();
+        let deadline = asupersync::Time::from_nanos(500_000);
+        let _ = request_ctx
+            .clone()
+            .with_budget_ceiling(Budget::INFINITE.with_deadline(deadline));
+        clock.advance_to(asupersync::Time::from_nanos(250_000));
+        assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+        assert!(!cancellation.is_cancel_requested());
+        assert_eq!(timer.next_deadline(), Some(deadline));
+        assert_eq!(
+            timer.pending_count(),
+            1,
+            "rearming must cancel the old registration"
+        );
+
+        let before = wakes.0.load(Ordering::SeqCst);
+        clock.advance_to(asupersync::Time::from_nanos(499_999));
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), before);
+        assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+        clock.advance_to(deadline);
+        assert!(timer.process_timers() > 0);
+        assert!(wakes.0.load(Ordering::SeqCst) > before);
+        assert!(matches!(
+            dispatch.as_mut().poll(&mut task_cx),
+            std::task::Poll::Ready(None)
+        ));
+        drop(dispatch);
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(
+            delivery.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_FAILED
+        );
+        assert!(
+            server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert_eq!(wire.lock().unwrap().len(), 1);
+        assert_eq!(timer.pending_count(), 0);
+        clock.advance_to(asupersync::Time::from_nanos(2_000_000));
+        assert_eq!(
+            timer.process_timers(),
+            0,
+            "the replaced timer must not wake later"
+        );
+        assert!(cx.budget().deadline.is_none());
+        assert!(request_ctx.ensure_live().is_err());
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn subscription_timer_uses_request_context_under_foreign_ambient_clock() {
+        #[derive(Default)]
+        struct TimerWake(AtomicUsize);
+
+        impl std::task::Wake for TimerWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        for foreign_cancelled in [false, true] {
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(asupersync::Time::from_secs(1)),
+            );
+            let foreign_clock = Arc::new(asupersync::time::VirtualClock::new());
+            foreign_clock.advance_to(asupersync::Time::from_secs(100));
+            let foreign_timer =
+                asupersync::time::TimerDriverHandle::with_virtual_clock(foreign_clock);
+            let foreign_runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(foreign_timer.clone())
+                .build()
+                .unwrap();
+            let foreign = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
+            if foreign_cancelled {
+                foreign.cancel_with(CancelKind::User, Some("unrelated ambient request"));
+            }
+            let ambient = Cx::set_current(Some(foreign));
+            let server = Arc::new(Server::new("subscription-clock-owner", "1.0.0").build());
+            let cancellation = McpRequestCancellation::new();
+            let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            let wire = Arc::new(Mutex::new(Vec::new()));
+            let wire_for_sender = Arc::clone(&wire);
+            let sender: NotificationSender = Arc::new(move |notification| {
+                wire_for_sender.lock().unwrap().push(notification);
+            });
+            let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(895) else {
+                unreachable!();
+            };
+            let inbound =
+                InboundRequestContext::new(cx.clone(), 895, InboundRequestTransport::Stdio);
+            let mut dispatch = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                ProtocolPolicy::ModernOnly,
+                &inbound,
+                request,
+                None,
+                None,
+                None,
+                Some(895),
+                cancellation.clone(),
+                Some(Arc::clone(&delivery)),
+                sender,
+            ));
+            let wakes = Arc::new(TimerWake::default());
+            let waker = std::task::Waker::from(Arc::clone(&wakes));
+            let mut task_cx = std::task::Context::from_waker(&waker);
+            assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(wire.lock().unwrap().len(), 1);
+            assert!(!cancellation.is_cancel_requested());
+            assert!(timer.pending_count() > 0);
+            assert_eq!(foreign_timer.pending_count(), 0);
+            let restored = Cx::current().expect("the caller's ambient context must be restored");
+            assert_eq!(restored.now(), asupersync::Time::from_secs(100));
+            assert_eq!(restored.is_cancel_requested(), foreign_cancelled);
+
+            let before = wakes.0.load(Ordering::SeqCst);
+            clock.advance_to(asupersync::Time::from_secs(1));
+            assert!(timer.process_timers() > 0);
+            assert!(wakes.0.load(Ordering::SeqCst) > before);
+            assert!(matches!(
+                dispatch.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(None)
+            ));
+            drop(dispatch);
+            assert!(cancellation.is_cancel_requested());
+            assert!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert_eq!(wire.lock().unwrap().len(), 1);
+            assert_eq!(
+                delivery.state.load(Ordering::Acquire),
+                FINAL_TERMINAL_FAILED
+            );
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(foreign_timer.pending_count(), 0);
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+            assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn subscription_timer_denies_missing_time_before_admission() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        for held_restriction in [false, true] {
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(clock);
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            let ambient = Cx::set_current(Some(cx.clone()));
+            let denied_cx = if held_restriction {
+                let _no_time = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                Cx::current().unwrap()
+            } else {
+                cx.clone()
+            };
+            let host_restriction = (!held_restriction)
+                .then(|| Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK));
+            let server = Arc::new(Server::new("subscription-time-admission", "1.0.0").build());
+            let wire = Arc::new(Mutex::new(Vec::new()));
+            let wire_for_sender = Arc::clone(&wire);
+            let sender: NotificationSender = Arc::new(move |notification| {
+                wire_for_sender.lock().unwrap().push(notification);
+            });
+            let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(896) else {
+                unreachable!();
+            };
+            let inbound =
+                InboundRequestContext::new(denied_cx, 896, InboundRequestTransport::Stdio);
+            let mut dispatch = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                ProtocolPolicy::ModernOnly,
+                &inbound,
+                request.clone(),
+                None,
+                None,
+                None,
+                Some(896),
+                McpRequestCancellation::new(),
+                None,
+                Arc::clone(&sender),
+            ));
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let std::task::Poll::Ready(Some(response)) = dispatch.as_mut().poll(&mut task_cx)
+            else {
+                panic!("missing time authority must refuse before acknowledging a listen");
+            };
+            assert_eq!(
+                response.error.map(|error| error.code),
+                Some(i32::from(McpErrorCode::InternalError).into())
+            );
+            assert!(wire.lock().unwrap().is_empty());
+            assert!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().capabilities().time, held_restriction);
+            drop(dispatch);
+            drop(host_restriction);
+
+            // The identical request can still claim this owner and install its
+            // timer when only the forbidden capability dimension is restored.
+            let inbound =
+                InboundRequestContext::new(cx.clone(), 896, InboundRequestTransport::Stdio);
+            let cancellation = McpRequestCancellation::new();
+            let mut admitted = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                ProtocolPolicy::ModernOnly,
+                &inbound,
+                request,
+                None,
+                None,
+                None,
+                Some(896),
+                cancellation.clone(),
+                None,
+                sender,
+            ));
+            assert!(admitted.as_mut().poll(&mut task_cx).is_pending());
+            assert_eq!(wire.lock().unwrap().len(), 1);
+            assert!(timer.pending_count() > 0);
+            cancellation.cancel();
+            assert!(matches!(
+                admitted.as_mut().poll(&mut task_cx),
+                std::task::Poll::Ready(None)
+            ));
+            drop(admitted);
+            assert!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert_eq!(wire.lock().unwrap().len(), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert!(cx.capabilities().time);
+            assert!(!cx.is_cancel_requested());
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn subscription_timer_rechecks_host_time_after_acknowledgement() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+        let ambient = Cx::set_current(Some(cx.clone()));
+        let server = Arc::new(Server::new("subscription-time-resume", "1.0.0").build());
+        let cancellation = McpRequestCancellation::new();
+        let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        let wire = Arc::new(Mutex::new(Vec::new()));
+        let wire_for_sender = Arc::clone(&wire);
+        let sender: NotificationSender = Arc::new(move |notification| {
+            wire_for_sender.lock().unwrap().push(notification);
+        });
+        let JsonRpcMessage::Request(request) = modern_subscriptions_listen_request(897) else {
+            unreachable!();
+        };
+        let inbound = InboundRequestContext::new(cx.clone(), 897, InboundRequestTransport::Stdio);
+        let mut dispatch = Box::pin(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+            ProtocolPolicy::ModernOnly,
+            &inbound,
+            request,
+            None,
+            None,
+            None,
+            Some(897),
+            cancellation.clone(),
+            Some(Arc::clone(&delivery)),
+            sender,
+        ));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(wire.lock().unwrap().len(), 1);
+        assert_eq!(
+            server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
+        assert!(timer.pending_count() > 0);
+        let no_time = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+        assert!(matches!(
+            dispatch.as_mut().poll(&mut task_cx),
+            std::task::Poll::Ready(None)
+        ));
+        assert!(!Cx::current().unwrap().capabilities().time);
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(
+            delivery.state.load(Ordering::Acquire),
+            FINAL_TERMINAL_FAILED
+        );
+        assert!(
+            server
+                .final_subscriptions
+                .inner
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        assert_eq!(
+            wire.lock().unwrap().len(),
+            1,
+            "no trailing frame may follow lost time authority"
+        );
+        assert_eq!(
+            timer.pending_count(),
+            0,
+            "the suspended timer must retire with its owner"
+        );
+        drop(dispatch);
+        drop(no_time);
+        clock.advance_to(asupersync::Time::from_secs(1));
+        assert_eq!(timer.process_timers(), 0);
+        assert!(cx.capabilities().time);
+        assert!(!cx.is_cancel_requested());
+        drop(ambient);
         assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
