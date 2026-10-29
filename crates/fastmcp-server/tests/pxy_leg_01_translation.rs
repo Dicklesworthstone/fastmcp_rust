@@ -141,6 +141,14 @@ impl ProxyBackend for OpenLegacyBackend {
     fn call_tool(&mut self, _: &str, _: serde_json::Value) -> McpResult<Vec<Content>> {
         panic!("exact legacy dispatch must not project through closed content")
     }
+    fn call_tool_with_progress(
+        &mut self,
+        _: &str,
+        _: serde_json::Value,
+        _: &mut dyn FnMut(f64, Option<f64>, Option<String>),
+    ) -> McpResult<Vec<Content>> {
+        panic!("exact legacy dispatch must not project through closed content")
+    }
     fn read_resource(&mut self, _: &str) -> McpResult<Vec<ResourceContent>> {
         panic!("exact legacy dispatch must not project through closed resource content")
     }

@@ -7288,7 +7288,7 @@ mod tests {
                                 .expect("foreign task selection receives an error");
                             assert_eq!(
                                 response.error.unwrap().code.as_i32(),
-                                Some(fastmcp_core::McpErrorCode::InvalidParams as i32)
+                                Some(i32::from(fastmcp_core::McpErrorCode::InvalidParams))
                             );
                             assert!(received.lock().unwrap().is_empty());
                             assert!(catalog.lock().unwrap().requested.is_empty());
