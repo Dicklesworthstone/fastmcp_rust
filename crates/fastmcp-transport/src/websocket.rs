@@ -221,11 +221,11 @@ fn websocket_lock_error(cx: &Cx, error: impl std::fmt::Display) -> TransportErro
 
 /// Runs one owned establishment phase under a child of the caller's context.
 ///
-/// `oneshot::Receiver::recv(cx)` registers the caller context's cancellation
-/// waker. That makes a quiet TCP, TLS, or Upgrade wait interruptible even when
-/// its I/O future has no readiness event to wake it. The phase itself runs in a
-/// region-owned child context, so cancellation also wakes that task to observe
-/// its checkpoint and drop its partially established socket or TLS stream.
+/// A cancellation receiver wakes a quiet TCP, TLS, or Upgrade wait even when
+/// its I/O future has no readiness event. The task's join future retains the
+/// phase until completion and aborts it if this establishment is abandoned.
+/// Dropping the task handle alone would detach it, allowing the discarded
+/// connection attempt to keep opening sockets or completing an Upgrade.
 async fn await_with_caller_cx<F, Fut, T>(cx: &Cx, phase: F) -> Result<T, TransportError>
 where
     F: FnOnce(Cx) -> Fut + Send + 'static,
@@ -233,20 +233,21 @@ where
     T: Send + 'static,
 {
     websocket_checkpoint(cx)?;
-    let (sender, mut receiver) = oneshot::channel();
-    let phase_task = cx
+    let mut phase_task = cx
         .spawn(move |phase_cx| async move {
+            // An establishment abandoned before its child first runs must
+            // not invoke even the phase factory under cancelled authority.
+            if phase_cx.checkpoint().is_err() {
+                return None;
+            }
             let mut future = Box::pin(phase(phase_cx.clone()));
-            let output = std::future::poll_fn(|task_cx| {
+            std::future::poll_fn(|task_cx| {
                 if phase_cx.checkpoint().is_err() {
                     return Poll::Ready(None);
                 }
                 future.as_mut().poll(task_cx).map(Some)
             })
-            .await;
-            if let Some(output) = output {
-                let _ = sender.send(&phase_cx, output);
-            }
+            .await
         })
         .map_err(|error| {
             websocket_invalid_data(format!(
@@ -254,24 +255,33 @@ where
             ))
         })?;
 
-    match receiver.recv(cx).await {
-        Ok(output) => Ok(output),
-        Err(oneshot::RecvError::Cancelled) => {
-            phase_task.abort();
-            Err(websocket_checkpoint(cx)
+    // join() itself is deliberately uninterruptible. Keep the caller's wake
+    // separately, while the join's Drop remains the child cancellation owner
+    // for every early return, timeout, panic, or dropped enclosing future.
+    let (_cancel_sender, mut cancel_receiver) = oneshot::channel::<()>();
+    let mut cancellation = std::pin::pin!(cancel_receiver.recv(cx));
+    let mut completion = std::pin::pin!(phase_task.join(cx));
+    std::future::poll_fn(|task_cx| {
+        if cancellation.as_mut().poll(task_cx).is_ready() {
+            return Poll::Ready(Err(websocket_checkpoint(cx)
                 .err()
-                .unwrap_or(TransportError::Cancelled))
+                .unwrap_or(TransportError::Cancelled)));
         }
-        Err(oneshot::RecvError::Closed) => {
-            phase_task.abort();
-            Err(websocket_checkpoint(cx).err().unwrap_or_else(|| {
-                websocket_invalid_data("WebSocket establishment phase ended without a result")
-            }))
+        websocket_checkpoint(cx)?;
+        match completion.as_mut().poll(task_cx) {
+            Poll::Ready(Ok(Some(output))) => {
+                websocket_checkpoint(cx)?;
+                Poll::Ready(Ok(output))
+            }
+            Poll::Ready(Ok(None) | Err(_)) => {
+                Poll::Ready(Err(websocket_checkpoint(cx).err().unwrap_or_else(|| {
+                    websocket_invalid_data("WebSocket establishment phase ended without a result")
+                })))
+            }
+            Poll::Pending => Poll::Pending,
         }
-        Err(oneshot::RecvError::PolledAfterCompletion) => Err(websocket_invalid_data(
-            "WebSocket establishment result was polled after completion",
-        )),
-    }
+    })
+    .await
 }
 
 /// Maximum WebSocket frame and assembled-message size accepted by FastMCP.
@@ -4775,6 +4785,27 @@ mod tests {
         }
     }
 
+    struct EstablishmentDropProbe(Arc<AtomicUsize>);
+
+    impl Drop for EstablishmentDropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    async fn wait_for_establishment_state(description: &str, ready: impl Fn() -> bool) {
+        for _ in 0..1024 {
+            if ready() {
+                return;
+            }
+            asupersync::runtime::yield_now().await;
+        }
+        assert!(
+            ready(),
+            "{description} did not settle in 1024 runtime turns"
+        );
+    }
+
     struct ReadFailingIo {
         write_attempted: Arc<AtomicBool>,
         error_kind: io::ErrorKind,
@@ -5850,6 +5881,176 @@ mod tests {
             // `await_with_caller_cx` seam as `TlsConnector::connect`, while
             // making the no-readiness interleaving deterministic.
             assert_quiet_establishment_phase_cancellation(&cx, "TLS handshake").await;
+        });
+    }
+
+    #[test]
+    fn async_client_abandoned_establishment_does_not_start_its_phase() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            let factories = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let capture = EstablishmentDropProbe(Arc::clone(&dropped));
+            let factory_calls = Arc::clone(&factories);
+            let mut attempt = Box::pin(await_with_caller_cx(&cx, move |_phase_cx| {
+                factory_calls.fetch_add(1, Ordering::AcqRel);
+                async move {
+                    let _capture = capture;
+                    std::future::pending::<()>().await;
+                }
+            }));
+            std::future::poll_fn(|task| {
+                assert!(attempt.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            // The current-thread runtime has not yielded to the queued child.
+            assert_eq!(factories.load(Ordering::Acquire), 0);
+            drop(attempt);
+            wait_for_establishment_state("abandoned phase capture", || {
+                dropped.load(Ordering::Acquire) == 1
+            })
+            .await;
+            assert_eq!(factories.load(Ordering::Acquire), 0);
+            assert_eq!(dropped.load(Ordering::Acquire), 1);
+            assert!(cx.checkpoint().is_ok());
+            assert_eq!(
+                await_with_caller_cx(&cx, |_phase_cx| async { 42_u8 })
+                    .await
+                    .unwrap(),
+                42,
+                "abandoning one phase cannot cancel its caller's next attempt"
+            );
+        });
+    }
+
+    #[test]
+    fn async_client_establishment_owns_pending_phase_until_join_or_abandonment() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            for abandon in [false, true] {
+                let started = Arc::new(AtomicBool::new(false));
+                let committed = Arc::new(AtomicUsize::new(0));
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let (release, mut ready) = oneshot::channel::<()>();
+                let phase_started = Arc::clone(&started);
+                let phase_committed = Arc::clone(&committed);
+                let capture = EstablishmentDropProbe(Arc::clone(&dropped));
+                let mut sibling = cx
+                    .spawn(|sibling_cx| async move {
+                        sibling_cx.checkpoint().expect("sibling remains live");
+                        73_u8
+                    })
+                    .expect("admit unrelated sibling");
+                let mut attempt = Box::pin(await_with_caller_cx(&cx, move |phase_cx| async move {
+                    let _capture = capture;
+                    phase_started.store(true, Ordering::Release);
+                    ready.recv(&phase_cx).await.expect("release live phase");
+                    phase_committed.fetch_add(1, Ordering::AcqRel);
+                    41_u8
+                }));
+                std::future::poll_fn(|task| {
+                    assert!(attempt.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                wait_for_establishment_state("phase's first poll", || {
+                    started.load(Ordering::Acquire)
+                })
+                .await;
+                assert_eq!(committed.load(Ordering::Acquire), 0);
+                assert_eq!(dropped.load(Ordering::Acquire), 0);
+
+                if abandon {
+                    drop(attempt);
+                    wait_for_establishment_state("abandoned active phase", || {
+                        dropped.load(Ordering::Acquire) == 1
+                    })
+                    .await;
+                    assert!(release.send(&cx, ()).is_err());
+                    assert_eq!(committed.load(Ordering::Acquire), 0);
+                } else {
+                    release.send(&cx, ()).expect("release owned phase");
+                    assert_eq!(attempt.await.unwrap(), 41);
+                    assert_eq!(committed.load(Ordering::Acquire), 1);
+                }
+                assert_eq!(dropped.load(Ordering::Acquire), 1);
+                assert_eq!(sibling.join(&cx).await.unwrap(), 73);
+                assert!(cx.checkpoint().is_ok());
+                assert!(!cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[test]
+    fn async_client_abandoned_upgrade_closes_its_socket_without_a_late_handoff() {
+        run_test(|| async {
+            let cx = Cx::current().expect("runtime root context");
+            for abandon in [false, true] {
+                let (client_socket, mut peer) = virtual_socket_pair();
+                let reading = Arc::new(AtomicBool::new(false));
+                let io = ReadNotifyingIo::new(client_socket, Arc::clone(&reading));
+                let mut upgrade = Box::pin(client_upgrade(&cx, "ws://owned-peer.test/mcp", io));
+                std::future::poll_fn(|task| {
+                    assert!(upgrade.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                wait_for_establishment_state("Upgrade response read", || {
+                    reading.load(Ordering::Acquire)
+                })
+                .await;
+                let request = read_http_headers_with_checkpoint(&cx, &mut peer)
+                    .await
+                    .unwrap();
+                let request = NativeHttpRequest::parse(&request).unwrap();
+                let response = ServerHandshake::new()
+                    .accept(&request)
+                    .unwrap()
+                    .response_bytes();
+
+                if abandon {
+                    drop(upgrade);
+                    let mut eof = false;
+                    for _ in 0..1024 {
+                        let mut byte = [0_u8; 1];
+                        let mut read = ReadBuf::new(&mut byte);
+                        let result = std::future::poll_fn(|task| {
+                            Poll::Ready(Pin::new(&mut peer).poll_read(task, &mut read))
+                        })
+                        .await;
+                        match result {
+                            Poll::Ready(Ok(())) => {
+                                assert!(
+                                    read.filled().is_empty(),
+                                    "no bytes after abandoned Upgrade"
+                                );
+                                eof = true;
+                                break;
+                            }
+                            Poll::Ready(Err(error)) => panic!("peer read failed: {error}"),
+                            Poll::Pending => asupersync::runtime::yield_now().await,
+                        }
+                    }
+                    assert!(
+                        eof,
+                        "abandoned Upgrade did not close its socket in 1024 turns"
+                    );
+                    assert!(peer.write_all(&response).await.is_err());
+                } else {
+                    peer.write_all(&response).await.unwrap();
+                    let mut client = upgrade.await.unwrap();
+                    let source = br#"{"jsonrpc":"2.0","id":901,"result":{"owned":true}}"#;
+                    let mut frame = BytesMut::new();
+                    FrameCodec::server()
+                        .encode(Frame::text(Bytes::copy_from_slice(source)), &mut frame)
+                        .unwrap();
+                    peer.write_all(&frame).await.unwrap();
+                    assert_eq!(client.recv_with_source(&cx).await.unwrap().source(), source);
+                }
+                assert!(cx.checkpoint().is_ok());
+                assert!(!cx.is_cancel_requested());
+            }
         });
     }
 
