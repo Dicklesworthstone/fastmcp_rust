@@ -4077,10 +4077,17 @@ mod tests {
         let typed: CancellationRequestId =
             serde_json::from_value(accepted["params"]["requestId"].clone())
                 .expect("negative-zero cancellation ID decodes");
-        // The pinned serde_json (=1.0.151, arbitrary_precision) normalizes
-        // every natively representable number at parse time, so a wire `-0`
-        // reaches typed decoding as the integer 0; exact-lexeme retention
-        // applies only to integers that overflow the native representations.
+        // A wire `-0` reaches typed decoding as the integer 0, and exact-lexeme
+        // retention applies only to integers that overflow the native
+        // representations. Note WHERE that normalization happens, because it
+        // moved: under serde_json =1.0.151 the PARSER normalized every natively
+        // representable number, so a `-0` was already gone before typed
+        // decoding. Since 1.0.152 the parser preserves the sign, so the
+        // `serde_json::Value` here really is `-0` and it is THIS type that
+        // canonicalizes it -- `Integer` is the "canonically spelled" variant
+        // and `IntegerExact` the lexeme-retaining one. The observable outcome
+        // is unchanged; only the layer responsible for it is. Assertions below
+        // must therefore compare typed values, not wire representations.
         assert!(matches!(&typed, CancellationRequestId::Integer(0)));
         assert_eq!(
             serde_json::to_value(&typed).expect("negative-zero ID re-encodes"),
@@ -4108,9 +4115,21 @@ mod tests {
                 .is_err(),
             "typed cancellation ID decoding rejects the same fractional field"
         );
+        // `baseline` is the pre-planting document and the planting mutated only
+        // its clone, so RE-DECODING it here is a real check that the sibling
+        // rejection left the admitted ID intact. The previous form compared
+        // `to_value(&typed)` against the retained wire, which asserts lexeme
+        // equality for a natively representable number: `Integer` is documented
+        // as "canonically spelled" and `IntegerExact` is the lexeme-retaining
+        // variant, so that equality was never the guarantee. It held only while
+        // serde_json normalized `-0` at parse time, and 1.0.152 began preserving
+        // the sign. Comparing typed values is representation-independent and
+        // cannot be defeated by a future change to number handling.
+        let readmitted: CancellationRequestId =
+            serde_json::from_value(baseline["params"]["requestId"].clone())
+                .expect("the admitted cancellation ID still decodes after a sibling rejection");
         assert_eq!(
-            serde_json::to_value(&typed).expect("accepted ID remains serializable"),
-            baseline["params"]["requestId"].clone(),
+            readmitted, typed,
             "fractional rejection cannot mutate the admitted cancellation ID"
         );
     }
