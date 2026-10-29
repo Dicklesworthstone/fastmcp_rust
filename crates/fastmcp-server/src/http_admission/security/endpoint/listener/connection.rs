@@ -33,7 +33,7 @@ use crate::{
     Server, ServerHttpEndpoint, ServerHttpEndpointError, TransportAuthorization,
     admit_modern_http_post, await_modern_sse_dispatch_election, close_detached_modern_http_session,
     dispatch_modern_http_request_with_cancellation_and_transport_authorization,
-    final_subscription_terminal_event, final_subscription_terminal_response_event,
+    final_subscription_terminal_event, final_subscription_terminal_response_event, finish_sse_body,
     h1_request_to_transport, h1_transport_authorization, http_endpoint_error_response,
     http_endpoint_response_to_static, http_request_accepts_sse, native_http1_codec,
     next_live_modern_http_response_body_generation, next_modern_http_stream_generation,
@@ -813,7 +813,7 @@ async fn sse(
         guard_response(cx, &mut lease, write_parts(cx, &mut writer, &[&head], io))
             .await
             .map_err(|_| ())??;
-        loop {
+        let (terminal_control, terminal_response) = loop {
             if let Some(lease) = lease.as_mut() {
                 lease.check(cx).map_err(|_| ())?;
             }
@@ -834,41 +834,43 @@ async fn sse(
                     )
                     .await
                     .map_err(|_| ())??;
-                    if control {
-                        terminal.mark_drained();
-                    }
-                    if complete {
-                        terminal.mark_completion_drained();
-                    }
-                    if terminal.is_settled() {
-                        break;
+                    if control || complete {
+                        break (control, complete);
                     }
                 }
-                Ok(None) if response.is_finished() => break,
+                Ok(None) if response.is_finished() => break (false, false),
                 Ok(None) if cancellation.is_cancel_requested() && !terminal.is_committed() => {
                     terminal.mark_failed();
-                    break;
+                    break (false, false);
                 }
                 Ok(None) if cx.checkpoint().is_err() => {
                     terminal.mark_failed();
-                    break;
+                    break (false, false);
                 }
                 Ok(None) => asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await,
                 Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
                     if response.is_finished() =>
                 {
-                    break;
+                    break (false, false);
                 }
                 Err(_) => return Err(()),
             }
-        }
-        guard_response(
-            cx,
-            &mut lease,
-            write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io),
+        };
+        finish_sse_body(
+            &terminal,
+            terminal_control,
+            terminal_response,
+            async {
+                guard_response(
+                    cx,
+                    &mut lease,
+                    write_parts(cx, &mut writer, &[b"0\r\n\r\n"], io),
+                )
+                .await
+                .map_err(|_| ())?
+            },
         )
         .await
-        .map_err(|_| ())?
     })
     .await;
     if result.is_err() {

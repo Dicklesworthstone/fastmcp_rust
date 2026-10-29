@@ -11493,6 +11493,46 @@ where
     .await
 }
 
+/// The terminal SSE event does not finish an HTTP body until its final chunk
+/// and flush succeed. Keep the receipt revocable throughout that last write,
+/// including when the connection future is abandoned while the flush waits.
+async fn finish_sse_body<F>(
+    delivery: &FinalSubscriptionTerminalDelivery,
+    terminal_control: bool,
+    terminal_response: bool,
+    flush: F,
+) -> Result<(), ()>
+where
+    F: Future<Output = Result<(), ()>>,
+{
+    struct PendingBody<'a> {
+        delivery: &'a FinalSubscriptionTerminalDelivery,
+        flushed: bool,
+    }
+
+    impl Drop for PendingBody<'_> {
+        fn drop(&mut self) {
+            if !self.flushed {
+                self.delivery.mark_failed();
+            }
+        }
+    }
+
+    let mut pending = PendingBody {
+        delivery,
+        flushed: false,
+    };
+    flush.await?;
+    if terminal_control {
+        delivery.mark_drained();
+    }
+    if terminal_response {
+        delivery.mark_completion_drained();
+    }
+    pending.flushed = true;
+    Ok(())
+}
+
 async fn send_h1_response<T>(
     cx: &Cx,
     listener_shutdown: &HttpListenerShutdown,
@@ -12220,7 +12260,7 @@ async fn send_modern_sse_stream(
         )
         .await?;
         let mut last_frame_write = cx.now();
-        loop {
+        let (terminal_control, terminal_response) = loop {
             // A failed request-scoped progress/log/terminal commit retires
             // this body even when response finalization had already claimed
             // the request cancellation token.
@@ -12229,8 +12269,8 @@ async fn send_modern_sse_stream(
             }
             match pop_sse_body_event(&response) {
                 Ok(Some(event)) => {
-                    let terminal_control = response.is_finished()
-                        && final_subscription_terminal_event(&event);
+                    let terminal_control =
+                        response.is_finished() && final_subscription_terminal_event(&event);
                     let terminal_response = final_subscription_terminal_response_event(&event);
                     let bytes = event.to_bytes().map_err(|_| ())?;
                     let prefix = format!("{:X}\r\n", bytes.len());
@@ -12247,17 +12287,13 @@ async fn send_modern_sse_stream(
                     )
                     .await?;
                     last_frame_write = cx.now();
-                    if terminal_control {
-                        terminal_delivery.mark_drained();
-                    }
-                    if terminal_response {
-                        terminal_delivery.mark_completion_drained();
-                    }
-                    if terminal_delivery.is_settled() {
-                        break;
+                    if terminal_control || terminal_response {
+                        // The listener must still own this response while
+                        // its terminating HTTP chunk is pending or partial.
+                        break (terminal_control, terminal_response);
                     }
                 }
-                Ok(None) if response.is_finished() => break,
+                Ok(None) if response.is_finished() => break (false, false),
                 Ok(None)
                     if request_cancellation.is_cancel_requested()
                         && !terminal_delivery.is_committed() =>
@@ -12266,16 +12302,22 @@ async fn send_modern_sse_stream(
                     // remain silent and settle now, rather than burning the
                     // drain budget waiting for a terminal it cannot send.
                     terminal_delivery.mark_failed();
-                    break;
+                    break (false, false);
                 }
                 Ok(None) => {
                     // A cancelled listener Cx must not park on its timer: two
                     // live catalog+Tasks writers would busy-loop or hang and
                     // starve the dispatch that still owns terminal settlement.
                     if listener_shutdown.is_requested() || cx.checkpoint().is_err() {
-                        if native_http_write_authority(cx, listener_shutdown, Some(&terminal_delivery)).is_err() {
+                        if native_http_write_authority(
+                            cx,
+                            listener_shutdown,
+                            Some(&terminal_delivery),
+                        )
+                        .is_err()
+                        {
                             terminal_delivery.mark_failed();
-                            break;
+                            break (false, false);
                         }
                         // Retain an admitted subscription until its global
                         // election commits, under the same fixed drain bound
@@ -12311,17 +12353,22 @@ async fn send_modern_sse_stream(
                 Err(DualEraHttpEndpointError::Transport(TransportError::Closed))
                     if response.is_finished() =>
                 {
-                    break;
+                    break (false, false);
                 }
                 Err(_) => return Err(()),
             }
-        }
-        write_native_http_response_parts(
-            cx,
-            listener_shutdown,
-            Some(&terminal_delivery),
-            &mut writer,
-            &[b"0\r\n\r\n"],
+        };
+        finish_sse_body(
+            &terminal_delivery,
+            terminal_control,
+            terminal_response,
+            write_native_http_response_parts(
+                cx,
+                listener_shutdown,
+                Some(&terminal_delivery),
+                &mut writer,
+                &[b"0\r\n\r\n"],
+            ),
         )
         .await
     }
@@ -47191,7 +47238,7 @@ mod lib_unit_tests {
     }
 
     #[cfg(unix)]
-    const NATIVE_HTTP_WRITE_PROBE_BYTES: usize = 6 * 1024 * 1024;
+    const NATIVE_HTTP_WRITE_PROBE_BYTES: usize = 5 * 1024 * 1024;
     #[cfg(unix)]
     const NATIVE_HTTP_WRITE_PROBE_END: &[u8] = b"response-write-payload-end";
     #[cfg(unix)]
@@ -47228,7 +47275,11 @@ mod lib_unit_tests {
             let mut payload = "x".repeat(NATIVE_HTTP_WRITE_PROBE_BYTES);
             payload.push_str(std::str::from_utf8(NATIVE_HTTP_WRITE_PROBE_END).unwrap());
             if arguments["stream"].as_bool() != Some(true) {
-                return Ok(vec![Content::text(payload)]);
+                // Exercise response backpressure within both protocol limits:
+                // each string is at most 4 MiB and the full result at most
+                // 6 MiB. One 6 MiB string instead tests result rejection.
+                let tail = payload.split_off(3 * 1024 * 1024);
+                return Ok(vec![Content::text(payload), Content::text(tail)]);
             }
             ctx.report_progress(0.5, Some(&payload));
             let deadline = Instant::now() + Duration::from_secs(10);
@@ -47400,15 +47451,31 @@ mod lib_unit_tests {
                 let response: JsonRpcResponse =
                     serde_json::from_slice(live_http_response_body(&response)?)
                         .map_err(|error| error.to_string())?;
-                let text_len = response
-                    .result
-                    .as_ref()
-                    .and_then(|value| value["content"][0]["text"].as_str())
-                    .map(str::len);
-                if response.error.is_some()
-                    || text_len
-                        != Some(NATIVE_HTTP_WRITE_PROBE_BYTES + NATIVE_HTTP_WRITE_PROBE_END.len())
+                if response.error.is_some() {
+                    return Err("a reading JSON peer received a result rejection".into());
+                }
+                let result = response.result.as_ref().ok_or("missing JSON result")?;
+                if serde_json::to_vec(result)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    > fastmcp_protocol::MAX_RESULT_ENCODED_BYTES
                 {
+                    return Err("the write probe exceeded the encoded result limit".into());
+                }
+                let content = result["content"]
+                    .as_array()
+                    .ok_or("missing result content")?;
+                let mut received = String::new();
+                for block in content {
+                    let text = block["text"].as_str().ok_or("missing result text")?;
+                    if text.len() > fastmcp_protocol::MAX_RESULT_STRING_BYTES {
+                        return Err("the write probe exceeded the result string limit".into());
+                    }
+                    received.push_str(text);
+                }
+                let mut expected = "x".repeat(NATIVE_HTTP_WRITE_PROBE_BYTES);
+                expected.push_str(std::str::from_utf8(NATIVE_HTTP_WRITE_PROBE_END).unwrap());
+                if received != expected {
                     return Err(
                         "a reading JSON peer did not receive the complete large response".into(),
                     );
@@ -47670,6 +47737,229 @@ mod lib_unit_tests {
                 .map_err(|_| "legacy SSE write controller panicked")??;
             require_quiescent_http_shutdown(shutdown, "legacy SSE write timeout").await
         });
+    }
+
+    #[derive(Default)]
+    struct NativeSseTrailerControl {
+        bytes: Mutex<Vec<u8>>,
+        permitted_bytes: AtomicUsize,
+        flush_ready: AtomicBool,
+        polls: AtomicUsize,
+    }
+
+    struct NativeSseTrailerWriter(Arc<NativeSseTrailerControl>);
+
+    impl asupersync::io::AsyncWrite for NativeSseTrailerWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _task: &mut std::task::Context<'_>,
+            input: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.polls.fetch_add(1, Ordering::AcqRel);
+            if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::Interrupted.into()));
+            }
+            let mut bytes = self.0.bytes.lock().unwrap();
+            let remaining = self
+                .0
+                .permitted_bytes
+                .load(Ordering::Acquire)
+                .saturating_sub(bytes.len());
+            if remaining == 0 {
+                return std::task::Poll::Pending;
+            }
+            let count = input.len().min(remaining).min(2);
+            bytes.extend_from_slice(&input[..count]);
+            std::task::Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _task: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.0.polls.fetch_add(1, Ordering::AcqRel);
+            if Cx::current().is_some_and(|cx| cx.checkpoint().is_err()) {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::Interrupted.into()));
+            }
+            if self.0.flush_ready.load(Ordering::Acquire) {
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            task: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(task)
+        }
+    }
+
+    #[test]
+    fn native_sse_receipt_waits_for_http_trailer_and_flush() {
+        for cancellation in [false, true] {
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                    clock,
+                ))
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            let ambient = Cx::set_current(Some(cx.clone()));
+            let shutdown = HttpListenerShutdown::new(&cx);
+            let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            delivery.subscription_request.store(true, Ordering::Release);
+            if cancellation {
+                assert!(delivery.mark_cancellation_enqueued());
+            } else {
+                delivery.mark_control_not_required();
+                delivery.mark_completion_enqueued();
+            }
+            let receipt = FinalSubscriptionTerminationReceipt {
+                terminal_deliveries: vec![Arc::clone(&delivery)],
+                ..Default::default()
+            };
+            shutdown.request();
+            cx.cancel_with(CancelKind::Shutdown, Some("pending SSE HTTP trailer"));
+            let control = Arc::new(NativeSseTrailerControl::default());
+            control.permitted_bytes.store(2, Ordering::Release);
+            let mut writer = NativeSseTrailerWriter(Arc::clone(&control));
+            let mut finish = Box::pin(finish_sse_body(
+                &delivery,
+                cancellation,
+                !cancellation,
+                write_native_http_response_parts(
+                    &cx,
+                    &shutdown,
+                    Some(&delivery),
+                    &mut writer,
+                    &[b"0\r\n\r\n"],
+                ),
+            ));
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(finish.as_mut().poll(&mut task).is_pending());
+            assert_eq!(control.bytes.lock().unwrap().as_slice(), b"0\r");
+            assert!(
+                !receipt.is_settled(),
+                "a partial trailer still owns the receipt"
+            );
+            control.permitted_bytes.store(5, Ordering::Release);
+            assert!(finish.as_mut().poll(&mut task).is_pending());
+            assert_eq!(control.bytes.lock().unwrap().as_slice(), b"0\r\n\r\n");
+            assert!(
+                !receipt.is_settled(),
+                "accepted bytes still need a successful flush"
+            );
+            control.flush_ready.store(true, Ordering::Release);
+            assert!(matches!(
+                finish.as_mut().poll(&mut task),
+                std::task::Poll::Ready(Ok(()))
+            ));
+            assert!(receipt.is_settled());
+            assert_eq!(
+                delivery.state.load(Ordering::Acquire),
+                FINAL_TERMINAL_DRAINED
+            );
+            assert_eq!(
+                delivery.completion_state.load(Ordering::Acquire),
+                FINAL_TERMINAL_DRAINED
+            );
+            assert_eq!(control.bytes.lock().unwrap().as_slice(), b"0\r\n\r\n");
+            assert!(
+                cx.checkpoint().is_err(),
+                "the terminal mask must not escape its poll"
+            );
+            drop(finish);
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn native_sse_pending_trailer_remains_revocable_and_abandonment_fails_receipt() {
+        for cancellation in [false, true] {
+            for boundary in 0..4 {
+                let clock = Arc::new(asupersync::time::VirtualClock::new());
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                        Arc::clone(&clock),
+                    ))
+                    .build()
+                    .unwrap();
+                let cx = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(asupersync::Time::from_secs(1)),
+                );
+                let ambient = Cx::set_current(Some(cx.clone()));
+                let shutdown = HttpListenerShutdown::new(&cx);
+                let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+                delivery.subscription_request.store(true, Ordering::Release);
+                if cancellation {
+                    assert!(delivery.mark_cancellation_enqueued());
+                } else {
+                    delivery.mark_control_not_required();
+                    delivery.mark_completion_enqueued();
+                }
+                let receipt = FinalSubscriptionTerminationReceipt {
+                    terminal_deliveries: vec![Arc::clone(&delivery)],
+                    ..Default::default()
+                };
+                shutdown.request();
+                cx.cancel_with(CancelKind::Shutdown, Some("revoked SSE HTTP trailer"));
+                let control = Arc::new(NativeSseTrailerControl::default());
+                control.permitted_bytes.store(5, Ordering::Release);
+                let mut writer = NativeSseTrailerWriter(Arc::clone(&control));
+                let mut finish = Box::pin(finish_sse_body(
+                    &delivery,
+                    cancellation,
+                    !cancellation,
+                    write_native_http_response_parts(
+                        &cx,
+                        &shutdown,
+                        Some(&delivery),
+                        &mut writer,
+                        &[b"0\r\n\r\n"],
+                    ),
+                ));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(finish.as_mut().poll(&mut task).is_pending());
+                assert_eq!(control.bytes.lock().unwrap().as_slice(), b"0\r\n\r\n");
+                assert!(!receipt.is_settled());
+                let polls = control.polls.load(Ordering::Acquire);
+                match boundary {
+                    0 => receipt.fail_pending(),
+                    1 => clock.advance_to(asupersync::Time::from_secs(1)),
+                    2 => {
+                        *delivery.native_shutdown_deadline.lock().unwrap() = Some(Instant::now());
+                    }
+                    _ => {}
+                }
+                if boundary != 3 {
+                    control.flush_ready.store(true, Ordering::Release);
+                    assert!(matches!(
+                        finish.as_mut().poll(&mut task),
+                        std::task::Poll::Ready(Err(()))
+                    ));
+                }
+                // Dropping a waiting body is independently a failed delivery,
+                // even when every trailer byte was already accepted.
+                drop(finish);
+                assert!(receipt.is_settled());
+                let terminal_state = if cancellation {
+                    delivery.state.load(Ordering::Acquire)
+                } else {
+                    delivery.completion_state.load(Ordering::Acquire)
+                };
+                assert_eq!(terminal_state, FINAL_TERMINAL_FAILED);
+                assert_eq!(control.polls.load(Ordering::Acquire), polls);
+                assert_eq!(control.bytes.lock().unwrap().as_slice(), b"0\r\n\r\n");
+                drop(ambient);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+            }
+        }
     }
 
     #[test]
