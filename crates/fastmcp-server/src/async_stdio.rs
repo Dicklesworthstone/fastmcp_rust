@@ -893,6 +893,15 @@ fn write<W: ConnectionWriter>(
             true,
         )
         .await;
+        // This match is single-armed only when `legacy-2024-11-05` is off, so
+        // `clippy::infallible_destructuring_match` fires in that projection
+        // alone. Taking its suggestion -- `let WriteAttempt::Complete(result)
+        // = attempt;` -- would not compile in the default build, where the
+        // `RequestDeadline` arm below is present and the match is genuinely
+        // fallible. A lint cannot see the arm a `cfg` removed, so this one is
+        // right about the code it was given and wrong about the code that
+        // ships. See bd-yhx86.
+        #[allow(clippy::infallible_destructuring_match)]
         let result = match attempt {
             WriteAttempt::Complete(result) => result,
             #[cfg(feature = "legacy-2024-11-05")]
