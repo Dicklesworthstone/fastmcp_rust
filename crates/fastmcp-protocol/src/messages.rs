@@ -1708,7 +1708,11 @@ where
         }
     }
 
-    impl<'de> Visitor<'de> for ResourceUriSeed {
+    // `'de` is elidable here and only here: this visitor's `visit_str` and
+    // `visit_string` carry their own `E`, so the deserializer lifetime is never
+    // named in the body. The sibling visitors below do name it (e.g.
+    // `A: SeqAccess<'de>`), which is why they keep the explicit form.
+    impl Visitor<'_> for ResourceUriSeed {
         type Value = String;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

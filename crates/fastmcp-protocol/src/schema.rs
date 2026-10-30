@@ -2979,6 +2979,8 @@ fn bounded_diagnostic_path(path: &str, root: &'static str) -> String {
 }
 
 fn escaped_diagnostic_character(character: char) -> String {
+    use std::fmt::Write as _;
+
     if character.is_ascii_alphanumeric()
         || matches!(character, '_' | '-' | '.' | '/' | ':' | '$' | '~')
     {
@@ -2988,8 +2990,13 @@ fn escaped_diagnostic_character(character: char) -> String {
     character
         .encode_utf16(&mut utf16)
         .iter()
-        .map(|unit| format!("\\u{unit:04x}"))
-        .collect()
+        .fold(String::new(), |mut escaped, unit| {
+            // Appending to one String avoids a per-unit allocation. `write!`
+            // into a String cannot fail, so the Result is discarded rather
+            // than unwrapped, which would add an unreachable panic path.
+            let _ = write!(escaped, "\\u{unit:04x}");
+            escaped
+        })
 }
 
 fn diagnostic_child_path(parent: &str, name: &str) -> String {
