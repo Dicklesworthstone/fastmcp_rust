@@ -38,6 +38,16 @@
 //! If you need to add a new transport (for example, QUIC or a custom IPC),
 //! this is the crate to extend.
 
+// Raised for the trait solver: proving `Send` for the nested async blocks in
+// the WebSocket client-control tests overflows the default limit. The two
+// sibling crates with async graphs this deep (`fastmcp-server`,
+// `fastmcp-client`) already raise it for the same reason; this crate was the
+// one that never did, because its lib-test target did not compile until
+// bd-jdcpe, so the diagnostic had nothing to appear in. Without this, rustc
+// reports `overflow evaluating the requirement {async block}: Send` as a
+// warning and ABANDONS the proof -- which means the future is not shown to be
+// `Send`, merely unchecked. See bd-35ktc.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 
 mod async_io;

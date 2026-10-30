@@ -96,12 +96,21 @@ impl ConnectionWriter for MemorySendHalf {
     }
     // `TransportSendHalf::close` is genuinely synchronous (lib.rs:285), so this
     // impl has nothing to await, and the two clippy lints that notice that are
-    // in direct conflict: as an `async fn` it draws `unused_async`, and in this
-    // block form it draws `manual_async_fn`. One of them has to be allowed.
-    // Allowing `manual_async_fn` is the one that works -- an item-level
-    // `#[allow(clippy::unused_async)]` does NOT suppress the other direction on
-    // a trait impl method (measured: clippy still reported it at this site with
-    // the attribute directly above).
+    // in direct conflict: as an `async fn` it draws
+    // `unused_async_trait_impl`, and in this block form it draws
+    // `manual_async_fn`. One of them has to be allowed, and this block form
+    // works.
+    //
+    // A correction to what this comment used to say: it reported that an
+    // item-level `#[allow(clippy::unused_async)]` did NOT suppress the
+    // `async fn` direction on a trait impl method. The measurement was right
+    // and the conclusion drawn from it was wrong -- the lint on a trait impl
+    // is `clippy::unused_async_trait_impl`, a DIFFERENT lint, so that allow
+    // named something this site never emits. Item-level allows do work here;
+    // the one that would have worked is
+    // `#[allow(clippy::unused_async_trait_impl)]`, which is what the
+    // `ReadyWriter` test impl further down now uses. Either form is correct;
+    // this one is left as it is because it is lazy and already proven.
     //
     // Both forms are lazy, which is the property that actually matters here.
     // What is NOT acceptable is `std::future::ready(..)`, which the RPITIT
@@ -4571,7 +4580,18 @@ mod tests {
             sends: usize,
         }
 
+        // Both methods keep their `async`, against `unused_async_trait_impl`,
+        // because the lint's suggested `std::future::ready(..)` is a behaviour
+        // change here and not a simplification: it evaluates the body when the
+        // future is CONSTRUCTED rather than when the driver polls it. `send`
+        // advances the virtual clock, cancels by peer and marks the terminal
+        // failed, and the ordering of those effects against the poll is the
+        // whole subject of the five `GuardCase`s. An eager body would still
+        // compile, so this is a row where applying the mechanical fix is worse
+        // than leaving the lint. `MemorySendHalf` above reaches the same
+        // conclusion in production for the same reason.
         impl ConnectionWriter for ReadyWriter {
+            #[allow(clippy::unused_async_trait_impl)]
             async fn send(&mut self, cx: &Cx, _: &JsonRpcMessage) -> Result<(), TransportError> {
                 assert!(cx.checkpoint().is_ok(), "the elected write poll has bounded cancellation masking");
                 self.sends += 1;
@@ -4584,6 +4604,7 @@ mod tests {
                 }
                 Ok(())
             }
+            #[allow(clippy::unused_async_trait_impl)]
             async fn close(&mut self, _: &Cx) -> Result<(), TransportError> { Ok(()) }
             fn is_closed(&self) -> bool { false }
         }

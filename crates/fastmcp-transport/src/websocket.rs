@@ -6208,8 +6208,14 @@ mod tests {
         // 0x00 Continuation completes the fragmented message; a second 0x01
         // Text frame is a data frame arriving inside it, which RFC 6455 §5.4
         // forbids.
+        // Not a boolean widened to an integer: these are the two RFC 6455 §5.2
+        // opcodes named in the comment above, which happen to BE 0 and 1.
+        // `u8::from(!continuation)` would satisfy the lint and leave the only
+        // call site in this module that does not pass a recognisable opcode.
+        #[allow(clippy::bool_to_int_with_if)]
+        let second_frame_opcode = if continuation { 0x00 } else { 0x01 };
         inbound.extend(build_masked_frame(
-            if continuation { 0x00 } else { 0x01 },
+            second_frame_opcode,
             true,
             &source[midpoint..],
         ));
@@ -6218,7 +6224,7 @@ mod tests {
             inbound.into_boxed_slice(),
         )
         .expect("bounded initial frames");
-        let (mut receiver, mut sender) = server.into_split();
+        let (mut receiver, sender) = server.into_split();
         let received = receiver.recv_with_source(&cx).await;
         if continuation {
             assert_eq!(
@@ -7711,21 +7717,21 @@ mod tests {
     #[test]
     fn async_client_split_protocol_failure_close_is_bounded_and_preserves_error() {
         run_test(|| async {
-            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Stalled).await
+            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Stalled).await;
         });
     }
 
     #[test]
     fn async_client_split_protocol_failure_writes_one_close_when_healthy() {
         run_test(|| async {
-            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Writable).await
+            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Writable).await;
         });
     }
 
     #[test]
     fn async_client_split_dropped_protocol_failure_keeps_original_error_without_new_close() {
         run_test(|| async {
-            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Dropped).await
+            assert_client_split_protocol_failure_close(ClientFailureCloseDrive::Dropped).await;
         });
     }
 

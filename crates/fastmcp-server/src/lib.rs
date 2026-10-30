@@ -3363,7 +3363,7 @@ impl GuardedTransportOutput {
             return None;
         };
         final_subscription_terminal_notification(notification)
-            .then(|| self.delivery.as_deref())
+            .then_some(self.delivery.as_deref())
             .flatten()
     }
 
@@ -49811,7 +49811,7 @@ mod lib_unit_tests {
             }
             assert_eq!(polls.load(Ordering::Acquire), 1);
             delivery.state.store(FINAL_TERMINAL_ENQUEUED, Ordering::Release);
-            write.await.map_err(|_| "elected control lost its partial output".to_owned())?;
+            write.await.map_err(|()| "elected control lost its partial output".to_owned())?;
             assert_eq!(polls.load(Ordering::Acquire), 2);
             assert_eq!(bytes.lock().unwrap().as_slice(), b"preend");
             delivery.mark_drained();
@@ -49819,7 +49819,7 @@ mod lib_unit_tests {
                 cx.checkpoint().map_err(|_| ())?;
                 bytes.lock().unwrap().extend_from_slice(b"0\r\n\r\n");
                 Ok(())
-            }).await.map_err(|_| "the elected body could not close its HTTP framing".to_owned())?;
+            }).await.map_err(|()| "the elected body could not close its HTTP framing".to_owned())?;
             assert_eq!(*delivery.native_shutdown_deadline.lock().unwrap(), Some(deadline));
             assert_eq!(bytes.lock().unwrap().as_slice(), b"preend0\r\n\r\n");
             *delivery.native_shutdown_deadline.lock().unwrap() = Some(Instant::now());
@@ -50019,7 +50019,7 @@ mod lib_unit_tests {
             for parts in [[b"ab".as_slice(), b"cd".as_slice()], [b"ef", b"gh"]] {
                 write_native_http_response_parts(&cx, &shutdown, None, &mut progressing, &parts)
                     .await
-                    .map_err(|_| "partial writes were prematurely cut off".to_owned())?;
+                    .map_err(|()| "partial writes were prematurely cut off".to_owned())?;
             }
             if progressing.bytes != b"abcdefgh" || started.elapsed() <= WRITE_TIMEOUT {
                 return Err("frame budgets restarted bytes or limited the stream lifetime".into());
@@ -50141,7 +50141,7 @@ mod lib_unit_tests {
                 &[b"done"],
             )
             .await
-            .map_err(|_| "ambient cancellation suppressed an elected terminal".to_owned())?;
+            .map_err(|()| "ambient cancellation suppressed an elected terminal".to_owned())?;
             if terminal.bytes != b"done" {
                 return Err("elected terminal drain changed its bytes".into());
             }

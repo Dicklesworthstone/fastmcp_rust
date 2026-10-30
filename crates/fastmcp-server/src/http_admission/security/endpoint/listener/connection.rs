@@ -1096,7 +1096,7 @@ mod tests {
                 assert_eq!(write_polls.load(Ordering::SeqCst), 1);
                 assert!(terminal.is_drained());
             } else {
-                assert!(matches!(result, Poll::Ready(Err(_)) | Poll::Ready(Ok(Err(())))));
+                assert!(matches!(result, Poll::Ready(Err(_) | Ok(Err(())))));
                 assert_eq!(write_polls.load(Ordering::SeqCst), 0);
                 assert_eq!(terminal.state.load(Ordering::Acquire), crate::FINAL_TERMINAL_FAILED);
             }
@@ -1205,7 +1205,7 @@ mod tests {
                 assert_eq!(writes.load(Ordering::SeqCst), 1);
                 assert!(terminal.is_drained());
             } else {
-                assert!(matches!(result, Poll::Ready(Err(_)) | Poll::Ready(Ok(Err(())))), "refusal={refusal}");
+                assert!(matches!(result, Poll::Ready(Err(_) | Ok(Err(())))), "refusal={refusal}");
                 assert_eq!(writes.load(Ordering::SeqCst), 0);
                 assert_eq!(terminal.state.load(Ordering::Acquire), crate::FINAL_TERMINAL_FAILED);
             }

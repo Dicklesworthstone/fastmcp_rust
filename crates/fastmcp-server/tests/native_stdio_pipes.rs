@@ -2,6 +2,13 @@
 //! These are implementation regressions, not aggregate conformance evidence.
 
 #![cfg(unix)]
+// An integration test is its OWN crate root, so it does not inherit the
+// `#![recursion_limit = "512"]` that `fastmcp-server`'s `src/lib.rs` carries for
+// exactly this reason. Proving `Send` for the nested `serve_stdio_io` async
+// block below overflows the default limit, and rustc then abandons the proof
+// rather than failing it, leaving the future unchecked rather than shown
+// `Send`. See bd-35ktc for the same class in `fastmcp-transport`.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 
 use std::future::{Future, poll_fn};
