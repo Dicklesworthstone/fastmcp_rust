@@ -288,7 +288,7 @@ fn facade_sampling_effect_is_implementable_and_consent_is_explicit() {
                 "maxTokens": 128
             }))
             .unwrap();
-        let capability: fastmcp_rust::modern::McpAppsSamplingCapability = Default::default();
+        let capability = fastmcp_rust::modern::McpAppsSamplingCapability::default();
         assert!(capability.tools.is_none());
         let result: fastmcp_rust::modern::McpAppsSamplingResult = ApprovedSampling
             .sampling_create_message(&cx, &cancellation, &params)
@@ -335,6 +335,16 @@ fn facade_sampling_effect_is_implementable_and_consent_is_explicit() {
 /// overrides actually run — nothing about Apps conformance, and nothing about
 /// the hooks this test does not override.
 #[cfg(feature = "apps")]
+// Both lints would delete the proof. `progress` carries no `.await` because
+// the trait's declared signature IS the assertion here, and the suggested
+// `std::future::ready` would move its two field mutations from poll time to
+// construction -- a behaviour change, not a cleanup. `_shape` is a
+// function-pointer coercion whose only observable is that it compiles, which
+// is exactly what "binding with no side-effect" describes. Same reading as
+// `facade_names_the_task_claims_a_custom_store_must_return` below, which
+// already carries the second of these two allows for the identical shape.
+// Both fire only under `--all-features`: `apps` is not a facade default.
+#[allow(clippy::unused_async_trait_impl, clippy::no_effect_underscore_binding)]
 #[test]
 fn facade_names_the_apps_control_types_its_embedder_hooks_demand() {
     use fastmcp_rust::mcp_apps_bridge::{
