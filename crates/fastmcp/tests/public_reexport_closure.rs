@@ -216,8 +216,7 @@ fn facade_root_names_every_type_its_dpop_api_demands() {
     let resource =
         CanonicalHttpUrl::parse("https://example.test/mcp").expect("an https URL parses");
     let refused = DpopSession::new(key, cleartext, resource)
-        .err()
-        .expect("a cleartext token endpoint is refused");
+        .expect_err("a cleartext token endpoint is refused");
     assert!(
         matches!(proof_failure(&refused), Some(DpopError::CleartextTarget)),
         "a cleartext target must surface as Proof(CleartextTarget), got {refused:?}"
@@ -551,6 +550,18 @@ fn facade_private_surface_names_every_promote_helper_the_handler_macros_emit() {
 /// or a backend, and they say nothing about the semantics of a custom
 /// implementation.
 #[cfg(feature = "tasks")]
+// Every assertion in this test is at the TYPE level: the two `*_shape`
+// functions exist so that `FinalTaskStore`'s exact return positions are written
+// out and have to resolve, and the `let _accepted` / `_initial` / `_shapes`
+// bindings exist so that the re-exported constructor paths have to resolve and
+// coerce. Both lints below are structurally hostile to that technique and their
+// suggestions would delete the subject rather than simplify it:
+// `unnecessary_wraps` would unwrap returns that must match the trait's
+// signature exactly (and that the `_shapes` fn-pointer tuple coerces against),
+// and `no_effect_underscore_binding` would remove the bindings that ARE the
+// proof. A test whose observable is "this compiles" has no run-time effect by
+// construction.
+#[allow(clippy::unnecessary_wraps, clippy::no_effect_underscore_binding)]
 #[test]
 fn facade_names_the_task_claims_a_custom_store_must_return() {
     use fastmcp_rust::{

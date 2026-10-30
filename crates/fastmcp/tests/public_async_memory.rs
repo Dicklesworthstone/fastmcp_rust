@@ -1,6 +1,12 @@
 //! Public in-process serving on a caller-owned runtime without a reactor or
 //! blocking pool. The modern facade also runs with `--no-default-features`.
 
+// An integration test is its own crate root, so it inherits no attribute from
+// the facade's `src/lib.rs` -- which does not raise this either. Proving `Send`
+// for the nested `Facade::serve` async block spawned below overflows the default
+// limit, and rustc then ABANDONS the proof rather than failing it, leaving the
+// future unchecked rather than shown `Send`. See bd-35ktc.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;

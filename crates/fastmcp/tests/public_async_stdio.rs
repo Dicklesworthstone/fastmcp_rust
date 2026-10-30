@@ -4,6 +4,14 @@
 //! transport endpoints use one caller-owned runtime with no blocking pool.
 
 #![cfg(unix)]
+// An integration test is its own crate root, so it inherits no attribute from
+// the facade's `src/lib.rs` -- which does not raise this either. Proving `Send`
+// for the nested `Facade::serve` -> `serve_stdio_io` async blocks spawned below
+// overflows the default limit, and rustc then ABANDONS the proof rather than
+// failing it, leaving those futures unchecked rather than shown `Send`. The two
+// sibling crates with async graphs this deep raise it for the same reason; see
+// bd-35ktc.
+#![recursion_limit = "512"]
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;

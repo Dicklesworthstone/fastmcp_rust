@@ -10078,6 +10078,14 @@ mod tests {
         assert!(validate(&schema, &json!("anything")).is_err());
     }
 
+    // `clippy::unicode_not_nfc` fires on U+212A KELVIN SIGN below, and its
+    // suggestion would invert this test. U+212A normalizes under NFC to plain
+    // `K` (U+004B); it appears here in the NON-matching set for `^\w+$`
+    // precisely because it LOOKS like an ASCII `K` and is a different code
+    // point. Normalizing the literal would turn a rejected input into an
+    // accepted one, which is the exact distinction this test exists to pin.
+    // (The `é` the lint also points at is already U+00E9 and composed.)
+    #[allow(clippy::unicode_not_nfc)]
     #[test]
     fn ecmascript_shorthand_patterns_distinguish_ascii_and_unicode() {
         // ECMA-262 CharacterClassEscape semantics, also exercised by the
