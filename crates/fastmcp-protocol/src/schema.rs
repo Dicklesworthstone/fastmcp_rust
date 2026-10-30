@@ -6482,7 +6482,7 @@ mod tests {
             .dynamic_anchor_target("node")
             .expect("one scope visit and two anchor visits fit the exact budget")
             .expect("the configured anchor exists");
-        assert!(std::ptr::eq(target, &root["$defs"]["node"]));
+        assert!(std::ptr::eq(target, &raw const root["$defs"]["node"]));
         assert_eq!(exact.remaining_work, 0);
         let mut exhausted = ValidationContext::new(&root, true);
         exhausted.push_dynamic_scope(source);

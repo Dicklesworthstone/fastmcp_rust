@@ -400,10 +400,7 @@ fn grandfather_rows_are_live_and_expire_when_their_artifact_is_repaired() {
             ));
             continue;
         }
-        if !values
-            .iter()
-            .any(|value| *value == MANDATED_UNTIL_2026_10_14)
-        {
+        if !values.contains(&MANDATED_UNTIL_2026_10_14) {
             stale.push(format!(
                 "{path}: no longer carries the former mandate; it records {values:?}"
             ));

@@ -511,7 +511,13 @@ mod retention_administration {
         let notification = FinalTaskStatusNotification::new(FinalTaskStatusNotificationParams {
             task: task.clone(),
             meta: None,
-            additional: Default::default(),
+            // Written out rather than imported. `clippy::default_trait_access`
+            // wants the concrete type named, but `BTreeMap` is not in scope
+            // here and the only use site is inside
+            // `#[cfg(feature = "tasks")] mod retention_administration`, so a
+            // top-level `use` would be an unused import whenever that feature
+            // is off -- which this target is built without.
+            additional: std::collections::BTreeMap::default(),
         });
         store.create_task(task, notification)
     }
@@ -601,7 +607,7 @@ mod retention_administration {
             );
             assert!(tasks.task_retention_audit(&owner, None, 1).is_err());
             let audit = tasks.task_retention_audit(&admin, None, 1).unwrap();
-            assert_eq!(audit.records(), &[receipt.clone()]);
+            assert_eq!(audit.records(), std::slice::from_ref(&receipt));
             assert_eq!(audit.retained_records(), 1);
             assert!(audit.retained_bytes() <= 4096);
 
