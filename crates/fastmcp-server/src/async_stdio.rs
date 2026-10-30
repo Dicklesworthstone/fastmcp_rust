@@ -301,9 +301,21 @@ struct OutputFrame {
 }
 
 impl OutputFrame {
+    /// Provider admission survives the outbox and is checked outside its lock
+    /// before every write poll. A frame may have waited behind another request
+    /// or a partially completed socket write since the registry approved it.
+    fn provider_allows_write(&self) -> bool {
+        self.owner
+            .as_ref()
+            .and_then(|owner| owner.subscription_terminal.as_ref())
+            .is_none_or(|delivery| delivery.allows_subscription_message(&self.message))
+    }
+
     fn terminal_delivery(&self) -> Option<&FinalSubscriptionTerminalDelivery> {
         self.subscription_control.then_some(())?;
-        self.owner.as_ref()?.subscription_cancellation_delivery(&self.message)
+        self.owner
+            .as_ref()?
+            .subscription_cancellation_delivery(&self.message)
     }
 
     fn drain_delivery(&self) -> Option<&FinalSubscriptionTerminalDelivery> {
@@ -765,9 +777,15 @@ async fn send_frame<W: ConnectionWriter>(
         .map(|deadline| Box::pin(Sleep::new(deadline)));
     poll_fn(|task| {
         let terminal_control = frame.drain_delivery().is_some_and(|delivery| {
-                delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
-                    && delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
+            delivery.state.load(Ordering::Acquire) == FINAL_TERMINAL_ENQUEUED
+                && delivery.completion_state.load(Ordering::Acquire) == FINAL_TERMINAL_DRAINED
         });
+        // Do not run a provider callback under OutputQueue's lock. On refusal
+        // this drops the pending send; the writer's existing partial-frame
+        // poison closes the connection if any bytes were already committed.
+        if !frame.provider_allows_write() {
+            return Poll::Ready(WriteAttempt::Complete(Ok(())));
+        }
         if frame.suppressed() {
             if let Some(delivery) = frame.terminal_delivery() {
                 delivery.mark_failed();
@@ -4142,6 +4160,346 @@ mod tests {
             assert!(io.response(50).is_none());
             assert!(io.response(51).unwrap().error.is_none());
         });
+    }
+
+    mod resource_subscription_delivery_tests {
+        use super::*;
+        use fastmcp_protocol::common_types::AbsoluteUri;
+
+        const PARENT: &str = "native://resources/parent";
+        const CHILD: &str = "native://resources/child";
+
+        struct ProviderPolicy {
+            allowed: AtomicBool,
+            revision: AtomicU64,
+        }
+
+        impl ResourceSubscriptionMatcher for ProviderPolicy {
+            fn revision(&self) -> u64 {
+                self.revision.load(Ordering::Acquire)
+            }
+
+            fn authorize(
+                &self,
+                ctx: &McpContext,
+                parent: &AbsoluteUri,
+                child: &AbsoluteUri,
+            ) -> McpResult<bool> {
+                ctx.ensure_live()?;
+                Ok(self.allowed.load(Ordering::Acquire)
+                    && parent.as_str() == PARENT
+                    && matches!(child.as_str(), PARENT | CHILD))
+            }
+
+            fn matches(
+                &self,
+                _ctx: &McpContext,
+                parent: &AbsoluteUri,
+                child: &AbsoluteUri,
+            ) -> McpResult<bool> {
+                Ok(parent.as_str() == PARENT && child.as_str() == CHILD)
+            }
+        }
+
+        struct Provider(Arc<ProviderPolicy>);
+
+        impl ResourceHandler for Provider {
+            fn definition(&self) -> fastmcp_protocol::Resource {
+                fastmcp_protocol::Resource {
+                    uri: PARENT.to_owned(),
+                    name: "native resource provider".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
+                Some(fastmcp_protocol::ResourceTemplate {
+                    uri_template: "native://resources/{item}".to_owned(),
+                    name: "native resource provider".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                })
+            }
+
+            fn subscription_matcher(
+                &self,
+                _ctx: &McpContext,
+                _parent: &AbsoluteUri,
+            ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+                Ok(Some(self.0.clone()))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                panic!("subscribing must not read the resource")
+            }
+        }
+
+        struct RecordingTransport(Arc<Mutex<Vec<JsonRpcMessage>>>);
+
+        impl Transport for RecordingTransport {
+            fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.0.lock().unwrap().push(message.clone());
+                Ok(())
+            }
+
+            fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                Err(TransportError::Closed)
+            }
+
+            fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn unsplit_resource_outbox_retains_original_provider_authority() {
+            for revoke in [false, true] {
+                let cx = Cx::for_testing();
+                let ctx = McpContext::with_state(cx.clone(), 57, SessionState::new());
+                let policy = Arc::new(ProviderPolicy {
+                    allowed: AtomicBool::new(true),
+                    revision: AtomicU64::new(1),
+                });
+                let service = Server::new("unsplit-provider-delivery", "1")
+                    .resource(Provider(Arc::clone(&policy)))
+                    .build();
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let transport = SharedTransport::new(RecordingTransport(Arc::clone(&sent)));
+                let owner = transport.output.claim();
+                let mut filter = SubscriptionFilter {
+                    resource_subscriptions: Some(vec![PARENT.to_owned()]),
+                    ..SubscriptionFilter::default()
+                };
+                let bindings = service
+                    .bind_subscription_resources(&ctx, &mut filter)
+                    .unwrap();
+                let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+                let notification_transport = transport.clone();
+                let notification_delivery = Arc::clone(&delivery);
+                let notification_cx = cx.clone();
+                let notifications: NotificationSender = Arc::new(move |notification| {
+                    notification_transport
+                        .send_with_delivery(
+                            &notification_cx,
+                            &JsonRpcMessage::Request(notification),
+                            Some(Arc::clone(&notification_delivery)),
+                        )
+                        .unwrap();
+                });
+                let lease = service
+                    .final_subscriptions
+                    .open_with_resource_bindings(
+                        RequestId::Number(57),
+                        filter,
+                        false,
+                        None,
+                        McpRequestCancellation::new(),
+                        Some(delivery),
+                        notifications,
+                        None,
+                        Some(FinalSubscriptionResourceAdmission {
+                            context: ctx.clone(),
+                            bindings,
+                        }),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    service
+                        .final_subscriptions
+                        .publish(ServerNotification::ResourceUpdated(
+                            fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                                uri: AbsoluteUri::parse(CHILD).unwrap(),
+                                meta: None,
+                                additional: BTreeMap::new(),
+                            },
+                        ))
+                        .unwrap(),
+                    1
+                );
+                assert_eq!(transport.output.state().queue.len(), 2);
+                assert!(sent.lock().unwrap().is_empty());
+                if revoke {
+                    policy.allowed.store(false, Ordering::Release);
+                    policy.revision.fetch_add(1, Ordering::AcqRel);
+                }
+                {
+                    let mut io = transport.inner.lock().unwrap();
+                    owner.release(&cx, io.as_mut());
+                }
+                assert_eq!(sent.lock().unwrap().len(), if revoke { 1 } else { 2 });
+                assert!(!transport.output.failure.load(Ordering::Acquire));
+                transport
+                    .send(
+                        &cx,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(58),
+                            serde_json::json!({}),
+                        )),
+                    )
+                    .unwrap();
+                assert_eq!(sent.lock().unwrap().len(), if revoke { 2 } else { 3 });
+                assert!(
+                    ctx.ensure_live().is_ok(),
+                    "one outbox refusal cannot cancel its caller"
+                );
+                drop(lease);
+            }
+        }
+
+        #[test]
+        fn withdrawn_synchronous_terminal_cannot_leave_an_enqueued_receipt() {
+            let cx = Cx::for_testing();
+            let cancellation = McpRequestCancellation::new();
+            let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            assert!(delivery.mark_cancellation_enqueued());
+            cancellation.cancel_by_peer();
+            let send = Arc::new(Mutex::new(
+                |_: &Cx, _: &JsonRpcMessage| -> Result<(), TransportError> {
+                    panic!("a peer-withdrawn terminal cannot reach the writer")
+                },
+            ));
+            send_guarded_subscription(
+                &cx,
+                &cancellation,
+                JsonRpcMessage::Request(
+                    subscription_cancellation_notification(&RequestId::Number(57)).unwrap(),
+                ),
+                Arc::clone(&delivery),
+                None,
+                &send,
+            )
+            .unwrap();
+            assert_eq!(
+                delivery.state.load(Ordering::Acquire),
+                FINAL_TERMINAL_FAILED
+            );
+        }
+
+        async fn delayed_child(cx: Cx, revoke: bool, partial: bool) {
+            let policy = Arc::new(ProviderPolicy {
+                allowed: AtomicBool::new(true),
+                revision: AtomicU64::new(1),
+            });
+            let io = Arc::new(IoProbe::default());
+            io.allow(usize::MAX);
+            let service = Server::new("native-provider-delivery", "1")
+                .resource(Provider(Arc::clone(&policy)))
+                .build();
+            let subscriptions = Arc::clone(&service.final_subscriptions);
+            let stream = Arc::clone(&io);
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    service
+                        .serve_stdio_io(
+                            &server_cx,
+                            ProbeReader(Arc::clone(&stream)),
+                            ProbeWriter(stream),
+                        )
+                        .await
+                })
+                .unwrap();
+            io.feed(&encoded(&request(
+                57,
+                SUBSCRIPTIONS_LISTEN,
+                serde_json::json!({"notifications":{"resourceSubscriptions":[PARENT]}}),
+            )));
+            until_io(&cx, &io, || {
+                io.messages().iter().any(|message| {
+                    matches!(message, JsonRpcMessage::Request(notification)
+                    if notification.method == "notifications/subscriptions/acknowledged")
+                })
+            })
+            .await;
+            let (before, writes) = {
+                let state = io.0.lock().unwrap();
+                (state.outbound.len(), state.writes)
+            };
+            io.allow(usize::from(partial));
+            assert_eq!(
+                subscriptions
+                    .publish(ServerNotification::ResourceUpdated(
+                        fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                            uri: AbsoluteUri::parse(CHILD).unwrap(),
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        },
+                    ))
+                    .unwrap(),
+                1
+            );
+            until_io(&cx, &io, || {
+                let state = io.0.lock().unwrap();
+                state.writes > writes && state.outbound.len() == before + usize::from(partial)
+            })
+            .await;
+            if revoke {
+                policy.allowed.store(false, Ordering::Release);
+                policy.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            // The sole changed condition is provider authority after enqueue
+            // and after the first writer poll. Releasing backpressure must not
+            // allow the pending frame to use its earlier authorization.
+            io.allow(usize::MAX);
+            if partial && revoke {
+                let result = match asupersync::time::timeout(
+                    cx.now(),
+                    Duration::from_secs(5),
+                    serving.join(&cx),
+                )
+                .await
+                {
+                    Ok(joined) => joined.unwrap(),
+                    Err(_) => {
+                        serving.abort();
+                        io.eof();
+                        let _ = serving.join(&cx).await;
+                        panic!("a revoked partial frame must close its owned connection");
+                    }
+                };
+                assert!(result.is_err());
+                let state = io.0.lock().unwrap();
+                assert_eq!(state.outbound.len(), before + 1);
+                assert!(state.reader_dropped && state.writer_dropped);
+                return;
+            }
+            io.feed(&encoded(&discover(58)));
+            until_io(&cx, &io, || io.response(58).is_some()).await;
+            let updates = io
+                .messages()
+                .into_iter()
+                .filter(|message| {
+                    matches!(message, JsonRpcMessage::Request(notification)
+                    if notification.method == "notifications/resources/updated"
+                        && notification.params.as_ref().unwrap()["uri"] == CHILD)
+                })
+                .count();
+            assert_eq!(updates, usize::from(!revoke));
+            assert!(io.response(58).unwrap().error.is_none());
+            io.feed(&encoded(&cancel(57)));
+            io.eof();
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(cx.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn async_stdio_resource_subscription_rechecks_provider_after_backpressure() {
+            run(|cx| async move {
+                delayed_child(cx.clone(), false, false).await;
+                delayed_child(cx, true, false).await;
+            });
+        }
+
+        #[test]
+        fn async_stdio_resource_subscription_revocation_after_partial_output_closes_connection() {
+            run(|cx| delayed_child(cx, true, true));
+        }
     }
 
     mod subscription_shutdown_tests {

@@ -129,9 +129,9 @@ pub use handler::{
     FinalElicitationContextExt, FinalMethodOutcome, FinalResourceReadCacheHintProvenance,
     FinalRoots, FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
     FinalToolSchemaAuthority, ProgressNotificationSender, PromptHandler, ResourceHandler,
-    ToolErrorKind, ToolExecutionMode, ToolHandler, UriParams, create_context_with_progress,
-    create_context_with_progress_and_senders, promote_legacy_prompt_messages,
-    promote_legacy_resource_contents, promote_legacy_tool_content,
+    ResourceSubscriptionMatcher, ToolErrorKind, ToolExecutionMode, ToolHandler, UriParams,
+    create_context_with_progress, create_context_with_progress_and_senders,
+    promote_legacy_prompt_messages, promote_legacy_resource_contents, promote_legacy_tool_content,
 };
 pub use middleware::continuation_replay::{
     ContinuationReplayAuthority, ContinuationReplayLimits, ContinuationReplayMiddleware,
@@ -159,7 +159,10 @@ pub use router::{
     InboundRequestContext, InboundRequestTransport, ModernConnection, MountResult,
     NotificationSender, Router, TagFilters,
 };
-use router::{RouterPromptCaller, RouterResourceReader, RouterToolCaller, TransportAuthorization};
+use router::{
+    ResourceSubscriptionBinding, RouterPromptCaller, RouterResourceReader, RouterToolCaller,
+    TransportAuthorization,
+};
 pub use session::Session;
 #[cfg(feature = "legacy-2024-11-05")]
 use session::SessionPrincipalBinding;
@@ -3305,11 +3308,148 @@ impl Drop for DispatchWorkerCompletionSignal {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+type SubscriptionDeliverySender = Arc<
+    dyn Fn(
+            &Cx,
+            &JsonRpcMessage,
+            Arc<FinalSubscriptionTerminalDelivery>,
+        ) -> Result<(), TransportError>
+        + Send
+        + Sync,
+>;
+
+#[derive(Clone)]
 enum PumpIoMode {
     Split,
+    #[cfg(feature = "websocket")]
+    GuardedSplit(SubscriptionDeliverySender),
     #[cfg(not(feature = "legacy-2024-11-05"))]
-    Unsplit,
+    GuardedUnsplit(SubscriptionDeliverySender),
+}
+
+impl PumpIoMode {
+    #[cfg(not(feature = "legacy-2024-11-05"))]
+    fn is_unsplit(&self) -> bool {
+        matches!(self, Self::GuardedUnsplit(_))
+    }
+
+    fn subscription_sender(&self) -> Option<SubscriptionDeliverySender> {
+        match self {
+            Self::Split => None,
+            #[cfg(feature = "websocket")]
+            Self::GuardedSplit(sender) => Some(Arc::clone(sender)),
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            Self::GuardedUnsplit(sender) => Some(Arc::clone(sender)),
+        }
+    }
+}
+
+/// Carries the originating listen's opaque admission through synchronous
+/// transport queues. Ordinary and exact-legacy messages have no such owner.
+struct GuardedTransportOutput {
+    message: JsonRpcMessage,
+    delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+}
+
+impl GuardedTransportOutput {
+    fn allows_write(&self) -> bool {
+        self.delivery
+            .as_ref()
+            .is_none_or(|delivery| delivery.allows_subscription_message(&self.message))
+    }
+
+    fn terminal_control(&self) -> Option<&FinalSubscriptionTerminalDelivery> {
+        let JsonRpcMessage::Request(notification) = &self.message else {
+            return None;
+        };
+        final_subscription_terminal_notification(notification)
+            .then(|| self.delivery.as_deref())
+            .flatten()
+    }
+
+    fn complete(&self, result: &Result<(), TransportError>) {
+        if result.is_err() {
+            if let Some(delivery) = &self.delivery {
+                delivery.mark_failed();
+            }
+        } else if let Some(delivery) = self.terminal_control() {
+            delivery.mark_drained();
+        }
+    }
+}
+
+impl Drop for GuardedTransportOutput {
+    fn drop(&mut self) {
+        if let Some(delivery) = self.terminal_control() {
+            // A successful writer has already settled this receipt. Dropping
+            // a still-queued elected control cannot report delivery success.
+            delivery.mark_failed();
+        }
+    }
+}
+
+fn send_guarded_subscription<S>(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    message: JsonRpcMessage,
+    delivery: Arc<FinalSubscriptionTerminalDelivery>,
+    subscription_sender: Option<&SubscriptionDeliverySender>,
+    send: &Arc<Mutex<S>>,
+) -> Result<(), TransportError>
+where
+    S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError>,
+{
+    let terminal_control = matches!(&message, JsonRpcMessage::Request(notification)
+        if final_subscription_terminal_notification(notification));
+    let withdrawn = || {
+        cancellation.is_cancel_requested()
+            && (!terminal_control || cancellation.is_peer_cancel_requested())
+    };
+    if withdrawn() {
+        if terminal_control {
+            delivery.mark_failed();
+        }
+        return Ok(());
+    }
+    if let Some(sender) = subscription_sender {
+        let result = sender(cx, &message, Arc::clone(&delivery));
+        if result.is_err() {
+            delivery.mark_failed();
+        }
+        return result;
+    }
+
+    let output = GuardedTransportOutput {
+        message,
+        delivery: Some(delivery),
+    };
+    let deadline = Instant::now() + STDIO_OUTPUT_COMMIT_TIMEOUT;
+    loop {
+        // A contended writer never freezes the provider verdict. No provider
+        // callback runs under its mutex; retry admission before try_lock.
+        if withdrawn() || !output.allows_write() {
+            return Ok(());
+        }
+        let writer = match send.try_lock() {
+            Ok(writer) => Some(writer),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mut writer) = writer {
+            if withdrawn() {
+                return Ok(());
+            }
+            let result = writer(cx, &output.message);
+            drop(writer);
+            output.complete(&result);
+            return result;
+        }
+        if Instant::now() >= deadline {
+            output.complete(&Err(TransportError::Timeout));
+            return Err(TransportError::Timeout);
+        }
+        std::thread::yield_now();
+    }
 }
 
 /// Longest an unsplit pump holds off its next `recv` for a listen that has
@@ -4488,9 +4628,37 @@ struct FinalSubscriptionTerminalDelivery {
     // this flag to retain an admitted listen across listener cancellation.
     subscription_request: AtomicBool,
     native_shutdown_deadline: Mutex<Option<Instant>>,
+    // Retained independently of registry membership so an already-buffered
+    // event cannot outlive the provider authority that admitted it.
+    subscription_admission: Mutex<Option<Arc<FinalSubscriptionTransportAdmission>>>,
 }
 
 impl FinalSubscriptionTerminalDelivery {
+    /// Rechecks data at the real transport boundary, after its outbox wait.
+    /// Never call this while holding an outbox, registry, or election lock:
+    /// provider callbacks may reenter the server.
+    fn allows_subscription_message(&self, message: &JsonRpcMessage) -> bool {
+        let admission = self
+            .subscription_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        admission.is_none_or(|admission| admission.allows(message))
+    }
+
+    fn allows_subscription_sse_event(&self, event: &SseEvent) -> bool {
+        if self
+            .subscription_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none()
+        {
+            return true;
+        }
+        subscription_sse_message(event)
+            .is_some_and(|message| self.allows_subscription_message(&message))
+    }
+
     /// Elects cancellation as the only terminal frame. Its body still belongs
     /// to the writer until the control has actually been consumed and flushed.
     fn mark_cancellation_enqueued(&self) -> bool {
@@ -4731,7 +4899,7 @@ impl ServerHttpSseResponse {
         if self.terminal_delivery.is_settled() {
             return Err(ServerHttpEndpointError::Closed);
         }
-        let popped = match pop_sse_body_event(&self.inner) {
+        let popped = match pop_guarded_sse_body_event(&self.inner, &self.terminal_delivery) {
             // A peer/session close cancels the transport body directly; with
             // no committed terminal sequence that is this body's clean close,
             // not a transport failure the reader must distinguish.
@@ -4805,6 +4973,69 @@ fn pop_sse_body_event(
     response: &DualEraHttpSseResponse,
 ) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
     sse_body_observation(response.pop_event())
+}
+
+/// Keep the opaque subscription admission attached across the HTTP mailbox.
+/// Pop releases transport locks before a provider is called. Refused data is
+/// discarded, while a previously elected terminal control remains drainable.
+fn pop_guarded_sse_body_event(
+    response: &DualEraHttpSseResponse,
+    delivery: &FinalSubscriptionTerminalDelivery,
+) -> Result<Option<SseEvent>, DualEraHttpEndpointError> {
+    loop {
+        let Some(event) = pop_sse_body_event(response)? else {
+            return Ok(None);
+        };
+        if delivery.allows_subscription_sse_event(&event) {
+            return Ok(Some(event));
+        }
+    }
+}
+
+fn subscription_sse_message(event: &SseEvent) -> Option<JsonRpcMessage> {
+    // Decode each concrete wire shape directly. The untagged enum's buffered
+    // intermediate cannot preserve JsonRpcRequest's raw parameter sidecar.
+    serde_json::from_str::<JsonRpcRequest>(&event.data)
+        .map(JsonRpcMessage::Request)
+        .or_else(|_| {
+            serde_json::from_str::<JsonRpcResponse>(&event.data).map(JsonRpcMessage::Response)
+        })
+        .ok()
+}
+
+/// A dequeue verdict cannot authorize a socket write resumed after backpressure.
+/// Parse once, retain the exact body admission, and recheck before every poll.
+/// Refusal after a partial write fails the body; it cannot fabricate a clean
+/// terminal sequence after a truncated data frame.
+async fn guard_subscription_sse_write<F>(
+    delivery: &FinalSubscriptionTerminalDelivery,
+    event: &SseEvent,
+    write: F,
+) -> Result<(), ()>
+where
+    F: Future<Output = Result<(), ()>>,
+{
+    let admission = delivery
+        .subscription_admission
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let Some(admission) = admission else {
+        return write.await;
+    };
+    let message = subscription_sse_message(event).ok_or(())?;
+    let mut write = std::pin::pin!(write);
+    std::future::poll_fn(|task| {
+        if !admission.allows(&message) {
+            return std::task::Poll::Ready(Err(()));
+        }
+        let polled = write.as_mut().poll(task);
+        if polled.is_ready() && !admission.allows(&message) {
+            return std::task::Poll::Ready(Err(()));
+        }
+        polled
+    })
+    .await
 }
 
 /// A producer may hold the response mailbox for the few instructions needed to
@@ -4993,11 +5224,23 @@ static NEXT_LIVE_MODERN_HTTP_RESPONSE_BODY_GENERATION: AtomicU64 = AtomicU64::ne
 
 /// Bridges handler catalog mutations onto live `subscriptions/listen` streams.
 struct FinalCatalogPublisher {
-    registry: Arc<FinalSubscriptionRegistry>,
+    registry: std::sync::Weak<FinalSubscriptionRegistry>,
+}
+
+fn weak_subscription_notification_sender(sender: &NotificationSender) -> NotificationSender {
+    let sender = Arc::downgrade(sender);
+    Arc::new(move |notification| {
+        if let Some(sender) = sender.upgrade() {
+            sender(notification);
+        }
+    })
 }
 
 impl fastmcp_core::CatalogChangePublisher for FinalCatalogPublisher {
     fn publish_catalog_changed(&self, kind: fastmcp_core::McpCatalogKind) -> bool {
+        let Some(registry) = self.registry.upgrade() else {
+            return false;
+        };
         let notification = match kind {
             fastmcp_core::McpCatalogKind::Tools => ServerNotification::ToolsListChanged(None),
             fastmcp_core::McpCatalogKind::Resources => {
@@ -5005,14 +5248,17 @@ impl fastmcp_core::CatalogChangePublisher for FinalCatalogPublisher {
             }
             fastmcp_core::McpCatalogKind::Prompts => ServerNotification::PromptsListChanged(None),
         };
-        self.registry.publish(notification).unwrap_or(0) > 0
+        registry.publish(notification).unwrap_or(0) > 0
     }
 
     fn publish_resource_updated(&self, uri: &str) -> bool {
+        let Some(registry) = self.registry.upgrade() else {
+            return false;
+        };
         let Ok(uri) = fastmcp_protocol::common_types::AbsoluteUri::parse(uri) else {
             return false;
         };
-        self.registry
+        registry
             .publish(ServerNotification::ResourceUpdated(
                 fastmcp_protocol::FinalResourceUpdatedNotificationParams {
                     uri,
@@ -5054,12 +5300,118 @@ struct FinalSubscriptionEntry {
     subscription_id: RequestId,
     modern_http_owner: Option<u64>,
     accepted_filter: SubscriptionFilter,
+    /// Wire and context-aware embedding listeners retain the exact resource
+    /// providers admitted before acknowledgement. The trusted embedding path
+    /// without a request context retains its documented exact-only behavior.
+    resource_admission: Option<Arc<FinalSubscriptionResourceAdmission>>,
     #[cfg(feature = "tasks")]
     task_principal: Option<Sha256Digest>,
     notification_sender: NotificationSender,
     request_cancellation: McpRequestCancellation,
     terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
     election: Arc<FinalSubscriptionElection>,
+}
+
+struct FinalSubscriptionResourceAdmission {
+    context: McpContext,
+    bindings: Vec<Arc<ResourceSubscriptionBinding>>,
+}
+
+struct FinalSubscriptionTransportAdmission {
+    registry: std::sync::Weak<FinalSubscriptionRegistry>,
+    registry_key: usize,
+    election: Arc<FinalSubscriptionElection>,
+    request_cancellation: McpRequestCancellation,
+    subscription_id: RequestId,
+    resources: Arc<FinalSubscriptionResourceAdmission>,
+    refused: AtomicBool,
+}
+
+impl FinalSubscriptionTransportAdmission {
+    fn allows(&self, message: &JsonRpcMessage) -> bool {
+        let JsonRpcMessage::Request(notification) = message else {
+            // Existing response/terminal elections own responses, including
+            // admission errors that never established a subscription.
+            return true;
+        };
+        let withdrawn = {
+            let phase = self
+                .election
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            matches!(*phase, FinalSubscriptionPhase::PeerTerminated)
+                || matches!(
+                    *phase,
+                    FinalSubscriptionPhase::Opening
+                        | FinalSubscriptionPhase::OpeningDelivery
+                        | FinalSubscriptionPhase::Active
+                        | FinalSubscriptionPhase::EventDelivery(_)
+                ) && self.request_cancellation.is_cancel_requested()
+        };
+        if withdrawn {
+            self.refused.store(true, Ordering::Release);
+            return false;
+        }
+        let correlated = notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("_meta"))
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .cloned()
+            .and_then(|id| serde_json::from_value::<RequestId>(id).ok())
+            .is_some_and(|id| self.subscription_id.correlates_with(&id));
+        if correlated
+            && (final_subscription_acknowledgement_notification(notification)
+                || final_subscription_terminal_notification(notification))
+        {
+            // These carry ordering/control authority rather than resource
+            // data. Retain an elected control and its acknowledgement prefix
+            // even when shutdown has ended the original request context.
+            return true;
+        }
+        let allowed = correlated
+            && !self.refused.load(Ordering::Acquire)
+            && self.resources.context.ensure_live().is_ok()
+            && if notification.method == "notifications/resources/updated" {
+                match ServerNotification::decode(notification) {
+                    Ok(ServerNotification::ResourceUpdated(params)) => {
+                        let mut matched = false;
+                        for binding in &self.resources.bindings {
+                            match binding.validate_event(&params.uri) {
+                                Ok(true) => {
+                                    matched = true;
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(_) => break,
+                            }
+                        }
+                        matched
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
+        if !allowed {
+            self.refused.store(true, Ordering::Release);
+            if let Some(registry) = self.registry.upgrade() {
+                let entry = registry
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .get(&self.registry_key)
+                    .filter(|entry| Arc::ptr_eq(&entry.election, &self.election))
+                    .cloned();
+                if let Some(entry) = entry {
+                    registry.retire_guarded_subscription(&entry);
+                }
+            }
+        }
+        allowed
+    }
 }
 
 #[derive(Default)]
@@ -5147,13 +5499,38 @@ struct FinalSubscriptionElection {
 
 #[derive(Default)]
 struct FinalSubscriptionEventQueue {
-    events: VecDeque<(JsonRpcRequest, usize)>,
+    events: VecDeque<FinalSubscriptionQueuedEvent>,
     retained_events: usize,
     retained_bytes: usize,
 }
 
+struct FinalSubscriptionQueuedEvent {
+    notification: JsonRpcRequest,
+    bytes: usize,
+    admission: Option<Arc<FinalSubscriptionResourceAdmission>>,
+    resource: Option<(
+        Arc<ResourceSubscriptionBinding>,
+        fastmcp_protocol::common_types::AbsoluteUri,
+    )>,
+}
+
+impl FinalSubscriptionQueuedEvent {
+    /// Enqueue permission is not delivery permission: an earlier callback may
+    /// change provider policy, its revision, or shared component visibility.
+    fn is_authorized(&self) -> bool {
+        self.admission
+            .as_ref()
+            .is_none_or(|admission| admission.context.ensure_live().is_ok())
+            && self
+                .resource
+                .as_ref()
+                .is_none_or(|(binding, emitted)| binding.validate_event(emitted).unwrap_or(false))
+    }
+}
+
 impl FinalSubscriptionEventQueue {
-    fn try_push(&mut self, notification: JsonRpcRequest, bytes: usize) -> bool {
+    fn try_push(&mut self, event: FinalSubscriptionQueuedEvent) -> bool {
+        let bytes = event.bytes;
         if self.retained_events >= MAX_FINAL_SUBSCRIPTION_QUEUED_EVENTS
             || bytes > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES.saturating_sub(self.retained_bytes)
         {
@@ -5161,11 +5538,11 @@ impl FinalSubscriptionEventQueue {
         }
         self.retained_events += 1;
         self.retained_bytes += bytes;
-        self.events.push_back((notification, bytes));
+        self.events.push_back(event);
         true
     }
 
-    fn pop_front(&mut self) -> Option<(JsonRpcRequest, usize)> {
+    fn pop_front(&mut self) -> Option<FinalSubscriptionQueuedEvent> {
         // Keep the popped event charged until its callback returns. A blocked
         // callback cannot permit another full queue in addition to its bytes.
         self.events.pop_front()
@@ -5507,8 +5884,36 @@ impl FinalSubscriptionRegistry {
         notification_sender: NotificationSender,
         task_principal: Option<Sha256Digest>,
     ) -> McpResult<FinalSubscriptionLease> {
+        self.open_with_resource_bindings(
+            subscription_id,
+            requested,
+            accept_tasks,
+            modern_http_owner,
+            request_cancellation,
+            terminal_delivery,
+            notification_sender,
+            task_principal,
+            None,
+        )
+    }
+
+    fn open_with_resource_bindings(
+        self: &Arc<Self>,
+        subscription_id: RequestId,
+        requested: SubscriptionFilter,
+        accept_tasks: bool,
+        modern_http_owner: Option<u64>,
+        request_cancellation: McpRequestCancellation,
+        terminal_delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+        notification_sender: NotificationSender,
+        task_principal: Option<Sha256Digest>,
+        resource_admission: Option<FinalSubscriptionResourceAdmission>,
+    ) -> McpResult<FinalSubscriptionLease> {
         #[cfg(not(feature = "tasks"))]
         let _ = task_principal;
+        requested
+            .validate_resource_subscriptions()
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
         if subscription_id.validate().is_err() {
             return Err(McpError::invalid_request(
                 "subscriptions/listen requires a valid JSON-RPC request id",
@@ -5516,6 +5921,22 @@ impl FinalSubscriptionRegistry {
         }
         if self.terminating.load(Ordering::Acquire) {
             return Err(McpError::request_cancelled());
+        }
+
+        if let Some(admission) = &resource_admission {
+            admission.context.ensure_live()?;
+            if request_cancellation.is_cancel_requested() {
+                return Err(McpError::request_cancelled());
+            }
+            // Opening an upstream relay may have suspended since resolution.
+            // An old provider verdict cannot authorize a new acknowledgement.
+            for binding in &admission.bindings {
+                if !binding.validate_event(binding.parent_uri())? {
+                    return Err(McpError::invalid_params(
+                        "resource subscription is no longer available",
+                    ));
+                }
+            }
         }
 
         #[cfg(feature = "tasks")]
@@ -5529,6 +5950,7 @@ impl FinalSubscriptionRegistry {
                 "failed to encode subscriptions/listen acknowledgement: {error}"
             ))
         })?;
+        let resource_admission = resource_admission.map(Arc::new);
 
         let mut state = self
             .inner
@@ -5556,6 +5978,21 @@ impl FinalSubscriptionRegistry {
         }
         state.next_key = key.checked_add(1).unwrap_or(0);
         let election = Arc::new(FinalSubscriptionElection::opening());
+        if let (Some(delivery), Some(resources)) = (&terminal_delivery, &resource_admission) {
+            *delivery
+                .subscription_admission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(Arc::new(FinalSubscriptionTransportAdmission {
+                    registry: Arc::downgrade(self),
+                    registry_key: key,
+                    election: Arc::clone(&election),
+                    request_cancellation: request_cancellation.clone(),
+                    subscription_id: subscription_id.clone(),
+                    resources: Arc::clone(resources),
+                    refused: AtomicBool::new(false),
+                }));
+        }
         let previous = state.entries.insert(
             key,
             FinalSubscriptionEntry {
@@ -5563,6 +6000,7 @@ impl FinalSubscriptionRegistry {
                 subscription_id: subscription_id.clone(),
                 modern_http_owner,
                 accepted_filter,
+                resource_admission,
                 #[cfg(feature = "tasks")]
                 task_principal,
                 notification_sender: notification_sender.clone(),
@@ -5619,8 +6057,7 @@ impl FinalSubscriptionRegistry {
         // time while retaining the opening phase so a concurrent publisher
         // cannot overtake an already-admitted event.
         loop {
-            let queued_notification;
-            let queued_bytes;
+            let queued;
             let mut phase = election
                 .phase
                 .lock()
@@ -5631,10 +6068,9 @@ impl FinalSubscriptionRegistry {
                         .opening_events
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some((notification, bytes)) = opening_events.pop_front() {
+                    if let Some(event) = opening_events.pop_front() {
                         *phase = FinalSubscriptionPhase::OpeningDelivery;
-                        queued_notification = notification;
-                        queued_bytes = bytes;
+                        queued = event;
                     } else {
                         *phase = FinalSubscriptionPhase::Active;
                         break;
@@ -5694,8 +6130,11 @@ impl FinalSubscriptionRegistry {
             }
             drop(phase);
 
-            let sent = catch_extension_unwind(|| notification_sender(queued_notification)).is_ok();
-            if !sent {
+            let queued_bytes = queued.bytes;
+            let authorized = queued.is_authorized() && !request_cancellation.is_cancel_requested();
+            let sent = authorized
+                && catch_extension_unwind(|| notification_sender(queued.notification)).is_ok();
+            if authorized && !sent {
                 let _ = extension_panic_error("final_subscription_event_sender");
             }
             let mut phase = election
@@ -5714,7 +6153,7 @@ impl FinalSubscriptionRegistry {
                     *phase = FinalSubscriptionPhase::Opening;
                 }
                 FinalSubscriptionPhase::ServerTerminationPending(1)
-                    if sent && !request_cancellation.is_cancel_requested() =>
+                    if (sent || !authorized) && !request_cancellation.is_cancel_requested() =>
                 {
                     *phase = FinalSubscriptionPhase::ServerTerminated;
                     drop(phase);
@@ -5815,8 +6254,7 @@ impl FinalSubscriptionRegistry {
                     let selected = target_subscription.is_none_or(|(target_key, election)| {
                         *key == target_key && Arc::ptr_eq(&entry.election, election)
                     });
-                    (selected && subscription_filter_accepts(&entry.accepted_filter, &notification))
-                        .then(|| entry.clone())
+                    selected.then(|| entry.clone())
                 })
                 .collect::<Vec<_>>()
         };
@@ -5826,13 +6264,56 @@ impl FinalSubscriptionRegistry {
         // metadata contract, no recipient observes a partial publication.
         let mut deliveries = Vec::with_capacity(targets.len());
         for entry in targets {
+            if entry
+                .resource_admission
+                .as_ref()
+                .is_some_and(|admission| admission.context.ensure_live().is_err())
+            {
+                self.retire_guarded_subscription(&entry);
+                continue;
+            }
+            // Provider code may reenter the server. Match and authorize only
+            // after releasing the registry mutex, and retain the exact binding
+            // that admitted this event for the later FIFO delivery check.
+            let resource = if let ServerNotification::ResourceUpdated(params) = &notification
+                && let Some(admission) = &entry.resource_admission
+            {
+                let mut matched = None;
+                let mut refused = false;
+                for binding in &admission.bindings {
+                    match binding.validate_event(&params.uri) {
+                        Ok(true) => {
+                            matched = Some(Arc::clone(binding));
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(_) => {
+                            refused = true;
+                            break;
+                        }
+                    }
+                }
+                if refused {
+                    self.retire_guarded_subscription(&entry);
+                    continue;
+                }
+                let Some(binding) = matched else {
+                    continue;
+                };
+                Some((binding, params.uri.clone()))
+            } else {
+                if !subscription_filter_accepts(&entry.accepted_filter, &notification) {
+                    continue;
+                }
+                None
+            };
             let event = tag_subscription_notification(&notification, &entry.subscription_id)?;
             let wire = event.encode().map_err(|error| {
                 McpError::internal_error(format!(
                     "failed to encode final subscription notification: {error}"
                 ))
             })?;
-            deliveries.push((entry, wire));
+            deliveries.push((entry, wire, resource));
         }
         Ok(self.publish_prepared(deliveries, "final_subscription_event_sender"))
     }
@@ -5895,18 +6376,33 @@ impl FinalSubscriptionRegistry {
         let mut deliveries = Vec::with_capacity(targets.len());
         for entry in targets {
             let event = tag_task_subscription_notification(&notification, &entry.subscription_id)?;
-            deliveries.push((entry, event));
+            deliveries.push((entry, event, None));
         }
         Ok(self.publish_prepared(deliveries, "final_task_subscription_sender"))
     }
 
     fn publish_prepared(
         &self,
-        deliveries: Vec<(FinalSubscriptionEntry, JsonRpcRequest)>,
+        deliveries: Vec<(
+            FinalSubscriptionEntry,
+            JsonRpcRequest,
+            Option<(
+                Arc<ResourceSubscriptionBinding>,
+                fastmcp_protocol::common_types::AbsoluteUri,
+            )>,
+        )>,
         panic_boundary: &'static str,
     ) -> usize {
         let mut count = 0;
-        for (entry, notification) in deliveries {
+        for (entry, notification, resource) in deliveries {
+            if entry
+                .resource_admission
+                .as_ref()
+                .is_some_and(|admission| admission.context.ensure_live().is_err())
+            {
+                self.retire_guarded_subscription(&entry);
+                continue;
+            }
             let bytes = final_subscription_event_bytes(&notification);
             let mut phase = entry
                 .election
@@ -5928,7 +6424,14 @@ impl FinalSubscriptionRegistry {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if entry.request_cancellation.is_cancel_requested()
-                || !bytes.is_some_and(|bytes| events.try_push(notification, bytes))
+                || !bytes.is_some_and(|bytes| {
+                    events.try_push(FinalSubscriptionQueuedEvent {
+                        notification,
+                        bytes,
+                        admission: entry.resource_admission.clone(),
+                        resource,
+                    })
+                })
             {
                 events.clear();
                 *phase = FinalSubscriptionPhase::PeerTerminated;
@@ -5963,6 +6466,39 @@ impl FinalSubscriptionRegistry {
         self.remove_entry(entry.registry_key);
     }
 
+    fn retire_guarded_subscription(&self, entry: &FinalSubscriptionEntry) {
+        {
+            let mut phase = entry
+                .election
+                .phase
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match *phase {
+                FinalSubscriptionPhase::PeerTerminated
+                | FinalSubscriptionPhase::ServerTerminated => return,
+                FinalSubscriptionPhase::ServerTerminationPending(_) => {
+                    // Refused data cannot revoke an already-elected terminal
+                    // control. Its current callback owner finishes that winner.
+                    entry
+                        .election
+                        .opening_events
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
+                    return;
+                }
+                _ => *phase = FinalSubscriptionPhase::PeerTerminated,
+            }
+            entry
+                .election
+                .opening_events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+        self.retire_failed_subscription(entry);
+    }
+
     /// The publisher that claims an idle subscription drives it synchronously.
     /// Concurrent publishers only append; they never invoke its callback in
     /// parallel. The return value counts this publisher's first event alone,
@@ -5970,15 +6506,19 @@ impl FinalSubscriptionRegistry {
     fn drain_subscription_events(
         &self,
         entry: &FinalSubscriptionEntry,
-        mut next: (JsonRpcRequest, usize),
+        mut next: FinalSubscriptionQueuedEvent,
         panic_boundary: &'static str,
     ) -> bool {
         let mut first = true;
         let mut first_delivered = false;
         loop {
-            let (notification, bytes) = next;
-            let sent = catch_extension_unwind(|| (entry.notification_sender)(notification)).is_ok();
-            if !sent {
+            let bytes = next.bytes;
+            let authorized =
+                next.is_authorized() && !entry.request_cancellation.is_cancel_requested();
+            let sent = authorized
+                && catch_extension_unwind(|| (entry.notification_sender)(next.notification))
+                    .is_ok();
+            if authorized && !sent {
                 let _ = extension_panic_error(panic_boundary);
             }
             let mut phase = entry
@@ -6007,7 +6547,7 @@ impl FinalSubscriptionRegistry {
                     first = false;
                 }
                 FinalSubscriptionPhase::ServerTerminationPending(1)
-                    if sent && !entry.request_cancellation.is_cancel_requested() =>
+                    if (sent || !authorized) && !entry.request_cancellation.is_cancel_requested() =>
                 {
                     events.clear();
                     *phase = FinalSubscriptionPhase::ServerTerminated;
@@ -6020,7 +6560,7 @@ impl FinalSubscriptionRegistry {
                         &entry.notification_sender,
                         &entry.request_cancellation,
                     ) {
-                        first_delivered |= first;
+                        first_delivered |= first && sent;
                     } else {
                         *entry
                             .election
@@ -8276,15 +8816,23 @@ impl TransportRecvHalf for WebSocketBridgeRecv {
 
 #[cfg(feature = "websocket")]
 struct WebSocketBridgeSend {
-    sender: asupersync_mpsc::Sender<JsonRpcMessage>,
+    sender: asupersync_mpsc::Sender<GuardedTransportOutput>,
 }
 
 #[cfg(feature = "websocket")]
-impl TransportSendHalf for WebSocketBridgeSend {
-    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+impl WebSocketBridgeSend {
+    fn send_with_delivery(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+        delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+    ) -> Result<(), TransportError> {
         cx.checkpoint().map_err(|_| TransportError::Cancelled)?;
         let result = match self.sender.try_reserve() {
-            Ok(permit) => permit.try_send(message.clone()),
+            Ok(permit) => permit.try_send(GuardedTransportOutput {
+                message: message.clone(),
+                delivery,
+            }),
             Err(asupersync_mpsc::SendError::Full(())) => {
                 return Err(TransportError::Io(std::io::Error::from(
                     std::io::ErrorKind::WouldBlock,
@@ -8302,6 +8850,13 @@ impl TransportSendHalf for WebSocketBridgeSend {
             asupersync_mpsc::SendError::Disconnected(_)
             | asupersync_mpsc::SendError::Cancelled(_) => TransportError::Closed,
         })
+    }
+}
+
+#[cfg(feature = "websocket")]
+impl TransportSendHalf for WebSocketBridgeSend {
+    fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+        self.send_with_delivery(cx, message, None)
     }
 
     fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
@@ -8613,9 +9168,35 @@ async fn run_websocket_dispatch_bridge(
     let driver_result = 'driver: loop {
         loop {
             match outgoing_receiver.try_recv() {
-                Ok(message) => transport.send(cx, &message).await.map_err(|_| {
-                    McpError::internal_error("WebSocket response could not be committed")
-                })?,
+                Ok(output) => {
+                    let mut authorized = true;
+                    let sent = {
+                        let mut sending = std::pin::pin!(transport.send(cx, &output.message));
+                        std::future::poll_fn(|task| {
+                            if !output.allows_write() {
+                                authorized = false;
+                                return Poll::Ready(Ok(()));
+                            }
+                            sending.as_mut().poll(task)
+                        })
+                        .await
+                    };
+                    // Cancelling an already-started frame poisons the socket;
+                    // never follow it with another frame on this connection.
+                    let sent = if sent.is_ok() && transport.is_closed() {
+                        Err(TransportError::Closed)
+                    } else {
+                        sent
+                    };
+                    if authorized || sent.is_err() {
+                        output.complete(&sent);
+                    }
+                    if sent.is_err() {
+                        break 'driver Err(McpError::internal_error(
+                            "WebSocket response could not be committed",
+                        ));
+                    }
+                }
                 Err(asupersync_mpsc::RecvError::Empty) => break,
                 Err(asupersync_mpsc::RecvError::Disconnected) => break 'driver Ok(()),
                 Err(asupersync_mpsc::RecvError::Cancelled) => break 'driver Ok(()),
@@ -12285,7 +12866,7 @@ async fn send_modern_sse_stream(
             if terminal_delivery.is_settled() {
                 return Err(());
             }
-            match pop_sse_body_event(&response) {
+            match pop_guarded_sse_body_event(&response, &terminal_delivery) {
                 Ok(Some(event)) => {
                     let terminal_control =
                         response.is_finished() && final_subscription_terminal_event(&event);
@@ -12296,12 +12877,16 @@ async fn send_modern_sse_stream(
                     // authority through listener cancellation, including
                     // already-queued frames before that terminal. It still
                     // cannot wait forever on a peer that has stopped reading.
-                    write_native_http_response_parts(
-                        cx,
-                        listener_shutdown,
-                        Some(&terminal_delivery),
-                        &mut writer,
-                        &[prefix.as_bytes(), &bytes, b"\r\n"],
+                    guard_subscription_sse_write(
+                        &terminal_delivery,
+                        &event,
+                        write_native_http_response_parts(
+                            cx,
+                            listener_shutdown,
+                            Some(&terminal_delivery),
+                            &mut writer,
+                            &[prefix.as_bytes(), &bytes, b"\r\n"],
+                        ),
                     )
                     .await?;
                     last_frame_write = cx.now();
@@ -13884,6 +14469,86 @@ impl Server {
         Ok(SubscriptionListenHandle { _lease: lease })
     }
 
+    /// Opens an in-process resource subscription under an existing request.
+    ///
+    /// Only modern resources resolved by this server are acknowledged. An
+    /// optional provider matcher can admit explicit sub-resources and checks
+    /// current authorization under the original request identity. Provider
+    /// revision, request liveness, and parent/child visibility are checked
+    /// again before enqueue and before each callback. Unsupported resources
+    /// are omitted from the acknowledgement, preserving valid empty filters.
+    ///
+    /// The handle owns registration, not a background task. Its caller must
+    /// retain the request lifetime; idle expiry is driven by wire transports.
+    /// Dropping or refusing this handle does not cancel its caller context.
+    /// This does not create a credential lease or a public-visibility proof.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structural refusal for an invalid or oversized filter,
+    /// request cancellation for an expired context, a provider error when
+    /// admission cannot be determined, or the registry's capacity refusal.
+    pub fn open_subscription_listen_in_context(
+        &self,
+        request_ctx: &McpContext,
+        subscription_id: RequestId,
+        mut notifications: SubscriptionFilter,
+        notification_sender: NotificationSender,
+    ) -> McpResult<SubscriptionListenHandle> {
+        if subscription_id.validate().is_err() {
+            return Err(McpError::invalid_request(
+                "subscriptions/listen requires a valid JSON-RPC request id",
+            ));
+        }
+        let bindings = self.bind_subscription_resources(request_ctx, &mut notifications)?;
+        // This embedding API has no durable Tasks authorization custody. Its
+        // context is used solely for core resource-provider subscriptions.
+        let lease = self.final_subscriptions.open_with_resource_bindings(
+            subscription_id,
+            notifications,
+            false,
+            None,
+            McpRequestCancellation::new(),
+            None,
+            notification_sender,
+            None,
+            Some(FinalSubscriptionResourceAdmission {
+                context: request_ctx.clone(),
+                bindings,
+            }),
+        )?;
+        Ok(SubscriptionListenHandle { _lease: lease })
+    }
+
+    fn bind_subscription_resources(
+        &self,
+        request_ctx: &McpContext,
+        notifications: &mut SubscriptionFilter,
+    ) -> McpResult<Vec<Arc<ResourceSubscriptionBinding>>> {
+        // Validate the entire set before invoking any provider, allocating
+        // registry state, or emitting an acknowledgement.
+        notifications
+            .validate_resource_subscriptions()
+            .map_err(|error| McpError::invalid_params(error.to_string()))?;
+        request_ctx.ensure_live()?;
+        let Some(uris) = notifications.resource_subscriptions.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut accepted = Vec::with_capacity(uris.len());
+        let mut bindings = Vec::with_capacity(uris.len());
+        for uri in uris {
+            let uri = fastmcp_protocol::common_types::AbsoluteUri::parse(uri.clone())
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            if let Some(binding) = self.router.bind_resource_subscription(request_ctx, &uri)? {
+                accepted.push(binding.parent_uri().as_str().to_owned());
+                bindings.push(Arc::new(binding));
+            }
+        }
+        request_ctx.ensure_live()?;
+        notifications.resource_subscriptions = Some(accepted);
+        Ok(bindings)
+    }
+
     /// Publishes one typed final Tasks status notification to matching streams.
     ///
     /// Only subscriptions whose acknowledged `taskIds` set contains the
@@ -15143,8 +15808,17 @@ impl Server {
             request_ctx =
                 request_ctx.with_min_log_level(Some(Self::mcp_log_level_from_final(level)));
         }
+        // A subscription's delivery guard retains this context after dispatch
+        // while its transport drains. The real sender is already owned by the
+        // dispatcher and registry entry; a context callback must not keep a
+        // transport receipt alive recursively through its own admission.
+        let context_notification_sender = if request.method == SUBSCRIPTIONS_LISTEN {
+            weak_subscription_notification_sender(&notification_sender)
+        } else {
+            Arc::clone(&notification_sender)
+        };
         {
-            let sender = notification_sender.clone();
+            let sender = context_notification_sender.clone();
             request_ctx =
                 request_ctx.with_log_sender(Arc::new(crate::handler::LogNotificationSender::new(
                     move |notification| {
@@ -15161,7 +15835,7 @@ impl Server {
             .as_ref()
             .and_then(|_| Self::request_progress_marker(&request))
             .map(|marker| {
-                let sender = notification_sender.clone();
+                let sender = context_notification_sender.clone();
                 let frame_context = request_ctx.clone();
                 let frame_cancellation = request_cancellation.clone();
                 Arc::new(handler::FinalProgressRuntime::new(
@@ -15493,7 +16167,7 @@ impl Server {
         let subscription_id = request.id.clone().ok_or_else(|| {
             McpError::invalid_request("subscriptions/listen must carry a JSON-RPC request id")
         })?;
-        let params = request
+        let mut params = request
             .params
             .clone()
             .ok_or_else(|| McpError::invalid_params("subscriptions/listen requires parameters"))
@@ -15519,6 +16193,8 @@ impl Server {
                 "subscriptions/listen requires exact final request metadata",
             ));
         }
+        let resource_bindings =
+            self.bind_subscription_resources(request_ctx, &mut params.notifications)?;
         #[cfg(feature = "tasks")]
         let tasks_requested =
             self.admit_final_task_subscription(&params.notifications, client_capabilities)?;
@@ -15680,7 +16356,7 @@ impl Server {
                 "Subscriptions require caller time capability",
             ));
         }
-        let lease = self.final_subscriptions.open_with_task_principal(
+        let lease = self.final_subscriptions.open_with_resource_bindings(
             subscription_id.clone(),
             params.notifications,
             tasks_requested,
@@ -15689,6 +16365,10 @@ impl Server {
             terminal_delivery.clone(),
             notification_sender,
             task_principal,
+            Some(FinalSubscriptionResourceAdmission {
+                context: request_ctx.clone(),
+                bindings: resource_bindings,
+            }),
         )?;
 
         while !self.final_subscriptions.is_terminating() {
@@ -15971,6 +16651,7 @@ impl Server {
         send: Arc<Mutex<S>>,
         background_send_failure: Arc<Mutex<Option<McpError>>>,
         queue: Arc<DispatchQueueState>,
+        subscription_sender: Option<SubscriptionDeliverySender>,
     ) -> Option<JsonRpcResponse>
     where
         S: FnMut(&Cx, &JsonRpcMessage) -> Result<(), TransportError> + Send + 'static,
@@ -16075,7 +16756,7 @@ impl Server {
             };
             let submitted = dispatch_cx.spawn_blocking({
                 let server = Arc::clone(&server);
-                let notification_sender = Arc::clone(&notification_sender);
+                let notification_callback = Arc::clone(&notification_sender);
                 let request_cancellation = request_cancellation.clone();
                 move |request_cx| {
                     let _reservation = reservation;
@@ -16087,6 +16768,43 @@ impl Server {
                         return;
                     }
                     let inbound = inbound.with_cx(request_cx.clone());
+                    let terminal = Arc::new(FinalSubscriptionTerminalDelivery::default());
+                    let notification_terminal = Arc::clone(&terminal);
+                    let notification_cx = request_cx.clone();
+                    let notification_cancellation = request_cancellation.clone();
+                    let notification_send = Arc::clone(&send);
+                    let notification_failure = Arc::clone(&background_send_failure);
+                    let notification_sender: NotificationSender = Arc::new(move |notification| {
+                        if subscription_sender.is_none() {
+                            // A caller-supplied synchronous callback owns its
+                            // handoff. Framework-owned queued transports use
+                            // the explicit delivery sink below instead.
+                            let output = GuardedTransportOutput {
+                                message: JsonRpcMessage::Request(notification.clone()),
+                                delivery: Some(Arc::clone(&notification_terminal)),
+                            };
+                            if output.allows_write() {
+                                notification_callback(notification);
+                                output.complete(&Ok(()));
+                            }
+                            return;
+                        }
+                        if let Err(error) = send_guarded_subscription(
+                            &notification_cx,
+                            &notification_cancellation,
+                            JsonRpcMessage::Request(notification),
+                            Arc::clone(&notification_terminal),
+                            subscription_sender.as_ref(),
+                            &notification_send,
+                        ) {
+                            if let Err(error) = returning_send_result(&error) {
+                                notification_failure.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .get_or_insert(error);
+                            }
+                            notification_cancellation.cancel();
+                        }
+                    });
                     let response = poll_on_cx(
                         &request_cx,
                         server.dispatch_with_protocol_policy_owned(
@@ -16098,7 +16816,7 @@ impl Server {
                             auth_custody_generation,
                             None,
                             request_cancellation,
-                            None,
+                            Some(terminal),
                             notification_sender,
                         ),
                     );
@@ -16952,6 +17670,11 @@ impl Server {
 
         let shared_recv = shared.clone();
         let shared_send = shared.clone();
+        let guarded_send = shared.clone();
+        let subscription_sender: SubscriptionDeliverySender =
+            Arc::new(move |cx, message, delivery| {
+                guarded_send.send_with_delivery(cx, message, Some(delivery))
+            });
         #[cfg(feature = "legacy-2024-11-05")]
         let run_result = self.run_loop_returning(
             cx,
@@ -16960,6 +17683,7 @@ impl Server {
             notification_sender,
             Some(notification_failure),
             label,
+            Some(subscription_sender),
         );
         #[cfg(not(feature = "legacy-2024-11-05"))]
         let run_result = match Arc::new(self).run_loop_pump_with_policy(
@@ -16976,7 +17700,7 @@ impl Server {
             None,
             None,
             None,
-            PumpIoMode::Unsplit,
+            PumpIoMode::GuardedUnsplit(subscription_sender),
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -17069,6 +17793,11 @@ impl Server {
 
         let shared_recv = shared.clone();
         let shared_send = shared.clone();
+        let guarded_send = shared.clone();
+        let subscription_sender: SubscriptionDeliverySender =
+            Arc::new(move |cx, message, delivery| {
+                guarded_send.send_with_delivery(cx, message, Some(delivery))
+            });
         let run_result = self.run_loop_returning(
             cx,
             move |cx| shared_recv.recv(cx),
@@ -17076,6 +17805,7 @@ impl Server {
             notification_sender,
             Some(notification_failure),
             "custom",
+            Some(subscription_sender),
         );
         let close_result = shared
             .close(cx)
@@ -17165,19 +17895,18 @@ impl Server {
     }
 
     #[cfg(feature = "websocket")]
-    fn run_split_transport_returning_shared_with_dispatch_cx<R, S>(
+    fn run_split_transport_returning_shared_with_dispatch_cx<R>(
         self: Arc<Self>,
         pump_cx: &Cx,
         dispatch_cx: &Cx,
         recv_half: R,
-        send_half: S,
+        send_half: WebSocketBridgeSend,
         transport_authorization: TransportAuthorization,
         auth_receipt: AuthDispatchCustody,
         websocket_connection_generation: u64,
     ) -> McpResult<()>
     where
         R: TransportRecvHalf + Send + 'static,
-        S: TransportSendHalf + 'static,
     {
         let recv_half = SharedRecvHalf::new(recv_half);
         let send_half = SharedSendHalf::new(send_half);
@@ -17189,6 +17918,18 @@ impl Server {
         );
         let recv_for_run = recv_half.clone();
         let send_for_run = send_half.clone();
+        let guarded_send = send_half.clone();
+        let subscription_sender: SubscriptionDeliverySender =
+            Arc::new(move |cx, message, delivery| {
+                if !delivery.allows_subscription_message(message) {
+                    return Ok(());
+                }
+                guarded_send
+                    .inner
+                    .lock()
+                    .map_err(|_| transport_lock_error())?
+                    .send_with_delivery(cx, message, Some(delivery))
+            });
         let run_result = self.run_loop_returning_shared_with_dispatch_cx(
             pump_cx,
             dispatch_cx,
@@ -17200,6 +17941,7 @@ impl Server {
             transport_authorization,
             auth_receipt,
             websocket_connection_generation,
+            subscription_sender,
         );
         let recv_close = recv_half
             .close(pump_cx)
@@ -17513,6 +18255,7 @@ impl Server {
         transport_authorization: TransportAuthorization,
         auth_receipt: AuthDispatchCustody,
         websocket_connection_generation: u64,
+        subscription_sender: SubscriptionDeliverySender,
     ) -> McpResult<()>
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -17532,7 +18275,7 @@ impl Server {
             Some(transport_authorization),
             Some(auth_receipt),
             Some(websocket_connection_generation),
-            PumpIoMode::Split,
+            PumpIoMode::GuardedSplit(subscription_sender),
         ) {
             0 => Ok(()),
             _ => Err(server_run_error(
@@ -17616,8 +18359,7 @@ impl Server {
         // Use the existing bounded blocking bridge in that arrangement; the
         // split/stdio pump supplies a distinct dispatch Cx and uses async
         // children instead. Both paths retain the same admission ownership.
-        let synchronous_dispatch =
-            io_mode == PumpIoMode::Split && cx.task_id() == dispatch_cx.task_id();
+        let synchronous_dispatch = !io_mode.is_unsplit() && cx.task_id() == dispatch_cx.task_id();
         let mut negotiated_era = None;
         let mut exit_code = 0;
         let mut drain_responses = false;
@@ -17781,8 +18523,7 @@ impl Server {
             // A listen does not finish until it is terminated, so on an
             // unsplit transport it cannot run inline: the pump would stop
             // reading and never see the cancellation that ends it (bd-4crkf).
-            let unsplit_listen =
-                io_mode == PumpIoMode::Unsplit && request.method == SUBSCRIPTIONS_LISTEN;
+            let unsplit_listen = io_mode.is_unsplit() && request.method == SUBSCRIPTIONS_LISTEN;
             let blocking_permit =
                 (synchronous_dispatch || unsplit_listen).then(try_reserve_blocking_dispatch);
             if matches!(blocking_permit, Some(None)) {
@@ -17850,10 +18591,14 @@ impl Server {
             let request_send = Arc::clone(&send);
             let listen_opened = unsplit_listen.then(|| Arc::new(UnsplitListenOpened::default()));
             let listen_opened_by_dispatch = listen_opened.clone();
+            let request_subscription_sender = io_mode.subscription_sender();
             let dispatch = move |request_cx: Cx| async move {
                 let mut reservation = reservation;
                 let cancellation = reservation.cancellation();
                 let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
+                let subscription_terminal = subscription_request
+                    .then(|| Arc::new(FinalSubscriptionTerminalDelivery::default()));
+                let notification_delivery = subscription_terminal.clone();
                 let inbound = inbound.with_cx(request_cx.clone());
                 let notification_send = Arc::clone(&request_send);
                 let notification_cx = request_cx.clone();
@@ -17867,16 +18612,29 @@ impl Server {
                     wait_for_stdio_progress_commit_fence(notification_request_id, &notification);
                     let acknowledgement = notification.method
                         == fastmcp_protocol::methods::NOTIFICATIONS_SUBSCRIPTIONS_ACKNOWLEDGED;
-                    let mut writer = notification_send
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if !notification_cancellation.is_cancel_requested()
-                        && writer(&notification_cx, &JsonRpcMessage::Request(notification)).is_err()
-                    {
+                    let result = if let Some(delivery) = &notification_delivery {
+                        send_guarded_subscription(
+                            &notification_cx,
+                            &notification_cancellation,
+                            JsonRpcMessage::Request(notification),
+                            Arc::clone(delivery),
+                            request_subscription_sender.as_ref(),
+                            &notification_send,
+                        )
+                    } else {
+                        let mut writer = notification_send
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if notification_cancellation.is_cancel_requested() {
+                            Ok(())
+                        } else {
+                            writer(&notification_cx, &JsonRpcMessage::Request(notification))
+                        }
+                    };
+                    if result.is_err() {
                         notification_failed.store(true, Ordering::Release);
                         notification_cancellation.cancel();
                     }
-                    drop(writer);
                     if acknowledgement && let Some(opened) = &notification_opened {
                         opened.fire();
                     }
@@ -17904,7 +18662,7 @@ impl Server {
                                 auth_custody_generation,
                                 None,
                                 cancellation.clone(),
-                                None,
+                                subscription_terminal,
                                 committed_notifications,
                             )
                             .await
@@ -17950,7 +18708,7 @@ impl Server {
                 }
                 reservation.disarm_failure();
             };
-            if io_mode == PumpIoMode::Unsplit && !unsplit_listen {
+            if io_mode.is_unsplit() && !unsplit_listen {
                 // An unsplit Transport holds one mutex during recv. Finish
                 // its response before receiving again, otherwise that read
                 // can lock out the response the peer is waiting for.
@@ -18064,7 +18822,7 @@ impl Server {
         transport_authorization: Option<TransportAuthorization>,
         auth_receipt: Option<AuthDispatchCustody>,
         websocket_connection_generation: Option<u64>,
-        _io_mode: PumpIoMode,
+        io_mode: PumpIoMode,
     ) -> i32
     where
         R: FnMut(&Cx, &AtomicBool) -> Result<JsonRpcMessage, TransportError>,
@@ -18153,6 +18911,7 @@ impl Server {
         let worker_transport_authorization = transport_authorization.clone().unwrap_or_default();
         let worker_auth_receipt = auth_receipt.clone();
         let worker_auth_custody_generation = auth_custody_generation;
+        let worker_subscription_sender = io_mode.subscription_sender();
         let (worker_completion_sender, worker_completion_receiver) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             // This dedicated thread is never the async driver: the receive
@@ -18291,6 +19050,10 @@ impl Server {
 
                 let request_id = request.id.clone();
                 if matches!(era, ProtocolEra::Modern2026) {
+                    let subscription_terminal = (request.method == SUBSCRIPTIONS_LISTEN)
+                        .then(|| Arc::new(FinalSubscriptionTerminalDelivery::default()));
+                    let notification_delivery = subscription_terminal.clone();
+                    let subscription_sender = worker_subscription_sender.clone();
                     let inbound = InboundRequestContext::with_modern_connection_context(
                         worker_cx.clone(),
                         request_id_to_u64(request.id.as_ref()),
@@ -18303,6 +19066,21 @@ impl Server {
                     let notification_cx = worker_cx.clone();
                     let notification_cancellation = request_cancellation.clone();
                     let notification_sender: NotificationSender = Arc::new(move |notification| {
+                        if let Some(delivery) = &notification_delivery {
+                            if send_guarded_subscription(
+                                &notification_cx,
+                                &notification_cancellation,
+                                JsonRpcMessage::Request(notification),
+                                Arc::clone(delivery),
+                                subscription_sender.as_ref(),
+                                &notification_send,
+                            )
+                            .is_err()
+                            {
+                                notification_cancellation.cancel();
+                            }
+                            return;
+                        }
                         let mut send_guard = notification_send
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -18327,7 +19105,7 @@ impl Server {
                             worker_auth_custody_generation,
                             None,
                             request_cancellation.clone(),
-                            None,
+                            subscription_terminal,
                             notification_sender,
                         ),
                     );
@@ -18935,6 +19713,7 @@ impl Server {
                         );
                         let request_server = Arc::clone(&server);
                         let request_send = Arc::clone(&send);
+                        let request_subscription_sender = io_mode.subscription_sender();
                         #[cfg(feature = "console")]
                         let request_renderer = traffic_renderer.clone();
                         let task_principal_admission = Arc::clone(&principal_admission);
@@ -19026,6 +19805,10 @@ impl Server {
                                         }
                                         ModernDispatchStart::Ready => {
                                             let subscription_request = request.method == SUBSCRIPTIONS_LISTEN;
+                                            let subscription_terminal = subscription_request
+                                                .then(|| Arc::new(FinalSubscriptionTerminalDelivery::default()));
+                                            let notification_delivery = subscription_terminal.clone();
+                                            let subscription_sender = request_subscription_sender.clone();
                                             let inbound = InboundRequestContext::with_modern_connection_context(
                                                 request_cx.clone(),
                                                 request_id_to_u64(request.id.as_ref()),
@@ -19050,6 +19833,20 @@ impl Server {
                                                         notification_request_id,
                                                         &notification,
                                                     );
+                                                    if let Some(delivery) = &notification_delivery {
+                                                        if send_guarded_subscription(
+                                                            &notification_cx,
+                                                            &notification_cancellation,
+                                                            JsonRpcMessage::Request(notification),
+                                                            Arc::clone(delivery),
+                                                            subscription_sender.as_ref(),
+                                                            &notification_send,
+                                                        ).is_err() {
+                                                            notification_failed.store(true, Ordering::Release);
+                                                            notification_cancellation.cancel();
+                                                        }
+                                                        return;
+                                                    }
                                                     let mut send_guard = notification_send
                                                         .lock()
                                                         .unwrap_or_else(
@@ -19091,7 +19888,7 @@ impl Server {
                                                         task_auth_custody_generation,
                                                         None,
                                                         request_cancellation.clone(),
-                                                        None,
+                                                        subscription_terminal,
                                                         notification_sender,
                                                     ),
                                             );
@@ -19519,6 +20316,7 @@ impl Server {
         notification_sender: NotificationSender,
         connection_failure: Option<Arc<AtomicBool>>,
         transport_label: &'static str,
+        subscription_sender: Option<SubscriptionDeliverySender>,
     ) -> McpResult<()>
     where
         R: FnMut(&Cx) -> Result<JsonRpcMessage, TransportError>,
@@ -19855,6 +20653,7 @@ impl Server {
                                 Arc::clone(&send),
                                 Arc::clone(&background_send_failure),
                                 Arc::clone(&modern_queue),
+                                subscription_sender.clone(),
                             );
                             #[cfg(feature = "legacy-2024-11-05")]
                             let response = response.map(HandledRequest::untracked);
@@ -20569,7 +21368,7 @@ impl Server {
 
     fn with_final_catalog_publisher(&self, ctx: McpContext) -> McpContext {
         ctx.with_catalog_publisher(Arc::new(FinalCatalogPublisher {
-            registry: Arc::clone(&self.final_subscriptions),
+            registry: Arc::downgrade(&self.final_subscriptions),
         }))
     }
 
@@ -22680,7 +23479,7 @@ struct UnsplitOutput {
 #[derive(Default)]
 struct UnsplitOutputState {
     owned: bool,
-    queue: VecDeque<JsonRpcMessage>,
+    queue: VecDeque<GuardedTransportOutput>,
     failed: bool,
 }
 
@@ -22720,6 +23519,7 @@ impl UnsplitOutput {
     fn claim_or_queue(
         &self,
         message: &JsonRpcMessage,
+        delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
     ) -> Result<Option<UnsplitOwnership<'_>>, TransportError> {
         let mut state = self.state();
         if state.failed {
@@ -22740,7 +23540,10 @@ impl UnsplitOutput {
                 "unsplit transport output queue is full while another caller owns the I/O handle",
             )));
         }
-        state.queue.push_back(message.clone());
+        state.queue.push_back(GuardedTransportOutput {
+            message: message.clone(),
+            delivery,
+        });
         Ok(None)
     }
 
@@ -22782,8 +23585,16 @@ impl UnsplitOwnership<'_> {
                 // Closed (or already failed): nothing queued can be written.
                 continue;
             };
-            for message in &batch {
-                if let Err(error) = writer.send(cx, message) {
+            for output in &batch {
+                // The outbox lock is released before the provider is called.
+                // A frame queued behind recv retains its original request
+                // admission rather than borrowing the receive pump's context.
+                if !output.allows_write() {
+                    continue;
+                }
+                let sent = writer.send(cx, &output.message);
+                output.complete(&sent);
+                if let Err(error) = sent {
                     if !error.is_cancelled() {
                         self.output.fail(&error);
                     }
@@ -22802,12 +23613,13 @@ impl Drop for UnsplitOwnership<'_> {
         }
         let mut state = self.output.state();
         state.owned = false;
-        if !state.queue.is_empty() {
-            state.queue.clear();
+        let abandoned = std::mem::take(&mut state.queue);
+        if !abandoned.is_empty() {
             state.failed = true;
             self.output.failure.store(true, Ordering::Release);
         }
         drop(state);
+        drop(abandoned);
         self.output.released.notify_all();
     }
 }
@@ -22917,15 +23729,38 @@ impl<T: Transport> SharedTransport<T> {
     }
 
     fn send(&self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
-        let Some(ownership) = self.output.claim_or_queue(message)? else {
+        self.send_with_delivery(cx, message, None)
+    }
+
+    fn send_with_delivery(
+        &self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+        delivery: Option<Arc<FinalSubscriptionTerminalDelivery>>,
+    ) -> Result<(), TransportError> {
+        let Some(ownership) = self.output.claim_or_queue(message, delivery.clone())? else {
             return Ok(());
         };
+        let output = GuardedTransportOutput {
+            message: message.clone(),
+            delivery,
+        };
+        // claim_or_queue made this caller the exclusive I/O owner, so no
+        // queued send can acquire the transport lock while policy is checked.
+        let authorized = output.allows_write();
         let mut guard = self.inner.lock().map_err(|_| transport_lock_error())?;
-        let result = guard
-            .as_mut()
-            .map_or(Err(TransportError::Closed), |transport| {
-                transport.send(cx, message)
-            });
+        let result = if authorized {
+            guard
+                .as_mut()
+                .map_or(Err(TransportError::Closed), |transport| {
+                    transport.send(cx, &output.message)
+                })
+        } else {
+            Ok(())
+        };
+        if authorized {
+            output.complete(&result);
+        }
         ownership.release(cx, guard.as_mut());
         result
     }
@@ -38125,6 +38960,897 @@ mod lib_unit_tests {
         );
     }
 
+    mod provider_resource_subscription_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+        const PARENT: &str = "catalog://items/parent";
+        const CHILD: &str = "catalog://items/child";
+        const SECOND: &str = "catalog://items/second";
+
+        struct Policy {
+            revision: AtomicU64,
+            authorized: AtomicBool,
+            registrations: AtomicUsize,
+            on_authorize: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        }
+
+        impl Policy {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    revision: AtomicU64::new(1),
+                    authorized: AtomicBool::new(true),
+                    registrations: AtomicUsize::new(0),
+                    on_authorize: Mutex::new(None),
+                })
+            }
+        }
+
+        impl ResourceSubscriptionMatcher for Policy {
+            fn revision(&self) -> u64 {
+                self.revision.load(Ordering::Acquire)
+            }
+
+            fn authorize(
+                &self,
+                ctx: &McpContext,
+                subscribed: &fastmcp_protocol::common_types::AbsoluteUri,
+                emitted: &fastmcp_protocol::common_types::AbsoluteUri,
+            ) -> McpResult<bool> {
+                let hook = self.on_authorize.lock().unwrap().take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+                Ok(self.authorized.load(Ordering::Acquire)
+                    && ctx.auth().and_then(|auth| auth.subject).as_deref() == Some("reader")
+                    && subscribed.as_str() == PARENT
+                    && matches!(emitted.as_str(), PARENT | CHILD | SECOND))
+            }
+
+            fn matches(
+                &self,
+                _ctx: &McpContext,
+                subscribed: &fastmcp_protocol::common_types::AbsoluteUri,
+                emitted: &fastmcp_protocol::common_types::AbsoluteUri,
+            ) -> McpResult<bool> {
+                Ok(subscribed.as_str() == PARENT && matches!(emitted.as_str(), CHILD | SECOND))
+            }
+        }
+
+        struct ResourceProvider(Arc<Policy>);
+
+        impl ResourceHandler for ResourceProvider {
+            fn definition(&self) -> Resource {
+                Resource {
+                    uri: PARENT.to_owned(),
+                    name: "provider".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                }
+            }
+
+            fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
+                Some(fastmcp_protocol::ResourceTemplate {
+                    uri_template: "catalog://items/{item}".to_owned(),
+                    name: "provider".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                })
+            }
+
+            fn subscription_matcher(
+                &self,
+                _ctx: &McpContext,
+                _subscribed: &fastmcp_protocol::common_types::AbsoluteUri,
+            ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+                self.0.registrations.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(self.0.clone()))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
+                panic!("subscription admission must not execute a resource read")
+            }
+        }
+
+        fn context(id: u64) -> McpContext {
+            McpContext::with_state(Cx::for_testing(), id, SessionState::new())
+                .with_auth(fastmcp_core::AuthContext::with_subject("reader"))
+        }
+
+        fn server(policy: &Arc<Policy>) -> Arc<Server> {
+            Arc::new(
+                Server::new("provider-subscriptions", "1")
+                    .resource(ResourceProvider(Arc::clone(policy)))
+                    .build(),
+            )
+        }
+
+        fn filter(uris: &[&str]) -> SubscriptionFilter {
+            SubscriptionFilter {
+                resource_subscriptions: Some(uris.iter().map(|uri| (*uri).to_owned()).collect()),
+                ..SubscriptionFilter::default()
+            }
+        }
+
+        fn update(uri: &str) -> ServerNotification {
+            ServerNotification::ResourceUpdated(
+                fastmcp_protocol::FinalResourceUpdatedNotificationParams {
+                    uri: fastmcp_protocol::common_types::AbsoluteUri::parse(uri).unwrap(),
+                    meta: None,
+                    additional: BTreeMap::new(),
+                },
+            )
+        }
+
+        fn capture() -> (NotificationSender, Arc<Mutex<Vec<JsonRpcRequest>>>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let output = Arc::clone(&sent);
+            (
+                Arc::new(move |frame| output.lock().unwrap().push(frame)),
+                sent,
+            )
+        }
+
+        struct HttpOutboxFixture {
+            server: Arc<Server>,
+            policy: Arc<Policy>,
+            context: McpContext,
+            response: ServerHttpSseResponse,
+            _session: DualEraHttpSession,
+            lease: FinalSubscriptionLease,
+        }
+
+        fn http_outbox_fixture() -> HttpOutboxFixture {
+            let policy = Policy::new();
+            let endpoint = Server::new("provider-http-outbox", "1")
+                .resource(ResourceProvider(Arc::clone(&policy)))
+                .test_http_endpoint("http://legacy.test")
+                .unwrap();
+            let server = Arc::clone(&endpoint.server);
+            let context = context(6410);
+            #[cfg(feature = "legacy-2024-11-05")]
+            let transport_endpoint = endpoint.transport_endpoint("http://legacy.test").unwrap();
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            let transport_endpoint = endpoint.transport_endpoint().unwrap();
+            let mut session = transport_endpoint.open_session().unwrap();
+            let listen = JsonRpcRequest::new(
+                SUBSCRIPTIONS_LISTEN,
+                Some(serde_json::json!({
+                    "_meta": {
+                        MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                        FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                    },
+                    "notifications": {"resourceSubscriptions": [PARENT]},
+                })),
+                6410_i64,
+            );
+            let request = HttpRequest::new(HttpMethod::Post, "/mcp")
+                .with_header("content-type", "application/json")
+                .with_header("accept", "text/event-stream")
+                .with_header("mcp-protocol-version", MODERN_PROTOCOL_VERSION)
+                .with_header("mcp-method", SUBSCRIPTIONS_LISTEN)
+                .with_body(serde_json::to_vec(&listen).unwrap());
+            let DualEraHttpEndpointResponse::ModernSse(inner) =
+                session.handle(context.cx(), request).unwrap()
+            else {
+                panic!("listen must receive a real transport SSE mailbox");
+            };
+            let sender = inner.sender();
+            let cancellation = sender.request_cancellation();
+            let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+            delivery.subscription_request.store(true, Ordering::Release);
+            let sender_cx = context.cx().clone();
+            let notifications: NotificationSender = Arc::new(move |notification| {
+                if final_subscription_terminal_notification(&notification) {
+                    sender
+                        .send_subscription_cancellation(&sender_cx, notification)
+                        .unwrap();
+                } else {
+                    sender.send_notification(&sender_cx, notification).unwrap();
+                }
+            });
+            let mut filter = filter(&[PARENT]);
+            let bindings = server
+                .bind_subscription_resources(&context, &mut filter)
+                .unwrap();
+            let lease = server
+                .final_subscriptions
+                .open_with_resource_bindings(
+                    6410_i64.into(),
+                    filter,
+                    false,
+                    Some(6410),
+                    cancellation.clone(),
+                    Some(Arc::clone(&delivery)),
+                    notifications,
+                    None,
+                    Some(FinalSubscriptionResourceAdmission {
+                        context: context.clone(),
+                        bindings,
+                    }),
+                )
+                .unwrap();
+            let response = ServerHttpSseResponse::new(inner, cancellation, delivery);
+            let acknowledgement = response.pop_event().unwrap().unwrap();
+            assert!(matches!(
+                subscription_sse_message(&acknowledgement),
+                Some(JsonRpcMessage::Request(notification))
+                    if final_subscription_acknowledgement_notification(&notification)
+            ));
+            HttpOutboxFixture {
+                server,
+                policy,
+                context,
+                response,
+                _session: session,
+                lease,
+            }
+        }
+
+        #[test]
+        fn provider_subscription_http_outbox_rechecks_after_transport_enqueue() {
+            for change in 0..5 {
+                let fixture = http_outbox_fixture();
+                assert_eq!(
+                    fixture
+                        .server
+                        .publish_subscription_notification(update(CHILD))
+                        .unwrap(),
+                    1
+                );
+                match change {
+                    1 => fixture.policy.authorized.store(false, Ordering::Release),
+                    2 => {
+                        fixture.policy.revision.fetch_add(1, Ordering::AcqRel);
+                    }
+                    3 => {
+                        assert!(fixture.context.disable_resource(PARENT));
+                    }
+                    4 => {
+                        assert!(fixture.context.disable_resource(CHILD));
+                    }
+                    _ => {}
+                }
+                let observed = fixture.response.pop_event();
+                if change == 0 {
+                    let event = observed.unwrap().unwrap();
+                    assert!(matches!(
+                        subscription_sse_message(&event),
+                        Some(JsonRpcMessage::Request(notification))
+                            if notification.params.as_ref().unwrap()["uri"] == CHILD
+                    ));
+                } else {
+                    assert!(
+                        !matches!(observed, Ok(Some(_))),
+                        "revoked mailbox data escaped"
+                    );
+                    fixture.policy.authorized.store(true, Ordering::Release);
+                    assert!(
+                        !matches!(fixture.response.pop_event(), Ok(Some(_))),
+                        "refusal must latch"
+                    );
+                    assert!(
+                        fixture
+                            .server
+                            .final_subscriptions
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .entries
+                            .is_empty()
+                    );
+                }
+                assert!(fixture.context.ensure_live().is_ok());
+            }
+        }
+
+        #[test]
+        fn provider_subscription_http_outbox_refusal_preserves_elected_control() {
+            let fixture = http_outbox_fixture();
+            assert_eq!(
+                fixture
+                    .server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(fixture.server.terminate_subscription_streams(), 1);
+            fixture.policy.authorized.store(false, Ordering::Release);
+            let event = fixture.response.pop_event().unwrap().unwrap();
+            assert!(matches!(
+                subscription_sse_message(&event),
+                Some(JsonRpcMessage::Request(notification))
+                    if final_subscription_terminal_notification(&notification)
+            ));
+            assert_eq!(
+                *fixture.lease.election.phase.lock().unwrap(),
+                FinalSubscriptionPhase::ServerTerminated
+            );
+            assert!(fixture.response.terminal_delivery.is_settled());
+        }
+
+        #[test]
+        fn provider_subscription_transport_control_observes_terminal_winner() {
+            for server_wins in [false, true] {
+                let fixture = http_outbox_fixture();
+                let acknowledgement = JsonRpcMessage::Request(
+                    subscription_acknowledgement(6410_i64.into(), filter(&[PARENT]))
+                        .unwrap()
+                        .encode()
+                        .unwrap(),
+                );
+                let control = JsonRpcMessage::Request(
+                    subscription_cancellation_notification(&6410_i64.into()).unwrap(),
+                );
+                if server_wins {
+                    assert_eq!(fixture.server.terminate_subscription_streams(), 1);
+                    assert!(!fixture.response.request_cancellation.cancel_by_peer());
+                } else {
+                    assert!(fixture.response.request_cancellation.cancel_by_peer());
+                }
+                assert_eq!(
+                    fixture
+                        .response
+                        .terminal_delivery
+                        .allows_subscription_message(&acknowledgement),
+                    server_wins
+                );
+                assert_eq!(
+                    fixture
+                        .response
+                        .terminal_delivery
+                        .allows_subscription_message(&control),
+                    server_wins
+                );
+                if !server_wins {
+                    assert_eq!(fixture.server.terminate_subscription_streams(), 0);
+                    assert_eq!(
+                        *fixture.lease.election.phase.lock().unwrap(),
+                        FinalSubscriptionPhase::PeerTerminated
+                    );
+                    assert!(
+                        !fixture
+                            .response
+                            .terminal_delivery
+                            .allows_subscription_message(&control)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn provider_subscription_http_write_rechecks_after_pending_poll() {
+            for revoked in [false, true] {
+                let fixture = http_outbox_fixture();
+                assert_eq!(
+                    fixture
+                        .server
+                        .publish_subscription_notification(update(CHILD))
+                        .unwrap(),
+                    1
+                );
+                let event = fixture.response.pop_event().unwrap().unwrap();
+                let polls = AtomicUsize::new(0);
+                let write = std::future::poll_fn(|_| {
+                    if polls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        std::task::Poll::Pending
+                    } else {
+                        std::task::Poll::Ready(Ok(()))
+                    }
+                });
+                let mut guarded = std::pin::pin!(guard_subscription_sse_write(
+                    &fixture.response.terminal_delivery,
+                    &event,
+                    write,
+                ));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(guarded.as_mut().poll(&mut task).is_pending());
+                if revoked {
+                    fixture.policy.authorized.store(false, Ordering::Release);
+                }
+                assert_eq!(
+                    guarded.as_mut().poll(&mut task),
+                    std::task::Poll::Ready(if revoked { Err(()) } else { Ok(()) })
+                );
+                assert_eq!(polls.load(Ordering::Acquire), if revoked { 1 } else { 2 });
+            }
+        }
+
+        #[test]
+        fn provider_subscription_transport_custody_releases_context_callbacks() {
+            for with_progress in [false, true] {
+                let policy = Policy::new();
+                let server = server(&policy);
+                let registry = Arc::downgrade(&server.final_subscriptions);
+                let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+                let released = Arc::downgrade(&delivery);
+                let captured_delivery = Arc::clone(&delivery);
+                let sender: NotificationSender = Arc::new(move |_| {
+                    // HTTP's deferred gate and native stdio's OutputOwner
+                    // both retain this same private receipt through sender.
+                    assert!(!captured_delivery.is_settled());
+                });
+                let context_sender = weak_subscription_notification_sender(&sender);
+                let log_sender = Arc::clone(&context_sender);
+                let mut ctx = context(6411)
+                    .with_catalog_publisher(Arc::new(FinalCatalogPublisher {
+                        registry: Arc::downgrade(&server.final_subscriptions),
+                    }))
+                    .with_log_sender(Arc::new(handler::LogNotificationSender::new(
+                        move |notification| log_sender(notification),
+                        ProtocolEra::Modern2026,
+                    )));
+                if with_progress {
+                    let frame_context = ctx.clone();
+                    let progress_sender = Arc::clone(&context_sender);
+                    let runtime = Arc::new(handler::FinalProgressRuntime::new(
+                        serde_json::from_value(serde_json::json!("retained-provider-context"))
+                            .unwrap(),
+                        move |notification| {
+                            if frame_context.ensure_live().is_ok() {
+                                progress_sender(notification);
+                            }
+                        },
+                    ));
+                    ctx = ctx.with_progress_reporter(runtime.into_reporter());
+                }
+                let mut notifications = filter(&[PARENT]);
+                let bindings = server
+                    .bind_subscription_resources(&ctx, &mut notifications)
+                    .unwrap();
+                let lease = server
+                    .final_subscriptions
+                    .open_with_resource_bindings(
+                        6411_i64.into(),
+                        notifications,
+                        false,
+                        None,
+                        McpRequestCancellation::new(),
+                        Some(Arc::clone(&delivery)),
+                        Arc::clone(&sender),
+                        None,
+                        Some(FinalSubscriptionResourceAdmission {
+                            context: ctx.clone(),
+                            bindings,
+                        }),
+                    )
+                    .unwrap();
+                drop(ctx);
+                drop(context_sender);
+                drop(sender);
+                drop(delivery);
+                drop(server);
+                assert!(
+                    released.upgrade().is_some(),
+                    "the active lease must retain delivery"
+                );
+                drop(lease);
+                assert!(
+                    released.upgrade().is_none(),
+                    "context notification custody leaked its receipt"
+                );
+                assert!(
+                    registry.upgrade().is_none(),
+                    "context catalog publication leaked its registry"
+                );
+            }
+        }
+
+        #[test]
+        fn provider_subscription_public_admission_acknowledges_only_resolved_resources() {
+            let policy = Policy::new();
+            let server = server(&policy);
+            let ctx = context(6401);
+            let (sender, sent) = capture();
+            let _handle = server
+                .open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6401_i64),
+                    filter(&[PARENT, "unknown:resource"]),
+                    sender,
+                )
+                .unwrap();
+            assert_eq!(
+                sent.lock().unwrap()[0].params.as_ref().unwrap()["notifications"]["resourceSubscriptions"],
+                serde_json::json!([PARENT])
+            );
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update(PARENT))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update("catalog://items/childish"))
+                    .unwrap(),
+                0
+            );
+            let frames = sent.lock().unwrap();
+            assert_eq!(frames.len(), 3);
+            for frame in frames.iter().skip(1) {
+                assert_eq!(
+                    frame.params.as_ref().unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+                    serde_json::json!(6401)
+                );
+            }
+            assert_eq!(policy.registrations.load(Ordering::Acquire), 1);
+            assert_eq!(ctx.auth().unwrap().subject.as_deref(), Some("reader"));
+        }
+
+        #[test]
+        fn provider_subscription_invalid_filter_has_no_provider_or_registry_effects() {
+            let policy = Policy::new();
+            let server = server(&policy);
+            let ctx = context(6402);
+            let (sender, sent) = capture();
+            assert!(
+                server
+                    .open_subscription_listen_in_context(
+                        &ctx,
+                        RequestId::from(6402_i64),
+                        filter(&[PARENT, "relative/resource"]),
+                        sender,
+                    )
+                    .is_err()
+            );
+            assert_eq!(policy.registrations.load(Ordering::Acquire), 0);
+            assert!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .is_empty()
+            );
+            assert!(sent.lock().unwrap().is_empty());
+            assert!(ctx.ensure_live().is_ok());
+            let (sender, sent) = capture();
+            let _handle = server
+                .open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6402_i64),
+                    filter(&[PARENT]),
+                    sender,
+                )
+                .unwrap();
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(sent.lock().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn provider_subscription_opening_queue_rechecks_authorization_revision_and_visibility() {
+            // The positive and four negative cases differ only in what changes
+            // after an event is queued behind the acknowledgement callback.
+            for change in 0..5 {
+                let policy = Policy::new();
+                let server = server(&policy);
+                let ctx = context(6403);
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let output = Arc::clone(&sent);
+                let owner = Arc::downgrade(&server);
+                let provider = Arc::clone(&policy);
+                let shared = ctx.clone();
+                let sender: NotificationSender = Arc::new(move |frame| {
+                    let acknowledgement =
+                        frame.method == "notifications/subscriptions/acknowledged";
+                    output.lock().unwrap().push(frame);
+                    if acknowledgement {
+                        assert_eq!(
+                            owner
+                                .upgrade()
+                                .unwrap()
+                                .publish_subscription_notification(update(CHILD))
+                                .unwrap(),
+                            1
+                        );
+                        match change {
+                            1 => provider.authorized.store(false, Ordering::Release),
+                            2 => {
+                                provider.revision.fetch_add(1, Ordering::AcqRel);
+                            }
+                            3 => {
+                                assert!(shared.disable_resource(PARENT));
+                            }
+                            4 => {
+                                assert!(shared.disable_resource(CHILD));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                let opened = server.open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6403_i64),
+                    filter(&[PARENT]),
+                    sender,
+                );
+                assert_eq!(opened.is_ok(), change == 0);
+                assert_eq!(sent.lock().unwrap().len(), if change == 0 { 2 } else { 1 });
+                if change != 0 {
+                    assert!(
+                        server
+                            .final_subscriptions
+                            .inner
+                            .lock()
+                            .unwrap()
+                            .entries
+                            .is_empty()
+                    );
+                }
+                assert!(
+                    ctx.ensure_live().is_ok(),
+                    "one listener cannot cancel its caller context"
+                );
+                drop(opened);
+            }
+        }
+
+        #[test]
+        fn provider_subscription_active_queue_rechecks_and_preserves_sibling_listener() {
+            let policy = Policy::new();
+            let server = server(&policy);
+            let ctx = context(6404);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let output = Arc::clone(&sent);
+            let owner = Arc::downgrade(&server);
+            let provider = Arc::clone(&policy);
+            let sender: NotificationSender = Arc::new(move |frame| {
+                let first = frame.method == "notifications/resources/updated"
+                    && frame
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("uri"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(CHILD);
+                output.lock().unwrap().push(frame);
+                if first {
+                    assert_eq!(
+                        owner
+                            .upgrade()
+                            .unwrap()
+                            .publish_subscription_notification(update(SECOND))
+                            .unwrap(),
+                        1
+                    );
+                    provider.authorized.store(false, Ordering::Release);
+                }
+            });
+            let _handle = server
+                .open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6404_i64),
+                    filter(&[PARENT]),
+                    sender,
+                )
+                .unwrap();
+            let (sibling_sender, sibling_frames) = capture();
+            let _sibling = server
+                .open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6405_i64),
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                    sibling_sender,
+                )
+                .unwrap();
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                sent.lock().unwrap().len(),
+                2,
+                "the queued revoked child is never exposed"
+            );
+            assert_eq!(
+                server
+                    .publish_subscription_notification(ServerNotification::ToolsListChanged(None))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(sibling_frames.lock().unwrap().len(), 2);
+            assert_eq!(
+                server
+                    .final_subscriptions
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .len(),
+                1
+            );
+            assert!(ctx.ensure_live().is_ok());
+        }
+
+        #[test]
+        fn provider_subscription_catalog_events_retain_the_caller_lifetime() {
+            for queued in [false, true] {
+                let policy = Policy::new();
+                let server = server(&policy);
+                let ctx = context(6406);
+                let sent = Arc::new(Mutex::new(Vec::new()));
+                let output = Arc::clone(&sent);
+                let owner = Arc::downgrade(&server);
+                let shared = ctx.clone();
+                let sender: NotificationSender = Arc::new(move |frame| {
+                    let acknowledgement =
+                        frame.method == "notifications/subscriptions/acknowledged";
+                    output.lock().unwrap().push(frame);
+                    if queued && acknowledgement {
+                        assert_eq!(
+                            owner
+                                .upgrade()
+                                .unwrap()
+                                .publish_subscription_notification(
+                                    ServerNotification::ToolsListChanged(None),
+                                )
+                                .unwrap(),
+                            1
+                        );
+                        assert!(shared.request_cancellation().cancel());
+                    }
+                });
+                let opened = server.open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6406_i64),
+                    SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    },
+                    sender,
+                );
+                assert_eq!(opened.is_ok(), !queued);
+                if !queued {
+                    assert!(ctx.request_cancellation().cancel());
+                    assert_eq!(
+                        server
+                            .publish_subscription_notification(
+                                ServerNotification::ToolsListChanged(None),
+                            )
+                            .unwrap(),
+                        0
+                    );
+                }
+                assert_eq!(sent.lock().unwrap().len(), 1);
+                assert!(
+                    server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
+                drop(opened);
+            }
+        }
+
+        #[test]
+        fn provider_subscription_refusal_cannot_rewrite_a_completed_terminal_winner() {
+            let policy = Policy::new();
+            let server = server(&policy);
+            let ctx = context(6407);
+            let (sender, sent) = capture();
+            let handle = server
+                .open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6407_i64),
+                    filter(&[PARENT]),
+                    sender,
+                )
+                .unwrap();
+            let owner = Arc::downgrade(&server);
+            let provider = Arc::clone(&policy);
+            *policy.on_authorize.lock().unwrap() = Some(Box::new(move || {
+                assert_eq!(owner.upgrade().unwrap().terminate_subscription_streams(), 1);
+                provider.authorized.store(false, Ordering::Release);
+            }));
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                *handle.lease().election.phase.lock().unwrap(),
+                FinalSubscriptionPhase::ServerTerminated
+            );
+            let frames = sent.lock().unwrap();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[1].method, "notifications/cancelled");
+            assert!(ctx.ensure_live().is_ok());
+        }
+
+        #[test]
+        fn provider_subscription_delivery_refusal_preserves_pending_terminal_control() {
+            let policy = Policy::new();
+            let server = server(&policy);
+            let ctx = context(6408);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let output = Arc::clone(&sent);
+            let owner = Arc::downgrade(&server);
+            let provider = Arc::clone(&policy);
+            let sender: NotificationSender = Arc::new(move |frame| {
+                let first = frame.method == "notifications/resources/updated"
+                    && frame
+                        .params
+                        .as_ref()
+                        .and_then(|params| params.get("uri"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(CHILD);
+                output.lock().unwrap().push(frame);
+                if first {
+                    assert_eq!(
+                        owner
+                            .upgrade()
+                            .unwrap()
+                            .publish_subscription_notification(update(SECOND))
+                            .unwrap(),
+                        1
+                    );
+                    let terminal_owner = owner.clone();
+                    let revoked = Arc::clone(&provider);
+                    *provider.on_authorize.lock().unwrap() = Some(Box::new(move || {
+                        assert_eq!(
+                            terminal_owner
+                                .upgrade()
+                                .unwrap()
+                                .terminate_subscription_streams(),
+                            1
+                        );
+                        revoked.authorized.store(false, Ordering::Release);
+                    }));
+                }
+            });
+            let handle = server
+                .open_subscription_listen_in_context(
+                    &ctx,
+                    RequestId::from(6408_i64),
+                    filter(&[PARENT]),
+                    sender,
+                )
+                .unwrap();
+            assert_eq!(
+                server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                *handle.lease().election.phase.lock().unwrap(),
+                FinalSubscriptionPhase::ServerTerminated
+            );
+            let frames = sent.lock().unwrap();
+            assert_eq!(frames.len(), 3);
+            assert_eq!(frames[1].params.as_ref().unwrap()["uri"], CHILD);
+            assert_eq!(frames[2].method, "notifications/cancelled");
+            assert!(ctx.ensure_live().is_ok());
+        }
+    }
+
     #[test]
     fn open_subscription_listen_receives_stateless_catalog_mutation() {
         let server = Server::new("in-process-listen", "1.0.0")
@@ -38810,6 +40536,7 @@ mod lib_unit_tests {
                 Arc::new(|_| {}),
                 Some(failure),
                 "custom-test",
+                None,
             )
             .expect_err("notification failure must dominate concurrent clean EOF");
 
@@ -38850,6 +40577,7 @@ mod lib_unit_tests {
                 Arc::new(|_| {}),
                 Some(failure),
                 "custom-test",
+                None,
             )
             .expect_err("latched notification I/O failure must win cancelled response send");
 
@@ -38895,6 +40623,7 @@ mod lib_unit_tests {
                 Arc::new(|_| {}),
                 Some(failure),
                 "custom-test",
+                None,
             )
             .expect_err("latched notification failure must win cancelled parse-error reply");
 
@@ -53842,6 +55571,7 @@ mod lib_unit_tests {
                             }),
                             None,
                             "test",
+                            None,
                         )
                     })
                     .expect("caller runtime admits receive pump");
@@ -53956,6 +55686,7 @@ mod lib_unit_tests {
                         Arc::new(|_| {}),
                         None,
                         "test",
+                        None,
                     )
                 })
                 .expect("caller runtime admits the receive pump");
@@ -54452,6 +56183,7 @@ mod lib_unit_tests {
                             }),
                             None,
                             "test",
+                            None,
                         )
                     })
                     .expect("caller runtime admits receive pump");

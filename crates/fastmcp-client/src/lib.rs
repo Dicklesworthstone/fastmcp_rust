@@ -16745,7 +16745,7 @@ impl HttpClient {
             .await
     }
 
-/// Attaches a durable final Tasks handle by reading its current snapshot.
+    /// Attaches a durable final Tasks handle by reading its current snapshot.
     ///
     /// The returned handle remains transport-neutral state; later operations
     /// take this same client so all requests retain its negotiated HTTP
@@ -25917,7 +25917,7 @@ impl Client {
         self.open_subscriptions_listener(notifications)
     }
 
-/// Commits upstream cancellation before retiring the live catalog listener.
+    /// Commits upstream cancellation before retiring the live catalog listener.
     ///
     /// A missing listener is a no-op so Drop / next-async cancel paths can
     /// retire a route that never installed one. The listener remains installed

@@ -1942,6 +1942,45 @@ pub trait ToolHandler: Send + Sync {
     }
 }
 
+/// Provider-owned resource relationships for one accepted subscription.
+///
+/// The router captures [`Self::revision`] when admitting a subscription and
+/// checks it around every provider callback and again before queued delivery.
+/// Providers must change the revision whenever their matching or authorization
+/// policy changes; a retired revision must never be reused. All methods must
+/// be bounded and nonblocking, and must use the supplied request context.
+///
+/// Matching does not confer authorization. Both the subscribed parent and
+/// emitted resource must remain visible to the caller, including exact-parent
+/// updates. The router additionally requires both URIs to resolve to the same
+/// effective modern resource registration. No URI normalization, lexical
+/// prefix, or template relationship is inferred by the framework.
+pub trait ResourceSubscriptionMatcher: Send + Sync {
+    /// Returns the current provider policy revision.
+    fn revision(&self) -> u64;
+
+    /// Reauthorizes the subscribed parent and emitted resource together.
+    ///
+    /// Return `false` when either resource is no longer visible. An error or
+    /// refusal retires the affected subscription; it cannot widen its filter.
+    fn authorize(
+        &self,
+        ctx: &McpContext,
+        subscribed: &AbsoluteUri,
+        emitted: &AbsoluteUri,
+    ) -> McpResult<bool>;
+
+    /// Returns whether this provider declares the emitted URI a child of the
+    /// subscribed resource. Exact identity is handled by the router after
+    /// authorization, so this method is used only for distinct URI spellings.
+    fn matches(
+        &self,
+        ctx: &McpContext,
+        subscribed: &AbsoluteUri,
+        emitted: &AbsoluteUri,
+    ) -> McpResult<bool>;
+}
+
 /// Handler for a resource.
 ///
 /// This trait is typically implemented via the `#[resource]` macro.
@@ -1959,6 +1998,23 @@ pub trait ToolHandler: Send + Sync {
 pub trait ResourceHandler: Send + Sync {
     /// Returns the resource definition.
     fn definition(&self) -> Resource;
+
+    /// Resolves provider-owned matching and authorization for a final resource
+    /// subscription. The router calls this with the exact subscribed URI after
+    /// resolving this handler and checking caller liveness and visibility.
+    ///
+    /// `None` retains exact-URI delivery for this resolved registration, with
+    /// session visibility checks. It does not assert a public-resource proof
+    /// or an authenticated authorization lease. Return a matcher to opt into
+    /// explicit provider child relationships and per-event authorization.
+    /// This registration callback must be bounded and nonblocking.
+    fn subscription_matcher(
+        &self,
+        _ctx: &McpContext,
+        _subscribed: &AbsoluteUri,
+    ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+        Ok(None)
+    }
 
     /// Retains the configured proxy origin through composition. Subscription
     /// admission consults the effective handler, including duplicate policy.
@@ -3474,6 +3530,71 @@ pub struct MountedResourceHandler {
     mounted_template: Option<ResourceTemplate>,
 }
 
+struct MountedResourceSubscriptionMatcher {
+    inner: Arc<dyn ResourceSubscriptionMatcher>,
+    source_uri: String,
+    mounted_uri: String,
+    mount_prefix: Option<String>,
+}
+
+impl MountedResourceSubscriptionMatcher {
+    fn source_uri(&self, uri: &AbsoluteUri) -> McpResult<AbsoluteUri> {
+        let source = if uri.as_str() == self.mounted_uri {
+            self.source_uri.clone()
+        } else if let Some(prefix) = &self.mount_prefix {
+            uri.as_str()
+                .strip_prefix(prefix)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "Resource is outside the mounted subscription namespace",
+                    )
+                })?
+                .to_owned()
+        } else if self.source_uri == self.mounted_uri {
+            return Ok(uri.clone());
+        } else {
+            return Err(McpError::invalid_params(
+                "Resource is outside the mounted subscription namespace",
+            ));
+        };
+        AbsoluteUri::parse(source).map_err(|_| {
+            McpError::invalid_params("Mounted subscription resource is not an absolute URI")
+        })
+    }
+}
+
+impl ResourceSubscriptionMatcher for MountedResourceSubscriptionMatcher {
+    fn revision(&self) -> u64 {
+        self.inner.revision()
+    }
+
+    fn authorize(
+        &self,
+        ctx: &McpContext,
+        subscribed: &AbsoluteUri,
+        emitted: &AbsoluteUri,
+    ) -> McpResult<bool> {
+        self.inner.authorize(
+            ctx,
+            &self.source_uri(subscribed)?,
+            &self.source_uri(emitted)?,
+        )
+    }
+
+    fn matches(
+        &self,
+        ctx: &McpContext,
+        subscribed: &AbsoluteUri,
+        emitted: &AbsoluteUri,
+    ) -> McpResult<bool> {
+        self.inner.matches(
+            ctx,
+            &self.source_uri(subscribed)?,
+            &self.source_uri(emitted)?,
+        )
+    }
+}
+
 impl MountedResourceHandler {
     /// Creates a mounted resource handler from authoritative source and
     /// destination registry keys.
@@ -3675,6 +3796,25 @@ impl ResourceHandler for MountedResourceHandler {
         let mut def = self.inner.definition();
         def.uri.clone_from(&self.mounted_uri);
         def
+    }
+
+    fn subscription_matcher(
+        &self,
+        ctx: &McpContext,
+        subscribed: &AbsoluteUri,
+    ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+        let source = AbsoluteUri::parse(self.translate_incoming_uri(subscribed.as_str())?)
+            .map_err(|_| {
+                McpError::invalid_params("Mounted subscription resource is not an absolute URI")
+            })?;
+        Ok(self.inner.subscription_matcher(ctx, &source)?.map(|inner| {
+            Arc::new(MountedResourceSubscriptionMatcher {
+                inner,
+                source_uri: self.source_uri.clone(),
+                mounted_uri: self.mounted_uri.clone(),
+                mount_prefix: self.mount_prefix.clone(),
+            }) as Arc<dyn ResourceSubscriptionMatcher>
+        }))
     }
 
     fn final_client_direct_https(&self) -> bool {

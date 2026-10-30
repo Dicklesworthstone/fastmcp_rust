@@ -1865,6 +1865,12 @@ where
         })
     }
 
+    /// Reports whether either half has closed or failed the shared connection.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
     /// Sends a JSON-RPC message in one unmasked server-role text frame.
     pub async fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         self.sender.send(cx, message).await

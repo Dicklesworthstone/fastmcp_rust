@@ -327,6 +327,7 @@ pub mod client {
         McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostResponse,
         McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
+    pub use crate::{ResourceSubscriptionRelations, SubscriptionListenRequest};
     #[cfg(feature = "apps")]
     pub use fastmcp_client::mcp_apps;
     pub use fastmcp_client::{http_auth, http_executor, mcp_config, sse};
@@ -422,6 +423,7 @@ pub mod protocol {
 /// [`modern::server_builder`] or [`legacy_2024::server_builder`] instead, so
 /// the protocol policy is fixed before application configuration begins.
 pub mod server {
+    pub use fastmcp_server::ResourceSubscriptionMatcher;
     pub use fastmcp_server::bidirectional;
     #[cfg(feature = "legacy-2024-11-05")]
     pub use fastmcp_server::legacy_2024;
@@ -1030,6 +1032,8 @@ pub use fastmcp_server::{
 };
 pub use fastmcp_server::{caching, oauth, oidc, rate_limiting, transform};
 
+pub use fastmcp_server::ResourceSubscriptionMatcher;
+
 // Re-export client types
 pub use fastmcp_client::{
     BoundedListPage, CachePartitionKey, CancellationRequested, Client, ClientBuilder,
@@ -1050,6 +1054,7 @@ pub use fastmcp_client::{
     StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
     SubscriptionTimeoutPolicy,
 };
+pub use fastmcp_client::{ResourceSubscriptionRelations, SubscriptionListenRequest};
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 
@@ -1139,6 +1144,9 @@ pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
 /// URI transports and has no synchronous split-transport escape route.
 #[cfg(feature = "legacy-2024-11-05")]
 pub mod auto {
+    pub use crate::{
+        ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
+    };
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
@@ -1796,7 +1804,7 @@ pub mod auto {
         pub async fn open_subscriptions_listener(
             &mut self,
             cx: &Cx,
-            notifications: crate::SubscriptionFilter,
+            notifications: impl Into<crate::SubscriptionListenRequest>,
         ) -> McpResult<()>
         where
             IO: Send + 'static,
@@ -2654,6 +2662,22 @@ pub mod auto {
                 .open_subscription_listen(subscription_id, notifications, notification_sender)
         }
 
+        /// Opens a resource subscription bound to the supplied caller context.
+        pub fn open_subscription_listen_in_context(
+            &self,
+            request_ctx: &crate::McpContext,
+            subscription_id: crate::RequestId,
+            notifications: crate::SubscriptionFilter,
+            notification_sender: crate::NotificationSender,
+        ) -> McpResult<fastmcp_server::SubscriptionListenHandle> {
+            self.inner.open_subscription_listen_in_context(
+                request_ctx,
+                subscription_id,
+                notifications,
+                notification_sender,
+            )
+        }
+
         #[cfg(feature = "tasks")]
         pub fn publish_task_status_notification(
             &self,
@@ -2869,6 +2893,9 @@ pub mod auto {
 /// }
 /// ```
 pub mod modern {
+    pub use crate::{
+        ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
+    };
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
@@ -4486,7 +4513,7 @@ pub mod modern {
         pub async fn open_subscriptions_listener(
             &mut self,
             cx: &Cx,
-            notifications: SubscriptionFilter,
+            notifications: impl Into<SubscriptionListenRequest>,
         ) -> McpResult<()>
         where
             IO: Send + 'static,
@@ -5337,7 +5364,7 @@ pub mod modern {
         /// Opens and collects one typed final subscriptions listener.
         pub fn listen_subscriptions(
             &mut self,
-            notifications: SubscriptionFilter,
+            notifications: impl Into<SubscriptionListenRequest>,
         ) -> McpResult<SubscriptionListenCollector> {
             self.inner.listen_subscriptions_typed(notifications)
         }
@@ -5349,7 +5376,7 @@ pub mod modern {
         /// same client can keep issuing requests such as `tools/call`.
         pub fn open_subscriptions_listener(
             &mut self,
-            notifications: SubscriptionFilter,
+            notifications: impl Into<SubscriptionListenRequest>,
         ) -> McpResult<()> {
             self.inner.open_subscriptions_listener(notifications)
         }
@@ -6738,7 +6765,7 @@ pub mod modern {
         pub async fn open_subscriptions_listener(
             &mut self,
             cx: &Cx,
-            notifications: SubscriptionFilter,
+            notifications: impl Into<SubscriptionListenRequest>,
             limits: SseLimits,
         ) -> Result<HttpSubscriptionListener<'_>, HttpClientError> {
             self.inner
@@ -6754,7 +6781,7 @@ pub mod modern {
         pub async fn start_subscriptions_listener(
             &mut self,
             cx: &Cx,
-            notifications: SubscriptionFilter,
+            notifications: impl Into<SubscriptionListenRequest>,
             limits: SseLimits,
         ) -> Result<(), HttpClientError> {
             self.inner
@@ -6801,7 +6828,7 @@ pub mod modern {
         pub async fn listen_subscriptions(
             &mut self,
             cx: &Cx,
-            notifications: SubscriptionFilter,
+            notifications: impl Into<SubscriptionListenRequest>,
             limits: fastmcp_client::sse::SseLimits,
         ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
             self.inner
@@ -7547,6 +7574,22 @@ pub mod modern {
         ) -> McpResult<fastmcp_server::SubscriptionListenHandle> {
             self.inner
                 .open_subscription_listen(subscription_id, notifications, notification_sender)
+        }
+
+        /// Opens a resource subscription bound to the supplied caller context.
+        pub fn open_subscription_listen_in_context(
+            &self,
+            request_ctx: &McpContext,
+            subscription_id: RequestId,
+            notifications: SubscriptionFilter,
+            notification_sender: crate::NotificationSender,
+        ) -> McpResult<fastmcp_server::SubscriptionListenHandle> {
+            self.inner.open_subscription_listen_in_context(
+                request_ctx,
+                subscription_id,
+                notifications,
+                notification_sender,
+            )
         }
 
         /// Publishes one typed final Tasks status notification.
@@ -11331,6 +11374,9 @@ pub mod prelude {
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use crate::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
+    pub use crate::{
+        ResourceSubscriptionMatcher, ResourceSubscriptionRelations, SubscriptionListenRequest,
+    };
     #[cfg(feature = "legacy-2024-11-05")]
     pub use crate::{auto, legacy_2024};
 }

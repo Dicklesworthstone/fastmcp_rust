@@ -1175,7 +1175,7 @@ impl ModernHttpResponseStream {
             .await
     }
 
-/// Reads a finite response body into memory under an explicit caller bound.
+    /// Reads a finite response body into memory under an explicit caller bound.
     ///
     /// This consumes the stream. It is appropriate for the disposable modern
     /// connection probe and ordinary JSON responses; callers expecting an SSE
@@ -6613,7 +6613,7 @@ impl ClientHttpConnection {
             .map_err(ClientHttpConnectionError::SubscriptionsListen)
     }
 
-/// Opens one live typed final core response stream.
+    /// Opens one live typed final core response stream.
     ///
     /// This is the ordinary request counterpart to
     /// [`Self::open_subscriptions_listener`]. Its collector retains bounded

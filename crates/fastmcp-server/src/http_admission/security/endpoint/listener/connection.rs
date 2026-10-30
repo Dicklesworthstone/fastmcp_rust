@@ -34,11 +34,11 @@ use crate::{
     admit_modern_http_post, await_modern_sse_dispatch_election, close_detached_modern_http_session,
     dispatch_modern_http_request_with_cancellation_and_transport_authorization,
     final_subscription_terminal_event, final_subscription_terminal_response_event, finish_sse_body,
-    h1_request_to_transport, h1_transport_authorization, http_endpoint_error_response,
-    http_endpoint_response_to_static, http_request_accepts_sse, native_http1_codec,
-    next_live_modern_http_response_body_generation, next_modern_http_stream_generation,
-    pop_sse_body_event, request_id_to_u64, send_h1_bad_request_response, send_h1_response,
-    spawn_modern_sse_dispatch, sse_response_head,
+    guard_subscription_sse_write, h1_request_to_transport, h1_transport_authorization,
+    http_endpoint_error_response, http_endpoint_response_to_static, http_request_accepts_sse,
+    native_http1_codec, next_live_modern_http_response_body_generation,
+    next_modern_http_stream_generation, pop_guarded_sse_body_event, request_id_to_u64,
+    send_h1_bad_request_response, send_h1_response, spawn_modern_sse_dispatch, sse_response_head,
 };
 
 pub(super) async fn serve(
@@ -820,7 +820,7 @@ async fn sse(
             if terminal.is_settled() {
                 return Err(());
             }
-            match pop_sse_body_event(&response) {
+            match pop_guarded_sse_body_event(&response, &terminal) {
                 Ok(Some(event)) => {
                     let control = response.is_finished()
                         && final_subscription_terminal_event(&event);
@@ -830,7 +830,11 @@ async fn sse(
                     guard_response(
                         cx,
                         &mut lease,
-                        write_parts(cx, &mut writer, &[prefix.as_bytes(), &bytes, b"\r\n"], io),
+                        guard_subscription_sse_write(
+                            &terminal,
+                            &event,
+                            write_parts(cx, &mut writer, &[prefix.as_bytes(), &bytes, b"\r\n"], io),
+                        ),
                     )
                     .await
                     .map_err(|_| ())??;

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use asupersync::Cx;
 use fastmcp_core::{McpContext, McpError, McpOutcome, McpResult, Outcome};
-use fastmcp_protocol::common_types::{Annotations, OpenMetadata, RawIcon};
+use fastmcp_protocol::common_types::{AbsoluteUri, Annotations, OpenMetadata, RawIcon};
 use fastmcp_protocol::{
     CompleteResult, FinalReadResourceResult, FinalResource, FinalResourceTemplate, Icon, Resource,
     ResourceContent, ResourceTemplate,
@@ -14,7 +14,8 @@ use fastmcp_protocol::{
 use super::{BlockingHandlerLane, outcome};
 use crate::bidirectional::MrtrCompletedInputs;
 use crate::handler::{
-    BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, ResourceHandler, UriParams,
+    BoxFuture, FinalMethodOutcome, FinalResourceReadCacheHintProvenance, ResourceHandler,
+    ResourceSubscriptionMatcher, UriParams,
 };
 
 /// Runs synchronous resource reads and subscription hooks on the caller's pool.
@@ -93,6 +94,13 @@ fn complete_only(
 impl<H: ResourceHandler + 'static> ResourceHandler for BlockingResource<H> {
     fn definition(&self) -> Resource {
         self.handler.definition()
+    }
+    fn subscription_matcher(
+        &self,
+        ctx: &McpContext,
+        subscribed: &AbsoluteUri,
+    ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+        self.handler.subscription_matcher(ctx, subscribed)
     }
     fn template(&self) -> Option<ResourceTemplate> {
         self.handler.template()

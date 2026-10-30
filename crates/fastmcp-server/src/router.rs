@@ -22,7 +22,8 @@ use crate::handler::{
 };
 use crate::handler::{
     BoxedCompletionHandler, BoxedPromptHandler, BoxedResourceHandler, BoxedToolHandler,
-    CompletionHandler, PromptHandler, ResourceHandler, ToolErrorKind, ToolHandler,
+    CompletionHandler, PromptHandler, ResourceHandler, ResourceSubscriptionMatcher, ToolErrorKind,
+    ToolHandler,
 };
 #[cfg(feature = "proxy")]
 use crate::proxy::ProxyCatalogCacheHint;
@@ -3954,6 +3955,50 @@ impl Router {
         self.resources.get(uri)
     }
 
+    /// Captures the actual modern registration and optional provider policy
+    /// for one request-owned resource subscription. Unknown or hidden resources
+    /// are omitted from the accepted subset without inventing a URI owner.
+    pub(crate) fn bind_resource_subscription(
+        self: &Arc<Self>,
+        ctx: &McpContext,
+        uri: &AbsoluteUri,
+    ) -> McpResult<Option<ResourceSubscriptionBinding>> {
+        ctx.ensure_live()?;
+        if !ctx.is_resource_enabled(uri.as_str()) {
+            return Ok(None);
+        }
+        let Some(resolved) =
+            self.resolve_resource_for_era(uri.as_str(), Some(ProtocolEra::Modern2026))
+        else {
+            return Ok(None);
+        };
+        let matcher =
+            crate::catch_extension_unwind(|| resolved.handler.subscription_matcher(ctx, uri))
+                .map_err(|_| crate::extension_panic_error("resource_subscription_registration"))?
+                .map_err(|error| sanitize_handler_error(ctx.cx(), "resource", error))?;
+        let matcher_revision = matcher
+            .as_ref()
+            .map(|matcher| {
+                crate::catch_extension_unwind(|| matcher.revision())
+                    .map_err(|_| crate::extension_panic_error("resource_subscription_revision"))
+            })
+            .transpose()?;
+        let binding = ResourceSubscriptionBinding {
+            router: Arc::clone(self),
+            context: ctx.clone(),
+            parent: uri.clone(),
+            registration_kind: resolved.registration_kind,
+            registration_key: resolved.registration_key.to_owned(),
+            matcher,
+            matcher_revision,
+        };
+        if binding.validate_event(uri)? {
+            Ok(Some(binding))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Gets a resource template by URI template.
     #[must_use]
     pub fn get_resource_template(&self, uri_template: &str) -> Option<&ResourceTemplate> {
@@ -4092,9 +4137,11 @@ impl Router {
         uri: &str,
         era: Option<ProtocolEra>,
     ) -> Option<ResolvedResource<'_>> {
-        if let Some(handler) = self.resources.get(uri) {
+        if let Some((key, handler)) = self.resources.get_key_value(uri) {
             let resolved = ResolvedResource {
                 handler,
+                registration_kind: ResourceRegistrationKind::Concrete,
+                registration_key: key,
                 params: UriParams::new(),
                 final_enabled: self.final_resources.contains_key(uri),
                 legacy_enabled: !self.final_only_resources.contains(uri),
@@ -4142,6 +4189,8 @@ impl Router {
             };
             let resolved = ResolvedResource {
                 handler,
+                registration_kind: ResourceRegistrationKind::Template,
+                registration_key: key,
                 params,
                 final_enabled: entry.final_definition.is_some(),
                 legacy_enabled: entry.legacy_enabled,
@@ -8151,8 +8200,144 @@ impl Router {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResourceRegistrationKind {
+    Concrete,
+    Template,
+}
+
+/// An admitted parent and its provider policy, retained by one listen request.
+#[derive(Clone)]
+pub(crate) struct ResourceSubscriptionBinding {
+    router: Arc<Router>,
+    context: McpContext,
+    parent: AbsoluteUri,
+    registration_kind: ResourceRegistrationKind,
+    registration_key: String,
+    matcher: Option<Arc<dyn ResourceSubscriptionMatcher>>,
+    matcher_revision: Option<u64>,
+}
+
+impl ResourceSubscriptionBinding {
+    pub(crate) fn parent_uri(&self) -> &AbsoluteUri {
+        &self.parent
+    }
+
+    fn owns(&self, resolved: &ResolvedResource<'_>) -> bool {
+        self.registration_kind == resolved.registration_kind
+            && self.registration_key == resolved.registration_key
+    }
+
+    fn check_revision(&self) -> McpResult<()> {
+        if let Some(matcher) = &self.matcher {
+            let revision = crate::catch_extension_unwind(|| matcher.revision())
+                .map_err(|_| crate::extension_panic_error("resource_subscription_revision"))?;
+            if Some(revision) != self.matcher_revision {
+                return Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "Resource subscription policy changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_visibility(&self, emitted: &AbsoluteUri) -> McpResult<()> {
+        self.context.ensure_live()?;
+        if !self.context.is_resource_enabled(self.parent.as_str())
+            || !self.context.is_resource_enabled(emitted.as_str())
+        {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Resource subscription visibility changed",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks matching and current authority without invoking a reader or
+    /// holding a registry lock. Call both before enqueue and before delivery.
+    pub(crate) fn validate_event(&self, emitted: &AbsoluteUri) -> McpResult<bool> {
+        self.context.ensure_live()?;
+        if !self.context.is_resource_enabled(self.parent.as_str()) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Resource subscription visibility changed",
+            ));
+        }
+        let Some(parent) = self
+            .router
+            .resolve_resource_for_era(self.parent.as_str(), Some(ProtocolEra::Modern2026))
+        else {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Resource subscription registration changed",
+            ));
+        };
+        if !self.owns(&parent) {
+            return Err(McpError::new(
+                McpErrorCode::ResourceForbidden,
+                "Resource subscription registration changed",
+            ));
+        }
+        self.check_revision()?;
+        let Some(child) = self
+            .router
+            .resolve_resource_for_era(emitted.as_str(), Some(ProtocolEra::Modern2026))
+        else {
+            return Ok(false);
+        };
+        if !self.owns(&child) {
+            return Ok(false);
+        }
+        let exact = emitted == &self.parent;
+        if self.matcher.is_none() && !exact {
+            return Ok(false);
+        }
+        if let Some(matcher) = &self.matcher {
+            if !exact {
+                let matched = crate::catch_extension_unwind(|| {
+                    matcher.matches(&self.context, &self.parent, emitted)
+                })
+                .map_err(|_| crate::extension_panic_error("resource_subscription_matching"))?
+                .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
+                self.context.ensure_live()?;
+                self.check_revision()?;
+                if !self.context.is_resource_enabled(self.parent.as_str()) {
+                    return Err(McpError::new(
+                        McpErrorCode::ResourceForbidden,
+                        "Resource subscription visibility changed",
+                    ));
+                }
+                if !matched {
+                    return Ok(false);
+                }
+            }
+            self.check_visibility(emitted)?;
+            let authorized = crate::catch_extension_unwind(|| {
+                matcher.authorize(&self.context, &self.parent, emitted)
+            })
+            .map_err(|_| crate::extension_panic_error("resource_subscription_authorization"))?
+            .map_err(|error| sanitize_handler_error(self.context.cx(), "resource", error))?;
+            self.check_visibility(emitted)?;
+            self.check_revision()?;
+            if !authorized {
+                return Err(McpError::new(
+                    McpErrorCode::ResourceForbidden,
+                    "Resource subscription is no longer authorized",
+                ));
+            }
+        }
+        self.check_visibility(emitted)?;
+        self.check_revision()?;
+        Ok(true)
+    }
+}
+
 struct ResolvedResource<'a> {
     handler: &'a BoxedResourceHandler,
+    registration_kind: ResourceRegistrationKind,
+    registration_key: &'a str,
     params: UriParams,
     final_enabled: bool,
     legacy_enabled: bool,
@@ -12733,6 +12918,442 @@ mod router_tests {
                 text: Some("content".to_string()),
                 blob: None,
             }])
+        }
+    }
+
+    mod resource_subscription_tests {
+        use super::*;
+
+        const PARENT: &str = "sub://project/root";
+        const CHILD: &str = "sub://project/root/child";
+
+        struct Policy {
+            revision: AtomicU64,
+            allowed: AtomicBool,
+            registrations: AtomicUsize,
+            authorizations: AtomicUsize,
+            matches: AtomicUsize,
+            panic_stage: AtomicUsize,
+            error_stage: AtomicUsize,
+            revise_during_match: AtomicBool,
+            revise_during_authorize: AtomicBool,
+        }
+
+        impl Policy {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    revision: AtomicU64::new(7),
+                    allowed: AtomicBool::new(true),
+                    registrations: AtomicUsize::new(0),
+                    authorizations: AtomicUsize::new(0),
+                    matches: AtomicUsize::new(0),
+                    panic_stage: AtomicUsize::new(0),
+                    error_stage: AtomicUsize::new(0),
+                    revise_during_match: AtomicBool::new(false),
+                    revise_during_authorize: AtomicBool::new(false),
+                })
+            }
+
+            fn private_error() -> McpError {
+                McpError::with_data(
+                    McpErrorCode::InternalError,
+                    "private provider credential",
+                    serde_json::json!({"private": "provider state"}),
+                )
+            }
+        }
+
+        impl ResourceSubscriptionMatcher for Policy {
+            fn revision(&self) -> u64 {
+                assert_ne!(
+                    self.panic_stage.load(Ordering::SeqCst),
+                    2,
+                    "private policy detail"
+                );
+                self.revision.load(Ordering::SeqCst)
+            }
+
+            fn authorize(
+                &self,
+                ctx: &McpContext,
+                subscribed: &AbsoluteUri,
+                emitted: &AbsoluteUri,
+            ) -> McpResult<bool> {
+                assert_eq!(ctx.request_id(), 901);
+                assert_eq!(subscribed.as_str(), PARENT);
+                assert!(emitted.as_str() == PARENT || emitted.as_str() == CHILD);
+                assert_ne!(
+                    self.panic_stage.load(Ordering::SeqCst),
+                    3,
+                    "private policy detail"
+                );
+                if self.error_stage.load(Ordering::SeqCst) == 3 {
+                    return Err(Self::private_error());
+                }
+                self.authorizations.fetch_add(1, Ordering::SeqCst);
+                if self.revise_during_authorize.load(Ordering::SeqCst) {
+                    self.revision.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(self.allowed.load(Ordering::SeqCst))
+            }
+
+            fn matches(
+                &self,
+                ctx: &McpContext,
+                subscribed: &AbsoluteUri,
+                emitted: &AbsoluteUri,
+            ) -> McpResult<bool> {
+                assert_eq!(ctx.request_id(), 901);
+                assert_eq!(subscribed.as_str(), PARENT);
+                assert_ne!(
+                    self.panic_stage.load(Ordering::SeqCst),
+                    4,
+                    "private policy detail"
+                );
+                if self.error_stage.load(Ordering::SeqCst) == 4 {
+                    return Err(Self::private_error());
+                }
+                self.matches.fetch_add(1, Ordering::SeqCst);
+                if self.revise_during_match.load(Ordering::SeqCst) {
+                    self.revision.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(emitted.as_str() == CHILD)
+            }
+        }
+
+        struct Provider(Arc<Policy>, bool);
+
+        impl ResourceHandler for Provider {
+            fn definition(&self) -> Resource {
+                NamedResource::new(PARENT).definition()
+            }
+
+            fn template(&self) -> Option<ResourceTemplate> {
+                if !self.1 {
+                    return None;
+                }
+                Some(ResourceTemplate {
+                    uri_template: "sub://project/{+path}".to_owned(),
+                    name: "subscription-provider".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                })
+            }
+
+            fn subscription_matcher(
+                &self,
+                _ctx: &McpContext,
+                subscribed: &AbsoluteUri,
+            ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+                assert_eq!(subscribed.as_str(), PARENT);
+                assert_ne!(
+                    self.0.panic_stage.load(Ordering::SeqCst),
+                    1,
+                    "private policy detail"
+                );
+                if self.0.error_stage.load(Ordering::SeqCst) == 1 {
+                    return Err(Policy::private_error());
+                }
+                self.0.registrations.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(self.0.clone()))
+            }
+
+            fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+                panic!("subscription admission must never invoke the resource reader")
+            }
+        }
+
+        fn context() -> McpContext {
+            McpContext::with_state(Cx::for_testing(), 901, SessionState::new())
+        }
+
+        fn fixture() -> (
+            Arc<Router>,
+            McpContext,
+            Arc<Policy>,
+            ResourceSubscriptionBinding,
+        ) {
+            let policy = Policy::new();
+            let mut router = Router::new();
+            router
+                .add_resource_with_behavior(
+                    Provider(policy.clone(), true),
+                    crate::DuplicateBehavior::Error,
+                )
+                .unwrap();
+            let router = Arc::new(router);
+            let ctx = context();
+            let binding = router
+                .bind_resource_subscription(&ctx, &AbsoluteUri::parse(PARENT).unwrap())
+                .unwrap()
+                .unwrap();
+            (router, ctx, policy, binding)
+        }
+
+        #[test]
+        fn resource_subscription_exact_binding_omits_unknown_legacy_and_disabled_resources() {
+            let mut router = Router::new();
+            router.add_resource(NamedResource::new(PARENT));
+            router.add_resource(NamedResource::new(CHILD));
+            router.add_legacy_resource(NamedResource::new("sub://project/legacy"));
+            let router = Arc::new(router);
+            let ctx = context();
+            let parent = AbsoluteUri::parse(PARENT).unwrap();
+            let binding = router
+                .bind_resource_subscription(&ctx, &parent)
+                .unwrap()
+                .unwrap();
+            assert_eq!(binding.parent_uri(), &parent);
+            assert!(binding.validate_event(&parent).unwrap());
+            assert!(
+                !binding
+                    .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                    .unwrap()
+            );
+            for uri in ["sub://project/unknown", "sub://project/legacy"] {
+                assert!(
+                    router
+                        .bind_resource_subscription(&ctx, &AbsoluteUri::parse(uri).unwrap())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert!(ctx.disable_resource(PARENT));
+            assert!(
+                router
+                    .bind_resource_subscription(&ctx, &parent)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                binding.validate_event(&parent).unwrap_err().code,
+                McpErrorCode::ResourceForbidden
+            );
+        }
+
+        #[test]
+        fn resource_subscription_provider_relation_preserves_exact_uri_spelling() {
+            let (_, _, policy, binding) = fixture();
+            assert!(
+                binding
+                    .validate_event(&AbsoluteUri::parse(PARENT).unwrap())
+                    .unwrap()
+            );
+            assert!(
+                binding
+                    .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                    .unwrap()
+            );
+            let authorizations = policy.authorizations.load(Ordering::SeqCst);
+            for uri in [
+                "sub://project/root/sibling",
+                "sub://project/rootish/child",
+                "sub://project/root/../root/child",
+                "sub://project/root/%63hild",
+                "sub://PROJECT/root/child",
+                "sub://project:80/root/child",
+                "other://project/root/child",
+            ] {
+                assert!(
+                    !binding
+                        .validate_event(&AbsoluteUri::parse(uri).unwrap())
+                        .unwrap(),
+                    "{uri}"
+                );
+            }
+            assert_eq!(policy.authorizations.load(Ordering::SeqCst), authorizations);
+            assert_eq!(policy.registrations.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn resource_subscription_cross_registration_cannot_borrow_a_provider_relation() {
+            let policy = Policy::new();
+            let mut router = Router::new();
+            router
+                .add_resource_with_behavior(
+                    Provider(policy.clone(), false),
+                    crate::DuplicateBehavior::Error,
+                )
+                .unwrap();
+            router.add_resource(NamedResource::new(CHILD));
+            let router = Arc::new(router);
+            let binding = router
+                .bind_resource_subscription(&context(), &AbsoluteUri::parse(PARENT).unwrap())
+                .unwrap()
+                .unwrap();
+            assert!(
+                !binding
+                    .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                    .unwrap()
+            );
+            assert_eq!(policy.matches.load(Ordering::SeqCst), 0);
+            assert_eq!(policy.authorizations.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn resource_subscription_rechecks_revocation_visibility_and_revision_before_delivery() {
+            for change in 0..6 {
+                let (_, ctx, policy, binding) = fixture();
+                let child = AbsoluteUri::parse(CHILD).unwrap();
+                assert!(binding.validate_event(&child).unwrap(), "enqueue admission");
+                match change {
+                    0 => {
+                        assert!(ctx.disable_resource(PARENT));
+                    }
+                    1 => {
+                        assert!(ctx.disable_resource(CHILD));
+                    }
+                    2 => policy.allowed.store(false, Ordering::SeqCst),
+                    3 => {
+                        policy.revision.fetch_add(1, Ordering::SeqCst);
+                    }
+                    4 => policy.revise_during_match.store(true, Ordering::SeqCst),
+                    5 => policy.revise_during_authorize.store(true, Ordering::SeqCst),
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    binding.validate_event(&child).unwrap_err().code,
+                    McpErrorCode::ResourceForbidden,
+                    "delivery change {change}"
+                );
+            }
+            let (_, _, policy, binding) = fixture();
+            policy.allowed.store(false, Ordering::SeqCst);
+            assert_eq!(
+                binding
+                    .validate_event(binding.parent_uri())
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::ResourceForbidden,
+                "exact updates still require provider authorization"
+            );
+        }
+
+        #[test]
+        fn resource_subscription_callback_panics_are_contained_without_private_diagnostics() {
+            for stage in 1..=4 {
+                let (router, ctx, policy, binding) = fixture();
+                policy.panic_stage.store(stage, Ordering::SeqCst);
+                let error = if stage == 1 {
+                    router
+                        .bind_resource_subscription(&ctx, binding.parent_uri())
+                        .err()
+                        .unwrap()
+                } else {
+                    binding
+                        .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                        .unwrap_err()
+                };
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert!(!error.message.contains("private policy detail"));
+                assert!(ctx.ensure_live().is_ok());
+            }
+        }
+
+        #[test]
+        fn resource_subscription_internal_errors_use_the_resource_redaction_boundary() {
+            for stage in [1, 3, 4] {
+                let (router, ctx, policy, binding) = fixture();
+                let child = AbsoluteUri::parse(CHILD).unwrap();
+                assert!(binding.validate_event(&child).unwrap());
+                policy.error_stage.store(stage, Ordering::SeqCst);
+                let error = if stage == 1 {
+                    router
+                        .bind_resource_subscription(&ctx, binding.parent_uri())
+                        .err()
+                        .unwrap()
+                } else {
+                    binding.validate_event(&child).unwrap_err()
+                };
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, SANITIZED_HANDLER_PANIC_MESSAGE);
+                assert!(error.data.is_none());
+                assert!(ctx.ensure_live().is_ok());
+                policy.error_stage.store(0, Ordering::SeqCst);
+                assert!(binding.validate_event(&child).unwrap());
+            }
+        }
+
+        #[test]
+        fn resource_subscription_blocking_adapter_retains_provider_authority() {
+            let policy = Policy::new();
+            let wrapped = crate::providers::BlockingResource::from_sync_hooks(
+                Provider(policy.clone(), true),
+                crate::providers::BlockingHandlerLane::new(1).unwrap(),
+            )
+            .unwrap();
+            let mut router = Router::new();
+            router.add_resource(wrapped);
+            let router = Arc::new(router);
+            let binding = router
+                .bind_resource_subscription(&context(), &AbsoluteUri::parse(PARENT).unwrap())
+                .unwrap()
+                .unwrap();
+            assert!(
+                binding
+                    .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                    .unwrap()
+            );
+            policy.allowed.store(false, Ordering::SeqCst);
+            assert!(
+                binding
+                    .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn resource_subscription_mount_translates_parent_child_and_revision() {
+            let policy = Policy::new();
+            let parent = AbsoluteUri::parse(format!("mounted:{PARENT}")).unwrap();
+            let child = AbsoluteUri::parse(format!("mounted:{CHILD}")).unwrap();
+            let wrapper = crate::handler::MountedResourceHandler::with_template(
+                Box::new(Provider(policy.clone(), true)),
+                PARENT.to_owned(),
+                parent.as_str().to_owned(),
+                ResourceTemplate {
+                    uri_template: "mounted:sub://project/{+path}".to_owned(),
+                    name: "mounted-provider".to_owned(),
+                    description: None,
+                    mime_type: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                },
+            );
+            let ctx = context();
+            let matcher = wrapper
+                .subscription_matcher(&ctx, &parent)
+                .unwrap()
+                .unwrap();
+            assert!(matcher.matches(&ctx, &parent, &child).unwrap());
+            assert!(matcher.authorize(&ctx, &parent, &child).unwrap());
+            assert!(
+                matcher
+                    .matches(&ctx, &parent, &AbsoluteUri::parse(CHILD).unwrap())
+                    .is_err()
+            );
+            let mut router = Router::new();
+            router.add_resource(wrapper);
+            let router = Arc::new(router);
+            let binding = router
+                .bind_resource_subscription(&ctx, &parent)
+                .unwrap()
+                .unwrap();
+            assert!(binding.validate_event(&child).unwrap());
+            assert!(
+                !binding
+                    .validate_event(&AbsoluteUri::parse(CHILD).unwrap())
+                    .unwrap()
+            );
+            policy.revision.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                binding.validate_event(&child).unwrap_err().code,
+                McpErrorCode::ResourceForbidden
+            );
         }
     }
 

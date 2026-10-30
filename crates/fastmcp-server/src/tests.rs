@@ -574,6 +574,290 @@ fn error_tool(_ctx: &McpContext) -> McpResult<String> {
     Err(McpError::invalid_params("Intentional error for testing"))
 }
 
+#[cfg(feature = "proxy")]
+mod provider_resource_subscription_http_tests {
+    use super::*;
+    use crate::ResourceSubscriptionMatcher;
+    use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+    use fastmcp_client::http_executor::{
+        ClientHttpConnectionError, ModernHttpSubscriptionListenError,
+        ModernHttpSubscriptionListenEvent,
+    };
+    use fastmcp_client::{
+        ClientProtocolPlan, HttpClient, HttpClientError, ResourceSubscriptionRelations,
+        SubscriptionListenRequest,
+    };
+    use fastmcp_core::CanonicalHttpUrl;
+    use fastmcp_protocol::common_types::AbsoluteUri;
+    use fastmcp_protocol::protocol_policy::ProtocolPolicy;
+    use fastmcp_protocol::{ServerNotification, SubscriptionFilter};
+
+    const PARENT: &str = "catalog://http/items/parent";
+    const CHILD: &str = "catalog://http/items/child";
+    const TEMPLATE: &str = "catalog://http/items/{item}";
+
+    struct StopHttpServer(Cx);
+
+    impl Drop for StopHttpServer {
+        fn drop(&mut self) {
+            self.0
+                .cancel_with(CancelKind::User, Some("Resource HTTP scenario complete"));
+        }
+    }
+
+    struct RelatedResource;
+
+    impl ResourceSubscriptionMatcher for RelatedResource {
+        fn revision(&self) -> u64 {
+            1
+        }
+
+        fn authorize(
+            &self,
+            ctx: &McpContext,
+            subscribed: &AbsoluteUri,
+            emitted: &AbsoluteUri,
+        ) -> McpResult<bool> {
+            ctx.ensure_live()?;
+            Ok(subscribed.as_str() == PARENT && matches!(emitted.as_str(), PARENT | CHILD))
+        }
+
+        fn matches(
+            &self,
+            ctx: &McpContext,
+            subscribed: &AbsoluteUri,
+            emitted: &AbsoluteUri,
+        ) -> McpResult<bool> {
+            ctx.ensure_live()?;
+            Ok(subscribed.as_str() == PARENT && emitted.as_str() == CHILD)
+        }
+    }
+
+    impl ResourceHandler for RelatedResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: TEMPLATE.to_owned(),
+                name: "Related resources".to_owned(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            Some(ResourceTemplate {
+                uri_template: TEMPLATE.to_owned(),
+                name: "Related resources".to_owned(),
+                description: None,
+                mime_type: None,
+                icon: None,
+                version: None,
+                tags: vec![],
+            })
+        }
+
+        fn subscription_matcher(
+            &self,
+            _ctx: &McpContext,
+            _subscribed: &AbsoluteUri,
+        ) -> McpResult<Option<Arc<dyn ResourceSubscriptionMatcher>>> {
+            Ok(Some(Arc::new(Self)))
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            Err(McpError::internal_error(
+                "Subscriptions must not read resource content",
+            ))
+        }
+    }
+
+    async fn observe_child(cx: &Cx, target: String, admit_relation: bool) -> Result<(), String> {
+        let plan = ClientProtocolPlan::http(
+            ProtocolPolicy::ModernOnly,
+            Some(CanonicalHttpUrl::parse(&target).map_err(|error| error.to_string())?),
+            None,
+            None,
+            "resource-subscription-http".to_owned(),
+            "resource-subscription-http".to_owned(),
+            "native-http".to_owned(),
+            1,
+            1,
+            0,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut client = HttpClient::connect(
+            cx,
+            plan,
+            ClientInfo {
+                name: "resource-subscription-http".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let filter = SubscriptionFilter {
+            resource_subscriptions: Some(vec![PARENT.to_owned()]),
+            ..SubscriptionFilter::default()
+        };
+        let mut request = SubscriptionListenRequest::new(filter.clone());
+        if admit_relation {
+            request = request.with_resource_relations(
+                ResourceSubscriptionRelations::new([(PARENT, CHILD)])
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let limits = fastmcp_client::sse::SseLimits::new(4_096, 8_192, 16)
+            .ok_or_else(|| "Invalid SSE test bounds".to_owned())?;
+        client
+            .start_subscriptions_listener(cx, request, limits)
+            .await
+            .map_err(|error| error.to_string())?;
+        let listener_id = client
+            .active_http_subscription_request_id()
+            .cloned()
+            .ok_or_else(|| "The public client lost its live listener".to_owned())?;
+        match client.next_http_subscription_event(cx).await {
+            Ok(Some(ModernHttpSubscriptionListenEvent::Acknowledged { accepted_filter }))
+                if accepted_filter == filter => {}
+            other => return Err(format!("Unexpected resource acknowledgement: {other:?}")),
+        }
+
+        // Publish through a real tools/call while the same public client owns
+        // its incremental SSE response. No registry or transport fixture is used.
+        let result = client
+            .call_tool(cx, "touch_file", serde_json::json!({"uri": CHILD}))
+            .await
+            .map_err(|error| error.to_string())?;
+        let result: serde_json::Value =
+            serde_json::from_str(&result.encode().map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        if result
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            != Some("notified")
+        {
+            return Err(format!(
+                "The shipped server did not publish the provider child: {result}"
+            ));
+        }
+
+        let event = client.next_http_subscription_event(cx).await;
+        if admit_relation {
+            match event {
+                Ok(Some(ModernHttpSubscriptionListenEvent::Notification(
+                    ServerNotification::ResourceUpdated(update),
+                ))) if update.uri.as_str() == CHILD
+                    && update
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("io.modelcontextprotocol/subscriptionId"))
+                        == Some(
+                            &serde_json::to_value(&listener_id)
+                                .map_err(|error| error.to_string())?,
+                        ) => {}
+                other => return Err(format!("The provider child was not delivered: {other:?}")),
+            }
+            if client.final_result_cache_stats().invalidations != 1
+                || !client.cancel_http_subscription(&listener_id)
+            {
+                return Err(
+                    "Accepted child did not invalidate its cache or retire its listener".to_owned(),
+                );
+            }
+        } else {
+            if !matches!(
+                event,
+                Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::SubscriptionsListen(
+                        ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter
+                    )
+                ))
+            ) {
+                return Err(format!("An unconfigured child was not refused: {event:?}"));
+            }
+            if client.final_result_cache_stats().invalidations != 0
+                || client.active_http_subscription_request_id().is_some()
+            {
+                return Err(
+                    "Refused child changed cache state or retained its failed listener".to_owned(),
+                );
+            }
+        }
+        client
+            .request_final_core(cx, "tools/list", serde_json::json!({}))
+            .await
+            .map_err(|error| {
+                format!("Independent request failed after listener retirement: {error}")
+            })?;
+        cx.checkpoint().map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn probe(admit_relation: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("HTTP test reactor"))
+            .blocking_threads(4, crate::MAX_DISPATCH_QUEUE_DEPTH)
+            .build()
+            .expect("HTTP test runtime");
+        let result: Result<(), String> = runtime.block_on(async move {
+            let cx = Cx::current().ok_or_else(|| "Missing caller runtime context".to_owned())?;
+            let bound = Server::new("provider-resource-http", "1.0.0")
+                .resource(RelatedResource)
+                .tool(TouchFile)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let target = format!(
+                "http://{}/mcp",
+                bound.local_addr().map_err(|error| error.to_string())?
+            );
+            let server_cx = cx.clone();
+            let mut client_task = cx
+                .spawn(move |client_cx| async move {
+                    let _stop_server = StopHttpServer(server_cx);
+                    let deadline = client_cx.now().saturating_add_nanos(10_000_000_000);
+                    let result = asupersync::time::timeout_at(
+                        deadline,
+                        observe_child(&client_cx, target, admit_relation),
+                    )
+                    .await
+                    .map_err(|_| "Resource subscription HTTP scenario timed out".to_owned())
+                    .and_then(std::convert::identity);
+                    // The guard closes the listener on success, refusal,
+                    // timeout, or unwind. Assertions occur after owned joins.
+                    result
+                })
+                .map_err(|error| error.to_string())?;
+            let served = bound.serve(&cx).await;
+            let observed = client_task.join(&cx).await;
+            let shutdown = served.map_err(|error| error.to_string())?;
+            if let crate::HttpServerShutdown::Nonquiescent(mut retained) = shutdown {
+                let settled = retained.settle_for(Duration::from_secs(1)).await;
+                return Err(format!(
+                    "HTTP test retained connection children: {settled:?}"
+                ));
+            }
+            observed.map_err(|error| error.to_string())?
+        });
+        result.expect("Provider resource subscription must complete through shipped HTTP APIs");
+    }
+
+    #[test]
+    fn provider_resource_subscription_http_end_to_end_positive() {
+        probe(true);
+    }
+
+    #[test]
+    fn provider_resource_subscription_http_end_to_end_planted_negative() {
+        // Only the request-local client relation differs from the positive.
+        probe(false);
+    }
+}
+
 // ============================================================================
 // Test Resource Handlers
 // ============================================================================
