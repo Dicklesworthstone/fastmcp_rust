@@ -4174,7 +4174,12 @@ impl ProxyFinalTaskListener for ProxyIncrementalStdioFinalTaskListener {
                 if let Some(event) = event {
                     return Ok(event);
                 }
-                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+                if let Err(error) = wait_for_proxy_listener_poll(cx, request_cancellation).await {
+                    let _ = self
+                        .client
+                        .with_backend(|backend| backend.cancel_incremental_final_task_listener(cx));
+                    return Err(error);
+                }
             }
         })
     }
@@ -4276,7 +4281,12 @@ impl ProxyCatalogListener for ProxyIncrementalStdioCatalogListener {
                         StdioSubscriptionEvent::Terminal => ProxyCatalogListenerEvent::Terminal,
                     });
                 }
-                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+                if let Err(error) = wait_for_proxy_listener_poll(cx, request_cancellation).await {
+                    let _ = self
+                        .client
+                        .with_backend(|backend| backend.cancel_incremental_catalog_listener(cx));
+                    return Err(error);
+                }
             }
         })
     }
@@ -8170,6 +8180,13 @@ impl ProxyBackend for ProxyHttpClient {
         }
     }
 
+    fn cancel_incremental_catalog_listener(&mut self, _cx: &Cx) -> McpResult<()> {
+        // The response body owns modern HTTP cancellation; dropping this one
+        // listener closes only its stream, including after a denied wait.
+        self.live_catalog_listener = None;
+        Ok(())
+    }
+
     #[cfg(feature = "tasks")]
     fn start_incremental_final_task_listener(
         &mut self,
@@ -8343,6 +8360,12 @@ impl ProxyBackend for ProxyHttpClient {
                 Ok(Some(ProxyFinalTaskListenerEvent::Terminal))
             }
         }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn cancel_incremental_final_task_listener(&mut self, _cx: &Cx) -> McpResult<()> {
+        self.live_task_listener = None;
+        Ok(())
     }
 }
 
@@ -8828,6 +8851,81 @@ async fn await_proxy_final_task_listener_event_or_cancellation(
 /// the next upstream SSE frame.
 const PROXY_OPERATION_CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// One bounded wait registered exclusively on the explicit caller's timer.
+/// Only timer bookkeeping runs under the temporary binding: upstream futures
+/// and application callbacks retain the ambient context that polled them.
+struct ProxyPollTimer {
+    sleep: Pin<Box<asupersync::time::Sleep>>,
+}
+
+impl ProxyPollTimer {
+    fn new(cx: &Cx) -> Self {
+        Self {
+            sleep: Box::pin(asupersync::time::sleep(
+                cx.now(),
+                PROXY_OPERATION_CANCEL_POLL,
+            )),
+        }
+    }
+
+    fn poll(
+        &mut self,
+        cx: &Cx,
+        context: Option<&McpContext>,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> Poll<McpResult<()>> {
+        if !cx.capabilities().time || Cx::current().is_some_and(|host| !host.capabilities().time) {
+            return Poll::Ready(Err(McpError::internal_error(
+                "Proxy waits require caller time capability",
+            )));
+        }
+        let budget = context.map_or_else(|| cx.budget(), |ctx| cx.budget().meet(ctx.budget()));
+        let _current = Cx::set_current(Some(cx.clone()));
+        if let Some(deadline) = budget.deadline
+            && deadline < self.sleep.deadline()
+        {
+            // Shared framework ceilings may tighten after registration. Move
+            // their wake earlier when observed, without extending the wait.
+            self.sleep.as_mut().get_mut().reset(deadline);
+        }
+        self.sleep.as_mut().poll(task_cx).map(Ok)
+    }
+
+    fn restart(&mut self, cx: &Cx) {
+        self.sleep.as_mut().set(asupersync::time::sleep(
+            cx.now(),
+            PROXY_OPERATION_CANCEL_POLL,
+        ));
+    }
+}
+
+/// Waits between bounded listener polls while registering an immediate wake
+/// for request cancellation. A silent upstream must not delay owner cleanup
+/// until the polling clock advances or another upstream frame arrives.
+async fn wait_for_proxy_listener_poll(
+    cx: &Cx,
+    request_cancellation: &fastmcp_core::McpRequestCancellation,
+) -> McpResult<()> {
+    let mut timer = ProxyPollTimer::new(cx);
+    let mut cancellation = std::pin::pin!(request_cancellation.cancelled());
+    std::future::poll_fn(|task_cx| {
+        if cx.checkpoint().is_err()
+            || request_cancellation.is_cancel_requested()
+            || cancellation.as_mut().poll(task_cx).is_ready()
+        {
+            return Poll::Ready(Err(McpError::request_cancelled()));
+        }
+        let result = timer.poll(cx, None, task_cx);
+        if result.is_ready()
+            && (cx.checkpoint().is_err() || request_cancellation.is_cancel_requested())
+        {
+            return Poll::Ready(Err(McpError::request_cancelled()));
+        }
+        result
+    })
+    .await
+}
+
 async fn await_proxy_operation_with_cancellation_priority<T>(
     cx: &Cx,
     request_cancellation: &fastmcp_core::McpRequestCancellation,
@@ -8854,24 +8952,26 @@ async fn await_proxy_operation_with_cancellation_priority<T>(
     let mut cancellation_wait = Box::pin(async move {
         cancellation.cancelled().await;
     });
-    let mut cancel_poll = Box::pin(asupersync::time::sleep(
-        cx.now(),
-        PROXY_OPERATION_CANCEL_POLL,
-    ));
+    let mut cancel_poll = ProxyPollTimer::new(cx);
     std::future::poll_fn(move |task_cx| {
         let cancellation_ready = cancelled() || cancellation_wait.as_mut().poll(task_cx).is_ready();
         if cancellation_ready && retain_ready.is_none() {
             return Poll::Ready(Err(McpError::request_cancelled()));
         }
         let Poll::Ready(result) = operation.as_mut().poll(task_cx) else {
-            if cancellation_ready {
+            if cancellation_ready
+                || cancelled()
+                || cancellation_wait.as_mut().poll(task_cx).is_ready()
+            {
                 return Poll::Ready(Err(McpError::request_cancelled()));
             }
-            if cancel_poll.as_mut().poll(task_cx).is_ready() {
-                cancel_poll = Box::pin(asupersync::time::sleep(
-                    cx.now(),
-                    PROXY_OPERATION_CANCEL_POLL,
-                ));
+            let timer_ready = match cancel_poll.poll(cx, context, task_cx) {
+                Poll::Ready(Ok(())) => true,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => false,
+            };
+            if timer_ready {
+                cancel_poll.restart(cx);
                 // Poll the replacement on the next turn. It may already be
                 // ready; discarding that result would leave a completed Sleep
                 // to be polled again. The wake prevents parking before the new
@@ -11480,7 +11580,10 @@ impl ProxyClient {
                 })?;
                 return Err(McpError::request_cancelled());
             }
-            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+            if let Err(error) = wait_for_proxy_listener_poll(cx, request_cancellation).await {
+                self.with_backend(|backend| backend.cancel_incremental_catalog_listener(cx))?;
+                return Err(error);
+            }
         }
     }
 
@@ -11537,7 +11640,10 @@ impl ProxyClient {
                 })?;
                 return Err(McpError::request_cancelled());
             }
-            asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(20)).await;
+            if let Err(error) = wait_for_proxy_listener_poll(cx, request_cancellation).await {
+                self.with_backend(|backend| backend.cancel_incremental_final_task_listener(cx))?;
+                return Err(error);
+            }
         };
         match event {
             ProxyFinalTaskListenerEvent::Acknowledged(filter) => {
@@ -15445,6 +15551,319 @@ IFS= read -r end
         assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
+    #[derive(Default)]
+    struct ProxyTimerWake(std::sync::atomic::AtomicUsize);
+
+    impl ProxyTimerWake {
+        fn count(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl std::task::Wake for ProxyTimerWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn proxy_custom_async_wait_deadline_probe(complete_before_deadline: bool) {
+        use std::future::Future;
+
+        // The same public request runs without an ambient Cx, under an
+        // unrelated clock, and under an unrelated cancelled request. Neither
+        // ambient context may own or prematurely complete this request's wait.
+        for ambient_mode in 0..3 {
+            for deadline_source in 0..3 {
+                let clock = Arc::new(asupersync::time::VirtualClock::new());
+                let timer =
+                    asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(timer.clone())
+                    .build()
+                    .unwrap();
+                let deadline = asupersync::Time::from_nanos(500_000);
+                let cx = runtime.request_cx_with_budget(
+                    asupersync::Budget::INFINITE.with_deadline(if deadline_source == 0 {
+                        deadline
+                    } else {
+                        asupersync::Time::from_secs(1)
+                    }),
+                );
+                let ctx = McpContext::new(cx.clone(), 4410);
+                let ctx = match deadline_source {
+                    0 => ctx,
+                    1 => ctx.with_operation_deadline(Some(deadline)),
+                    _ => ctx
+                        .with_budget_ceiling(asupersync::Budget::INFINITE.with_deadline(deadline)),
+                };
+                let foreign_clock = Arc::new(asupersync::time::VirtualClock::new());
+                foreign_clock.advance_to(asupersync::Time::from_secs(100));
+                let foreign_timer =
+                    asupersync::time::TimerDriverHandle::with_virtual_clock(foreign_clock);
+                let foreign_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(foreign_timer.clone())
+                    .build()
+                    .unwrap();
+                let foreign = foreign_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                foreign.set_cancel_requested(ambient_mode == 2);
+                let ambient = Cx::set_current((ambient_mode != 0).then_some(foreign));
+                let state = Arc::new(Mutex::new(OwnedAsyncState {
+                    hold: true,
+                    ..OwnedAsyncState::default()
+                }));
+                let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+                let mut request =
+                    Box::pin(proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({})));
+                let wakes = Arc::new(ProxyTimerWake::default());
+                let waker = std::task::Waker::from(Arc::clone(&wakes));
+                let mut task_cx = std::task::Context::from_waker(&waker);
+                assert!(request.as_mut().poll(&mut task_cx).is_pending());
+                assert_eq!(timer.next_deadline(), Some(deadline));
+                assert_eq!(timer.pending_count(), 1);
+                assert_eq!(foreign_timer.pending_count(), 0);
+                let before = wakes.count();
+                clock.advance_to(asupersync::Time::from_nanos(499_999));
+                assert_eq!(timer.process_timers(), 0);
+                assert_eq!(wakes.count(), before);
+                assert!(request.as_mut().poll(&mut task_cx).is_pending());
+                if complete_before_deadline {
+                    let upstream_waker = {
+                        let mut state = state.lock().unwrap();
+                        state.hold = false;
+                        state.waker.take().unwrap()
+                    };
+                    upstream_waker.wake();
+                } else {
+                    clock.advance_to(deadline);
+                    assert_eq!(timer.process_timers(), 1);
+                }
+                assert!(
+                    wakes.count() > before,
+                    "completion must have a real wake source"
+                );
+                let std::task::Poll::Ready(result) = request.as_mut().poll(&mut task_cx) else {
+                    panic!(
+                        "the exact deadline or the earlier upstream reply must settle the request"
+                    );
+                };
+                if complete_before_deadline {
+                    assert!(result.unwrap().encode().unwrap().contains("owned"));
+                } else {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                }
+                drop(request);
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(foreign_timer.pending_count(), 0);
+                match Cx::current() {
+                    None => assert_eq!(ambient_mode, 0),
+                    Some(restored) => {
+                        assert_ne!(ambient_mode, 0);
+                        assert_eq!(restored.now(), asupersync::Time::from_secs(100));
+                        assert_eq!(restored.is_cancel_requested(), ambient_mode == 2);
+                    }
+                }
+                let state = state.lock().unwrap();
+                assert_eq!((state.prepared, state.executed, state.dropped), (1, 1, 1));
+                assert_eq!(state.synchronous_calls, 0);
+                assert!(!ctx.request_cancellation().is_cancel_requested());
+                assert!(!cx.is_cancel_requested());
+                drop(state);
+                drop(ambient);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+                assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(2)));
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_custom_async_wait_caller_deadline_positive() {
+        proxy_custom_async_wait_deadline_probe(true);
+    }
+
+    #[test]
+    fn proxy_custom_async_wait_caller_deadline_planted_negative() {
+        proxy_custom_async_wait_deadline_probe(false);
+    }
+
+    #[test]
+    fn proxy_custom_async_wait_rearms_for_shared_tightened_deadline() {
+        use std::future::Future;
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let ctx = McpContext::new(cx.clone(), 4411);
+        let ambient = Cx::set_current(None);
+        let state = Arc::new(Mutex::new(OwnedAsyncState {
+            hold: true,
+            ..OwnedAsyncState::default()
+        }));
+        let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+        let mut request =
+            Box::pin(proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({})));
+        let wakes = Arc::new(ProxyTimerWake::default());
+        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        assert!(request.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(
+            timer.next_deadline(),
+            Some(asupersync::Time::from_nanos(20_000_000))
+        );
+        let deadline = asupersync::Time::from_nanos(500_000);
+        let _ = ctx
+            .clone()
+            .with_budget_ceiling(asupersync::Budget::INFINITE.with_deadline(deadline));
+        clock.advance_to(asupersync::Time::from_nanos(250_000));
+        assert!(request.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(timer.next_deadline(), Some(deadline));
+        assert_eq!(timer.pending_count(), 1, "rearming removes the old timer");
+        let before = wakes.count();
+        clock.advance_to(asupersync::Time::from_nanos(499_999));
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(wakes.count(), before);
+        clock.advance_to(deadline);
+        assert_eq!(timer.process_timers(), 1);
+        assert!(wakes.count() > before);
+        let std::task::Poll::Ready(Err(error)) = request.as_mut().poll(&mut task_cx) else {
+            panic!("a shared framework deadline must retire the silent owned request");
+        };
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        drop(request);
+        assert_eq!(state.lock().unwrap().dropped, 1);
+        assert_eq!(timer.pending_count(), 0);
+        clock.advance_to(asupersync::Time::from_nanos(20_000_000));
+        assert_eq!(
+            timer.process_timers(),
+            0,
+            "the replaced timer cannot wake later"
+        );
+        assert!(!cx.is_cancel_requested());
+        assert!(Cx::current().is_none());
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    fn proxy_custom_async_wait_time_capability_probe(pending: bool) {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::future::Future;
+
+        for held_restriction in [false, true] {
+            let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::new(
+                asupersync::time::VirtualClock::new(),
+            ));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let ambient = Cx::set_current(Some(cx.clone()));
+            let held = if held_restriction {
+                let _restriction =
+                    Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                Cx::current().unwrap()
+            } else {
+                cx.clone()
+            };
+            let host_restriction = (!held_restriction)
+                .then(|| Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK));
+            let ctx = McpContext::new(held, 4412);
+            let state = Arc::new(Mutex::new(OwnedAsyncState {
+                hold: pending,
+                ..OwnedAsyncState::default()
+            }));
+            let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+            let mut request =
+                Box::pin(proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({})));
+            let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let std::task::Poll::Ready(result) = request.as_mut().poll(&mut task_cx) else {
+                panic!("denied timer authority cannot leave a request parked");
+            };
+            if pending {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert!(error.message.contains("time capability"));
+            } else {
+                assert!(result.unwrap().encode().unwrap().contains("owned"));
+            }
+            drop(request);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(state.lock().unwrap().dropped, 1);
+            assert_eq!(Cx::current().unwrap().capabilities().time, held_restriction);
+            assert!(!cx.is_cancel_requested());
+            drop(host_restriction);
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn proxy_custom_async_wait_time_capability_ready_positive() {
+        proxy_custom_async_wait_time_capability_probe(false);
+    }
+
+    #[test]
+    fn proxy_custom_async_wait_time_capability_pending_planted_negative() {
+        proxy_custom_async_wait_time_capability_probe(true);
+    }
+
+    #[test]
+    fn proxy_custom_async_wait_losing_time_retires_its_timer() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::future::Future;
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let ambient = Cx::set_current(Some(cx.clone()));
+        let ctx = McpContext::new(cx.clone(), 4413);
+        let state = Arc::new(Mutex::new(OwnedAsyncState {
+            hold: true,
+            ..OwnedAsyncState::default()
+        }));
+        let proxy = owned_async_proxy(&state, false, OwnedAsyncFault::None);
+        let mut request =
+            Box::pin(proxy.call_tool_typed_async(&ctx, "owned", serde_json::json!({})));
+        let wakes = Arc::new(ProxyTimerWake::default());
+        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        assert!(request.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(timer.pending_count(), 1);
+        let restriction = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+        let std::task::Poll::Ready(Err(error)) = request.as_mut().poll(&mut task_cx) else {
+            panic!("a wait must observe the polling host's tightened capability ceiling");
+        };
+        assert_eq!(error.code, McpErrorCode::InternalError);
+        drop(request);
+        assert_eq!(state.lock().unwrap().dropped, 1);
+        assert_eq!(timer.pending_count(), 0);
+        let before = wakes.count();
+        clock.advance_to(asupersync::Time::from_nanos(20_000_000));
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(wakes.count(), before);
+        assert!(!Cx::current().unwrap().capabilities().time);
+        assert!(!cx.is_cancel_requested());
+        drop(restriction);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
     #[test]
     fn proxy_custom_async_request_rejects_mismatched_result() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -17746,7 +18165,11 @@ IFS= read -r end
     }
 
     #[cfg(unix)]
-    fn proxy_incremental_listener_caller_runtime_probe(tasks: bool, interrupt: Option<bool>) {
+    fn proxy_incremental_listener_caller_runtime_probe(
+        tasks: bool,
+        interrupt: Option<bool>,
+        wait_failure: Option<bool>,
+    ) {
         use std::future::Future;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::task::Poll;
@@ -17846,11 +18269,23 @@ IFS= read -r end
                 }});
                 write_chunked_sse_event(&mut stream, format!("data: {ack}\n\n").as_bytes());
                 stream.flush().unwrap();
-                assert!(
-                    !released
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("caller releases terminal event")
-                );
+                if released
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("caller releases terminal event or retires the live stream")
+                {
+                    let mut byte = [0];
+                    match stream.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::BrokenPipe
+                            ) => {}
+                        other => panic!("retired listener must close its owned HTTP body: {other:?}"),
+                    }
+                    continue;
+                }
                 let terminal = serde_json::json!({"jsonrpc": "2.0", "id": request["id"], "result": {
                     "resultType": "complete", "_meta": {"io.modelcontextprotocol/subscriptionId": request["id"]}
                 }});
@@ -18004,6 +18439,49 @@ IFS= read -r end
                             .is_pending(),
                         "event read yields before peer terminal"
                     );
+                    if let Some(cancel) = wait_failure {
+                        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+                        let wakes = Arc::new(ProxyTimerWake::default());
+                        let waker = std::task::Waker::from(Arc::clone(&wakes));
+                        let mut task_cx = std::task::Context::from_waker(&waker);
+                        assert!(next.as_mut().poll(&mut task_cx).is_pending());
+                        let before = wakes.count();
+                        let restriction = (!cancel).then(|| {
+                            Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK)
+                        });
+                        if cancel {
+                            assert!(cancellation.cancel());
+                            assert!(wakes.count() > before);
+                        }
+                        let Poll::Ready(Err(error)) = next.as_mut().poll(&mut task_cx) else {
+                            panic!("a silent HTTP listener must release its request-owned wait");
+                        };
+                        assert_eq!(
+                            error.code,
+                            if cancel {
+                                McpErrorCode::RequestCancelled
+                            } else {
+                                McpErrorCode::InternalError
+                            }
+                        );
+                        drop(next);
+                        drop(restriction);
+                        // A retired stream must release its installation slot.
+                        // Preparing a successor reserves no network effects.
+                        proxy.with_backend(|backend| {
+                            #[cfg(feature = "tasks")]
+                            if tasks {
+                                assert!(backend.prepare_incremental_final_task_listener(filter.clone())?.is_some());
+                                return backend.abort_incremental_final_task_listener_opening();
+                            }
+                            assert!(backend.prepare_incremental_catalog_listener(filter.clone())?.is_some());
+                            backend.abort_incremental_catalog_listener_opening()
+                        }).unwrap();
+                        assert!(!cx.is_cancel_requested());
+                        release.send(true).unwrap();
+                        return;
+                    }
                     drop(next);
                     let mut sibling = root
                         .spawn(move |_| async move {
@@ -18031,9 +18509,159 @@ IFS= read -r end
     #[cfg(unix)]
     #[test]
     fn proxy_incremental_listener_caller_runtime_positive() {
-        proxy_incremental_listener_caller_runtime_probe(false, None);
+        proxy_incremental_listener_caller_runtime_probe(false, None, None);
         #[cfg(feature = "tasks")]
-        proxy_incremental_listener_caller_runtime_probe(true, None);
+        proxy_incremental_listener_caller_runtime_probe(true, None, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_incremental_http_listener_wait_failure_closes_stream() {
+        for cancel in [false, true] {
+            proxy_incremental_listener_caller_runtime_probe(false, None, Some(cancel));
+            #[cfg(feature = "tasks")]
+            proxy_incremental_listener_caller_runtime_probe(true, None, Some(cancel));
+        }
+    }
+
+    #[cfg(unix)]
+    fn proxy_incremental_listener_wait_probe(tasks: bool, interrupt: u8) {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::future::Future;
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let ambient = Cx::set_current(None);
+        let state = Arc::new(Mutex::new(TestState::default()));
+        let proxy = ProxyClient::from_backend(TestBackend {
+            state: Arc::clone(&state),
+            incremental_catalog_listener: true,
+            #[cfg(feature = "tasks")]
+            incremental_final_task_listener: true,
+            pending_incremental_listeners: true,
+            ..TestBackend::default()
+        });
+        let mut opening = Box::pin(open_incremental_listener_probe(
+            &proxy,
+            &cx,
+            SubscriptionFilter::default(),
+            tasks,
+        ));
+        let mut opening_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            opening.as_mut().poll(&mut opening_cx),
+            std::task::Poll::Ready(Ok(true))
+        ));
+        drop(opening);
+        let cancellation = McpRequestCancellation::new();
+        let mut next = Box::pin(next_incremental_listener_probe(
+            &proxy,
+            &cx,
+            &cancellation,
+            tasks,
+        ));
+        let wakes = Arc::new(ProxyTimerWake::default());
+        let waker = std::task::Waker::from(Arc::clone(&wakes));
+        let mut task_cx = std::task::Context::from_waker(&waker);
+        assert!(next.as_mut().poll(&mut task_cx).is_pending());
+        assert_eq!(state.lock().unwrap().incremental_listener_polls, 1);
+        assert_eq!(timer.pending_count(), 1);
+        let before = wakes.count();
+        let restricted_host = (interrupt == 2).then(|| Cx::set_current(Some(cx.clone())));
+        let restriction = (interrupt == 2)
+            .then(|| Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK));
+        if interrupt == 0 {
+            state.lock().unwrap().incremental_listener_ready = true;
+            clock.advance_to(asupersync::Time::from_nanos(20_000_000));
+            assert_eq!(timer.process_timers(), 1);
+            assert!(wakes.count() > before);
+        } else if interrupt == 1 {
+            assert!(cancellation.cancel());
+            assert!(
+                wakes.count() > before,
+                "silent listener cancellation must wake its owner"
+            );
+            assert_eq!(cx.now(), asupersync::Time::ZERO);
+        }
+        let std::task::Poll::Ready(result) = next.as_mut().poll(&mut task_cx) else {
+            panic!("listener completion, cancellation, or denied TIME must settle the public wait");
+        };
+        if interrupt == 0 {
+            assert!(result.unwrap());
+        } else {
+            assert_eq!(
+                result.unwrap_err().code,
+                if interrupt == 1 {
+                    McpErrorCode::RequestCancelled
+                } else {
+                    McpErrorCode::InternalError
+                }
+            );
+        }
+        drop(next);
+        assert_eq!(timer.pending_count(), 0);
+        let observed = state.lock().unwrap();
+        assert_eq!(
+            observed.incremental_listener_polls,
+            if interrupt == 0 { 2 } else { 1 }
+        );
+        assert_eq!(
+            observed.incremental_catalog_listener_cancellations,
+            usize::from(interrupt != 0 && !tasks)
+        );
+        #[cfg(feature = "tasks")]
+        assert_eq!(
+            observed.incremental_final_task_listener_cancellations,
+            usize::from(interrupt != 0 && tasks)
+        );
+        drop(observed);
+        drop(restriction);
+        drop(restricted_host);
+        assert!(Cx::current().is_none());
+        assert!(!cx.is_cancel_requested());
+        // Retiring a listener leaves ordinary requests on the same route usable.
+        let sibling = McpContext::new(cx.clone(), 4414);
+        assert_eq!(
+            proxy
+                .call_tool(&sibling, "sibling", serde_json::json!({}))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            state.lock().unwrap().last_tool.as_ref().unwrap().0,
+            "sibling"
+        );
+        let before = wakes.count();
+        clock.advance_to(asupersync::Time::from_nanos(40_000_000));
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(wakes.count(), before);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_incremental_listener_wait_positive() {
+        proxy_incremental_listener_wait_probe(false, 0);
+        #[cfg(feature = "tasks")]
+        proxy_incremental_listener_wait_probe(true, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_incremental_listener_wait_planted_negative() {
+        for interrupt in [1, 2] {
+            proxy_incremental_listener_wait_probe(false, interrupt);
+            #[cfg(feature = "tasks")]
+            proxy_incremental_listener_wait_probe(true, interrupt);
+        }
     }
 
     #[cfg(unix)]
@@ -19479,9 +20107,9 @@ IFS= read -r end
     #[test]
     fn proxy_incremental_listener_caller_runtime_planted_negative() {
         for cancel in [false, true] {
-            proxy_incremental_listener_caller_runtime_probe(false, Some(cancel));
+            proxy_incremental_listener_caller_runtime_probe(false, Some(cancel), None);
             #[cfg(feature = "tasks")]
-            proxy_incremental_listener_caller_runtime_probe(true, Some(cancel));
+            proxy_incremental_listener_caller_runtime_probe(true, Some(cancel), None);
         }
     }
 
@@ -19835,7 +20463,7 @@ IFS= read -r end
 
     fn proxy_cancel_timer_rearm_probe(cancel: bool) {
         use std::future::Future;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::task::{Context, Poll, Wake, Waker};
 
         struct WakeCount(AtomicUsize);
@@ -19849,20 +20477,28 @@ IFS= read -r end
             }
         }
 
-        // An unrelated cancelled ambient context makes a real Sleep immediately
-        // ready on every rearm, deterministically exercising the same lifecycle
-        // as a scheduler delay spanning the replacement timer's deadline.
+        // Only the explicit caller's clock may expire a wait. Keep an unrelated
+        // cancelled Cx ambient while repeatedly expiring and rearming its timer.
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let timer = asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
         let ambient = Cx::for_testing();
         ambient.set_cancel_requested(true);
-        let _ambient = Cx::set_current(Some(ambient));
-        let cx = Cx::for_testing();
+        let ambient_guard = Cx::set_current(Some(ambient));
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let cancellation = McpRequestCancellation::new();
         let polls = AtomicUsize::new(0);
+        let complete = AtomicBool::new(false);
         let operation = std::future::poll_fn(|_| {
-            if polls.fetch_add(1, Ordering::SeqCst) < 3 {
-                Poll::Pending
-            } else {
+            polls.fetch_add(1, Ordering::SeqCst);
+            if complete.load(Ordering::SeqCst) {
                 Poll::Ready(Ok(73))
+            } else {
+                Poll::Pending
             }
         });
         let mut wait = Box::pin(super::await_proxy_operation_with_cancellation_priority(
@@ -19877,15 +20513,28 @@ IFS= read -r end
         let mut task_cx = Context::from_waker(&waker);
         for turn in 1..=3 {
             assert!(wait.as_mut().poll(&mut task_cx).is_pending());
-            assert_eq!(polls.load(Ordering::SeqCst), turn);
+            assert_eq!(timer.pending_count(), 1);
+            let before = wakes.0.load(Ordering::SeqCst);
+            clock.advance_to(asupersync::Time::from_nanos(turn * 20_000_000));
+            assert_eq!(timer.process_timers(), 1);
+            assert!(wakes.0.load(Ordering::SeqCst) > before);
+            let expired_wakes = wakes.0.load(Ordering::SeqCst);
+            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            assert!(
+                wakes.0.load(Ordering::SeqCst) > expired_wakes,
+                "the next poll must be scheduled to register the replacement timer"
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), usize::try_from(turn).unwrap() * 2);
+            assert_eq!(timer.pending_count(), 0);
         }
         assert!(
-            wakes.0.load(Ordering::SeqCst) >= 3,
-            "an immediately-ready replacement timer cannot leave the request parked"
+            wakes.0.load(Ordering::SeqCst) >= 6,
+            "rearming an expired timer cannot leave the request parked"
         );
         if cancel {
             assert!(cancellation.cancel());
         }
+        complete.store(true, Ordering::SeqCst);
         let Poll::Ready(result) = wait.as_mut().poll(&mut task_cx) else {
             panic!("upstream completion or request cancellation must finish the wait");
         };
@@ -19893,17 +20542,22 @@ IFS= read -r end
             assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
             assert_eq!(
                 polls.load(Ordering::SeqCst),
-                3,
+                6,
                 "late upstream result untouched"
             );
         } else {
             assert_eq!(result.unwrap(), 73);
-            assert_eq!(polls.load(Ordering::SeqCst), 4);
+            assert_eq!(polls.load(Ordering::SeqCst), 7);
         }
         assert!(
             !cx.is_cancel_requested(),
             "the explicit caller Cx remains live"
         );
+        drop(wait);
+        assert_eq!(timer.pending_count(), 0);
+        assert!(Cx::current().unwrap().is_cancel_requested());
+        drop(ambient_guard);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[test]
@@ -19914,6 +20568,38 @@ IFS= read -r end
     #[test]
     fn proxy_cancel_timer_rearm_planted_negative() {
         proxy_cancel_timer_rearm_probe(true);
+    }
+
+    #[test]
+    fn proxy_wait_cancellation_precedes_denied_time() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::future::Future;
+
+        let cx = Cx::for_testing();
+        let ambient = Cx::set_current(Some(cx.clone()));
+        let restriction = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+        let cancellation = McpRequestCancellation::new();
+        let operation = std::future::poll_fn(|_| {
+            assert!(cancellation.cancel());
+            std::task::Poll::Pending::<fastmcp_core::McpResult<()>>
+        });
+        let mut wait = Box::pin(super::await_proxy_operation_with_cancellation_priority(
+            &cx,
+            &cancellation,
+            operation,
+            None,
+            None,
+        ));
+        let mut task_cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(Err(error)) = wait.as_mut().poll(&mut task_cx) else {
+            panic!("cancellation arriving during an upstream poll must win before TIME refusal");
+        };
+        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+        assert!(!Cx::current().unwrap().capabilities().time);
+        assert!(!cx.is_cancel_requested());
+        drop(wait);
+        drop(restriction);
+        drop(ambient);
     }
 
     #[cfg(feature = "tasks")]
@@ -24744,10 +25430,10 @@ IFS= read -r end
         last_unsubscribe: Option<String>,
         last_prompt: Option<(String, HashMap<String, String>)>,
         incremental_catalog_listener_starts: usize,
-        #[cfg(feature = "tasks")]
         incremental_catalog_listener_cancellations: usize,
-        #[cfg(feature = "tasks")]
         incremental_catalog_cleanup_cx_cancelled: Option<bool>,
+        incremental_listener_polls: usize,
+        incremental_listener_ready: bool,
         #[cfg(feature = "tasks")]
         incremental_final_task_listener_starts: usize,
         #[cfg(feature = "tasks")]
@@ -24766,6 +25452,7 @@ IFS= read -r end
         legacy_progress: Option<(f64, Option<f64>, Option<String>)>,
         pending_updated_uris: Vec<String>,
         incremental_catalog_listener: bool,
+        pending_incremental_listeners: bool,
         #[cfg(feature = "tasks")]
         incremental_final_task_listener: bool,
     }
@@ -24923,7 +25610,23 @@ IFS= read -r end
             Ok(self.incremental_catalog_listener)
         }
 
-        #[cfg(feature = "tasks")]
+        fn try_next_incremental_catalog_listener(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> fastmcp_core::McpResult<Option<fastmcp_client::StdioSubscriptionEvent>> {
+            if !self.pending_incremental_listeners {
+                return self
+                    .next_incremental_catalog_listener(cx, cancellation)
+                    .map(Some);
+            }
+            let mut state = self.state.lock().unwrap();
+            state.incremental_listener_polls += 1;
+            Ok(state
+                .incremental_listener_ready
+                .then_some(fastmcp_client::StdioSubscriptionEvent::Terminal))
+        }
+
         fn cancel_incremental_catalog_listener(&mut self, cx: &Cx) -> fastmcp_core::McpResult<()> {
             let mut state = self.state.lock().expect("state lock poisoned");
             state.incremental_catalog_listener_cancellations += 1;
@@ -24948,6 +25651,24 @@ IFS= read -r end
         #[cfg(feature = "tasks")]
         fn supports_incremental_final_task_listener(&mut self) -> fastmcp_core::McpResult<bool> {
             Ok(self.incremental_final_task_listener)
+        }
+
+        #[cfg(feature = "tasks")]
+        fn try_next_incremental_final_task_listener(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> fastmcp_core::McpResult<Option<ProxyFinalTaskListenerEvent>> {
+            if !self.pending_incremental_listeners {
+                return self
+                    .next_incremental_final_task_listener(cx, cancellation)
+                    .map(Some);
+            }
+            let mut state = self.state.lock().unwrap();
+            state.incremental_listener_polls += 1;
+            Ok(state
+                .incremental_listener_ready
+                .then_some(ProxyFinalTaskListenerEvent::Terminal))
         }
 
         #[cfg(feature = "tasks")]
