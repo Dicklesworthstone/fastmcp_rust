@@ -49161,7 +49161,13 @@ mod lib_unit_tests {
         marker: &[u8],
     ) -> Result<(), String> {
         let mut search_from = 0;
-        let mut buffer = [0_u8; 64 * 1024];
+        // Heap, not a 64 KiB stack array. This is a read staging buffer whose
+        // only consumer is the `extend_from_slice` below, so where it lives is
+        // not part of what any of this helper's six callers test -- which is
+        // why moving it is free here, and not the "reflexive boxing changes
+        // what the test exercises" case that `large_stack_arrays` usually
+        // wants measured first.
+        let mut buffer = vec![0_u8; 64 * 1024];
         loop {
             if received[search_from..]
                 .windows(marker.len())
