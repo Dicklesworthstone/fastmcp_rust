@@ -6278,9 +6278,11 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// or skips that disagree require an explicit `json_schema()` implementation.
 /// Enum schemas follow Serde's external, internal (`tag`), adjacent (`tag` and
 /// `content`), and `untagged` representations. Internal tagging supports named
-/// and unit variants; internal newtypes require adjacent tagging or an explicit
-/// schema because their arbitrary payload schemas cannot safely be merged with
-/// a discriminator. Adjacent tagging supports every payload form. Untagged
+/// and unit variants, plus newtypes containing a derived named-object payload.
+/// Internal newtypes preserve their payload's references and reject discriminator
+/// collisions, closed objects, root resource/applicator boundaries, and catch-all
+/// maps. Other internal newtype payloads require adjacent tagging or an explicit
+/// schema. Adjacent tagging supports every payload form. Untagged
 /// enums and trailing `#[serde(untagged)]` variants use `anyOf` so overlapping
 /// alternatives remain valid. Enum aliases, catch-all variants, flattened
 /// fields, and custom wire conversions require an explicit schema and produce
@@ -7403,9 +7405,43 @@ fn generate_enum_variant_schema(
     let fields = &variant.fields;
     if let SchemaEnumRepresentation::Internal { tag } = representation {
         return match fields {
+            syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                let field = &fields.unnamed[0];
+                let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
+                if payload_attrs.deny_unknown_fields {
+                    return Err(syn::Error::new_spanned(
+                        variant,
+                        "internally tagged newtype enums with deny_unknown_fields require an explicit schema; implement json_schema() explicitly",
+                    ));
+                }
+                if attrs.skip
+                    || attrs.default
+                    || attrs.skip_serializing_if
+                    || has_json_schema_attr(&field.attrs, "skip")
+                {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "internally tagged newtype payloads cannot be skipped, defaulted, or conditionally omitted; implement json_schema() explicitly",
+                    ));
+                }
+                let payload = match schema_flatten_type(&field.ty) {
+                    Ok(SchemaFlattenType::Object(payload)) => payload,
+                    Ok(SchemaFlattenType::MapValue(_)) | Err(_) => {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "internally tagged newtype schemas require a derived named-object payload; use adjacent tagging or implement json_schema() explicitly",
+                        ));
+                    }
+                };
+                Ok(quote! {
+                    fastmcp_protocol::schema::FlattenedObjectSchema::internally_tagged::<#payload>(
+                        __fastmcp_schema_context, #tag, #name,
+                    )
+                })
+            }
             syn::Fields::Unnamed(_) => Err(syn::Error::new_spanned(
                 variant,
-                "JsonSchema supports internally tagged named and unit variants; use adjacent tagging or implement json_schema() explicitly for a newtype payload",
+                "internally tagged tuple variants require adjacent tagging or an explicit schema; implement json_schema() explicitly",
             )),
             syn::Fields::Unit => Ok(quote! {
                 // Serde's internally tagged unit visitor ignores extra members,
@@ -7807,7 +7843,7 @@ mod serde_schema_tests {
     #[test]
     fn serde_schema_unmodeled_enum_payloads_require_explicit_schemas() {
         for input in [
-            syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Newtype(Payload) } },
+            syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Newtype(String) } },
             syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Tuple(String, u32) } },
             syn::parse_quote! {
                 #[serde(tag = "kind")] enum Invalid { Known, #[serde(other)] Other }
@@ -7826,6 +7862,47 @@ mod serde_schema_tests {
         ] {
             assert!(
                 enum_representation_error(input).contains("implement json_schema() explicitly")
+            );
+        }
+    }
+
+    #[test]
+    fn serde_schema_internal_newtypes_have_actionable_payload_diagnostics() {
+        for (input, expected) in [
+            (
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(Option<Payload>) } },
+                "require a derived named-object payload",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(BTreeMap<String, u8>) } },
+                "require a derived named-object payload",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(Vec<Payload>) } },
+                "require a derived named-object payload",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(#[serde(default)] Payload) } },
+                "cannot be skipped, defaulted, or conditionally omitted",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(#[serde(skip)] Payload) } },
+                "cannot be skipped, defaulted, or conditionally omitted",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind")] enum Invalid { Value(#[serde(skip_serializing_if = "empty")] Payload) } },
+                "cannot be skipped, defaulted, or conditionally omitted",
+            ),
+            (
+                syn::parse_quote! { #[serde(tag = "kind", deny_unknown_fields)] enum Invalid { Value(Payload) } },
+                "newtype enums with deny_unknown_fields require an explicit schema",
+            ),
+        ] {
+            let error = enum_representation_error(input);
+            assert!(error.contains(expected), "{error}");
+            assert!(
+                error.contains("implement json_schema() explicitly"),
+                "{error}"
             );
         }
     }

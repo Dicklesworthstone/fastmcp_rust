@@ -5947,6 +5947,302 @@ fn json_schema_flattened_input_and_output_reach_registered_modern_dispatch() {
     });
 }
 
+mod internally_tagged_newtypes {
+    use super::*;
+    use fastmcp_rust::schema::{
+        JsonSchemaType, SchemaGenerationError, SchemaGenerationLimits, SchemaGenerator,
+    };
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(rename_all = "camelCase")]
+    struct CommandFields {
+        /// Required payload metadata remains beside the discriminator.
+        request_id: String,
+        #[serde(default)]
+        attempt_count: u8,
+        optional_limit: Option<u16>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Command {
+        Start(CommandFields),
+        #[serde(rename = "resume-job")]
+        Resume(Box<CommandFields>),
+        Finished,
+    }
+
+    fn assert_round_trip<T>(schema: &fastmcp_rust::schema::AdmittedSchema, value: serde_json::Value)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        schema
+            .validate(&value)
+            .expect("the tagged payload validates");
+        let decoded: T =
+            serde_json::from_value(value).expect("Serde accepts the same tagged payload");
+        let serialized = serde_json::to_value(&decoded).unwrap();
+        schema
+            .validate(&serialized)
+            .expect("serialized output obeys the generated schema");
+        assert_eq!(serde_json::from_value::<T>(serialized).unwrap(), decoded);
+    }
+
+    #[test]
+    fn json_schema_internal_newtypes_preserve_payload_names_defaults_and_variant_tags() {
+        let generated = Command::try_json_schema().unwrap();
+        assert_eq!(generated, Command::json_schema());
+        let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+        for valid in [
+            json!({"kind":"start", "requestId":"a"}),
+            json!({"kind":"resume-job", "requestId":"b", "attemptCount":255, "optionalLimit":65535}),
+            json!({"kind":"start", "requestId":"c", "optionalLimit":null, "ignored":true}),
+            json!({"kind":"finished"}),
+        ] {
+            assert_round_trip::<Command>(&schema, valid);
+        }
+        for invalid in [
+            json!({"requestId":"a"}),
+            json!({"kind":"start"}),
+            json!({"kind":"resume", "requestId":"b"}),
+            json!({"kind":1, "requestId":"a"}),
+            json!({"kind":"start", "requestId":1}),
+            json!({"kind":"start", "requestId":"a", "attemptCount":256}),
+            json!({"kind":"start", "requestId":"a", "optionalLimit":"none"}),
+            json!({"Start":{"requestId":"a"}}),
+        ] {
+            assert!(schema.validate(&invalid).is_err(), "{invalid}");
+            assert!(serde_json::from_value::<Command>(invalid).is_err());
+        }
+        // Reusing one payload for two variants must not add either variant's
+        // discriminator to the shared cached definition.
+        let payload = schema.schema()["$defs"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|body| body["properties"].get("requestId").is_some())
+            .unwrap();
+        assert!(payload["properties"].get("kind").is_none());
+        assert!(payload["properties"]["requestId"]["description"].is_string());
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct RecursiveFields {
+        depth: u8,
+        next: Option<Box<RecursiveCommand>>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum RecursiveCommand {
+        Node(Box<RecursiveFields>),
+        End,
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct GenericFields<T: JsonSchemaType> {
+        payload: T,
+    }
+
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(tag = "kind")]
+    enum GenericCommand<T: JsonSchemaType> {
+        Value(GenericFields<T>),
+    }
+
+    #[test]
+    fn json_schema_internal_newtypes_preserve_recursive_and_generic_property_references() {
+        let schema =
+            fastmcp_rust::schema::admit_final_schema(RecursiveCommand::try_json_schema().unwrap())
+                .unwrap();
+        assert!(schema.schema()["$defs"].is_object());
+        let valid = json!({"kind":"node", "depth":1, "next":{"kind":"node", "depth":2, "next":{"kind":"end"}}});
+        assert_round_trip::<RecursiveCommand>(&schema, valid.clone());
+        for (path, value) in [
+            ("/next/depth", json!(256)),
+            ("/next/kind", json!("unknown")),
+            ("/next/next", json!({"kind":"node"})),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(path).unwrap() = value;
+            assert!(schema.validate(&invalid).is_err(), "{invalid}");
+            assert!(serde_json::from_value::<RecursiveCommand>(invalid).is_err());
+        }
+        let generic = fastmcp_rust::schema::admit_final_schema(
+            GenericCommand::<RecursiveCommand>::try_json_schema().unwrap(),
+        )
+        .unwrap();
+        assert_round_trip::<GenericCommand<RecursiveCommand>>(
+            &generic,
+            json!({"kind":"Value", "payload":valid}),
+        );
+        let invalid = json!({"kind":"Value", "payload":{"kind":"node", "depth":"bad"}});
+        assert!(generic.validate(&invalid).is_err());
+        assert!(serde_json::from_value::<GenericCommand<RecursiveCommand>>(invalid).is_err());
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(tag = "kind")]
+    enum NestedObjectCommand {
+        Flattened(NestedFlattenedSchemaEnvelope),
+        Resource(FlattenedResourceFields),
+    }
+
+    #[test]
+    fn json_schema_internal_newtypes_keep_nested_flattening_and_property_resource_scopes() {
+        let schema = fastmcp_rust::schema::admit_final_schema(
+            NestedObjectCommand::try_json_schema().unwrap(),
+        )
+        .unwrap();
+        assert_round_trip::<NestedObjectCommand>(
+            &schema,
+            json!({
+                "kind":"Flattened", "tenant":"t", "version":1, "userName":"Alice",
+            }),
+        );
+        let resource = json!({"kind":"Resource", "choice":"Allowed"});
+        assert_round_trip::<NestedObjectCommand>(&schema, resource.clone());
+        let mut invalid = resource;
+        invalid["choice"] = json!("not-a-choice");
+        assert!(schema.validate(&invalid).is_err());
+        assert!(serde_json::from_value::<NestedObjectCommand>(invalid).is_err());
+    }
+
+    #[derive(JsonSchema)]
+    struct ConflictingFields {
+        #[serde(rename = "kind")]
+        discriminator: String,
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(tag = "kind")]
+    enum ConflictingCommand {
+        Value(ConflictingFields),
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(tag = "kind")]
+    enum ClosedCommand {
+        Value(ClosedFlattenedSchemaFields),
+    }
+
+    #[derive(JsonSchema)]
+    #[serde(tag = "kind")]
+    enum CatchAllCommand {
+        Value(FlattenedTypedMapEnvelope),
+    }
+
+    #[test]
+    fn json_schema_internal_newtypes_refuse_collisions_closure_and_budget_exhaustion() {
+        for (result, message) in [
+            (
+                ConflictingCommand::try_json_schema(),
+                "conflicts with the serde tag key",
+            ),
+            (
+                ClosedCommand::try_json_schema(),
+                "deny_unknown_fields require an explicit schema",
+            ),
+            (
+                CatchAllCommand::try_json_schema(),
+                "resources, applicators, closure",
+            ),
+        ] {
+            let error =
+                result.expect_err("unsupported payloads cannot publish a partial tagged schema");
+            assert!(error.to_string().contains(message), "{error}");
+        }
+        for (limits, expected) in [
+            (
+                SchemaGenerationLimits {
+                    max_types: 1,
+                    ..SchemaGenerationLimits::default()
+                },
+                SchemaGenerationError::TypeLimit,
+            ),
+            (
+                SchemaGenerationLimits {
+                    max_bytes: 0,
+                    ..SchemaGenerationLimits::default()
+                },
+                SchemaGenerationError::ByteLimit,
+            ),
+        ] {
+            let mut generator = SchemaGenerator::with_limits(limits);
+            let root = generator.subschema_for::<RecursiveCommand>();
+            assert_eq!(generator.finish(root).unwrap_err(), expected);
+        }
+        assert!(
+            RecursiveCommand::try_json_schema().is_ok(),
+            "failed generations cannot poison later callers"
+        );
+    }
+
+    static COMMAND_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn command_error(_kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+        Some(json!({"kind":"finished"}))
+    }
+
+    #[tool(output_schema = Command, error_mapper = command_error)]
+    async fn echo_internal_newtype(ctx: &McpContext, value: Command) -> McpResult<Command> {
+        ctx.checkpoint()?;
+        COMMAND_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(value)
+    }
+
+    #[test]
+    fn json_schema_internal_newtype_input_and_output_reach_registered_modern_dispatch() {
+        on_caller_runtime(async {
+            let server = Server::new("internal-newtype-schema", "1.0.0")
+                .tool(EchoInternalNewtype)
+                .try_build()
+                .unwrap();
+            let connection = ModernConnection::new();
+            let valid = json!({"kind":"resume-job", "requestId":"job-1", "attemptCount":2});
+            let expected =
+                serde_json::to_value(serde_json::from_value::<Command>(valid.clone()).unwrap())
+                    .unwrap();
+            let before = COMMAND_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_internal_newtype",
+                    json!({"value":valid.clone()}),
+                )
+                .await,
+            );
+            assert_schema_bound_success(&result, &expected);
+            for (property, value) in [
+                ("kind", json!("unknown")),
+                ("requestId", json!(false)),
+                ("attemptCount", json!(256)),
+            ] {
+                let mut invalid = valid.clone();
+                invalid[property] = value;
+                let result = schema_bound_complete(
+                    schema_bound_wire_call(
+                        &server,
+                        &connection,
+                        "echo_internal_newtype",
+                        json!({"value":invalid}),
+                    )
+                    .await,
+                );
+                assert_eq!(result["isError"], true);
+                assert_eq!(result["structuredContent"], json!({"kind":"finished"}));
+                assert_eq!(
+                    COMMAND_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                    before + 1,
+                    "invalid tagged payloads must not invoke the application handler"
+                );
+            }
+        });
+    }
+}
+
 fn serde_schema_default_retry_limit() -> u32 {
     3
 }

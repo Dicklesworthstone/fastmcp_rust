@@ -1,4 +1,4 @@
-//! Bounded composition for the Serde flatten profile emitted by the derive.
+//! Bounded object composition for Serde flattening and tagged newtypes.
 //!
 //! Flattening copies object members, not an `allOf` of closed objects or maps.
 //! Property schemas keep the generation document's original reference scope.
@@ -41,6 +41,61 @@ impl FlattenedObjectSchema {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Composes the discriminator of an internally tagged newtype with one
+    /// derived named-object payload. The cached payload body remains unchanged
+    /// so another variant or an ordinary property can reuse its original refs.
+    ///
+    /// This deliberately shares the bounded object-composition profile with
+    /// flattening. Arbitrary root applicators/resources, closed payloads and
+    /// catch-all maps require an explicit schema; no constraint is discarded.
+    #[must_use]
+    pub fn internally_tagged<T: FlattenableSchemaObject>(
+        context: &mut SchemaGenerator,
+        tag: &str,
+        variant: &str,
+    ) -> Value {
+        if context.error.is_some() {
+            return Value::Bool(false);
+        }
+        if T::DENY_UNKNOWN_FIELDS {
+            context.reject_flatten(
+                "$",
+                "internally tagged newtype payloads with deny_unknown_fields require an explicit schema",
+            );
+            return Value::Bool(false);
+        }
+        let mut object = Self::new();
+        object.flatten::<T>(context);
+        if context.error.is_some() {
+            return Value::Bool(false);
+        }
+        if object.properties.contains_key(tag) {
+            context.reject_flatten(
+                tag,
+                "internally tagged newtype payload property conflicts with the serde tag key",
+            );
+            return Value::Bool(false);
+        }
+        // Bound both caller-supplied strings before constructing the tag's
+        // schema. property() then charges its complete retained representation,
+        // including the separately retained required property name.
+        if tag
+            .len()
+            .checked_add(variant.len())
+            .is_none_or(|bytes| bytes > context.limits.max_bytes.saturating_sub(context.bytes))
+        {
+            context.error = Some(SchemaGenerationError::ByteLimit);
+            return Value::Bool(false);
+        }
+        object.property(
+            context,
+            tag,
+            serde_json::json!({ "type": "string", "const": variant }),
+            true,
+        );
+        object.finish()
     }
 
     /// Adds an ordinary field without silently replacing a renamed collision.
@@ -306,6 +361,86 @@ mod tests {
     impl FlattenableSchemaObject for PlainObject {
         const DENY_UNKNOWN_FIELDS: bool = false;
         const HAS_FLATTEN_FIELDS: bool = false;
+    }
+
+    #[test]
+    fn internal_tagging_keeps_shared_payload_bodies_unmodified() {
+        let mut context = SchemaGenerator::new();
+        drop(context.subschema_for::<PlainObject>());
+        let cached = context.definitions[&TypeId::of::<PlainObject>()]
+            .body
+            .clone()
+            .unwrap();
+        let first =
+            FlattenedObjectSchema::internally_tagged::<PlainObject>(&mut context, "kind", "first");
+        let second =
+            FlattenedObjectSchema::internally_tagged::<PlainObject>(&mut context, "kind", "second");
+        assert_eq!(
+            context.definitions[&TypeId::of::<PlainObject>()]
+                .body
+                .as_ref(),
+            Some(&cached)
+        );
+        let document = context
+            .finish(serde_json::json!({"oneOf":[first,second]}))
+            .unwrap();
+        let schema = super::super::admit_final_schema(document).unwrap();
+        for variant in ["first", "second"] {
+            schema
+                .validate(&serde_json::json!({"kind":variant,"name":"present"}))
+                .unwrap();
+            assert!(
+                schema
+                    .validate(&serde_json::json!({"kind":variant}))
+                    .is_err()
+            );
+        }
+        assert!(
+            schema
+                .validate(&serde_json::json!({"kind":"third","name":"present"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn internal_tagging_preserves_root_constraint_and_discriminator_budget_failures() {
+        fn constrained<const CASE: u8>() {
+            let mut context = SchemaGenerator::new();
+            let root = FlattenedObjectSchema::internally_tagged::<ConstrainedObject<CASE>>(
+                &mut context,
+                "kind",
+                "value",
+            );
+            assert!(matches!(
+                context.finish(root),
+                Err(SchemaGenerationError::InvalidSchema(_))
+            ));
+        }
+        constrained::<0>();
+        constrained::<1>();
+        constrained::<2>();
+        constrained::<3>();
+
+        let mut context = SchemaGenerator::new();
+        let cached = context.subschema_for::<PlainObject>();
+        let limit = context.limits.max_bytes;
+        let oversized = "x".repeat(limit + 1);
+        let root = FlattenedObjectSchema::internally_tagged::<PlainObject>(
+            &mut context,
+            "kind",
+            &oversized,
+        );
+        assert_eq!(context.error, Some(SchemaGenerationError::ByteLimit));
+        assert_eq!(
+            context.definitions[&TypeId::of::<PlainObject>()]
+                .body
+                .as_ref(),
+            Some(&cached)
+        );
+        assert!(matches!(
+            context.finish(root),
+            Err(SchemaGenerationError::ByteLimit)
+        ));
     }
 
     #[test]
