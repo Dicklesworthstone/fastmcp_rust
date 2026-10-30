@@ -14661,6 +14661,16 @@ impl HttpClient {
         limits: sse::SseLimits,
         timeout_policy: RequestTimeoutPolicy,
     ) -> Result<ModernHttpRequestExecution, HttpClientError> {
+        // Single-armed only when `legacy-2024-11-05` is off, which is the one
+        // projection where `clippy::infallible_destructuring_match` fires.
+        // Its suggestion -- `let ClientHttpConnection::Modern(client) =
+        // &self.connection;` -- does not compile in the default build, where
+        // the `LegacySse` arm below is present and the match is genuinely
+        // fallible. A lint cannot see the arm a `cfg` removed. Second
+        // confirmed instance of this shape; the first is
+        // `fastmcp-server/src/async_stdio.rs` on `WriteAttempt`. Any enum with
+        // a cfg-gated variant can produce it. See bd-yhx86.
+        #[allow(clippy::infallible_destructuring_match)]
         let client = match &self.connection {
             ClientHttpConnection::Modern(client) => client,
             #[cfg(feature = "legacy-2024-11-05")]
