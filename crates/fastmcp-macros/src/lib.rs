@@ -3716,18 +3716,40 @@ fn uses_compact_nullable_schema(ty: &Type) -> bool {
     }
 }
 
+/// Reports whether a path names one of the deriving item's own type parameters.
+///
+/// A parameter is always written bare: one segment, no qualified self, no
+/// leading `::`, no arguments. `std::string::String`, `::T` and `T<U>` name
+/// types even when a parameter shares the final identifier.
+fn is_schema_generic_param(type_path: &syn::TypePath, generic_params: &[Ident]) -> bool {
+    type_path.qself.is_none()
+        && type_path.path.leading_colon.is_none()
+        && type_path.path.segments.len() == 1
+        && type_path.path.segments[0].arguments.is_none()
+        && generic_params.contains(&type_path.path.segments[0].ident)
+}
+
 /// Generates a JSON schema type for a Rust type.
 ///
 /// The result may be a block expression. `json!` reads a brace-delimited
 /// value as an object literal, so a splice into a `json!` value position must
 /// be parenthesized.
-fn type_to_json_schema(ty: &Type) -> TokenStream2 {
+///
+/// `generic_params` carries the type parameters of the item being derived, so
+/// an occurrence of one can be told apart from a nameable type. Callers outside
+/// `#[derive(JsonSchema)]` pass an empty slice: a handler signature and a
+/// transparent payload name concrete types only.
+fn type_to_json_schema(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
     match ty {
         Type::Tuple(tuple) if tuple.elems.is_empty() => {
             return quote! { serde_json::json!({ "type": "null" }) };
         }
         Type::Tuple(tuple) => {
-            let items: Vec<_> = tuple.elems.iter().map(type_to_json_schema).collect();
+            let items: Vec<_> = tuple
+                .elems
+                .iter()
+                .map(|elem| type_to_json_schema(elem, generic_params))
+                .collect();
             let length = items.len();
             return quote! {
                 serde_json::json!({
@@ -3739,7 +3761,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             };
         }
         Type::Array(array) => {
-            let items = type_to_json_schema(&array.elem);
+            let items = type_to_json_schema(&array.elem, generic_params);
             let length = &array.len;
             return quote! {
                 // Keep the usize const-expression context without a generated
@@ -3754,19 +3776,35 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             };
         }
         Type::Slice(slice) => {
-            let items = type_to_json_schema(&slice.elem);
+            let items = type_to_json_schema(&slice.elem, generic_params);
             return quote! {
                 serde_json::json!({ "type": "array", "items": (#items) })
             };
         }
-        Type::Paren(paren) => return type_to_json_schema(&paren.elem),
-        Type::Group(group) => return type_to_json_schema(&group.elem),
-        Type::Reference(reference) => return type_to_json_schema(&reference.elem),
+        Type::Paren(paren) => return type_to_json_schema(&paren.elem, generic_params),
+        Type::Group(group) => return type_to_json_schema(&group.elem, generic_params),
+        Type::Reference(reference) => {
+            return type_to_json_schema(&reference.elem, generic_params);
+        }
         _ => {}
     }
     let Type::Path(type_path) = ty else {
         return quote! { serde_json::json!({}) };
     };
+
+    // A type parameter is not a nameable type, so the custom-type fallback
+    // closure below cannot be emitted for one: `json_schema()` is an inherent
+    // method of the deriving item's own `impl` block, and no bound can supply
+    // an inherent method. The parameter does carry `JsonSchemaType` -- the use
+    // site must declare it, because `subschema_for` requires it -- so the
+    // context hook is both the only form that compiles and the one autoref
+    // dispatch would have selected. Checked ahead of the built-in names
+    // because a parameter named `String` or `Value` is neither of those types.
+    if is_schema_generic_param(type_path, generic_params) {
+        return quote! {
+            __fastmcp_schema_context.subschema_for::<#ty>()
+        };
+    }
 
     let segment = type_path.path.segments.last().unwrap();
     let type_name = segment.ident.to_string();
@@ -3798,7 +3836,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                     syn::GenericArgument::Type(ty) => Some(ty),
                     _ => None,
                 }) {
-                    return type_to_json_schema(inner_ty);
+                    return type_to_json_schema(inner_ty, generic_params);
                 }
             }
             quote! {
@@ -3814,7 +3852,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             // separate reusable-schema concern.
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                    let inner_schema = type_to_json_schema(inner_ty);
+                    let inner_schema = type_to_json_schema(inner_ty, generic_params);
                     if !uses_compact_nullable_schema(inner_ty) {
                         return quote! {{
                             let mut inner_schema = #inner_schema;
@@ -3870,7 +3908,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             // For Vec<T>, create array schema
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                    let inner_schema = type_to_json_schema(inner_ty);
+                    let inner_schema = type_to_json_schema(inner_ty, generic_params);
                     return quote! {
                         serde_json::json!({
                             "type": "array",
@@ -3885,7 +3923,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
             // For Set<T>, create array schema with uniqueItems
             if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
                 if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                    let inner_schema = type_to_json_schema(inner_ty);
+                    let inner_schema = type_to_json_schema(inner_ty, generic_params);
                     return quote! {
                         serde_json::json!({
                             "type": "array",
@@ -3904,7 +3942,7 @@ fn type_to_json_schema(ty: &Type) -> TokenStream2 {
                 // We mainly care about the value type (second arg)
                 if args.args.len() >= 2 {
                     if let Some(syn::GenericArgument::Type(value_ty)) = args.args.iter().nth(1) {
-                        let value_schema = type_to_json_schema(value_ty);
+                        let value_schema = type_to_json_schema(value_ty, generic_params);
                         return quote! {
                             serde_json::json!({
                                 "type": "object",
@@ -5060,7 +5098,9 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|(name, ty, doc, default_expr)| {
             let name_str = name.to_string();
-            let schema = type_to_json_schema(ty);
+            // A handler parameter names a concrete type: there is no deriving
+            // item here whose generic parameters could be in scope.
+            let schema = type_to_json_schema(ty, &[]);
 
             let default_insert = default_expr.as_ref().map_or_else(
                 || quote! {},
@@ -6339,12 +6379,31 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         Err(error) => return error.to_compile_error().into(),
     };
 
+    // A field type that is one of these parameters resolves through the
+    // context hook rather than the inherent-provider fallback. Lifetimes and
+    // const parameters never occupy a schema position.
+    let generic_params: Vec<Ident> = input
+        .generics
+        .type_params()
+        .map(|param| param.ident.clone())
+        .collect();
+
     // Process fields based on data type
     let schema_impl = match &input.data {
         syn::Data::Struct(data_struct) => validate_struct_schema_attributes(&input.attrs, true)
-            .and_then(|()| generate_struct_schema(data_struct, &type_desc_tokens, &serde_attrs)),
-        syn::Data::Enum(data_enum) => validate_enum_schema_attributes(&input.attrs)
-            .and_then(|()| generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs)),
+            .and_then(|()| {
+                generate_struct_schema(
+                    data_struct,
+                    &type_desc_tokens,
+                    &serde_attrs,
+                    &generic_params,
+                )
+            }),
+        syn::Data::Enum(data_enum) => {
+            validate_enum_schema_attributes(&input.attrs).and_then(|()| {
+                generate_enum_schema(data_enum, &type_desc_tokens, &serde_attrs, &generic_params)
+            })
+        }
         syn::Data::Union(_) => {
             return syn::Error::new_spanned(input, "JsonSchema cannot be derived for unions")
                 .to_compile_error()
@@ -6803,6 +6862,7 @@ fn generate_struct_schema(
     data: &syn::DataStruct,
     type_desc_tokens: &TokenStream2,
     serde_attrs: &SchemaSerdeAttrs,
+    generic_params: &[Ident],
 ) -> syn::Result<TokenStream2> {
     if serde_attrs.tag.is_some() || serde_attrs.content.is_some() || serde_attrs.untagged {
         return Err(syn::Error::new_spanned(
@@ -6811,7 +6871,7 @@ fn generate_struct_schema(
         ));
     }
     if serde_attrs.transparent {
-        return generate_transparent_struct_schema(data, type_desc_tokens);
+        return generate_transparent_struct_schema(data, type_desc_tokens, generic_params);
     }
     for field in &data.fields {
         let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
@@ -6825,12 +6885,13 @@ fn generate_struct_schema(
             }
         }
     }
-    generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs)
+    generate_fields_schema(&data.fields, type_desc_tokens, serde_attrs, generic_params)
 }
 
 fn generate_transparent_struct_schema(
     data: &syn::DataStruct,
     type_desc_tokens: &TokenStream2,
+    generic_params: &[Ident],
 ) -> syn::Result<TokenStream2> {
     let mut serialized = None;
     let mut deserialized = None;
@@ -6891,7 +6952,7 @@ fn generate_transparent_struct_schema(
             "JsonSchema serde(transparent) requires the same payload in both wire directions; implement json_schema() explicitly",
         ));
     }
-    let payload_schema = type_to_json_schema(&payload.ty);
+    let payload_schema = type_to_json_schema(&payload.ty, generic_params);
     Ok(quote! {
         {
             let mut schema = #payload_schema;
@@ -6995,6 +7056,7 @@ fn generate_fields_schema(
     fields: &syn::Fields,
     type_desc_tokens: &TokenStream2,
     serde_attrs: &SchemaSerdeAttrs,
+    generic_params: &[Ident],
 ) -> syn::Result<TokenStream2> {
     let schema = match fields {
         syn::Fields::Named(fields) => {
@@ -7042,7 +7104,7 @@ fn generate_fields_schema(
                         }),
                         SchemaFlattenType::MapValue(ty) => {
                             catch_all_seen = true;
-                            let schema = type_to_json_schema(ty);
+                            let schema = type_to_json_schema(ty, generic_params);
                             flattened_fields.push(quote! {
                                 let value_schema = #schema;
                                 object.catch_all(__fastmcp_schema_context, value_schema);
@@ -7070,7 +7132,7 @@ fn generate_fields_schema(
                 }
 
                 // Generate the base schema
-                let field_schema = type_to_json_schema(field_type);
+                let field_schema = type_to_json_schema(field_type, generic_params);
 
                 // Add description if available
                 let property_value = if let Some(desc) = &field_doc {
@@ -7167,7 +7229,7 @@ fn generate_fields_schema(
                         "JsonSchema cannot represent conditional tuple positions; implement json_schema() explicitly",
                     ));
                 }
-                item_schemas.push(type_to_json_schema(&field.ty));
+                item_schemas.push(type_to_json_schema(&field.ty, generic_params));
                 if !field_attrs.default && !serde_attrs.default {
                     min_items = item_schemas.len();
                 }
@@ -7217,6 +7279,7 @@ fn generate_enum_schema(
     data: &syn::DataEnum,
     type_desc_tokens: &TokenStream2,
     serde_attrs: &SchemaSerdeAttrs,
+    generic_params: &[Ident],
 ) -> syn::Result<TokenStream2> {
     if serde_attrs.transparent {
         return Err(syn::Error::new_spanned(
@@ -7364,7 +7427,13 @@ fn generate_enum_schema(
                 } else {
                     representation
                 };
-                generate_enum_variant_schema(variant, &variant_name, &payload_attrs, representation)
+                generate_enum_variant_schema(
+                    variant,
+                    &variant_name,
+                    &payload_attrs,
+                    representation,
+                    generic_params,
+                )
             })
             .collect::<syn::Result<Vec<_>>>()?;
 
@@ -7401,6 +7470,7 @@ fn generate_enum_variant_schema(
     name: &str,
     payload_attrs: &SchemaSerdeAttrs,
     representation: SchemaEnumRepresentation<'_>,
+    generic_params: &[Ident],
 ) -> syn::Result<TokenStream2> {
     let fields = &variant.fields;
     if let SchemaEnumRepresentation::Internal { tag } = representation {
@@ -7465,8 +7535,12 @@ fn generate_enum_variant_schema(
                         ));
                     }
                 }
-                let payload =
-                    generate_fields_schema(fields, &quote! { None::<&str> }, payload_attrs)?;
+                let payload = generate_fields_schema(
+                    fields,
+                    &quote! { None::<&str> },
+                    payload_attrs,
+                    generic_params,
+                )?;
                 Ok(quote! {
                     {
                         let mut schema = #payload;
@@ -7483,7 +7557,12 @@ fn generate_enum_variant_schema(
         };
     }
 
-    let payload = generate_fields_schema(fields, &quote! { None::<&str> }, payload_attrs)?;
+    let payload = generate_fields_schema(
+        fields,
+        &quote! { None::<&str> },
+        payload_attrs,
+        generic_params,
+    )?;
     match representation {
         SchemaEnumRepresentation::Untagged => Ok(payload),
         SchemaEnumRepresentation::External => {
@@ -7586,8 +7665,20 @@ mod serde_schema_tests {
         let syn::Data::Struct(data) = &input.data else {
             panic!("struct fixture required");
         };
+        let generic_params: Vec<syn::Ident> = input
+            .generics
+            .type_params()
+            .map(|param| param.ident.clone())
+            .collect();
         validate_struct_schema_attributes(&input.attrs, true)
-            .and_then(|()| generate_struct_schema(data, &quote::quote! { None::<&str> }, &attrs))
+            .and_then(|()| {
+                generate_struct_schema(
+                    data,
+                    &quote::quote! { None::<&str> },
+                    &attrs,
+                    &generic_params,
+                )
+            })
             .expect_err("unmodeled struct representation must produce a diagnostic")
             .to_string()
     }
@@ -7790,8 +7881,20 @@ mod serde_schema_tests {
         let syn::Data::Enum(data) = &input.data else {
             panic!("enum fixture required");
         };
+        let generic_params: Vec<syn::Ident> = input
+            .generics
+            .type_params()
+            .map(|param| param.ident.clone())
+            .collect();
         validate_enum_schema_attributes(&input.attrs)
-            .and_then(|()| generate_enum_schema(data, &quote::quote! { None::<&str> }, &attrs))
+            .and_then(|()| {
+                generate_enum_schema(
+                    data,
+                    &quote::quote! { None::<&str> },
+                    &attrs,
+                    &generic_params,
+                )
+            })
             .expect_err("unsupported enum representation must produce a diagnostic")
             .to_string()
     }
