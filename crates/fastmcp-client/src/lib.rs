@@ -43402,7 +43402,7 @@ exec sleep 2
                 .expect("terminal handle operations complete without another request");
             listener.set_nonblocking(true).unwrap();
             match listener.accept() {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Ok(_) => panic!("terminal poll/watch must not contact the server again"),
                 Err(error) => panic!("terminal request isolation: {error}"),
             }
@@ -43660,7 +43660,7 @@ exec sleep 2
             done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
             listener.set_nonblocking(true).unwrap();
             match listener.accept() {
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Ok(_) => panic!(
                     "one watcher event must not issue another reconciliation or terminal poll"
                 ),
@@ -43996,7 +43996,7 @@ exec sleep 2
                     let mut byte = [0_u8; 1];
                     match reconcile.read(&mut byte) {
                         Ok(0) => {}
-                        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
                         other => panic!(
                             "cancelled or timed-out reconciliation closes its socket: {other:?}"
                         ),
@@ -44014,7 +44014,7 @@ exec sleep 2
             done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
             listener.set_nonblocking(true).unwrap();
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
             );
         });
 
@@ -44213,7 +44213,7 @@ exec sleep 2
                 let mut byte = [0_u8; 1];
                 assert!(
                     matches!(stream.read(&mut byte), Err(error)
-                    if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+                    if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
                     "{name} socket must still be live before the caller drops reconciliation"
                 );
                 stream
@@ -44225,7 +44225,7 @@ exec sleep 2
                 let mut byte = [0_u8; 1];
                 match stream.read(&mut byte) {
                     Ok(0) => {}
-                    Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
                     other => panic!(
                         "dropping reconciliation must close the live {name} socket: {other:?}"
                     ),
@@ -44241,7 +44241,7 @@ exec sleep 2
             write_http_cache_test_response(&mut reused, "application/json", response.as_bytes());
             done_receiver.recv_timeout(Duration::from_secs(2)).unwrap();
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
             );
         });
 
@@ -44275,7 +44275,9 @@ exec sleep 2
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
                 assert!(
-                    std::future::poll_fn(|task_cx| { Poll::Ready(pending.as_mut().poll(task_cx)) })
+                    std::future::poll_fn(|task_cx| {
+                        std::task::Poll::Ready(pending.as_mut().poll(task_cx))
+                    })
                         .await
                         .is_pending(),
                     "the peer withholds the authoritative result"
