@@ -1534,6 +1534,14 @@ pub struct FinalEmptyParams {
 /// `_meta` key correlating an event-stream subscription with its listen request.
 pub const FINAL_SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
 
+/// Maximum number of resource URI entries in one subscription filter.
+/// Duplicate entries count separately toward this admission limit.
+pub const MAX_RESOURCE_SUBSCRIPTIONS: usize = 256;
+
+/// Maximum aggregate UTF-8 bytes in a subscription filter's resource URIs.
+/// Each URI must also satisfy [`crate::common_types::MAX_ABSOLUTE_URI_BYTES`].
+pub const MAX_RESOURCE_SUBSCRIPTION_BYTES: usize = 256 * 1024;
+
 /// Final notification categories selected for a subscription stream.
 ///
 /// Every present field is an explicit opt-in. `false` and an empty resource
@@ -1547,11 +1555,18 @@ pub struct SubscriptionFilter {
         skip_serializing_if = "Option::is_none"
     )]
     pub prompts_list_changed: Option<bool>,
-    /// Resource URIs for update notifications.
+    /// Byte-preserved absolute resource URIs for update notifications.
+    ///
+    /// Wire admission validates URI syntax, entry count, and aggregate bytes.
+    /// Locally constructed filters can use [`Self::validate_resource_subscriptions`]
+    /// before registering or dispatching them. URI validity grants no resource
+    /// access or provider relationship.
     #[serde(
         rename = "resourceSubscriptions",
         default,
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_resource_subscriptions",
+        serialize_with = "serialize_resource_subscriptions"
     )]
     pub resource_subscriptions: Option<Vec<String>>,
     /// Receive resource catalog change notifications when true.
@@ -1589,8 +1604,159 @@ pub struct SubscriptionFilter {
     /// entry, so the check can never fire. (Contrast `GetTaskParams` in
     /// `tasks_extension`, where the same pair of attributes DOES reject,
     /// because it flattens a typed struct that leaves unknown keys behind.)
-    #[serde(flatten, default)]
+    #[serde(
+        flatten,
+        default,
+        serialize_with = "serialize_subscription_filter_additional"
+    )]
     pub additional: BTreeMap<String, Value>,
+}
+
+fn validate_resource_subscription_additional(
+    additional: &BTreeMap<String, Value>,
+) -> Result<(), crate::common_types::CommonTypeError> {
+    if additional.contains_key("resourceSubscriptions") {
+        return Err(crate::common_types::CommonTypeError::Invalid(
+            "resource subscription field shadow",
+        ));
+    }
+    Ok(())
+}
+
+fn serialize_subscription_filter_additional<S>(
+    additional: &BTreeMap<String, Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    validate_resource_subscription_additional(additional).map_err(serde::ser::Error::custom)?;
+    additional.serialize(serializer)
+}
+
+fn admit_resource_subscription_uri(
+    uri: &str,
+    retained_bytes: usize,
+) -> Result<usize, crate::common_types::CommonTypeError> {
+    use crate::common_types::{CommonTypeError, MAX_ABSOLUTE_URI_BYTES};
+
+    // Check before AbsoluteUri::parse allocates its byte-preserving copy.
+    if uri.len() > MAX_ABSOLUTE_URI_BYTES {
+        return Err(CommonTypeError::TooLong("URI"));
+    }
+    let total_bytes = retained_bytes
+        .checked_add(uri.len())
+        .filter(|bytes| *bytes <= MAX_RESOURCE_SUBSCRIPTION_BYTES)
+        .ok_or(CommonTypeError::TooLong("resource subscription URI bytes"))?;
+    AbsoluteUri::parse(uri)?;
+    Ok(total_bytes)
+}
+
+fn validate_resource_subscription_list(
+    uris: &[String],
+) -> Result<(), crate::common_types::CommonTypeError> {
+    if uris.len() > MAX_RESOURCE_SUBSCRIPTIONS {
+        return Err(crate::common_types::CommonTypeError::TooLong(
+            "resource subscription count",
+        ));
+    }
+    let mut retained_bytes = 0;
+    for uri in uris {
+        retained_bytes = admit_resource_subscription_uri(uri, retained_bytes)?;
+    }
+    Ok(())
+}
+
+fn serialize_resource_subscriptions<S>(
+    uris: &Option<Vec<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if let Some(uris) = uris {
+        validate_resource_subscription_list(uris).map_err(serde::ser::Error::custom)?;
+    }
+    uris.serialize(serializer)
+}
+
+fn deserialize_resource_subscriptions<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ResourceUriSeed {
+        index: usize,
+        retained_bytes: usize,
+    }
+
+    impl<'de> DeserializeSeed<'de> for ResourceUriSeed {
+        type Value = String;
+
+        fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            // Refuse an excess element before decoding or retaining its data.
+            if self.index >= MAX_RESOURCE_SUBSCRIPTIONS {
+                return Err(serde::de::Error::custom(
+                    crate::common_types::CommonTypeError::TooLong("resource subscription count"),
+                ));
+            }
+            deserializer.deserialize_str(self)
+        }
+    }
+
+    impl<'de> Visitor<'de> for ResourceUriSeed {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an absolute resource URI within subscription limits")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            admit_resource_subscription_uri(value, self.retained_bytes).map_err(E::custom)?;
+            Ok(value.to_owned())
+        }
+
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+            admit_resource_subscription_uri(&value, self.retained_bytes).map_err(E::custom)?;
+            Ok(value)
+        }
+    }
+
+    struct ResourceUrisVisitor;
+
+    impl<'de> Visitor<'de> for ResourceUrisVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded array of absolute resource URIs")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            // Do not reserve from a peer-controlled size hint. The count and
+            // byte checks precede every retained element, including duplicates.
+            let mut uris = Vec::new();
+            let mut retained_bytes = 0;
+            while let Some(uri) = sequence.next_element_seed(ResourceUriSeed {
+                index: uris.len(),
+                retained_bytes,
+            })? {
+                retained_bytes += uri.len(); // admitted by the element seed
+                uris.push(uri);
+            }
+            Ok(uris)
+        }
+    }
+
+    // An absent field is None through serde's default. A present field must
+    // be an array; null cannot masquerade as an omitted subscription filter.
+    deserializer.deserialize_seq(ResourceUrisVisitor).map(Some)
 }
 
 /// An unrecognized [`SubscriptionFilter`] key that closely resembles a
@@ -1621,6 +1787,20 @@ fn folded_edit_distance(left: &str, right: &str) -> usize {
 }
 
 impl SubscriptionFilter {
+    /// Validates resource URI syntax and bounded retention before local use.
+    ///
+    /// Absent and empty resource selections are valid. Every supplied entry,
+    /// including duplicates, consumes the count and aggregate byte budgets.
+    /// Validation neither normalizes URI spelling nor authorizes delivery.
+    pub fn validate_resource_subscriptions(
+        &self,
+    ) -> Result<(), crate::common_types::CommonTypeError> {
+        validate_resource_subscription_additional(&self.additional)?;
+        self.resource_subscriptions
+            .as_deref()
+            .map_or(Ok(()), validate_resource_subscription_list)
+    }
+
     /// Canonical wire names of the typed filter fields, in declaration order.
     pub const CANONICAL_FIELDS: [&'static str; 4] = [
         "promptsListChanged",
@@ -9682,6 +9862,230 @@ mod tests {
             serde_json::from_str::<Value>(wire).expect("legacy completion fixture is JSON"),
             "legacy completion _meta is retained without asserting source member order"
         );
+    }
+
+    fn assert_resource_subscription_admission(
+        uris: Vec<String>,
+        expected: Result<(), crate::common_types::CommonTypeError>,
+    ) {
+        let filter = SubscriptionFilter {
+            resource_subscriptions: Some(uris.clone()),
+            ..SubscriptionFilter::default()
+        };
+        assert_eq!(filter.validate_resource_subscriptions(), expected);
+        assert_eq!(serde_json::to_value(&filter).is_ok(), expected.is_ok());
+
+        let value = serde_json::json!({"resourceSubscriptions": uris});
+        let raw = serde_json::to_string(&value).expect("resource filter fixture encodes");
+        let from_value = serde_json::from_value::<SubscriptionFilter>(value);
+        let from_wire = serde_json::from_str::<SubscriptionFilter>(&raw);
+        assert_eq!(from_value.is_ok(), expected.is_ok());
+        assert_eq!(from_wire.is_ok(), expected.is_ok());
+        if expected.is_ok() {
+            assert_eq!(from_value.unwrap(), filter);
+            assert_eq!(from_wire.unwrap(), filter);
+        }
+    }
+
+    #[test]
+    fn final_resource_subscription_filter_preserves_optional_and_uri_spelling() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"resourceSubscriptions": []}),
+            serde_json::json!({
+                "resourceSubscriptions": [
+                    "Provider+custom:Collection/Alpha%2fBeta#Part",
+                    "https://EXAMPLE.test:443/a/../b?key=%41",
+                    "urn:example:opaque"
+                ],
+                "toolsListChanged": false,
+                "com.example/future": {"enabled": true}
+            }),
+        ] {
+            let raw = serde_json::to_string(&value).unwrap();
+            let filter: SubscriptionFilter = serde_json::from_str(&raw).unwrap();
+            assert_eq!(filter.validate_resource_subscriptions(), Ok(()));
+            assert_eq!(serde_json::to_value(&filter).unwrap(), value);
+            assert_eq!(
+                filter.resource_subscriptions.is_some(),
+                value.get("resourceSubscriptions").is_some(),
+                "an explicitly empty selection remains distinct from an omitted one"
+            );
+        }
+    }
+
+    #[test]
+    fn final_resource_subscription_filter_rejects_malformed_uris_and_shapes() {
+        for uri in [
+            "",
+            "relative/path",
+            "/absolute/path",
+            "1invalid:item",
+            "file:///path with spaces",
+            "urn:bad%Q1",
+            "urn:bad%",
+            "urn:bad\tvalue",
+            "urn:nonascii-é",
+        ] {
+            let mut filter = SubscriptionFilter {
+                resource_subscriptions: Some(vec!["urn:valid".to_owned(), uri.to_owned()]),
+                ..SubscriptionFilter::default()
+            };
+            assert!(filter.validate_resource_subscriptions().is_err());
+            let value = serde_json::json!({"resourceSubscriptions": ["urn:valid", uri]});
+            assert!(serde_json::from_value::<SubscriptionFilter>(value.clone()).is_err());
+            assert!(serde_json::from_str::<SubscriptionFilter>(&value.to_string()).is_err());
+            filter.resource_subscriptions.as_mut().unwrap()[1] = "urn:valid".to_owned();
+            assert_eq!(filter.validate_resource_subscriptions(), Ok(()));
+        }
+
+        for selection in [
+            serde_json::Value::Null,
+            serde_json::json!("urn:valid"),
+            serde_json::json!({"uri": "urn:valid"}),
+            serde_json::json!([null]),
+            serde_json::json!([42]),
+            serde_json::json!([{"uri": "urn:valid"}]),
+        ] {
+            let value = serde_json::json!({"resourceSubscriptions": selection});
+            assert!(serde_json::from_value::<SubscriptionFilter>(value.clone()).is_err());
+            assert!(serde_json::from_str::<SubscriptionFilter>(&value.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn final_resource_subscription_filter_rejects_flattened_resource_field_shadowing() {
+        use crate::common_types::CommonTypeError;
+
+        for selection in [None, Some(vec!["urn:admitted".to_owned()])] {
+            let mut filter = SubscriptionFilter {
+                resource_subscriptions: selection,
+                additional: BTreeMap::from([(
+                    "com.example/resourceSubscriptions".to_owned(),
+                    serde_json::json!(["opaque extension data"]),
+                )]),
+                ..SubscriptionFilter::default()
+            };
+            assert_eq!(filter.validate_resource_subscriptions(), Ok(()));
+            assert!(serde_json::to_value(&filter).is_ok());
+
+            filter.additional.insert(
+                "resourceSubscriptions".to_owned(),
+                serde_json::json!(["relative/unvalidated"]),
+            );
+            let unchanged = filter.clone();
+            assert_eq!(
+                filter.validate_resource_subscriptions(),
+                Err(CommonTypeError::Invalid(
+                    "resource subscription field shadow"
+                ))
+            );
+            assert!(serde_json::to_value(&filter).is_err());
+            assert_eq!(filter, unchanged);
+        }
+    }
+
+    #[test]
+    fn final_resource_subscription_filter_enforces_entry_count_before_decoding_excess() {
+        use crate::common_types::CommonTypeError;
+
+        for count in [MAX_RESOURCE_SUBSCRIPTIONS - 1, MAX_RESOURCE_SUBSCRIPTIONS] {
+            assert_resource_subscription_admission(vec!["urn:same".to_owned(); count], Ok(()));
+        }
+        assert_resource_subscription_admission(
+            vec!["urn:same".to_owned(); MAX_RESOURCE_SUBSCRIPTIONS + 1],
+            Err(CommonTypeError::TooLong("resource subscription count")),
+        );
+
+        // The next value has invalid JSON string escapes. At capacity its
+        // contents must not be decoded at all: count refusal wins first.
+        let at_capacity =
+            serde_json::to_string(&vec!["urn:same"; MAX_RESOURCE_SUBSCRIPTIONS]).unwrap();
+        let wire = format!(
+            r#"{{"resourceSubscriptions":{},"\q"]}}"#,
+            &at_capacity[..at_capacity.len() - 1]
+        );
+        let error = serde_json::from_str::<SubscriptionFilter>(&wire).unwrap_err();
+        assert!(error.to_string().contains("resource subscription count"));
+    }
+
+    #[test]
+    fn final_resource_subscription_filter_enforces_per_uri_byte_boundaries() {
+        use crate::common_types::{CommonTypeError, MAX_ABSOLUTE_URI_BYTES};
+
+        for bytes in [MAX_ABSOLUTE_URI_BYTES - 1, MAX_ABSOLUTE_URI_BYTES] {
+            let uri = format!("urn:{}", "a".repeat(bytes - 4));
+            assert_eq!(uri.len(), bytes);
+            assert_resource_subscription_admission(vec![uri], Ok(()));
+        }
+        let uri = format!("urn:{}", "a".repeat(MAX_ABSOLUTE_URI_BYTES - 3));
+        assert_resource_subscription_admission(vec![uri], Err(CommonTypeError::TooLong("URI")));
+    }
+
+    #[test]
+    fn final_resource_subscription_filter_enforces_aggregate_byte_boundaries() {
+        use crate::common_types::{CommonTypeError, MAX_ABSOLUTE_URI_BYTES};
+
+        // Five valid URIs vary only one byte of aggregate size. Repeated URIs
+        // count toward retention exactly like distinct entries; deduplication
+        // cannot be used to admit an oversized peer filter.
+        for delta in [-1_isize, 0, 1] {
+            let mut uris = vec![format!("urn:{}", "a".repeat(MAX_ABSOLUTE_URI_BYTES - 4)); 3];
+            let final_large_size = (MAX_ABSOLUTE_URI_BYTES - 3)
+                .checked_add_signed(delta)
+                .unwrap();
+            uris.push(format!("urn:{}", "b".repeat(final_large_size - 4)));
+            uris.push("u:a".to_owned());
+            assert_eq!(
+                uris.iter().map(String::len).sum::<usize>(),
+                MAX_RESOURCE_SUBSCRIPTION_BYTES
+                    .checked_add_signed(delta)
+                    .unwrap()
+            );
+            assert_resource_subscription_admission(
+                uris,
+                if delta <= 0 {
+                    Ok(())
+                } else {
+                    Err(CommonTypeError::TooLong("resource subscription URI bytes"))
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn final_resource_subscription_uri_admission_reaches_listen_and_acknowledgement() {
+        let accepted = serde_json::json!({"resourceSubscriptions": ["custom:item%2fchild"]});
+        let refused = serde_json::json!({"resourceSubscriptions": ["relative/item%2fchild"]});
+        for (filter, valid) in [(accepted, true), (refused, false)] {
+            let params = serde_json::json!({
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": FINAL_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": filter.clone()
+            });
+            assert_eq!(
+                CoreRequest::decode(ProtocolEra::Modern2026, SUBSCRIPTIONS_LISTEN, Some(&params))
+                    .is_ok(),
+                valid
+            );
+            let acknowledgement = serde_json::json!({"notifications": filter});
+            assert_eq!(
+                serde_json::from_value::<FinalSubscriptionsAcknowledgedNotificationParams>(
+                    acknowledgement.clone()
+                )
+                .is_ok(),
+                valid
+            );
+            assert_eq!(
+                serde_json::from_str::<FinalSubscriptionsAcknowledgedNotificationParams>(
+                    &acknowledgement.to_string()
+                )
+                .is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]
