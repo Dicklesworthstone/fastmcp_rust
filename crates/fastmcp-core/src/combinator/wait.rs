@@ -6,52 +6,13 @@ use std::task::{Context, Poll};
 
 use asupersync::Cx;
 use asupersync::channel::oneshot;
-use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use asupersync::time::Sleep;
 
 use super::{BoxFuture, poll_slot};
 use crate::error::{McpError, McpResult};
+use crate::runtime::ambient_capability_ceiling;
 
 mod bounded;
-
-// Capture the active effect ceiling before installing the explicit caller.
-// Cx::set_current preserves the supplied Cx's restrictions, not those of the
-// ambient frame it replaces. The ambient context contributes only a ceiling:
-// it must not replace the caller's identity, cancellation or runtime drivers.
-fn ambient_capability_ceiling() -> CapMask {
-    let Some(active) = Cx::current() else {
-        return CapMask::all();
-    };
-    let capabilities = active.capabilities();
-    let mut ceiling = CapMask::all();
-    for (allowed, without_effect) in [
-        (
-            capabilities.spawn,
-            CapSet::<false, true, true, true, true>::MASK,
-        ),
-        (
-            capabilities.time,
-            CapSet::<true, false, true, true, true>::MASK,
-        ),
-        (
-            capabilities.entropy,
-            CapSet::<true, true, false, true, true>::MASK,
-        ),
-        (
-            capabilities.io,
-            CapSet::<true, true, true, false, true>::MASK,
-        ),
-        (
-            capabilities.remote,
-            CapSet::<true, true, true, true, false>::MASK,
-        ),
-    ] {
-        if !allowed {
-            ceiling = ceiling.intersect(without_effect);
-        }
-    }
-    ceiling
-}
 
 fn checkpoint(cx: &Cx) -> McpResult<()> {
     if cx
@@ -143,6 +104,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Wake, Waker};
     use std::time::Duration;
+
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 
     use super::*;
     use crate::combinator::{first_ok, quorum, quorum_timeout, race, race_timeout};

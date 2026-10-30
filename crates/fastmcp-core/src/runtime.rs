@@ -42,8 +42,11 @@ pub mod envelope;
 use std::cell::{Cell, OnceCell};
 use std::fmt;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use asupersync::runtime::Runtime;
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::reactor::create_reactor;
@@ -470,7 +473,7 @@ thread_local! {
     /// A pool thread is never the driver, so bridging an async operation on one
     /// cannot starve the thread that would complete it. Without this
     /// distinction the detection below would reject the paths that work today.
-    static BLOCKING_LANE: Cell<bool> = const { Cell::new(false) };
+    static BLOCKING_LANE_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Declares the current thread a dedicated blocking lane until dropped.
@@ -478,21 +481,44 @@ thread_local! {
 /// Set this on threads owned by a blocking pool, never on an async worker: it
 /// is an assertion that some OTHER thread is driving the runtime, which is what
 /// makes a blocking bridge safe here.
+///
+/// The declaration belongs to this thread and lasts until every nested guard
+/// has been dropped, even when guards are released out of order.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<fastmcp_core::runtime::BlockingLaneGuard>();
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<fastmcp_core::runtime::BlockingLaneGuard>();
+/// ```
 #[must_use = "the lane declaration ends when the guard is dropped"]
 pub struct BlockingLaneGuard {
-    previous: bool,
+    _thread_bound: PhantomData<Rc<()>>,
 }
 
 impl Drop for BlockingLaneGuard {
     fn drop(&mut self) {
-        BLOCKING_LANE.with(|lane| lane.set(self.previous));
+        BLOCKING_LANE_DEPTH.with(|depth| {
+            depth.set(depth.get().checked_sub(1).expect("blocking lane is active"));
+        });
     }
 }
 
 /// Enters a dedicated blocking lane on the current thread.
 pub fn enter_blocking_lane() -> BlockingLaneGuard {
+    BLOCKING_LANE_DEPTH.with(|depth| {
+        depth.set(
+            depth
+                .get()
+                .checked_add(1)
+                .expect("blocking lane nesting overflow"),
+        );
+    });
     BlockingLaneGuard {
-        previous: BLOCKING_LANE.with(|lane| lane.replace(true)),
+        _thread_bound: PhantomData,
     }
 }
 
@@ -511,7 +537,7 @@ pub fn enter_blocking_lane() -> BlockingLaneGuard {
 /// other uses are unaffected.
 #[must_use]
 pub fn bridge_would_starve_its_driver() -> bool {
-    BRIDGE_NESTED_IN_TASK.with(Cell::get) && !BLOCKING_LANE.with(Cell::get)
+    BRIDGE_NESTED_IN_TASK.with(Cell::get) && BLOCKING_LANE_DEPTH.with(Cell::get) == 0
 }
 
 /// Keeps reentrancy rejection unwind-safe without holding a TLS borrow while
@@ -607,6 +633,45 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     })
 }
 
+// Capture the active effect ceiling before installing the explicit caller.
+// Cx::set_current preserves the supplied Cx's restrictions, not those of the
+// ambient frame it replaces. The ambient context contributes only a ceiling:
+// it must not replace the caller's identity, cancellation or runtime drivers.
+pub(crate) fn ambient_capability_ceiling() -> CapMask {
+    let Some(active) = asupersync::Cx::current() else {
+        return CapMask::all();
+    };
+    let capabilities = active.capabilities();
+    let mut ceiling = CapMask::all();
+    for (allowed, without_effect) in [
+        (
+            capabilities.spawn,
+            CapSet::<false, true, true, true, true>::MASK,
+        ),
+        (
+            capabilities.time,
+            CapSet::<true, false, true, true, true>::MASK,
+        ),
+        (
+            capabilities.entropy,
+            CapSet::<true, true, false, true, true>::MASK,
+        ),
+        (
+            capabilities.io,
+            CapSet::<true, true, true, false, true>::MASK,
+        ),
+        (
+            capabilities.remote,
+            CapSet::<true, true, true, true, false>::MASK,
+        ),
+    ] {
+        if !allowed {
+            ceiling = ceiling.intersect(without_effect);
+        }
+    }
+    ceiling
+}
+
 /// Drives `future` to completion on the calling thread under the caller's own
 /// `cx`, without creating or entering a runtime.
 ///
@@ -616,6 +681,10 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
 /// clock, and children spawned through `cx` join `cx`'s region. The caller's
 /// runtime is not driven while this thread waits, so the loop re-polls at least
 /// every millisecond and readiness that no driver delivers is still observed.
+///
+/// The active context also limits ambient effects for the entire call,
+/// including cleanup. Supplying a broader retained `cx` cannot restore an
+/// effect denied by the context from which this bridge was entered.
 ///
 /// The entry is recorded exactly as [`block_on`] records its own, so
 /// [`bridge_would_starve_its_driver`] still names a reverse request that could
@@ -643,7 +712,9 @@ pub fn poll_on_cx<F: Future>(cx: &asupersync::Cx, future: F) -> F::Output {
     // Record the position before installing `cx`, which would otherwise make
     // a bridge entered from a bare thread look like one entered from a task.
     let _entry = BridgeEntry::enter();
+    let ceiling = ambient_capability_ceiling();
     let _current = asupersync::Cx::set_current(Some(cx.clone()));
+    let _restriction = asupersync::Cx::push_restriction(ceiling);
     let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
     let mut task_cx = Context::from_waker(&waker);
     let mut future = std::pin::pin!(future);
@@ -742,6 +813,148 @@ mod tests {
             "the thread's previous cx is restored"
         );
         assert_eq!(super::poll_on_cx(&cx, async { 5 }), 5);
+    }
+
+    fn effects(cx: &asupersync::Cx) -> [bool; 5] {
+        let capabilities = cx.capabilities();
+        [
+            capabilities.spawn,
+            capabilities.time,
+            capabilities.entropy,
+            capabilities.io,
+            capabilities.remote,
+        ]
+    }
+
+    fn effect_masks() -> [super::CapMask; 7] {
+        use super::{CapMask, CapSet, CapSetRuntimeMask};
+
+        [
+            CapMask::all(),
+            CapSet::<false, true, true, true, true>::MASK,
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, false, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+            CapSet::<true, true, true, true, false>::MASK,
+            CapMask::none(),
+        ]
+    }
+
+    #[test]
+    fn poll_on_cx_intersects_retained_and_ambient_effects_across_pending() {
+        use asupersync::Cx;
+        use std::future::poll_fn;
+        use std::task::Poll;
+
+        for caller_mask in effect_masks() {
+            for host_mask in effect_masks() {
+                let caller = Cx::for_request_with_budget(asupersync::Budget::new());
+                let retained = {
+                    let _current = Cx::set_current(Some(caller.clone()));
+                    let _restriction = Cx::push_restriction(caller_mask);
+                    Cx::current().unwrap()
+                };
+                let host = Cx::for_request_with_budget(asupersync::Budget::new());
+                assert_ne!(caller.task_id(), host.task_id());
+                let _host = Cx::set_current(Some(host.clone()));
+                let _host_restriction = Cx::push_restriction(host_mask);
+                let host_effects = effects(&Cx::current().unwrap());
+                let caller_effects = effects(&retained);
+                let expected: [bool; 5] =
+                    std::array::from_fn(|i| host_effects[i] && caller_effects[i]);
+                let mut polls = 0;
+                let result = super::poll_on_cx(
+                    &retained,
+                    poll_fn(|task| {
+                        let current = Cx::current().unwrap();
+                        assert_eq!(effects(&current), expected);
+                        assert_eq!(current.task_id(), caller.task_id());
+                        assert_eq!(current.region_id(), caller.region_id());
+                        polls += 1;
+                        if polls == 1 {
+                            task.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            current.set_cancel_requested(true);
+                            Poll::Ready(37)
+                        }
+                    }),
+                );
+                assert_eq!(result, 37);
+                assert_eq!(polls, 2);
+                assert!(caller.is_cancel_requested());
+                assert!(!host.is_cancel_requested());
+                let restored = Cx::current().unwrap();
+                assert_eq!(restored.task_id(), host.task_id());
+                assert_eq!(effects(&restored), host_effects);
+            }
+        }
+        assert!(Cx::current().is_none());
+    }
+
+    #[test]
+    fn poll_on_cx_keeps_the_ambient_ceiling_during_panic_cleanup() {
+        use asupersync::Cx;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct ObserveDrop(Rc<Cell<Option<[bool; 5]>>>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.set(Cx::current().as_ref().map(effects));
+            }
+        }
+
+        let caller = Cx::for_testing();
+        let host = Cx::for_testing();
+        let _host = Cx::set_current(Some(host));
+        let restriction = Cx::push_restriction(super::CapMask::none());
+        let observed = Rc::new(Cell::new(None));
+        let probe = ObserveDrop(Rc::clone(&observed));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::poll_on_cx(&caller, async move {
+                let _probe = probe;
+                panic!("restricted bridge panic");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(observed.get(), Some([false; 5]));
+        assert_eq!(effects(&Cx::current().unwrap()), [false; 5]);
+        assert_eq!(super::poll_on_cx(&caller, async { 41 }), 41);
+        drop(restriction);
+        assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+    }
+
+    #[test]
+    fn blocking_lane_guards_preserve_nested_declarations_in_any_drop_order() {
+        let cx = asupersync::Cx::for_testing();
+        let _current = asupersync::Cx::set_current(Some(cx.clone()));
+        let starves = || {
+            super::poll_on_cx(&cx, async { super::bridge_would_starve_its_driver() })
+        };
+
+        assert!(starves());
+        for outer_first in [false, true] {
+            let outer = super::enter_blocking_lane();
+            let inner = super::enter_blocking_lane();
+            assert!(!starves());
+            if outer_first {
+                drop(outer);
+                assert!(!starves());
+                drop(inner);
+            } else {
+                drop(inner);
+                assert!(!starves());
+                drop(outer);
+            }
+            assert!(starves(), "the final guard releases the declaration");
+        }
+        let panic = std::panic::catch_unwind(|| {
+            let _lane = super::enter_blocking_lane();
+            panic!("blocking lane panic");
+        });
+        assert!(panic.is_err());
+        assert!(starves(), "unwinding releases the declaration");
     }
 
     #[test]
