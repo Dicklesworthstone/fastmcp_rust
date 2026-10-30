@@ -679,6 +679,66 @@ impl ModernHttpResponseMetadata {
     }
 }
 
+// A retained request context owns cancellation and clocks, but cannot enlarge
+// the host's current authority. Native TCP and Sleep fall back when their
+// drivers are masked, so checking the effective bits must precede both a
+// context rebind and every resumed poll that can perform I/O or register time.
+fn modern_http_capability_ceiling(
+    cx: &Cx,
+) -> Result<asupersync::cx::CapMask, ModernHttpExecutorError> {
+    use asupersync::cx::{CapMask, CapSet, CapSetRuntimeMask};
+
+    let held = cx.capabilities();
+    let host = Cx::current().map(|current| current.capabilities());
+    if !held.io || host.is_some_and(|capabilities| !capabilities.io) {
+        return Err(ModernHttpExecutorError::CapabilityDenied { capability: "IO" });
+    }
+    if !held.time || host.is_some_and(|capabilities| !capabilities.time) {
+        return Err(ModernHttpExecutorError::CapabilityDenied { capability: "TIME" });
+    }
+
+    let mut ceiling = CapMask::all();
+    if let Some(host) = host {
+        if !host.spawn {
+            ceiling = ceiling.intersect(<CapSet<false, true, true, true, true>>::MASK);
+        }
+        if !host.entropy {
+            ceiling = ceiling.intersect(<CapSet<true, true, false, true, true>>::MASK);
+        }
+        if !host.remote {
+            ceiling = ceiling.intersect(<CapSet<true, true, true, true, false>>::MASK);
+        }
+    }
+    Ok(ceiling)
+}
+
+struct ModernHttpCallerGuard {
+    // Fields drop in declaration order: remove the intersection before
+    // restoring the previous ambient context.
+    _ceiling: asupersync::cx::cx::CurrentCxGuard,
+    _caller: asupersync::cx::cx::CurrentCxGuard,
+}
+
+fn bind_modern_http_caller(cx: &Cx) -> Result<ModernHttpCallerGuard, ModernHttpExecutorError> {
+    let ceiling = modern_http_capability_ceiling(cx)?;
+    let caller = Cx::set_current(Some(cx.clone()));
+    let ceiling = Cx::push_restriction(ceiling);
+    Ok(ModernHttpCallerGuard {
+        _ceiling: ceiling,
+        _caller: caller,
+    })
+}
+
+fn check_modern_http_effects(cx: &Cx) -> Result<(), ModernHttpExecutorError> {
+    check_modern_http_context(cx)?;
+    modern_http_capability_ceiling(cx)?;
+    Ok(())
+}
+
+fn modern_http_io_capability_error(error: ModernHttpExecutorError) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, error.to_string())
+}
+
 // Only the full HTTP request flush commits a response wait. Modern requests
 // never use Expect: 100-continue, so there is no earlier header-only flush.
 //
@@ -700,7 +760,7 @@ impl AsyncRead for ModernHttpIo {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let _caller = Cx::set_current(Some(self.cx.clone()));
+        let _caller = bind_modern_http_caller(&self.cx).map_err(modern_http_io_capability_error)?;
         Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
@@ -711,7 +771,7 @@ impl AsyncWrite for ModernHttpIo {
         cx: &mut Context<'_>,
         bytes: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let _caller = Cx::set_current(Some(self.cx.clone()));
+        let _caller = bind_modern_http_caller(&self.cx).map_err(modern_http_io_capability_error)?;
         let written = Pin::new(&mut self.inner).poll_write(cx, bytes);
         if matches!(written, Poll::Ready(Ok(count)) if count > 0) {
             self.request_bytes_sent.store(true, Ordering::Release);
@@ -720,7 +780,7 @@ impl AsyncWrite for ModernHttpIo {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let _caller = Cx::set_current(Some(self.cx.clone()));
+        let _caller = bind_modern_http_caller(&self.cx).map_err(modern_http_io_capability_error)?;
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Ready(Ok(())) => {
                 let _ = self.committed_at.set(self.cx.now());
@@ -731,7 +791,7 @@ impl AsyncWrite for ModernHttpIo {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let _caller = Cx::set_current(Some(self.cx.clone()));
+        let _caller = bind_modern_http_caller(&self.cx).map_err(modern_http_io_capability_error)?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -782,7 +842,7 @@ impl HttpResponseDeadline {
     }
 
     fn check(&mut self) -> Result<(), ModernHttpExecutorError> {
-        check_modern_http_context(&self.cx)?;
+        check_modern_http_effects(&self.cx)?;
         if self.response_deadlines.is_none()
             && let Some(committed_at) = self.committed_at.get()
         {
@@ -829,10 +889,10 @@ impl HttpResponseDeadline {
             sleep.reset(next);
         }
         // Native Sleep binds its driver at poll time. Install only the actual
-        // caller context for this poll, restoring the ambient context before
-        // returning; no runtime or independent timer task is created here.
+        // caller's clock and cancellation for this poll while retaining the
+        // host's authority ceiling. No independent timer task is created here.
         let ready = {
-            let _caller = Cx::set_current(Some(self.cx.clone()));
+            let _caller = bind_modern_http_caller(&self.cx)?;
             Pin::new(sleep).poll(cx).is_ready()
         };
         if ready {
@@ -899,6 +959,7 @@ impl ModernHttpBody {
     fn check_deadline(&mut self) -> Result<(), ModernHttpExecutorError> {
         if let Err(error) = self.deadline.check() {
             self.inner = None;
+            self.deadline.sleep = None;
             return Err(error);
         }
         Ok(())
@@ -918,6 +979,7 @@ impl Body for ModernHttpBody {
         }
         if let Err(error) = self.deadline.poll(cx) {
             self.inner = None;
+            self.deadline.sleep = None;
             return Poll::Ready(Some(Err(error)));
         }
         let frame = Pin::new(self.inner.as_mut().expect("body ownership checked")).poll_frame(cx);
@@ -927,10 +989,12 @@ impl Body for ModernHttpBody {
         match frame {
             Poll::Ready(Some(Err(_))) => {
                 self.inner = None;
+                self.deadline.sleep = None;
                 Poll::Ready(Some(Err(ModernHttpExecutorError::ResponseBodyReadFailed)))
             }
             Poll::Ready(None) => {
                 self.inner = None;
+                self.deadline.sleep = None;
                 Poll::Ready(None)
             }
             other => other.map(|frame| {
@@ -1188,15 +1252,15 @@ impl ModernHttpResponseStream {
             if cancellation.is_cancel_requested() {
                 return Err(ModernHttpExecutorError::Cancelled);
             }
-            check_modern_http_context(cx)?;
+            check_modern_http_effects(cx)?;
             let mut ambient_cancelled = std::pin::pin!(cancellation_signal.recv(cx));
             let frame = poll_fn(|task_cx| {
                 if cancelled.as_mut().poll(task_cx).is_ready() {
                     return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                 }
-                check_modern_http_context(cx)?;
+                check_modern_http_effects(cx)?;
                 if ambient_cancelled.as_mut().poll(task_cx).is_ready() {
-                    check_modern_http_context(cx)?;
+                    check_modern_http_effects(cx)?;
                     return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                 }
                 match Pin::new(&mut response.body).poll_frame(task_cx) {
@@ -1218,7 +1282,7 @@ impl ModernHttpResponseStream {
                 if cancellation.is_cancel_requested() {
                     return Err(ModernHttpExecutorError::Cancelled);
                 }
-                check_modern_http_context(cx)?;
+                check_modern_http_effects(cx)?;
                 let chunk = data.chunk();
                 if chunk.len() > maximum_bytes.saturating_sub(bytes.len()) {
                     return Err(ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes });
@@ -1971,13 +2035,13 @@ impl ModernHttpRequestExecution {
                             .err()
                             .unwrap_or(ModernHttpExecutorError::Cancelled),
                     )
-                } else if caller_deadline.as_mut().is_some_and(|sleep| {
-                    let _caller = Cx::set_current(Some(cx.clone()));
-                    Pin::new(sleep).poll(task_cx).is_ready()
-                }) {
-                    Some(ModernHttpExecutorError::Transport(
-                        ClientError::DeadlineExceeded,
-                    ))
+                } else if let Some(sleep) = caller_deadline.as_mut() {
+                    match bind_modern_http_caller(cx) {
+                        Ok(_caller) => Pin::new(sleep).poll(task_cx).is_ready().then_some(
+                            ModernHttpExecutorError::Transport(ClientError::DeadlineExceeded),
+                        ),
+                        Err(error) => Some(error),
+                    }
                 } else {
                     None
                 }
@@ -2063,6 +2127,7 @@ impl ModernHttpRequestExecution {
                     if matches!(
                         reason,
                         ExecutionTerminalReason::CallerCancelled
+                            | ExecutionTerminalReason::CapabilityDenied
                             | ExecutionTerminalReason::IdleTimeout
                             | ExecutionTerminalReason::AbsoluteTimeout
                     ) {
@@ -2109,7 +2174,7 @@ impl Drop for ModernHttpRequestExecution {
 }
 
 fn modern_http_execution_caller_error(cx: &Cx) -> Option<ModernHttpExecutorError> {
-    check_modern_http_context(cx).err().or_else(|| {
+    check_modern_http_effects(cx).err().or_else(|| {
         cx.budget()
             .deadline
             .filter(|deadline| cx.now() >= *deadline)
@@ -2139,6 +2204,9 @@ fn modern_http_execution_error_reason(
         ModernHttpExecutorError::Cancelled => ExecutionTerminalReason::CallerCancelled,
         ModernHttpExecutorError::CredentialUnavailable => {
             ExecutionTerminalReason::CredentialUnavailable
+        }
+        ModernHttpExecutorError::CapabilityDenied { .. } => {
+            ExecutionTerminalReason::CapabilityDenied
         }
         ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle) => {
             ExecutionTerminalReason::IdleTimeout
@@ -2272,6 +2340,59 @@ mod owned_execution_reentrancy_tests {
     ) -> Poll<Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError>> {
         let mut next = std::pin::pin!(execution.next_event(cx));
         next.as_mut().poll(&mut Context::from_waker(waker))
+    }
+
+    #[test]
+    fn modern_http_authority_loss_retires_suspended_execution_once() {
+        use asupersync::cx::{CapSet, CapSetRuntimeMask};
+
+        for (mask, denied) in [
+            (<CapSet<true, true, true, false, true>>::MASK, "IO"),
+            (<CapSet<true, false, true, true, true>>::MASK, "TIME"),
+        ] {
+            let cx = Cx::for_testing();
+            let polls = Arc::new(AtomicUsize::new(0));
+            let drops = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(AtomicBool::new(false));
+            let mut execution = execution(
+                &cx,
+                ProbeOperation {
+                    polls: polls.clone(),
+                    drops: drops.clone(),
+                    ready: ready.clone(),
+                    wake: false,
+                    panic: false,
+                },
+            );
+            let control = execution.control();
+            assert!(poll_once(&mut execution, &cx, Waker::noop()).is_pending());
+            ready.store(true, Ordering::SeqCst);
+            {
+                let _host = Cx::set_current(Some(cx.clone()));
+                let _restriction = Cx::push_restriction(mask);
+                assert!(matches!(
+                    poll_once(&mut execution, &cx, Waker::noop()),
+                    Poll::Ready(Err(ModernHttpFinalCoreListenError::Executor(
+                        ModernHttpExecutorError::CapabilityDenied { capability }
+                    ))) if capability == denied
+                ));
+            }
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                control.terminal_reason(),
+                Some(ExecutionTerminalReason::CapabilityDenied)
+            );
+            assert!(control.is_terminal_nonblocking());
+            assert!(control.take_cancellation_event().is_some());
+            assert!(control.take_cancellation_event().is_none());
+            assert!(matches!(
+                poll_once(&mut execution, &cx, Waker::noop()),
+                Poll::Ready(Ok(None))
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert!(cx.checkpoint().is_ok());
+        }
     }
 
     #[test]
@@ -3094,7 +3215,7 @@ impl ModernHttpSseResponseStream {
         if self.is_closed() {
             return Err(ModernHttpExecutorError::SseStreamClosed);
         }
-        if let Err(error) = check_modern_http_context(cx) {
+        if let Err(error) = check_modern_http_effects(cx) {
             self.close();
             return Err(error);
         }
@@ -3111,7 +3232,7 @@ impl ModernHttpSseResponseStream {
         let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
 
         loop {
-            if let Err(error) = check_modern_http_context(cx) {
+            if let Err(error) = check_modern_http_effects(cx) {
                 self.close();
                 return Err(error);
             }
@@ -3122,8 +3243,10 @@ impl ModernHttpSseResponseStream {
                     .ok_or(ModernHttpExecutorError::SseStreamClosed)?;
                 let mut cancellation = std::pin::pin!(cancellation_signal.recv(cx));
                 poll_fn(|task_cx| {
+                    check_modern_http_effects(cx)?;
                     if cancellation.as_mut().poll(task_cx).is_ready() {
-                        return Poll::Ready(Err(()));
+                        check_modern_http_context(cx)?;
+                        return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
                     match Pin::new(&mut response.body).poll_frame(task_cx) {
                         Poll::Ready(frame) => Poll::Ready(Ok(frame)),
@@ -3134,10 +3257,9 @@ impl ModernHttpSseResponseStream {
             };
             let frame = match frame {
                 Ok(frame) => frame,
-                Err(()) => {
+                Err(error) => {
                     self.close();
-                    check_modern_http_context(cx)?;
-                    return Err(ModernHttpExecutorError::Cancelled);
+                    return Err(error);
                 }
             };
             let frame = match reject_body_frame_after_cancellation(cx, frame) {
@@ -3262,7 +3384,7 @@ impl ModernHttpSseResponseStream {
         if self.is_closed() {
             return Err(ModernHttpExecutorError::SseStreamClosed);
         }
-        if let Err(error) = check_modern_http_context(cx) {
+        if let Err(error) = check_modern_http_effects(cx) {
             self.close();
             return Err(error);
         }
@@ -3852,11 +3974,16 @@ fn validate_http_subscription_notification_filter(
 
 /// Errors raised before or while executing one modern POST.
 #[derive(Debug)]
-pub enum ModernHttpExecutorError {
-    /// Request metadata cannot safely become an HTTP header value.
+pub enum ModernHttpExecutorError {    /// Request metadata cannot safely become an HTTP header value.
     InvalidRequestMetadata,
     /// Caller cancellation was observed before dispatching the POST.
     Cancelled,
+    /// The request or its current host denies an effect required by HTTP.
+    /// No denied socket or timer operation is performed.
+    CapabilityDenied {
+        /// The required runtime capability, either `IO` or `TIME`.
+        capability: &'static str,
+    },
     /// A configured bearer credential cannot authorize this request anymore.
     /// Authenticated dispatch never falls back to an anonymous POST.
     CredentialUnavailable,
@@ -3921,6 +4048,9 @@ impl fmt::Display for ModernHttpExecutorError {
                 formatter.write_str("invalid modern MCP request metadata")
             }
             Self::Cancelled => formatter.write_str("modern MCP request was cancelled"),
+            Self::CapabilityDenied { capability } => {
+                write!(formatter, "modern MCP request requires {capability} capability")
+            }
             Self::CredentialUnavailable => {
                 formatter.write_str("modern MCP bearer credential is unavailable")
             }
@@ -4188,7 +4318,7 @@ impl ModernHttpExecutor {
         if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
             return Err(ModernHttpExecutorError::Cancelled);
         }
-        check_modern_http_context(cx)?;
+        check_modern_http_effects(cx)?;
         if self
             .resource_tls
             .as_ref()
@@ -4250,14 +4380,14 @@ impl ModernHttpExecutor {
                     if cancelled.as_mut().poll(task_cx).is_ready() {
                         return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
-                    check_modern_http_context(cx)?;
+                    check_modern_http_effects(cx)?;
                     if ambient_cancelled.as_mut().poll(task_cx).is_ready() {
                         check_modern_http_context(cx)?;
                         return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
                     deadline.poll(task_cx)?;
                     let response = {
-                        let _caller = Cx::set_current(Some(cx.clone()));
+                        let _caller = bind_modern_http_caller(cx)?;
                         exchange.as_mut().poll(task_cx)
                     };
                     deadline.poll(task_cx)?;
@@ -4268,14 +4398,14 @@ impl ModernHttpExecutor {
             None => {
                 let mut ambient_cancelled = std::pin::pin!(ambient_cancellation_signal.recv(cx));
                 poll_fn(|task_cx| {
-                    check_modern_http_context(cx)?;
+                    check_modern_http_effects(cx)?;
                     if ambient_cancelled.as_mut().poll(task_cx).is_ready() {
                         check_modern_http_context(cx)?;
                         return Poll::Ready(Err(ModernHttpExecutorError::Cancelled));
                     }
                     deadline.poll(task_cx)?;
                     let response = {
-                        let _caller = Cx::set_current(Some(cx.clone()));
+                        let _caller = bind_modern_http_caller(cx)?;
                         exchange.as_mut().poll(task_cx)
                     };
                     deadline.poll(task_cx)?;
@@ -4287,7 +4417,7 @@ impl ModernHttpExecutor {
         if cancellation.is_some_and(McpRequestCancellation::is_cancel_requested) {
             return Err(ModernHttpExecutorError::Cancelled);
         }
-        check_modern_http_context(cx)?;
+        check_modern_http_effects(cx)?;
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
         let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
             let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
@@ -12443,6 +12573,343 @@ mod tests {
     use crate::{
         CanonicalHttpUrl, ClientBuilder, ClientProtocolPlan, ProtocolPolicy, ReverseRequestHandlers,
     };
+
+    mod modern_http_authority_tests {
+        use super::*;
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::OnceLock;
+        use std::sync::atomic::AtomicBool;
+
+        use asupersync::cx::{CapMask, CapSet, CapSetRuntimeMask};
+        use asupersync::http::Body;
+        use asupersync::http::h1::http_client::ClientIo;
+        use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+
+        use crate::http_executor::{
+            HttpResponseDeadline, HttpResponseTimeoutPolicy, ModernHttpIo, bind_modern_http_caller,
+        };
+        use crate::{RequestTimeoutPolicy, RequestTimeoutSource};
+
+        const NO_IO: CapMask = <CapSet<true, true, true, false, true>>::MASK;
+        const NO_TIME: CapMask = <CapSet<true, false, true, true, true>>::MASK;
+
+        fn narrowed(cx: &Cx, mask: CapMask) -> Cx {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(mask);
+            Cx::current().unwrap()
+        }
+
+        fn virtual_owner() -> (Runtime, Cx, Arc<VirtualClock>, TimerDriverHandle) {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(clock.clone());
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            (runtime, cx, clock, timer)
+        }
+
+        fn request(target: &str) -> ModernHttpRequest {
+            ModernHttpRequest::new(
+                target,
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_vec(),
+                MODERN_PROTOCOL_VERSION,
+                "tools/list",
+                None,
+            )
+            .unwrap()
+        }
+
+        // Unlike Runtime::block_on, this does not replace the host context.
+        // Real loopback I/O is bounded even if a regression never completes.
+        fn poll_to_ready<F: Future>(future: F) -> F::Output {
+            let mut future = std::pin::pin!(future);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut task = Context::from_waker(Waker::noop());
+            loop {
+                if let Poll::Ready(result) = future.as_mut().poll(&mut task) {
+                    return result;
+                }
+                assert!(Instant::now() < deadline, "HTTP authority fixture stalled");
+                thread::yield_now();
+            }
+        }
+
+        fn response_deadline(cx: &Cx) -> HttpResponseDeadline {
+            let committed_at = Arc::new(OnceLock::new());
+            committed_at.set(cx.now()).unwrap();
+            HttpResponseDeadline {
+                cx: cx.clone(),
+                committed_at,
+                policy: HttpResponseTimeoutPolicy::Ordinary(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4))
+                        .unwrap(),
+                ),
+                response_deadlines: None,
+                caller_deadline: None,
+                sleep: None,
+                progress_marker: None,
+                last_progress: None,
+            }
+        }
+
+        #[test]
+        fn binding_retains_owner_clock_cancellation_and_every_host_mask_bit() {
+            let (_runtime, owner, clock, _timer) = virtual_owner();
+            clock.advance(73);
+            let held = narrowed(&owner, <CapSet<true, true, false, true, true>>::MASK);
+            assert!(Cx::current().is_none());
+            {
+                let _binding = bind_modern_http_caller(&held).unwrap();
+                assert_eq!(Cx::current().unwrap().now(), Time::from_nanos(73));
+                assert!(!Cx::current().unwrap().capabilities().entropy);
+            }
+            assert!(Cx::current().is_none());
+            let foreign = narrowed(
+                &Cx::for_testing(),
+                <CapSet<false, true, true, true, false>>::MASK,
+            );
+            foreign.cancel_with(CancelKind::User, Some("unrelated host"));
+            let _host = Cx::set_current(Some(foreign));
+            {
+                let _binding = bind_modern_http_caller(&held).unwrap();
+                let current = Cx::current().unwrap();
+                let capabilities = current.capabilities();
+                assert!(capabilities.io && capabilities.time);
+                assert!(!capabilities.spawn && !capabilities.entropy && !capabilities.remote);
+                assert_eq!(current.now(), Time::from_nanos(73));
+                assert!(current.checkpoint().is_ok());
+            }
+            assert!(Cx::current().unwrap().is_cancel_requested());
+            assert!(owner.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn denied_held_or_host_context_never_opens_a_socket() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let request = request(&format!("http://{}/mcp", listener.local_addr().unwrap()));
+            let executor = ModernHttpExecutor::new();
+            let broad = Cx::for_testing();
+            for (mask, denied) in [(NO_IO, "IO"), (NO_TIME, "TIME")] {
+                let narrow = narrowed(&broad, mask);
+                for deny_held in [false, true] {
+                    let (held, host) = if deny_held {
+                        (&narrow, &broad)
+                    } else {
+                        (&broad, &narrow)
+                    };
+                    let _host = Cx::set_current(Some(host.clone()));
+                    let mut exchange = std::pin::pin!(executor.execute(held, &request));
+                    assert!(matches!(
+                        exchange.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                        Poll::Ready(Err(ModernHttpExecutorError::CapabilityDenied { capability }))
+                            if capability == denied
+                    ));
+                    assert!(matches!(listener.accept(), Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock));
+                }
+            }
+        }
+
+        #[test]
+        fn native_io_refuses_reads_writes_flush_and_shutdown_without_consuming_bytes() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let native = runtime_block_on(asupersync::net::TcpStream::connect(
+                listener.local_addr().unwrap(),
+            ))
+            .unwrap();
+            let (mut peer, _) = listener.accept().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            peer.write_all(b"ready").unwrap();
+            let owner = Cx::for_testing();
+            let mut io = ModernHttpIo {
+                inner: ClientIo::Plain(native),
+                cx: owner.clone(),
+                committed_at: Arc::new(OnceLock::new()),
+                request_bytes_sent: Arc::new(AtomicBool::new(false)),
+            };
+            let mut task = Context::from_waker(Waker::noop());
+            for mask in [NO_IO, NO_TIME] {
+                let _host = Cx::set_current(Some(narrowed(&owner, mask)));
+                let mut bytes = [0_u8; 5];
+                let mut read = ReadBuf::new(&mut bytes);
+                assert!(matches!(Pin::new(&mut io).poll_read(&mut task, &mut read),
+                    Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied));
+                assert!(read.filled().is_empty());
+                assert!(matches!(Pin::new(&mut io).poll_write(&mut task, b"denied"),
+                    Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied));
+                assert!(matches!(Pin::new(&mut io).poll_flush(&mut task),
+                    Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied));
+                assert!(matches!(Pin::new(&mut io).poll_shutdown(&mut task),
+                    Poll::Ready(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied));
+                assert!(!io.request_bytes_sent.load(Ordering::Acquire));
+                assert!(io.committed_at.get().is_none());
+                assert!(matches!(peer.read(&mut bytes), Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock));
+            }
+            let mut bytes = [0_u8; 5];
+            let mut read = ReadBuf::new(&mut bytes);
+            poll_to_ready(std::future::poll_fn(|task| {
+                Pin::new(&mut io).poll_read(task, &mut read)
+            }))
+            .unwrap();
+            assert_eq!(read.filled(), b"ready");
+            assert_eq!(
+                poll_to_ready(std::future::poll_fn(|task| {
+                    Pin::new(&mut io).poll_write(task, b"allowed")
+                }))
+                .unwrap(),
+                7
+            );
+            poll_to_ready(std::future::poll_fn(|task| {
+                Pin::new(&mut io).poll_flush(task)
+            }))
+            .unwrap();
+            assert!(io.request_bytes_sent.load(Ordering::Acquire));
+            assert!(io.committed_at.get().is_some());
+            peer.set_nonblocking(false).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut sent = [0_u8; 7];
+            peer.read_exact(&mut sent).unwrap();
+            assert_eq!(&sent, b"allowed");
+        }
+
+        #[test]
+        fn deadline_refuses_denied_time_before_sleep_and_keeps_the_owner_clock() {
+            let (_runtime, owner, clock, timer) = virtual_owner();
+            let (_foreign_runtime, foreign, foreign_clock, foreign_timer) = virtual_owner();
+            foreign_clock.advance(10_000_000_000);
+            foreign.cancel_with(CancelKind::User, Some("unrelated host"));
+            let mut task = Context::from_waker(Waker::noop());
+            let mut deadline = response_deadline(&owner);
+            {
+                let _host = Cx::set_current(Some(foreign.clone()));
+                deadline.poll(&mut task).unwrap();
+            }
+            assert_eq!(timer.pending_count(), 1);
+            assert_eq!(foreign_timer.pending_count(), 0);
+            for mask in [NO_IO, NO_TIME] {
+                let mut refused = response_deadline(&owner);
+                let _host = Cx::set_current(Some(narrowed(&foreign, mask)));
+                assert!(matches!(
+                    refused.poll(&mut task),
+                    Err(ModernHttpExecutorError::CapabilityDenied { .. })
+                ));
+                assert!(
+                    refused.sleep.is_none(),
+                    "denial cannot create a fallback Sleep"
+                );
+                assert!(matches!(
+                    deadline.poll(&mut task),
+                    Err(ModernHttpExecutorError::CapabilityDenied { .. })
+                ));
+                assert_eq!(timer.pending_count(), 1);
+                assert_eq!(foreign_timer.pending_count(), 0);
+            }
+            let mut held_refusal = response_deadline(&narrowed(&owner, NO_TIME));
+            assert!(matches!(
+                held_refusal.poll(&mut task),
+                Err(ModernHttpExecutorError::CapabilityDenied { capability: "TIME" })
+            ));
+            assert!(held_refusal.sleep.is_none());
+            clock.advance(2_000_000_000);
+            assert!(matches!(
+                deadline.poll(&mut task),
+                Err(ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle))
+            ));
+            drop(deadline);
+            assert_eq!(timer.pending_count(), 0);
+        }
+
+        #[test]
+        fn real_exchange_works_without_ambient_context_or_under_foreign_cancellation() {
+            for foreign_host in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let request = request(&format!("http://{}/mcp", listener.local_addr().unwrap()));
+                let server = thread::spawn(move || {
+                    let mut peer = accept_notification_test_peer(&listener);
+                    assert!(
+                        read_request(&mut peer)
+                            .head
+                            .starts_with("POST /mcp HTTP/1.1")
+                    );
+                    write_response(&mut peer, 200, "application/json", b"{\"allowed\":true}");
+                });
+                let (_runtime, owner, clock, timer) = virtual_owner();
+                let foreign = narrowed(
+                    &Cx::for_testing(),
+                    <CapSet<false, true, false, true, false>>::MASK,
+                );
+                foreign.cancel_with(CancelKind::User, Some("unrelated host"));
+                assert!(Cx::current().is_none());
+                let _host = foreign_host.then(|| Cx::set_current(Some(foreign)));
+                let executor = ModernHttpExecutor::new();
+                let response = poll_to_ready(executor.execute(&owner, &request)).unwrap();
+                let body = poll_to_ready(response.read_to_end(&owner, 128)).unwrap();
+                assert_eq!(body, b"{\"allowed\":true}");
+                assert!(owner.checkpoint().is_ok());
+                // Native connect can leave a short readiness backoff timer;
+                // distinguish it from a leaked, much longer response timer.
+                clock.advance(10_000_000);
+                let _ = timer.process_timers();
+                assert_eq!(timer.pending_count(), 0);
+                server.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn suspended_response_body_closes_before_consumption_after_host_narrows() {
+            for (mask, denied) in [(NO_IO, "IO"), (NO_TIME, "TIME")] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let request = request(&format!("http://{}/mcp", listener.local_addr().unwrap()));
+                let (release, wait) = mpsc::channel();
+                let server = thread::spawn(move || {
+                    let mut peer = accept_notification_test_peer(&listener);
+                    read_request(&mut peer);
+                    peer.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                    peer.flush().unwrap();
+                    wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                    let _ = peer.write_all(b"{}");
+                });
+                let (_runtime, owner, clock, timer) = virtual_owner();
+                let executor = ModernHttpExecutor::new();
+                let mut response = poll_to_ready(executor.execute(&owner, &request)).unwrap();
+                let body = &mut response.response.body;
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(Pin::new(&mut *body).poll_frame(&mut task).is_pending());
+                assert!(timer.pending_count() > 0);
+                {
+                    let _host = Cx::set_current(Some(narrowed(&owner, mask)));
+                    assert!(matches!(Pin::new(&mut *body).poll_frame(&mut task),
+                        Poll::Ready(Some(Err(ModernHttpExecutorError::CapabilityDenied { capability })))
+                            if capability == denied));
+                }
+                assert!(body.inner.is_none());
+                assert!(body.deadline.sleep.is_none());
+                clock.advance(10_000_000);
+                let _ = timer.process_timers();
+                assert_eq!(timer.pending_count(), 0);
+                release.send(()).unwrap();
+                server.join().unwrap();
+                assert!(matches!(
+                    Pin::new(body).poll_frame(&mut task),
+                    Poll::Ready(None)
+                ));
+                assert!(owner.checkpoint().is_ok());
+            }
+        }
+    }
 
     #[derive(Debug)]
     struct CapturedHttpRequest {

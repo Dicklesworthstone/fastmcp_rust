@@ -569,6 +569,8 @@ pub enum ExecutionTerminalReason {
     PeerProtocol,
     /// The configured HTTP credential could no longer authorize dispatch.
     CredentialUnavailable,
+    /// The request or its current host denied a required runtime capability.
+    CapabilityDenied,
     /// Local executor shutdown selected the terminal transition.
     Shutdown,
 }
