@@ -216,7 +216,7 @@ pub use session::{ClientProtocolPlan, ClientProtocolPlanError, ClientSession};
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 use std::io::Read;
@@ -842,6 +842,158 @@ impl CompletionParams {
     }
 }
 
+/// Explicit resource relationships trusted for one client subscription.
+///
+/// Exact acknowledged URIs are always admitted. A different emitted URI is
+/// admitted only when this immutable policy contains its exact parent/child
+/// pair and the peer acknowledged that parent. URI spelling is preserved:
+/// prefixes, path containment, templates, and normalized aliases confer no
+/// permission. The policy is local configuration and is never sent on the wire.
+/// Server-side provider ownership and authorization remain the server's duty.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceSubscriptionRelations {
+    children: Arc<BTreeMap<String, BTreeSet<String>>>,
+}
+
+impl ResourceSubscriptionRelations {
+    /// Admits a finite set of explicit parent/child resource relationships.
+    ///
+    /// Both URIs must be absolute. At most
+    /// [`fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTIONS`] input pairs and
+    /// [`fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTION_BYTES`] total URI bytes
+    /// are accepted, including duplicate pairs. No URI is normalized.
+    pub fn new<I, P, C>(relations: I) -> McpResult<Self>
+    where
+        I: IntoIterator<Item = (P, C)>,
+        P: AsRef<str>,
+        C: AsRef<str>,
+    {
+        let mut children = BTreeMap::<String, BTreeSet<String>>::new();
+        let mut total_bytes = 0usize;
+        for (index, (parent, child)) in relations.into_iter().enumerate() {
+            if index >= fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTIONS {
+                return Err(McpError::invalid_params(
+                    "Too many resource subscription relationships",
+                ));
+            }
+            let parent = parent.as_ref();
+            let child = child.as_ref();
+            total_bytes = total_bytes
+                .checked_add(parent.len())
+                .and_then(|bytes| bytes.checked_add(child.len()))
+                .filter(|bytes| *bytes <= fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTION_BYTES)
+                .ok_or_else(|| {
+                    McpError::invalid_params(
+                        "Resource subscription relationships exceed their URI byte limit",
+                    )
+                })?;
+            fastmcp_protocol::common_types::AbsoluteUri::parse(parent).map_err(|_| {
+                McpError::invalid_params("Resource subscription parent must be an absolute URI")
+            })?;
+            fastmcp_protocol::common_types::AbsoluteUri::parse(child).map_err(|_| {
+                McpError::invalid_params("Resource subscription child must be an absolute URI")
+            })?;
+            children
+                .entry(parent.to_owned())
+                .or_default()
+                .insert(child.to_owned());
+        }
+        Ok(Self {
+            children: Arc::new(children),
+        })
+    }
+
+    fn accepts(&self, accepted_filter: &SubscriptionFilter, emitted: &str) -> bool {
+        accepted_filter
+            .resource_subscriptions
+            .as_ref()
+            .is_some_and(|parents| {
+                parents.iter().any(|parent| {
+                    parent == emitted
+                        || self
+                            .children
+                            .get(parent)
+                            .is_some_and(|children| children.contains(emitted))
+                })
+            })
+    }
+}
+
+/// One subscription's requested wire filter and immutable local event policy.
+///
+/// Passing a [`SubscriptionFilter`] directly to a listen API selects exact URI
+/// matching. Use this value to opt that one request into explicit semantic
+/// subresources without changing the connection or any other listener.
+#[derive(Debug, Clone)]
+pub struct SubscriptionListenRequest {
+    notifications: SubscriptionFilter,
+    resource_relations: ResourceSubscriptionRelations,
+}
+
+impl SubscriptionListenRequest {
+    /// Selects a filter with exact resource URI matching.
+    #[must_use]
+    pub fn new(notifications: SubscriptionFilter) -> Self {
+        Self {
+            notifications,
+            resource_relations: ResourceSubscriptionRelations::default(),
+        }
+    }
+
+    /// Configures explicit resource relationships before this request is opened.
+    ///
+    /// Every configured parent must occur in the requested resource filter.
+    /// Admission checks that condition before allocating or sending the listen
+    /// request. Only parents retained by the acknowledgement can admit children.
+    #[must_use]
+    pub fn with_resource_relations(mut self, relations: ResourceSubscriptionRelations) -> Self {
+        self.resource_relations = relations;
+        self
+    }
+
+    /// Returns the exact requested wire filter.
+    #[must_use]
+    pub const fn notifications(&self) -> &SubscriptionFilter {
+        &self.notifications
+    }
+
+    /// Returns this request's immutable resource event policy.
+    #[must_use]
+    pub const fn resource_relations(&self) -> &ResourceSubscriptionRelations {
+        &self.resource_relations
+    }
+
+    fn validate(&self) -> McpResult<()> {
+        self.notifications
+            .validate_resource_subscriptions()
+            .map_err(|error| {
+                McpError::invalid_params(format!("Invalid resource subscription filter: {error}"))
+            })?;
+        if self.resource_relations.children.keys().any(|parent| {
+            self.notifications
+                .resource_subscriptions
+                .as_ref()
+                .is_none_or(|requested| !requested.contains(parent))
+        }) {
+            return Err(McpError::invalid_params(
+                "Resource subscription relationship names an unrequested parent",
+            ));
+        }
+        Ok(())
+    }
+
+    fn into_parts(self) -> McpResult<(SubscriptionFilter, ResourceSubscriptionRelations)> {
+        self.validate()?;
+        Ok((self.notifications, self.resource_relations))
+    }
+}
+
+impl From<SubscriptionFilter> for SubscriptionListenRequest {
+    fn from(notifications: SubscriptionFilter) -> Self {
+        Self::new(notifications)
+    }
+}
+
 /// The request-owned terminal record for a final subscription listener.
 ///
 /// The acknowledgement binds the requested filter to the JSON-RPC request
@@ -1426,6 +1578,7 @@ fn catalog_subscription_requested(filter: &SubscriptionFilter) -> bool {
 fn validate_subscription_notification_filter(
     notification: &ServerNotification,
     accepted_filter: &SubscriptionFilter,
+    resource_relations: &ResourceSubscriptionRelations,
 ) -> McpResult<()> {
     let accepted = match notification {
         ServerNotification::ResourcesListChanged(_) => {
@@ -1435,10 +1588,9 @@ fn validate_subscription_notification_filter(
         ServerNotification::PromptsListChanged(_) => {
             accepted_filter.prompts_list_changed == Some(true)
         }
-        ServerNotification::ResourceUpdated(update) => accepted_filter
-            .resource_subscriptions
-            .as_ref()
-            .is_some_and(|uris| uris.iter().any(|uri| uri == update.uri.as_str())),
+        ServerNotification::ResourceUpdated(update) => {
+            resource_relations.accepts(accepted_filter, update.uri.as_str())
+        }
         ServerNotification::Cancelled(_)
         | ServerNotification::Progress(_)
         | ServerNotification::Message(_)
@@ -5740,6 +5892,7 @@ struct LiveWebSocketCatalogSubscription {
     core_request: CoreRequest,
     requested_filter: SubscriptionFilter,
     accepted_filter: Option<SubscriptionFilter>,
+    resource_relations: ResourceSubscriptionRelations,
     acknowledgement_delivered: bool,
     pending_notifications: VecDeque<ServerNotification>,
     terminal_response: Option<(JsonRpcResponse, Option<String>)>,
@@ -7074,7 +7227,11 @@ where
                             "Subscription listener received an event before acknowledgement",
                         )
                     })?;
-                    validate_subscription_notification_filter(notification, accepted)?;
+                    validate_subscription_notification_filter(
+                        notification,
+                        accepted,
+                        &subscription.resource_relations,
+                    )?;
                     if subscription.pending_notifications.len()
                         >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS
                     {
@@ -9032,11 +9189,12 @@ where
     pub async fn listen_subscriptions_typed(
         &mut self,
         cx: &Cx,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
     ) -> McpResult<SubscriptionListenCollector>
     where
         IO: Send + 'static,
     {
+        let (notifications, resource_relations) = notifications.into().into_parts()?;
         if cx.checkpoint().is_err()
             || cx
                 .budget()
@@ -9358,7 +9516,11 @@ where
                                     "WebSocket subscription emitted a notification before acknowledgement",
                                 ).await);
                             };
-                            if let Err(error) = validate_subscription_notification_filter(&notification, accepted) {
+                            if let Err(error) = validate_subscription_notification_filter(
+                                &notification,
+                                accepted,
+                                &resource_relations,
+                            ) {
                                 return Err(self.terminal_callback_error(cx, error).await);
                             }
                             if retained_event_count >= MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS {
@@ -9386,11 +9548,12 @@ where
     pub async fn open_subscriptions_listener(
         &mut self,
         cx: &Cx,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
     ) -> McpResult<()>
     where
         IO: Send + 'static,
     {
+        let (notifications, resource_relations) = notifications.into().into_parts()?;
         if cx.checkpoint().is_err()
             || cx
                 .budget()
@@ -9451,6 +9614,7 @@ where
             core_request,
             requested_filter: notifications,
             accepted_filter: None,
+            resource_relations,
             acknowledgement_delivered: false,
             pending_notifications: VecDeque::new(),
             terminal_response: None,
@@ -16279,10 +16443,14 @@ impl HttpClient {
     pub async fn open_subscriptions_listener(
         &mut self,
         cx: &Cx,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: sse::SseLimits,
     ) -> Result<HttpSubscriptionListener<'_>, HttpClientError> {
-        self.refuse_http_catalog_task_ids(&notifications)?;
+        let notifications = notifications.into();
+        notifications
+            .validate()
+            .map_err(HttpClientError::CoreResult)?;
+        self.refuse_http_catalog_task_ids(notifications.notifications())?;
         if cx.checkpoint().is_err() {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
@@ -16324,10 +16492,14 @@ impl HttpClient {
     pub async fn start_subscriptions_listener(
         &mut self,
         cx: &Cx,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: sse::SseLimits,
     ) -> Result<(), HttpClientError> {
-        self.refuse_http_catalog_task_ids(&notifications)?;
+        let notifications = notifications.into();
+        notifications
+            .validate()
+            .map_err(HttpClientError::CoreResult)?;
+        self.refuse_http_catalog_task_ids(notifications.notifications())?;
         if self.live_subscription.is_some() {
             return Err(HttpClientError::CoreResult(McpError::invalid_request(
                 "A final HTTP subscription is already active on this client",
@@ -16564,7 +16736,7 @@ impl HttpClient {
     pub async fn listen_subscriptions_typed(
         &mut self,
         cx: &Cx,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: sse::SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
         self.open_subscriptions_listener(cx, notifications, limits)
@@ -16573,7 +16745,7 @@ impl HttpClient {
             .await
     }
 
-    /// Attaches a durable final Tasks handle by reading its current snapshot.
+/// Attaches a durable final Tasks handle by reading its current snapshot.
     ///
     /// The returned handle remains transport-neutral state; later operations
     /// take this same client so all requests retain its negotiated HTTP
@@ -16952,6 +17124,7 @@ struct LiveStdioCatalogSubscription {
     core_request: CoreRequest,
     requested_filter: SubscriptionFilter,
     accepted_filter: Option<SubscriptionFilter>,
+    resource_relations: ResourceSubscriptionRelations,
     acknowledgement_delivered: bool,
     pending_notifications: VecDeque<ServerNotification>,
     /// A failed cancellation control leaves this listener owned by the client.
@@ -22694,6 +22867,7 @@ impl Client {
         mut waiter: ResponseWaiter,
         core_request: &CoreRequest,
         requested: &SubscriptionFilter,
+        resource_relations: &ResourceSubscriptionRelations,
         mut deadlines: RequestDeadlines,
     ) -> McpResult<SubscriptionListenCollector> {
         let cx = self.cx.clone();
@@ -23031,6 +23205,7 @@ impl Client {
                             if let Err(error) = validate_subscription_notification_filter(
                                 &notification,
                                 accepted_filter,
+                                resource_relations,
                             ) {
                                 return Err(self.terminate_connection(error));
                             }
@@ -25522,7 +25697,7 @@ impl Client {
     /// [`Self::next_subscription_event`].
     pub fn listen_subscriptions_typed(
         &mut self,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
     ) -> McpResult<SubscriptionListenCollector> {
         self.listen_subscriptions_with_timeout_policy(
             notifications,
@@ -25534,9 +25709,10 @@ impl Client {
     /// absolute lifetimes. Valid matching acknowledgement/events reset only idle.
     pub fn listen_subscriptions_with_timeout_policy(
         &mut self,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<SubscriptionListenCollector> {
+        let (notifications, resource_relations) = notifications.into().into_parts()?;
         timeout_policy.validate()?;
         self.ensure_initialized()?;
         if self.session.selected_era() != Some(ProtocolEra::Modern2026) {
@@ -25606,7 +25782,13 @@ impl Client {
             Ok(deadlines) => deadlines,
             Err(error) => return Err(self.finish_committed_request_locally(&request_id, error)),
         };
-        self.recv_subscription_listener(waiter, &core_request, &requested, deadlines)
+        self.recv_subscription_listener(
+            waiter,
+            &core_request,
+            &requested,
+            &resource_relations,
+            deadlines,
+        )
     }
 
     /// Starts a real, incrementally driven final catalog subscription on this
@@ -25619,7 +25801,7 @@ impl Client {
     /// same `Client` can still issue ordinary requests such as `tools/call`.
     pub fn open_subscriptions_listener(
         &mut self,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
     ) -> McpResult<()> {
         self.open_subscriptions_listener_with_timeout_policy(
             notifications,
@@ -25631,9 +25813,10 @@ impl Client {
     /// Its absolute lifetime is fixed at send, even under continuous events.
     pub fn open_subscriptions_listener_with_timeout_policy(
         &mut self,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<()> {
+        let (notifications, resource_relations) = notifications.into().into_parts()?;
         timeout_policy.validate()?;
         self.ensure_initialized()?;
         if self.live_catalog_subscription.is_some() {
@@ -25703,6 +25886,7 @@ impl Client {
             core_request,
             requested_filter: notifications,
             accepted_filter: None,
+            resource_relations,
             acknowledgement_delivered: false,
             pending_notifications: VecDeque::new(),
             cancellation_failure: None,
@@ -25721,8 +25905,10 @@ impl Client {
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
     ) -> McpResult<()> {
+        let notifications = notifications.into();
+        notifications.validate()?;
         self.ensure_initialized_with_cancellation(cx, Some(cancellation))
             .await?;
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
@@ -25731,7 +25917,7 @@ impl Client {
         self.open_subscriptions_listener(notifications)
     }
 
-    /// Commits upstream cancellation before retiring the live catalog listener.
+/// Commits upstream cancellation before retiring the live catalog listener.
     ///
     /// A missing listener is a no-op so Drop / next-async cancel paths can
     /// retire a route that never installed one. The listener remains installed
@@ -25864,8 +26050,11 @@ impl Client {
                         ));
                         continue;
                     };
-                    if let Err(error) =
-                        validate_subscription_notification_filter(&notification, accepted_filter)
+                    if let Err(error) = validate_subscription_notification_filter(
+                        &notification,
+                        accepted_filter,
+                        &subscription.resource_relations,
+                    )
                     {
                         harvest_error = Some(error);
                         continue;
@@ -27247,6 +27436,310 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_core::block_on;
+
+    #[test]
+    fn resource_subscription_relations_are_bounded_and_byte_exact() {
+        let parent = "catalog://tenant/root";
+        let child = "record://tenant/item-1";
+        let filter = SubscriptionFilter {
+            resource_subscriptions: Some(vec![parent.to_owned()]),
+            ..SubscriptionFilter::default()
+        };
+        let relations = ResourceSubscriptionRelations::new([(parent, child)]).unwrap();
+        assert!(relations.accepts(&filter, parent));
+        assert!(relations.accepts(&filter, child));
+        assert!(!ResourceSubscriptionRelations::default().accepts(&filter, child));
+        for rejected in [
+            "catalog://tenant/root-hidden",
+            "record://tenant/item-2",
+            "record://other-tenant/item-1",
+            "RECORD://tenant/item-1",
+            "record://tenant/%69tem-1",
+            "record://tenant/other/../item-1",
+        ] {
+            assert!(!relations.accepts(&filter, rejected), "{rejected}");
+        }
+        assert!(!relations.accepts(&SubscriptionFilter::default(), child));
+        assert!(
+            SubscriptionListenRequest::new(SubscriptionFilter::default())
+                .with_resource_relations(relations)
+                .into_parts()
+                .is_err()
+        );
+        assert!(ResourceSubscriptionRelations::new([(parent, "relative/child")]).is_err());
+        assert!(ResourceSubscriptionRelations::new([("relative/parent", child)]).is_err());
+
+        let maximum = fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTIONS;
+        assert!(ResourceSubscriptionRelations::new(vec![(parent, child); maximum]).is_ok());
+        assert!(ResourceSubscriptionRelations::new(vec![(parent, child); maximum + 1]).is_err());
+        let parent = format!("urn:{}", "p".repeat(508));
+        let child = format!("urn:{}", "c".repeat(508));
+        let mut at_limit = vec![(parent, child); maximum];
+        assert_eq!(
+            at_limit
+                .iter()
+                .map(|(parent, child)| parent.len() + child.len())
+                .sum::<usize>(),
+            fastmcp_protocol::MAX_RESOURCE_SUBSCRIPTION_BYTES,
+        );
+        assert!(ResourceSubscriptionRelations::new(at_limit.clone()).is_ok());
+        at_limit.last_mut().unwrap().1.push('x');
+        assert!(ResourceSubscriptionRelations::new(at_limit).is_err());
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn subscription_resource_relation_case(
+        case: &str,
+    ) -> (
+        SubscriptionListenRequest,
+        SubscriptionFilter,
+        &'static str,
+        bool,
+    ) {
+        let parent = "catalog://tenant/root";
+        let child = "record://tenant/item-1";
+        let filter = SubscriptionFilter {
+            resource_subscriptions: Some(vec![parent.to_owned()]),
+            ..SubscriptionFilter::default()
+        };
+        let mut accepted = filter.clone();
+        let mut request = SubscriptionListenRequest::new(filter);
+        if !matches!(case, "exact" | "unconfigured") {
+            request = request.with_resource_relations(
+                ResourceSubscriptionRelations::new([(parent, child)]).unwrap(),
+            );
+        }
+        let emitted = match case {
+            "exact" => parent,
+            "child" | "unconfigured" => child,
+            "unacknowledged" => {
+                accepted.resource_subscriptions = Some(Vec::new());
+                child
+            }
+            "sibling" => "record://tenant/item-2",
+            "prefix" => "catalog://tenant/root-hidden",
+            "widened" => {
+                accepted
+                    .resource_subscriptions
+                    .as_mut()
+                    .unwrap()
+                    .push(child.to_owned());
+                child
+            }
+            _ => panic!("unknown resource relationship fixture"),
+        };
+        (
+            request,
+            accepted,
+            emitted,
+            matches!(case, "exact" | "child"),
+        )
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn subscription_resource_relation_frames(
+        accepted: &SubscriptionFilter,
+        emitted: &str,
+    ) -> [String; 3] {
+        [
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    "notifications": accepted,
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/resources/updated",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    "uri": emitted,
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                }
+            })
+            .to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
+    fn stdio_subscription_resource_relations_probe(incremental: bool, case: &str) {
+        let (request, accepted, emitted, allowed) = subscription_resource_relation_case(case);
+        let frames = subscription_resource_relation_frames(&accepted, emitted);
+        let discovery = modern_discovery_response("resource-relations", &[MODERN_PROTOCOL_VERSION]);
+        let script = r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' "$1"
+IFS= read -r listen || exit 91
+case "$listen" in *subscriptions/listen*) ;; *) exit 92;; esac
+printf '%s\n' "$2" "$3" "$4"
+exec sleep 2
+"#;
+        let mut client = Client::stdio_with_protocol_plan_with_cx(
+            Cx::for_request(),
+            "sh",
+            &[
+                "-c", script, "--", &discovery, &frames[0], &frames[1], &frames[2],
+            ],
+            ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly),
+        )
+        .unwrap();
+        let result = if incremental {
+            (|| -> McpResult<Vec<ServerNotification>> {
+                client.open_subscriptions_listener(request)?;
+                let cx = Cx::for_request();
+                let cancellation = McpRequestCancellation::new();
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation)?,
+                    StdioSubscriptionEvent::Acknowledged(ref filter) if filter == &accepted
+                ));
+                let StdioSubscriptionEvent::Notification(notification) =
+                    client.next_subscription_event(&cx, &cancellation)?
+                else {
+                    panic!("admitted resource event must be observable");
+                };
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation)?,
+                    StdioSubscriptionEvent::Terminal
+                ));
+                Ok(vec![notification])
+            })()
+        } else {
+            client.listen_subscriptions_typed(request).map(|collector| {
+                assert_eq!(collector.accepted_filter, accepted);
+                collector.notifications
+            })
+        };
+        let cleanup = client.close();
+        if allowed {
+            let notifications = result.unwrap();
+            assert!(matches!(notifications.as_slice(),
+                [ServerNotification::ResourceUpdated(update)] if update.uri.as_str() == emitted));
+            cleanup.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_subscription_resource_relations_positive() {
+        for incremental in [false, true] {
+            for case in ["exact", "child"] {
+                stdio_subscription_resource_relations_probe(incremental, case);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_subscription_resource_relations_planted_negative() {
+        for incremental in [false, true] {
+            for case in [
+                "unconfigured",
+                "unacknowledged",
+                "sibling",
+                "prefix",
+                "widened",
+            ] {
+                stdio_subscription_resource_relations_probe(incremental, case);
+            }
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    async fn websocket_subscription_resource_relations_probe(incremental: bool, case: &str) {
+        let cx = Cx::current().unwrap();
+        let (request, accepted, emitted, allowed) = subscription_resource_relation_case(case);
+        let (client_io, mut peer_io) = async_websocket_pair();
+        write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
+        for frame in subscription_resource_relation_frames(&accepted, emitted) {
+            write_server_text_frame(&mut peer_io, &frame).await;
+        }
+        let mut client = WebSocketClient::connect_with_cx(
+            &cx,
+            ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly),
+            async_websocket_client_info(),
+            ClientCapabilities::default(),
+            AsyncWsClientTransport::from_upgraded(client_io),
+        )
+        .await
+        .unwrap();
+        let result = if incremental {
+            async {
+                client.open_subscriptions_listener(&cx, request).await?;
+                let cancellation = McpRequestCancellation::new();
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation).await?,
+                    StdioSubscriptionEvent::Acknowledged(ref filter) if filter == &accepted
+                ));
+                let StdioSubscriptionEvent::Notification(notification) =
+                    client.next_subscription_event(&cx, &cancellation).await?
+                else {
+                    panic!("admitted resource event must be observable");
+                };
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation).await?,
+                    StdioSubscriptionEvent::Terminal
+                ));
+                Ok::<_, McpError>(vec![notification])
+            }
+            .await
+        } else {
+            client
+                .listen_subscriptions_typed(&cx, request)
+                .await
+                .map(|collector| {
+                    assert_eq!(collector.accepted_filter, accepted);
+                    collector.notifications
+                })
+        };
+        if allowed {
+            let notifications = result.unwrap();
+            assert!(matches!(notifications.as_slice(),
+                [ServerNotification::ResourceUpdated(update)] if update.uri.as_str() == emitted));
+            client.close(&cx).await.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_subscription_resource_relations_positive() {
+        run_test(|| async {
+            for incremental in [false, true] {
+                for case in ["exact", "child"] {
+                    websocket_subscription_resource_relations_probe(incremental, case).await;
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn websocket_subscription_resource_relations_planted_negative() {
+        run_test(|| async {
+            for incremental in [false, true] {
+                for case in [
+                    "unconfigured",
+                    "unacknowledged",
+                    "sibling",
+                    "prefix",
+                    "widened",
+                ] {
+                    websocket_subscription_resource_relations_probe(incremental, case).await;
+                }
+            }
+        });
+    }
 
     fn acknowledgement_with_subscription_id(
         id: RequestId,

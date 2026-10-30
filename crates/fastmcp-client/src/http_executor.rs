@@ -81,8 +81,8 @@ use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
     MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
-    ReverseRequestHandlers, SubscriptionTimeoutPolicy, admit_mrtr_input_required,
-    validate_protocol_plan_feature,
+    ResourceSubscriptionRelations, ReverseRequestHandlers, SubscriptionListenRequest,
+    SubscriptionTimeoutPolicy, admit_mrtr_input_required, validate_protocol_plan_feature,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use crate::{ReverseCallbackState, ReverseRequestCancellation};
@@ -1130,9 +1130,13 @@ impl ModernHttpResponseStream {
     pub fn into_final_subscriptions_listener(
         self,
         request_id: RequestId,
-        requested: SubscriptionFilter,
+        requested: impl Into<SubscriptionListenRequest>,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListener, ModernHttpSubscriptionListenError> {
+        let (requested, resource_relations) = requested
+            .into()
+            .into_parts()
+            .map_err(ModernHttpSubscriptionListenError::InvalidSubscriptionRequest)?;
         if request_id.validate().is_err() {
             return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
         }
@@ -1147,6 +1151,7 @@ impl ModernHttpResponseStream {
             request_id,
             requested,
             accepted_filter: None,
+            resource_relations,
             maximum_jsonrpc_bytes,
             terminal_received: false,
         })
@@ -1162,7 +1167,7 @@ impl ModernHttpResponseStream {
         self,
         cx: &Cx,
         request_id: RequestId,
-        requested: SubscriptionFilter,
+        requested: impl Into<SubscriptionListenRequest>,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
         self.into_final_subscriptions_listener(request_id, requested, limits)?
@@ -1170,7 +1175,7 @@ impl ModernHttpResponseStream {
             .await
     }
 
-    /// Reads a finite response body into memory under an explicit caller bound.
+/// Reads a finite response body into memory under an explicit caller bound.
     ///
     /// This consumes the stream. It is appropriate for the disposable modern
     /// connection probe and ordinary JSON responses; callers expecting an SSE
@@ -1367,6 +1372,7 @@ pub struct ModernHttpSubscriptionListener {
     request_id: RequestId,
     requested: SubscriptionFilter,
     accepted_filter: Option<SubscriptionFilter>,
+    resource_relations: ResourceSubscriptionRelations,
     maximum_jsonrpc_bytes: usize,
     terminal_received: bool,
 }
@@ -1661,6 +1667,7 @@ impl ModernHttpSubscriptionListener {
                         validate_http_subscription_notification_filter(
                             &notification,
                             accepted_filter,
+                            &self.resource_relations,
                         )?;
                         Ok(ModernHttpSubscriptionListenEvent::Notification(
                             notification,
@@ -3479,6 +3486,8 @@ pub struct ModernHttpSubscriptionListenCollector {
 /// response stream.
 #[derive(Debug)]
 pub enum ModernHttpSubscriptionListenError {
+    /// The local subscription filter or resource relationship policy is invalid.
+    InvalidSubscriptionRequest(McpError),
     /// The supplied request ID is not a valid JSON-RPC correlation key.
     InvalidRequestId,
     /// Constructing or issuing the final `subscriptions/listen` request failed.
@@ -3577,6 +3586,7 @@ pub enum ModernHttpSubscriptionListenError {
 impl fmt::Display for ModernHttpSubscriptionListenError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidSubscriptionRequest(error) => error.fmt(formatter),
             Self::InvalidRequestId => {
                 formatter.write_str("subscriptions/listen requires a valid JSON-RPC request ID")
             }
@@ -3675,6 +3685,7 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
 impl std::error::Error for ModernHttpSubscriptionListenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidSubscriptionRequest(error) => Some(error),
             Self::Request(error) => Some(error),
             Self::Executor(error) => Some(error),
             Self::JsonRpcAdmission(error) => Some(error),
@@ -3947,6 +3958,7 @@ fn validate_http_subscription_notification_id(
 fn validate_http_subscription_notification_filter(
     notification: &ServerNotification,
     accepted_filter: &SubscriptionFilter,
+    resource_relations: &ResourceSubscriptionRelations,
 ) -> Result<(), ModernHttpSubscriptionListenError> {
     let accepted = match notification {
         ServerNotification::ResourcesListChanged(_) => {
@@ -3956,10 +3968,9 @@ fn validate_http_subscription_notification_filter(
         ServerNotification::PromptsListChanged(_) => {
             accepted_filter.prompts_list_changed == Some(true)
         }
-        ServerNotification::ResourceUpdated(update) => accepted_filter
-            .resource_subscriptions
-            .as_ref()
-            .is_some_and(|uris| uris.iter().any(|uri| uri == update.uri.as_str())),
+        ServerNotification::ResourceUpdated(update) => {
+            resource_relations.accepts(accepted_filter, update.uri.as_str())
+        }
         ServerNotification::Cancelled(_)
         | ServerNotification::Progress(_)
         | ServerNotification::Message(_)
@@ -6574,7 +6585,7 @@ impl ClientHttpConnection {
         &self,
         cx: &Cx,
         request_id: RequestId,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListener, ClientHttpConnectionError> {
         match self {
@@ -6592,7 +6603,7 @@ impl ClientHttpConnection {
         &self,
         cx: &Cx,
         request_id: RequestId,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, ClientHttpConnectionError> {
         self.open_subscriptions_listener(cx, request_id, notifications, limits)
@@ -6602,7 +6613,7 @@ impl ClientHttpConnection {
             .map_err(ClientHttpConnectionError::SubscriptionsListen)
     }
 
-    /// Opens one live typed final core response stream.
+/// Opens one live typed final core response stream.
     ///
     /// This is the ordinary request counterpart to
     /// [`Self::open_subscriptions_listener`]. Its collector retains bounded
@@ -8865,9 +8876,13 @@ impl ModernHttpClient {
         &self,
         cx: &Cx,
         request_id: RequestId,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListener, ModernHttpSubscriptionListenError> {
+        let (notifications, resource_relations) = notifications
+            .into()
+            .into_parts()
+            .map_err(ModernHttpSubscriptionListenError::InvalidSubscriptionRequest)?;
         if request_id.validate().is_err() {
             return Err(ModernHttpSubscriptionListenError::InvalidRequestId);
         }
@@ -8907,7 +8922,12 @@ impl ModernHttpClient {
             .execute_post_discovery_request(cx, &request)
             .await
             .map_err(ModernHttpSubscriptionListenError::Request)?;
-        response.into_final_subscriptions_listener(request_id, notifications, limits)
+        response.into_final_subscriptions_listener(
+            request_id,
+            SubscriptionListenRequest::new(notifications)
+                .with_resource_relations(resource_relations),
+            limits,
+        )
     }
 
     /// Opens and consumes one typed final `subscriptions/listen` HTTP stream.
@@ -8915,7 +8935,7 @@ impl ModernHttpClient {
         &self,
         cx: &Cx,
         request_id: RequestId,
-        notifications: SubscriptionFilter,
+        notifications: impl Into<SubscriptionListenRequest>,
         limits: SseLimits,
     ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
         self.open_subscriptions_listener(cx, request_id, notifications, limits)
@@ -12549,8 +12569,9 @@ mod tests {
         ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
         ModernHttpFinalCoreListenError, ModernHttpMrtrError, ModernHttpRequest,
         ModernHttpResponseKind, ModernHttpSubscriptionListenCollector,
-        ModernHttpSubscriptionListenError, decode_modern_discovery_response,
-        reject_body_frame_after_cancellation, validate_response_head,
+        ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
+        decode_modern_discovery_response, reject_body_frame_after_cancellation,
+        validate_response_head,
     };
     #[cfg(feature = "legacy-2024-11-05")]
     use super::{
@@ -17269,13 +17290,194 @@ mod tests {
             .expect("final subscriptions/listen server must join");
     }
 
+    fn public_http_subscription_resource_relations_probe(incremental: bool, case: &str) {
+        let parent = "catalog://tenant/root";
+        let child = "record://tenant/item-1";
+        let filter = SubscriptionFilter {
+            resource_subscriptions: Some(vec![parent.to_owned()]),
+            ..SubscriptionFilter::default()
+        };
+        let mut accepted = filter.clone();
+        let mut request = crate::SubscriptionListenRequest::new(filter);
+        if !matches!(case, "exact" | "unconfigured") {
+            request = request.with_resource_relations(
+                crate::ResourceSubscriptionRelations::new([(parent, child)]).unwrap(),
+            );
+        }
+        let emitted = match case {
+            "exact" => parent,
+            "child" | "unconfigured" => child,
+            "unacknowledged" => {
+                accepted.resource_subscriptions = Some(Vec::new());
+                child
+            }
+            "sibling" => "record://tenant/item-2",
+            "prefix" => "catalog://tenant/root-hidden",
+            "widened" => {
+                accepted
+                    .resource_subscriptions
+                    .as_mut()
+                    .unwrap()
+                    .push(child.to_owned());
+                child
+            }
+            _ => panic!("unknown resource relationship fixture"),
+        };
+        let allowed = matches!(case, "exact" | "child");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (sent, received) = mpsc::sync_channel(1);
+        let peer_accepted = accepted.clone();
+        let server = thread::spawn(move || {
+            let mut discovery = accept_notification_test_peer(&listener);
+            read_request(&mut discovery);
+            write_response(
+                &mut discovery,
+                200,
+                "application/json",
+                modern_discovery_body(),
+            );
+            let mut stream = accept_notification_test_peer(&listener);
+            let request = read_request(&mut stream);
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["id"], 2);
+            assert_eq!(request["method"], "subscriptions/listen");
+            assert_eq!(
+                request["params"]["notifications"]["resourceSubscriptions"],
+                serde_json::json!([parent])
+            );
+            assert_eq!(
+                request["params"].as_object().unwrap().len(),
+                2,
+                "the local relation policy must never widen the wire request"
+            );
+            let acknowledgement = serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    "notifications": peer_accepted,
+                }
+            });
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0", "method": "notifications/resources/updated",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    "uri": emitted,
+                }
+            });
+            let terminal = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                }
+            });
+            let body =
+                format!("data: {acknowledgement}\n\ndata: {notification}\n\ndata: {terminal}\n\n");
+            write_response(&mut stream, 200, "text/event-stream", body.as_bytes());
+            sent.send(()).unwrap();
+            let mut sibling = accept_notification_test_peer(&listener);
+            let request = read_request(&mut sibling);
+            let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "tools/list");
+            write_response(&mut sibling, 200, "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#);
+        });
+        let cx = Cx::for_request();
+        let mut client = runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    &target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_client_with_cx(&cx),
+        )
+        .unwrap();
+        let limits = SseLimits::new(4_096, 8_192, 16).unwrap();
+        let result = if incremental {
+            runtime_block_on(client.start_subscriptions_listener(&cx, request, limits)).unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            (|| -> Result<Vec<ServerNotification>, crate::HttpClientError> {
+                assert!(matches!(
+                    runtime_block_on(client.next_http_subscription_event(&cx))?,
+                    Some(ModernHttpSubscriptionListenEvent::Acknowledged { ref accepted_filter })
+                        if accepted_filter == &accepted
+                ));
+                let Some(ModernHttpSubscriptionListenEvent::Notification(notification)) =
+                    runtime_block_on(client.next_http_subscription_event(&cx))?
+                else {
+                    panic!("admitted resource event must be observable");
+                };
+                assert!(matches!(
+                    runtime_block_on(client.next_http_subscription_event(&cx))?,
+                    Some(ModernHttpSubscriptionListenEvent::Terminal { .. })
+                ));
+                Ok(vec![notification])
+            })()
+        } else {
+            let listener =
+                runtime_block_on(client.open_subscriptions_listener(&cx, request, limits)).unwrap();
+            received.recv_timeout(Duration::from_secs(2)).unwrap();
+            runtime_block_on(listener.collect(&cx)).map(|collector| {
+                assert_eq!(collector.accepted_filter, accepted);
+                collector.notifications
+            })
+        };
+        if allowed {
+            let notifications = result.unwrap();
+            assert!(matches!(notifications.as_slice(),
+                [ServerNotification::ResourceUpdated(update)] if update.uri.as_str() == emitted));
+            assert!(client.final_result_cache_stats().invalidations > 0);
+        } else {
+            assert!(matches!(result,
+                Err(crate::HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(
+                    ModernHttpSubscriptionListenError::EventOutsideAcceptedFilter
+                    | ModernHttpSubscriptionListenError::AcknowledgementResourceFilterNotRequested
+                )))
+            ));
+            assert_eq!(client.final_result_cache_stats().invalidations, 0);
+        }
+        assert!(cx.checkpoint().is_ok());
+        runtime_block_on(client.request_final_core(&cx, "tools/list", serde_json::json!({})))
+            .expect("subscription policy cannot retire independent requests");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn public_http_subscription_resource_relations_positive() {
+        for incremental in [false, true] {
+            for case in ["exact", "child"] {
+                public_http_subscription_resource_relations_probe(incremental, case);
+            }
+        }
+    }
+
+    #[test]
+    fn public_http_subscription_resource_relations_planted_negative() {
+        for incremental in [false, true] {
+            for case in [
+                "unconfigured",
+                "unacknowledged",
+                "sibling",
+                "prefix",
+                "widened",
+            ] {
+                public_http_subscription_resource_relations_probe(incremental, case);
+            }
+        }
+    }
+
     fn public_http_subscription_event_owner_case(
         method: &'static str,
         event_id: Option<serde_json::Value>,
         accepted: bool,
     ) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .expect("bind subscription event ownership peer");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind subscription event ownership peer");
         let target = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (sent, received) = mpsc::sync_channel(1);
         let server = thread::spawn(move || {
