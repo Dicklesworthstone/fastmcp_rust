@@ -824,6 +824,13 @@ pub enum ProxyFinalTaskListenerEvent {
 #[cfg(feature = "tasks")]
 const MAX_RELAYED_FINAL_TASKS: usize = 128;
 
+/// Bounded recovery for a finite Task whose last observed deadline has passed.
+/// This never extends the lifetime of a cached Task snapshot. An initially
+/// promised longer finite lifetime is preserved, but subsequent reads and
+/// aliases cannot restart this local locator-retention clock.
+#[cfg(feature = "tasks")]
+const RELAYED_FINAL_TASK_RECOVERY_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Maximum independently configured upstream routes in one Tasks broker.
 #[cfg(feature = "tasks")]
 const MAX_RELAYED_FINAL_TASK_ROUTES: usize = 32;
@@ -5124,9 +5131,15 @@ struct ProxyFinalTaskRegistry {
 /// Finite retention is anchored to upstream createdAt + ttlMs, including later
 /// authoritative TTL changes; polling never restarts the lifetime.
 ///
-/// This increment retains the existing null-TTL policy. A configured positive
-/// TTL contract, renewal during outages, and transactional null-TTL reclamation
-/// are still required before claiming the full transparent Tasks gateway profile.
+/// A finite record can outlive its last observed deadline as an opaque locator
+/// for a fresh authorized get, never as a deliverable cached snapshot. Its
+/// immutable recovery ceiling also bounds outage retention and quota charges.
+///
+/// This increment retains the existing null-TTL policy and already promised
+/// initial finite lifetimes. A configured route maximum-TTL contract, the
+/// configured 365-day hard cap, scheduled renewal, null-TTL administration, and
+/// bounded orphan audit remain incomplete; this is not the full transparent
+/// Tasks gateway profile.
 #[cfg(feature = "tasks")]
 #[derive(Debug, Clone)]
 struct ProxyRelayedFinalTask {
@@ -5135,9 +5148,18 @@ struct ProxyRelayedFinalTask {
     binding: ProxyUpstreamBinding,
     owner: fastmcp_core::Sha256Digest,
     expires_at: Option<Instant>,
+    recovery_until: Option<Instant>,
     retained_at: Instant,
     wall_origin: chrono::DateTime<chrono::Utc>,
     snapshot_revision: u64,
+}
+
+#[cfg(feature = "tasks")]
+#[derive(Clone, Copy)]
+enum ProxyFinalTaskLookup {
+    CurrentSnapshot,
+    /// Only an authoritative get may use a locator past its snapshot deadline.
+    RecoveryLocator,
 }
 
 /// One bounded upstream Task creation admitted before its non-reversible
@@ -5569,6 +5591,7 @@ impl ProxyFinalTaskRelay {
         self: &Arc<Self>,
         owner: fastmcp_core::Sha256Digest,
         handle: &FinalTaskId,
+        lookup: ProxyFinalTaskLookup,
     ) -> McpResult<(Arc<Self>, ProxyRelayedFinalTask)> {
         let routes = self
             .attached_routes
@@ -5579,7 +5602,11 @@ impl ProxyFinalTaskRelay {
             .clone();
         let mut selected = None;
         for route in std::iter::once(Arc::clone(self)).chain(routes) {
-            match route.known_mapping(owner, handle) {
+            let mapping = match lookup {
+                ProxyFinalTaskLookup::CurrentSnapshot => route.known_mapping(owner, handle),
+                ProxyFinalTaskLookup::RecoveryLocator => route.known_locator(owner, handle),
+            };
+            match mapping {
                 Ok(task) => {
                     if selected.is_some() {
                         return Err(unknown_proxy_task());
@@ -5640,7 +5667,13 @@ impl ProxyFinalTaskRelay {
         let handle = serde_json::from_value::<FinalTaskId>(value.clone()).map_err(|_| {
             McpError::invalid_request("Proxy relayed final Task carrier is invalid")
         })?;
-        let retained = self.resolve_task(proxy_task_owner(ctx)?, &handle)?.1;
+        let retained = self
+            .resolve_task(
+                proxy_task_owner(ctx)?,
+                &handle,
+                ProxyFinalTaskLookup::CurrentSnapshot,
+            )?
+            .1;
         let mut result = retained.creation;
         result.task = retained.task;
         set_relayed_task_id(&mut result.task, handle);
@@ -5716,8 +5749,13 @@ impl ProxyFinalTaskRelay {
         }
         let retained_at = Instant::now();
         let wall_origin = chrono::Utc::now();
+        let expires_at = Self::task_expiry(&result.task, retained_at, wall_origin)?;
+        if expires_at.is_some_and(|deadline| deadline <= retained_at) {
+            return Err(unknown_proxy_task());
+        }
         let mut retained = ProxyRelayedFinalTask {
-            expires_at: Self::task_expiry(&result.task, retained_at, wall_origin)?,
+            expires_at,
+            recovery_until: Self::task_recovery_ceiling(expires_at, retained_at)?,
             task: result.task.clone(),
             creation: result,
             binding: self.binding,
@@ -5750,11 +5788,25 @@ impl ProxyFinalTaskRelay {
                 && existing.task.base().task_id == retained.task.base().task_id
                 && existing.task.base().created_at == retained.task.base().created_at
                 && existing
-                    .expires_at
+                    .recovery_until
                     .is_none_or(|deadline| deadline > retained_at)
         }) {
+            let observed_expiry =
+                Self::task_expiry(&retained.task, existing.retained_at, existing.wall_origin)?;
+            Self::admit_task_recovery_deadline(observed_expiry, existing.recovery_until)?;
+            if existing
+                .expires_at
+                .is_some_and(|deadline| deadline <= retained_at)
+            {
+                // Reissuing the same upstream identity is not a fresh get and
+                // cannot restart an expired mapping's authority or ceiling.
+                return Err(unknown_proxy_task());
+            }
             retained.task = existing.task.clone();
-            retained.expires_at = Self::task_expiry(&retained.task, retained_at, wall_origin)?;
+            retained.expires_at = existing.expires_at;
+            retained.recovery_until = existing.recovery_until;
+            retained.retained_at = existing.retained_at;
+            retained.wall_origin = existing.wall_origin;
             retained.snapshot_revision = existing.snapshot_revision;
         }
         registry.tasks.insert(reservation.handle.clone(), retained);
@@ -5778,15 +5830,25 @@ impl ProxyFinalTaskRelay {
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
         let now = Instant::now();
+        Self::reclaim_expired_tasks(&mut registry, now);
         let retained = registry
             .tasks
             .get(handle)
             .filter(|retained| {
                 retained.binding == self.binding
                     && retained.owner == owner
-                    && retained.expires_at.is_none_or(|deadline| deadline > now)
+                    && retained
+                        .recovery_until
+                        .is_none_or(|deadline| deadline > now)
             })
             .ok_or_else(unknown_proxy_task)?;
+        let snapshot_is_live = retained.expires_at.is_none_or(|deadline| deadline > now);
+        // A late unsolicited notification cannot revive cached authority.
+        // Recovery is possible only through a read that captured this exact
+        // owner/route mapping's local revision before contacting upstream.
+        if !snapshot_is_live && expected_revision.is_none() {
+            return Err(unknown_proxy_task());
+        }
         if retained.task.base().task_id != task.base().task_id
             || retained.task.base().created_at != task.base().created_at
         {
@@ -5794,20 +5856,41 @@ impl ProxyFinalTaskRelay {
                 "Proxy upstream Task snapshot changed its admitted identity",
             ));
         }
-        if proxy_task_snapshots_match(&retained.task, task)? {
-            return Ok(Some(retained.task.clone()));
-        }
-        if proxy_task_is_terminal(&retained.task) && !proxy_task_is_terminal(task) {
-            // A late poll/event may observe a pre-completion snapshot. It
-            // cannot resurrect a terminal Task or roll back its TTL.
-            return Ok(Some(retained.task.clone()));
-        }
+        let matches_snapshot = proxy_task_snapshots_match(&retained.task, task)?;
+        let regresses_terminal =
+            proxy_task_is_terminal(&retained.task) && !proxy_task_is_terminal(task);
         if expected_revision != Some(retained.snapshot_revision) {
+            if snapshot_is_live && (matches_snapshot || regresses_terminal) {
+                return Ok(Some(retained.task.clone()));
+            }
             // Every differing unsolicited snapshot needs an authoritative
             // get. Even a later-looking timestamp can belong to an older
             // input round after the upstream wall clock moves backwards.
             // Only a read fenced by this local revision may replace state.
             return Ok(None);
+        }
+        let expiry = Self::task_expiry(task, retained.retained_at, retained.wall_origin)?;
+        if expiry.is_some_and(|deadline| deadline <= now) {
+            // A fresh, revision-fenced observation of expiry is authoritative.
+            // Retire all aliases atomically; neither an identical snapshot nor
+            // a previously terminal result may leak past this deadline.
+            registry.tasks.retain(|_, alias| {
+                !(alias.binding == self.binding
+                    && alias.owner == owner
+                    && alias.task.base().task_id == task.base().task_id
+                    && alias.task.base().created_at == task.base().created_at)
+            });
+            return Err(unknown_proxy_task());
+        }
+        Self::admit_task_recovery_deadline(expiry, retained.recovery_until)?;
+        if matches_snapshot && snapshot_is_live {
+            return Ok(Some(retained.task.clone()));
+        }
+        if regresses_terminal {
+            // A late poll may observe a pre-completion snapshot. It cannot
+            // resurrect a terminal Task, or return an expired terminal cache
+            // while recovering. A bounded fresh read must resolve that case.
+            return Ok(snapshot_is_live.then(|| retained.task.clone()));
         }
         if proxy_task_is_terminal(&retained.task)
             && !proxy_task_terminal_payloads_match(&retained.task, task)?
@@ -5830,19 +5913,27 @@ impl ProxyFinalTaskRelay {
                 && retained.owner == owner
                 && retained.task.base().task_id == task.base().task_id
                 && retained.task.base().created_at == task.base().created_at
-                && retained.expires_at.is_none_or(|deadline| deadline > now)
+                && retained
+                    .recovery_until
+                    .is_none_or(|deadline| deadline > now)
             {
                 let expiry = Self::task_expiry(task, retained.retained_at, retained.wall_origin)?;
-                updates.push((alias.clone(), expiry));
+                let recovery_until = match retained.recovery_until {
+                    Some(deadline) => Some(deadline),
+                    None => Self::task_recovery_ceiling(expiry, retained.retained_at)?,
+                };
+                Self::admit_task_recovery_deadline(expiry, recovery_until)?;
+                updates.push((alias.clone(), expiry, recovery_until));
             }
         }
-        for (alias, expiry) in updates {
+        for (alias, expiry, recovery_until) in updates {
             let retained = registry
                 .tasks
                 .get_mut(&alias)
                 .expect("validated alias is retained");
             retained.task = task.clone();
             retained.expires_at = expiry;
+            retained.recovery_until = recovery_until;
             retained.snapshot_revision = revision;
         }
         registry.next_snapshot_revision = revision;
@@ -5870,7 +5961,7 @@ impl ProxyFinalTaskRelay {
             if attempt == 2 {
                 break;
             }
-            let current = self.known_mapping(owner, handle)?;
+            let current = self.known_locator(owner, handle)?;
             expected_revision = Some(current.snapshot_revision);
             task = self
                 .client
@@ -5918,12 +6009,49 @@ impl ProxyFinalTaskRelay {
     fn reclaim_expired_tasks(registry: &mut ProxyFinalTaskRegistry, now: Instant) {
         registry.tasks.retain(|_, retained| {
             retained
-                .expires_at
-                .is_none_or(|expires_at| expires_at > now)
+                .recovery_until
+                .is_none_or(|recovery_until| recovery_until > now)
         });
     }
 
-    fn known_mapping(
+    fn task_recovery_ceiling(
+        expires_at: Option<Instant>,
+        retained_at: Instant,
+    ) -> McpResult<Option<Instant>> {
+        expires_at
+            .map(|deadline| {
+                retained_at
+                    .checked_add(RELAYED_FINAL_TASK_RECOVERY_LIFETIME)
+                    .map(|recovery_until| recovery_until.max(deadline))
+                    .ok_or_else(|| {
+                        McpError::invalid_request(
+                            "Proxy final Task recovery deadline cannot be represented locally",
+                        )
+                    })
+            })
+            .transpose()
+    }
+
+    fn admit_task_recovery_deadline(
+        expires_at: Option<Instant>,
+        recovery_until: Option<Instant>,
+    ) -> McpResult<()> {
+        if let Some(ceiling) = recovery_until {
+            if expires_at.is_none_or(|deadline| deadline > ceiling) {
+                return Err(McpError::with_data(
+                    McpErrorCode::InvalidRequest,
+                    "Proxy upstream Task retention exceeds its fixed local recovery ceiling",
+                    serde_json::json!({"reason": "UpstreamStateUnknown"}),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A locator reveals no cached Task and confers no mutation/listen
+    /// authority. The caller must perform a fresh get and reconcile before
+    /// exposing any snapshot whose prior authoritative deadline has elapsed.
+    fn known_locator(
         &self,
         owner: fastmcp_core::Sha256Digest,
         handle: &FinalTaskId,
@@ -5941,6 +6069,21 @@ impl ProxyFinalTaskRelay {
             .ok_or_else(unknown_proxy_task)
     }
 
+    fn known_mapping(
+        &self,
+        owner: fastmcp_core::Sha256Digest,
+        handle: &FinalTaskId,
+    ) -> McpResult<ProxyRelayedFinalTask> {
+        let retained = self.known_locator(owner, handle)?;
+        if retained
+            .expires_at
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            return Err(unknown_proxy_task());
+        }
+        Ok(retained)
+    }
+
     #[cfg(test)]
     fn known_task(&self, ctx: &McpContext, handle: &FinalTaskId) -> McpResult<FinalTask> {
         self.known_mapping(proxy_task_owner(ctx)?, handle)
@@ -5956,7 +6099,11 @@ impl ProxyFinalTaskRelay {
         let parameters = serde_json::from_value::<FinalGetTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
         let owner = proxy_task_owner(ctx)?;
-        let (route, retained) = self.resolve_task(owner, &parameters.task_id)?;
+        let (route, retained) = self.resolve_task(
+            owner,
+            &parameters.task_id,
+            ProxyFinalTaskLookup::RecoveryLocator,
+        )?;
         let mut result = route
             .client
             .get_final_task(ctx, retained.task.base().task_id.clone())
@@ -5984,7 +6131,11 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
-        let (route, retained) = self.resolve_task(proxy_task_owner(ctx)?, &parameters.task_id)?;
+        let (route, retained) = self.resolve_task(
+            proxy_task_owner(ctx)?,
+            &parameters.task_id,
+            ProxyFinalTaskLookup::CurrentSnapshot,
+        )?;
         let result = route
             .client
             .update_final_task(ctx, &retained.task, parameters.input_responses)
@@ -6002,7 +6153,11 @@ impl ProxyFinalTaskRelay {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<FinalCancelTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
-        let (route, retained) = self.resolve_task(proxy_task_owner(ctx)?, &parameters.task_id)?;
+        let (route, retained) = self.resolve_task(
+            proxy_task_owner(ctx)?,
+            &parameters.task_id,
+            ProxyFinalTaskLookup::CurrentSnapshot,
+        )?;
         let result = route
             .client
             .cancel_final_task(ctx, retained.task.base().task_id.clone())
@@ -6025,7 +6180,8 @@ impl ProxyFinalTaskRelay {
         let mut groups: Vec<(Arc<Self>, Vec<FinalTaskId>)> = Vec::new();
         // Resolve the entire selection before opening any upstream stream.
         for handle in task_ids {
-            let (route, _) = self.resolve_task(owner, &handle)?;
+            let (route, _) =
+                self.resolve_task(owner, &handle, ProxyFinalTaskLookup::CurrentSnapshot)?;
             match groups
                 .iter_mut()
                 .find(|(known, _)| Arc::ptr_eq(known, &route))
@@ -21628,6 +21784,19 @@ IFS= read -r end
                 additional: BTreeMap::new(),
             })
         }
+        fn update_final_task(
+            &mut self,
+            task: &fastmcp_protocol::Task,
+            input_responses: fastmcp_protocol::TaskInputResponses,
+        ) -> fastmcp_core::McpResult<fastmcp_protocol::UpdateTaskResult> {
+            self.backend.update_final_task(task, input_responses)
+        }
+        fn cancel_final_task(
+            &mut self,
+            task_id: fastmcp_protocol::FinalTaskId,
+        ) -> fastmcp_core::McpResult<fastmcp_protocol::FinalCancelTaskResult> {
+            self.backend.cancel_final_task(task_id)
+        }
         fn open_final_task_listener(
             &mut self,
             notifications: SubscriptionFilter,
@@ -21707,6 +21876,527 @@ IFS= read -r end
             &fixture.context,
             serde_json::json!({"_meta": metadata, "taskId": fixture.handle}),
         ))
+    }
+
+    #[cfg(feature = "tasks")]
+    fn age_relay_task_mappings(
+        relay: &super::ProxyFinalTaskRelay,
+        handles: &[fastmcp_protocol::FinalTaskId],
+        elapsed: Duration,
+    ) {
+        let mut registry = relay.tasks.lock().unwrap();
+        for handle in handles {
+            let retained = registry.tasks.get_mut(handle).unwrap();
+            // Model monotonic time passing without sleeps or wall-clock
+            // timestamp changes. Both deadlines retain the original anchor.
+            retained.retained_at -= elapsed;
+            retained.expires_at = retained.expires_at.map(|deadline| deadline - elapsed);
+            retained.recovery_until = retained.recovery_until.map(|deadline| deadline - elapsed);
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn relay_task_with_ttl(
+        task: &fastmcp_protocol::Task,
+        ttl_ms: Option<u64>,
+    ) -> fastmcp_protocol::Task {
+        let mut value = serde_json::to_value(task).unwrap();
+        value["ttlMs"] = serde_json::json!(ttl_ms);
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_renews_owned_aliases_after_snapshot_deadline() {
+        let initial = final_task_relay_result_with_ttl("renewed-aliases", Some(60_000)).task;
+        let renewed = relay_task_with_ttl(&initial, Some(120_000));
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        let alias = issue_relay_test_task(&fixture.relay, &fixture.context, initial.clone())
+            .task
+            .base()
+            .task_id
+            .clone();
+        let foreign = McpContext::new(Cx::for_testing(), 867).with_auth(
+            fastmcp_core::AuthContext::with_subject("other-retention-owner"),
+        );
+        let foreign_handle = issue_relay_test_task(&fixture.relay, &foreign, initial)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let handles = [fixture.handle.clone(), alias];
+        age_relay_task_mappings(&fixture.relay, &handles, Duration::from_secs(90));
+        let (old_deadline, ceiling, foreign_before) = {
+            let registry = fixture.relay.tasks.lock().unwrap();
+            let retained = &registry.tasks[&fixture.handle];
+            (
+                retained.expires_at.unwrap(),
+                retained.recovery_until,
+                serde_json::to_value(&registry.tasks[&foreign_handle].task).unwrap(),
+            )
+        };
+        for handle in &handles {
+            assert!(fixture.relay.known_task(&fixture.context, handle).is_err());
+        }
+        fixture
+            .replies
+            .lock()
+            .unwrap()
+            .extend((0..2).map(|_| TaskReconciliationReply {
+                result: Ok(renewed.clone()),
+                before_reply: None,
+            }));
+        for _ in 0..2 {
+            let result = task_reconciliation_get(&fixture).unwrap();
+            assert_eq!(result["taskId"], fixture.handle.as_str());
+            assert_eq!(result["ttlMs"], 120_000);
+            let registry = fixture.relay.tasks.lock().unwrap();
+            for handle in &handles {
+                let retained = &registry.tasks[handle];
+                assert_eq!(
+                    retained.expires_at,
+                    Some(old_deadline + Duration::from_secs(60))
+                );
+                assert_eq!(
+                    retained.recovery_until, ceiling,
+                    "polling cannot renew the ceiling"
+                );
+                assert!(super::proxy_task_snapshots_match(&retained.task, &renewed).unwrap());
+            }
+            assert_eq!(
+                serde_json::to_value(&registry.tasks[&foreign_handle].task).unwrap(),
+                foreign_before,
+                "same upstream identity never updates another owner"
+            );
+        }
+        assert_eq!(
+            fixture.calls.lock().unwrap().as_slice(),
+            ["tasks/get", "tasks/get"]
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_outage_retains_capacity_until_ceiling() {
+        let initial = final_task_relay_result_with_ttl("outage-retention", Some(60_000)).task;
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        let mut handles = vec![fixture.handle.clone()];
+        for _ in 1..super::MAX_RELAYED_FINAL_TASKS {
+            handles.push(
+                issue_relay_test_task(&fixture.relay, &fixture.context, initial.clone())
+                    .task
+                    .base()
+                    .task_id
+                    .clone(),
+            );
+        }
+        age_relay_task_mappings(&fixture.relay, &handles, Duration::from_secs(90));
+        fixture
+            .replies
+            .lock()
+            .unwrap()
+            .push_back(TaskReconciliationReply {
+                result: Err(fastmcp_core::McpError::internal_error(
+                    "upstream temporarily unavailable",
+                )),
+                before_reply: None,
+            });
+        let before = fixture
+            .proxy
+            .final_task_registry_snapshot_for_test()
+            .unwrap();
+        assert_eq!(
+            task_reconciliation_get(&fixture).unwrap_err().message,
+            "upstream temporarily unavailable"
+        );
+        assert_eq!(
+            fixture
+                .proxy
+                .final_task_registry_snapshot_for_test()
+                .unwrap(),
+            before
+        );
+        let error = match fixture.relay.reserve_task_creation(&fixture.context) {
+            Ok(_) => panic!("ambiguous mappings must keep their existing quota charge"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("capacity exhausted"));
+        assert_eq!(
+            fixture.relay.tasks.lock().unwrap().tasks.len(),
+            super::MAX_RELAYED_FINAL_TASKS
+        );
+        {
+            let mut registry = fixture.relay.tasks.lock().unwrap();
+            for retained in registry.tasks.values_mut() {
+                retained.recovery_until = Some(Instant::now() - Duration::from_millis(1));
+            }
+        }
+        let error = task_reconciliation_get(&fixture).unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["tasks/get"]);
+        assert!(fixture.relay.tasks.lock().unwrap().tasks.is_empty());
+        drop(
+            fixture
+                .relay
+                .reserve_task_creation(&fixture.context)
+                .unwrap(),
+        );
+        assert_eq!(
+            fixture
+                .proxy
+                .final_task_registry_snapshot_for_test()
+                .unwrap(),
+            serde_json::json!({"pendingCreations": 0, "tasks": {}}),
+            "hard-ceiling cleanup releases each mapping without retaining tombstones"
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_requires_fresh_get_before_cached_mutating_or_listening_use() {
+        let initial = final_task_relay_result_with_ttl("get-before-use", Some(60_000)).task;
+        let renewed = relay_task_with_ttl(&initial, Some(120_000));
+        let fixture = task_reconciliation_fixture(initial, Vec::new());
+        age_relay_task_mappings(
+            &fixture.relay,
+            &[fixture.handle.clone()],
+            Duration::from_secs(90),
+        );
+        let metadata =
+            serde_json::to_value(FinalRequestMeta::new(ClientCapabilities::default())).unwrap();
+        let parameters = serde_json::json!({"_meta": metadata, "taskId": fixture.handle});
+        let mut update = parameters.clone();
+        update["inputResponses"] = serde_json::json!({});
+        let carrier = crate::FinalTaskWorkDescriptor::new(serde_json::json!({
+            (super::RELAYED_TASK_RESULT_MEMBER): fixture.handle,
+        }))
+        .unwrap();
+        let foreign = McpContext::new(Cx::for_testing(), 868).with_auth(
+            fastmcp_core::AuthContext::with_subject("unauthorized-retention-owner"),
+        );
+        let before = fixture
+            .proxy
+            .final_task_registry_snapshot_for_test()
+            .unwrap();
+        let errors = [
+            fixture
+                .relay
+                .known_task(&fixture.context, &fixture.handle)
+                .unwrap_err(),
+            fixture
+                .relay
+                .admit_carried_task(&fixture.context, &carrier)
+                .unwrap_err(),
+            block_on(
+                fixture
+                    .relay
+                    .dispatch_update(&fixture.context, update.clone()),
+            )
+            .unwrap_err(),
+            block_on(
+                fixture
+                    .relay
+                    .dispatch_cancel(&fixture.context, parameters.clone()),
+            )
+            .unwrap_err(),
+            block_on(fixture.relay.dispatch_get(&foreign, parameters.clone())).unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+            assert!(error.data.is_none());
+        }
+        let error = match block_on(fixture.relay.open_listener_async(
+            &fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]),
+        )) {
+            Ok(_) => panic!("expired cached snapshots cannot admit a listener"),
+            Err(error) => error,
+        };
+        assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+        assert!(fixture.calls.lock().unwrap().is_empty());
+        assert_eq!(
+            fixture
+                .proxy
+                .final_task_registry_snapshot_for_test()
+                .unwrap(),
+            before
+        );
+        fixture
+            .replies
+            .lock()
+            .unwrap()
+            .push_back(TaskReconciliationReply {
+                result: Ok(renewed),
+                before_reply: None,
+            });
+        task_reconciliation_get(&fixture).unwrap();
+        assert!(
+            fixture
+                .relay
+                .admit_carried_task(&fixture.context, &carrier)
+                .unwrap()
+                .is_some()
+        );
+        block_on(fixture.relay.dispatch_update(&fixture.context, update)).unwrap();
+        block_on(fixture.relay.dispatch_cancel(&fixture.context, parameters)).unwrap();
+        let mut listener = block_on(fixture.relay.open_listener_async(
+            &fixture.context,
+            relay_test_filter(vec![fixture.handle.clone()]),
+        ))
+        .unwrap();
+        assert!(matches!(
+            listener
+                .next(fixture.context.cx(), &McpRequestCancellation::new())
+                .unwrap(),
+            ProxyFinalTaskListenerEvent::Acknowledged(_)
+        ));
+        assert_eq!(
+            fixture.calls.lock().unwrap().as_slice(),
+            [
+                "tasks/get",
+                "tasks/update",
+                "tasks/cancel",
+                "subscriptions/listen"
+            ]
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_authoritative_expiry_retires_owned_aliases() {
+        for terminal in [false, true] {
+            for shortened in [false, true] {
+                let mut initial = final_task_relay_result_with_ttl(
+                    "authoritative-expiry",
+                    Some(if shortened { 120_000 } else { 60_000 }),
+                )
+                .task;
+                if terminal {
+                    let mut value = serde_json::to_value(&initial).unwrap();
+                    value.as_object_mut().unwrap().remove("inputRequests");
+                    value["status"] = serde_json::json!("completed");
+                    value["result"] = serde_json::json!({"content": [{"type": "text", "text": "retained terminal"}]});
+                    initial = serde_json::from_value(value).unwrap();
+                }
+                let expired = relay_task_with_ttl(&initial, Some(60_000));
+                let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+                let alias =
+                    issue_relay_test_task(&fixture.relay, &fixture.context, initial.clone())
+                        .task
+                        .base()
+                        .task_id
+                        .clone();
+                let foreign = McpContext::new(Cx::for_testing(), 869).with_auth(
+                    fastmcp_core::AuthContext::with_subject("other-expiry-owner"),
+                );
+                let foreign_handle = issue_relay_test_task(&fixture.relay, &foreign, initial)
+                    .task
+                    .base()
+                    .task_id
+                    .clone();
+                let handles = [fixture.handle.clone(), alias];
+                age_relay_task_mappings(&fixture.relay, &handles, Duration::from_secs(90));
+                fixture
+                    .replies
+                    .lock()
+                    .unwrap()
+                    .push_back(TaskReconciliationReply {
+                        result: Ok(expired),
+                        before_reply: None,
+                    });
+                for _ in 0..2 {
+                    let error = task_reconciliation_get(&fixture).unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+                    assert!(error.data.is_none());
+                }
+                let registry = fixture.relay.tasks.lock().unwrap();
+                assert_eq!(registry.tasks.len(), 1);
+                assert!(registry.tasks.contains_key(&foreign_handle));
+                assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["tasks/get"]);
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_refuses_ceiling_extension_and_null_ttl_escape() {
+        let initial = final_task_relay_result_with_ttl("fixed-ceiling", Some(60_000)).task;
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        let before = fixture
+            .proxy
+            .final_task_registry_snapshot_for_test()
+            .unwrap();
+        let ceiling = fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].recovery_until;
+        for ttl in [Some(31 * 24 * 60 * 60 * 1_000), None] {
+            fixture
+                .replies
+                .lock()
+                .unwrap()
+                .push_back(TaskReconciliationReply {
+                    result: Ok(relay_task_with_ttl(&initial, ttl)),
+                    before_reply: None,
+                });
+            let error = task_reconciliation_get(&fixture).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"reason": "UpstreamStateUnknown"}))
+            );
+            assert_eq!(
+                fixture
+                    .proxy
+                    .final_task_registry_snapshot_for_test()
+                    .unwrap(),
+                before
+            );
+            assert_eq!(
+                fixture.relay.tasks.lock().unwrap().tasks[&fixture.handle].recovery_until,
+                ceiling
+            );
+        }
+        assert_eq!(
+            fixture.calls.lock().unwrap().as_slice(),
+            ["tasks/get", "tasks/get"]
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_preserves_initial_long_lifetime_without_alias_reset() {
+        let initial = final_task_relay_result_with_ttl(
+            "initial-long-lifetime",
+            Some(45 * 24 * 60 * 60 * 1_000),
+        )
+        .task;
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        // Age the original mapping so a new alias would observably reset its
+        // clock if it used admission time rather than the retained anchors.
+        age_relay_task_mappings(
+            &fixture.relay,
+            &[fixture.handle.clone()],
+            Duration::from_secs(90),
+        );
+        let alias = issue_relay_test_task(&fixture.relay, &fixture.context, initial.clone())
+            .task
+            .base()
+            .task_id
+            .clone();
+        let (deadline, ceiling) = {
+            let registry = fixture.relay.tasks.lock().unwrap();
+            let retained = &registry.tasks[&fixture.handle];
+            let alias = &registry.tasks[&alias];
+            assert_eq!(retained.expires_at, retained.recovery_until);
+            assert_eq!(alias.expires_at, retained.expires_at);
+            assert_eq!(alias.recovery_until, retained.recovery_until);
+            assert_eq!(alias.retained_at, retained.retained_at);
+            assert_eq!(alias.wall_origin, retained.wall_origin);
+            (retained.expires_at, retained.recovery_until)
+        };
+        fixture
+            .replies
+            .lock()
+            .unwrap()
+            .push_back(TaskReconciliationReply {
+                result: Ok(initial),
+                before_reply: None,
+            });
+        task_reconciliation_get(&fixture).unwrap();
+        let registry = fixture.relay.tasks.lock().unwrap();
+        for handle in [&fixture.handle, &alias] {
+            assert_eq!(registry.tasks[handle].expires_at, deadline);
+            assert_eq!(registry.tasks[handle].recovery_until, ceiling);
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_stale_expired_reply_cannot_delete_a_renewed_mapping() {
+        let initial = final_task_relay_result_with_ttl("renewal-race", Some(60_000)).task;
+        let renewed = relay_task_with_ttl(&initial, Some(120_000));
+        let fixture = task_reconciliation_fixture(initial.clone(), Vec::new());
+        age_relay_task_mappings(
+            &fixture.relay,
+            &[fixture.handle.clone()],
+            Duration::from_secs(90),
+        );
+        let route = Arc::downgrade(&fixture.relay);
+        let owner = super::proxy_task_owner(&fixture.context).unwrap();
+        let handle = fixture.handle.clone();
+        let concurrent = renewed.clone();
+        fixture.replies.lock().unwrap().extend([
+            TaskReconciliationReply {
+                result: Ok(initial),
+                before_reply: Some(Box::new(move || {
+                    let route = route.upgrade().unwrap();
+                    let revision = route
+                        .known_locator(owner, &handle)
+                        .unwrap()
+                        .snapshot_revision;
+                    assert!(
+                        route
+                            .record_task(owner, &handle, &concurrent, Some(revision))
+                            .unwrap()
+                            .is_some()
+                    );
+                })),
+            },
+            TaskReconciliationReply {
+                result: Ok(renewed.clone()),
+                before_reply: None,
+            },
+        ]);
+        assert_eq!(task_reconciliation_get(&fixture).unwrap()["ttlMs"], 120_000);
+        assert!(
+            super::proxy_task_snapshots_match(
+                &fixture
+                    .relay
+                    .known_task(&fixture.context, &fixture.handle)
+                    .unwrap(),
+                &renewed,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fixture.calls.lock().unwrap().as_slice(),
+            ["tasks/get", "tasks/get"]
+        );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_recovery_ceiling_elapsed_during_get_cannot_recreate_mapping() {
+        let initial = final_task_relay_result_with_ttl("ceiling-during-get", Some(60_000)).task;
+        let renewed = relay_task_with_ttl(&initial, Some(120_000));
+        let fixture = task_reconciliation_fixture(initial, Vec::new());
+        let route = Arc::downgrade(&fixture.relay);
+        let handle = fixture.handle.clone();
+        fixture
+            .replies
+            .lock()
+            .unwrap()
+            .push_back(TaskReconciliationReply {
+                result: Ok(renewed),
+                before_reply: Some(Box::new(move || {
+                    route
+                        .upgrade()
+                        .unwrap()
+                        .tasks
+                        .lock()
+                        .unwrap()
+                        .tasks
+                        .get_mut(&handle)
+                        .unwrap()
+                        .recovery_until = Some(Instant::now() - Duration::from_millis(1));
+                })),
+            });
+        let error = task_reconciliation_get(&fixture).unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
+        assert!(fixture.relay.tasks.lock().unwrap().tasks.is_empty());
+        assert_eq!(fixture.calls.lock().unwrap().as_slice(), ["tasks/get"]);
     }
 
     #[cfg(feature = "tasks")]
@@ -24523,7 +25213,7 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
-    fn proxy_final_tasks_relay_reclaims_elapsed_finite_ttl_but_retains_null_ttl() {
+    fn proxy_final_tasks_relay_reclaims_elapsed_recovery_ceiling_but_retains_null_ttl() {
         let proxy = ProxyClient::from_backend_with_upstream_binding(
             FinalTaskRelayBackend {
                 calls: Arc::new(Mutex::new(Vec::new())),
@@ -24561,6 +25251,16 @@ IFS= read -r end
             "null ttlMs is never silently given a local expiry"
         );
         super::ProxyFinalTaskRelay::reclaim_expired_tasks(&mut registry, Instant::now());
+        assert!(
+            registry.tasks.contains_key(&finite.base().task_id),
+            "an unvalidated old deadline does not release the locator or its charge"
+        );
+        registry
+            .tasks
+            .get_mut(&finite.base().task_id)
+            .unwrap()
+            .recovery_until = Some(Instant::now() - Duration::from_millis(1));
+        super::ProxyFinalTaskRelay::reclaim_expired_tasks(&mut registry, Instant::now());
         assert!(!registry.tasks.contains_key(&finite.base().task_id));
         assert!(registry.tasks.contains_key(&unlimited.base().task_id));
     }
@@ -24596,22 +25296,16 @@ IFS= read -r end
             expires_at,
             "a fresh read of the same task must preserve its authoritative deadline"
         );
-        relay
-            .tasks
-            .lock()
-            .unwrap()
-            .tasks
-            .get_mut(&handle)
-            .unwrap()
-            .expires_at = Some(Instant::now() - Duration::from_millis(1));
+        age_relay_task_mappings(&relay, &[handle.clone()], Duration::from_secs(90));
         let error = block_on(relay.dispatch_get(&owner, parameters)).unwrap_err();
         assert_eq!(error.code, McpErrorCode::InvalidParams);
         assert_eq!(error.message, "Unknown proxy-relayed final Task handle");
         assert_eq!(
             calls.lock().unwrap().as_slice(),
-            ["tasks/get"],
-            "an expired mapping never dispatches upstream recovery"
+            ["tasks/get", "tasks/get"],
+            "a fresh authoritative read confirms expiry without restarting its lifetime"
         );
+        assert!(!relay.tasks.lock().unwrap().tasks.contains_key(&handle));
     }
 
     #[cfg(feature = "tasks")]
