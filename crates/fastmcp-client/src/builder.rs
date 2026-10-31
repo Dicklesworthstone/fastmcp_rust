@@ -835,12 +835,15 @@ impl ClientBuilder {
             .validate()
             .map_err(|_| Self::http_timeout_policy_error())?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
+        // Each era starts from the caller's explicit configuration. Modern
+        // callback defaults must not become legacy initialize requirements
+        // when Auto selects a fresh exact-2024 connection.
+        let legacy_capabilities =
+            legacy_capabilities_for_handlers(&builder.capabilities, &reverse_request_handlers);
         let mut client_capabilities = builder.capabilities.clone();
         if reverse_request_handlers.has_modern_handlers() {
             reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
         }
-        let legacy_capabilities =
-            legacy_capabilities_for_handlers(&client_capabilities, &reverse_request_handlers);
         let client_implementation = builder.client_implementation_for_session();
         let mut connection = ClientHttpConnection::connect_with_settings(
             cx,
@@ -925,10 +928,7 @@ impl ClientBuilder {
             .validate()
             .map_err(|_| HttpClientError::Connection(Self::http_timeout_policy_error()))?;
         let reverse_request_handlers = builder.reverse_request_handlers.clone();
-        let mut client_capabilities = builder.capabilities.clone();
-        if reverse_request_handlers.has_modern_handlers() {
-            reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
-        }
+        let client_capabilities = builder.capabilities.clone();
         let client_implementation = builder.client_implementation_for_session();
         // Heap the connect step rather than awaiting it inline. It is the whole
         // discovery-or-initialize flow and dominated this future's 16 KB, which

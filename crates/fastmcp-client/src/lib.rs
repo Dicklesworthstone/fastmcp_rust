@@ -14179,6 +14179,12 @@ impl HttpClient {
     ) -> Result<Self, HttpClientError> {
         let mcp_apps_settings = settings.mcp_apps.clone();
         let request_timeout_policy = settings.request_timeout_policy;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let legacy_client_capabilities = client_capabilities.clone();
+        let mut client_capabilities = client_capabilities;
+        if protocol_plan.policy() != ProtocolPolicy::LegacyOnly {
+            reverse_request_handlers.derive_modern_capabilities(&mut client_capabilities);
+        }
         let mut connection = ClientHttpConnection::connect_with_settings(
             cx,
             protocol_plan,
@@ -14188,8 +14194,6 @@ impl HttpClient {
         )
         .await
         .map_err(HttpClientError::Connection)?;
-        #[cfg(feature = "legacy-2024-11-05")]
-        let mut client_capabilities = client_capabilities;
         if connection.selected_protocol_era() == ProtocolEra::Modern2026
             && reverse_request_handlers.has_modern_handlers()
         {
@@ -14205,6 +14209,11 @@ impl HttpClient {
         // legacy method handlers.
         #[cfg(feature = "legacy-2024-11-05")]
         if connection.selected_protocol_era() == ProtocolEra::Legacy2024 {
+            // Auto's modern probe may have advertised callback-derived
+            // capabilities. The fresh legacy handshake derives independently
+            // from the original configuration; explicit claims remain subject
+            // to exact-2024 validation rather than being silently discarded.
+            client_capabilities = legacy_client_capabilities;
             reverse_request_handlers.derive_legacy_capabilities(&mut client_capabilities);
             reverse_request_handlers
                 .validate_legacy_capabilities(&client_capabilities)

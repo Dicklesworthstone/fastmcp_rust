@@ -18993,6 +18993,313 @@ mod tests {
         server.join().expect("Auto fallback server must join");
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    fn assert_http_auto_callback_capabilities(
+        ready_client: bool,
+        fallback: bool,
+        legacy_roots: bool,
+        form_only: bool,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let modern_target = format!("http://{address}/mcp");
+        let sse_target = format!("http://{address}/legacy-sse");
+        let message_target = format!("http://{address}/legacy-message");
+        let advertised_message_target = message_target.clone();
+        let modern_capabilities = serde_json::json!({
+            "sampling":{}, "roots":{},
+            "elicitation":if form_only {
+                serde_json::json!({"form":{}})
+            } else {
+                serde_json::json!({"form":{}, "url":{}})
+            }
+        });
+        let legacy_capabilities = if legacy_roots {
+            serde_json::json!({"roots":{}})
+        } else {
+            serde_json::json!({})
+        };
+        let (done, finished) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let accept = || {
+                accept_legacy_test_peer(&listener, &finished, deadline)
+                    .unwrap()
+                    .expect("the capability-selection exchange reaches its next request")
+            };
+            let mut probe = accept();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut probe).body).unwrap();
+            assert_eq!(request["method"], SERVER_DISCOVER);
+            assert_eq!(
+                request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+                modern_capabilities,
+                "the modern leg advertises only its configured handler defaults and explicit restrictions",
+            );
+            if !fallback {
+                write_response(&mut probe, 200, "application/json", modern_discovery_body());
+                let mut sibling = accept();
+                let request: serde_json::Value =
+                    serde_json::from_slice(&read_request(&mut sibling).body).unwrap();
+                assert_eq!(request["method"], "tools/list");
+                assert_eq!(request["id"], 2);
+                assert_eq!(
+                    request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+                    modern_capabilities,
+                );
+                write_response(&mut sibling, 200, "application/json",
+                    br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#);
+                return;
+            }
+            write_response(&mut probe, 404, "text/plain", b"");
+            let mut sse = accept();
+            assert!(
+                read_request(&mut sse)
+                    .head
+                    .starts_with("GET /legacy-sse HTTP/1.1\r\n")
+            );
+            begin_chunked_sse(&mut sse);
+            write_chunked_sse_event(
+                &mut sse,
+                &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
+            );
+
+            if form_only {
+                finished.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    matches!(listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                    "an explicit unsupported legacy capability must fail before initialize"
+                );
+                return;
+            }
+            let mut initialize = accept();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut initialize).body).unwrap();
+            assert_eq!(request["method"], "initialize");
+            assert_eq!(request["id"], 1);
+            assert_eq!(
+                request["params"]["capabilities"], legacy_capabilities,
+                "the fresh legacy leg must not inherit modern callback defaults"
+            );
+            assert!(request["params"].get("_meta").is_none());
+            write_response(&mut initialize, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"callback-era-peer\",\"version\":\"1\"}}}\n\n",
+            );
+            let mut initialized = accept();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut initialized).body).unwrap();
+            assert_eq!(request["method"], "notifications/initialized");
+            write_response(&mut initialized, 202, "application/json", b"");
+
+            let mut ping = accept();
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut ping).body).unwrap();
+            assert_eq!(request["method"], "ping");
+            assert_eq!(request["id"], 2);
+            write_response(&mut ping, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"roots/list\",\"id\":81,\"params\":{}}\n\n",
+            );
+            let mut callback = accept();
+            let response: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut callback).body).unwrap();
+            assert_eq!(response["id"], 81);
+            if legacy_roots {
+                assert_eq!(response["result"]["roots"][0]["uri"], "file:///legacy-only");
+            } else {
+                assert_eq!(
+                    response["error"]["code"], -32601,
+                    "a modern roots handler grants no exact-2024 callback authority"
+                );
+            }
+            write_response(&mut callback, 202, "application/json", b"");
+            write_chunked_sse_event(
+                &mut sse,
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n\n",
+            );
+            // Keep the response owner live until initialize, initialized and
+            // the correlated application response have all reached the caller.
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+            finish_chunked_sse(&mut sse);
+        });
+
+        let legacy_calls = Arc::new(AtomicUsize::new(0));
+        let mut handlers = ReverseRequestHandlers::new()
+            .with_modern_sampling_create_message(|_, _, _| {
+                Box::pin(async { panic!("this exchange never requests modern sampling") })
+            })
+            .with_modern_roots_list(|_, _, _| {
+                Box::pin(async { panic!("a legacy roots request cannot invoke modern roots") })
+            })
+            .with_modern_elicitation_create(|_, _, _| {
+                Box::pin(async { panic!("this exchange never requests modern elicitation") })
+            });
+        if legacy_roots {
+            let calls = Arc::clone(&legacy_calls);
+            handlers = handlers.with_roots_list(move |_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(crate::ListRootsResult::new(vec![
+                        fastmcp_protocol::Root::new("file:///legacy-only"),
+                    ]))
+                })
+            });
+        }
+        let mut builder = ClientBuilder::new()
+            .protocol_plan(plan(
+                &modern_target,
+                &sse_target,
+                &message_target,
+                ProtocolPolicy::Auto,
+            ))
+            .reverse_request_handlers(handlers)
+            .request_timeout_policy(
+                crate::RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(10))
+                    .unwrap(),
+            );
+        if form_only {
+            builder = builder.capabilities(ClientCapabilities {
+                elicitation: Some(fastmcp_protocol::ElicitationCapability::form()),
+                ..ClientCapabilities::default()
+            });
+        }
+        runtime_block_on(async {
+            let cx =
+                Cx::current().expect("the HTTP callback fixture uses its runtime-owned context");
+            let result = if ready_client {
+                builder
+                    .connect_http_client_with_cx(&cx)
+                    .await
+                    .map(|client| client.connection)
+            } else {
+                builder
+                    .connect_http_with_cx(&cx)
+                    .await
+                    .map_err(crate::HttpClientError::Connection)
+            };
+            if fallback && form_only {
+                let error = result
+                    .err()
+                    .expect("explicit incompatible configuration must remain refused");
+                if ready_client {
+                    assert!(matches!(error, crate::HttpClientError::CoreResult(error)
+                    if error.message == "MCP 2024-11-05 does not define an elicitation client capability"));
+                } else {
+                    assert!(matches!(
+                        error,
+                        crate::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                            ModernHttpClientError::Negotiation(
+                                ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly
+                            )
+                        ))
+                    ));
+                }
+                signal_legacy_test_peer_stop(&done);
+                peer.join().unwrap();
+                assert_eq!(legacy_calls.load(Ordering::SeqCst), 0);
+                return;
+            }
+            let mut connection =
+                result.expect("era-specific callback capabilities admit the selected client");
+            if fallback {
+                assert_eq!(connection.selected_protocol_era(), ProtocolEra::Legacy2024);
+                if !ready_client {
+                    let ClientHttpConnection::LegacySse(legacy) = &connection else {
+                        unreachable!()
+                    };
+                    let capabilities = legacy.client_capabilities.clone();
+                    connection
+                        .request_json(
+                            &cx,
+                            "initialize",
+                            serde_json::json!({
+                                "protocolVersion":"2024-11-05", "capabilities":capabilities,
+                                "clientInfo":{"name":"raw-era-client", "version":"1"}
+                            }),
+                            RequestId::Number(1),
+                            4096,
+                        )
+                        .await
+                        .unwrap();
+                    connection
+                        .notify(&cx, "notifications/initialized", None)
+                        .await
+                        .unwrap();
+                }
+                let response = connection
+                    .request_json(
+                        &cx,
+                        "ping",
+                        serde_json::json!({}),
+                        RequestId::Number(2),
+                        4096,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.id, Some(RequestId::Number(2)));
+            } else {
+                assert_eq!(connection.selected_protocol_era(), ProtocolEra::Modern2026);
+                assert!(
+                    connection
+                        .modern_reverse_request_handlers()
+                        .unwrap()
+                        .has_modern_handlers()
+                );
+                let response = connection
+                    .request_json(
+                        &cx,
+                        "tools/list",
+                        serde_json::json!({}),
+                        RequestId::Number(2),
+                        4096,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.id, Some(RequestId::Number(2)));
+            }
+            assert_eq!(
+                legacy_calls.load(Ordering::SeqCst),
+                usize::from(fallback && legacy_roots)
+            );
+            assert!(cx.checkpoint().is_ok());
+            signal_legacy_test_peer_stop(&done);
+            peer.join().unwrap();
+        });
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_auto_fallback_keeps_callback_capabilities_in_their_selected_era() {
+        for ready_client in [false, true] {
+            for legacy_roots in [false, true] {
+                assert_http_auto_callback_capabilities(ready_client, true, legacy_roots, false);
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_auto_modern_callbacks_preserve_explicit_capability_narrowing() {
+        for ready_client in [false, true] {
+            for form_only in [false, true] {
+                assert_http_auto_callback_capabilities(ready_client, false, true, form_only);
+            }
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_auto_fallback_refuses_explicit_modern_only_capabilities() {
+        for ready_client in [false, true] {
+            assert_http_auto_callback_capabilities(ready_client, true, true, true);
+        }
+    }
+
     #[cfg(all(feature = "apps", feature = "legacy-2024-11-05"))]
     #[test]
     fn public_http_client_legacy_only_completes_exact_legacy_lifecycle() {
