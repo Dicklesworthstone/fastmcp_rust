@@ -1,0 +1,133 @@
+HOST=hz3
+DATE=2026-10-31T04:17:24Z
+NPROC=64
+PROJECTION=--workspace --lib (feature-unified), DEFAULT test-threads
+
+=== BUILD: cargo test --workspace --lib --no-run ===
+BUILD_EXIT=0
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-rust/9629672dd39891ee/out/fastmcp_rust-9629672dd39891ee)
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-server/c260c19eb10f8cdc/out/fastmcp_server-c260c19eb10f8cdc)
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-transport/034d1b8b7ad0be99/out/fastmcp_transport-034d1b8b7ad0be99)
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-xtask/6c87bdd7d044c41e/out/fastmcp_xtask-6c87bdd7d044c41e)
+compile error lines: 0
+
+lib test binaries found: 9
+.rch-target/debug/build/fastmcp-client/cb51084638bd5995/out/fastmcp_client-cb51084638bd5995
+.rch-target/debug/build/fastmcp-console/f964ab1590c0bac7/out/fastmcp_console-f964ab1590c0bac7
+.rch-target/debug/build/fastmcp-core/c9a57017b0cd816d/out/fastmcp_core-c9a57017b0cd816d
+.rch-target/debug/build/fastmcp-derive/9487234c1c8f4bdb/out/fastmcp_derive-9487234c1c8f4bdb
+.rch-target/debug/build/fastmcp-protocol/15612f0632a85807/out/fastmcp_protocol-15612f0632a85807
+.rch-target/debug/build/fastmcp-rust/9629672dd39891ee/out/fastmcp_rust-9629672dd39891ee
+.rch-target/debug/build/fastmcp-server/c260c19eb10f8cdc/out/fastmcp_server-c260c19eb10f8cdc
+.rch-target/debug/build/fastmcp-transport/034d1b8b7ad0be99/out/fastmcp_transport-034d1b8b7ad0be99
+.rch-target/debug/build/fastmcp-xtask/6c87bdd7d044c41e/out/fastmcp_xtask-6c87bdd7d044c41e
+
+############################################################
+### ONE FULL RUN PER CRATE, default test-threads
+############################################################
+
+======== fastmcp-client ========
+DISCOVERED=2497  ran=2497  exit=101
+test result: FAILED. 2468 passed; 29 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.33s
+  failing names:
+     http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog
+     http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+     http_auth::dpop::native::core::tasks::tests::input_answers_require_the_observed_ledger_before_discovery
+     http_auth::dpop::native::core::tasks::wait::tests::opaque_peer_intervals_lengthen_local_minimum_without_overflow_or_shortening
+     http_auth::managed::tasks::tests::reviewed_task_clients_keep_lifecycle_operations_unprojected_and_bound
+     http_auth::managed::tasks::tests::reviewed_task_projection_refuses_bad_operations_before_credential_acquisition
+     http_auth::managed::tasks::tests::reviewed_task_rounds_project_the_final_body_without_disclosing_state_or_secrets
+     http_auth::managed::tasks::watch::checkpoint::resume::store::asynchronous::tests::restart::cancelled_staging_wait_retains_the_same_one_use_completion_and_charge
+     http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+     http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+     http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+     http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+     mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+     memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+     task_wait::tests::public_http_wait_rejects_changed_identity_and_retains_original_snapshot
+     task_wait::tests::public_http_wait_cancels_sleep_and_inflight_read_without_cancelling_task
+     task_wait::tests::public_http_wait_stops_at_poll_budget_and_never_shortens_server_minimum
+     tests::async_mrtr_callback_cancellation
+     task_wait::tests::public_http_wait_returns_every_task_outcome_and_preserves_payloads
+     tests::async_mrtr_continuation_bounds
+     tests::async_mrtr_operation_deadline
+     tests::async_mrtr_public_verbs
+     task_wait::tests::public_http_wait_replaces_present_and_absent_poll_suggestions
+     task_wait::tests::public_http_wait_deadline_includes_pending_response_without_reset
+     tests::async_mrtr_refusal_and_passthrough
+     tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget
+     tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry
+     tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime
+     tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry
+
+======== fastmcp-console ========
+DISCOVERED=446  ran=446  exit=0
+test result: ok. 446 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.35s
+
+======== fastmcp-core ========
+DISCOVERED=462  ran=462  exit=0
+test result: ok. 462 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.43s
+
+======== fastmcp-derive ========
+DISCOVERED=0  ran=0  exit=127
+
+======== fastmcp-protocol ========
+DISCOVERED=803  ran=803  exit=0
+test result::tests::cache_ttl_retains_the_unbounded_wire_value_until_runtime_conversion ... ok
+test result::tests::exact_object_encoding_preserves_admitted_member_order_and_number_lexemes ... ok
+test result::tests::final_input_required_uses_retry_members_not_legacy_input ... ok
+test result::tests::locally_authored_extras_use_the_bounded_exact_value_boundary ... ok
+test result::tests::locally_authored_final_server_info_encodes_only_in_metadata ... ok
+test result::tests::rejected_extension_retains_its_raw_envelope ... ok
+test result::tests::legacy_results_reject_each_final_only_metadata_member_without_changing_valid_round_trip ... ok
+test result::tests::generic_peer_result_missing_type_compatibility_is_era_diagnostic_only ... ok
+test result::tests::result_unit_a_rejects_null_discriminator ... ok
+test result::tests::result_unit_b_typed_decode_preserves_open_members ... ok
+test result::tests::result_unit_a_positive_round_trip ... ok
+test result::tests::result_unit_b_typed_decode_rejects_wrong_known_kind ... ok
+test result::tests::final_result_metadata_roles_preserve_open_entries_and_reject_one_field_variants ... ok
+test result::tests::exact_json_object_key_keeps_its_narrow_bound ... ok
+test result::tests::exact_json_document_admits_its_bound_and_refuses_one_more_byte ... ok
+test result::tests::exact_json_string_value_admits_its_bound_and_refuses_one_more_byte ... ok
+test result: ok. 803 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.39s
+
+======== fastmcp-rust ========
+DISCOVERED=44  ran=44  exit=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.68s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.71s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.68s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.09s
+
+======== fastmcp-server ========
+DISCOVERED=2850  ran=2850  exit=101
+test result: FAILED. 2844 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.36s
+  failing names:
+     http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response
+     http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes
+     lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+     lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+     lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress
+     lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer
+
+======== fastmcp-transport ========
+DISCOVERED=743  ran=743  exit=101
+test result: FAILED. 742 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.53s
+  failing names:
+     memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority
+
+======== fastmcp-xtask ========
+DISCOVERED=153  ran=153  exit=0
+test result: ok. 153 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+================ TOTALS (feature-unified, default threads) ================
+DISCOVERED=7998  PASSED=7919  FAILED=36
+
+================ THE CONFOUND KILLER ================
+  discovered=1  failed_here=1   live_http_subscription_acknowledgement_precedes_deferred_progress
+  discovered=1  failed_here=1   live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+
+READING: failed_here=1 for BOTH -> projection eliminated; green-to-red since
+         59788afa stands, and 98e9f18e / 77f75357 are the 2-commit window.
+         failed_here=0 -> they pass under feature unification, so the failure
+         is specific to the crate's own default projection, not a regression.
+         discovered=0 -> VOID for that name; it was not in this projection.
