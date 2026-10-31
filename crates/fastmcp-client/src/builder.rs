@@ -534,12 +534,13 @@ impl ClientBuilder {
         self
     }
 
-    /// Configures exact MCP 2024-11-05 server-to-client request handlers.
+    /// Configures modern embedded-input and exact-2024 reverse request handlers.
     ///
-    /// The builder derives the matching legacy `sampling` and `roots`
-    /// capabilities only if negotiation selects the exact legacy initialize
-    /// handshake. Auto discovery remains a modern request without these
-    /// legacy-only capability claims; a legacy fallback advertises them.
+    /// Each selected era advertises the capabilities implied by its matching
+    /// handlers. Modern sampling/roots/elicitation handlers survive a successful
+    /// Auto discovery; exact-2024 sampling and roots handlers enter only on a
+    /// fresh legacy fallback. Explicitly configured capability options remain
+    /// unchanged, including sampling tools and elicitation form/URL restrictions.
     #[must_use]
     pub fn reverse_request_handlers(mut self, handlers: ReverseRequestHandlers) -> Self {
         self.reverse_request_handlers = handlers;
@@ -1267,7 +1268,7 @@ impl ClientBuilder {
         };
         let mut plan = self.protocol_plan.clone();
         if auto_probe {
-            builder.reverse_request_handlers = ReverseRequestHandlers::new();
+            builder = self.modern_stdio_probe_builder();
             plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
         }
         let mut probing = auto_probe;
@@ -1380,16 +1381,30 @@ impl ClientBuilder {
 
     /// Returns the builder state for an already-selected exact-2024 connection.
     ///
-    /// Reverse request handlers are an exact-2024 surface. Their derived
-    /// capabilities and handlers must therefore stay out of the disposable
-    /// final discovery probe and enter only after Auto has authorized its
-    /// fresh legacy connection.
+    /// Only exact-2024 handlers contribute capabilities or remain installed
+    /// on this leg. Modern handler defaults must not leak through a failed
+    /// modern probe into its fresh legacy replacement.
     fn legacy_builder_with_reverse_handlers(&self) -> Self {
         let mut builder = self.clone();
+        builder
+            .reverse_request_handlers
+            .modern_sampling_create_message = None;
+        builder.reverse_request_handlers.modern_roots_list = None;
+        builder.reverse_request_handlers.modern_elicitation_create = None;
         builder.capabilities = legacy_capabilities_for_handlers(
             &builder.capabilities,
             &builder.reverse_request_handlers,
         );
+        builder
+    }
+
+    /// Keeps modern handlers on a disposable Auto probe while withholding
+    /// exact-2024 callbacks. A successful probe becomes the application client,
+    /// so dropping its modern handlers would disable MRTR after negotiation.
+    fn modern_stdio_probe_builder(&self) -> Self {
+        let mut builder = self.clone();
+        builder.reverse_request_handlers.sampling_create_message = None;
+        builder.reverse_request_handlers.roots_list = None;
         builder
     }
 
@@ -1419,11 +1434,9 @@ impl ClientBuilder {
         retry_deadline: ConnectionRetryDeadline,
     ) -> McpResult<Client> {
         let modern_plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
-        // Exact-2024 reverse handlers neither advertise nor execute during a
-        // modern probe. Keep that disposable child handler-free so Auto stays
-        // modern-first regardless of local legacy callback configuration.
-        let mut modern_builder = self.clone();
-        modern_builder.reverse_request_handlers = ReverseRequestHandlers::new();
+        // The successful probe becomes the modern client. Retain its modern
+        // MRTR handlers while excluding exact-2024 reverse callbacks.
+        let modern_builder = self.modern_stdio_probe_builder();
         match modern_builder.try_connect_with_protocol_plan(
             command,
             args,
@@ -1759,10 +1772,15 @@ impl ClientBuilder {
         protocol_plan: ClientProtocolPlan,
         timeout_policy: RequestTimeoutPolicy,
     ) -> Client {
+        let mut capabilities = self.capabilities.clone();
+        if protocol_plan.policy() == ProtocolPolicy::ModernOnly {
+            self.reverse_request_handlers
+                .derive_modern_capabilities(&mut capabilities);
+        }
         // Create a placeholder session - will be updated on first use
         let mut session = ClientSession::new_placeholder(
             self.client_info.clone(),
-            self.capabilities.clone(),
+            capabilities,
             fastmcp_protocol::ServerInfo {
                 name: String::new(),
                 version: String::new(),
@@ -3002,6 +3020,277 @@ exec sleep 5
             .expect("derived callbacks and advertised legacy capabilities agree");
     }
 
+    #[cfg(unix)]
+    fn stdio_modern_mrtr_handler_probe(
+        policy: ProtocolPolicy,
+        deferred: bool,
+        capabilities: Option<ClientCapabilities>,
+        expected_capabilities: serde_json::Value,
+        accepted: bool,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let script = r#"
+IFS= read -r discover || exit 80
+case "$discover" in *'"method":"server/discover"'*) ;; *) exit 81;; esac
+case "$discover" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *) exit 82;; esac
+printf '%s\n' "$1"
+IFS= read -r original || exit 83
+case "$original" in *'"method":"'"$4"'"'*) ;; *) exit 84;; esac
+case "$original" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *) exit 85;; esac
+case "$original" in *inputResponses*|*requestState*) exit 86;; esac
+printf '%s\n' "$2"
+next=3
+if [ "$6" = accept ]; then
+    IFS= read -r retry || exit 87
+    case "$retry" in *'"method":"'"$4"'"'*) ;; *) exit 88;; esac
+    case "$retry" in *'"id":3,'*|*'"id":3}'*) ;; *) exit 89;; esac
+    case "$retry" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *) exit 90;; esac
+    case "$retry" in *'"requestState":"stdio-handler-state"'*) ;; *) exit 91;; esac
+    case "$retry" in *'"e":{"action":"decline"}'*) ;; *) exit 92;; esac
+    case "$retry" in *'"r":{"roots":[]}'*) ;; *) exit 93;; esac
+    case "$retry" in *'"text":"stdio-sample"'*) ;; *) exit 94;; esac
+    printf '{"jsonrpc":"2.0","id":3,"result":%s}\n' "$5"
+    next=4
+fi
+IFS= read -r reused || exit 95
+case "$reused" in *'"method":"tools/list"'*) ;; *) exit 96;; esac
+case "$reused" in *'"id":'"$next"','*|*'"id":'"$next"'}'*) ;; *) exit 97;; esac
+case "$reused" in *inputResponses*|*requestState*) exit 98;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}\n' "$next"
+IFS= read -r unexpected
+exit 0
+"#;
+        let discovery = serde_json::json!({
+            "jsonrpc":"2.0","id":1,"result":{
+                "resultType":"complete","supportedVersions":["2026-07-28"],
+                "capabilities":{},"ttlMs":0,"cacheScope":"private",
+                "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"stdio-mrtr-handlers","version":"1"}}
+            }
+        }).to_string();
+        let input = serde_json::json!({
+            "jsonrpc":"2.0","id":2,"result":{
+                "resultType":"input_required","requestState":"stdio-handler-state",
+                "inputRequests":{
+                    "e":{"method":"elicitation/create","params":{
+                        "mode":"url","message":"Open the review page",
+                        "elicitationId":"stdio-review","url":"https://example.com/review"
+                    }},
+                    "r":{"method":"roots/list"},
+                    "s":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":9}}
+                }
+            }
+        })
+        .to_string();
+        let expected_capabilities = expected_capabilities.to_string();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("stdio MRTR test runtime builds");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("stdio MRTR test uses the caller runtime");
+            for method in ["tools/call", "resources/read", "prompts/get"] {
+                let calls = Arc::new([
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                    AtomicUsize::new(0),
+                ]);
+                let mut handlers = ReverseRequestHandlers::new()
+                    .with_modern_elicitation_create({
+                        let calls = Arc::clone(&calls);
+                        move |_cx, _cancellation, _params| {
+                            calls[0].fetch_add(1, Ordering::SeqCst);
+                            Box::pin(async { Ok(fastmcp_protocol::ElicitResult::decline()) })
+                        }
+                    })
+                    .with_modern_roots_list({
+                        let calls = Arc::clone(&calls);
+                        move |_cx, _cancellation, _params| {
+                            calls[1].fetch_add(1, Ordering::SeqCst);
+                            Box::pin(async {
+                                Ok(fastmcp_protocol::FinalEmbeddedRootsListResult {
+                                    roots: Vec::new(),
+                                })
+                            })
+                        }
+                    })
+                    .with_modern_sampling_create_message({
+                        let calls = Arc::clone(&calls);
+                        move |_cx, _cancellation, _params| {
+                            calls[2].fetch_add(1, Ordering::SeqCst);
+                            Box::pin(async {
+                                serde_json::from_value(serde_json::json!({
+                                    "role":"assistant","model":"stdio-model",
+                                    "content":{"type":"text","text":"stdio-sample"}
+                                }))
+                                .map_err(|_| McpError::internal_error("invalid sampling fixture"))
+                            })
+                        }
+                    });
+                if policy == ProtocolPolicy::Auto {
+                    handlers = handlers.with_sampling_create_message(|_, _, _| {
+                        Box::pin(async {
+                            panic!("Auto's modern leg must never invoke an exact-2024 handler")
+                        })
+                    });
+                }
+                let complete = match method {
+                    "tools/call" => serde_json::json!({"resultType":"complete","content":[]}),
+                    "resources/read" => serde_json::json!({
+                        "resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"
+                    }),
+                    "prompts/get" => serde_json::json!({"resultType":"complete","messages":[]}),
+                    _ => unreachable!(),
+                };
+                let complete_wire = complete.to_string();
+                let mut builder = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(policy))
+                    .reverse_request_handlers(handlers)
+                    .auto_initialize(deferred)
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(5))
+                            .expect("bounded stdio MRTR fixture policy"),
+                    )
+                    .max_retries(0);
+                if let Some(capabilities) = capabilities.clone() {
+                    builder = builder.capabilities(capabilities);
+                }
+                let mut client = builder
+                    .connect_stdio_with_cx(
+                        &cx,
+                        "sh",
+                        &[
+                            "-c",
+                            script,
+                            "stdio-mrtr-handlers",
+                            &discovery,
+                            &input,
+                            &expected_capabilities,
+                            method,
+                            &complete_wire,
+                            if accepted { "accept" } else { "reject" },
+                        ],
+                    )
+                    .await
+                    .expect("configured modern handlers survive stdio construction");
+                assert_eq!(
+                    client.is_initialized(),
+                    policy == ProtocolPolicy::Auto || !deferred
+                );
+                let cancellation = crate::McpRequestCancellation::new();
+                let result = match method {
+                    "tools/call" => {
+                        client
+                            .call_tool_with_cx(
+                                &cx,
+                                &cancellation,
+                                "stdio-tool",
+                                serde_json::json!({}),
+                            )
+                            .await
+                    }
+                    "resources/read" => {
+                        client
+                            .read_resource_with_cx(&cx, &cancellation, "file:///stdio-resource")
+                            .await
+                    }
+                    "prompts/get" => {
+                        client
+                            .get_prompt_with_cx(
+                                &cx,
+                                &cancellation,
+                                "stdio-prompt",
+                                std::collections::HashMap::new(),
+                            )
+                            .await
+                    }
+                    _ => unreachable!(),
+                };
+                if accepted {
+                    let result =
+                        result.expect("the selected stdio client resolves all MRTR inputs");
+                    assert_eq!(result.method(), method);
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&result.encode().unwrap())
+                            .unwrap(),
+                        complete,
+                    );
+                } else {
+                    let error =
+                        result.expect_err("explicit form-only capability must refuse URL input");
+                    assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                    assert_eq!(
+                        error.message,
+                        "MRTR input-required result requests an unadvertised client capability"
+                    );
+                }
+                for count in calls.iter() {
+                    assert_eq!(count.load(Ordering::SeqCst), usize::from(accepted));
+                }
+                let reused = client
+                    .request_core_with_cx(&cx, &cancellation, "tools/list", serde_json::json!({}))
+                    .await
+                    .expect("MRTR completion or refusal preserves the selected connection");
+                assert_eq!(reused.method(), "tools/list");
+                assert_eq!(client.protocol_policy(), policy);
+                assert!(client.reverse_request_handlers.is_empty());
+                assert!(client.reverse_request_handlers.has_modern_handlers());
+                client
+                    .close_with_cx(&cx)
+                    .await
+                    .expect("the test closes its owned subprocess");
+                assert!(client.child.is_none());
+            }
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_modern_handlers_advertise_and_resolve_mrtr_for_all_verbs() {
+        for deferred in [false, true] {
+            stdio_modern_mrtr_handler_probe(
+                ProtocolPolicy::ModernOnly,
+                deferred,
+                None,
+                serde_json::json!({"elicitation":{"form":{},"url":{}},"roots":{},"sampling":{}}),
+                true,
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn stdio_auto_retains_modern_mrtr_handlers_after_discovery() {
+        for deferred in [false, true] {
+            stdio_modern_mrtr_handler_probe(
+                ProtocolPolicy::Auto,
+                deferred,
+                None,
+                serde_json::json!({"elicitation":{"form":{},"url":{}},"roots":{},"sampling":{}}),
+                true,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_modern_handler_defaults_preserve_explicit_capability_restrictions() {
+        for deferred in [false, true] {
+            stdio_modern_mrtr_handler_probe(
+                ProtocolPolicy::ModernOnly,
+                deferred,
+                Some(ClientCapabilities {
+                    sampling: Some(fastmcp_protocol::SamplingCapability::default().with_context()),
+                    elicitation: Some(fastmcp_protocol::ElicitationCapability::form()),
+                    ..ClientCapabilities::default()
+                }),
+                serde_json::json!({"elicitation":{"form":{}},"roots":{},"sampling":{"context":{}}}),
+                false,
+            );
+        }
+    }
+
     #[test]
     fn reverse_handlers_reject_modern_and_require_legacy_capability_parity() {
         let sampling_handler = || {
@@ -3482,16 +3771,24 @@ exec sleep 5
                     exec sleep 2 ;;
                 *) exit 1 ;;
             esac"#;
-        let handlers = ReverseRequestHandlers::new().with_sampling_create_message(
-            |_cx, _cancellation, _params| {
+        let handlers = ReverseRequestHandlers::new()
+            .with_sampling_create_message(|_cx, _cancellation, _params| {
                 Box::pin(async {
                     Ok(fastmcp_protocol::CreateMessageResult::text(
                         "installed after fallback",
                         "auto-legacy-model",
                     ))
                 })
-            },
-        );
+            })
+            .with_modern_sampling_create_message(|_, _, _| {
+                Box::pin(async { panic!("legacy fallback cannot invoke modern sampling") })
+            })
+            .with_modern_roots_list(|_, _, _| {
+                Box::pin(async { panic!("legacy fallback cannot invoke modern roots") })
+            })
+            .with_modern_elicitation_create(|_, _, _| {
+                Box::pin(async { panic!("legacy fallback cannot invoke modern elicitation") })
+            });
 
         let runtime = reverse_callback_test_runtime();
         let test = runtime.handle().spawn(async move {
@@ -3502,6 +3799,10 @@ exec sleep 5
                 .await
                 .expect("MethodNotFound authorizes a fresh legacy client with its callbacks");
 
+            assert!(
+                !client.reverse_request_handlers.has_modern_handlers(),
+                "the fresh legacy leg retains only its selected-era handlers",
+            );
             assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
             assert_eq!(
                 client.selected_protocol_era(),
