@@ -13803,11 +13803,7 @@ impl FinalTaskHandle {
     }
 
     fn admit_snapshot(&mut self, task: FinalTask) -> Result<bool, HttpClientError> {
-        if &task.base().task_id != self.task_id() {
-            return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                "final task snapshot does not match this handle",
-            )));
-        }
+        task_wait::admit_identity(&self.task, &task).map_err(HttpClientError::CoreResult)?;
         if self.is_terminal() || self.snapshot_is_identical(&task)? {
             return Ok(false);
         }
@@ -13851,8 +13847,10 @@ impl FinalTaskHandle {
     /// Reads the authoritative current snapshot through `tasks/get`.
     ///
     /// The stored snapshot changes only after the response has passed the
-    /// exact task-ID check in the HTTP Tasks decoder. Once a terminal snapshot
-    /// is admitted, returns that retained outcome without another request.
+    /// exact task-ID, creation-instant and retention checks. Equivalent
+    /// timestamp spellings remain admissible and retain their wire form.
+    /// Once a terminal snapshot is admitted, returns that retained outcome
+    /// without another request.
     pub async fn poll(
         &mut self,
         cx: &Cx,
@@ -13873,6 +13871,8 @@ impl FinalTaskHandle {
     /// A successful `tasks/update` result is only an empty acknowledgement;
     /// it does not contain a replacement task snapshot. Use [`Self::poll`] or
     /// [`Self::watch`] to observe the server's subsequent task state.
+    /// The retained input ledger and finite expiry are checked before a
+    /// request ID is allocated or any input responses are sent.
     pub async fn resume_input(
         &mut self,
         cx: &Cx,
@@ -14063,11 +14063,8 @@ impl FinalTaskWatch<'_, '_> {
                     return Ok(Some(FinalTaskWatchEvent::Acknowledged { accepted_filter }));
                 }
                 Some(ModernHttpSubscriptionListenEvent::TaskNotification(notification)) => {
-                    if &notification.params.task.base().task_id != self.handle.task_id() {
-                        return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                            "final task notification does not match this handle",
-                        )));
-                    }
+                    task_wait::admit_identity(self.handle.task(), &notification.params.task)
+                        .map_err(HttpClientError::CoreResult)?;
                     if self.handle.snapshot_is_identical(&notification.params.task)? {
                         continue;
                     }
@@ -16820,21 +16817,7 @@ impl HttpClient {
         if cx.checkpoint().is_err() {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
-        let FinalTask::InputRequired { input_requests, .. } = task else {
-            return Err(HttpClientError::CoreResult(McpError::invalid_params(
-                "tasks/update requires an input_required final task",
-            )));
-        };
-        let ledger = TaskInputLedger::from_requests(input_requests).map_err(|_| {
-            HttpClientError::CoreResult(McpError::invalid_params(
-                "final task input requests are not an admitted ledger",
-            ))
-        })?;
-        ledger.validate_responses(&input_responses).map_err(|_| {
-            HttpClientError::CoreResult(McpError::invalid_params(
-                "tasks/update inputResponses do not match the retained task input requests",
-            ))
-        })?;
+        task_wait::admit_task_input(task, &input_responses).map_err(HttpClientError::CoreResult)?;
 
         let request_id = self.next_request_id()?;
         self.connection

@@ -222,7 +222,7 @@ fn peer(initial: Value, replies: Vec<Reply>) -> (String, JoinHandle<Vec<Duration
             &mut sentinel,
             &json!({
                 "jsonrpc": "2.0", "id": next_id,
-                "result": {"resultType": "complete", "tools": []}
+                "result": {"resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"}
             }),
         )
         .unwrap();
@@ -503,6 +503,289 @@ fn public_http_wait_rejects_changed_identity_and_retains_original_snapshot() {
         None,
         Ok(FinalTaskWaitOutcome::Completed),
     );
+}
+
+fn run_http_task_identity_case(
+    through_watch: bool,
+    reconcile: bool,
+    candidate: Value,
+    admitted: bool,
+) {
+    let initial = task("working", None);
+    let before = serde_json::to_vec(&snapshot(&initial)).unwrap();
+    let expected = serde_json::to_vec(&snapshot(&candidate)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let peer = std::thread::spawn(move || {
+        let mut discover = accept(&listener);
+        assert_eq!(read(&mut discover)["method"], "server/discover");
+        write(&mut discover, &discovery()).unwrap();
+        let mut attach = accept(&listener);
+        assert_eq!(read(&mut attach)["method"], "tasks/get");
+        write(&mut attach, &response(2, initial.clone())).unwrap();
+
+        let mut observe = accept(&listener);
+        let request = read(&mut observe);
+        assert_eq!(request["id"], 3);
+        if through_watch {
+            assert_eq!(request["method"], "subscriptions/listen");
+            assert_eq!(
+                request["params"]["notifications"]["taskIds"],
+                json!(["wait-task"])
+            );
+            let mut notified = if reconcile {
+                let mut ambiguous = initial;
+                ambiguous["statusMessage"] = json!("requires authoritative reconciliation");
+                ambiguous
+            } else {
+                candidate.clone()
+            };
+            notified["_meta"] = json!({"io.modelcontextprotocol/subscriptionId": 3});
+            let acknowledged = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 3},
+                    "notifications": {"taskIds": ["wait-task"]}
+                }
+            });
+            let notification = json!({
+                "jsonrpc": "2.0", "method": "notifications/tasks", "params": notified
+            });
+            let terminal = json!({"jsonrpc":"2.0", "id":3,
+                "result":{"resultType":"complete",
+                    "_meta":{"io.modelcontextprotocol/subscriptionId":3}}});
+            let body =
+                format!("data: {acknowledged}\n\ndata: {notification}\n\ndata: {terminal}\n\n");
+            write!(
+                observe,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            )
+            .unwrap();
+            observe.flush().unwrap();
+            if reconcile {
+                let mut get = accept(&listener);
+                let request = read(&mut get);
+                assert_eq!(request["id"], 4);
+                assert_eq!(request["method"], "tasks/get");
+                write(&mut get, &response(4, candidate)).unwrap();
+            }
+        } else {
+            assert_eq!(request["method"], "tasks/get");
+            write(&mut observe, &response(3, candidate)).unwrap();
+        }
+
+        // A changed identity must not provoke an extra reconciliation or
+        // consume the next request's response. The same client stays usable.
+        let expected_id = if reconcile { 5 } else { 4 };
+        let mut sibling = accept(&listener);
+        let request = read(&mut sibling);
+        assert_eq!(request["method"], "tools/list");
+        assert_eq!(request["id"], expected_id);
+        write(
+            &mut sibling,
+            &json!({"jsonrpc":"2.0", "id":expected_id,
+                "result":{"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}}),
+        )
+        .unwrap();
+    });
+
+    RuntimeBuilder::current_thread()
+        .with_reactor(create_reactor().unwrap())
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = HttpClient::connect(
+                &cx,
+                plan(&target),
+                ClientInfo {
+                    name: "task-identity-client".to_owned(),
+                    version: "1".to_owned(),
+                },
+                ClientCapabilities::default(),
+            )
+            .await
+            .unwrap();
+            let mut handle = client
+                .attach_final_task(&cx, FinalTaskId::parse("wait-task").unwrap())
+                .await
+                .unwrap();
+            if through_watch {
+                let mut watch = handle
+                    .watch(
+                        &cx,
+                        &mut client,
+                        crate::sse::SseLimits::new(4096, 8192, 8).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    watch.next_event(&cx).await.unwrap(),
+                    Some(crate::FinalTaskWatchEvent::Acknowledged { .. })
+                ));
+                let event = watch.next_event(&cx).await;
+                if admitted {
+                    assert!(matches!(
+                        event.unwrap(),
+                        Some(crate::FinalTaskWatchEvent::TaskUpdated(_))
+                    ));
+                } else {
+                    assert!(
+                        event.is_err(),
+                        "a changed identity must not replace the handle"
+                    );
+                    assert!(watch.next_event(&cx).await.unwrap().is_none());
+                }
+            } else {
+                assert_eq!(handle.poll(&cx, &mut client).await.is_ok(), admitted);
+            }
+            assert_eq!(
+                serde_json::to_vec(handle.task()).unwrap(),
+                if admitted { expected } else { before },
+                "a refused snapshot must leave the exact retained state unchanged"
+            );
+            assert!(cx.checkpoint().is_ok());
+            client.list_tools(&cx, None).await.unwrap();
+        });
+    peer.join().unwrap();
+}
+
+#[test]
+fn public_http_task_poll_preserves_creation_and_retention_identity() {
+    for field in ["createdAt", "ttlMs"] {
+        let mut changed = task("working", None);
+        changed["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+        changed[field] = if field == "createdAt" {
+            json!("2026-07-28T12:00:01Z")
+        } else {
+            json!(60000)
+        };
+        run_http_task_identity_case(false, false, changed, false);
+    }
+    let mut equivalent = task("working", None);
+    equivalent["createdAt"] = json!("2026-07-28T08:00:00-04:00");
+    equivalent["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+    run_http_task_identity_case(false, false, equivalent, true);
+}
+
+#[test]
+fn public_http_task_watch_preserves_identity_before_and_after_reconciliation() {
+    for field in ["createdAt", "ttlMs"] {
+        for (reconcile, updated) in [
+            (false, "2026-07-28T12:00:02Z"),
+            (false, "2026-07-28T12:00:01Z"),
+            (true, "2026-07-28T12:00:01Z"),
+        ] {
+            let mut changed = task("working", None);
+            changed["lastUpdatedAt"] = json!(updated);
+            changed[field] = if field == "createdAt" {
+                json!("2026-07-28T12:00:01Z")
+            } else {
+                json!(60000)
+            };
+            run_http_task_identity_case(true, reconcile, changed, false);
+        }
+    }
+    let mut equivalent = task("working", None);
+    equivalent["createdAt"] = json!("2026-07-28T08:00:00-04:00");
+    equivalent["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+    run_http_task_identity_case(true, false, equivalent, true);
+}
+
+#[test]
+fn public_http_task_input_expiry_refuses_before_request_allocation() {
+    let live_expiry_ms = u64::try_from(wall_now_nanos() / 1_000_000).unwrap() + 300_000;
+    for ttl_ms in [None, Some(live_expiry_ms), Some(1)] {
+        let expired = ttl_ms == Some(1);
+        let mut initial = task("input_required", None);
+        initial["createdAt"] = json!("1970-01-01T00:00:00Z");
+        initial["ttlMs"] = json!(ttl_ms);
+        let before = serde_json::to_vec(&snapshot(&initial)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let mut discover = accept(&listener);
+            assert_eq!(read(&mut discover)["method"], "server/discover");
+            write(&mut discover, &discovery()).unwrap();
+            let mut attach = accept(&listener);
+            assert_eq!(read(&mut attach)["method"], "tasks/get");
+            write(&mut attach, &response(2, initial)).unwrap();
+            if !expired {
+                let mut update = accept(&listener);
+                let request = read(&mut update);
+                assert_eq!(request["id"], 3);
+                assert_eq!(request["method"], "tasks/update");
+                assert_eq!(request["params"]["taskId"], "wait-task");
+                assert_eq!(
+                    request["params"]["inputResponses"],
+                    json!({"roots":{"roots":[]}})
+                );
+                write(
+                    &mut update,
+                    &json!({"jsonrpc":"2.0", "id":3,
+                    "result":{"resultType":"complete"}}),
+                )
+                .unwrap();
+            }
+            let expected_id = if expired { 3 } else { 4 };
+            let mut sibling = accept(&listener);
+            let request = read(&mut sibling);
+            assert_eq!(
+                request["method"], "tools/list",
+                "expired input must not be transmitted or retried"
+            );
+            assert_eq!(
+                request["id"], expected_id,
+                "local refusal must not consume a request ID"
+            );
+            write(
+                &mut sibling,
+                &json!({"jsonrpc":"2.0", "id":expected_id,
+                    "result":{"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"}}),
+            )
+            .unwrap();
+        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "task-input-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities {
+                        roots: Some(Default::default()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+                let mut handle = client
+                    .attach_final_task(&cx, FinalTaskId::parse("wait-task").unwrap())
+                    .await
+                    .unwrap();
+                let inputs = serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap();
+                let updated = handle.resume_input(&cx, &mut client, inputs).await;
+                assert_eq!(updated.is_ok(), !expired);
+                assert_eq!(
+                    serde_json::to_vec(handle.task()).unwrap(),
+                    before,
+                    "an update acknowledgement or refusal cannot invent a Task state"
+                );
+                assert!(cx.checkpoint().is_ok());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        peer.join().unwrap();
+    }
 }
 
 #[test]

@@ -16,12 +16,15 @@ use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
 #[cfg(unix)]
 use crate::Client;
+#[cfg(any(unix, feature = "websocket-experimental"))]
+use crate::FinalUpdateTaskResult;
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
-use crate::{FinalTask, FinalTaskHandle, FinalTaskId, HttpClient, HttpClientError};
-#[cfg(any(unix, feature = "websocket-experimental"))]
-use crate::{FinalTaskInputResponses, FinalUpdateTaskResult, TaskInputLedger};
+use crate::{
+    FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses, HttpClient, HttpClientError,
+    TaskInputLedger,
+};
 
 /// Explicit finite limits for one observation of an already-created Task.
 ///
@@ -374,7 +377,6 @@ async fn guard_websocket_task_operation<T>(
     .await
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 pub(super) fn admit_task_input(
     task: &FinalTask,
     input_responses: &FinalTaskInputResponses,
@@ -408,7 +410,6 @@ fn checkpoint_task_operation(cx: &Cx, cancellation: &McpRequestCancellation) -> 
     Ok(())
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 pub(super) fn admit_input_retention(task: &FinalTask) -> McpResult<()> {
     if retention_deadline(task)?.is_some_and(|expires| wall_now_nanos() >= expires) {
         return Err(McpError::invalid_request(
@@ -499,7 +500,7 @@ fn next_delay(task: &FinalTask, policy: FinalTaskWaitPolicy) -> McpResult<Durati
         })
 }
 
-fn admit_identity(previous: &FinalTask, next: &FinalTask) -> McpResult<()> {
+pub(super) fn admit_identity(previous: &FinalTask, next: &FinalTask) -> McpResult<()> {
     let invalid = || McpError::invalid_request("Final Task identity changed during observation");
     if previous.base().task_id != next.base().task_id
         || previous.base().ttl_ms != next.base().ttl_ms
