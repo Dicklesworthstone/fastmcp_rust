@@ -5353,11 +5353,12 @@ impl FinalSubscriptionTransportAdmission {
             self.refused.store(true, Ordering::Release);
             return false;
         }
-        let correlated = notification
+        let subscription_id = notification
             .params
             .as_ref()
             .and_then(|params| params.get("_meta"))
-            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY));
+        let correlated = subscription_id
             .cloned()
             .and_then(|id| serde_json::from_value::<RequestId>(id).ok())
             .is_some_and(|id| self.subscription_id.correlates_with(&id));
@@ -5370,10 +5371,16 @@ impl FinalSubscriptionTransportAdmission {
             // even when shutdown has ended the original request context.
             return true;
         }
-        let allowed = correlated
-            && !self.refused.load(Ordering::Acquire)
+        let allowed = !self.refused.load(Ordering::Acquire)
             && self.resources.context.ensure_live().is_ok()
-            && if notification.method == "notifications/resources/updated" {
+            && if let Some(owned) = self.request_notification_matches(notification) {
+                // Progress and logs belong to the request carrying this body,
+                // not to its selected subscription event filter. An explicit
+                // subscription ID still cannot name a different listener.
+                owned && (subscription_id.is_none() || correlated)
+            } else if !correlated {
+                false
+            } else if notification.method == "notifications/resources/updated" {
                 match ServerNotification::decode(notification) {
                     Ok(ServerNotification::ResourceUpdated(params)) => {
                         let mut matched = false;
@@ -5411,6 +5418,43 @@ impl FinalSubscriptionTransportAdmission {
             }
         }
         allowed
+    }
+
+    /// Only request-scoped progress and opted-in logs may omit subscription
+    /// metadata. Other notifications retain their subscription/provider guard.
+    fn request_notification_matches(&self, notification: &JsonRpcRequest) -> Option<bool> {
+        match notification.method.as_str() {
+            "notifications/progress" => Some(match ServerNotification::decode(notification) {
+                Ok(ServerNotification::Progress(params)) => self
+                    .resources
+                    .context
+                    .progress_marker()
+                    .cloned()
+                    .and_then(|marker| serde_json::from_value::<ProgressMarker>(marker).ok())
+                    .is_some_and(|expected| match (expected, params.progress_token) {
+                        (ProgressMarker::String(expected), ProgressMarker::String(actual)) => {
+                            expected == actual
+                        }
+                        (ProgressMarker::Number(expected), ProgressMarker::Number(actual)) => {
+                            RequestId::Integer(expected.as_str().to_owned())
+                                .correlates_with(&RequestId::Integer(actual.as_str().to_owned()))
+                        }
+                        _ => false,
+                    }),
+                _ => false,
+            }),
+            "notifications/message" => Some(match ServerNotification::decode(notification) {
+                Ok(ServerNotification::Message(params)) => self
+                    .resources
+                    .context
+                    .min_log_level()
+                    .is_some_and(|minimum| {
+                        Server::mcp_log_level_from_final(params.level).rank() >= minimum.rank()
+                    }),
+                _ => false,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -12020,6 +12064,7 @@ where
     );
     let write_authority = || native_http_write_authority(cx, listener_shutdown, terminal_delivery);
     let mut write = std::pin::pin!(write);
+    let mut write_completed = false;
     loop {
         let authority = write_authority()?;
         let now = cx.now();
@@ -12029,6 +12074,9 @@ where
         if authority == NativeHttpWriteAuthority::AwaitingSubscriptionTermination {
             asupersync::runtime::yield_now().await;
             continue;
+        }
+        if write_completed {
+            return Ok(());
         }
         let wait = HTTP_ACCEPT_CANCEL_POLL.min(Duration::from_nanos(deadline.duration_since(now)));
         let next = std::future::poll_fn(|task_cx| {
@@ -12041,6 +12089,11 @@ where
             }
             let polled = match authority {
                 Err(()) => std::task::Poll::Ready(Err(())),
+                Ok(NativeHttpWriteAuthority::Ordinary | NativeHttpWriteAuthority::Terminal)
+                    if write_completed =>
+                {
+                    std::task::Poll::Ready(Ok(()))
+                }
                 // Socket writes observe the ambient Cx too. Mask only this
                 // poll; no mask crosses an await or the write deadline.
                 Ok(NativeHttpWriteAuthority::Terminal) => cx.masked(|| write.as_mut().poll(task_cx)),
@@ -12050,16 +12103,29 @@ where
                     std::task::Poll::Pending
                 }
             };
-            if polled.is_ready()
-                && (cx.now() >= deadline
-                    || !matches!(write_authority(), Ok(NativeHttpWriteAuthority::Ordinary | NativeHttpWriteAuthority::Terminal)))
-            {
-                // A ready operation is never repolled if shutdown raced its
-                // final poll. Late completion cannot settle a revoked receipt
-                // or cross the original caller/frame deadline.
+            if matches!(polled, std::task::Poll::Ready(Err(()))) {
+                return polled;
+            }
+            if polled.is_ready() {
+                write_completed = true;
+            }
+            if cx.now() >= deadline {
                 return std::task::Poll::Ready(Err(()));
             }
-            polled
+            match write_authority() {
+                Err(()) => std::task::Poll::Ready(Err(())),
+                Ok(NativeHttpWriteAuthority::AwaitingSubscriptionTermination) => {
+                    // The peer can observe an acknowledgement and request
+                    // shutdown before its write poll returns. Keep that
+                    // completed prefix while the listener elects the control;
+                    // polling its completed future again would replay bytes.
+                    task_cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+                Ok(NativeHttpWriteAuthority::Ordinary | NativeHttpWriteAuthority::Terminal) => {
+                    polled
+                }
+            }
         });
         if let Ok(result) = asupersync::time::timeout(now, wait, next).await {
             return result;
@@ -12083,13 +12149,26 @@ async fn write_native_http_response_parts<W>(
 where
     W: asupersync::io::AsyncWrite + Unpin,
 {
-    bounded_native_http_response_write(cx, listener_shutdown, terminal_delivery, async {
-        for part in parts {
-            writer.write_all(part).await.map_err(|_| ())?;
-        }
-        writer.flush().await.map_err(|_| ())
-    })
+    bounded_native_http_response_write(
+        cx,
+        listener_shutdown,
+        terminal_delivery,
+        write_http_response_parts(writer, parts),
+    )
     .await
+}
+
+/// The caller supplies write authority around this one pinned I/O operation.
+/// Event admission belongs here, inside the bounded writer: a completed frame
+/// may await terminal election without re-admitting or replaying its bytes.
+async fn write_http_response_parts<W>(writer: &mut W, parts: &[&[u8]]) -> Result<(), ()>
+where
+    W: asupersync::io::AsyncWrite + Unpin,
+{
+    for part in parts {
+        writer.write_all(part).await.map_err(|_| ())?;
+    }
+    writer.flush().await.map_err(|_| ())
 }
 
 /// The terminal SSE event does not finish an HTTP body until its final chunk
@@ -12877,15 +12956,17 @@ async fn send_modern_sse_stream(
                     // authority through listener cancellation, including
                     // already-queued frames before that terminal. It still
                     // cannot wait forever on a peer that has stopped reading.
-                    guard_subscription_sse_write(
-                        &terminal_delivery,
-                        &event,
-                        write_native_http_response_parts(
-                            cx,
-                            listener_shutdown,
-                            Some(&terminal_delivery),
-                            &mut writer,
-                            &[prefix.as_bytes(), &bytes, b"\r\n"],
+                    bounded_native_http_response_write(
+                        cx,
+                        listener_shutdown,
+                        Some(&terminal_delivery),
+                        guard_subscription_sse_write(
+                            &terminal_delivery,
+                            &event,
+                            write_http_response_parts(
+                                &mut writer,
+                                &[prefix.as_bytes(), &bytes, b"\r\n"],
+                            ),
                         ),
                     )
                     .await?;
@@ -39520,6 +39601,64 @@ mod lib_unit_tests {
         }
 
         #[test]
+        fn provider_subscription_bounded_partial_write_still_refuses_revocation() {
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                    clock,
+                ))
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+            let ambient = Cx::set_current(Some(cx.clone()));
+            let shutdown = HttpListenerShutdown::new(&cx);
+            let fixture = http_outbox_fixture();
+            assert_eq!(
+                fixture
+                    .server
+                    .publish_subscription_notification(update(CHILD))
+                    .unwrap(),
+                1
+            );
+            let event = fixture.response.pop_event().unwrap().unwrap();
+            let bytes = event.to_bytes().unwrap();
+            let parts = [bytes.as_slice()];
+            let control = Arc::new(NativeSseTrailerControl::default());
+            control.permitted_bytes.store(4, Ordering::Release);
+            let mut writer = NativeSseTrailerWriter(Arc::clone(&control));
+            let mut write = Box::pin(bounded_native_http_response_write(
+                &cx,
+                &shutdown,
+                Some(&fixture.response.terminal_delivery),
+                guard_subscription_sse_write(
+                    &fixture.response.terminal_delivery,
+                    &event,
+                    write_http_response_parts(&mut writer, &parts),
+                ),
+            ));
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(write.as_mut().poll(&mut task).is_pending());
+            assert_eq!(control.bytes.lock().unwrap().as_slice(), &bytes[..4]);
+            let polls = control.polls.load(Ordering::Acquire);
+            fixture.policy.authorized.store(false, Ordering::Release);
+            control
+                .permitted_bytes
+                .store(bytes.len(), Ordering::Release);
+            control.flush_ready.store(true, Ordering::Release);
+            assert!(matches!(
+                write.as_mut().poll(&mut task),
+                std::task::Poll::Ready(Err(()))
+            ));
+            assert_eq!(control.polls.load(Ordering::Acquire), polls);
+            assert_eq!(control.bytes.lock().unwrap().as_slice(), &bytes[..4]);
+            assert!(fixture.response.terminal_delivery.is_settled());
+            drop(write);
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+
+        #[test]
         fn provider_subscription_transport_custody_releases_context_callbacks() {
             for with_progress in [false, true] {
                 let policy = Policy::new();
@@ -49706,6 +49845,212 @@ mod lib_unit_tests {
         });
     }
 
+    struct RequestNotificationAdmissionFixture {
+        delivery: Arc<FinalSubscriptionTerminalDelivery>,
+        admission: Arc<FinalSubscriptionTransportAdmission>,
+        context: McpContext,
+        scope: Option<fastmcp_core::McpContextLeaseGuard>,
+    }
+
+    fn request_notification_admission_fixture(
+        cx: &Cx,
+        marker: Option<ProgressMarker>,
+        log_level: Option<McpLogLevel>,
+    ) -> RequestNotificationAdmissionFixture {
+        let cancellation = McpRequestCancellation::new();
+        let mut context = McpContext::new(cx.clone(), 937)
+            .with_request_cancellation(cancellation.clone())
+            .with_min_log_level(log_level);
+        if let Some(marker) = marker {
+            let progress = Arc::new(handler::FinalProgressRuntime::new(marker, |_| {}));
+            context = context.with_progress_reporter(progress.into_reporter());
+        }
+        let (context, scope) = context.begin_request_scope().unwrap();
+        let election = Arc::new(FinalSubscriptionElection::opening());
+        *election.phase.lock().unwrap() = FinalSubscriptionPhase::Active;
+        let admission = Arc::new(FinalSubscriptionTransportAdmission {
+            registry: std::sync::Weak::new(),
+            registry_key: 0,
+            election,
+            request_cancellation: cancellation,
+            subscription_id: 937_i64.into(),
+            resources: Arc::new(FinalSubscriptionResourceAdmission {
+                context: context.clone(),
+                bindings: Vec::new(),
+            }),
+            refused: AtomicBool::new(false),
+        });
+        let delivery = Arc::new(FinalSubscriptionTerminalDelivery::default());
+        delivery.subscription_request.store(true, Ordering::Release);
+        *delivery.subscription_admission.lock().unwrap() = Some(Arc::clone(&admission));
+        RequestNotificationAdmissionFixture {
+            delivery,
+            admission,
+            context,
+            scope: Some(scope),
+        }
+    }
+
+    fn request_progress_notification(marker: serde_json::Value) -> JsonRpcRequest {
+        JsonRpcRequest::notification(
+            "notifications/progress",
+            Some(serde_json::json!({"progressToken": marker, "progress": 1})),
+        )
+    }
+
+    fn request_log_notification(level: &str) -> JsonRpcRequest {
+        JsonRpcRequest::notification(
+            "notifications/message",
+            Some(serde_json::json!({"level": level, "data": "request-owned log"})),
+        )
+    }
+
+    #[test]
+    fn subscription_transport_admits_request_progress_and_opted_in_logs() {
+        for (expected, actual) in [
+            (serde_json::json!("marker"), serde_json::json!("marker")),
+            (serde_json::json!(7), serde_json::from_str("7e0").unwrap()),
+            (serde_json::from_str("7.0").unwrap(), serde_json::json!(7)),
+            (
+                serde_json::json!("x".repeat(4096)),
+                serde_json::json!("x".repeat(4096)),
+            ),
+        ] {
+            let fixture = request_notification_admission_fixture(
+                &Cx::for_testing(),
+                Some(serde_json::from_value(expected).unwrap()),
+                Some(McpLogLevel::Info),
+            );
+            for mut notification in [
+                request_progress_notification(actual),
+                request_log_notification("info"),
+                request_log_notification("warning"),
+            ] {
+                assert!(
+                    fixture
+                        .delivery
+                        .allows_subscription_message(&JsonRpcMessage::Request(
+                            notification.clone()
+                        ),),
+                    "request-owned notifications need no subscription metadata",
+                );
+                notification.params.as_mut().unwrap()["_meta"] = serde_json::json!({
+                    FINAL_SUBSCRIPTION_ID_META_KEY: 937,
+                });
+                let event = SseEvent::message(serde_json::to_string(&notification).unwrap());
+                assert!(fixture.delivery.allows_subscription_sse_event(&event));
+            }
+            assert!(!fixture.admission.refused.load(Ordering::Acquire));
+            assert!(fixture.context.ensure_live().is_ok());
+        }
+    }
+
+    #[test]
+    fn subscription_transport_rejects_foreign_or_malformed_request_notifications() {
+        let mut rejected = vec![
+            request_progress_notification(serde_json::json!("foreign")),
+            request_progress_notification(serde_json::json!(7)),
+            request_log_notification("debug"),
+            request_log_notification("invalid-level"),
+            JsonRpcRequest::notification("notifications/tools/list_changed", None),
+            JsonRpcRequest::notification(
+                "notifications/cancelled",
+                Some(serde_json::json!({
+                    "requestId": 938,
+                    "_meta": {FINAL_SUBSCRIPTION_ID_META_KEY: 938},
+                })),
+            ),
+        ];
+        let mut malformed = request_progress_notification(serde_json::json!("marker"));
+        malformed.params.as_mut().unwrap()["progress"] = serde_json::json!("invalid");
+        rejected.push(malformed);
+        for id in [
+            serde_json::json!(938),
+            serde_json::json!("937"),
+            serde_json::Value::Null,
+        ] {
+            for mut notification in [
+                request_progress_notification(serde_json::json!("marker")),
+                request_log_notification("info"),
+            ] {
+                notification.params.as_mut().unwrap()["_meta"] = serde_json::json!({
+                    FINAL_SUBSCRIPTION_ID_META_KEY: id,
+                });
+                rejected.push(notification);
+            }
+        }
+        for notification in rejected {
+            let fixture = request_notification_admission_fixture(
+                &Cx::for_testing(),
+                Some("marker".into()),
+                Some(McpLogLevel::Info),
+            );
+            assert!(
+                !fixture
+                    .delivery
+                    .allows_subscription_message(&JsonRpcMessage::Request(notification.clone()),),
+                "invalid request-owned notification escaped: {notification:?}"
+            );
+            assert!(fixture.admission.refused.load(Ordering::Acquire));
+            assert!(
+                !fixture
+                    .delivery
+                    .allows_subscription_message(&JsonRpcMessage::Request(
+                        request_progress_notification(serde_json::json!("marker")),
+                    )),
+                "refusal must remain latched for later valid progress"
+            );
+            assert!(
+                !fixture
+                    .delivery
+                    .allows_subscription_message(&JsonRpcMessage::Request(
+                        request_log_notification("info"),
+                    )),
+                "refusal must remain latched for later valid logs"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_transport_request_notifications_keep_opt_in_and_liveness_fences() {
+        for progress in [false, true] {
+            let fixture = request_notification_admission_fixture(&Cx::for_testing(), None, None);
+            let notification = if progress {
+                request_progress_notification(serde_json::json!("marker"))
+            } else {
+                request_log_notification("info")
+            };
+            assert!(
+                !fixture
+                    .delivery
+                    .allows_subscription_message(&JsonRpcMessage::Request(notification,))
+            );
+        }
+        for cancel in [false, true] {
+            let mut fixture = request_notification_admission_fixture(
+                &Cx::for_testing(),
+                Some("marker".into()),
+                Some(McpLogLevel::Info),
+            );
+            if cancel {
+                fixture.context.request_cancellation().cancel_by_peer();
+            } else {
+                drop(fixture.scope.take());
+            }
+            assert!(fixture.context.ensure_live().is_err());
+            for notification in [
+                request_progress_notification(serde_json::json!("marker")),
+                request_log_notification("info"),
+            ] {
+                assert!(
+                    !fixture
+                        .delivery
+                        .allows_subscription_message(&JsonRpcMessage::Request(notification),)
+                );
+            }
+        }
+    }
+
     #[derive(Default)]
     struct NativeSseTrailerControl {
         bytes: Mutex<Vec<u8>>,
@@ -49761,6 +50106,142 @@ mod lib_unit_tests {
         ) -> std::task::Poll<std::io::Result<()>> {
             self.poll_flush(task)
         }
+    }
+
+    #[test]
+    fn native_subscription_completed_progress_waits_for_election_without_readmission() {
+        struct ShutdownOnFlushWriter {
+            inner: NativeSseTrailerWriter,
+            listener: Cx,
+        }
+
+        impl asupersync::io::AsyncWrite for ShutdownOnFlushWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                task: &mut std::task::Context<'_>,
+                input: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                asupersync::io::AsyncWrite::poll_write(
+                    std::pin::Pin::new(&mut self.get_mut().inner),
+                    task,
+                    input,
+                )
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                task: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                let writer = self.get_mut();
+                let result = asupersync::io::AsyncWrite::poll_flush(
+                    std::pin::Pin::new(&mut writer.inner),
+                    task,
+                );
+                if matches!(result, std::task::Poll::Ready(Ok(()))) {
+                    writer
+                        .listener
+                        .cancel_with(CancelKind::Shutdown, Some("progress observed"));
+                }
+                result
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                task: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                self.poll_flush(task)
+            }
+        }
+
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+            .build()
+            .unwrap();
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(asupersync::Time::from_secs(1)));
+        let ambient = Cx::set_current(Some(cx.clone()));
+        let listener = Cx::for_testing();
+        let shutdown = HttpListenerShutdown::new(&listener);
+        let mut fixture = request_notification_admission_fixture(&cx, Some("marker".into()), None);
+        let event = SseEvent::message(
+            serde_json::to_string(&request_progress_notification(serde_json::json!("marker")))
+                .unwrap(),
+        );
+        let bytes = event.to_bytes().unwrap();
+        let parts = [bytes.as_slice()];
+        let control = Arc::new(NativeSseTrailerControl::default());
+        control
+            .permitted_bytes
+            .store(bytes.len(), Ordering::Release);
+        control.flush_ready.store(true, Ordering::Release);
+        let mut writer = ShutdownOnFlushWriter {
+            inner: NativeSseTrailerWriter(Arc::clone(&control)),
+            listener,
+        };
+        let mut write = Box::pin(bounded_native_http_response_write(
+            &cx,
+            &shutdown,
+            Some(&fixture.delivery),
+            guard_subscription_sse_write(
+                &fixture.delivery,
+                &event,
+                write_http_response_parts(&mut writer, &parts),
+            ),
+        ));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        assert_eq!(*control.bytes.lock().unwrap(), bytes);
+        let polls = control.polls.load(Ordering::Acquire);
+        let deadline = *fixture.delivery.native_shutdown_deadline.lock().unwrap();
+        // Reconstruct the interval timeout while retaining the completed I/O.
+        clock.advance_to(asupersync::Time::from_millis(21));
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        *fixture.admission.election.phase.lock().unwrap() =
+            FinalSubscriptionPhase::ServerTerminated;
+        assert!(fixture.delivery.mark_cancellation_enqueued());
+        fixture.context.request_cancellation().cancel();
+        drop(fixture.scope.take());
+        assert!(fixture.context.ensure_live().is_err());
+        assert!(matches!(
+            write.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(control.polls.load(Ordering::Acquire), polls);
+        assert_eq!(*control.bytes.lock().unwrap(), bytes);
+        assert_eq!(
+            *fixture.delivery.native_shutdown_deadline.lock().unwrap(),
+            deadline
+        );
+        assert!(
+            !fixture.delivery.is_settled(),
+            "the terminal control still needs delivery"
+        );
+        drop(write);
+        let extra_polls = AtomicUsize::new(0);
+        let mut extra = Box::pin(guard_subscription_sse_write(
+            &fixture.delivery,
+            &event,
+            async {
+                extra_polls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        ));
+        assert!(matches!(
+            extra.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Err(()))
+        ));
+        assert_eq!(
+            extra_polls.load(Ordering::Acquire),
+            0,
+            "no new frame gained drain authority"
+        );
+        drop(extra);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[test]
@@ -50030,7 +50511,7 @@ mod lib_unit_tests {
 
     #[test]
     fn native_subscription_write_completion_rechecks_original_authority() {
-        for boundary in 0..3 {
+        for boundary in 0..2 {
             let clock = Arc::new(asupersync::time::VirtualClock::new());
             let runtime = RuntimeBuilder::current_thread()
                 .blocking_threads(0, 0)
@@ -50042,18 +50523,18 @@ mod lib_unit_tests {
             let shutdown = HttpListenerShutdown::new(&cx);
             let delivery = FinalSubscriptionTerminalDelivery::default();
             delivery.subscription_request.store(true, Ordering::Release);
-            if boundary != 2 {
-                assert!(delivery.mark_cancellation_enqueued());
-                shutdown.request();
-            }
+            assert!(delivery.mark_cancellation_enqueued());
+            shutdown.request();
             let polls = AtomicUsize::new(0);
             let mut write = Box::pin(bounded_native_http_response_write(
-                &cx, &shutdown, Some(&delivery), async {
+                &cx,
+                &shutdown,
+                Some(&delivery),
+                async {
                     polls.fetch_add(1, Ordering::AcqRel);
                     match boundary {
                         0 => clock.advance_to(asupersync::Time::from_secs(1)),
-                        1 => delivery.mark_failed(),
-                        _ => shutdown.request(),
+                        _ => delivery.mark_failed(),
                     }
                     Ok(())
                 },
@@ -50062,6 +50543,147 @@ mod lib_unit_tests {
             assert!(matches!(write.as_mut().poll(&mut task_cx), std::task::Poll::Ready(Err(()))));
             assert_eq!(polls.load(Ordering::Acquire), 1, "a completed write must never be restarted");
             drop(write);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+        }
+    }
+
+    #[test]
+    fn native_subscription_ready_acknowledgement_waits_for_control_without_replay() {
+        let clock = Arc::new(asupersync::time::VirtualClock::new());
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::clone(&clock),
+            ))
+            .build()
+            .unwrap();
+        let cx = runtime
+            .request_cx_with_budget(Budget::INFINITE.with_deadline(asupersync::Time::from_secs(1)));
+        let ambient = Cx::set_current(Some(cx.clone()));
+        let listener_cx = Cx::for_testing();
+        let shutdown = HttpListenerShutdown::new(&listener_cx);
+        let delivery = FinalSubscriptionTerminalDelivery::default();
+        delivery.subscription_request.store(true, Ordering::Release);
+        let polls = AtomicUsize::new(0);
+        let bytes = Mutex::new(Vec::new());
+        let operation = std::future::poll_fn(|_| {
+            let poll = polls.fetch_add(1, Ordering::AcqRel);
+            assert!(poll < 2, "a completed frame must not be polled again");
+            if poll == 0 {
+                bytes.lock().unwrap().extend_from_slice(b"acknow");
+                return std::task::Poll::Pending;
+            }
+            bytes.lock().unwrap().extend_from_slice(b"ledged\r\n");
+            // A real peer can see the acknowledgement and cancel the listener
+            // on another thread before the socket flush poll returns.
+            listener_cx.cancel_with(CancelKind::Shutdown, Some("acknowledgement observed"));
+            std::task::Poll::Ready(Ok(()))
+        });
+        let mut write = Box::pin(bounded_native_http_response_write(
+            &cx,
+            &shutdown,
+            Some(&delivery),
+            operation,
+        ));
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        assert_eq!(bytes.lock().unwrap().as_slice(), b"acknow");
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        assert_eq!(bytes.lock().unwrap().as_slice(), b"acknowledged\r\n");
+        assert_eq!(polls.load(Ordering::Acquire), 2);
+        let deadline = delivery.native_shutdown_deadline.lock().unwrap().unwrap();
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        assert_eq!(polls.load(Ordering::Acquire), 2);
+        // Expire one bounded poll wait while retaining the successful frame.
+        // The next timeout closure must inherit that completion too.
+        clock.advance_to(asupersync::Time::from_millis(21));
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        assert_eq!(polls.load(Ordering::Acquire), 2);
+        // The two election stores are separately visible. The prefix cannot
+        // finish waiting until this request's control also has authority.
+        delivery
+            .completion_state
+            .store(FINAL_TERMINAL_DRAINED, Ordering::Release);
+        assert!(write.as_mut().poll(&mut task).is_pending());
+        assert_eq!(polls.load(Ordering::Acquire), 2);
+        delivery
+            .state
+            .store(FINAL_TERMINAL_ENQUEUED, Ordering::Release);
+        assert!(matches!(
+            write.as_mut().poll(&mut task),
+            std::task::Poll::Ready(Ok(()))
+        ));
+        assert_eq!(polls.load(Ordering::Acquire), 2);
+        assert_eq!(bytes.lock().unwrap().as_slice(), b"acknowledged\r\n");
+        assert_eq!(
+            *delivery.native_shutdown_deadline.lock().unwrap(),
+            Some(deadline)
+        );
+        assert!(
+            !delivery.is_settled(),
+            "the control and HTTP trailer still need to flush"
+        );
+        assert!(
+            cx.checkpoint().is_ok(),
+            "root cancellation did not cancel this child Cx"
+        );
+        drop(write);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn native_subscription_ready_prefix_retains_all_deadline_and_failure_fences() {
+        for boundary in 0..4 {
+            let clock = Arc::new(asupersync::time::VirtualClock::new());
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                    Arc::clone(&clock),
+                ))
+                .build()
+                .unwrap();
+            let caller_deadline = if boundary == 0 { 1 } else { 3 };
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(asupersync::Time::from_secs(caller_deadline)),
+            );
+            let ambient = Cx::set_current(Some(cx.clone()));
+            let listener_cx = Cx::for_testing();
+            let shutdown = HttpListenerShutdown::new(&listener_cx)
+                .with_response_write_timeout(Duration::from_secs(2));
+            let delivery = FinalSubscriptionTerminalDelivery::default();
+            delivery.subscription_request.store(true, Ordering::Release);
+            let polls = AtomicUsize::new(0);
+            let mut write = Box::pin(bounded_native_http_response_write(
+                &cx,
+                &shutdown,
+                Some(&delivery),
+                async {
+                    polls.fetch_add(1, Ordering::AcqRel);
+                    listener_cx.cancel_with(CancelKind::Shutdown, Some("ready prefix observed"));
+                    Ok(())
+                },
+            ));
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(write.as_mut().poll(&mut task).is_pending());
+            assert_eq!(polls.load(Ordering::Acquire), 1);
+            match boundary {
+                0 => clock.advance_to(asupersync::Time::from_secs(1)),
+                1 => clock.advance_to(asupersync::Time::from_secs(2)),
+                2 => delivery.mark_failed(),
+                _ => *delivery.native_shutdown_deadline.lock().unwrap() = Some(Instant::now()),
+            }
+            assert!(matches!(
+                write.as_mut().poll(&mut task),
+                std::task::Poll::Ready(Err(()))
+            ));
+            assert_eq!(
+                polls.load(Ordering::Acquire),
+                1,
+                "a held completion cannot restart the write"
+            );
+            drop(write);
+            drop(ambient);
             assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
         }
     }
