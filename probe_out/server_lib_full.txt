@@ -1,0 +1,64 @@
+HOST=hz3
+DATE=2026-10-31T03:59:35Z
+NPROC=64   # the variable under test
+HEAD_CLAIMED=<no repo on worker>
+REPETITIONS=3   features=DEFAULT, test-threads=DEFAULT (both flags omitted)
+
+=== BUILD (outside the measurement window) ===
+BUILD_EXIT=0
+   Compiling fastmcp-server v0.13.0 (/data/projects/fastmcp_rust/crates/fastmcp-server)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 57s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd)
+BIN=.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd
+DISCOVERED=2482
+
+================ RUN 1 of 3 ================
+exit=101  ran=2482 of discovered=2482
+test result: FAILED. 2478 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.12s
+-> RUN 1 RED (4 failed)
+
+================ RUN 2 of 3 ================
+exit=101  ran=2482 of discovered=2482
+test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.21s
+-> RUN 2 RED (6 failed)
+
+================ RUN 3 of 3 ================
+exit=101  ran=2482 of discovered=2482
+test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.94s
+-> RUN 3 RED (6 failed)
+
+================ POPULATION ACROSS 3 RUNS ================
+distinct failing names = 6
+
+--- failed in ALL 3 runs (deterministic) ---
+    lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress
+    lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer
+    http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes
+    http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response
+
+--- failed in FEWER than 3 runs (intermittent) ---
+   2/3  lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+   2/3  lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+(both sections empty means the target is GREEN)
+
+================ bd-55ola, SPECIFICALLY ================
+failed in 0 of 3 full-target runs at default parallelism:  returning_subscription_quiescence_runs_hook_after_owner_retirement
+bd-55ola claims: nondeterministic under default test-threads, failed 1 of 3, PASSES ALONE.
+READING: 0 -> did not reproduce (weak for a flake claim, see the rate arithmetic).
+         1..2 -> CONFIRMED intermittent at that rate.
+         3 -> stronger than the bead says: deterministic, not a flake.
+
+================ DETAIL: up to 40 deterministic names, solo-serial ================
+detail set = 4 names
+  FAIL-solo  lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress
+          thread 'lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress' (3048892) panicked at crates/fastmcp-server/src/lib.rs:26215:16:
+  FAIL-solo  lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer
+          thread 'lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer' (3049305) panicked at crates/fastmcp-server/src/lib.rs:26215:16:
+  FAIL-solo  http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes
+          thread 'http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes' (3053877) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:602:74:
+          thread 'http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes' (3053877) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:474:38:
+  FAIL-solo  http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response
+          thread 'http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response' (3054208) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:645:72:
+          thread 'http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response' (3054208) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:474:38:
+
+solo-serial on the deterministic set: FAIL=4 (hard defects)  PASS=0 (interactions)  VOID=0
