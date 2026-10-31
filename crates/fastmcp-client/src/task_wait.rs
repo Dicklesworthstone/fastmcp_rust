@@ -111,9 +111,12 @@ impl FinalTaskHandle {
     /// Finite `ttlMs` is measured from `createdAt`, not the latest response or
     /// `lastUpdatedAt`. Its remaining lifetime uses the host's wall clock once
     /// at admission and is also anchored to monotonic clocks for this wait.
-    /// Later wall-clock advances may shorten it; rollback cannot extend the
-    /// admitted wait. This is local expiry observation, not proof of server
-    /// deletion or a replacement for server-side authorization and retention.
+    /// Later wall-clock advances may shorten it; rollback cannot extend an
+    /// unchanged retention deadline. Fresh authoritative snapshots may change
+    /// `ttlMs`; their checked expiry replaces the previous retention bound
+    /// without restarting the caller's original timeout. This is local expiry
+    /// observation, not proof of server deletion or a replacement for
+    /// server-side authorization and retention.
     /// A null TTL leaves the explicit local wait bounds in force.
     ///
     /// A retained terminal snapshot is data already delivered and returns
@@ -172,9 +175,9 @@ impl FinalTaskHandle {
     /// Reconciles this handle through one yielding Unix stdio `tasks/get`.
     ///
     /// Use this after an acknowledged input update, which deliberately does
-    /// not invent a new Task state. Identity, creation instant and TTL must
-    /// still match before the retained snapshot is replaced. A refused read,
-    /// cancellation or abandonment leaves the last snapshot unchanged. Use
+    /// not invent a new Task state. Identity and creation instant must still
+    /// match; an authoritative TTL change replaces the retention bound. A
+    /// refused read, cancellation or abandonment leaves the last snapshot unchanged. Use
     /// the same client that attached this handle; the server authorizes reads.
     #[cfg(unix)]
     pub async fn poll_with_stdio(
@@ -198,8 +201,9 @@ impl FinalTaskHandle {
 
     /// Reconciles this handle through one cancellation-aware WebSocket read.
     ///
-    /// Task identity, creation instant and retention must match before the
-    /// retained snapshot changes. A terminal snapshot returns without I/O.
+    /// Task identity and creation instant must match before the retained
+    /// snapshot changes. Authoritative TTL changes remain admissible. A
+    /// terminal snapshot returns without I/O.
     /// Cancelling or dropping an in-flight read preserves the last snapshot
     /// and follows the same request custody as [`Self::wait_with_websocket`].
     #[cfg(feature = "websocket-experimental")]
@@ -411,12 +415,30 @@ fn checkpoint_task_operation(cx: &Cx, cancellation: &McpRequestCancellation) -> 
 }
 
 pub(super) fn admit_input_retention(task: &FinalTask) -> McpResult<()> {
-    if retention_deadline(task)?.is_some_and(|expires| wall_now_nanos() >= expires) {
+    input_retention_remaining(task).map(|_| ())
+}
+
+/// Remaining lifetime of the exact supplied input snapshot, without narrowing
+/// an otherwise valid long TTL through a nanosecond-sized runtime clock.
+/// Callers meet this value with their own finite operation budget before
+/// scheduling a timer, and recheck retention before committing input effects.
+pub(super) fn input_retention_remaining(task: &FinalTask) -> McpResult<Option<Duration>> {
+    let Some(expires) = retention_deadline(task)? else {
+        return Ok(None);
+    };
+    let remaining = expires
+        .checked_sub(wall_now_nanos())
+        .ok_or_else(|| McpError::invalid_request("Invalid final Task retention deadline"))?;
+    if remaining <= 0 {
         return Err(McpError::invalid_request(
             "Final Task input snapshot has expired",
         ));
     }
-    Ok(())
+    let seconds = u64::try_from(remaining / 1_000_000_000)
+        .map_err(|_| McpError::invalid_request("Invalid final Task retention deadline"))?;
+    let nanos = u32::try_from(remaining % 1_000_000_000)
+        .map_err(|_| McpError::invalid_request("Invalid final Task retention deadline"))?;
+    Ok(Some(Duration::new(seconds, nanos)))
 }
 
 trait TaskWaitTransport {
@@ -503,13 +525,15 @@ fn next_delay(task: &FinalTask, policy: FinalTaskWaitPolicy) -> McpResult<Durati
 pub(super) fn admit_identity(previous: &FinalTask, next: &FinalTask) -> McpResult<()> {
     let invalid = || McpError::invalid_request("Final Task identity changed during observation");
     if previous.base().task_id != next.base().task_id
-        || previous.base().ttl_ms != next.base().ttl_ms
         || timestamp_nanos(&previous.base().created_at).map_err(|_| invalid())?
             != timestamp_nanos(&next.base().created_at).map_err(|_| invalid())?
     {
         return Err(invalid());
     }
-    Ok(())
+    // Retention is mutable Task state, not part of its identity. A fresh
+    // authoritative snapshot may extend, shorten or remove the TTL; still
+    // validate its complete checked expiry before replacing retained state.
+    retention_deadline(next).map(|_| ())
 }
 
 fn wall_now_nanos() -> i128 {
@@ -535,6 +559,8 @@ fn retention_deadline(task: &FinalTask) -> McpResult<Option<i128>> {
 }
 
 struct WaitBudget {
+    local_wall_deadline: Instant,
+    local_runtime_deadline: Time,
     wall_deadline: Instant,
     runtime_deadline: Time,
     retention_deadline: Option<i128>,
@@ -561,32 +587,70 @@ impl WaitBudget {
             .budget()
             .deadline
             .map_or(local_deadline, |caller| caller.min(local_deadline));
-        let mut remaining = timeout.min(Duration::from_nanos(local_deadline.duration_since(now)));
-        let retention_deadline = retention_deadline(task)?;
-        let mut deadline_outcome = FinalTaskWaitOutcome::DeadlineElapsed;
-        if let Some(expires) = retention_deadline {
-            let nanos = expires.saturating_sub(wall_now).max(0);
-            if nanos <= remaining.as_nanos() as i128 {
-                // Only narrow after meeting the at-most-24-hour local ceiling.
-                remaining = Duration::from_nanos(u64::try_from(nanos).map_err(|_| {
-                    McpError::invalid_request("Invalid final Task retention deadline")
-                })?);
-                deadline_outcome = FinalTaskWaitOutcome::TaskExpired;
-            }
-        }
-        let runtime_deadline =
-            now.saturating_add_nanos(u64::try_from(remaining.as_nanos()).map_err(|_| {
-                McpError::invalid_params("Final Task wait deadline is out of range")
-            })?);
+        let remaining = timeout.min(Duration::from_nanos(local_deadline.duration_since(now)));
         let wall_deadline = Instant::now()
             .checked_add(remaining)
             .ok_or_else(|| McpError::invalid_params("Final Task wait deadline is out of range"))?;
-        Ok(Self {
+        let mut budget = Self {
+            local_wall_deadline: wall_deadline,
+            local_runtime_deadline: local_deadline,
             wall_deadline,
-            runtime_deadline,
-            retention_deadline,
-            deadline_outcome,
-        })
+            runtime_deadline: local_deadline,
+            retention_deadline: None,
+            deadline_outcome: FinalTaskWaitOutcome::DeadlineElapsed,
+        };
+        budget.refresh_retention_at_wall_time(cx, task, wall_now)?;
+        Ok(budget)
+    }
+
+    fn refresh_retention(&mut self, cx: &Cx, task: &FinalTask) -> McpResult<()> {
+        self.refresh_retention_at_wall_time(cx, task, wall_now_nanos())
+    }
+
+    fn refresh_retention_at_wall_time(
+        &mut self,
+        cx: &Cx,
+        task: &FinalTask,
+        wall_now: i128,
+    ) -> McpResult<()> {
+        let retention_deadline = retention_deadline(task)?;
+        if retention_deadline == self.retention_deadline {
+            // Repeated snapshots must not re-anchor the same expiry after a
+            // wall-clock rollback or reset either original local deadline.
+            return Ok(());
+        }
+        let now = cx.now();
+        let monotonic_now = Instant::now();
+        let local_remaining = self
+            .local_wall_deadline
+            .saturating_duration_since(monotonic_now)
+            .min(Duration::from_nanos(
+                self.local_runtime_deadline.duration_since(now),
+            ));
+        let mut runtime_deadline = self.local_runtime_deadline;
+        let mut wall_deadline = self.local_wall_deadline;
+        let mut deadline_outcome = FinalTaskWaitOutcome::DeadlineElapsed;
+        if let Some(expires) = retention_deadline {
+            let nanos = expires.saturating_sub(wall_now).max(0);
+            if nanos <= local_remaining.as_nanos() as i128 {
+                // Only narrow after meeting the at-most-24-hour local ceiling.
+                let nanos = u64::try_from(nanos).map_err(|_| {
+                    McpError::invalid_request("Invalid final Task retention deadline")
+                })?;
+                runtime_deadline = now.saturating_add_nanos(nanos);
+                wall_deadline = monotonic_now
+                    .checked_add(Duration::from_nanos(nanos))
+                    .ok_or_else(|| {
+                        McpError::invalid_request("Invalid final Task retention deadline")
+                    })?;
+                deadline_outcome = FinalTaskWaitOutcome::TaskExpired;
+            }
+        }
+        self.retention_deadline = retention_deadline;
+        self.runtime_deadline = runtime_deadline;
+        self.wall_deadline = wall_deadline;
+        self.deadline_outcome = deadline_outcome;
+        Ok(())
     }
 
     fn stop(&self, cx: &Cx, cancellation: &McpRequestCancellation) -> Option<FinalTaskWaitOutcome> {
@@ -684,7 +748,7 @@ async fn wait_for_task<T: TaskWaitTransport>(
     {
         return Ok(outcome);
     }
-    let budget = WaitBudget::new(cx, policy.timeout, handle.task())?;
+    let mut budget = WaitBudget::new(cx, policy.timeout, handle.task())?;
     if let Some(outcome) = budget.stop(cx, cancellation) {
         return Ok(outcome);
     }
@@ -728,6 +792,10 @@ async fn wait_for_task<T: TaskWaitTransport>(
             Err(outcome) => return Ok(outcome),
         };
         admit_identity(handle.task(), &task)?;
+        if let Some(outcome) = budget.stop(cx, cancellation) {
+            return Ok(outcome);
+        }
+        budget.refresh_retention(cx, &task)?;
         if let Some(outcome) = budget.stop(cx, cancellation) {
             return Ok(outcome);
         }

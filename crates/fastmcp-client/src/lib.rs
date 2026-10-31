@@ -13847,7 +13847,8 @@ impl FinalTaskHandle {
     /// Reads the authoritative current snapshot through `tasks/get`.
     ///
     /// The stored snapshot changes only after the response has passed the
-    /// exact task-ID, creation-instant and retention checks. Equivalent
+    /// exact task-ID, creation-instant and checked-retention admission.
+    /// Authoritative TTL changes replace the prior retention value. Equivalent
     /// timestamp spellings remain admissible and retain their wire form.
     /// Once a terminal snapshot is admitted, returns that retained outcome
     /// without another request.
@@ -34541,7 +34542,7 @@ exec sleep 2
 
     #[cfg(all(feature = "tasks", feature = "websocket-experimental"))]
     #[test]
-    fn websocket_task_handle_reconciliation_rejects_rewritten_identity_and_retention() {
+    fn websocket_task_handle_reconciliation_preserves_identity_and_accepts_retention_changes() {
         run_test(|| async {
             let cx = Cx::current().unwrap();
             for field in ["taskId", "createdAt", "ttlMs"] {
@@ -34553,18 +34554,21 @@ exec sleep 2
                 changed[field] = match field {
                     "taskId" => serde_json::json!("another-task"),
                     "createdAt" => serde_json::json!("2026-07-28T00:00:01Z"),
-                    _ => serde_json::json!(60_000),
+                    _ => serde_json::json!(u64::MAX),
                 };
                 write_server_text_frame(&mut peer_io, &websocket_handle_response(3, changed)).await;
-                assert_eq!(
-                    handle
-                        .poll_with_websocket(&cx, &mut client, &McpRequestCancellation::new())
-                        .await
-                        .unwrap_err()
-                        .code,
-                    McpErrorCode::InvalidRequest
-                );
-                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let result = handle
+                    .poll_with_websocket(&cx, &mut client, &McpRequestCancellation::new())
+                    .await;
+                if field == "ttlMs" {
+                    assert_eq!(
+                        result.unwrap().base().ttl_ms.as_ref().unwrap().try_as_millis().unwrap(),
+                        u64::MAX
+                    );
+                } else {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                }
                 let mut expected = vec![
                     (SERVER_DISCOVER_METHOD, Some(1)),
                     ("tasks/get", Some(2)),

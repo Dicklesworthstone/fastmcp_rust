@@ -70,8 +70,99 @@ fn retention_uses_creation_instant_not_update_time_or_timestamp_spelling() {
     admit_identity(&initial, &updated).unwrap();
     value["ttlMs"] = json!(1001);
     let extended: FinalTask = serde_json::from_str(&value.to_string()).unwrap();
-    assert!(admit_identity(&initial, &extended).is_err());
+    admit_identity(&initial, &extended).unwrap();
+    assert_eq!(retention_deadline(&extended).unwrap(), Some(1_001_000_000));
     assert_eq!(retention_deadline(&initial).unwrap(), Some(1_000_000_000));
+}
+
+#[test]
+fn authoritative_retention_changes_preserve_the_original_wait_ceiling() {
+    let cx = Cx::for_testing();
+    let cancellation = McpRequestCancellation::new();
+    let wall_now = 500_000_000_000;
+    let mut budget = WaitBudget::at_wall_time(
+        &cx,
+        Duration::from_secs(600),
+        &task("working", Some(1_000_000), 1),
+        wall_now,
+    )
+    .unwrap();
+    let original_runtime = budget.local_runtime_deadline;
+    let original_wall = budget.local_wall_deadline;
+    let first_expiry = budget.runtime_deadline;
+    assert_eq!(budget.deadline_outcome, FinalTaskWaitOutcome::TaskExpired);
+
+    // A fresh extension can recover the unused portion of the original
+    // caller budget, but cannot start a new local timeout.
+    budget
+        .refresh_retention_at_wall_time(&cx, &task("working", Some(1_500_000), 1), wall_now)
+        .unwrap();
+    assert_eq!(
+        budget.deadline_outcome,
+        FinalTaskWaitOutcome::DeadlineElapsed
+    );
+    assert_eq!(budget.runtime_deadline, original_runtime);
+    assert_eq!(budget.wall_deadline, original_wall);
+    assert!(budget.runtime_deadline > first_expiry);
+
+    budget
+        .refresh_retention_at_wall_time(&cx, &task("working", Some(900_000), 1), wall_now)
+        .unwrap();
+    assert_eq!(budget.deadline_outcome, FinalTaskWaitOutcome::TaskExpired);
+    assert!(budget.runtime_deadline < first_expiry);
+    assert_eq!(
+        budget.stop_at_wall_time(&cx, &cancellation, 900_000_000_000),
+        Some(FinalTaskWaitOutcome::TaskExpired),
+    );
+
+    budget
+        .refresh_retention_at_wall_time(&cx, &task("working", None, 1), wall_now)
+        .unwrap();
+    assert_eq!(budget.retention_deadline, None);
+    assert_eq!(budget.runtime_deadline, original_runtime);
+    assert_eq!(budget.wall_deadline, original_wall);
+
+    // Replacing null retention with a finite snapshot is also authoritative.
+    budget
+        .refresh_retention_at_wall_time(&cx, &task("working", Some(800_000), 1), wall_now)
+        .unwrap();
+    let admitted_runtime = budget.runtime_deadline;
+    let admitted_wall = budget.wall_deadline;
+    budget
+        .refresh_retention_at_wall_time(
+            &cx,
+            &task("working", Some(800_000), 7),
+            wall_now - 100_000_000_000,
+        )
+        .unwrap();
+    assert_eq!(budget.runtime_deadline, admitted_runtime);
+    assert_eq!(budget.wall_deadline, admitted_wall);
+    assert_eq!(budget.local_runtime_deadline, original_runtime);
+    assert_eq!(budget.local_wall_deadline, original_wall);
+
+    budget.local_runtime_deadline = cx.now();
+    budget
+        .refresh_retention_at_wall_time(&cx, &task("working", Some(u64::MAX), 1), wall_now)
+        .unwrap();
+    assert_eq!(
+        budget.stop_at_wall_time(&cx, &cancellation, wall_now),
+        Some(FinalTaskWaitOutcome::DeadlineElapsed),
+        "a retention extension cannot revive an exhausted caller budget",
+    );
+}
+
+#[test]
+fn input_retention_remaining_admits_null_and_long_lifetimes_without_narrowing() {
+    assert_eq!(
+        input_retention_remaining(&task("input_required", None, 1)).unwrap(),
+        None
+    );
+    assert!(input_retention_remaining(&task("input_required", Some(1), 1)).is_err());
+    let remaining = input_retention_remaining(&task("input_required", Some(u64::MAX), 1))
+        .unwrap()
+        .unwrap();
+    assert!(remaining.as_nanos() > u128::from(u64::MAX));
+    assert!(remaining <= Duration::from_millis(u64::MAX));
 }
 
 #[test]
@@ -301,4 +392,103 @@ fn a_fresh_working_snapshot_does_not_restart_the_retention_clock() {
         assert!(!cancellation.is_cancel_requested());
         assert!(cx.checkpoint().is_ok());
     });
+}
+
+struct RetentionUpdates {
+    snapshots: std::collections::VecDeque<FinalTask>,
+    calls: usize,
+}
+
+impl TaskWaitTransport for RetentionUpdates {
+    type Error = McpError;
+
+    async fn read_task(
+        &mut self,
+        _: &Cx,
+        _: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTask> {
+        let next = self
+            .snapshots
+            .pop_front()
+            .expect("no extra reconciliation read");
+        assert_eq!(&task_id, &next.base().task_id);
+        self.calls += 1;
+        Ok(next)
+    }
+}
+
+#[test]
+fn shared_wait_admits_finite_null_and_shortened_retention_through_completion() {
+    RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let short_ttl = Some(expiry_after(Duration::from_secs(30)));
+            let long_ttl = Some(expiry_after(Duration::from_secs(60)));
+            let final_task = task("completed", short_ttl, 1);
+            let expected = serde_json::to_vec(&final_task).unwrap();
+            let mut handle = FinalTaskHandle::new(task("working", short_ttl, 1));
+            let mut transport = RetentionUpdates {
+                snapshots: std::collections::VecDeque::from([
+                    task("working", long_ttl, 1),
+                    task("working", None, 1),
+                    task("working", long_ttl, 1),
+                    final_task,
+                ]),
+                calls: 0,
+            };
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                wait_for_task(
+                    &mut handle,
+                    &cx,
+                    &mut transport,
+                    &cancellation,
+                    FinalTaskWaitPolicy::default(),
+                )
+                .await
+                .unwrap(),
+                FinalTaskWaitOutcome::Completed,
+            );
+            assert_eq!(transport.calls, 4);
+            assert!(transport.snapshots.is_empty());
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), expected);
+            assert!(!cancellation.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+        });
+}
+
+#[test]
+fn shared_wait_retention_extension_does_not_restart_the_caller_timeout() {
+    RuntimeBuilder::current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut handle = FinalTaskHandle::new(task(
+                "working",
+                Some(expiry_after(Duration::from_secs(30))),
+                1,
+            ));
+            let mut transport = ReadyRead {
+                result: task("working", None, 60_000),
+                calls: 0,
+            };
+            let expected = serde_json::to_vec(&transport.result).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let policy =
+                FinalTaskWaitPolicy::new(Duration::from_millis(100), 8, Duration::from_millis(1))
+                    .unwrap();
+            assert_eq!(
+                wait_for_task(&mut handle, &cx, &mut transport, &cancellation, policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::DeadlineElapsed,
+            );
+            assert_eq!(transport.calls, 1);
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), expected);
+            assert!(cx.checkpoint().is_ok());
+        });
 }

@@ -287,7 +287,7 @@ fn public_stdio_failed_input_update_is_not_replayed_or_promoted_to_a_snapshot() 
 }
 
 #[test]
-fn public_stdio_reconciliation_rejects_identity_changes_without_losing_input() {
+fn public_stdio_reconciliation_preserves_identity_and_accepts_retention_changes() {
     for field in ["taskId", "createdAt", "ttlMs"] {
         asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
             let cx = Cx::current().unwrap();
@@ -298,7 +298,7 @@ fn public_stdio_reconciliation_rejects_identity_changes_without_losing_input() {
             task[field] = match field {
                 "taskId" => json!("other-task"),
                 "createdAt" => json!("2026-07-28T00:00:01Z"),
-                _ => json!(60_000),
+                _ => json!(u64::MAX),
             };
             let response = json!({"jsonrpc":"2.0","id":3,"result":task});
             let script = format!("{DISCOVERY}{}\nprintf '%s\\n' '{response}'\n{}", r#"
@@ -309,8 +309,16 @@ case "$poll" in *'"method":"tasks/get"'*) ;; *) exit 88 ;; esac
             let (mut client, mut handle) = connect(&cx, &script).await;
             let before = serde_json::to_vec(handle.task()).unwrap();
             let cancellation = McpRequestCancellation::new();
-            assert!(handle.poll_with_stdio(&cx, &mut client, &cancellation).await.is_err());
-            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+            let result = handle.poll_with_stdio(&cx, &mut client, &cancellation).await;
+            if field == "ttlMs" {
+                let task = result.unwrap();
+                assert!(matches!(task, FinalTask::Working(_)));
+                assert_eq!(task.base().ttl_ms.as_ref().unwrap().try_as_millis().unwrap(), u64::MAX);
+                assert_eq!(task.base().created_at.as_str(), "2026-07-28T00:00:00Z");
+            } else {
+                assert!(result.is_err());
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+            }
             if field == "taskId" {
                 assert!(client.transport_is_closed(),
                     "the typed Tasks decoder must reject a response for another Task");

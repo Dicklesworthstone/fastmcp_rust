@@ -477,12 +477,12 @@ fn public_http_wait_deadline_includes_pending_response_without_reset() {
 
 #[test]
 fn public_http_wait_rejects_changed_identity_and_retains_original_snapshot() {
-    for field in ["taskId", "createdAt", "ttlMs"] {
+    for field in ["taskId", "createdAt"] {
         let mut changed = task("completed", None);
         changed[field] = match field {
             "taskId" => json!("foreign-task"),
             "createdAt" => json!("2026-07-28T12:00:02Z"),
-            _ => json!(60000),
+            _ => unreachable!(),
         };
         run(
             task("working", Some(5)),
@@ -506,12 +506,12 @@ fn public_http_wait_rejects_changed_identity_and_retains_original_snapshot() {
 }
 
 fn run_http_task_identity_case(
+    initial: Value,
     through_watch: bool,
     reconcile: bool,
     candidate: Value,
     admitted: bool,
 ) {
-    let initial = task("working", None);
     let before = serde_json::to_vec(&snapshot(&initial)).unwrap();
     let expected = serde_json::to_vec(&snapshot(&candidate)).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -628,10 +628,17 @@ fn run_http_task_identity_case(
                 ));
                 let event = watch.next_event(&cx).await;
                 if admitted {
-                    assert!(matches!(
-                        event.unwrap(),
-                        Some(crate::FinalTaskWatchEvent::TaskUpdated(_))
-                    ));
+                    if reconcile {
+                        assert!(matches!(
+                            event.unwrap(),
+                            Some(crate::FinalTaskWatchEvent::TaskReconciled { .. })
+                        ));
+                    } else {
+                        assert!(matches!(
+                            event.unwrap(),
+                            Some(crate::FinalTaskWatchEvent::TaskUpdated(_))
+                        ));
+                    }
                 } else {
                     assert!(
                         event.is_err(),
@@ -654,45 +661,52 @@ fn run_http_task_identity_case(
 }
 
 #[test]
-fn public_http_task_poll_preserves_creation_and_retention_identity() {
-    for field in ["createdAt", "ttlMs"] {
-        let mut changed = task("working", None);
-        changed["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
-        changed[field] = if field == "createdAt" {
-            json!("2026-07-28T12:00:01Z")
-        } else {
-            json!(60000)
-        };
-        run_http_task_identity_case(false, false, changed, false);
-    }
+fn public_http_task_poll_preserves_creation_identity() {
+    let mut changed = task("working", None);
+    changed["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+    changed["createdAt"] = json!("2026-07-28T12:00:01Z");
+    run_http_task_identity_case(task("working", None), false, false, changed, false);
     let mut equivalent = task("working", None);
     equivalent["createdAt"] = json!("2026-07-28T08:00:00-04:00");
     equivalent["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
-    run_http_task_identity_case(false, false, equivalent, true);
+    run_http_task_identity_case(task("working", None), false, false, equivalent, true);
 }
 
 #[test]
 fn public_http_task_watch_preserves_identity_before_and_after_reconciliation() {
-    for field in ["createdAt", "ttlMs"] {
-        for (reconcile, updated) in [
-            (false, "2026-07-28T12:00:02Z"),
-            (false, "2026-07-28T12:00:01Z"),
-            (true, "2026-07-28T12:00:01Z"),
-        ] {
-            let mut changed = task("working", None);
-            changed["lastUpdatedAt"] = json!(updated);
-            changed[field] = if field == "createdAt" {
-                json!("2026-07-28T12:00:01Z")
-            } else {
-                json!(60000)
-            };
-            run_http_task_identity_case(true, reconcile, changed, false);
-        }
+    for (reconcile, updated) in [
+        (false, "2026-07-28T12:00:02Z"),
+        (false, "2026-07-28T12:00:01Z"),
+        (true, "2026-07-28T12:00:01Z"),
+    ] {
+        let mut changed = task("working", None);
+        changed["lastUpdatedAt"] = json!(updated);
+        changed["createdAt"] = json!("2026-07-28T12:00:01Z");
+        run_http_task_identity_case(task("working", None), true, reconcile, changed, false);
     }
     let mut equivalent = task("working", None);
     equivalent["createdAt"] = json!("2026-07-28T08:00:00-04:00");
     equivalent["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
-    run_http_task_identity_case(true, false, equivalent, true);
+    run_http_task_identity_case(task("working", None), true, false, equivalent, true);
+}
+
+#[test]
+fn public_http_task_poll_and_watch_accept_authoritative_retention_changes() {
+    for (previous_ttl, next_ttl) in [
+        (None, Some(u64::MAX / 2)),
+        (Some(u64::MAX / 2), Some(u64::MAX)),
+        (Some(u64::MAX), Some(u64::MAX / 2)),
+        (Some(u64::MAX), None),
+    ] {
+        for (through_watch, reconcile) in [(false, false), (true, false), (true, true)] {
+            let mut initial = task("working", None);
+            initial["ttlMs"] = json!(previous_ttl);
+            let mut candidate = initial.clone();
+            candidate["ttlMs"] = json!(next_ttl);
+            candidate["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+            run_http_task_identity_case(initial, through_watch, reconcile, candidate, true);
+        }
+    }
 }
 
 #[test]
