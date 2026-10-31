@@ -15613,11 +15613,18 @@ impl Server {
         .await;
         let result = match result {
             Ok(value) => {
-                let metadata_seal = final_core_middleware_metadata_seal(
-                    final_core_request.as_ref(),
-                    &request,
-                    &value,
-                );
+                let metadata_seal = if entered_middleware.is_empty() {
+                    // No response callback can change protected metadata.
+                    // Keep typed validation and liveness below, without
+                    // decoding the entire result twice to compare its seal.
+                    Ok(None)
+                } else {
+                    final_core_middleware_metadata_seal(
+                        final_core_request.as_ref(),
+                        &request,
+                        &value,
+                    )
+                };
                 metadata_seal
                     .and_then(|metadata_seal| {
                         self.apply_middleware_response(
@@ -15989,11 +15996,18 @@ impl Server {
             });
         let result = match result {
             Ok(value) => {
-                let metadata_seal = final_core_middleware_metadata_seal(
-                    final_core_request.as_ref(),
-                    &request,
-                    &value,
-                );
+                let metadata_seal = if entered_middleware.is_empty() {
+                    // No response callback can change protected metadata.
+                    // Keep typed validation and liveness below, without
+                    // decoding the entire result twice to compare its seal.
+                    Ok(None)
+                } else {
+                    final_core_middleware_metadata_seal(
+                        final_core_request.as_ref(),
+                        &request,
+                        &value,
+                    )
+                };
                 metadata_seal
                     .and_then(|metadata_seal| {
                         self.apply_middleware_response_with_liveness(
@@ -27545,6 +27559,149 @@ mod lib_unit_tests {
             McpErrorCode::InvalidRequest
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn final_core_without_middleware_keeps_typed_handler_result_validation() {
+        use fastmcp_protocol::common_types::{Annotations, ContentBlock};
+
+        struct AnnotatedResultTool {
+            priority: f64,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for AnnotatedResultTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "annotated_result".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({"type": "object"}),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(
+                &self,
+                _ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<Vec<Content>> {
+                Err(McpError::internal_error(
+                    "this test requires the final tool hook",
+                ))
+            }
+
+            fn call_final(
+                &self,
+                ctx: &McpContext,
+                _arguments: serde_json::Value,
+            ) -> McpResult<CompleteResult<fastmcp_protocol::FinalCallToolResult>> {
+                ctx.checkpoint()?;
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CompleteResult::new(
+                    fastmcp_protocol::FinalCallToolResult {
+                        content: vec![ContentBlock::Text {
+                            text: "retained é🙂".to_owned(),
+                            // Public fields can serialize a value that typed
+                            // result decoding must still refuse.
+                            annotations: Some(Annotations {
+                                priority: Some(self.priority),
+                                ..Annotations::default()
+                            }),
+                            meta: None,
+                            additional: BTreeMap::new(),
+                        }],
+                        is_error: false,
+                        structured_content: Some(serde_json::json!({"retained": true})),
+                    },
+                    ResultMeta::empty().with_metadata(
+                        OpenMetadata::try_from_entries([(
+                            "com.example/trace".to_owned(),
+                            serde_json::json!("retained"),
+                        )])
+                        .expect("open result metadata is valid"),
+                    ),
+                ))
+            }
+        }
+
+        for owned in [false, true] {
+            for (priority, valid) in [(0.5, true), (2.0, false)] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let server = Arc::new(
+                    Server::new("final-core-without-middleware", "1.0.0")
+                        .tool(AnnotatedResultTool {
+                            priority,
+                            calls: Arc::clone(&calls),
+                        })
+                        .build(),
+                );
+                assert!(server.middleware.is_empty());
+                let inbound = InboundRequestContext::new(
+                    Cx::for_testing(),
+                    770,
+                    InboundRequestTransport::Memory,
+                );
+                let request = JsonRpcRequest::new(
+                    "tools/call",
+                    Some(serde_json::json!({
+                        "name": "annotated_result",
+                        "arguments": {},
+                        "_meta": {
+                            MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                        },
+                    })),
+                    770_i64,
+                );
+                let response = if owned {
+                    block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        ProtocolPolicy::ModernOnly,
+                        &inbound,
+                        request,
+                        None,
+                        None,
+                        None,
+                        None,
+                        McpRequestCancellation::new(),
+                        None,
+                        Arc::new(|_| {}),
+                    ))
+                } else {
+                    block_on(server.dispatch_stateless(&inbound, &request))
+                }
+                .expect("the tool request has a response");
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "owned={owned}");
+                assert_eq!(response.id, Some(770_i64.into()));
+                if valid {
+                    assert!(response.error.is_none(), "owned={owned}: {response:?}");
+                    assert_eq!(
+                        response.result,
+                        Some(serde_json::json!({
+                            "resultType": "complete",
+                            "content": [{
+                                "type": "text",
+                                "text": "retained é🙂",
+                                "annotations": {"priority": 0.5},
+                            }],
+                            "structuredContent": {"retained": true},
+                            "_meta": {"com.example/trace": "retained"},
+                        })),
+                        "owned={owned}",
+                    );
+                } else {
+                    assert!(response.result.is_none(), "owned={owned}: {response:?}");
+                    assert_eq!(
+                        response.error.as_ref().map(|error| error.code.clone()),
+                        Some(i32::from(McpErrorCode::InternalError).into()),
+                        "out-of-range handler annotations must fail closed; owned={owned}",
+                    );
+                }
+            }
+        }
     }
 
     #[cfg(feature = "tasks")]
