@@ -142,6 +142,198 @@ fn resolve_fresh_task_runs_roots_sampling_and_elicitation_then_updates_once() {
 }
 
 #[test]
+fn resolve_retention_admits_live_finite_and_unlimited_inputs_before_refusing_expired_ones() {
+    for retention in 0..3 {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut client = client(&peer, session.clone(), roots(Arc::clone(&calls)));
+            let (result, ()) = Box::pin(pair(
+                client.resolve_task_inputs_final(&cx, id(), 1, INPUT_BYTES),
+                async {
+                    peer.discovery("access-one", true).await;
+                    let mut snapshot = if retention == 1 {
+                        finite_task("input_required", "complete", Duration::from_secs(60))
+                    } else {
+                        task("input_required", "complete")
+                    };
+                    if retention == 2 {
+                        snapshot["createdAt"] = json!("1970-01-01T00:00:00Z");
+                        snapshot["ttlMs"] = json!(1);
+                    }
+                    let fetched = peer.rpc("tasks/get", "access-one", snapshot, false).await;
+                    if retention != 2 {
+                        let sent = updated(&peer, json!({"roots":{"roots":[]}})).await;
+                        assert_eq!(fetched["id"], 2);
+                        assert_eq!(sent["id"], 3);
+                    }
+                    peer.no_more(&cx).await;
+                },
+            ))
+            .await;
+            if retention == 2 {
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Request {
+                        code: Some(McpErrorCode::InvalidRequest)
+                    })
+                ));
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(retention != 2));
+            assert_eq!(
+                client.cached_credential_generation(),
+                (retention != 2).then_some(1)
+            );
+            assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
+            assert!(!cx.is_cancel_requested());
+            let (next, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
+                if retention == 2 {
+                    peer.discovery("access-one", true).await;
+                }
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
+            }))
+            .await;
+            assert!(next.is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+struct ExpiringInput {
+    cancellation: crate::ReverseRequestCancellation,
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for ExpiringInput {
+    fn drop(&mut self) {
+        assert!(
+            self.cancellation.is_cancel_requested(),
+            "Task expiry must cancel a callback before disposing its future"
+        );
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn resolve_task_retention_interrupts_silent_parallel_callbacks_and_releases_their_owners() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let disposed = Arc::clone(&drops);
+        let tokens = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&tokens);
+        let (entered, mut receipt) = asupersync::channel::oneshot::channel::<()>();
+        let entered = std::sync::Mutex::new(Some(entered));
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+            observed.lock().unwrap().push(local.clone());
+            let index = counted.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
+            } else {
+                let owner = ExpiringInput {
+                    cancellation: local,
+                    drops: Arc::clone(&disposed),
+                };
+                if index == 2 {
+                    entered
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .send_blocking(())
+                        .unwrap();
+                }
+                Box::pin(async move {
+                    let _owner = owner;
+                    std::future::pending().await
+                })
+            }
+        });
+        let mut client = client(&peer, session.clone(), handlers);
+        let retention_deadline = cx.now().saturating_add_nanos(10_000_000_000);
+        let (result, ()) = asupersync::time::timeout_at(
+            retention_deadline,
+            Box::pin(pair(
+                client.resolve_task_inputs_final(&cx, id(), 3, INPUT_BYTES),
+                async {
+                    peer.discovery("access-one", true).await;
+                    // Stamp after the network handshake. The input lifetime is
+                    // much shorter than the client's unchanged 30-second budget.
+                    let (mut stream, request) = peer.request("tasks/get", "access-one").await;
+                    let mut snapshot =
+                        finite_task("input_required", "complete", Duration::from_secs(2));
+                    snapshot["inputRequests"] = json!({
+                        "a-ready":{"method":"roots/list"},
+                        "b-pending":{"method":"roots/list"},
+                        "c-pending":{"method":"roots/list"}
+                    });
+                    reply(
+                        &mut stream,
+                        json!({
+                            "jsonrpc":"2.0", "id":request["id"], "result":snapshot
+                        }),
+                        false,
+                    )
+                    .await;
+                    receipt.recv(&cx).await.unwrap();
+                    // Every host future is now silent. Only a retained Task timer
+                    // can settle the operation before its OAuth deadline.
+                    peer.no_more(&cx).await;
+                },
+            )),
+        )
+        .await
+        .expect("Task retention must settle before the 30-second OAuth operation deadline");
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Request {
+                code: Some(McpErrorCode::InvalidRequest)
+            })
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(
+            tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .all(crate::ReverseRequestCancellation::is_cancel_requested)
+        );
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
+        assert!(!cx.is_cancel_requested());
+        peer.no_more(&cx).await;
+        let (next, ()) = Box::pin(pair(client.get_task_final(&cx, id()), async {
+            peer.discovery("access-one", true).await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
+        }))
+        .await;
+        assert!(next.is_ok());
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
 fn resolve_admits_the_entire_batch_before_the_first_callback() {
     for unsupported_later in [false, true] {
         run(async {

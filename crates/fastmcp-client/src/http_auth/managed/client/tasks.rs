@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use asupersync::Cx;
 use asupersync::time::Sleep;
-use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation};
-use fastmcp_protocol::tasks_extension::TaskInputLedger;
+use fastmcp_core::{McpError, McpRequestCancellation};
 use fastmcp_protocol::FinalCoreResult;
 use serde_json::Value;
 
@@ -79,23 +78,15 @@ pub(super) enum TaskResult {
     Listen(Option<Box<ModernHttpSubscriptionTermination>>),
 }
 
-fn invalid_input() -> ManagedHttpClientError {
-    ManagedHttpClientError::Request {
-        code: Some(McpErrorCode::InvalidParams),
-    }
-}
-
 fn admit_input(
     task: &FinalTask,
     responses: &FinalTaskInputResponses,
 ) -> Result<(), ManagedHttpClientError> {
-    let FinalTask::InputRequired { input_requests, .. } = task else {
-        return Err(invalid_input());
-    };
-    TaskInputLedger::from_requests(input_requests)
-        .map_err(|_| invalid_input())?
-        .validate_responses(responses)
-        .map_err(|_| invalid_input())
+    crate::task_wait::admit_task_input(task, responses).map_err(|error| {
+        ManagedHttpClientError::Request {
+            code: Some(error.code),
+        }
+    })
 }
 
 fn admit_wait(minimum_interval: Duration, max_polls: usize) -> Result<(), ManagedHttpClientError> {
@@ -135,6 +126,13 @@ impl TaskCall<'_> {
         client: &mut HttpClient,
     ) -> Result<TaskResult, HttpClientError> {
         checkpoint(cx, cancellation)?;
+        // Supplied snapshots were admitted before credential acquisition. A
+        // renewal or fresh discovery may have consumed their remaining lifetime;
+        // check again before allocating an ID or disclosing input responses.
+        if let Self::Update { task, responses } = &self {
+            crate::task_wait::admit_task_input(task, responses)
+                .map_err(HttpClientError::CoreResult)?;
+        }
         // All verbs use the ordinary client's one monotonic ID allocator. The
         // native methods retain bilateral Tasks admission and raw correlation.
         let id = client.next_request_id()?;
@@ -429,9 +427,11 @@ impl ManagedHttpClient {
     }
 
     /// Supplies responses matching a retained input-required snapshot. Invalid
-    /// phase or mismatched outstanding response kinds refuse before acquiring
-    /// credentials or taking connection custody. Partial updates and unknown or
-    /// already-satisfied keys retain the shared protocol ledger's semantics.
+    /// phase, mismatched outstanding response kinds or expired retention refuse
+    /// before acquiring credentials or taking connection custody. Retention is
+    /// rechecked after renewal/discovery and before allocating the update ID.
+    /// Partial updates and unknown or already-satisfied keys retain the shared
+    /// protocol ledger's semantics.
     /// The upstream remains responsible for current ownership and state
     /// authorization. The acknowledgement is not a new task snapshot, and a
     /// failed or abandoned update is never automatically replayed.

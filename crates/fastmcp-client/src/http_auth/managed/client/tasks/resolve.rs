@@ -9,6 +9,8 @@ use std::io::{self, Write};
 use std::task::Poll;
 
 use asupersync::Cx;
+use asupersync::time::Sleep;
+use asupersync::types::Time;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 use fastmcp_protocol::tasks_extension::{
     MAX_TASK_INPUT_MAP_ENTRIES, TaskInputLedger, TaskInputRequests,
@@ -21,9 +23,7 @@ use super::{
     MAX_TASK_RESPONSE_BYTES, ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult,
     checkpoint,
 };
-use crate::http_auth::rpc::interaction::{
-    admit_embedded_input, normalize_embedded_input_context,
-};
+use crate::http_auth::rpc::interaction::{admit_embedded_input, normalize_embedded_input_context};
 use crate::{
     FinalTask, FinalTaskId, FinalTaskInputResponses, FinalUpdateTaskResult, HttpClient,
     HttpClientError, MrtrCallbackOwner, ReverseRequestCancellation, ReverseRequestHandlers,
@@ -32,6 +32,46 @@ use crate::{
 
 fn invalid(message: &'static str) -> McpError {
     McpError::invalid_params(message)
+}
+
+fn expired_input() -> HttpClientError {
+    HttpClientError::CoreResult(McpError::invalid_request(
+        "Final Task input snapshot has expired",
+    ))
+}
+
+// The retained snapshot, not a callback or a later credential renewal, fixes
+// this disclosure's lifetime. Wall time is checked at every effect boundary;
+// the caller's runtime timer also caps the original remaining duration so a
+// silent callback wakes and a clock adjustment cannot extend the operation.
+struct InputRetention<'task> {
+    task: &'task FinalTask,
+    deadline: Option<Time>,
+}
+
+impl<'task> InputRetention<'task> {
+    fn new(cx: &Cx, task: &'task FinalTask) -> Result<Self, HttpClientError> {
+        let remaining = crate::task_wait::input_retention_remaining(task)
+            .map_err(HttpClientError::CoreResult)?;
+        if remaining.is_some() && cx.timer_driver().is_none() {
+            return Err(HttpClientError::CoreResult(McpError::internal_error(
+                "Task input retention requires a caller timer driver",
+            )));
+        }
+        let deadline = remaining.map(|remaining| {
+            cx.now()
+                .saturating_add_nanos(u64::try_from(remaining.as_nanos()).unwrap_or(u64::MAX))
+        });
+        Ok(Self { task, deadline })
+    }
+
+    fn check(&self, cx: &Cx) -> Result<(), HttpClientError> {
+        crate::task_wait::admit_input_retention(self.task).map_err(HttpClientError::CoreResult)?;
+        if self.deadline.is_some_and(|deadline| cx.now() >= deadline) {
+            return Err(expired_input());
+        }
+        Ok(())
+    }
 }
 
 fn admit_limits(max_inputs: usize, max_payload_bytes: usize) -> Result<(), ManagedHttpClientError> {
@@ -88,6 +128,7 @@ fn prepare_inputs(
     let FinalTask::InputRequired { input_requests, .. } = task else {
         return Err(invalid("Task is not awaiting input"));
     };
+    crate::task_wait::admit_input_retention(task)?;
     if input_requests.is_empty() || input_requests.len() > max_inputs {
         return Err(invalid("Managed Task input count is outside its bounds"));
     }
@@ -108,7 +149,9 @@ fn prepare_inputs(
             }
         };
         if !installed {
-            return Err(invalid("Task input requires an unconfigured reverse handler"));
+            return Err(invalid(
+                "Task input requires an unconfigured reverse handler",
+            ));
         }
         let encoded = serde_json::to_value(request)
             .map_err(|_| invalid("Task input descriptor could not be encoded"))?;
@@ -130,11 +173,13 @@ fn prepare_inputs(
 async fn resolve_one(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
+    retention: &InputRetention<'_>,
     handlers: &ReverseRequestHandlers,
     key: &str,
     request: FinalEmbeddedInputRequest,
 ) -> Result<(FinalEmbeddedInputResponse, MrtrCallbackOwner), HttpClientError> {
     checkpoint(cx, cancellation)?;
+    retention.check(cx)?;
     let kind = request.response_kind();
     let local = ReverseRequestCancellation::new();
     let mut callback = std::pin::pin!(handlers.invoke_embedded_input_request_async(
@@ -150,13 +195,19 @@ async fn resolve_one(
         if let Err(error) = checkpoint(cx, cancellation) {
             return Poll::Ready(Err(error));
         }
-        let result = catch_client_callback_unwind(|| callback.as_mut().poll(task))
-            .unwrap_or_else(|_| {
+        if let Err(error) = retention.check(cx) {
+            return Poll::Ready(Err(error));
+        }
+        let result =
+            catch_client_callback_unwind(|| callback.as_mut().poll(task)).unwrap_or_else(|_| {
                 Poll::Ready(Err(McpError::internal_error(
                     "Client Task input handler failed",
                 )))
             });
         if let Err(error) = checkpoint(cx, cancellation) {
+            return Poll::Ready(Err(error));
+        }
+        if let Err(error) = retention.check(cx) {
             return Poll::Ready(Err(error));
         }
         result.map(|value| value.map_err(HttpClientError::CoreResult))
@@ -178,6 +229,7 @@ async fn resolve_one(
 async fn resolve_batch(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
+    retention: &InputRetention<'_>,
     handlers: &ReverseRequestHandlers,
     effective: TaskInputRequests,
     budget: &mut PayloadBudget,
@@ -187,12 +239,13 @@ async fn resolve_batch(
             "Managed Task input count is outside its bounds",
         )));
     }
+    let mut timer = std::pin::pin!(retention.deadline.map(Sleep::new));
     let mut pending: Vec<_> = effective
         .into_iter()
         .map(|(key, request)| {
             Some(Box::pin(async move {
                 let (response, owner) =
-                    resolve_one(cx, cancellation, handlers, &key, request).await?;
+                    resolve_one(cx, cancellation, retention, handlers, &key, request).await?;
                 Ok::<_, HttpClientError>((key, response, owner))
             }))
         })
@@ -201,8 +254,15 @@ async fn resolve_batch(
     let mut owners = Vec::with_capacity(pending.len());
     poll_fn(|task| {
         checkpoint(cx, cancellation)?;
+        retention.check(cx)?;
+        if let Some(timer) = timer.as_mut().as_pin_mut()
+            && timer.poll(task).is_ready()
+        {
+            return Poll::Ready(Err(expired_input()));
+        }
         for slot in &mut pending {
             checkpoint(cx, cancellation)?;
+            retention.check(cx)?;
             let Some(future) = slot else {
                 continue;
             };
@@ -221,6 +281,7 @@ async fn resolve_batch(
             owners.push(owner);
         }
         checkpoint(cx, cancellation)?;
+        retention.check(cx)?;
         if owners.len() == pending.len() {
             Poll::Ready(Ok((
                 std::mem::take(&mut responses),
@@ -253,6 +314,7 @@ pub(super) async fn dispatch(
         .map_err(HttpClientError::Connection)?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
+    let retention = InputRetention::new(cx, &snapshot.task)?;
     // CallbackBoundary installed these operation-local wrapped handlers. Never
     // reach into the builder for unguarded copies or derive extra capabilities.
     let handlers = client
@@ -282,17 +344,31 @@ pub(super) async fn dispatch(
     if omitted_contexts != 0 {
         log::debug!("Unadvertised sampling context omitted from managed Task inputs");
     }
-    let (responses, owners) =
-        resolve_batch(cx, cancellation, &handlers, effective, &mut budget).await?;
+    let (responses, owners) = resolve_batch(
+        cx,
+        cancellation,
+        &retention,
+        &handlers,
+        effective,
+        &mut budget,
+    )
+    .await?;
     ledger
         .validate_responses(&responses)
         .map_err(|_| HttpClientError::CoreResult(invalid("Invalid Task input response batch")))?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
+    retention.check(cx)?;
     let update_id = client.next_request_id()?;
     let acknowledged = client
         .connection
-        .update_task_final(cx, update_id, &snapshot.task, responses, MAX_TASK_RESPONSE_BYTES)
+        .update_task_final(
+            cx,
+            update_id,
+            &snapshot.task,
+            responses,
+            MAX_TASK_RESPONSE_BYTES,
+        )
         .await
         .map_err(HttpClientError::Connection)?;
     asupersync::runtime::yield_now().await;
@@ -326,8 +402,11 @@ impl ManagedHttpClient {
     /// those cannot be undone if a later callback or the update fails.
     ///
     /// One credential and one managed deadline cover discovery, snapshot, host
-    /// input and update. Cancellation, logout, revocation, expiry and abandonment
-    /// dispose local callback owners and prevent further updates. No uncertain
+    /// input and update. The Task's finite retention is checked before callbacks
+    /// and update, and a caller-runtime timer interrupts pending callbacks at
+    /// that earlier deadline. Null retention adds no Task deadline. Cancellation,
+    /// logout, revocation, expiry and abandonment dispose local callback owners
+    /// and prevent further updates. No uncertain
     /// update is retried; no task is created, polled, watched or cancelled. An
     /// acknowledgement is not evidence that the task subsequently completed.
     /// Invoking this API again is a new disclosure decision, not exactly-once
@@ -398,7 +477,7 @@ mod tests {
         serde_json::from_str::<FinalGetTaskResult>(&json!({
             "resultType":"complete", "taskId":"task-1", "status":"input_required",
             "createdAt":"2026-07-28T12:00:00Z", "lastUpdatedAt":"2026-07-28T12:00:00Z",
-            "ttlMs":60000, "inputRequests":inputs
+            "ttlMs":null, "inputRequests":inputs
         }).to_string())
         .unwrap()
         .task
@@ -496,9 +575,20 @@ mod tests {
             Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) })
         });
         let request = serde_json::from_value(json!({"method":"roots/list"})).unwrap();
-        let mut future = Box::pin(resolve_one(&cx, &cancellation, &handlers, "one", request));
+        let snapshot = task(json!({"one":{"method":"roots/list"}}));
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
+        let mut future = Box::pin(resolve_one(
+            &cx,
+            &cancellation,
+            &retention,
+            &handlers,
+            "one",
+            request,
+        ));
         assert!(matches!(
-            future.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
             Poll::Ready(Err(_))
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -509,13 +599,22 @@ mod tests {
     fn callback_panic_is_a_sanitized_failure_not_an_update_answer() {
         let cx = Cx::for_testing();
         let cancellation = McpRequestCancellation::new();
-        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(|_, _, _| {
-            panic!("private-handler-payload")
-        });
+        let handlers = ReverseRequestHandlers::new()
+            .with_modern_roots_list(|_, _, _| panic!("private-handler-payload"));
         let request = serde_json::from_value(json!({"method":"roots/list"})).unwrap();
-        let mut future = Box::pin(resolve_one(&cx, &cancellation, &handlers, "one", request));
-        let Poll::Ready(Err(HttpClientError::CoreResult(error))) =
-            future.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+        let snapshot = task(json!({"one":{"method":"roots/list"}}));
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
+        let mut future = Box::pin(resolve_one(
+            &cx,
+            &cancellation,
+            &retention,
+            &handlers,
+            "one",
+            request,
+        ));
+        let Poll::Ready(Err(HttpClientError::CoreResult(error))) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
         else {
             panic!("callback panic must settle as an error");
         };
@@ -610,9 +709,12 @@ mod tests {
             }
         });
         let mut budget = PayloadBudget(4096);
+        let snapshot = task(serde_json::to_value(root_inputs(&["a", "b"])).unwrap());
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
         let mut batch = Box::pin(resolve_batch(
             &cx,
             &cancellation,
+            &retention,
             &handlers,
             root_inputs(&["a", "b"]),
             &mut budget,
@@ -679,9 +781,12 @@ mod tests {
                 },
             );
             let mut budget = PayloadBudget(1024);
+            let snapshot = task(serde_json::to_value(root_inputs(&["a", "b", "c", "d"])).unwrap());
+            let retention = InputRetention::new(&cx, &snapshot).unwrap();
             let mut batch = Box::pin(resolve_batch(
                 &cx,
                 &cancellation,
+                &retention,
                 &handlers,
                 root_inputs(&["a", "b", "c", "d"]),
                 &mut budget,
@@ -725,9 +830,12 @@ mod tests {
             })
         });
         let mut budget = PayloadBudget(4096);
+        let snapshot = task(serde_json::to_value(root_inputs(&["a", "b", "c"])).unwrap());
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
         let mut batch = Box::pin(resolve_batch(
             &cx,
             &cancellation,
+            &retention,
             &handlers,
             root_inputs(&["a", "b", "c"]),
             &mut budget,
@@ -782,9 +890,12 @@ mod tests {
             }
         });
         let mut budget = PayloadBudget(4096);
+        let snapshot = task(serde_json::to_value(root_inputs(&["a", "b", "c"])).unwrap());
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
         let mut batch = Box::pin(resolve_batch(
             &cx,
             &cancellation,
+            &retention,
             &handlers,
             root_inputs(&["a", "b", "c"]),
             &mut budget,
@@ -819,17 +930,19 @@ mod tests {
             .map(|key| serde_json::to_vec(&(key, &response)).unwrap().len())
             .sum();
         let handlers = roots();
+        let snapshot = task(serde_json::to_value(root_inputs(&["a", "b", "c"])).unwrap());
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
         for exact in [false, true] {
             let mut budget = PayloadBudget(bytes - usize::from(!exact));
             let mut batch = Box::pin(resolve_batch(
                 &cx,
                 &cancellation,
+                &retention,
                 &handlers,
                 root_inputs(&["a", "b", "c"]),
                 &mut budget,
             ));
-            let Poll::Ready(result) =
-                batch.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            let Poll::Ready(result) = batch.as_mut().poll(&mut Context::from_waker(Waker::noop()))
             else {
                 panic!("all-ready inputs must settle in one poll");
             };
@@ -854,9 +967,12 @@ mod tests {
             panic!("precancelled input handler must never be invoked")
         });
         let mut budget = PayloadBudget(4096);
+        let snapshot = task(serde_json::to_value(root_inputs(&["a", "b"])).unwrap());
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
         let mut batch = Box::pin(resolve_batch(
             &cx,
             &cancellation,
+            &retention,
             &handlers,
             root_inputs(&["a", "b"]),
             &mut budget,

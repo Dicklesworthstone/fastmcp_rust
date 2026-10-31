@@ -11,7 +11,7 @@ use asupersync::io::{AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder};
-use fastmcp_core::CanonicalHttpUrl;
+use fastmcp_core::{CanonicalHttpUrl, McpErrorCode};
 use fastmcp_protocol::{FINAL_PROTOCOL_VERSION, TASKS_EXTENSION};
 use serde_json::json;
 
@@ -291,15 +291,8 @@ impl Peer {
         body
     }
     async fn discovery(&self, token: &str, enabled: bool) {
-        let mut capabilities = json!({"tools":{}});
-        if enabled {
-            capabilities["extensions"] = json!({TASKS_EXTENSION:{}});
-        }
-        self.rpc("server/discover", token, json!({
-            "resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION], "capabilities":capabilities,
-            "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"managed-tasks-peer","version":"1"}},
-            "ttlMs":0, "cacheScope":"private"
-        }), false).await;
+        self.rpc("server/discover", token, discovery_result(enabled), false)
+            .await;
     }
     async fn no_more(&self, cx: &Cx) {
         assert!(
@@ -312,6 +305,18 @@ impl Peer {
             "unexpected refresh, discovery, task request or replay"
         );
     }
+}
+
+fn discovery_result(enabled: bool) -> Value {
+    let mut capabilities = json!({"tools":{}});
+    if enabled {
+        capabilities["extensions"] = json!({TASKS_EXTENSION:{}});
+    }
+    json!({
+        "resultType":"complete", "supportedVersions":[FINAL_PROTOCOL_VERSION], "capabilities":capabilities,
+        "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"managed-tasks-peer","version":"1"}},
+        "ttlMs":0, "cacheScope":"private"
+    })
 }
 
 async fn reply(stream: &mut Tls, value: Value, sse: bool) {
@@ -337,7 +342,7 @@ fn task(status: &str, envelope: &str) -> Value {
     let mut value = json!({
         "resultType":envelope, "taskId":"task-1", "status":status,
         "createdAt":"2026-07-28T12:00:00.000Z", "lastUpdatedAt":"2026-07-28T12:00:00.000Z",
-        "ttlMs":60000, "pollIntervalMs":10
+        "ttlMs":null, "pollIntervalMs":10
     });
     if status == "input_required" {
         value["inputRequests"] = json!({"roots":{"method":"roots/list"}});
@@ -347,6 +352,27 @@ fn task(status: &str, envelope: &str) -> Value {
     }
     value
 }
+
+fn finite_task(status: &str, envelope: &str, lifetime: Duration) -> Value {
+    let mut value = task(status, envelope);
+    // An epoch creation instant makes the finite expiry independent of a
+    // hard-coded civil date while preserving the exact wire duration.
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .checked_add(lifetime)
+        .unwrap();
+    value["createdAt"] = json!("1970-01-01T00:00:00Z");
+    value["ttlMs"] = json!(u64::try_from(expires.as_millis()).unwrap());
+    value
+}
+
+fn task_snapshot(value: Value) -> FinalTask {
+    serde_json::from_str::<FinalGetTaskResult>(&value.to_string())
+        .unwrap()
+        .task
+}
+
 fn responses(value: Value) -> FinalTaskInputResponses {
     serde_json::from_value(value).unwrap()
 }
@@ -689,6 +715,144 @@ fn managed_task_input_admission_preserves_partial_and_unknown_key_semantics() {
     let working: FinalGetTaskResult =
         serde_json::from_str(&task("working", "complete").to_string()).unwrap();
     assert!(admit_input(&working.task, &responses(json!({}))).is_err());
+}
+
+#[test]
+fn managed_task_expired_input_refuses_before_refresh_and_live_partial_updates_succeed() {
+    for finite in [false, true] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let mut client = peer.client(session.clone()).with_tasks();
+            let (primed, ()) = pair(client.get_task_final(&cx, id()), async {
+                peer.discovery("access-one", true).await;
+                peer.rpc(
+                    "tasks/get",
+                    "access-one",
+                    task("working", "complete"),
+                    false,
+                )
+                .await;
+            })
+            .await;
+            primed.unwrap();
+            renew(&session);
+
+            let mut expired = task("input_required", "complete");
+            expired["createdAt"] = json!("1970-01-01T00:00:00Z");
+            expired["ttlMs"] = json!(1);
+            let expired = task_snapshot(expired);
+            let before = serde_json::to_vec(&expired).unwrap();
+            assert!(matches!(
+                client
+                    .update_task_final(&cx, &expired, responses(json!({"roots":{"roots":[]}})))
+                    .await,
+                Err(ManagedHttpClientError::Request {
+                    code: Some(McpErrorCode::InvalidRequest)
+                })
+            ));
+            assert_eq!(serde_json::to_vec(&expired).unwrap(), before);
+            assert_eq!(client.cached_credential_generation(), Some(1));
+            peer.no_more(&cx).await;
+
+            let mut live = if finite {
+                finite_task("input_required", "complete", Duration::from_secs(60))
+            } else {
+                task("input_required", "complete")
+            };
+            live["inputRequests"]["later"] = json!({"method":"roots/list"});
+            let live = task_snapshot(live);
+            let before = serde_json::to_vec(&live).unwrap();
+            let (updated, request) = pair(
+                client.update_task_final(&cx, &live, responses(json!({"roots":{"roots":[]}}))),
+                async {
+                    // Expired input did not consume the pending renewal or any
+                    // connection/request custody. The live call owns it now.
+                    peer.token(true).await;
+                    peer.discovery("access-two", true).await;
+                    peer.rpc(
+                        "tasks/update",
+                        "access-two",
+                        json!({"resultType":"complete"}),
+                        false,
+                    )
+                    .await
+                },
+            )
+            .await;
+            updated.unwrap();
+            assert_eq!(request["id"], 2);
+            assert_eq!(
+                request["params"]["inputResponses"],
+                json!({"roots":{"roots":[]}})
+            );
+            assert_eq!(serde_json::to_vec(&live).unwrap(), before);
+            assert_eq!(client.cached_credential_generation(), Some(2));
+            assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn managed_task_input_expiring_during_discovery_never_reaches_update_dispatch() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let mut client = peer.client(session.clone()).with_tasks();
+        let snapshot = task_snapshot(finite_task(
+            "input_required",
+            "complete",
+            Duration::from_secs(2),
+        ));
+        let before = serde_json::to_vec(&snapshot).unwrap();
+        let (result, ()) = pair(
+            client.update_task_final(&cx, &snapshot, responses(json!({"roots":{"roots":[]}}))),
+            async {
+                let (mut stream, request) = peer.request("server/discover", "access-one").await;
+                // The snapshot was live at API entry. Let its actual retention
+                // expire while discovery, under the original OAuth guard, waits.
+                while crate::task_wait::admit_input_retention(&snapshot).is_ok() {
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(25)).await;
+                }
+                reply(
+                    &mut stream,
+                    json!({
+                        "jsonrpc":"2.0", "id":request["id"], "result":discovery_result(true)
+                    }),
+                    false,
+                )
+                .await;
+                peer.no_more(&cx).await;
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Request {
+                code: Some(McpErrorCode::InvalidRequest)
+            })
+        ));
+        assert_eq!(serde_json::to_vec(&snapshot).unwrap(), before);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert!(session.check(&cx, &McpRequestCancellation::new()).is_ok());
+        assert!(!cx.is_cancel_requested());
+        let (next, ()) = pair(client.get_task_final(&cx, id()), async {
+            peer.discovery("access-one", true).await;
+            peer.rpc(
+                "tasks/get",
+                "access-one",
+                task("working", "complete"),
+                false,
+            )
+            .await;
+        })
+        .await;
+        assert!(next.is_ok());
+        peer.no_more(&cx).await;
+    });
 }
 
 mod listen;
