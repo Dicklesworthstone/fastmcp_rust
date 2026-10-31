@@ -172,7 +172,12 @@ fn ordinary_core_rpc_still_rejects_the_subscription_tail_exception() {
         "_meta":FinalRequestMeta::new(ClientCapabilities::default())
     }))).unwrap();
     let mut decoder = CoreDecoder::for_request(request, RequestId::Number(7), limits().core).unwrap();
-    let result = br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[]}}"#;
+    // Modern `tools/list` is a cache-hinted result family, so `ttlMs` and
+    // `cacheScope` are required members. Without them the result decodes as
+    // `Protocol(InvalidResult)` and the `admit` below unwraps on an error, so
+    // the terminal-tail refusal this test actually asserts is never reached.
+    // Every other modern complete-result fixture in this crate carries both.
+    let result = br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#;
     assert!(matches!(StreamDecoder::admit(&mut decoder, result, true).unwrap(), StreamEvent::Result(_)));
     assert!(matches!(decoder.admit_terminal_tail(CANCEL.as_bytes()),
         Err(DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))));

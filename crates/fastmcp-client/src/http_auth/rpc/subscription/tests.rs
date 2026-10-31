@@ -381,8 +381,15 @@ fn preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requ
         json!({"taskIds":["task"]}),
         json!({"toolsListChange":true}),
         json!({"resourceSubscriptions":["file:///a","file:///a"]}),
-        json!({"resourceSubscriptions":["x".repeat(MAX_MANAGED_SUBSCRIPTION_RESOURCE_BYTES + 1)]}),
-        json!({"resourceSubscriptions": (0..=MAX_MANAGED_SUBSCRIPTION_RESOURCES).map(|i| format!("file:///{i}")).collect::<Vec<_>>()}),
+        // A VALID absolute URI that exceeds the managed byte bound. A
+        // colon-free string never reaches `prepare`: `resourceSubscriptions`
+        // deserializes through `AbsoluteUri::parse`, which refuses it as
+        // `Invalid("URI scheme")`, so `params`' `expect` fired here and the
+        // length check in `admit_filter` was unreachable from this test. The
+        // scheme keeps the element admissible on the wire (well under
+        // `MAX_ABSOLUTE_URI_BYTES`) while still overrunning the 16 KiB managed
+        // bound, which is the refusal this row asserts.
+        json!({"resourceSubscriptions":[format!("file:///{}", "x".repeat(MAX_MANAGED_SUBSCRIPTION_RESOURCE_BYTES))]}),
     ] {
         assert!(
             prepare(
@@ -394,6 +401,27 @@ fn preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requ
             .is_err()
         );
     }
+    // An over-COUNT is refused at wire admission, not by `admit_filter`, and it
+    // cannot be asserted through `prepare` at all. `MAX_RESOURCE_SUBSCRIPTIONS`
+    // (wire) and `MAX_MANAGED_SUBSCRIPTION_RESOURCES` (managed) are BOTH 256,
+    // so deserialization admits at most 256 elements while `admit_filter`
+    // refuses only `len() > 256` -- its count guard is unreachable by any input
+    // that can reach it. This row therefore asserts the refusal that actually
+    // happens, which keeps "an over-count is rejected" covered; the unreachable
+    // managed guard is reported on bd-c8xxl rather than papered over here.
+    let over_count = serde_json::from_value::<FinalSubscriptionsListenParams>(json!({
+        "_meta": FinalRequestMeta::new(ClientCapabilities::default()),
+        "notifications": {
+            "resourceSubscriptions": (0..=MAX_MANAGED_SUBSCRIPTION_RESOURCES)
+                .map(|i| format!("file:///{i}"))
+                .collect::<Vec<_>>()
+        },
+    }));
+    assert!(
+        over_count.is_err(),
+        "{} resource subscriptions must be refused on the wire",
+        MAX_MANAGED_SUBSCRIPTION_RESOURCES + 1
+    );
     let mut limits = ManagedCoreLimits::default();
     limits.notifications = 0;
     assert!(matches!(

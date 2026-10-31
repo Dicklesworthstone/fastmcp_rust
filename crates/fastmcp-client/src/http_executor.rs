@@ -17580,16 +17580,22 @@ mod tests {
             assert!(client.final_result_cache_stats().invalidations > 0);
             assert!(client.cancel_http_subscription(&RequestId::Number(2)));
         } else {
-            assert!(matches!(
-                event,
-                Err(crate::HttpClientError::Connection(
-                    ClientHttpConnectionError::SubscriptionsListen(
-                        ModernHttpSubscriptionListenError::EventMissingId
-                            | ModernHttpSubscriptionListenError::EventInvalidId
-                            | ModernHttpSubscriptionListenError::EventIdMismatch { .. }
-                    )
-                ))
-            ));
+            // Borrow rather than move, so a refusal that is merely a different
+            // variant is distinguishable from the input being ADMITTED. Those
+            // two have opposite severity and a bare `matches!` reports neither.
+            assert!(
+                matches!(
+                    &event,
+                    Err(crate::HttpClientError::Connection(
+                        ClientHttpConnectionError::SubscriptionsListen(
+                            ModernHttpSubscriptionListenError::EventMissingId
+                                | ModernHttpSubscriptionListenError::EventInvalidId
+                                | ModernHttpSubscriptionListenError::EventIdMismatch { .. }
+                        )
+                    ))
+                ),
+                "a non-matching event owner must be refused by id, got: {event:?}"
+            );
             assert_eq!(client.final_result_cache_stats().invalidations, 0);
             assert!(client.active_http_subscription_request_id().is_none());
             assert!(!client.cancel_http_subscription(&RequestId::Number(2)));
@@ -18003,13 +18009,23 @@ mod tests {
             ));
             let error = runtime_block_on(subscription.next_event(&cx))
                 .expect_err("a cancellation may only end its exact subscription");
-            assert!(matches!(
-                (expected_error, error),
-                ("missing", ModernHttpSubscriptionListenError::EventMissingId)
-                    | ("invalid", ModernHttpSubscriptionListenError::EventInvalidId)
-                    | ("foreign", ModernHttpSubscriptionListenError::EventIdMismatch { .. })
-                    | ("request", ModernHttpSubscriptionListenError::CancellationRequestIdMismatch { .. })
-            ));
+            // Borrow rather than move the error so the failure message can name
+            // it. The predicate is unchanged; a `matches!` that consumes its
+            // subject can only ever report "assertion failed", which is what
+            // made this row undiagnosable from a log.
+            assert!(
+                matches!(
+                    (expected_error, &error),
+                    ("missing", ModernHttpSubscriptionListenError::EventMissingId)
+                        | ("invalid", ModernHttpSubscriptionListenError::EventInvalidId)
+                        | ("foreign", ModernHttpSubscriptionListenError::EventIdMismatch { .. })
+                        | (
+                            "request",
+                            ModernHttpSubscriptionListenError::CancellationRequestIdMismatch { .. }
+                        )
+                ),
+                "{expected_error} cancellation produced an unexpected refusal: {error:?}"
+            );
             assert!(!subscription.terminal_received);
             assert!(subscription.stream.response.is_none());
             assert!(subscription.stream.parser.is_none());
