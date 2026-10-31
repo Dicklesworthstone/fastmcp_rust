@@ -1,0 +1,138 @@
+HOST=hz3
+DATE=2026-10-31T03:44:32Z
+NPROC=64   # parallelism is the variable under test
+BLOBS:
+  d9a3eae3ae41243ef5aa52b5cda7a69059d9af33  native_pipe.rs
+
+############################################################
+###  fastmcp-transport --lib   x5   default test-threads
+############################################################
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 14s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-transport/440466e33e22086c/out/fastmcp_transport-440466e33e22086c)
+DISCOVERED=664
+  run 1: RED   exit=101  test result: FAILED. 663 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s
+        test memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority ... FAILED
+  run 2: RED   exit=101  test result: FAILED. 663 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.59s
+        test memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority ... FAILED
+  run 3: RED   exit=101  test result: FAILED. 663 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.64s
+        test memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority ... FAILED
+  run 4: RED   exit=101  test result: FAILED. 663 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.66s
+        test memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority ... FAILED
+  run 5: RED   exit=101  test result: FAILED. 663 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.56s
+        test memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority ... FAILED
+  --> fastmcp-transport: GREEN=0 RED=5 VOID=0 of 5
+  --> failure population (times-failed  name):
+              5 memory::asynchronous::wait::tests::authority::ready_channel_commit_does_not_require_unused_timer_authority
+  (empty means nothing failed in any run)
+
+############################################################
+###  fastmcp-client --lib   x4   default test-threads
+############################################################
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 53.42s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc)
+DISCOVERED=1836
+  run 1: RED   exit=101  test result: FAILED. 1818 passed; 18 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.87s
+        test http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog ... FAILED
+        test http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception ... FAILED
+        test http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests ... FAILED
+        test http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle ... FAILED
+        test http_executor::tests::public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch ... FAILED
+        test http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids ... FAILED
+        test http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners ... FAILED
+        test mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment ... FAILED
+        test memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication ... FAILED
+        test tests::async_mrtr_operation_deadline ... FAILED
+        test tests::async_mrtr_continuation_bounds ... FAILED
+        test tests::async_mrtr_public_verbs ... FAILED
+        test tests::async_mrtr_callback_cancellation ... FAILED
+        test tests::async_mrtr_refusal_and_passthrough ... FAILED
+        test tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget ... FAILED
+        test tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry ... FAILED
+        test tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime ... FAILED
+        test tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry ... FAILED
+  run 2: RED   exit=101  test result: FAILED. 1819 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.96s
+        test http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog ... FAILED
+        test http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception ... FAILED
+        test http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests ... FAILED
+        test http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle ... FAILED
+        test http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids ... FAILED
+        test http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners ... FAILED
+        test mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment ... FAILED
+        test memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication ... FAILED
+        test tests::async_mrtr_callback_cancellation ... FAILED
+        test tests::async_mrtr_continuation_bounds ... FAILED
+        test tests::async_mrtr_public_verbs ... FAILED
+        test tests::async_mrtr_operation_deadline ... FAILED
+        test tests::async_mrtr_refusal_and_passthrough ... FAILED
+        test tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry ... FAILED
+        test tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget ... FAILED
+        test tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry ... FAILED
+        test tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime ... FAILED
+  run 3: RED   exit=101  test result: FAILED. 1819 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 13.00s
+        test http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog ... FAILED
+        test http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception ... FAILED
+        test http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests ... FAILED
+        test http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle ... FAILED
+        test http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids ... FAILED
+        test mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment ... FAILED
+        test http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners ... FAILED
+        test memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication ... FAILED
+        test tests::async_mrtr_public_verbs ... FAILED
+        test tests::async_mrtr_callback_cancellation ... FAILED
+        test tests::async_mrtr_operation_deadline ... FAILED
+        test tests::async_mrtr_continuation_bounds ... FAILED
+        test tests::async_mrtr_refusal_and_passthrough ... FAILED
+        test tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget ... FAILED
+        test tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry ... FAILED
+        test tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry ... FAILED
+        test tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime ... FAILED
+  run 4: RED   exit=101  test result: FAILED. 1819 passed; 17 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.17s
+        test http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog ... FAILED
+        test http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception ... FAILED
+        test http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests ... FAILED
+        test http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle ... FAILED
+        test http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids ... FAILED
+        test http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners ... FAILED
+        test mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment ... FAILED
+        test memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication ... FAILED
+        test tests::async_mrtr_callback_cancellation ... FAILED
+        test tests::async_mrtr_operation_deadline ... FAILED
+        test tests::async_mrtr_continuation_bounds ... FAILED
+        test tests::async_mrtr_public_verbs ... FAILED
+        test tests::async_mrtr_refusal_and_passthrough ... FAILED
+        test tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget ... FAILED
+        test tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry ... FAILED
+        test tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime ... FAILED
+        test tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry ... FAILED
+  --> fastmcp-client: GREEN=0 RED=4 VOID=0 of 4
+  --> failure population (times-failed  name):
+              4 tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry
+              4 tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime
+              4 tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry
+              4 tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget
+              4 tests::async_mrtr_refusal_and_passthrough
+              4 tests::async_mrtr_public_verbs
+              4 tests::async_mrtr_operation_deadline
+              4 tests::async_mrtr_continuation_bounds
+              4 tests::async_mrtr_callback_cancellation
+              4 memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+              4 mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+              4 http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+              4 http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+              4 http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+              4 http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+              4 http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+              4 http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog
+              1 http_executor::tests::public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch
+  (empty means nothing failed in any run)
+
+================ THE NAMED TESTS, SPECIFICALLY ================
+   failed in 0 run(s)   native_pipe_backpressure_yields_and_wakes_without_duplicating_bytes
+   failed in 0 run(s)   native_pipe_readiness_updates_waker_and_preserves_data_through_eof
+   failed in 0 run(s)   deferred_control_maintenance_exhaustion_preserves_sibling_ownership
+   failed in 0 run(s)   client_deferred_yielding_legacy_positive
+   failed in 1 run(s)   public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch
+   failed in 0 run(s)   public_http_mrtr_callback_caller_runtime_planted_negative
+   failed in 0 run(s)   automatic_catalog_lists_expire_while_waiting_for_the_second_page

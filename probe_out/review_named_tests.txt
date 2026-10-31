@@ -1,0 +1,71 @@
+HOST=hz4
+DATE=2026-10-31T01:16:25Z
+
+######## BUILD fastmcp-server --lib ########
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.43s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd)
+BIN=.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd
+DISCOVERED=2482
+
+================ fastmcp-server :: returning_subscription_quiescence_runs_hook_after_owner_retirement ================
+FULL=lib_unit_tests::returning_subscription_quiescence_runs_hook_after_owner_retirement
+test lib_unit_tests::returning_subscription_quiescence_runs_hook_after_owner_retirement ... FastMCP Server: legacy-returning-bounded-cleanup v1.0.0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.46s
+-> PASS (exit 0)
+
+######## BUILD fastmcp-transport --lib ########
+BUILD_EXIT=0
+   Compiling fastmcp-transport v0.13.0 (/data/projects/fastmcp_rust/crates/fastmcp-transport)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.76s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-transport/440466e33e22086c/out/fastmcp_transport-440466e33e22086c)
+BIN=.rch-target/debug/build/fastmcp-transport/440466e33e22086c/out/fastmcp_transport-440466e33e22086c
+DISCOVERED=664
+
+================ fastmcp-transport :: native_pipe_backpressure_yields_and_wakes_without_duplicating_bytes ================
+FULL=async_io::native_pipe::tests::native_pipe_backpressure_yields_and_wakes_without_duplicating_bytes
+test async_io::native_pipe::tests::native_pipe_backpressure_yields_and_wakes_without_duplicating_bytes ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 663 filtered out; finished in 0.01s
+-> PASS (exit 0)
+
+######## BUILD fastmcp-client --lib ########
+BUILD_EXIT=0
+   Compiling fastmcp-client v0.13.0 (/data/projects/fastmcp_rust/crates/fastmcp-client)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 10s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc)
+BIN=.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc
+DISCOVERED=1836
+
+================ fastmcp-client :: deferred_control_maintenance_exhaustion_preserves_sibling_ownership ================
+FULL=execution::tests::deferred_control_maintenance_exhaustion_preserves_sibling_ownership
+test execution::tests::deferred_control_maintenance_exhaustion_preserves_sibling_ownership ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.00s
+-> PASS (exit 0)
+
+================ fastmcp-client :: public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch ================
+FULL=http_executor::tests::public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch
+test http_executor::tests::public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.01s
+-> PASS (exit 0)
+
+================ fastmcp-client :: public_http_mrtr_callback_caller_runtime_planted_negative ================
+FULL=tests::public_http_mrtr_callback_caller_runtime_planted_negative
+test tests::public_http_mrtr_callback_caller_runtime_planted_negative ... fastmcp client callback panicked; panic payload redacted
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 6.16s
+-> PASS (exit 0)
+
+================ fastmcp-client :: automatic_catalog_lists_expire_while_waiting_for_the_second_page ================
+FULL=tests::automatic_catalog_lists_expire_while_waiting_for_the_second_page
+test tests::automatic_catalog_lists_expire_while_waiting_for_the_second_page ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 2.25s
+-> PASS (exit 0)
+
+================ SUMMARY ================
+
+  fastmcp-server  returning_subscription_quiescence_runs_hook_after_ow  PASS
+  fastmcp-transport  native_pipe_backpressure_yields_and_wakes_without_du  PASS
+  fastmcp-client  deferred_control_maintenance_exhaustion_preserves_si  PASS
+  fastmcp-client  public_http_modern_subscriptions_listen_rejects_one_  PASS
+  fastmcp-client  public_http_mrtr_callback_caller_runtime_planted_neg  PASS
+  fastmcp-client  automatic_catalog_lists_expire_while_waiting_for_the  PASS
+PASS=6 FAIL=0 VOID=0 of 6

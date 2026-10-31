@@ -1,0 +1,115 @@
+HOST=hz3
+DATE=2026-10-31T03:51:32Z
+NPROC=64
+
+=== BUILD (warm from the determinism run) ===
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc)
+BIN=.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc
+DISCOVERED=1836
+
+=== NAME RESOLUTION ===
+unresolved=0 of 18
+
+############################################################
+### PASS A: all 18 together, --test-threads=1 (serial)
+############################################################
+exit=101
+ran=18 of 18 requested
+test result: FAILED. 1 passed; 17 failed; 0 ignored; 0 measured; 1818 filtered out; finished in 0.27s
+--- per-test outcome ---
+   test http_executor::tests::public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch ... ok
+--- panic text (first 200 lines of failure detail) ---
+failures:
+
+failures:
+    http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog
+    http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+    http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+    http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+    http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+    http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+    mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+    memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+    tests::async_mrtr_callback_cancellation
+    tests::async_mrtr_continuation_bounds
+    tests::async_mrtr_operation_deadline
+    tests::async_mrtr_public_verbs
+    tests::async_mrtr_refusal_and_passthrough
+    tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget
+    tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry
+    tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime
+    tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry
+
+test result: FAILED. 1 passed; 17 failed; 0 ignored; 0 measured; 1818 filtered out; finished in 0.27s
+
+
+############################################################
+### PASS B: each name ALONE, --exact --test-threads=1
+############################################################
+  FAIL  http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog
+          thread 'http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog' (2541080) panicked at crates/fastmcp-client/src/http_auth/dpop/native/core/catalog.rs:392:79:
+  FAIL  http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+          thread 'http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception' (2541096) panicked at crates/fastmcp-client/src/http_auth/dpop/native/core/stream/subscription/tests/termination.rs:176:71:
+  FAIL  http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+          thread 'http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests' (2541121) panicked at crates/fastmcp-client/src/http_auth/rpc/subscription/tests.rs:10:6:
+  FAIL  http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+          thread 'http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle' (2541140) panicked at crates/fastmcp-client/src/http_executor.rs:18962:10:
+  FAIL  http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+          thread 'http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids' (2541154) panicked at crates/fastmcp-client/src/http_executor.rs:18006:13:
+          assertion failed: matches!((expected_error, error),
+  FAIL  http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+          thread 'http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners' (2541170) panicked at crates/fastmcp-client/src/http_executor.rs:17583:13:
+          assertion failed: matches!(event,
+  FAIL  mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+          thread 'mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment' (2541188) panicked at crates/fastmcp-client/src/mcp_config.rs:1834:14:
+  FAIL  memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+          thread 'memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication' (2541200) panicked at crates/fastmcp-client/src/memory.rs:834:14:
+  FAIL  tests::async_mrtr_callback_cancellation
+          thread 'tests::async_mrtr_callback_cancellation' (2541211) panicked at crates/fastmcp-client/src/lib.rs:56982:29:
+          assertion failed: std::future::poll_fn(|task_cx|
+          thread 'tests::async_mrtr_callback_cancellation' (2541211) panicked at crates/fastmcp-client/src/lib.rs:57101:36:
+          called `Result::unwrap()` on an `Err` value: Panicked(PanicPayload { message: "assertion failed: std::future::poll_fn(|task_cx|\n                std::task::Poll::Ready(operation.as_mut().poll(task_cx))).await.is_pending()" })
+  FAIL  tests::async_mrtr_continuation_bounds
+          thread 'tests::async_mrtr_continuation_bounds' (2541221) panicked at crates/fastmcp-client/src/lib.rs:57040:17:
+          assertion `left == right` failed: tools/call/round-bound
+            left: 0
+           right: 4
+  FAIL  tests::async_mrtr_operation_deadline
+          thread 'tests::async_mrtr_operation_deadline' (2541250) panicked at crates/fastmcp-client/src/lib.rs:57040:17:
+          assertion `left == right` failed: tools/call/deadline-callback
+            left: 0
+           right: 1
+  FAIL  tests::async_mrtr_public_verbs
+          thread 'tests::async_mrtr_public_verbs' (2541276) panicked at crates/fastmcp-client/src/lib.rs:57040:17:
+          assertion `left == right` failed: tools/call/warm
+            left: 0
+           right: 2
+  FAIL  tests::async_mrtr_refusal_and_passthrough
+          thread 'tests::async_mrtr_refusal_and_passthrough' (2541291) panicked at crates/fastmcp-client/src/lib.rs:57040:17:
+          assertion `left == right` failed: tools/call/handler-error
+            left: 0
+           right: 1
+  FAIL  tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget
+          thread 'tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget' (2541312) panicked at crates/fastmcp-client/src/lib.rs:56732:28:
+  FAIL  tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry
+          thread 'tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry' (2541337) panicked at crates/fastmcp-client/src/lib.rs:56718:17:
+          assertion `left == right` failed
+            left: InvalidRequest
+           right: InvalidParams
+  FAIL  tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime
+          thread 'tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime' (2541363) panicked at crates/fastmcp-client/src/lib.rs:57580:9:
+  FAIL  tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry
+          thread 'tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry' (2541374) panicked at crates/fastmcp-client/src/lib.rs:57599:9:
+          assertion `left == right` failed
+            left: InvalidRequest
+           right: InternalError
+  PASS  http_executor::tests::public_http_modern_subscriptions_listen_rejects_one_field_acknowledgement_id_mismatch
+
+================ VERDICT ================
+PASS B solo-serial:  PASS=1  FAIL=17  VOID=0  of 18
+
+READING: a name that FAILS solo-serial is a deterministic defect independent
+of load. A name that PASSES solo-serial but failed 4/4 in the full target is
+a cross-test interaction -- shared fixture, shared port, or a global.

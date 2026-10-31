@@ -1,0 +1,55 @@
+HOST=hz4
+DATE=2026-10-31T01:01:08Z
+BLOBS:
+  514a597869521fe828893647224ec26d3c8b7f46  crates/fastmcp-client/tests/task_01_b.rs
+  95266b32cf5722aaecc12e5756f7439f6fa4e2da  crates/fastmcp-client/tests/task_resume_store.rs
+  07fd8eb93ed1872baaa4896ffe2b1f9c3ac169c4  crates/fastmcp-client/Cargo.toml
+=== BUILD (outside the run window) ===
+BUILD_EXIT=0
+   Compiling fastmcp-protocol v0.13.0 (/data/projects/fastmcp_rust/crates/fastmcp-protocol)
+   Compiling fastmcp-transport v0.13.0 (/data/projects/fastmcp_rust/crates/fastmcp-transport)
+   Compiling fastmcp-client v0.13.0 (/data/projects/fastmcp_rust/crates/fastmcp-client)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3m 28s
+  Executable tests/task_01_b.rs (.rch-target/debug/build/fastmcp-client/17d09b22cfe9139b/out/task_01_b-17d09b22cfe9139b)
+  Executable tests/task_resume_store.rs (.rch-target/debug/build/fastmcp-client/27ad4597c7c93aad/out/task_resume_store-27ad4597c7c93aad)
+BINS=2
+  .rch-target/debug/build/fastmcp-client/17d09b22cfe9139b/out/task_01_b-17d09b22cfe9139b
+  .rch-target/debug/build/fastmcp-client/27ad4597c7c93aad/out/task_resume_store-27ad4597c7c93aad
+
+================ task_01_b ================
+DISCOVERED=2
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.38s
+-> task_01_b PASS (exit 0)
+
+================ task_resume_store ================
+DISCOVERED=24
+running 24 tests
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+test capacity_is_reserved_before_protection_and_failed_seal_leaves_file_unchanged ... ok
+test changed_ciphertext_is_not_reinterpreted_as_an_empty_store ... ok
+test conditional_cleanup::exact_removal_survives_reopen_without_erasing_other_tasks ... ok
+test conditional_cleanup::failed_conditional_delete_preserves_file_record_and_page_generation ... ok
+test conditional_cleanup::protected_historical_slot_can_be_removed_even_when_live_lookup_filters_it ... ok
+test conditional_cleanup::stale_or_cross_owner_disposal_cannot_delete_current_controls ... ok
+test current_binding_and_provider_profile_cannot_be_selected_from_stored_data ... ok
+test lifecycle::accepted_task_initial_insert_reopens_without_persisting_input_payloads ... ok
+test lifecycle::changed_retention_is_a_conflict_even_with_identical_task_control_timestamps ... ok
+test lifecycle::conditional_update_and_terminal_removal_are_durable_across_reopen ... ok
+test lifecycle::duplicate_initial_insert_never_overwrites_identical_or_newer_controls ... ok
+test lifecycle::failed_initial_protection_preserves_absence_and_existing_durable_records ... ok
+test lifecycle::failed_protection_keeps_the_expected_record_and_file_unchanged ... ok
+test lifecycle::initial_insert_admits_capacity_and_owner_before_protection ... ok
+test lifecycle::missing_or_wrong_owner_changes_cannot_recreate_or_remove_a_record ... ok
+test lifecycle::restart_handoff::active_then_terminal_restart_changes_use_the_existing_atomic_store ... ok
+test lifecycle::restart_handoff::explicit_unavailable_change_removes_a_protected_expired_record ... ok
+test lifecycle::restart_handoff::unavailable_restart_disposal_preserves_newer_work_and_failed_terminal_results ... ok
+test lifecycle::stale_update_and_terminal_cleanup_cannot_mutate_newer_records ... ok
+test page_cursor_cannot_cross_a_committed_mutation ... ok
+-> task_resume_store PASS (exit 0)
+
+================ SUMMARY ================
+
+  task_01_b  PASS  (2 discovered)
+  task_resume_store  PASS  (24 discovered)
+targets: PASS=2 FAIL=0 VOID=0

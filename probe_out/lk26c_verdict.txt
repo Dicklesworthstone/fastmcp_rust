@@ -1,0 +1,24 @@
+PROBE_HOST=hz4
+PROBE_DATE=2026-10-30T23:59:44Z
+PROBE_PWD=/Users/jemanuel/projects/fastmcp_rust
+=== BUILD (outside the sampling window on purpose) ===
+BUILD_EXIT=0
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+[1m[92m  Executable[0m unittests src/lib.rs (.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd)
+PARSED_BIN=.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd
+BIN=.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd
+=== CONTROL: resolve the FULL test path, because --exact needs it ===
+FULL_NAME=lib_unit_tests::subscription_deadline_does_not_wait_for_a_listener_shutdown_election
+MATCHES=1
+=== RUN, bounded, in background ===
+WRAPPER=2822424 HARNESS=2822424
+--- output ---
+
+running 1 test
+test lib_unit_tests::subscription_deadline_does_not_wait_for_a_listener_shutdown_election ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.25s
+
+VERDICT: the test RAN and COMPLETED (exit 0) -- NO HANG at this revision.
+test lib_unit_tests::subscription_deadline_does_not_wait_for_a_listener_shutdown_election ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.25s
