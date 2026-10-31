@@ -1,0 +1,168 @@
+HOST=hz3
+DATE=2026-10-31T04:08:55Z
+NPROC=64
+
+=== BUILD (warm) ===
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.48s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd)
+BIN=.rch-target/debug/build/fastmcp-server/9c6a0b207eff01cd/out/fastmcp_server-9c6a0b207eff01cd
+DISCOVERED=2482   (full name list synced back in probe_out/server_lib_discovered.txt)
+
+############################################################
+### PART 1: full output per failing test, solo, serial
+############################################################
+
+================================================================
+### lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress
+================================================================
+exit=101
+
+running 1 test
+test lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress ... 
+thread 'lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress' (3171985) panicked at crates/fastmcp-server/src/lib.rs:26215:16:
+called `Result::unwrap()` on an `Err` value: "subscription stream closed before acknowledgement and progress"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.51s
+
+
+================================================================
+### lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer
+================================================================
+exit=101
+
+running 1 test
+test lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer ... 
+thread 'lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer' (3172207) panicked at crates/fastmcp-server/src/lib.rs:26215:16:
+called `Result::unwrap()` on an `Err` value: "Resource temporarily unavailable (os error 11)"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 7.29s
+
+
+================================================================
+### http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes
+================================================================
+exit=101
+
+running 1 test
+test http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes ... 
+thread 'http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes' (3176700) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:602:74:
+called `Result::unwrap()` on an `Err` value: BodyFailed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes' (3176700) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:474:38:
+called `Result::unwrap()` on an `Err` value: Panicked(PanicPayload { message: "called `Result::unwrap()` on an `Err` value: BodyFailed" })
+FAILED
+
+failures:
+
+failures:
+    http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.49s
+
+
+================================================================
+### http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response
+================================================================
+exit=101
+
+running 1 test
+test http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response ... 
+thread 'http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response' (3177134) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:645:72:
+called `Result::unwrap()` on an `Err` value: BodyFailed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response' (3177134) panicked at crates/fastmcp-server/src/http_admission/security/endpoint.rs:474:38:
+called `Result::unwrap()` on an `Err` value: Panicked(PanicPayload { message: "called `Result::unwrap()` on an `Err` value: BodyFailed" })
+FAILED
+
+failures:
+
+failures:
+    http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.26s
+
+
+================================================================
+### lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+================================================================
+exit=101
+
+running 1 test
+test lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware ... 
+thread 'lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware' (3177361) panicked at crates/fastmcp-server/src/lib.rs:26215:16:
+called `Result::unwrap()` on an `Err` value: "live SSE chunk omitted its size terminator"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.50s
+
+
+================================================================
+### lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+================================================================
+exit=101
+
+running 1 test
+test lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal ... 
+thread 'lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal' (3177607) panicked at crates/fastmcp-server/src/lib.rs:26215:16:
+called `Result::unwrap()` on an `Err` value: "live SSE chunk omitted its size terminator"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2481 filtered out; finished in 0.50s
+
+
+############################################################
+### PART 2: bd-55ola -- 10 complete-target runs, default threads
+############################################################
+  run 1: RED   test result: FAILED. 2477 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.18s
+  run 2: RED   test result: FAILED. 2477 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.21s
+  run 3: RED   test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.93s
+  run 4: RED   test result: FAILED. 2478 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.46s
+  run 5: RED   test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.29s
+  run 6: RED   test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.38s
+  run 7: RED   test result: FAILED. 2478 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.33s
+  run 8: RED   test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.02s
+  run 9: RED   test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.71s
+  run 10: RED   test result: FAILED. 2476 passed; 6 failed; 0 ignored; 0 measured; 0 filtered out; finished in 20.20s
+
+  --> GREEN=0 RED=10 VOID=0 of 10 complete-target runs
+  --> bd-55ola's test failed in 0 of 10
+
+  --> failure population across all 10 (times-failed  name):
+             10 lib_unit_tests::live_http_subscription_acknowledgement_precedes_deferred_progress
+             10 lib_unit_tests::live_http_response_write_timeout_releases_stalled_json_peer
+             10 http_admission::security::endpoint::tests::secured_subscription_cancellation_is_delivered_once_then_finishes
+             10 http_admission::security::endpoint::tests::generic_subscription_controls_cannot_finish_a_secured_response
+              8 lib_unit_tests::live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+              6 lib_unit_tests::live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+
+READING for bd-55ola: 0 of 10 takes the residual on a 1-in-3 claim from
+~30% to ~2%, which is a clearance rather than a non-reproduction.

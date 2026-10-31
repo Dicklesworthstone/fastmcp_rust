@@ -1,0 +1,313 @@
+# fastmcp-server --lib : per-bead verdicts from the EXECUTED set
+# subject  HEAD 6fa8cd6e, worker hz3, DEFAULT features, DEFAULT test-threads (NPROC=64)
+# runs     13 complete-target runs, ran == DISCOVERED = 2482 every time, 0 VOIDs
+# universe probe_out/server_lib_discovered.txt (the binary's own --list), NOT a source grep
+# sound    in-list AND not in the 6-name failure population => passed in every run
+# caveat   a PASS on a *planted negative* is the INTENDED state, not a contradiction;
+#          read each row against what the bead actually claims before acting on it.
+
+bd-3oqg8 [review]   1 pass / 0 fail
+    PASSED 13/13   roots_list_descriptor_admits_absent_and_empty_params_only
+
+bd-4shqn [review]   7 pass / 1 fail
+    FAILED 10/10   live_http_subscription_acknowledgement_precedes_deferred_progress
+    PASSED 13/13   async_stdio_server_backpressure_cancellation_suppresses_queued_final_result
+    PASSED 13/13   builder_refuses_each_unreviewed_header_exposure_without_building
+    PASSED 13/13   legacy_application_content_rejects_malformed_results_and_forbidden_envelopes
+    PASSED 13/13   live_http_sse_handler_admission_preserves_parameter_header_rejection
+    PASSED 13/13   live_runtime_routes_exact_legacy_frames_through_the_2024_adapter
+    PASSED 13/13   returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler
+
+bd-55ola [review]   3 pass / 0 fail
+    PASSED 13/13   discovery_auth_methods_follow_public_client_policy
+    PASSED 13/13   forced_subscription_ack_order_under_recv_lock_is_written_when_recv_returns
+    PASSED 13/13   returning_subscription_quiescence_runs_hook_after_owner_retirement
+
+bd-56zxy [in_progress]   5 pass / 0 fail
+    PASSED 13/13   async_stdio_server_refuses_raw_parameters_beyond_the_document_bound
+    PASSED 13/13   native_admission_refuses_missing_runtime_and_restricted_spawn
+    PASSED 13/13   nested_tool_resource_call_shares_parent_cost_ledger
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler
+    PASSED 13/13   test_cancel_active_requests_waits_for_guard_drop
+
+bd-63l5 [open]   1 pass / 0 fail
+    PASSED 13/13   fnd_04_b_planted_negative
+
+bd-6ieg3 [review]   1 pass / 0 fail
+    PASSED 13/13   live_http_request_read_timeout_releases_idle_and_trickling_connections
+
+bd-8d61j [review]   10 pass / 0 fail
+    PASSED 13/13   async_stdio_server_refuses_raw_parameters_beyond_the_document_bound
+    PASSED 13/13   live_http_legacy_reverse_response_rejects_foreign_principal_before_pending_mutation
+    PASSED 13/13   native_admission_refuses_missing_runtime_and_restricted_spawn
+    PASSED 13/13   returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup
+    PASSED 13/13   returning_split_waits_for_non_quiescent_modern_child_before_cleanup
+    PASSED 13/13   returning_subscription_nonquiescence_preserves_operation_and_close_errors
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_modern_child
+    PASSED 13/13   test_cancel_active_requests_waits_for_guard_drop
+    PASSED 13/13   test_handler_read_listing_and_read_with_uri
+
+bd-bi6mo [review]   1 pass / 0 fail
+    PASSED 13/13   live_http_legacy_reverse_response_bypasses_the_originating_session_mutex
+
+bd-cache-01-a-3qjm [open]   1 pass / 0 fail
+    PASSED 13/13   cache_01_a_planted_negative
+
+bd-cache-01-b-74yf [open]   1 pass / 0 fail
+    PASSED 13/13   cache_01_b_planted_negative
+
+bd-e3en4 [open]   0 pass / 6 fail
+    FAILED 10/10   generic_subscription_controls_cannot_finish_a_secured_response
+    FAILED 10/10   live_http_response_write_timeout_releases_stalled_json_peer
+    FAILED 6/10    live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+    FAILED 10/10   live_http_subscription_acknowledgement_precedes_deferred_progress
+    FAILED 8/10    live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+    FAILED 10/10   secured_subscription_cancellation_is_delivered_once_then_finishes
+
+bd-ep6pp [open]   3 pass / 0 fail
+    PASSED 13/13   public_http_protocol_policy_admits_matching_modern_metadata
+    PASSED 13/13   public_http_protocol_policy_rejects_metadata_free_modern_request
+    PASSED 13/13   removed_methods_are_method_not_found_not_invalid_params
+
+bd-f6apv [blocked]   13 pass / 0 fail
+    PASSED 13/13   auth_01_a_header_map_alias_case_insensitive_native_planted_negative
+    PASSED 13/13   auth_01_a_header_map_alias_case_insensitive_positive
+    PASSED 13/13   auth_01_a_nested_meta_headers_legacy_positive
+    PASSED 13/13   auth_01_a_nested_meta_headers_native_planted_negative
+    PASSED 13/13   auth_01_a_unit_planted_negative
+    PASSED 13/13   auth_01_a_unit_positive
+    PASSED 13/13   auth_01_http_body_query_planted_negative
+    PASSED 13/13   auth_01_http_header_only_positive
+    PASSED 13/13   auth_01_http_legacy_cancellation_body_planted_negative
+    PASSED 13/13   auth_01_http_legacy_cancellation_header_positive
+    PASSED 13/13   oauth_auth_01_a_valid_refresh_rotation_authenticates_and_reuses_grant
+    PASSED 13/13   oauth_auth_01_a_wrong_client_refresh_denial_preserves_state_before_valid_reuse
+    PASSED 13/13   oauth_auth_01_a_wrong_client_revoke_denial_preserves_state_and_token
+
+bd-fnd-01-implementation-b-zz0r [blocked]   9 pass / 0 fail
+    PASSED 13/13   claims_provider_cannot_substitute_a_different_subject
+    PASSED 13/13   default_oidc_and_oauth_issuers_match
+    PASSED 13/13   discovery_does_not_advertise_signing
+    PASSED 13/13   issuance_fails_closed_without_external_signer
+    PASSED 13/13   oidc_debug_surfaces_redact_token_and_pii_canaries_without_changing_wire_data
+    PASSED 13/13   provider_requires_exact_safe_oauth_issuer_and_defaults_follow_custom_oauth
+    PASSED 13/13   request_completion_mark_done
+    PASSED 13/13   returning_subscription_protocol_failure_after_quiescence_runs_hook
+    PASSED 13/13   user_claims_filter_by_scope
+
+bd-g6fp3 [open]   4 pass / 0 fail
+    PASSED 13/13   dispatch_stateless_listen_is_not_method_not_found
+    PASSED 13/13   dispatch_stateless_refuses_the_removed_modern_ping
+    PASSED 13/13   removed_methods_are_method_not_found_not_invalid_params
+    PASSED 13/13   the_owned_production_dispatch_refuses_the_removed_ping_under_every_modern_policy
+
+bd-htrmq [review]   3 pass / 0 fail
+    PASSED 13/13   http_extension_notification_deadline_and_drop_prevent_late_effects
+    PASSED 13/13   http_extension_notification_settles_children_before_status_and_after_drop
+    PASSED 13/13   native_http_response_write_deadline_preserves_progress_and_bounds_stalls
+
+bd-lk26c [review]   1 pass / 0 fail
+    PASSED 13/13   subscription_deadline_does_not_wait_for_a_listener_shutdown_election
+
+bd-mcp-2026-07-28-support-ahet [open]   7 pass / 0 fail
+    PASSED 13/13   handle_tools_call_not_found
+    PASSED 13/13   live_http_legacy_cancellation_bypasses_the_busy_session_lock
+    PASSED 13/13   live_http_loopback_preserves_exact_legacy_sse_and_post_lifecycle
+    PASSED 13/13   receive_pump_cancels_a_running_handler_in_band
+    PASSED 13/13   returning_split_waits_for_non_quiescent_modern_child_before_cleanup
+    PASSED 13/13   srv_04_modern_owned_cancellation_does_not_change_sibling
+    PASSED 13/13   test_server_cancels_inflight_requests
+
+bd-mcp-2026-07-28-support-ahet.1 [open]   2 pass / 0 fail
+    PASSED 13/13   default_oidc_and_oauth_issuers_match
+    PASSED 13/13   user_claims_filter_by_scope
+
+bd-mcp-2026-07-28-support-ahet.15.1 [open]   5 pass / 0 fail
+    PASSED 13/13   returning_subscription_protocol_failure_after_quiescence_runs_hook
+    PASSED 13/13   srv_01_a_unit_planted_negative
+    PASSED 13/13   srv_01_a_unit_positive
+    PASSED 13/13   srv_01_b_unit_planted_negative
+    PASSED 13/13   srv_01_b_unit_positive
+
+bd-mcp-2026-07-28-support-ahet.15.2 [open]   4 pass / 0 fail
+    PASSED 13/13   srv_01_a_unit_planted_negative
+    PASSED 13/13   srv_01_a_unit_positive
+    PASSED 13/13   srv_01_b_unit_planted_negative
+    PASSED 13/13   srv_01_b_unit_positive
+
+bd-mcp-2026-07-28-support-ahet.17.2 [open]   5 pass / 0 fail
+    PASSED 13/13   returning_subscription_protocol_failure_after_quiescence_runs_hook
+    PASSED 13/13   srv_01_a_unit_planted_negative
+    PASSED 13/13   srv_01_a_unit_positive
+    PASSED 13/13   srv_01_b_unit_planted_negative
+    PASSED 13/13   srv_01_b_unit_positive
+
+bd-mcp-2026-07-28-support-ahet.3.1 [review]   4 pass / 0 fail
+    PASSED 13/13   fnd_03_i_unit_planted_negative
+    PASSED 13/13   fnd_03_i_unit_positive
+    PASSED 13/13   fnd_03_integration_unit_planted_negative
+    PASSED 13/13   fnd_03_integration_unit_positive
+
+bd-mcp-2026-07-28-support-ahet.3.3 [review]   4 pass / 0 fail
+    PASSED 13/13   fnd_03_i_unit_planted_negative
+    PASSED 13/13   fnd_03_i_unit_positive
+    PASSED 13/13   fnd_03_integration_unit_planted_negative
+    PASSED 13/13   fnd_03_integration_unit_positive
+
+bd-mcp-2026-07-28-support-ahet.4 [open]   1 pass / 0 fail
+    PASSED 13/13   secured_https_refuses_early_data_even_on_a_raw_acceptor
+
+bd-mcp-auth-00-b-ykgm [review]   11 pass / 0 fail
+    PASSED 13/13   auth_00_expired_mrtr_foreign_owner_preserves_negative
+    PASSED 13/13   auth_00_expired_mrtr_owner_retires_positive
+    PASSED 13/13   auth_00_http_mrtr_anonymous_complete_remains_available
+    PASSED 13/13   auth_00_http_mrtr_cancelled_state_foreign_owner_preserves_negative
+    PASSED 13/13   auth_00_http_mrtr_cancelled_state_owner_retires_positive
+    PASSED 13/13   auth_00_http_mrtr_ownerless_leaked_handle_preserves_owner_state
+    PASSED 13/13   auth_00_http_mrtr_reduced_grants_preserve_state_negative
+    PASSED 13/13   auth_00_http_mrtr_stable_owner_completes_two_rounds
+    PASSED 13/13   auth_00_http_mrtr_subject_without_owner_rejects_without_allocating
+    PASSED 13/13   auth_00_http_mrtr_unchanged_grants_rotation_completes_positive
+    PASSED 13/13   auth_00_ownerless_http_retry_rejects_before_expired_state_lookup
+
+bd-mcp-fnd-01-14def-freeze-package-imv2 [in_progress]   1 pass / 0 fail
+    PASSED 13/13   claims_provider_cannot_substitute_a_different_subject
+
+bd-mcp-fnd-04-a-jmi7 [review]   1 pass / 0 fail
+    PASSED 13/13   fnd_04_b_planted_negative
+
+bd-mcp-fnd-04-b-th72 [in_progress]   25 pass / 0 fail
+    PASSED 13/13   final_progress_timer_rearm_planted_negative
+    PASSED 13/13   final_progress_timer_rearm_positive
+    PASSED 13/13   fnd_04_b_planted_negative
+    PASSED 13/13   fnd_04_modern_request_region_cancellation_isolates_sibling
+    PASSED 13/13   fnd_04_modern_request_region_drains_descendants_before_completion
+    PASSED 13/13   fnd_04_modern_request_region_drop_closes_descendants
+    PASSED 13/13   fnd_04_modern_request_region_unavailable_runtime_never_dispatches
+    PASSED 13/13   legacy_request_dispatch_and_region_close_retain_simultaneous_failures
+    PASSED 13/13   legacy_returning_completed_request_allows_sibling_reuse_after_eof
+    PASSED 13/13   mrtr_handler_state_binding_planted_negative
+    PASSED 13/13   mrtr_handler_state_conversation_positive
+    PASSED 13/13   rate_limit_clock_boundary_planted_negative
+    PASSED 13/13   rate_limit_clock_boundary_positive
+    PASSED 13/13   rate_limiting_middleware_without_extractor_is_method_scoped
+    PASSED 13/13   reality_check_regression_returning_transport_preserves_run_and_close_failures
+    PASSED 13/13   receive_pump_cancels_a_running_handler_in_band
+    PASSED 13/13   receive_pump_routes_sampling_response_while_handler_waits
+    PASSED 13/13   shared_transport_close_failure_keeps_io_retired_negative
+    PASSED 13/13   shared_transport_close_retires_io_once_positive
+    PASSED 13/13   srv_04_modern_owned_cancellation_does_not_change_sibling
+    PASSED 13/13   srv_04_modern_owned_dispatch_runs_requests_concurrently
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler
+    PASSED 13/13   subscription_hook_errors_preserve_session_state
+    PASSED 13/13   test_rate_limiting_middleware_per_client
+    PASSED 13/13   test_server_cancels_inflight_requests
+
+bd-mcp-http-03-integration-vx7y [review]   2 pass / 0 fail
+    PASSED 13/13   discovery_does_not_advertise_signing
+    PASSED 13/13   issuance_fails_closed_without_external_signer
+
+bd-mcp-leg-02-integration-wlj6 [open]   1 pass / 0 fail
+    PASSED 13/13   leg_02_i_planted_negative
+
+bd-mcp-std-01-integration-qc7c [open]   4 pass / 0 fail
+    PASSED 13/13   fnd_03_i_unit_planted_negative
+    PASSED 13/13   fnd_03_i_unit_positive
+    PASSED 13/13   fnd_03_integration_unit_planted_negative
+    PASSED 13/13   fnd_03_integration_unit_positive
+
+bd-n3m6v [review]   18 pass / 0 fail
+    PASSED 13/13   async_stdio_server_backpressure_cancellation_suppresses_queued_final_result
+    PASSED 13/13   async_stdio_server_refuses_raw_parameters_beyond_the_document_bound
+    PASSED 13/13   legacy_application_content_rejects_malformed_results_and_forbidden_envelopes
+    PASSED 13/13   legacy_application_content_roundtrips_and_strict_mode_rejects_extensions
+    PASSED 13/13   live_http_legacy_reverse_response_rejects_foreign_principal_before_pending_mutation
+    PASSED 13/13   live_http_sse_handler_admission_preserves_parameter_header_rejection
+    PASSED 13/13   live_runtime_rejects_completion_notification_without_invoking_handler
+    PASSED 13/13   live_runtime_rejects_only_non_object_legacy_tool_arguments_without_advancing_lifecycle
+    PASSED 13/13   live_runtime_routes_exact_legacy_completion_through_the_legacy_router_surface
+    PASSED 13/13   live_runtime_routes_exact_legacy_frames_through_the_2024_adapter
+    PASSED 13/13   public_stdio_legacy_progress_sender_is_absent_when_only_token_is_removed
+    PASSED 13/13   public_stdio_legacy_progress_token_installs_f64_notification_sender
+    PASSED 13/13   returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup
+    PASSED 13/13   returning_split_waits_for_non_quiescent_modern_child_before_cleanup
+    PASSED 13/13   returning_subscription_nonquiescence_preserves_operation_and_close_errors
+    PASSED 13/13   returning_subscription_protocol_failure_preserves_cleanup_and_close_errors
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_legacy_handler
+    PASSED 13/13   stdio_pump_returns_failure_and_skips_hooks_for_non_quiescent_modern_child
+
+bd-onrqu [review]   3 pass / 0 fail
+    PASSED 13/13   alternating_tool_resource_recursion_uses_one_effective_depth
+    PASSED 13/13   nested_tool_calls_preserve_framework_terminal_errors
+    PASSED 13/13   opaque_internal_handler_errors_use_the_fixed_peer_contract
+
+bd-q96o3 [open]   2 pass / 0 fail
+    PASSED 13/13   modern_all_catalogs_allow_explicit_anonymous_provider_pagination
+    PASSED 13/13   modern_catalog_cursors_authenticate_every_byte_and_preserve_valid_replays
+
+bd-rssik [open]   6 pass / 6 fail
+    FAILED 10/10   generic_subscription_controls_cannot_finish_a_secured_response
+    FAILED 10/10   live_http_response_write_timeout_releases_stalled_json_peer
+    FAILED 6/10    live_http_shutdown_owns_registered_sse_body_before_flushing_terminal
+    FAILED 10/10   live_http_subscription_acknowledgement_precedes_deferred_progress
+    FAILED 8/10    live_http_subscription_cancellation_cannot_be_replaced_by_response_middleware
+    FAILED 10/10   secured_subscription_cancellation_is_delivered_once_then_finishes
+    PASSED 13/13   elected_shutdown_revalidates_original_credential_before_any_write
+    PASSED 13/13   forced_subscription_ack_order_active_first_keeps_graceful_completion
+    PASSED 13/13   forced_subscription_ack_order_pump_first_keeps_graceful_completion
+    PASSED 13/13   returning_subscription_unrelated_peer_cancel_preserves_owner_until_eof
+    PASSED 13/13   revoked_credential_withholds_committed_and_generic_subscription_controls
+    PASSED 13/13   subscription_deadline_does_not_wait_for_a_listener_shutdown_election
+
+bd-sdf4b [review]   7 pass / 0 fail
+    PASSED 13/13   async_stdio_server_refuses_raw_parameters_beyond_the_document_bound
+    PASSED 13/13   async_stdio_server_retains_exact_parameter_bytes_within_shared_admission_bound
+    PASSED 13/13   dispatch_stateless_listen_is_not_method_not_found
+    PASSED 13/13   forced_subscription_ack_order_under_recv_lock_is_written_when_recv_returns
+    PASSED 13/13   legacy_application_content_roundtrips_and_strict_mode_rejects_extensions
+    PASSED 13/13   public_stdio_cancellation_fence_drops_interleaved_progress_before_commit
+    PASSED 13/13   test_handler_read_listing_and_read_with_uri
+
+bd-sv4so [in_progress]   8 pass / 0 fail
+    PASSED 13/13   live_http_non_sse_shutdown_suppresses_the_pending_response
+    PASSED 13/13   live_http_sse_write_half_close_before_election_preserves_response
+    PASSED 13/13   memory_server_routes_cancellation_while_a_handler_is_pending
+    PASSED 13/13   public_stdio_final_progress_cancellation_suppresses_post_cancellation_frames
+    PASSED 13/13   returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup
+    PASSED 13/13   returning_split_waits_for_non_quiescent_modern_child_before_cleanup
+    PASSED 13/13   returning_subscription_background_response_write_succeeds
+    PASSED 13/13   subscription_deadline_does_not_wait_for_a_listener_shutdown_election
+
+bd-t1fvv [in_progress]   4 pass / 0 fail
+    PASSED 13/13   live_http_shutdown_bounded_settlement_finishes_lifecycle_once
+    PASSED 13/13   live_http_shutdown_joins_a_cooperative_child
+    PASSED 13/13   live_http_shutdown_polled_settlement_finishes_lifecycle_once
+    PASSED 13/13   live_http_shutdown_returns_caller_owned_noncooperative_child_for_later_join
+
+bd-uf8pv [review]   2 pass / 0 fail
+    PASSED 13/13   live_http_sse_handler_admission_preserves_parameter_header_rejection
+    PASSED 13/13   unserviceable_caller_deadline_drops_native_socket_before_ingress
+
+bd-wvi90 [review]   3 pass / 0 fail
+    PASSED 13/13   listing_budget_accounts_for_a_size_that_gains_a_digit
+    PASSED 13/13   listing_entry_cost_matches_rendered_entry
+    PASSED 13/13   test_handler_read_listing_and_read_with_uri
+
+bd-x3273 [in_progress]   10 pass / 0 fail
+    PASSED 13/13   live_http_legacy_reverse_response_reaches_an_async_handler
+    PASSED 13/13   live_http_legacy_reverse_response_rejects_foreign_principal_before_pending_mutation
+    PASSED 13/13   live_http_non_sse_shutdown_suppresses_the_pending_response
+    PASSED 13/13   live_http_sse_write_half_close_before_election_preserves_response
+    PASSED 13/13   memory_server_routes_cancellation_while_a_handler_is_pending
+    PASSED 13/13   public_stdio_final_progress_cancellation_suppresses_post_cancellation_frames
+    PASSED 13/13   public_stdio_peer_close_removes_without_terminal_completion
+    PASSED 13/13   returning_split_waits_for_non_quiescent_legacy_handler_before_owned_cleanup
+    PASSED 13/13   returning_split_waits_for_non_quiescent_modern_child_before_cleanup
+    PASSED 13/13   returning_subscription_background_response_write_succeeds
+
+bd-xstbj [review]   1 pass / 0 fail
+    PASSED 13/13   async_stdio_server_retains_exact_parameter_bytes_within_shared_admission_bound
+
+# TOTALS: 43 beads name >=1 discovered server test; 205 test-citations PASS, 13 FAIL
