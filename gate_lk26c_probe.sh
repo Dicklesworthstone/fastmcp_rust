@@ -41,7 +41,13 @@ if [ -f /tmp/lk26c_verdict.txt ]; then
   cat /tmp/lk26c_verdict.txt
   echo "=== END PRIOR RUN ==="
 fi
-exec > >(tee /tmp/lk26c_verdict.txt) 2>&1
+# probe_out/ is repo-relative so it can be retrieved with `rch exec --job
+# --sync-back probe_out`, which transfers EVEN ON NONZERO EXIT. That is the
+# purpose-built answer to attempt 3, where the work finished and the SSH drop
+# took the verdict with it. /tmp is kept as a second copy for the recovery
+# branch above. The directory must exist or --sync-back fails with exit 102.
+mkdir -p probe_out
+exec > >(tee /tmp/lk26c_verdict.txt probe_out/lk26c_verdict.txt) 2>&1
 
 echo "PROBE_HOST=$(hostname)"
 echo "PROBE_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -79,13 +85,24 @@ if [ -z "${BIN:-}" ] || [ ! -x "$BIN" ]; then
   exit 11
 fi
 
-echo "=== CONTROL: the binary runs and this test is DISCOVERED exactly once ==="
-# A zero-match filter would hang on nothing and look identical to a hang.
-# Validate the instrument against its own positive before trusting a timeout.
-"$BIN" --list 2>/dev/null | grep -c "$TEST"
+echo "=== CONTROL: resolve the FULL test path, because --exact needs it ==="
+# Attempt 4 was VOID for this exact reason: the control grepped `--list` for a
+# SUBSTRING and printed 1, while the run passed that same bare leaf name to
+# `--exact`, which requires the complete `module::path::name`. All 2482 tests
+# were filtered out, the binary exited 0 in 0.00s, and the script reported
+# "NOT a hang" -- a false negative. A control must use the EXACT matcher the
+# run will use, not an approximation of it.
+FULL=$("$BIN" --list --format terse 2>/dev/null | sed 's/: test$//' | grep -E "(^|::)${TEST}$")
+MATCHES=$(printf '%s\n' "$FULL" | grep -c . )
+echo "FULL_NAME=${FULL:-<none>}"
+echo "MATCHES=$MATCHES"
+if [ "$MATCHES" != "1" ]; then
+  echo "NO VERDICT: the filter resolves to $MATCHES tests, not exactly 1."
+  exit 12
+fi
 
 echo "=== RUN, bounded, in background ==="
-timeout --signal=KILL 40 "$BIN" "$TEST" --exact --test-threads=1 --nocapture \
+timeout --signal=KILL 40 "$BIN" "$FULL" --exact --test-threads=1 --nocapture \
   >/tmp/lk26c_run.$$ 2>&1 &
 WRAPPER=$!
 
@@ -96,9 +113,18 @@ PID=$(pgrep -P "$WRAPPER" | head -1)
 echo "WRAPPER=$WRAPPER HARNESS=$PID"
 
 if [ ! -d "/proc/$PID" ]; then
-  echo "PROCESS ALREADY GONE AT 5s -- this is NOT a hang on this host."
-  wait "$WRAPPER"; echo "EXIT=$?"
+  wait "$WRAPPER"; RC=$?
   echo "--- output ---"; cat /tmp/lk26c_run.$$
+  # A run that executed ZERO tests exits 0 in 0.00s and is indistinguishable
+  # from a pass unless this line is checked. Never read "finished fast" as a
+  # verdict without it.
+  if grep -q 'running 1 test' /tmp/lk26c_run.$$; then
+    echo "VERDICT: the test RAN and COMPLETED (exit $RC) -- NO HANG at this revision."
+    grep -E '^test |^test result:' /tmp/lk26c_run.$$
+  else
+    echo "NO VERDICT: zero tests executed (exit $RC). This is a VOID, not a pass."
+    exit 13
+  fi
   exit 0
 fi
 
