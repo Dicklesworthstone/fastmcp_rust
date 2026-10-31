@@ -3898,15 +3898,13 @@ fn validate_http_subscription_acknowledgement_filter(
                 );
             }
             (Some(requested), Some(acknowledged)) => {
-                for (index, task_id) in acknowledged.iter().enumerate() {
-                    if !requested.iter().any(|requested| requested == task_id)
-                        || acknowledged[..index]
-                            .iter()
-                            .any(|previous| previous == task_id)
-                    {
+                // Task IDs use exact-set semantics. Every occurrence remains
+                // in the typed, count-bounded diagnostic representation.
+                for task_id in acknowledged {
+                    if !requested.iter().any(|requested| requested == task_id) {
                         return Err(
-                        ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested,
-                    );
+                            ModernHttpSubscriptionListenError::AcknowledgementExtensionFilterNotRequested,
+                        );
                     }
                 }
             }

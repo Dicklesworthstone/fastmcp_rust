@@ -304,6 +304,8 @@ pub mod client {
         SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
     /// Tasks client APIs are available only with the official Tasks extension.
+    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    pub use crate::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use crate::{
         FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
@@ -1058,6 +1060,8 @@ pub use fastmcp_client::{ResourceSubscriptionRelations, SubscriptionListenReques
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 
+#[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+pub use fastmcp_client::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
     FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
@@ -1188,6 +1192,8 @@ pub mod auto {
     pub use fastmcp_transport::Transport;
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
+    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
         FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
@@ -3103,6 +3109,8 @@ pub mod modern {
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
+    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
         FinalTask, FinalTaskHandle, FinalTaskInputResponses, FinalTaskStatusNotification,
@@ -4352,6 +4360,24 @@ pub mod modern {
                 .await
         }
 
+        /// Watches one Task through this session's existing subscription owner.
+        /// Local cancellation or dropping the watch retires its listen request
+        /// without cancelling remote work or an independent catalog listener.
+        #[cfg(feature = "tasks")]
+        pub async fn watch_final_task<'client, 'handle>(
+            &'client mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &'handle mut FinalTaskHandle,
+        ) -> McpResult<FinalTaskStreamWatch<'client, 'handle, fastmcp_client::WebSocketClient<IO>>>
+        where
+            IO: Send + 'static,
+        {
+            handle
+                .watch_with_websocket(cx, &mut self.inner, cancellation)
+                .await
+        }
+
         /// Submits explicit Task input without replaying an uncertain update.
         /// The acknowledgement preserves the handle's snapshot; use
         /// [`Self::poll_final_task`] to reconcile before waiting again.
@@ -4611,6 +4637,21 @@ pub mod modern {
         ) -> McpResult<FinalTaskWaitOutcome> {
             handle
                 .wait_with_stdio(cx, &mut self.inner, cancellation, policy)
+                .await
+        }
+
+        /// Watches one Task through the sole yielding stdio ingress driver.
+        /// The watch exposes retained snapshots and bounded reconciliation;
+        /// cancellation/drop affects only its exact subscription request.
+        #[cfg(all(feature = "tasks", unix))]
+        pub async fn watch_final_task<'client, 'handle>(
+            &'client mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            handle: &'handle mut FinalTaskHandle,
+        ) -> McpResult<FinalTaskStreamWatch<'client, 'handle, fastmcp_client::Client>> {
+            handle
+                .watch_with_stdio(cx, &mut self.inner, cancellation)
                 .await
         }
 
@@ -11306,6 +11347,8 @@ pub mod prelude {
         tool,
         validate_final_core_result,
     };
+    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    pub use crate::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,

@@ -850,3 +850,161 @@ fn task_wait_policy_and_missing_timer_fail_before_transport_activity() {
         Poll::Ready(Ok(FinalTaskWaitOutcome::TimerUnavailable))
     ));
 }
+
+#[test]
+fn public_http_task_watch_acknowledgements_use_exact_set_subsets() {
+    for mode in ["duplicates", "empty", "absent", "foreign"] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let mut discover = accept(&listener);
+            assert_eq!(read(&mut discover)["method"], "server/discover");
+            write(&mut discover, &discovery()).unwrap();
+            let mut attach = accept(&listener);
+            assert_eq!(read(&mut attach)["method"], "tasks/get");
+            write(&mut attach, &response(2, task("working", None))).unwrap();
+
+            let mut observe = accept(&listener);
+            let request = read(&mut observe);
+            assert_eq!(request["id"], 3);
+            assert_eq!(request["method"], "subscriptions/listen");
+            assert_eq!(
+                request["params"]["notifications"]["taskIds"],
+                json!(["wait-task"])
+            );
+            let accepted = match mode {
+                "duplicates" => json!({"taskIds":["wait-task", "wait-task"]}),
+                "empty" => json!({"taskIds":[]}),
+                "absent" => json!({}),
+                "foreign" => json!({"taskIds":["wait-task", "foreign-task"]}),
+                _ => unreachable!(),
+            };
+            let acknowledged = json!({"jsonrpc":"2.0", "method":"notifications/subscriptions/acknowledged", "params":{
+                "_meta":{"io.modelcontextprotocol/subscriptionId":3}, "notifications":accepted
+            }});
+            let mut body = format!("data: {acknowledged}\n\n");
+            if mode == "duplicates" {
+                let mut completed = task("completed", None);
+                completed["lastUpdatedAt"] = json!("2026-07-28T12:00:02Z");
+                completed["_meta"] = json!({"io.modelcontextprotocol/subscriptionId":3});
+                let notification =
+                    json!({"jsonrpc":"2.0", "method":"notifications/tasks", "params":completed});
+                body.push_str(&format!("data: {notification}\n\n"));
+            }
+            let terminal = json!({"jsonrpc":"2.0", "id":3, "result":{
+                "resultType":"complete", "_meta":{"io.modelcontextprotocol/subscriptionId":3}
+            }});
+            body.push_str(&format!("data: {terminal}\n\n"));
+            // Keep a valid live response open through the next independent
+            // request. Empty acceptance must exhaust before the queued
+            // normal terminal, and cannot rely on an early transport EOF.
+            write!(observe,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+                body.len(),
+            ).unwrap();
+            observe.flush().unwrap();
+
+            let mut sibling = accept(&listener);
+            let request = read(&mut sibling);
+            assert_eq!(
+                request["method"], "tools/list",
+                "no implicit Task cancellation or extra observation request"
+            );
+            assert_eq!(request["id"], 4);
+            write(
+                &mut sibling,
+                &json!({"jsonrpc":"2.0", "id":4, "result":{
+                    "resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"
+                }}),
+            )
+            .unwrap();
+            drop(observe);
+        });
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut client = HttpClient::connect(
+                    &cx,
+                    plan(&target),
+                    ClientInfo {
+                        name: "task-ack-client".to_owned(),
+                        version: "1".to_owned(),
+                    },
+                    ClientCapabilities::default(),
+                )
+                .await
+                .unwrap();
+                let mut handle = client
+                    .attach_final_task(&cx, FinalTaskId::parse("wait-task").unwrap())
+                    .await
+                    .unwrap();
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let mut watch = handle
+                    .watch(
+                        &cx,
+                        &mut client,
+                        crate::sse::SseLimits::new(4096, 8192, 8).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let acknowledged = watch.next_event(&cx).await;
+                if mode == "foreign" {
+                    assert!(
+                        acknowledged.is_err(),
+                        "a distinct unrequested ID must not widen the watch"
+                    );
+                } else {
+                    let Some(crate::FinalTaskWatchEvent::Acknowledged { accepted_filter }) =
+                        acknowledged.unwrap()
+                    else {
+                        panic!("valid accepted subsets must reach the caller");
+                    };
+                    let accepted = fastmcp_protocol::task_subscription_ids(&accepted_filter)
+                        .unwrap()
+                        .unwrap_or_default();
+                    assert_eq!(accepted.is_empty(), mode != "duplicates");
+                    assert!(
+                        accepted
+                            .iter()
+                            .all(|id| id == &FinalTaskId::parse("wait-task").unwrap())
+                    );
+                }
+                if mode == "duplicates" {
+                    let Some(crate::FinalTaskWatchEvent::TaskUpdated(notification)) =
+                        watch.next_event(&cx).await.unwrap()
+                    else {
+                        panic!("duplicate accepted IDs must permit the owned Task event");
+                    };
+                    assert!(matches!(
+                        notification.params.task,
+                        FinalTask::Completed { .. }
+                    ));
+                }
+                let exhausted = asupersync::time::timeout_at(
+                    cx.now() + Duration::from_millis(250),
+                    watch.next_event(&cx),
+                )
+                .await
+                .expect("exhausted watches must not wait for peer data")
+                .unwrap();
+                assert!(exhausted.is_none());
+                drop(watch);
+                if mode == "duplicates" {
+                    assert!(matches!(handle.task(), FinalTask::Completed { .. }));
+                    assert_eq!(
+                        serde_json::to_value(handle.task()).unwrap()["result"]["opaque"],
+                        json!({"x":[1,true,"kept"]})
+                    );
+                } else {
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                }
+                assert!(cx.checkpoint().is_ok());
+                client.list_tools(&cx, None).await.unwrap();
+            });
+        peer.join().unwrap();
+    }
+}

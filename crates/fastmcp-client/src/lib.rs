@@ -54,6 +54,8 @@ mod execution;
 mod memory;
 #[cfg(feature = "tasks")]
 mod task_wait;
+#[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+pub use task_wait::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
 pub use task_wait::{FinalTaskWaitOutcome, FinalTaskWaitPolicy};
 pub mod http_auth;
@@ -1390,12 +1392,10 @@ fn validate_subscription_acknowledgement_filter(
                 ));
             }
             (Some(requested), Some(acknowledged)) => {
-                for (index, task_id) in acknowledged.iter().enumerate() {
-                    if !requested.iter().any(|requested| requested == task_id)
-                        || acknowledged[..index]
-                            .iter()
-                            .any(|previous| previous == task_id)
-                    {
+                // Task IDs use exact-set semantics; bounded duplicate IDs
+                // remain part of the admitted diagnostic representation.
+                for task_id in acknowledged {
+                    if !requested.iter().any(|requested| requested == task_id) {
                         return Err(subscription_listener_protocol_error(
                             "Subscription acknowledgement contains an invalid Tasks filter",
                         ));
@@ -5915,6 +5915,9 @@ struct LiveWebSocketTaskSubscription {
     terminal_response: Option<(JsonRpcResponse, Option<String>)>,
     lifetime: WebSocketSubscriptionLifetime,
     terminal_error: Option<McpError>,
+    /// A dropped high-level watch leaves this exact owner for the next
+    /// connection operation to cancel before allocating or reading again.
+    abandoned: bool,
 }
 
 /// The committed listen request owns these clocks across every receive owner.
@@ -9992,6 +9995,7 @@ where
         if self.closed {
             return Err(McpError::internal_error("WebSocket client is closed"));
         }
+        self.settle_abandoned_websocket_request().await?;
         if self.live_task_subscription.is_some() {
             return Err(McpError::invalid_request(
                 "A final Tasks WebSocket subscription is already active on this client",
@@ -10046,6 +10050,7 @@ where
                 self.subscription_timeout_policy,
             ),
             terminal_error: None,
+            abandoned: false,
         });
         self.finish_websocket_request(&request_id);
         Ok(())
@@ -10075,7 +10080,9 @@ where
             .live_task_subscription
             .as_ref()
             .is_some_and(|subscription| {
-                subscription.terminal_error.is_some() || subscription.terminal_response.is_some()
+                !subscription.abandoned
+                    && (subscription.terminal_error.is_some()
+                        || subscription.terminal_response.is_some())
             })
         {
             return self.take_ready_task_subscription_event()?.ok_or_else(|| {
@@ -11225,11 +11232,13 @@ where
     where
         IO: Send + 'static,
     {
-        let Some(owner) = self.transient_request.as_ref() else {
-            return Ok(());
-        };
-        match owner.state.phase.load(Ordering::Acquire) {
-            WebSocketTransientRequestState::ABANDONED_RESPONSE => {
+        let phase = self
+            .transient_request
+            .as_ref()
+            .map(|owner| owner.state.phase.load(Ordering::Acquire));
+        match phase {
+            None => Ok(()),
+            Some(WebSocketTransientRequestState::ABANDONED_RESPONSE) => {
                 let owner = self
                     .transient_request
                     .take()
@@ -11246,7 +11255,7 @@ where
                     Err(outcome)
                 }
             }
-            WebSocketTransientRequestState::ABANDONED_SEND => {
+            Some(WebSocketTransientRequestState::ABANDONED_SEND) => {
                 let error = self
                     .reverse_callback_pool
                     .terminal_error()
@@ -11260,14 +11269,26 @@ where
                 self.settle_close(&connection_cx).await?;
                 Err(error)
             }
-            WebSocketTransientRequestState::TERMINAL => {
+            Some(WebSocketTransientRequestState::TERMINAL) => {
                 self.transient_request = None;
                 Ok(())
             }
             _ => Err(McpError::internal_error(
                 "WebSocket client already owns an active request",
             )),
+        }?;
+        // A high-level Tasks watch owns no separate writer or receive task.
+        // Its Drop marks the retained slot; settle any abandoned RPC first so
+        // an uncertain frame can never be followed by a cancellation write.
+        #[cfg(feature = "tasks")]
+        if self
+            .live_task_subscription
+            .as_ref()
+            .is_some_and(|subscription| subscription.abandoned)
+        {
+            self.cancel_live_task_subscription().await?;
         }
+        Ok(())
     }
 
     async fn allocate_request_id(&mut self) -> McpResult<RequestId>
@@ -13907,7 +13928,9 @@ impl FinalTaskHandle {
     /// cursor nor a resumption token, so a new watch must begin from an
     /// explicit [`Self::poll`] reconciliation. An already terminal handle
     /// returns an exhausted watcher without opening a subscription. A live
-    /// watcher stops after yielding its first terminal Task snapshot.
+    /// watcher stops after yielding its first terminal Task snapshot. An
+    /// acknowledgement accepting no Task IDs is yielded once and exhausts
+    /// the watcher without changing its retained snapshot.
     pub async fn watch<'client, 'handle>(
         &'handle mut self,
         cx: &Cx,
@@ -13946,7 +13969,9 @@ impl FinalTaskHandle {
 #[cfg(feature = "tasks")]
 #[derive(Debug, Clone)]
 pub enum FinalTaskWatchEvent {
-    /// The server acknowledged the exact task filter requested by the watcher.
+    /// The server acknowledged an accepted subset of the requested Task filter.
+    /// Repeated occurrences of the same ID use exact-set semantics. An empty
+    /// accepted subset is yielded once and exhausts the watcher.
     Acknowledged {
         /// The task-only subscription filter accepted by the server.
         accepted_filter: SubscriptionFilter,
@@ -14002,9 +14027,10 @@ impl FinalTaskWatch<'_, '_> {
     /// Reads one task watcher event, skipping exact repeated Task snapshots.
     ///
     /// `None` is returned after a terminal Task snapshot or subscription result
-    /// was yielded, or immediately when the handle was already terminal when
-    /// the watcher opened. A Task terminal closes only this response body;
-    /// buffered later snapshots cannot replace or repeat its outcome.
+    /// was yielded, after an acknowledgement accepted no Task IDs, or
+    /// immediately when the handle was already terminal when the watcher
+    /// opened. A Task terminal or empty acknowledgement closes only this
+    /// response body; buffered later snapshots cannot change the handle.
     ///
     /// A changed notification with an equal or older update instant triggers
     /// one `tasks/get` under this same caller context and the client's request
@@ -14049,17 +14075,17 @@ impl FinalTaskWatch<'_, '_> {
                             "final task subscription acknowledgement has invalid task IDs",
                         ))
                     })?
-                    .ok_or_else(|| {
-                        HttpClientError::CoreResult(McpError::invalid_request(
-                            "final task subscription acknowledgement omitted the requested task",
-                        ))
-                    })?;
-                    if accepted_task_ids.len() != 1
-                        || accepted_task_ids.first() != Some(self.handle.task_id())
+                    .unwrap_or_default();
+                    if accepted_task_ids.iter().any(|id| id != self.handle.task_id())
                     {
                         return Err(HttpClientError::CoreResult(McpError::invalid_request(
-                            "final task subscription acknowledgement did not accept the requested task",
+                            "final task subscription acknowledgement widened the requested task filter",
                         )));
+                    }
+                    if accepted_task_ids.is_empty()
+                        && let Some(mut listener) = self.listener.take()
+                    {
+                        listener.cancel();
                     }
                     return Ok(Some(FinalTaskWatchEvent::Acknowledged { accepted_filter }));
                 }

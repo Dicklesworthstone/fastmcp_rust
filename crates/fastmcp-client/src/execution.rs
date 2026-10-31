@@ -4150,13 +4150,12 @@ fn validate_task_subscription_filter(
         McpError::invalid_request("Tasks subscription acknowledgement filter is invalid")
     })?;
     if let Some(accepted_task_ids) = accepted_task_ids {
-        for (index, task_id) in accepted_task_ids.iter().enumerate() {
+        // Typed decoding still validates and counts every repeated Task ID;
+        // accepted membership is a set operation without rewriting those IDs.
+        for task_id in &accepted_task_ids {
             if !requested_task_ids
                 .iter()
                 .any(|requested| requested == task_id)
-                || accepted_task_ids[..index]
-                    .iter()
-                    .any(|previous| previous == task_id)
             {
                 return Err(McpError::invalid_request(
                     "Tasks subscription acknowledgement contains an unrequested taskId",
