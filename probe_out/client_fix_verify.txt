@@ -1,0 +1,124 @@
+HOST=hz3
+DATE=2026-10-31T04:40:53Z
+NPROC=64
+BLOBS (bind the claim to the bytes under test):
+  587c9d0121a8cd972ad6cb476035edf2e72371cb  rpc/subscription/tests.rs
+  05c952da781b3e8f7a117330df25397c6523c068  .../tests/termination.rs
+
+=== BUILD ===
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.61s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc)
+BIN=.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc
+DISCOVERED=1836   (baseline was 1836)
+
+############################################################
+### THE TWO FIXED TESTS, solo, serial, full output
+############################################################
+
+---- http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+   -> PASS (exit 0)
+
+---- http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+   -> PASS (exit 0)
+
+---- http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+   -> STILL FAILING (exit 101). The diagnosis was wrong; here is why:
+
+running 1 test
+test http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids ... 
+thread 'http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids' (4006288) panicked at crates/fastmcp-client/src/http_executor.rs:18016:13:
+invalid cancellation produced an unexpected refusal: NotificationAdmission(InvalidParams { method: "notifications/cancelled" })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+             at ./crates/fastmcp-client/src/http_executor.rs:18016:13
+   3: fastmcp_client::http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids::{closure#0}
+             at ./crates/fastmcp-client/src/http_executor.rs:17954:88
+   4: <fastmcp_client::http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   5: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.09s
+
+
+---- http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+   -> STILL FAILING (exit 101). The diagnosis was wrong; here is why:
+
+running 1 test
+test http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners ... 
+thread 'http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners' (4006347) panicked at crates/fastmcp-client/src/http_executor.rs:17586:13:
+a non-matching event owner must be refused by id, got: Err(Connection(SubscriptionsListen(NotificationAdmission(InvalidParams { method: "notifications/tools/list_changed" }))))
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: public_http_subscription_event_owner_case
+             at ./crates/fastmcp-client/src/http_executor.rs:17586:13
+   3: public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+             at ./crates/fastmcp-client/src/http_executor.rs:17635:13
+   4: fastmcp_client::http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners::{closure#0}
+             at ./crates/fastmcp-client/src/http_executor.rs:17628:84
+   5: <fastmcp_client::http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   6: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.09s
+
+
+fixed-and-passing: 2 of 4
+
+############################################################
+### THE GATE: full target x3, default test-threads
+############################################################
+  run 1: test result: FAILED. 1821 passed; 15 failed; 0 ignored; 0 measured; 0 filtered out; finished in 22.68s
+  run 2: test result: FAILED. 1821 passed; 15 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.50s
+  run 3: test result: FAILED. 1821 passed; 15 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.11s
+
+  failing population across the 3 runs (times-failed  name):
+           3 tests::sync_reverse_handler_nesting_block_on_is_refused_before_any_retry
+           3 tests::sync_reverse_handler_is_polled_under_the_caller_cx_without_a_nested_runtime
+           3 tests::public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry
+           3 tests::public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget
+           3 tests::async_mrtr_refusal_and_passthrough
+           3 tests::async_mrtr_public_verbs
+           3 tests::async_mrtr_operation_deadline
+           3 tests::async_mrtr_continuation_bounds
+           3 tests::async_mrtr_callback_cancellation
+           3 memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+           3 mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+           3 http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+           3 http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+           3 http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+           3 http_auth::dpop::native::core::catalog::era_tests::modern_looking_metadata_cannot_retag_a_legacy_typed_catalog
+
+  distinct failing names = 15   (baseline 18: 17 deterministic + 1 intermittent)
+
+  NEITHER FIXED TEST MAY APPEAR BELOW:
+     0 occurrence(s)  preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+     0 occurrence(s)  ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+     1 occurrence(s)  public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+     1 occurrence(s)  public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+
+  REGRESSION CHECK -- names failing now that were NOT in the baseline 18:
+     new failures introduced: 0   (must be 0)

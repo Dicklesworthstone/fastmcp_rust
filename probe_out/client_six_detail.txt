@@ -1,0 +1,318 @@
+HOST=hz3
+DATE=2026-10-31T04:31:53Z
+NPROC=64
+
+=== BUILD (warm) ===
+BUILD_EXIT=0
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.52s
+  Executable unittests src/lib.rs (.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc)
+BIN=.rch-target/debug/build/fastmcp-client/d10adaaf362889bc/out/fastmcp_client-d10adaaf362889bc
+DISCOVERED=1836  (full list synced back)
+
+================================================================
+### http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+================================================================
+exit=101
+
+running 1 test
+test http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle ... 
+thread 'http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle' (3811994) panicked at crates/fastmcp-client/src/http_executor.rs:18962:10:
+the public client completes the exact fresh legacy lifecycle: Connection(LegacyPersistentReceiverStopped)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/result.rs:1869:5
+   3: <core::result::Result<fastmcp_client::HttpClient, fastmcp_client::HttpClientError>>::expect
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1184:23
+   4: public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+             at ./crates/fastmcp-client/src/http_executor.rs:18962:10
+   5: fastmcp_client::http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle::{closure#0}
+             at ./crates/fastmcp-client/src/http_executor.rs:18864:76
+   6: <fastmcp_client::http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_executor::tests::public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.09s
+
+
+================================================================
+### mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+================================================================
+exit=101
+
+running 1 test
+test mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment ... 
+thread 'mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment' (3812034) panicked at crates/fastmcp-client/src/mcp_config.rs:1834:14:
+default config client completes modern discovery: ClientError(McpError { code: InternalError, message: "Transport closed", data: None })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/result.rs:1869:5
+   3: <core::result::Result<fastmcp_client::Client, fastmcp_client::mcp_config::ConfigError>>::expect
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1184:23
+   4: fastmcp_client::mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+             at ./crates/fastmcp-client/src/mcp_config.rs:1834:14
+   5: fastmcp_client::mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment::{closure#0}
+             at ./crates/fastmcp-client/src/mcp_config.rs:1803:83
+   6: <fastmcp_client::mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    mcp_config::tests::config_client_uses_modern_first_builder_with_identity_cwd_and_environment
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.08s
+
+
+================================================================
+### http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+================================================================
+exit=101
+
+running 1 test
+test http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids ... 
+thread 'http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids' (3812089) panicked at crates/fastmcp-client/src/http_executor.rs:18006:13:
+assertion failed: matches!((expected_error, error),
+    ("missing", ModernHttpSubscriptionListenError::EventMissingId) |
+    ("invalid", ModernHttpSubscriptionListenError::EventInvalidId) |
+    ("foreign", ModernHttpSubscriptionListenError::EventIdMismatch { .. }) |
+    ("request",
+    ModernHttpSubscriptionListenError::CancellationRequestIdMismatch { .. }))
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:150:5
+   3: public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+             at ./crates/fastmcp-client/src/http_executor.rs:18006:13
+   4: fastmcp_client::http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids::{closure#0}
+             at ./crates/fastmcp-client/src/http_executor.rs:17948:88
+   5: <fastmcp_client::http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   6: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_executor::tests::public_http_subscription_cancellation_requires_matching_request_and_stream_ids
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.09s
+
+
+================================================================
+### http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+================================================================
+exit=101
+
+running 1 test
+test http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners ... 
+thread 'http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners' (3812126) panicked at crates/fastmcp-client/src/http_executor.rs:17583:13:
+assertion failed: matches!(event,
+    Err(crate::HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(ModernHttpSubscriptionListenError::EventMissingId
+    | ModernHttpSubscriptionListenError::EventInvalidId |
+    ModernHttpSubscriptionListenError::EventIdMismatch { .. }))))
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::panicking::panic
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:150:5
+   3: public_http_subscription_event_owner_case
+             at ./crates/fastmcp-client/src/http_executor.rs:17583:13
+   4: public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+             at ./crates/fastmcp-client/src/http_executor.rs:17629:13
+   5: fastmcp_client::http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners::{closure#0}
+             at ./crates/fastmcp-client/src/http_executor.rs:17622:84
+   6: <fastmcp_client::http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_executor::tests::public_http_subscription_rejects_invalid_and_string_lookalike_event_owners
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.09s
+
+
+================================================================
+### http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+================================================================
+exit=101
+
+running 1 test
+test http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception ... 
+thread 'http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception' (3812155) panicked at crates/fastmcp-client/src/http_auth/dpop/native/core/stream/subscription/tests/termination.rs:176:71:
+called `Result::unwrap()` on an `Err` value: Core(Protocol(InvalidResult))
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/result.rs:1869:5
+   3: unwrap<fastmcp_client::http_auth::dpop::native::core::stream::StreamEvent<fastmcp_protocol::messages::CoreResult, fastmcp_protocol::messages::ServerNotification>, fastmcp_client::http_auth::dpop::native::core::stream::DpopStreamError>
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   4: ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+             at ./crates/fastmcp-client/src/http_auth/dpop/native/core/stream/subscription/tests/termination.rs:176:71
+   5: fastmcp_client::http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception::{closure#0}
+             at ./crates/fastmcp-client/src/http_auth/dpop/native/core/stream/subscription/tests/termination.rs:169:69
+   6: <fastmcp_client::http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   7: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_auth::dpop::native::core::stream::subscription::tests::termination::ordinary_core_rpc_still_rejects_the_subscription_tail_exception
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.08s
+
+
+================================================================
+### http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+================================================================
+exit=101
+
+running 1 test
+test http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests ... 
+thread 'http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests' (3812183) panicked at crates/fastmcp-client/src/http_auth/rpc/subscription/tests.rs:10:6:
+typed subscription parameters: Error("invalid URI scheme", line: 0, column: 0)
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/result.rs:1869:5
+   3: <core::result::Result<fastmcp_protocol::messages::FinalSubscriptionsListenParams, serde_json::error::Error>>::expect
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1184:23
+   4: params
+             at ./crates/fastmcp-client/src/http_auth/rpc/subscription/tests.rs:10:6
+   5: preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+             at ./crates/fastmcp-client/src/http_auth/rpc/subscription/tests.rs:390:17
+   6: fastmcp_client::http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests::{closure#0}
+             at ./crates/fastmcp-client/src/http_auth/rpc/subscription/tests.rs:379:87
+   7: <fastmcp_client::http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+   8: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    http_auth::rpc::subscription::tests::preflight_refuses_unnegotiated_filters_duplicate_resources_and_oversized_requests
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.08s
+
+
+================================================================
+### memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+================================================================
+exit=101
+
+running 1 test
+test memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication ... 
+thread 'memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication' (3812310) panicked at crates/fastmcp-client/src/memory.rs:834:14:
+called `Result::unwrap()` on an `Err` value: Io(Custom { kind: Other, error: "memory transport send obligation admission refused: obligation holder is no longer live" })
+stack backtrace:
+   0: __rustc::rust_begin_unwind
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/std/src/panicking.rs:677:5
+   1: core::panicking::panic_fmt
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/panicking.rs:80:14
+   2: core::result::unwrap_failed
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/result.rs:1869:5
+   3: unwrap<(), fastmcp_transport::TransportError>
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/result.rs:1232:23
+   4: {async_fn#0}
+             at ./crates/fastmcp-client/src/memory.rs:834:14
+   5: {async_block#0}
+             at ./crates/fastmcp-client/src/memory.rs:1403:66
+   6: <asupersync::time::timeout_future::TimeoutFuture<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}::{closure#0}> as core::future::future::Future>::poll
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/time/timeout_future.rs:293:27
+   7: {async_block#0}
+             at ./crates/fastmcp-client/src/memory.rs:1431:14
+   8: {closure#2}<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{async_block_env#0}>
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/runtime/current_thread.rs:674:22
+   9: <asupersync::runtime::current_thread::drive_root_on<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}>::{closure#2} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  10: <core::panic::unwind_safe::AssertUnwindSafe<asupersync::runtime::current_thread::drive_root_on<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}>::{closure#2}> as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/panic/unwind_safe.rs:275:9
+  11: do_call<core::panic::unwind_safe::AssertUnwindSafe<asupersync::runtime::current_thread::drive_root_on::{closure_env#2}<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{async_block_env#0}>>, core::task::poll::Poll<()>>
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:574:43
+  12: __rust_try
+  13: catch_unwind<core::task::poll::Poll<()>, core::panic::unwind_safe::AssertUnwindSafe<asupersync::runtime::current_thread::drive_root_on::{closure_env#2}<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{async_block_env#0}>>>
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panicking.rs:542:19
+  14: catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<asupersync::runtime::current_thread::drive_root_on::{closure_env#2}<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{async_block_env#0}>>, core::task::poll::Poll<()>>
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/std/src/panic.rs:359:14
+  15: drive_root_on<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{async_block_env#0}>
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/runtime/current_thread.rs:669:26
+  16: <asupersync::runtime::current_thread::CurrentThreadDriver>::drive::<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}>::{closure#0}
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/runtime/current_thread.rs:466:13
+  17: <asupersync::runtime::current_thread::WorkerLoan>::with_thread_context::<core::result::Result<(), alloc::boxed::Box<dyn core::any::Any + core::marker::Send>>, <asupersync::runtime::current_thread::CurrentThreadDriver>::drive<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}>::{closure#0}>
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/runtime/current_thread.rs:583:22
+  18: <asupersync::runtime::current_thread::CurrentThreadDriver>::drive::<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}>
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/runtime/current_thread.rs:465:28
+  19: <asupersync::runtime::builder::Runtime>::block_on::<fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}>
+             at /home/ubuntu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/asupersync-0.5.0/src/runtime/builder.rs:4106:42
+  20: memory_client_caller_deadline_interrupts_full_queue_before_publication
+             at ./crates/fastmcp-client/src/memory.rs:1401:17
+  21: fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0}
+             at ./crates/fastmcp-client/src/memory.rs:1395:80
+  22: <fastmcp_client::memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication::{closure#0} as core::ops::function::FnOnce<()>>::call_once
+             at /home/ubuntu/.rustup/toolchains/nightly-2026-08-25-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/ops/function.rs:250:5
+  23: <fn() -> core::result::Result<(), alloc::string::String> as core::ops::function::FnOnce<()>>::call_once
+             at /rustc/e7769602aca3770e8d8ea55716becb22e839a579/library/core/src/ops/function.rs:250:5
+note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
+FAILED
+
+failures:
+
+failures:
+    memory::tests::memory_client_caller_deadline_interrupts_full_queue_before_publication
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1835 filtered out; finished in 0.11s
+
+
+================ ERROR-VALUE SUMMARY ================
+(the line after each 'panicked at' is the payload; that is the datum)
+    Err(crate::HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(ModernHttpSubscriptionListenError::EventMissingId
+assertion failed: matches!((expected_error, error),
+assertion failed: matches!(event,
+called `Result::unwrap()` on an `Err` value: Core(Protocol(InvalidResult))
+called `Result::unwrap()` on an `Err` value: Io(Custom { kind: Other, error: "memory transport send obligation admission refused: obligation holder is no longer live" })
+
+HolderNotLive present anywhere in this run? -> 0
