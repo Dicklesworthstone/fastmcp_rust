@@ -680,15 +680,23 @@ fn exact_json_value_len(value: &ExactJsonValue, depth: usize) -> Result<usize, R
 }
 
 fn encoded_json_string_len(value: &str) -> Result<usize, ResultDecodeError> {
-    let mut encoded_bytes = 2_usize;
-    for character in value.chars() {
-        let bytes = match character {
-            '"' | '\\' | '\u{0008}' | '\u{000c}' | '\n' | '\r' | '\t' => 2,
-            '\u{0000}'..='\u{001f}' => 6,
-            _ => character.len_utf8(),
+    // UTF-8 is copied unchanged except for JSON's ASCII escape bytes. Start
+    // with the original byte length instead of decoding every scalar and
+    // doing checked arithmetic for every ordinary byte of a large result.
+    let mut encoded_bytes = value
+        .len()
+        .checked_add(2)
+        .ok_or_else(|| ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"))?;
+    for byte in value
+        .bytes()
+        .filter(|byte| *byte < 0x20 || matches!(byte, b'"' | b'\\'))
+    {
+        let extra_bytes = match byte {
+            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 1,
+            _ => 5,
         };
         encoded_bytes = encoded_bytes
-            .checked_add(bytes)
+            .checked_add(extra_bytes)
             .ok_or_else(|| ResultDecodeError::new(ResultDecodeErrorKind::BoundExceeded, "$"))?;
     }
     Ok(encoded_bytes)
@@ -1795,22 +1803,31 @@ fn encode_exact_value(value: &ExactJsonValue, output: &mut String) {
 
 fn encode_json_string(value: &str, output: &mut String) {
     output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\u{0008}' => output.push_str("\\b"),
-            '\u{000c}' => output.push_str("\\f"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            '\u{0000}'..='\u{001f}' => {
+    let mut remaining = value;
+    while let Some(index) = remaining
+        .as_bytes()
+        .iter()
+        .position(|byte| *byte < 0x20 || matches!(byte, b'"' | b'\\'))
+    {
+        // Every delimiter is ASCII, so both ends of the unchanged span are
+        // UTF-8 boundaries even when it contains multibyte characters.
+        output.push_str(&remaining[..index]);
+        match remaining.as_bytes()[index] {
+            b'"' => output.push_str("\\\""),
+            b'\\' => output.push_str("\\\\"),
+            b'\x08' => output.push_str("\\b"),
+            b'\x0c' => output.push_str("\\f"),
+            b'\n' => output.push_str("\\n"),
+            b'\r' => output.push_str("\\r"),
+            b'\t' => output.push_str("\\t"),
+            byte => {
                 use std::fmt::Write as _;
-                let _ = write!(output, "\\u{:04x}", u32::from(character));
+                let _ = write!(output, "\\u{byte:04x}");
             }
-            _ => output.push(character),
         }
+        remaining = &remaining[index + 1..];
     }
+    output.push_str(remaining);
     output.push('"');
 }
 
@@ -1905,31 +1922,49 @@ impl<'a> ExactJsonParser<'a> {
                         ResultDecodeError::new(ResultDecodeErrorKind::InvalidJson, path)
                     })?;
                     self.offset += 1;
-                    match escaped {
-                        b'"' => value.push('"'),
-                        b'\\' => value.push('\\'),
-                        b'/' => value.push('/'),
-                        b'b' => value.push('\u{0008}'),
-                        b'f' => value.push('\u{000c}'),
-                        b'n' => value.push('\n'),
-                        b'r' => value.push('\r'),
-                        b't' => value.push('\t'),
-                        b'u' => value.push(self.unicode_escape(path)?),
+                    let character = match escaped {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{0008}',
+                        b'f' => '\u{000c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => self.unicode_escape(path)?,
                         _ => {
                             return Err(ResultDecodeError::new(
                                 ResultDecodeErrorKind::InvalidJson,
                                 path,
                             ));
                         }
+                    };
+                    if character.len_utf8() > max_bytes.saturating_sub(value.len()) {
+                        return Err(ResultDecodeError::new(
+                            ResultDecodeErrorKind::BoundExceeded,
+                            path,
+                        ));
                     }
+                    value.push(character);
                 }
                 _ => {
                     let tail = &self.input[self.offset..];
-                    let character = tail.chars().next().ok_or_else(|| {
-                        ResultDecodeError::new(ResultDecodeErrorKind::InvalidJson, path)
-                    })?;
-                    value.push(character);
-                    self.offset += character.len_utf8();
+                    let bytes = tail
+                        .as_bytes()
+                        .iter()
+                        .position(|byte| *byte < 0x20 || matches!(byte, b'"' | b'\\'))
+                        .unwrap_or(tail.len());
+                    // An ASCII delimiter cannot split a UTF-8 character.
+                    // Enforce the decoded byte budget before copying the run,
+                    // retaining the same bound for raw and escaped strings.
+                    if bytes > max_bytes.saturating_sub(value.len()) {
+                        return Err(ResultDecodeError::new(
+                            ResultDecodeErrorKind::BoundExceeded,
+                            path,
+                        ));
+                    }
+                    value.push_str(&tail[..bytes]);
+                    self.offset += bytes;
                 }
             }
             if value.len() > max_bytes {
@@ -2151,6 +2186,103 @@ impl<'a> ExactJsonParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_json_string_runs_preserve_unicode_and_every_ascii_escape() {
+        let ascii: String = (0_u8..=127).map(char::from).collect();
+        let prefix = "plain-\u{00e9}-\u{4e2d}-\u{1f642}".repeat(512);
+        for value in [
+            String::new(),
+            prefix.clone(),
+            format!("{prefix}{ascii}{prefix}\u{2028}\u{2029}"),
+        ] {
+            let expected = serde_json::to_string(&value).expect("reference string encoding");
+            let mut encoded = String::new();
+            encode_json_string(&value, &mut encoded);
+            assert_eq!(encoded, expected);
+            assert_eq!(encoded_json_string_len(&value).unwrap(), expected.len());
+            assert_eq!(
+                parse_exact_json(&encoded).expect("valid UTF-8 and JSON escapes are admitted"),
+                ExactJsonValue::String(value)
+            );
+        }
+
+        assert_eq!(
+            parse_exact_json(r#""before-\u00e9-\u4e2d-\ud83d\ude42-after\/\n""#).unwrap(),
+            ExactJsonValue::String("before-\u{00e9}-\u{4e2d}-\u{1f642}-after/\n".to_owned())
+        );
+    }
+
+    #[test]
+    fn exact_json_string_runs_reject_controls_and_malformed_escapes() {
+        let prefix = "plain-\u{00e9}-\u{4e2d}-\u{1f642}".repeat(512);
+        let accepted = format!("\"{prefix}\\nend\"");
+        let before = parse_exact_json(&accepted).expect("escaped newline is valid");
+        for suffix in [
+            "\nend\"",
+            "\0end\"",
+            "\\qend\"",
+            "\\u00xz\"",
+            "\\ud800x\"",
+            "\\ud800\\u0041\"",
+            "\\udc00\"",
+            "\\",
+            "",
+        ] {
+            let error = parse_exact_json(&format!("\"{prefix}{suffix}"))
+                .expect_err("changing only the suffix must reject invalid JSON strings");
+            assert_eq!(error.kind(), ResultDecodeErrorKind::InvalidJson);
+        }
+        assert_eq!(parse_exact_json(&accepted).unwrap(), before);
+    }
+
+    #[test]
+    fn exact_json_string_runs_enforce_decoded_unicode_byte_bounds() {
+        for (limit, object_key) in [
+            (MAX_RESULT_STRING_BYTES, false),
+            (MAX_RESULT_KEY_BYTES, true),
+        ] {
+            for (tail, decoded_bytes) in [
+                ("\u{1f642}", 4),
+                ("\\ud83d\\ude42", 4),
+                ("\\\"", 1),
+                ("\\n", 1),
+            ] {
+                let document = |extra: usize| {
+                    let value = format!("{}{}", "a".repeat(limit - decoded_bytes + extra), tail);
+                    if object_key {
+                        format!("{{\"{value}\":0}}")
+                    } else {
+                        format!("{{\"text\":\"{value}\"}}")
+                    }
+                };
+                parse_exact_json(&document(0)).expect("exact decoded UTF-8 byte bound is admitted");
+                let error = parse_exact_json(&document(1))
+                    .expect_err("one decoded byte over the same bound is refused");
+                assert_eq!(error.kind(), ResultDecodeErrorKind::BoundExceeded);
+                let error = parse_exact_json(&document(decoded_bytes))
+                    .expect_err("an escape cannot grow an already full decoded string");
+                assert_eq!(error.kind(), ResultDecodeErrorKind::BoundExceeded);
+            }
+        }
+    }
+
+    #[test]
+    fn large_result_string_runs_preserve_payload_and_number_lexemes() {
+        let source = format!(
+            "{{\"resultType\":\"complete\",\"first\":\"{}\",\"second\":\"{}\",\"integer\":123456789012345678901234567890,\"decimal\":-7.30E-12}}",
+            "x".repeat(3 * 1024 * 1024),
+            "y".repeat(2 * 1024 * 1024),
+        );
+        let (decoded, diagnostic) = decode_peer_result(
+            &source,
+            ResultPeerEra::Modern,
+            &CoreResultDiscriminatorPolicy,
+        )
+        .expect("large content inside the per-string and document bounds is admitted");
+        assert_eq!(diagnostic, None);
+        assert_eq!(encode_result(&decoded), source);
+    }
 
     // LIMIT-01: one string value admits a 3 MiB decoded binary block as
     // Base64 (4 MiB). One more byte is refused.
