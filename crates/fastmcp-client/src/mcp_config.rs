@@ -33,8 +33,8 @@
 //! let config = ConfigLoader::default().load()?;
 //!
 //! // Create a client for a specific server
-//! # fn create_client(config: &McpConfig, cx: &Cx) -> Result<(), ConfigError> {
-//! let client = config.client(cx, "filesystem")?;
+//! # async fn create_client(config: &McpConfig, cx: &Cx) -> Result<(), ConfigError> {
+//! let client = config.client(cx, "filesystem").await?;
 //! # let _ = client;
 //! # Ok(())
 //! # }
@@ -767,8 +767,9 @@ impl McpConfig {
     /// let config = McpConfig::new();
     /// let _client = config.client("filesystem");
     /// ```
-    pub fn client(&self, cx: &Cx, name: &str) -> Result<Client, ConfigError> {
+    pub async fn client(&self, cx: &Cx, name: &str) -> Result<Client, ConfigError> {
         self.client_with_timeout_policy(cx, name, RequestTimeoutPolicy::default())
+            .await
     }
 
     /// Creates a client using an explicit idle/absolute timeout policy.
@@ -781,7 +782,7 @@ impl McpConfig {
     ///
     /// Returns an error if the server is not found, disabled, or fails to
     /// start or initialize.
-    pub fn client_with_timeout_policy(
+    pub async fn client_with_timeout_policy(
         &self,
         cx: &Cx,
         name: &str,
@@ -792,7 +793,7 @@ impl McpConfig {
             .map_err(ConfigError::ClientError)?;
         let config = self.enabled_server(name)?;
 
-        spawn_client_from_config(name, config, cx, timeout_policy)
+        spawn_client_from_config(cx, name, config, timeout_policy).await
     }
 
     /// Connects a ready HTTP client from one server's explicit endpoint
@@ -842,10 +843,10 @@ impl McpConfig {
 }
 
 /// Spawns a client from a server configuration.
-fn spawn_client_from_config(
+async fn spawn_client_from_config(
+    cx: &Cx,
     name: &str,
     config: &ServerConfig,
-    cx: &Cx,
     timeout_policy: RequestTimeoutPolicy,
 ) -> Result<Client, ConfigError> {
     let mut builder = ClientBuilder::new()
@@ -857,7 +858,8 @@ fn spawn_client_from_config(
     }
     let arguments = config.args.iter().map(String::as_str).collect::<Vec<_>>();
     builder
-        .connect_stdio_once_with_cx(&config.command, &arguments, cx)
+        .connect_stdio_with_cx(cx, &config.command, &arguments)
+        .await
         .map_err(ConfigError::ClientError)
 }
 
@@ -1103,6 +1105,14 @@ pub fn claude_desktop_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_config_client_test(test: impl std::future::Future<Output = ()>) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().expect("test reactor"))
+            .build()
+            .expect("caller-owned configuration test runtime");
+        runtime.block_on(test);
+    }
 
     #[test]
     fn test_empty_config() {
@@ -1450,18 +1460,22 @@ mod tests {
 
     #[test]
     fn test_error_server_not_found() {
-        let config = McpConfig::new();
-        let result = config.client(&Cx::for_testing(), "nonexistent");
-        assert!(matches!(result, Err(ConfigError::ServerNotFound(_))));
+        run_config_client_test(async {
+            let config = McpConfig::new();
+            let result = config.client(&Cx::current().unwrap(), "nonexistent").await;
+            assert!(matches!(result, Err(ConfigError::ServerNotFound(_))));
+        });
     }
 
     #[test]
     fn test_error_server_disabled() {
-        let mut config = McpConfig::new();
-        config.add_server("disabled", ServerConfig::new("echo").disabled());
+        run_config_client_test(async {
+            let mut config = McpConfig::new();
+            config.add_server("disabled", ServerConfig::new("echo").disabled());
 
-        let result = config.client(&Cx::for_testing(), "disabled");
-        assert!(matches!(result, Err(ConfigError::ServerDisabled(_))));
+            let result = config.client(&Cx::current().unwrap(), "disabled").await;
+            assert!(matches!(result, Err(ConfigError::ServerDisabled(_))));
+        });
     }
 
     #[test]
@@ -1604,117 +1618,127 @@ mod tests {
 
     #[test]
     fn active_and_cancelled_contexts_differ_only_at_cancellation_gate() {
-        let mut config = McpConfig::new();
-        config.add_server("cancelled", ServerConfig::new("definitely-not-a-command"));
-        let original_config = config.to_json();
+        run_config_client_test(async {
+            let mut config = McpConfig::new();
+            config.add_server("cancelled", ServerConfig::new("definitely-not-a-command"));
+            let original_config = config.to_json();
 
-        let active_error = match config.client(&Cx::for_testing(), "cancelled") {
-            Ok(_) => panic!("an unresolved command must not create a client"),
-            Err(error) => error,
-        };
-        assert!(matches!(active_error, ConfigError::ClientError(_)));
-        assert!(!matches!(
-            active_error,
-            ConfigError::ClientError(McpError {
-                code: fastmcp_core::McpErrorCode::RequestCancelled,
-                ..
-            })
-        ));
-        assert_eq!(config.to_json(), original_config);
+            let active_error = match config.client(&Cx::current().unwrap(), "cancelled").await {
+                Ok(_) => panic!("an unresolved command must not create a client"),
+                Err(error) => error,
+            };
+            assert!(matches!(active_error, ConfigError::ClientError(_)));
+            assert!(!matches!(
+                active_error,
+                ConfigError::ClientError(McpError {
+                    code: fastmcp_core::McpErrorCode::RequestCancelled,
+                    ..
+                })
+            ));
+            assert_eq!(config.to_json(), original_config);
 
-        let cancelled_cx = Cx::for_testing();
-        cancelled_cx.set_cancel_requested(true);
+            let cancelled_cx = Cx::for_testing();
+            cancelled_cx.set_cancel_requested(true);
 
-        let error = match config.client(&cancelled_cx, "cancelled") {
-            Ok(_) => panic!("cancelled context must be rejected before spawn"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            ConfigError::ClientError(McpError {
-                code: fastmcp_core::McpErrorCode::RequestCancelled,
-                ..
-            })
-        ));
-        assert_eq!(config.to_json(), original_config);
+            let error = match config.client(&cancelled_cx, "cancelled").await {
+                Ok(_) => panic!("cancelled context must be rejected before spawn"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                ConfigError::ClientError(McpError {
+                    code: fastmcp_core::McpErrorCode::RequestCancelled,
+                    ..
+                })
+            ));
+            assert_eq!(config.to_json(), original_config);
+        });
     }
 
     #[test]
     fn invalid_policy_precedes_config_lookup_and_process_creation() {
-        let mut config = McpConfig::new();
-        config.add_server("configured", ServerConfig::new("definitely-not-a-command"));
-        let invalid_policy = RequestTimeoutPolicy {
-            idle_timeout: std::time::Duration::ZERO,
-            absolute_timeout: std::time::Duration::from_secs(1),
-            reset_idle_on_matching_progress: true,
-            bounds: crate::RequestTimeoutBounds::Bounded,
-        };
+        run_config_client_test(async {
+            let mut config = McpConfig::new();
+            config.add_server("configured", ServerConfig::new("definitely-not-a-command"));
+            let invalid_policy = RequestTimeoutPolicy {
+                idle_timeout: std::time::Duration::ZERO,
+                absolute_timeout: std::time::Duration::from_secs(1),
+                reset_idle_on_matching_progress: true,
+                bounds: crate::RequestTimeoutBounds::Bounded,
+            };
 
-        let error = match config.client_with_timeout_policy(
-            &Cx::for_testing(),
-            "missing",
-            invalid_policy,
-        ) {
-            Ok(_) => panic!("invalid timeout policy must fail before configuration lookup"),
-            Err(error) => error,
-        };
-        assert!(matches!(
-            error,
-            ConfigError::ClientError(McpError {
-                code: fastmcp_core::McpErrorCode::InvalidParams,
-                ..
-            })
-        ));
+            let error = match config
+                .client_with_timeout_policy(&Cx::current().unwrap(), "missing", invalid_policy)
+                .await
+            {
+                Ok(_) => panic!("invalid timeout policy must fail before configuration lookup"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                error,
+                ConfigError::ClientError(McpError {
+                    code: fastmcp_core::McpErrorCode::InvalidParams,
+                    ..
+                })
+            ));
 
-        let cancelled_cx = Cx::for_testing();
-        cancelled_cx.set_cancel_requested(true);
-        let error =
-            match config.client_with_timeout_policy(&cancelled_cx, "configured", invalid_policy) {
+            let cancelled_cx = Cx::for_testing();
+            cancelled_cx.set_cancel_requested(true);
+            let error = match config
+                .client_with_timeout_policy(&cancelled_cx, "configured", invalid_policy)
+                .await
+            {
                 Ok(_) => panic!("invalid timeout policy must fail before checkpoint and spawn"),
                 Err(error) => error,
             };
-        assert!(matches!(
-            error,
-            ConfigError::ClientError(McpError {
-                code: fastmcp_core::McpErrorCode::InvalidParams,
-                ..
-            })
-        ));
+            assert!(matches!(
+                error,
+                ConfigError::ClientError(McpError {
+                    code: fastmcp_core::McpErrorCode::InvalidParams,
+                    ..
+                })
+            ));
+        });
     }
 
     #[cfg(unix)]
     #[test]
     fn policy_aware_config_client_applies_policy_to_initialization() {
-        let mut config = McpConfig::new();
-        config.add_server(
-            "silent",
-            ServerConfig::new("sh").with_args(["-c", "exec sleep 5"]),
-        );
-        let policy = RequestTimeoutPolicy::new(
-            std::time::Duration::from_millis(50),
-            std::time::Duration::from_millis(250),
-        )
-        .expect("custom initialization policy must validate");
-        let started = std::time::Instant::now();
+        run_config_client_test(async {
+            let mut config = McpConfig::new();
+            config.add_server(
+                "silent",
+                ServerConfig::new("sh").with_args(["-c", "exec sleep 5"]),
+            );
+            let policy = RequestTimeoutPolicy::new(
+                std::time::Duration::from_millis(50),
+                std::time::Duration::from_millis(250),
+            )
+            .expect("custom initialization policy must validate");
+            let started = std::time::Instant::now();
 
-        let error = match config.client_with_timeout_policy(&Cx::for_testing(), "silent", policy) {
-            Ok(_) => panic!("silent initialization must honor the custom idle timeout"),
-            Err(error) => error,
-        };
-        let ConfigError::ClientError(error) = error else {
-            panic!("initialization timeout must remain a client lifecycle error");
-        };
+            let error = match config
+                .client_with_timeout_policy(&Cx::current().unwrap(), "silent", policy)
+                .await
+            {
+                Ok(_) => panic!("silent initialization must honor the custom idle timeout"),
+                Err(error) => error,
+            };
+            let ConfigError::ClientError(error) = error else {
+                panic!("initialization timeout must remain a client lifecycle error");
+            };
 
-        assert_eq!(error.message, "Request timed out at the idle deadline");
-        assert_eq!(
-            error.data,
-            Some(serde_json::json!({"timeoutSource": "idle"}))
-        );
-        // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the custom
-        // idle timeout fired; this proves it fired at that deadline rather
-        // than late. Timing is the property a custom-timeout test exists to
-        // assert. Real `sh` child, so virtual time cannot replace it.
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            assert_eq!(error.message, "Request timed out at the idle deadline");
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({"timeoutSource": "idle"}))
+            );
+            // (c) KNOWN LOAD-DEPENDENT SITE. The typed error proves the custom
+            // idle timeout fired; this proves it fired at that deadline rather
+            // than late. Timing is the property a custom-timeout test exists to
+            // assert. Real `sh` child, so virtual time cannot replace it.
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        });
     }
 
     #[cfg(unix)]
@@ -1763,50 +1787,60 @@ mod tests {
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
     #[test]
     fn config_client_auto_reopens_a_fresh_child_for_exact_legacy_fallback() {
-        let (server, trace) = legacy_fallback_config_fixture(1);
-        let mut config = McpConfig::new();
-        config.add_server("legacy", server);
+        run_config_client_test(async {
+            let cx = Cx::current().unwrap();
+            let (server, trace) = legacy_fallback_config_fixture(1);
+            let mut config = McpConfig::new();
+            config.add_server("legacy", server);
 
-        let mut client = config
-            .client(&Cx::for_request(), "legacy")
-            .expect("the correlated refusal authorizes one fresh legacy child");
+            let mut client = config
+                .client(&cx, "legacy")
+                .await
+                .expect("the correlated refusal authorizes one fresh legacy child");
 
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
-        );
-        client
-            .ping()
-            .expect("the fresh configured legacy child is usable");
-        client.close().expect("configured legacy client cleanup");
-        let trace = std::fs::read_to_string(trace).expect("read the complete child trace");
-        let events: Vec<_> = trace.lines().collect();
-        assert_eq!(
-            events.len(),
-            3,
-            "exactly two children and one ping: {trace}"
-        );
-        let probe = events[0].strip_prefix("spawn:").expect("discovery child");
-        let legacy = events[1]
-            .strip_prefix("spawn:")
-            .expect("fresh legacy child");
-        assert_ne!(
-            probe, legacy,
-            "fallback must not reuse the discovery process"
-        );
-        assert_eq!(events[2], format!("ping:{legacy}"));
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            assert_eq!(
+                client.selected_protocol_era(),
+                Some(fastmcp_protocol::protocol_policy::ProtocolEra::Legacy2024)
+            );
+            client
+                .ping_with_cx(&cx, &fastmcp_core::McpRequestCancellation::new())
+                .await
+                .expect("the fresh configured legacy child is usable");
+            client
+                .close_with_cx(&cx)
+                .await
+                .expect("configured legacy client cleanup");
+            let trace = std::fs::read_to_string(trace).expect("read the complete child trace");
+            let events: Vec<_> = trace.lines().collect();
+            assert_eq!(
+                events.len(),
+                3,
+                "exactly two children and one ping: {trace}"
+            );
+            let probe = events[0].strip_prefix("spawn:").expect("discovery child");
+            let legacy = events[1]
+                .strip_prefix("spawn:")
+                .expect("fresh legacy child");
+            assert_ne!(
+                probe, legacy,
+                "fallback must not reuse the discovery process"
+            );
+            assert_eq!(events[2], format!("ping:{legacy}"));
+        });
     }
 
     #[cfg(unix)]
     #[test]
     fn config_client_uses_modern_first_builder_with_identity_cwd_and_environment() {
-        let cwd = std::env::current_dir().expect("current directory is available");
-        let cwd = cwd
-            .to_str()
-            .expect("test workspace path is valid UTF-8")
-            .to_owned();
-        let script = r#"test "$PWD" = "$FASTMCP_CONFIG_EXPECTED_CWD" || exit 91;
+        run_config_client_test(async {
+            let cx = Cx::current().unwrap();
+            let cwd = std::env::current_dir().expect("current directory is available");
+            let cwd = cwd
+                .to_str()
+                .expect("test workspace path is valid UTF-8")
+                .to_owned();
+            let script = r#"test "$PWD" = "$FASTMCP_CONFIG_EXPECTED_CWD" || exit 91;
             test "$FASTMCP_CONFIG_CANARY" = "config-modern-env" || exit 92;
             IFS= read -r discover || exit 93;
             case "$discover" in *server/discover*) ;; *) exit 94 ;; esac;
@@ -1818,100 +1852,113 @@ mod tests {
             case "$ping" in *2026-07-28*) ;; *) exit 99 ;; esac;
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}';
             IFS= read -r end"#;
-        let mut config = McpConfig::new();
-        config.add_server(
-            "modern",
-            ServerConfig::new("sh")
-                .with_args(["-c", script])
-                .with_cwd(cwd.as_str())
-                .with_env("FASTMCP_CONFIG_EXPECTED_CWD", cwd.as_str())
-                .with_env("FASTMCP_CONFIG_CANARY", "config-modern-env"),
-        );
-        let config_before = config.to_json();
+            let mut config = McpConfig::new();
+            config.add_server(
+                "modern",
+                ServerConfig::new("sh")
+                    .with_args(["-c", script])
+                    .with_cwd(cwd.as_str())
+                    .with_env("FASTMCP_CONFIG_EXPECTED_CWD", cwd.as_str())
+                    .with_env("FASTMCP_CONFIG_CANARY", "config-modern-env"),
+            );
+            let config_before = config.to_json();
 
-        let mut default_client = config
-            .client(&Cx::for_request(), "modern")
-            .expect("default config client completes modern discovery");
-        #[cfg(feature = "legacy-2024-11-05")]
-        assert_eq!(default_client.protocol_policy(), ProtocolPolicy::Auto);
-        #[cfg(not(feature = "legacy-2024-11-05"))]
-        assert_eq!(default_client.protocol_policy(), ProtocolPolicy::ModernOnly);
-        assert_eq!(
-            default_client.request_timeout_policy(),
-            RequestTimeoutPolicy::default()
-        );
-        assert_eq!(
-            default_client.selected_protocol_era(),
-            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
-        );
-        assert_eq!(default_client.protocol_version(), "2026-07-28");
-        default_client
-            .ping()
-            .expect("default configured modern client is usable");
-        default_client
-            .close()
-            .expect("default configured modern client cleanup");
+            let mut default_client = config
+                .client(&cx, "modern")
+                .await
+                .expect("default config client completes modern discovery");
+            #[cfg(feature = "legacy-2024-11-05")]
+            assert_eq!(default_client.protocol_policy(), ProtocolPolicy::Auto);
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            assert_eq!(default_client.protocol_policy(), ProtocolPolicy::ModernOnly);
+            assert_eq!(
+                default_client.request_timeout_policy(),
+                RequestTimeoutPolicy::default()
+            );
+            assert_eq!(
+                default_client.selected_protocol_era(),
+                Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+            );
+            assert_eq!(default_client.protocol_version(), "2026-07-28");
+            default_client
+                .ping_with_cx(&cx, &fastmcp_core::McpRequestCancellation::new())
+                .await
+                .expect("default configured modern client is usable");
+            default_client
+                .close_with_cx(&cx)
+                .await
+                .expect("default configured modern client cleanup");
 
-        let timeout_policy = RequestTimeoutPolicy::new(
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_secs(4),
-        )
-        .expect("configured modern timeout policy is valid");
+            let timeout_policy = RequestTimeoutPolicy::new(
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(4),
+            )
+            .expect("configured modern timeout policy is valid");
 
-        let mut client = config
-            .client_with_timeout_policy(&Cx::for_request(), "modern", timeout_policy)
-            .expect("configured stdio client completes modern discovery");
+            let mut client = config
+                .client_with_timeout_policy(&cx, "modern", timeout_policy)
+                .await
+                .expect("configured stdio client completes modern discovery");
 
-        #[cfg(feature = "legacy-2024-11-05")]
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
-        #[cfg(not(feature = "legacy-2024-11-05"))]
-        assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
-        assert_eq!(
-            client.selected_protocol_era(),
-            Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
-        );
-        assert_eq!(client.protocol_version(), "2026-07-28");
-        assert_eq!(client.request_timeout_policy(), timeout_policy);
-        client
-            .ping()
-            .expect("the configured modern session is usable");
-        client.close().expect("configured modern client cleanup");
-        assert_eq!(config.to_json(), config_before);
+            #[cfg(feature = "legacy-2024-11-05")]
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::Auto);
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            assert_eq!(client.protocol_policy(), ProtocolPolicy::ModernOnly);
+            assert_eq!(
+                client.selected_protocol_era(),
+                Some(fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026)
+            );
+            assert_eq!(client.protocol_version(), "2026-07-28");
+            assert_eq!(client.request_timeout_policy(), timeout_policy);
+            client
+                .ping_with_cx(&cx, &fastmcp_core::McpRequestCancellation::new())
+                .await
+                .expect("the configured modern session is usable");
+            client
+                .close_with_cx(&cx)
+                .await
+                .expect("configured modern client cleanup");
+            assert_eq!(config.to_json(), config_before);
+        });
     }
 
     #[cfg(unix)]
     #[test]
     fn config_client_wrong_id_discovery_never_authorizes_legacy_fallback() {
-        let (server, trace) = legacy_fallback_config_fixture(2);
-        let mut config = McpConfig::new();
-        config.add_server("wrong-id", server);
-        let config_before = config.to_json();
-        let timeout_policy = RequestTimeoutPolicy::new(
-            std::time::Duration::from_millis(100),
-            std::time::Duration::from_secs(1),
-        )
-        .expect("bounded wrong-ID policy is valid");
+        run_config_client_test(async {
+            let cx = Cx::current().unwrap();
+            let (server, trace) = legacy_fallback_config_fixture(2);
+            let mut config = McpConfig::new();
+            config.add_server("wrong-id", server);
+            let config_before = config.to_json();
+            let timeout_policy = RequestTimeoutPolicy::new(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(1),
+            )
+            .expect("bounded wrong-ID policy is valid");
 
-        let error =
-            match config.client_with_timeout_policy(&Cx::for_request(), "wrong-id", timeout_policy)
+            let error = match config
+                .client_with_timeout_policy(&cx, "wrong-id", timeout_policy)
+                .await
             {
                 Err(error) => error,
                 Ok(mut client) => {
-                    let _ = client.close();
+                    let _ = client.close_with_cx(&cx).await;
                     panic!("a wrong-ID discovery refusal must not open a legacy child")
                 }
             };
 
-        assert!(matches!(error, ConfigError::ClientError(_)));
-        assert_eq!(config.to_json(), config_before);
-        let trace = std::fs::read_to_string(trace).expect("read the rejected discovery trace");
-        let events: Vec<_> = trace.lines().collect();
-        assert_eq!(
-            events.len(),
-            1,
-            "wrong-ID refusal must spawn only one child: {trace}"
-        );
-        assert!(events[0].starts_with("spawn:"));
+            assert!(matches!(error, ConfigError::ClientError(_)));
+            assert_eq!(config.to_json(), config_before);
+            let trace = std::fs::read_to_string(trace).expect("read the rejected discovery trace");
+            let events: Vec<_> = trace.lines().collect();
+            assert_eq!(
+                events.len(),
+                1,
+                "wrong-ID refusal must spawn only one child: {trace}"
+            );
+            assert!(events[0].starts_with("spawn:"));
+        });
     }
 
     #[test]
