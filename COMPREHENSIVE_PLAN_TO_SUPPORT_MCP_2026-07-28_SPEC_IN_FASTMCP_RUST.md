@@ -1,7 +1,7 @@
 # Comprehensive Plan to Support MCP 2026-07-28 in FastMCP Rust
 
 - Status: active implementation campaign; aggregate support remains unverified
-- Latest source/tracker reality check: 2026-09-04, sections 7.23 and 7.24.
+- Latest source/tracker reality check: 2026-10-31, section 7.25.
   Earlier dated implementation inventories are historical observations.
 - Required protocol eras: MCP `2026-07-28` final and MCP `2024-11-05`
 - Required default product policy: automatic, downgrade-resistant negotiation
@@ -3698,7 +3698,7 @@ They must never be reachable from a modern transport policy.
 
 ### 7.23 Reality-check vision checklist
 
-#### Current assessment: 2026-09-12
+#### Historical assessment: 2026-09-12
 
 The project contains substantial usable framework code and a published `0.9.0`
 CLI. It is not a qualified implementation of the complete dual-era product
@@ -3798,7 +3798,7 @@ item; it never implies aggregate MCP 2026-07-28 support.
 
 ### 7.24 Gap classification and bridge plan
 
-#### Current bridge: 2026-09-12
+#### Historical bridge: 2026-09-12
 
 The immediate order is to finish the already-written capabilities and their
 original acceptance before expanding the coding frontier:
@@ -4061,6 +4061,279 @@ scope. Pass six found no further discrepancy in the revised role scopes,
 preserved test IDs/ownership/status, or all 145 formal parents' 784 exact
 prerequisites. BV reported no cycles. This is structural and scoped semantic
 validation, not a certificate for every remaining leaf or running capability.
+
+### 7.25 Reality check: 2026-10-31
+
+**Verdict:** FastMCP Rust has substantial implemented framework and protocol
+capability, a published CLI that passes the narrow smoke cases below, and
+considerable unfinished integration and qualification. It does not yet deliver
+the complete, qualified dual-era/all-official-profile product required by
+section 0. A source implementation, a publication, and a verified capability
+are three different observations. None of the issue counts below measures
+percentage completion.
+
+#### Scope and identity
+
+This assessment read all of root AGENTS.md and README.md, the three original
+porting/specification/architecture documents, and the relevant console,
+feature-parity, canonical campaign, acceptance and prior-audit sections. It
+compared all 145 formal package headings with all 145 tracker parents, searched
+the entire product source for implementation entrypoints and placeholders,
+and traced selected production and test paths. It is not a line-by-line review
+of every Rust file, every issue comment, or all 39,908 lines of the campaign
+document. Absence findings below name the searched public/runtime surfaces.
+
+The source anchor is `0b5892424d396eb28a55ffaaceea865af634eaf4`, tree
+`1ea431a6db6a7874c84d880fc5750311a20fd82c`, workspace `0.13.0`, pinned
+`nightly-2026-08-25`. Tracked files were clean before the audit. Existing
+untracked scratch files were preserved; they were excluded from the clean
+RCH source snapshot. The audit changes this plan and the issue ledger only.
+Wall-clock observations crossed into 2026-11-01 UTC while still October 31 in
+America/New_York. No implementation Bead was closed and no gate was reported.
+
+Useful source blob identities, independent of unrelated later tree changes:
+
+| Subject | Git blob |
+|---|---|
+| Cargo.toml | `7863cd8729e9e21f435d570a1135c6cab7bd1ab6` |
+| Cargo.lock | `6db8949fb0afde69bfec5b4d75a3db11ceb52412` |
+| rust-toolchain.toml | `e36bd453a98fc579be6afd951f5ef5b7cc170469` |
+| facade testing/server.rs | `87778166ecae9d1204bfa6feaa349e57237634c9` |
+| server lib.rs | `d8a60eb4f833712c88f1fa2dc5a6868ef908e021` |
+| client lib.rs | `a32cf69c182d52bccd74658f24a8cf0dc5cebc96` |
+
+#### Fresh observations, separate from historical evidence
+
+1. **Published CLI smoke passes.** GitHub and crates.io both expose `0.13.0`.
+   The GitHub release was published 2026-10-13T04:39:13Z. The downloaded
+   macOS arm64 archive matches SHA-256
+   `eb703d9dd8e1b97afd1ee4d368a1873911e00eb65629555aa1b61cd389409033`.
+   Under DSR, the real binary passed version/help plus four independently
+   observed subprocess/wire cases: Auto discovery refusal followed by exact
+   2024 initialization in a different process; legacy inspection returning
+   the expected tool; rejection of an unsupported initialized version before
+   catalog traffic; and ModernOnly refusal without any legacy initialize.
+   Every recorded peer PID was absent after completion. This is release-CLI
+   smoke against a scripted independent peer, not a FastMCP-server integration,
+   modern positive, malicious-peer cleanup proof, or aggregate conformance.
+   The initial inspection failed because the audit peer omitted resource
+   templates; the initial negative assertion expected the rejected version
+   literal although the CLI intentionally reports a fixed diagnostic. Both
+   attempts are retained and neither is attributed as a product defect.
+2. **Formatting is red.** DSR ran the pinned `cargo fmt --all -- --check`:
+   exit 1, 136 distinct files, 2,218 reported diff locations, including 111
+   files in fastmcp-client. These are not changed-line counts. The result
+   updates existing `bd-s46tx`; it does not silently replace or claim an
+   improvement over measurements made on other subjects/instruments.
+3. **The installed DSR can report false green.** At installed DSR commit
+   `a2141405ff4d9a871238265aa1710b29e4db96a0` (version 0.1.0),
+   `dsr -j quality --tool fastmcp_rust --work-dir <repo>` returned exit 0,
+   `checks=[]`, `total=0`. The `fastmcp_rust` registration has no checks; the
+   `fastmcp` registration for the same repository has four, including only
+   two filtered client tests. A separate DSR development checkout contains
+   an empty-check refusal, but the installed consumer does not. Existing
+   `scripts/verify_batch.sh` also dispatches builds by plain SSH, contrary
+   to the current DSR-around-RCH rule. New bug
+   `bd-mcp-2026-07-28-support-ahet.6.1` owns this concrete integration defect.
+4. **Default Cargo coverage is narrower than target count.** Fresh locked,
+   offline metadata reports 176 workspace targets, 37 with required features,
+   and 25 whose requirements are absent from the resolved default workspace
+   feature set: CLI 2, client 10, facade 10, server 3. The other 12 gated
+   targets have their requirements satisfied by feature unification. This is
+   target eligibility, not executed test coverage; internal `cfg` exclusions
+   require their own inventory. Default, no-default and all-feature results
+   cannot substitute for one another. Existing owner: `bd-hy8mq`.
+5. **Dependency policy needs target-scoped evidence.** The native default
+   normal/build graph has no Tokio path. An all-feature/all-target query
+   reaches Tokio through asupersync → wasm-bindgen-futures → Tokio. The
+   lockfile entry is therefore not proof of a native runtime violation, nor
+   may an all-target claim ignore it. The live banned-dependency fence now
+   exists; its review Bead's old absence title is not current source truth.
+6. **The current all-feature workspace check fails to compile.** The DSR-wrapped
+   RCH command is `cargo check --locked --workspace --all-targets
+   --all-features -j 1` against the clean source anchor on `vmi1152480`.
+   An earlier invalid RCH argument combination exited 2; a two-core request
+   was refused with 103; the one-core request reached the source compiler and
+   exited **101** after 1,126 seconds of remote execution. The two diagnostics,
+   E0425 and E0433, have one immediate cause: `proxy.rs:832` uses `Duration`
+   without importing it for `RELAYED_FINAL_TASK_RECOVERY_LIFETIME`. The source
+   blob is `d317638fccd12159b94e16f908aa9876f41497ad`; the constant was added
+   by `e0a95215`. No Rust tests ran, and no clippy, performance or aggregate
+   conformance pass is claimed. Further errors may appear after this blocker
+   is repaired; an early compiler abort is not an exhaustive error census.
+   RCH completed normally, so this is a reproduced source failure, not a
+   missing-toolchain or unavailable-worker diagnosis. DSR run ID:
+   `2A0A88D9-9AB8-49BF-B1DA-DECBB9D525CB`.
+   Exact diagnostics and the existing recovery-test inventory were returned
+   to `bd-pxy-task-01-implementation-b-xzcm` and `bd-bcgdq`; changing the
+   lifetime constant, disabling Tasks, or closing PXY-TASK-01 is not a remedy.
+
+Raw audit captures are in `/tmp/fastmcp-reality.HxrJEn/`; these are local,
+temporary investigation artifacts, not a durable release receipt. Important
+digests: `fmt.log` SHA-256
+`a5424218ccdb228e1512440609838fb1b61913dbfc450009b77785680c01b012`;
+`dsr-empty.json` SHA-256
+`3b30beb6279b7509ce39272754b8bb3ca27ab627561ed979a730b1821a30f973`;
+`release-probe.log` SHA-256
+`d5ee79491dc837b4636c07545807336be39f50cc394c3a31b7f34d76bfbfcdf2`.
+`check-single.log` SHA-256:
+`05d9b8979da4ea9c178711035732767c44e7626079fb8ccee91a6d2abb4f380d`.
+The installed DSR empty run ID is
+`F41BBB0F-822D-4FBC-85C0-FBB089792FE4`.
+
+README's official server result, 112 successes/zero failures at `1c2dc896`,
+and client result, 55 successes/46 failures at `2b6c519e`, remain historical
+October observations. The 46 client failures are the recorded authorization
+adapter/profile integration boundary; they neither establish that the whole
+auth library is broken nor prove that it works. No conformance-only security
+bypass is an acceptable remedy. Those results and the recorded server-suite
+failures at `6fa8cd6e` are not fresh results for this audit's anchor.
+
+#### Vision checklist and specific bridge
+
+`PARTIAL` means real implementation exists but its full contract is incomplete
+or unqualified; `UNPROVEN` denotes an evidence gap rather than an observed
+functional failure. `WORKING` is restricted to the exact freshly exercised
+release slice. Earlier absence claims must not override newer source.
+
+| # | Testable goal and authority | Reality at the anchor | Concrete next work and existing owner |
+|---|---|---|---|
+| 1 | Install and invoke the published CLI; README | `WORKING` for macOS arm64 version/help and four bounded legacy/negotiation smoke cases only | Packaged, platform and real-server matrix remains CLI-CORE-01/CLI-01/REL scope. |
+| 2 | Modern metadata, discovery, result algebra and direction; section 0/PRT | `PARTIAL`: real modern types, policy, routing and discover implementation | Finish exact composed-schema/negative matrices through PRT-01..05, SRV and TST; never infer support from the version constant. |
+| 3 | Exact 2024 adapter and immutable Auto negotiation; section 0 | `PARTIAL`: real stdio and separate HTTP+SSE adapters; the published CLI's fresh-child fallback works in the observed case | Close LEG and PXY-LEG matrices; fix the reopened configured-client Auto defect `bd-config-client-auto-stdio-byl21`. |
+| 4 | Caller-owned runtime, cancellation, bounded shutdown; AGENTS/FND-04 | `PARTIAL`, with a remaining architectural violation: core runtime.rs still exports a private-runtime block_on bridge unconditionally | FND-04/05 and LIMIT-01 must remove production reachability and prove settled children, sibling isolation and no post-terminal effects. Old claims that upstream has no child-region primitive are obsolete. |
+| 5 | Native stdio and Streamable HTTP; STD/HTTP | `PARTIAL`: bind_http/serve_http, per-request modern dispatch and stream handling are real | Complete transport/platform, disconnect, admission, header and cleanup tests through STD-01, HTTP-01..06 and XPORT-01. |
+| 6 | Concurrent clients, deadlines and MRTR; CLT/MRTR | `PARTIAL`: real correlation registry, execution handles and opaque continuation paths | Prove timeout/cancel/late-response/retry combinations, bounded state and public consumer behavior; CLT-01/02, MRTR-01..03. |
+| 7 | Subscriptions and incremental Tasks watches; SUB/TASK | `PARTIAL`: real listen/ack/event code and fresh source additions for stdio/WebSocket Task watches | Resolve recorded server/client failures at their current blobs and exercise termination/race compositions; SUB-01..03, TASK, `bd-rssik`, `bd-95h2e`. |
+| 8 | Tools, resources, prompts, completion, macros and facade; README/API | `PARTIAL`: real handlers/derive implementations, not a stub skeleton | Compile and run packaged and renamed-facade consumers, generic derives and all result families; TOOL/RES/PRM/CMP/MAC/API and current macro compile debt. |
+| 9 | Bounded Draft 2020-12 validation; SCH | `PARTIAL`: refs, dynamic refs, unevaluated/composition keywords and work limits exist | Complete the applicable official suite and explicit regex/vocabulary boundary; SCH-01..03. Refusal-only tests cannot prove supported positive semantics. |
+| 10 | Authenticated HTTP and OAuth/OIDC; AUTH | `PARTIAL`: native discovery, managed OAuth, credential binding/custody and feature-gated RS256 resource verification exist | Complete issuer/resource/audience/lifetime/rotation and live client conformance; AUTH-00..07, `bd-conformance-oauth-driver-unconfigured-97rnu`. Absence of jsonwebtoken is not absence of JWT verification. |
+| 11 | OAuth client credentials; section 0.6/AUTHX | `PARTIAL`: native machine-client flow and explicitly enabled development issuer grant exist | Qualify complete external/built-in issuer compositions and security boundaries; AUTHX-02/05. Earlier “not implemented” labels are stale. |
+| 12 | Enterprise-managed OIDC and SAML; section 0.6 | `NOT_STARTED` in the inspected client/server enterprise exchange paths; a feature flag/JOSE dependency is insufficient | Implement the real bounded assertion/exchange/custody chains and positive/negative issuer tests; AUTHX-01/04, including `bd-mcp-authx-04-85fm`. Mandatory final-product scope remains intact. |
+| 13 | Principal-safe cache/middleware behavior; CACHE/SRV-MW | `PARTIAL`: real partitioning, hints, invalidation and middleware | Test auth mutation, continuations, pagination, expiry and proxy composition together; CACHE-01..03, SRV-MW-01, AUTH. |
+| 14 | Official Tasks plus durable/distributed profiles; TASK/TASKP/TASKR | `PARTIAL`: real in-memory final Tasks and lifecycle APIs; retained Docket source is excluded | Supply and qualify persistent/distributed stores with recovery, leases and fencing in their named profiles; do not count process-memory state as crash durability. |
+| 15 | Host-neutral Apps and mandatory compositions; APP | `PARTIAL`: UI resources, metadata and host bridge exist | Complete Apps lifecycle plus sampling/Tasks/MRTR compositions; APP-01..04, COMP-ALL-01. A browser renderer is not required. |
+| 16 | Proxy/gateway, credentials and era isolation; PXY | `PARTIAL`: real catalog, forwarding and typed execution paths | Qualify cancellation, identity/cache separation, upstream failure and cross-era/Tasks behavior; PXY/PXY-LEG and COMP-ALL-01. |
+| 17 | Production-faithful downstream test toolkit; DX-TEST-01 | `PARTIAL`, with a concrete API defect: TestServerBuilder::build drops name/version/timeout | New `bd-mcp-dx-test-01-90xf.1` repairs construction and adds live Memory behavior tests; existing A/B/I/V obligations remain required. |
+| 18 | Sealed out-of-tree extension authoring; EXT-DEV-01 | `PARTIAL`: typed registry/handlers exist, but inspected handlers receive McpContext; the specified sealed ExtensionContext surface was not found | Build the narrow facade contract and renamed packaged consumers with compile-fail authority tests; `bd-mcp-ext-dev-01-t6la`. Registry existence is not this contract. |
+| 19 | Bounded operator health/readiness; OPS-01 | `NOT_STARTED` for the specified OperatorSnapshot/AdmissionProbe public contract in inspected core/facade/server paths | Implement immutable snapshots and actual admission permits; wire real contributors and bounded redaction/cardinality tests; `bd-mcp-ops-01-wi8p`. Logs are not health semantics. |
+| 20 | Safe human/agent diagnostics; console plan/CLI | `PARTIAL`: real stderr console, plain detection, sanitization and credential redaction | Qualify hostile text, TTY/non-TTY, error envelopes and protocol-stdout isolation through CLI-CORE/DOC. |
+| 21 | Latency, throughput, memory, overload and eight-hour soak; PERF-01 | `UNPROVEN`: microbench source exists, no qualifying current complete matrix found | Execute the preregistered PERF-01 budgets on the named noncontended runner class, including full soak; `bd-mcp-perf-01-qxgw`. No speed or leak claim follows from this audit. |
+| 22 | Complete secure, reproducible qualification; sections 0.7/2.6 | `UNPROVEN`: formatting is red, installed DSR admits zero-work green, current whole-suite proof is absent | Repair DSR consumer wiring, run exact nonempty default/minimal/all-feature inventories, then official conformance/security/interop; CI-BASE/CORE/ALL, CONF, INTEROP, TST and the new DSR bug. |
+| 23 | Evidence-backed docs and separately authorized publication; DOC/REL | `PARTIAL`: release artifacts exist; aggregate support remains expressly unclaimed | Reconcile stale executable plan/spec bodies, consume bound component/composition results, then seal and independently authorize publication; DOC-01/02, REL families. Publication itself cannot satisfy GATE-ALL-MCP-READY. |
+| 24 | Still-normative deprecated roots, sampling and logging; section 0/DEPR | `PARTIAL`: real context resolvers, capability checks and logging surfaces exist | Prove installed-resolver policy, era-correct wire behavior, MRTR/proxy composition and cancellation; DEPR-01, MRTR, OBS and LEG. Deprecation does not remove the implementation obligation. |
+| 25 | Confined filesystem and protected state; FND/security | `PARTIAL`: handle-relative no-follow filesystem traversal and bounded process-bound envelope code exist | Qualify platform support, cancellation, race/replay/rotation and caller-owned blocking-pool behavior through FND-06..09. Filesystem support outside Linux/macOS remains explicitly fail-closed; library code is not a new cryptographic or platform attestation. |
+
+#### Backlog coverage and what actually blocks completion
+
+The pre-edit census is 1,364 issues: 479 closed, 744 open, 103 review,
+17 in progress, 15 blocked and six deferred. All 145 formal package IDs have
+exactly matching tracker-parent titles; all those parents remain open. Thus
+no new top-level vision family was found without a parent. That does **not**
+validate every child acceptance body or prove that implementing only the
+currently actionable issues completes the product.
+
+The 193 `batch-pending` labels include 98 review, 67 closed, 26 open and two
+deferred rows. Five review rows lack that label. A label-only query includes
+closed history; a review-plus-label query omits unresolved mismatches.
+`bd-burne` retains the new census. Ownership/status repair belongs to each
+owner and the designated verifier, not to mass foreign claims during an audit.
+`bd-bcgdq` still records the missing batch-verification owner and is the
+coordination prerequisite for accepting implementation closure. This audit
+does not self-appoint that role.
+
+Two concrete observations lacked specific open coverage and now have
+self-contained implementation-plus-test bugs: the installed DSR empty/alias
+path under CI-BASE-01 and the discarded test-builder settings under
+DX-TEST-01. Existing format, feature-matrix and queue issues received fresh
+comments. None of the existing 145 formal packages was duplicated.
+
+Completing the **full amended contracts**, including the new defects,
+integration/verification children and complete composition gates, would cover
+the documented vision in principle. Merely closing every currently open row
+would not: review/rework debt, stale commands, contradictory historical
+package bodies, missing executed feature sets, and unqualified compositions
+must be resolved rather than relabeled. This is a coverage conclusion, not
+a forecast that the implementation is nearly finished.
+
+#### Ordered bridge and acceptance boundaries
+
+1. **Make one verification lane trustworthy and available.** Assign the
+   existing batch-verification role; fix the installed DSR alias/empty-check
+   defect; bind clean sources and every compile-time input; use RCH for heavy
+   work. Validate missing/zero/filtered/failing gates before consuming green
+   results. Do not introduce another ledger or status epic. This restores an
+   enforced capability gate and earns no protocol capability credit.
+2. **Resolve current compile/test debt on its original owners.** Build first,
+   then inventory and execute the actual tests. Cover default, stripped
+   modern-only and all-feature configurations explicitly. Repair formatting
+   deliberately without reformatting byte-frozen inputs. Reproduce the
+   configured-client Auto, macro, subscription and cleanup failures against
+   the current blobs; historical failures identify targets, not automatic
+   diagnoses of this anchor. Retain every failed attempt.
+3. **Close a complete developer journey.** A packaged renamed facade builds
+   a caller-owned server, registers real handlers, serves both configured
+   eras, admits a configured client, executes tool/resource/prompt operations,
+   and settles cancellation/shutdown. Pair each positive with the same path
+   differing only in the forbidden version, authority, timeout or capacity.
+   API/CLI/DX/LEG/CLT/FND owners share contract boundaries; no test-only server
+   can supply production capability credit. Include the test-builder defect.
+4. **Finish missing runtime contracts and compose them.** Implement EMA,
+   operator health, the sealed extension facade and durable/distributed Task
+   profiles under their existing owners. Join auth rotation, cache identity,
+   MRTR single-use state, subscriptions, Tasks and proxy cleanup through real
+   consumers. An expired credential, cancelled parent or terminal request
+   must not authorize later work merely because an isolated component passed.
+   Wire activation remains optional; section 0's required implementation and
+   final-product evidence remain mandatory.
+5. **Qualify the complete product, then describe and release it.** Reach
+   zero-baseline official client/server conformance on the shipped profile;
+   complete differential SDK/platform/security and composition matrices;
+   measure PERF-01's frozen latency/throughput/RSS/size/compile budgets and
+   eight-hour soak. Only their bound results feed CI-ALL-MCP-01 and DOC-02,
+   then REL-01 and separately authorized REL-02. Narrow release smoke or a
+   successful all-feature check cannot replace any of these gates.
+
+#### Ambition and refinement decisions
+
+Three design passes strengthened this bridge: first, replace file-by-file
+completion with the complete packaged developer journey; second, require
+composed authority/lifetime conservation across auth, continuation, cache,
+Task and shutdown boundaries; third, make qualification reproducible across
+feature projections with exact executable inventories and first-failure
+retention. These extend the usefulness of existing work without inventing a
+new architecture or weakening mandatory profiles.
+
+Seven refinement passes cover: (1) current source versus stale absence claims,
+including JWT, OIDC signing, client credentials and upstream child regions;
+(2) actual default feature eligibility rather than all gated targets;
+(3) installed-tool behavior rather than an unrelated fixed checkout;
+(4) specific existing owners, same-Bead positive/negative tests and duplicate
+avoidance; (5) exact commands, scope/claim limits and ranked-item source review;
+(6) correcting the new bugs' scheduling edges; and (7) final consistency and
+graph checks after those corrections.
+The final pass checks only the revised bridge and affected records; it does
+not certify every child in the backlog. Core-only green, a scripted peer,
+format counts, and closed-task counts remain explicitly insufficient for
+aggregate support.
+
+Final BV triage after the two additions reports 1,366 nodes, 2,923 edges,
+41 actionable and 887 not-closed records, with no cycles; `br dep cycles`
+also reports none. Its first recommendation, `bd-ep6pp`, demonstrates why
+ranking needs source review: current `validate_final_method` already removes
+the modern ping bypass, and `owned_core_metadata_bytes` now uses discovery.
+That implementation still needs its exact verification; the open title is not
+instructions to repeat the code change. The next ranked items are the
+verification-owner gap and frozen-document drift. This audit neither closes
+the ping issue nor rewrites frozen evidence around a changed subject.
+
+The first graph pass exposed an executable scheduling mistake in this audit's
+new records: `parent-child` edges made each repair wait for completion of its
+whole package. Those two new edges were replaced with nonblocking `related`
+associations; both bugs now appear in `br ready`. No existing package edge,
+acceptance requirement, assignee or status was changed. Documentation whitespace
+validation and dependency-cycle checks pass. UBS exits 3 because Markdown and
+JSONL contain no supported source language; this is not a code-scan pass.
 
 #### Historical bridge baseline
 
