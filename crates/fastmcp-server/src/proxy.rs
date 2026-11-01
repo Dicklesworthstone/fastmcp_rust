@@ -10,6 +10,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
+#[cfg(feature = "tasks")]
+use std::time::Duration;
 use std::time::Instant;
 
 use asupersync::Cx;
