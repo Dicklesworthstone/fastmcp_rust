@@ -1,679 +1,547 @@
 #!/usr/bin/env bash
-#
-# Batch-verification runner that emits the receipt AGENTS.md requires.
-#
-# WHY THIS EXISTS (the hard-gate justification AGENTS.md demands of a process
-# artifact, since otherwise this would be ceremony):
-#
-#   concrete consumer     the batch-verification orchestrator, the only role
-#                         permitted to close an implementation Bead, which needs
-#                         evidence bound to an exact revision in order to do it.
-#   enforced gate         batch_verify. This script produces that gate's inputs
-#                         and fails closed. It does not record a verdict and has
-#                         no authority to.
-#   observed defect class three, all observed in this repository.
-#                         (1) The RCH lane returning "completion unconfirmed"
-#                             while retaining project ownership, which left a P1
-#                             measurement ungettable across seven attempts on
-#                             three workers, so NO batch verification happened.
-#                         (2) Green output accepted as proof when nothing ran:
-#                             23 test targets print "ok. 0 passed" when their
-#                             cfg is absent.
-#                         (3) A stale subject measured as if current: a worker
-#                             serving an out-of-date mirror, and a
-#                             `cargo ... | tail -N` pipeline whose follow-up
-#                             `echo "EXIT=${PIPESTATUS[0]}"` reports the echo's
-#                             own status, hiding a failed build.
-#   retirement condition  when the RCH lane completes reliably AND emits a
-#                         receipt carrying these same fields. Delete this then.
-#
-# It deliberately does NOT record a gate verdict, close a Bead, or decide
-# capability credit. Those are separate revision-bound decisions (RH-7, PL-4).
-#
-# HOW IT AVOIDS THE THREE DEFECTS ABOVE
-#
-#   * Bypasses the RCH scheduler entirely: plain ssh to one named worker, so a
-#     wedged queue cannot swallow the run.
-#   * Enforces PL-1. passed==0 is RED. The discovered set and the executed set
-#     are captured separately and compared, never assumed equal. Ignored and
-#     filtered-out counts are reported, never silently tolerated.
-#   * Binds the subject by BLOB IDENTITY. A manifest digest over the
-#     compilation-relevant paths is computed locally and independently
-#     recomputed on the worker; a mismatch invalidates the receipt. Each run
-#     syncs into a FRESH directory, so stale files from an earlier sync cannot
-#     participate and no deletion is ever required.
-#   * Captures every exit status with `rc=$?` on its own line.
-#
-# USAGE
-#
-#   scripts/verify_batch.sh --scope "-p fastmcp-client --lib" \
-#       [--worker ubuntu@HOST] [--features tasks] [--filter NAME ...] \
-#       [--test-threads 1] [--beads bd-aaa,bd-bbb] [--out DIR] [--key PATH]
-#
-# --scope is passed to cargo verbatim so the receipt records exactly what ran.
-# Omitting --filter runs the whole target, which is what a real batch wants.
-# --test-threads 1 matters: 38 client --lib tests fail at default parallelism
-# and 1 fails serialized, on the same worker and revision. Serialize before
-# attributing a red to a commit.
+# Repository qualification entrypoint: installed DSR owns every gate; RCH owns
+# heavy execution. No gate reporting, Bead closure, or capability promotion.
+# Consumer: batch verifier. Observed defects: empty DSR registrations returned
+# success, aliases disagreed, and the previous runner bypassed RCH with SSH.
+# Retire this adapter when installed DSR enforces the same inventory/source
+# contract; keep the executable negative cases in its replacement.
+set -euo pipefail
+exec python3 - "$0" "$@" <<'PY'
+import argparse
+import collections
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
 
-set -u -o pipefail
+SCRIPT = Path(sys.argv[1]).resolve()
+ROOT = SCRIPT.parent.parent
+ALIASES = ("fastmcp", "fastmcp_rust")
+LIB_KINDS = {"lib", "rlib", "proc-macro", "dylib", "cdylib", "staticlib"}
 
-# Byte-deterministic collation: see the manifest note below.
-export LC_ALL=C
 
-WORKER='ubuntu@194.140.197.98'            # hz3
-REMOTE_BASE='/data/projects/fastmcp_rust_batchverify'
-KEY="$HOME/.ssh/contabo_vps_ed25519"
-TOOLCHAIN='nightly-2026-08-25'
-PROFILE='test'
-SCOPE=''
-FEATURES=''
-BEADS=''
-OUT=''
-THREADS=''
-CHECK_ONLY=0
-CLIPPY=0
-FILTERS=()
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
 
-die() { printf 'verify_batch: %s\n' "$*" >&2; exit 2; }
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --worker)       WORKER="${2:?}"; shift 2 ;;
-        --remote-base)  REMOTE_BASE="${2:?}"; shift 2 ;;
-        --scope)        SCOPE="${2:?}"; shift 2 ;;
-        --features)     FEATURES="${2:?}"; shift 2 ;;
-        --beads)        BEADS="${2:?}"; shift 2 ;;
-        --out)          OUT="${2:?}"; shift 2 ;;
-        --key)          KEY="${2:?}"; shift 2 ;;
-        --toolchain)    TOOLCHAIN="${2:?}"; shift 2 ;;
-        --test-threads) THREADS="${2:?}"; shift 2 ;;
-        --check-only)   CHECK_ONLY=1; shift ;;
-        --clippy)       CHECK_ONLY=1; CLIPPY=1; shift ;;
-        --filter)       FILTERS+=("${2:?}"); shift 2 ;;
-        -h|--help)      sed -n '2,70p' "$0"; exit 0 ;;
-        *)              die "unknown argument: $1" ;;
-    esac
-done
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
 
-[ -n "$SCOPE" ] || die 'need --scope (passed to cargo verbatim)'
-[ -f "$KEY" ]   || die "ssh key not found: $KEY"
-command -v rsync >/dev/null || die 'rsync not found locally'
 
-OUT="${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/fastmcp-verify.XXXXXX")}" || die 'cannot create output dir'
-mkdir -p "$OUT" || die "cannot create $OUT"
+def git(*args):
+    return subprocess.check_output(["git", "-C", str(ROOT), *args]).decode().strip()
 
-# ServerAliveInterval is load-bearing, not hygiene. The remote script redirects
-# every phase to a file on the worker, so this channel carries NO bytes for the
-# whole build -- 10 to 30 minutes for a cold fastmcp-server test target. Without
-# keepalives an idle NAT or firewall drop closes the channel, the remote process
-# group takes SIGHUP, and the run dies with no receipt and no log, which reads
-# exactly like a build failure. 60s x 30 tolerates a half-hour silent link and
-# still gives up within ~30 minutes of a genuinely dead peer.
-SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=25 \
-     -o ServerAliveInterval=60 -o ServerAliveCountMax=30 "$WORKER")
 
-# The channel the BUILD will actually resolve, read from the file the build
-# reads. $TOOLCHAIN only steers the `rustc +<channel> -vV` probe that fills the
-# receipt's three compiler fields; the compile itself resolves rust-toolchain.toml.
-# If the two disagree the receipt names a compiler that did not build the
-# subject, which is the same class as measuring a stale mirror: the claim and
-# the thing claimed about come apart. Compared on the receipt, never assumed
-# equal, and not a hard pre-dispatch failure so a deliberate cross-toolchain run
-# still produces its diagnostics -- it just cannot be read as clean.
-PINNED_CHANNEL="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-    rust-toolchain.toml | head -1)"
+def json_objects(text):
+    # Product stderr can precede a libtest object without a newline. Decode
+    # complete objects, advancing past each one so nested objects count once.
+    decoder = json.JSONDecoder()
+    position = 0
+    while True:
+        start = text.find("{", position)
+        if start < 0:
+            return
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except ValueError:
+            position = start + 1
+            continue
+        position = end
+        if isinstance(value, dict):
+            yield value
 
-# ---------------------------------------------------------------------------
-# Subject identity, captured BEFORE the run.
-#
-# The manifest covers the paths that can change what gets COMPILED. Binding
-# over the whole repo would make every unrelated edit by a parallel lane
-# invalidate the receipt; binding over nothing would let a stale mirror pass.
-# The path set is recorded in the receipt so the scope of the claim is explicit.
-# ---------------------------------------------------------------------------
-MANIFEST_PATHS='Cargo.toml Cargo.lock rust-toolchain.toml crates'
-# NOTE: the manifest deliberately excludes evidence/ and .github/, which ARE
-# synced because test targets read them at compile time. So a run whose subject
-# is an evidence file (FND-01 probes, dependency-verification.toml) is NOT bound
-# by the manifest digest: that digest can be identical across two different
-# evidence trees. Bind such a claim to the evidence file's own sha256 instead --
-# the dependency-verification.toml [[source_input]] rows already carry one.
 
-# `.github` and `evidence` are here because test targets read them at COMPILE
-# time via include_str!/include_bytes! (fnd_01_dependency_evidence.rs :19048,
-# :51973, :51987). Omitting them made cargo report 5 "couldn't read ... No such
-# file or directory" errors that looked exactly like project defects and were
-# purely this script's doing. Syncing them is READ-ONLY; RULE 0.5 forbids
-# modifying anything under .github/workflows, not compiling against it.
-SYNC_PATHS=(Cargo.toml Cargo.lock rust-toolchain.toml crates spec scripts tools
-            .github evidence README.md)
-[ -d .cargo ] && SYNC_PATHS+=(.cargo)
-
-head_sha="$(git rev-parse HEAD)" || die 'not a git repository'
-tree_sha="$(git rev-parse 'HEAD^{tree}')"
-git status --porcelain --untracked-files=no > "$OUT/dirty-before.txt"
-dirty_before="$(shasum -a 256 < "$OUT/dirty-before.txt" | cut -d' ' -f1)"
-dirty_count="$(wc -l < "$OUT/dirty-before.txt" | tr -d ' ')"
-
-# Per-file content hashes of the WORKING TREE (what actually gets built), not
-# of git objects. Sorted by path so the digest is order-independent.
-# shellcheck disable=SC2086
-find $MANIFEST_PATHS -type f \
-    \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.json' \
-       -o -name '*.yaml' -o -name '*.txt' \) -print0 2>/dev/null \
-    | sort -z | xargs -0 shasum -a 256 \
-    | awk '{ print $1 " " $2 }' > "$OUT/manifest-local.txt"
-if awk 'NF != 2 { exit 1 }' "$OUT/manifest-local.txt"; then :; else
-    die 'a manifest path contains whitespace; the two-field digest cannot bind it'
-fi
-manifest_files="$(wc -l < "$OUT/manifest-local.txt" | tr -d ' ')"
-manifest_local="$(shasum -a 256 < "$OUT/manifest-local.txt" | cut -d' ' -f1)"
-
-printf '== subject ==\nHEAD      %s\ntree      %s\ndirty     %s tracked file(s) modified\nmanifest  %s  (%s files over: %s)\n\n' \
-    "$head_sha" "$tree_sha" "$dirty_count" "${manifest_local:0:16}" \
-    "$manifest_files" "$MANIFEST_PATHS"
-
-[ "$manifest_files" -gt 100 ] || die "manifest only matched $manifest_files files; refusing to bind a subject that thin"
-
-# ---------------------------------------------------------------------------
-# Sync into a FRESH remote directory. No --delete, so nothing is ever removed;
-# a fresh path means no file from an earlier sync can participate. The cargo
-# target dir is a shared pool OUTSIDE the fresh tree so caching still works.
-# ---------------------------------------------------------------------------
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-remote_dir="$REMOTE_BASE/run-${head_sha:0:8}-$stamp"
-target_dir="$REMOTE_BASE/.target-pool"
-
-# Any include_str!/include_bytes! target that is NOT under a synced path makes
-# cargo emit "couldn't read ... No such file or directory", which reads as a
-# repository defect and is purely this script's doing. Refuse to run instead.
-missing_includes="$(python3 - "${SYNC_PATHS[@]}" <<'SCAN'
-import os, re, sys, pathlib
-synced = set(sys.argv[1:])
-pat = re.compile(r'include_(?:str|bytes)!\s*\(\s*"([^"]+)"')
-cwd = pathlib.Path.cwd()
-missing = set()
-for p in pathlib.Path('crates').rglob('*.rs'):
-    try: txt = p.read_text(errors='replace')
-    except OSError: continue
-    for m in pat.finditer(txt):
-        target = (p.parent / m.group(1)).resolve()
-        try: rel = target.relative_to(cwd)
-        except ValueError: continue
-        root = str(rel).split(os.sep)[0]
-        if root not in synced:
-            missing.add(root)
-print(' '.join(sorted(missing)))
-SCAN
-)"
-if [ -n "$missing_includes" ]; then
-    die "compile-time include roots are not in SYNC_PATHS: $missing_includes"
-fi
-
-printf '== sync ==\nworker    %s\nremote    %s\n' "$WORKER" "$remote_dir"
-"${SSH[@]}" "mkdir -p '$remote_dir' '$target_dir'" || die 'cannot create the remote directories'
-
-# Everything a build or a test fixture can read, and nothing else. Anything
-# added here must also be considered for MANIFEST_PATHS above.
-rsync -az --no-perms --omit-dir-times \
-    --exclude 'target/' --exclude '.rch-target-*' --exclude '*.log' \
-    -e "ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=25 -o ServerAliveInterval=60 -o ServerAliveCountMax=30" \
-    "${SYNC_PATHS[@]}" "$WORKER:$remote_dir/" > "$OUT/rsync.log" 2>&1
-rsync_rc=$?
-printf 'rsync     rc=%s\n\n' "$rsync_rc"
-
-feature_args=''
-[ -n "$FEATURES" ] && feature_args="--features $FEATURES"
-thread_args=''
-[ -n "$THREADS" ] && thread_args="--test-threads $THREADS"
-
-# ---------------------------------------------------------------------------
-# Remote script. Written locally and copied, never inlined into an ssh
-# argument: a single quote inside a single-quoted ssh payload silently
-# truncates the script, which is how an earlier run in this repository
-# "succeeded" while measuring nothing.
-# ---------------------------------------------------------------------------
-cat > "$OUT/remote.sh" <<REMOTE
-#!/usr/bin/env bash
-set -u
-cd '$remote_dir' || { echo "RECEIPT_VERDICT=NO_REMOTE_DIR"; exit 9; }
-# Per-run scratch. Concurrent runs previously shared /tmp/vb_* and one
-# reported the other's diagnostics as its own.
-RUNTMP='$remote_dir/.vb-run'
-mkdir -p "\$RUNTMP"
-export CARGO_TARGET_DIR='$target_dir'
-export RCH_CARGO_WRAPPER_BYPASS=1
-export CARGO_TERM_COLOR=never
-# Must match the local side exactly or the manifest ordering diverges.
-export LC_ALL=C
-
-# Independent recomputation of the manifest. Same file set, same algorithm,
-# computed from the worker's own filesystem. This is what clears a stale
-# mirror: blob identity, not sync byte counts and not an rsync exit status.
-find $MANIFEST_PATHS -type f \\
-    \\( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.json' \\
-       -o -name '*.yaml' -o -name '*.txt' \\) -print0 2>/dev/null \\
-    | sort -z | xargs -0 sha256sum \
-    | awk '{ print \$1 " " \$2 }' > \$RUNTMP/vb_manifest.txt
-echo "RECEIPT_MANIFEST_FILES=\$(wc -l < \$RUNTMP/vb_manifest.txt | tr -d ' ')"
-echo "RECEIPT_MANIFEST_DIGEST=\$(sha256sum < \$RUNTMP/vb_manifest.txt | cut -d' ' -f1)"
-
-echo "RECEIPT_HOST=\$(hostname -s)"
-echo "RECEIPT_RUSTC=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^release: //p')"
-echo "RECEIPT_COMMIT_HASH=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^commit-hash: //p')"
-echo "RECEIPT_TARGET=\$(rustc +$TOOLCHAIN -vV 2>/dev/null | sed -n 's/^host: //p')"
-
-# FREE SPACE ON THE TARGET-POOL FILESYSTEM, captured BEFORE the build and
-# therefore present even on a receipt whose build died.
-#
-# This is a diagnosis field, not hygiene. A worker that runs out of disk does
-# not report "out of disk": the link step dies as
-#   collect2: fatal error: ld terminated with signal 7 [Bus error]
-# because ld writes its output through mmap, and the surrounding cargo text is
-# an ordinary "error: could not compile". The receipt then says compile FAILED,
-# which reads exactly like a code defect in the subject under test. Observed
-# 2026-10-11 on hz3 at 50MB free of 906GB, where a 2365-test lib target had
-# compiled green on the same pool twenty minutes earlier.
-#
-# Reported unconditionally so a GREEN receipt also records how much headroom it
-# had. A run that finished with almost nothing left is a run whose next sibling
-# will fail for reasons that have nothing to do with the code.
-echo "RECEIPT_DISK_AVAIL_KB=\$(df -Pk '$target_dir' 2>/dev/null | awk 'NR==2 { print \$4 }')"
-echo "RECEIPT_DISK_PCT_USED=\$(df -Pk '$target_dir' 2>/dev/null | awk 'NR==2 { gsub(/%/, "", \$5); print \$5 }')"
-
-if [ '$CHECK_ONLY' = 1 ]; then
-    if [ '$CLIPPY' = 1 ]; then
-        cargo +$TOOLCHAIN clippy --locked $SCOPE $feature_args -- -D warnings \
-            > \$RUNTMP/vb_build.log 2>&1
-    else
-        cargo +$TOOLCHAIN check --locked $SCOPE $feature_args > \$RUNTMP/vb_build.log 2>&1
-    fi
-    check_rc=\$?
-    echo "RECEIPT_CHECK_RC=\$check_rc"
-    echo "RECEIPT_BUILD_RC=\$check_rc"
-    echo "RECEIPT_ERRORS=\$(grep -cE '^error(\[|:)' \$RUNTMP/vb_build.log)"
-    echo "RECEIPT_WARNINGS=\$(grep -cE '^warning(\[|:)' \$RUNTMP/vb_build.log)"
-    grep -oE 'clippy::[a-z_]+' \$RUNTMP/vb_build.log | sort | uniq -c | sort -rn \
-        | sed 's/^/RECEIPT_LINT /'
-    grep -E '^(error|warning)(\[|:)' -A3 \$RUNTMP/vb_build.log \
-        | grep -E '^\s*-->' | sed 's/^ *--> */RECEIPT_SITE /' | head -60
-    grep -E '^error' -A6 \$RUNTMP/vb_build.log | head -150
-    echo "RECEIPT_END"
-    exit \$check_rc
-fi
-
-# COMPILE IS A HARD GATE WITH ITS OWN CAPTURED STATUS. The assignment is on its
-# own line because \${PIPESTATUS[0]} read after an intervening command reports
-# that command's status, not the build's.
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args --no-run > \$RUNTMP/vb_build.log 2>&1
-build_rc=\$?
-echo "RECEIPT_BUILD_RC=\$build_rc"
-if [ "\$build_rc" != 0 ]; then
-    echo "RECEIPT_VERDICT=BUILD_FAILED"
-    grep -E '^error(\[|:)' \$RUNTMP/vb_build.log | head -25
-    exit 1
-fi
-
-# DISCOVERED set, independent of the run. PL-1 compares this against EXECUTED.
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args -- --list > \$RUNTMP/vb_list.log 2>&1
-grep -E ': test\$' \$RUNTMP/vb_list.log | sed 's/: test\$//' | sort -u > \$RUNTMP/vb_discovered.txt
-echo "RECEIPT_DISCOVERED=\$(wc -l < \$RUNTMP/vb_discovered.txt | tr -d ' ')"
-
-# Text parsing of libtest progress lines is NOT reliable here: product code
-# writes straight to stderr, bypassing libtest's capture, and lands ON the
-# progress line --
-#   test tests::panicked_progress_callback_... ... fastmcp client callback panicked
-# so the ok token never appears where a line anchor can see it, and four
-# went unmatched that way. libtest's JSON events are one object per line and
-# are immune to interleaved output.
-cargo +$TOOLCHAIN test --locked $SCOPE $feature_args \
-    -- -Z unstable-options --format json $thread_args "\$@" > \$RUNTMP/vb_run.log 2>&1
-run_rc=\$?
-echo "RECEIPT_RUN_RC=\$run_rc"
-# Not anchored and tolerant of the space libtest actually emits
-# ({ "type": "test", ...}); the anchored no-space form matched nothing at all
-# and reported 0 events for a run that emitted 4,722 of them.
-echo "RECEIPT_JSON_EVENTS=\$(grep -c '\"type\": *\"test\"' \$RUNTMP/vb_run.log)"
-# The whole log is returned and parsed locally, so there is ONE parser and the
-# worker needs no python.
-echo "RECEIPT_END"
-REMOTE
-
-scp -i "$KEY" -o BatchMode=yes -q "$OUT/remote.sh" "$WORKER:$remote_dir/vb_remote.sh" \
-    || die 'cannot stage the remote script'
-
-# The header must name the command that ACTUALLY runs. It previously printed
-# the `cargo test` form unconditionally, so a --check-only log read as if a
-# test run had happened. receipt.json's `mode` was honest; the human-facing
-# header was not, and a misread log is exactly the evidence defect this script
-# exists to prevent.
-if [ "$CHECK_ONLY" = 1 ]; then
-    if [ "$CLIPPY" = 1 ]; then
-        printf '== run ==\ncargo clippy --locked %s %s -- -D warnings\n\n' \
-            "$SCOPE" "$feature_args"
-    else
-        printf '== run ==\ncargo check --locked %s %s\n\n' "$SCOPE" "$feature_args"
-    fi
-else
-    printf '== run ==\ncargo test --locked %s %s -- %s %s\n\n' \
-        "$SCOPE" "$feature_args" "$thread_args" "${FILTERS[*]-}"
-fi
-
-"${SSH[@]}" "chmod +x '$remote_dir/vb_remote.sh' && '$remote_dir/vb_remote.sh' ${FILTERS[*]-}" \
-    > "$OUT/remote.out" 2>&1
-remote_rc=$?
-"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_discovered.txt'" > "$OUT/discovered.txt" 2>/dev/null || :
-"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_run.log'"        > "$OUT/run.log"       2>/dev/null || :
-# The compiler/clippy diagnostic stream. The receipt greps this file ON THE
-# WORKER for counts and a truncated sample, so without fetching it a --clippy
-# or --check-only run leaves no diagnostics behind at all: run.log is the TEST
-# stream and is empty for those modes. A pass/fail verdict is not a work list.
-"${SSH[@]}" "cat '$remote_dir/.vb-run/vb_build.log'"      > "$OUT/build.log"     2>/dev/null || :
-
-# Subject identity AFTER the run. Movement invalidates the receipt.
-git status --porcelain --untracked-files=no > "$OUT/dirty-after.txt"
-dirty_after="$(shasum -a 256 < "$OUT/dirty-after.txt" | cut -d' ' -f1)"
-head_after="$(git rev-parse HEAD)"
-
-python3 - "$OUT" "$head_sha" "$head_after" "$tree_sha" "$dirty_before" \
-    "$dirty_after" "$manifest_local" "$manifest_files" "$MANIFEST_PATHS" \
-    "$TOOLCHAIN" "$PROFILE" "$SCOPE" "$FEATURES" "$BEADS" "$remote_rc" \
-    "$rsync_rc" "$WORKER" "$remote_dir" "$THREADS" "${FILTERS[*]-}" \
-    "$PINNED_CHANNEL" <<'PY'
-import json, re, sys, pathlib
-
-(out, head_before, head_after, tree, dirty_before, dirty_after, manifest_local,
- manifest_files, manifest_paths, toolchain, profile, scope, features, beads,
- remote_rc, rsync_rc, worker, remote_dir, threads, filters,
- pinned_channel) = sys.argv[1:22]
-root = pathlib.Path(out)
-raw = (root / 'remote.out').read_text(errors='replace')
-
-def field(name):
-    m = re.search(rf'^RECEIPT_{name}=(.*)$', raw, re.M)
-    return m.group(1).strip() if m else None
-
-# libtest JSON events, extracted from ANYWHERE in the line rather than anchored
-# at its start.
-#
-# The anchored form read 2361 of 2365 outcomes on fastmcp-server --lib and
-# reported the other 4 as "discovered but never ran". They had all run and
-# passed; product code had written to stderr WITHOUT a trailing newline, so the
-# event arrived as a suffix:
-#   Note: Rich logging not initialized (logger already set){ "type": "test", ... }
-#   Server ready.{ "type": "test", ... }
-# This is the same defect that made the text progress lines unreadable, and
-# moving to JSON events did not cure it, because the corruption is in the byte
-# stream, not the format. raw_decode also lets several objects share one line.
-#
-# This widens only WHERE an event may be found. It does not infer an outcome
-# from a corrupt object, and a name with no decodable outcome event stays
-# missing, which is what keeps the PL-1 comparison below honest.
-events, suites = [], []
-decoder = json.JSONDecoder()
-run_log = root / 'run.log'
-if run_log.exists():
-    for line in run_log.read_text(errors='replace').splitlines():
-        for start in (i for i, ch in enumerate(line) if ch == '{'):
-            try:
-                event, _ = decoder.raw_decode(line, start)
-            except ValueError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get('type') == 'test' and event.get('event') in ('ok', 'failed', 'ignored'):
-                events.append(event)
-            elif event.get('type') == 'suite' and event.get('event') in ('ok', 'failed'):
-                suites.append(event)
-
-results  = suites
-passed   = sum(s.get('passed', 0) for s in suites)
-failed   = sum(s.get('failed', 0) for s in suites)
-ignored  = sum(s.get('ignored', 0) for s in suites)
-filtered = sum(s.get('filtered_out', 0) for s in suites)
-executed_ids = sorted({e['name'] for e in events if e['event'] in ('ok', 'failed')})
-ignored_ids  = sorted({e['name'] for e in events if e['event'] == 'ignored'})
-failed_ids   = sorted({e['name'] for e in events if e['event'] == 'failed'})
-
-def ids(name):
-    p = root / name
-    return sorted(set(p.read_text(errors='replace').split())) if p.exists() else []
-
-discovered, executed = ids('discovered.txt'), executed_ids
-manifest_remote = field('MANIFEST_DIGEST')
-
-# Every condition below has turned a green-looking run into a false claim here
-# at least once. They are checked, not assumed.
-reasons, warnings = [], []
-if rsync_rc != '0':
-    reasons.append(f'rsync exited {rsync_rc}: the worker may not hold the subject')
-if manifest_remote != manifest_local:
-    reasons.append(f'manifest mismatch: local {manifest_local[:16]} vs worker '
-                   f'{(manifest_remote or "<none>")[:16]} - a stale or partial mirror was measured')
-if field('MANIFEST_FILES') != manifest_files:
-    reasons.append(f'manifest file count differs: local {manifest_files} vs worker {field("MANIFEST_FILES")}')
-# PL-3 proof-configuration binding. The three compiler fields come from
-# `rustc +<channel> -vV 2>/dev/null` run BEFORE the build, under `set -u`
-# without `set -e`, so all three are empty whenever that probe fails and the
-# run continues regardless. The reachable case is mundane: the pinned channel is
-# not installed on the worker yet, the probe fails, and rustup then installs it
-# on demand for the compile that follows -- which goes green. The receipt then
-# carries rustc: null and still reads as a clean verification. These were the
-# only receipt fields captured and never checked; an unbound toolchain makes a
-# receipt void, not green.
-compiler_fields = {'rustc': field('RUSTC'), 'rustc commit': field('COMMIT_HASH'),
-                   'host target': field('TARGET')}
-unbound = sorted(name for name, value in compiler_fields.items() if not value)
-if unbound:
-    reasons.append(
-        f'receipt does not bind the compiler: {", ".join(unbound)} empty or absent. '
-        f'`rustc +{toolchain} -vV` produced nothing on the worker, so this run records no '
-        'toolchain identity and cannot satisfy PL-3. Usually the channel was not installed '
-        'when the probe ran, which rustup then fixes silently for the build. VOID, not red: '
-        'the subject may be fine, but this receipt cannot say so.'
-    )
-# The probe channel and the channel the compile resolves are independent inputs.
-# $TOOLCHAIN steers only the probe; rust-toolchain.toml steers the build.
-if pinned_channel and pinned_channel != toolchain:
-    reasons.append(
-        f'the receipt describes a compiler the build did not use: probed +{toolchain} while '
-        f'rust-toolchain.toml pins {pinned_channel}, and the compile resolves the pin. Re-run '
-        'without --toolchain, or treat the compiler fields as describing neither.'
-    )
-# Worker capacity is read BEFORE the compile verdict, because an exhausted
-# filesystem makes the compile verdict mean something different. ld dies of
-# SIGBUS on a full disk and cargo reports it as "could not compile", so a
-# receipt that says only "compile FAILED" sends the reader looking for a defect
-# in the subject. Naming the capacity failure separately is the whole point:
-# the subject was never evaluated, so this receipt is void rather than red.
-disk_avail_kb = None
-try:
-    disk_avail_kb = int(field('DISK_AVAIL_KB'))
-except (TypeError, ValueError):
+class Rejected(Exception):
     pass
-# 2 GiB. A single fastmcp-server test binary and its incremental artifacts do
-# not fit below this, so a run starting here is untrustworthy whatever it
-# reports. The bound is deliberately generous: it is cheaper to re-run on
-# another worker than to debug a phantom link error.
-disk_exhausted = disk_avail_kb is not None and disk_avail_kb < 2 * 1024 * 1024
 
-if field('BUILD_RC') is None:
-    reasons.append('no build status reported: the remote script did not reach the compile step')
-elif field('BUILD_RC') != '0':
-    if disk_exhausted:
-        reasons.append(
-            f'WORKER OUT OF DISK, not a subject failure: {disk_avail_kb} KiB free on the '
-            f'target-pool filesystem ({field("DISK_PCT_USED")}% used). A full disk kills ld '
-            'with SIGBUS and cargo reports it as "could not compile". This receipt is VOID, '
-            'not red: re-run on a worker with free space before reading anything into it.'
+
+class Gates:
+    def __init__(self, output, alias):
+        self.output = output
+        self.alias = alias
+        self.dsr = shutil.which("dsr")
+        if not self.dsr:
+            raise Rejected("installed dsr is unavailable")
+        self.runs = []
+        self.sequence = 0
+
+    def run(self, label, checks, targets=(), planted=None, env_overrides=None):
+        """Run actual installed DSR, then validate its exact nonempty contract."""
+        self.sequence += 1
+        directory = self.output / f"{self.sequence:03d}-{label}"
+        directory.mkdir()
+        commands = [command for _, command in checks]
+        required = {"checks": commands, "targets": list(targets)}
+        write_json(directory / "required.json", required)
+        required_digest = digest((directory / "required.json").read_bytes())
+        registrations = {name: json.loads(json.dumps(required)) for name in ALIASES}
+        if planted is not None:
+            planted(registrations[self.alias])
+        config = directory / "repos.yaml"
+        # JSON is a YAML subset; this avoids shell/YAML interpolation of paths.
+        write_json(config, {"tools": registrations})
+        config_digest = digest(config.read_bytes())
+        env = dict(os.environ, DSR_REPOS_FILE=str(config), LC_ALL="C")
+        if env_overrides:
+            env.update(env_overrides)
+        with (directory / "dsr.json").open("w") as stdout, (directory / "dsr.log").open("w") as stderr:
+            process = subprocess.run(
+                [self.dsr, "-j", "quality", "--tool", self.alias, "--work-dir", str(ROOT)],
+                env=env, stdout=stdout, stderr=stderr, check=False,
+            )
+        record = {"label": label, "directory": str(directory), "exit_code": process.returncode,
+                  "required_sha256": required_digest, "configuration_sha256": config_digest,
+                  "required_targets": list(targets), "commands": commands}
+        self.runs.append(record)
+        reasons = []
+        if not commands:
+            reasons.append("required checks are empty")
+        if any(value != required for value in registrations.values()):
+            reasons.append("alias registrations differ from the frozen required inventory")
+        try:
+            response = json.loads((directory / "dsr.json").read_text())
+            details = response["details"]
+            observed = details["checks"]
+            if details.get("tool") != self.alias:
+                reasons.append("DSR result names another alias")
+            if [item["command"] for item in observed] != commands:
+                reasons.append("DSR command inventory differs from required commands")
+            if details.get("total") != len(commands) or details.get("passed") != len(commands):
+                reasons.append("DSR did not execute and pass every required check")
+            if details.get("failed") != 0 or details.get("skipped") or details.get("dry_run"):
+                reasons.append("DSR failed, skipped, or only dry-ran checks")
+            if response.get("status") != "success" or any(
+                item.get("exit_code") != 0 or item.get("passed") is not True for item in observed
+            ):
+                reasons.append("DSR retained a failed check")
+        except (ValueError, KeyError, TypeError) as error:
+            reasons.append(f"invalid DSR result: {error}")
+        if process.returncode:
+            reasons.append(f"DSR exited {process.returncode}")
+        if digest((directory / "required.json").read_bytes()) != required_digest:
+            reasons.append("required inventory changed during execution")
+        if digest(config.read_bytes()) != config_digest:
+            reasons.append("DSR registration changed during execution")
+        record["reasons"] = reasons
+        write_json(directory / "contract.json", record)
+        if reasons:
+            raise Rejected(f"{label}: " + "; ".join(reasons))
+        return directory
+
+
+def redirected(argv, output, stderr=None):
+    command = shlex.join([str(value) for value in argv])
+    if stderr is None:
+        return command + " > " + shlex.quote(str(output)) + " 2>&1"
+    return command + " > " + shlex.quote(str(output)) + " 2> " + shlex.quote(str(stderr))
+
+
+def self_test(gates):
+    results = []
+    checks = [("target-a", "printf '%s\\n' target-a"),
+              ("target-b", 'printf "%s\\n" target-b; exit "${FASTMCP_DSR_CONTRACT_EXIT:-0}"')]
+    targets = ["target-a", "target-b"]
+    for alias in ALIASES:
+        gates.alias = alias
+        gates.run("dsr_alias_nonempty_positive-" + alias, checks, targets,
+                  env_overrides={"FASTMCP_DSR_CONTRACT_EXIT": "0"})
+    results.append("dsr_alias_nonempty_positive")
+    for label, mutate, exit_code, expected_reason in (
+        ("dsr_alias_empty_negative", lambda entry: entry.update(checks=[]), "0", "DSR command inventory"),
+        ("dsr_failed_gate_negative", None, "7", "DSR retained a failed check"),
+        ("dsr_required_target_omission_negative", lambda entry: (
+            entry["checks"].pop(), entry["targets"].pop()
+        ), "0", "DSR command inventory"),
+    ):
+        try:
+            gates.run(label, checks, targets, planted=mutate,
+                      env_overrides={"FASTMCP_DSR_CONTRACT_EXIT": exit_code})
+        except Rejected as error:
+            if expected_reason not in str(error):
+                raise Rejected(f"negative failed for the wrong reason: {label}: {error}") from error
+            results.append(label)
+        else:
+            raise Rejected(f"planted negative was accepted: {label}")
+    write_json(gates.output / "contract-tests.json", {"passed": results, "proof_class": "installed-DSR configuration"})
+    for name in results:
+        print(f"PASS {name}")
+    # These are parser controls, separate from the installed-DSR cases above.
+    library = {"package": "probe", "name": "probe", "kind": ["lib"], "test": True,
+               "required_features": [], "enabled_features": [], "eligible": True}
+    if len(select_targets([library], ["probe"], False, [("--lib", None)])) != 1:
+        raise Rejected("parser did not select the positive library target")
+    for name, target in (
+        ("required_example_omission_negative", dict(library, name="example", kind=["example"])),
+        ("required_bench_omission_negative", dict(library, name="bench", kind=["bench"])),
+        ("required_test_false_omission_negative", dict(library, name="binary", kind=["bin"], test=False)),
+        ("required_custom_harness_omission_negative", dict(library, name="custom", kind=["test"], harness=False)),
+    ):
+        try:
+            select_targets([library, target], ["probe"], False, [("--all-targets", None)])
+        except Rejected as error:
+            if "unsupported test target" not in str(error):
+                raise
+        else:
+            raise Rejected(f"parser silently omitted a required target: {name}")
+        if len(select_targets([library, target], ["probe"], False,
+                              [("--all-targets", None)], compile_only=True)) != 2:
+            raise Rejected("compile-only parser omitted a target from --all-targets")
+        print(f"PASS {name}")
+    listed = "alpha: test\nbeta: test\n"
+    positive_events = [
+        {"type": "test", "event": event, "name": name}
+        for name in ("alpha", "beta") for event in ("started", "ok")
+    ] + [{"type": "suite", "event": "ok", "passed": 2, "failed": 0,
+          "ignored": 0, "filtered_out": 0}]
+    positive_log = "\n".join(json.dumps(event) for event in positive_events)
+    if observe_tests(listed, positive_log, [])["reasons"]:
+        raise Rejected("libtest parser refused exact positive inventories")
+    for name, omitted in (("required_started_missing_negative", 2),
+                          ("required_passed_missing_negative", 3)):
+        negative_log = "\n".join(json.dumps(event) for index, event in enumerate(positive_events)
+                                 if index != omitted)
+        if not observe_tests(listed, negative_log, [])["reasons"]:
+            raise Rejected(f"libtest parser accepted an incomplete inventory: {name}")
+        print(f"PASS {name}")
+    try:
+        parse_scope("-p probe --release")
+    except Rejected as error:
+        if "unsupported scope argument" not in str(error):
+            raise
+    else:
+        raise Rejected("scope parser silently dropped an unsupported option")
+    print("PASS unsupported_scope_negative")
+    target = dict(library, name="integration", kind=["test"])
+    positive = {"test": [{"name": "integration", "harness": True}]}
+    negative = {"test": [{"name": "integration", "harness": False}]}
+    if not uses_libtest(positive, target) or uses_libtest(negative, target):
+        raise Rejected("manifest harness declaration was ignored")
+    print("PASS custom_harness_manifest_negative")
+
+
+def parse_scope(text):
+    tokens = shlex.split(text)
+    packages, selectors, features = [], [], []
+    workspace = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in ("-p", "--package", "--test", "--bin", "--features"):
+            if index + 1 == len(tokens):
+                raise Rejected(f"missing value after {token}")
+            value = tokens[index + 1]
+            index += 2
+            if token in ("-p", "--package"):
+                packages.append(value)
+            elif token == "--features":
+                features.extend([token, value])
+            else:
+                selectors.append((token, value))
+        else:
+            index += 1
+            if token == "--workspace":
+                workspace = True
+            elif token in ("--all-features", "--no-default-features"):
+                features.append(token)
+            elif token in ("--lib", "--tests", "--bins", "--all-targets"):
+                selectors.append((token, None))
+            else:
+                raise Rejected(f"unsupported scope argument {token!r}; select packages and lib/bin/test targets explicitly")
+    if workspace == bool(packages):
+        raise Rejected("scope must select either --workspace or one or more -p packages")
+    if not selectors:
+        selectors = [("--lib", None), ("--tests", None), ("--bins", None)]
+    return packages, workspace, selectors, features
+
+
+def uses_libtest(manifest, target):
+    # Cargo metadata exposes `test` but not the manifest's `harness` flag.
+    if LIB_KINDS.intersection(target["kind"]):
+        return manifest.get("lib", {}).get("harness", True)
+    for kind in ("bin", "test", "example", "bench"):
+        if kind in target["kind"]:
+            for entry in manifest.get(kind, []):
+                if entry.get("name") == target["name"]:
+                    return entry.get("harness", True)
+                if "name" not in entry and entry.get("harness") is False:
+                    # An inferred target name cannot justify assuming libtest.
+                    # Require an explicit name before this runner credits it.
+                    return False
+    return True
+
+
+def target_inventory(metadata):
+    enabled = {node["id"]: set(node["features"]) for node in metadata["resolve"]["nodes"]}
+    members = set(metadata["workspace_members"])
+    inventory = []
+    for package in metadata["packages"]:
+        if package["source"] is None:
+            try:
+                Path(package["manifest_path"]).resolve().relative_to(ROOT)
+            except ValueError as error:
+                raise Rejected("external path dependency is outside the clean-revision source proof") from error
+        if package["id"] not in members:
+            continue
+        manifest = tomllib.loads(Path(package["manifest_path"]).read_text())
+        for target in package["targets"]:
+            required = target.get("required-features", [])
+            inventory.append({"package": package["name"], "name": target["name"], "kind": target["kind"],
+                              "test": target["test"], "required_features": required,
+                              "harness": uses_libtest(manifest, target),
+                              "enabled_features": sorted(enabled[package["id"]]),
+                              "eligible": set(required) <= enabled[package["id"]]})
+    return inventory
+
+
+def select_targets(inventory, packages, workspace, selectors, compile_only=False):
+    names = {target["package"] for target in inventory}
+    if set(packages) - names:
+        raise Rejected(f"unknown packages: {sorted(set(packages) - names)}; facade package is fastmcp-rust")
+    selected = []
+    matched = set()
+    for target in inventory:
+        if not workspace and target["package"] not in packages:
+            continue
+        kind = target["kind"]
+        flag = "--lib" if LIB_KINDS.intersection(kind) else (
+            "--test" if "test" in kind else "--bin" if "bin" in kind else
+            "--example" if "example" in kind else "--bench" if "bench" in kind else None
         )
-    else:
-        reasons.append('compile FAILED: a test count taken after a failed build measures a stale binary')
-elif disk_exhausted:
-    # The build survived, but with no headroom left. Say so on the receipt
-    # rather than letting the next lane discover it as a mystery link error.
-    reasons.append(
-        f'worker disk is effectively full ({disk_avail_kb} KiB free, '
-        f'{field("DISK_PCT_USED")}% used): this run finished, but its result is not '
-        'reproducible on this worker and a sibling run will likely fail in the linker'
+        if flag is None:
+            continue
+        for index, (selector, name) in enumerate(selectors):
+            matches = selector == "--all-targets" or selector == flag and (name is None or name == target["name"])
+            matches |= selector == "--tests" and flag == "--test" or selector == "--bins" and flag == "--bin"
+            if matches:
+                matched.add(index)
+                if not compile_only and (flag in ("--example", "--bench") or not target["test"]
+                                         or not target.get("harness", True)):
+                    raise Rejected(f"unsupported test target {target['package']}::{target['name']} "
+                                   f"({kind}, test={target['test']}, harness={target.get('harness', True)}); "
+                                   "select libtest --lib/--test/--bin targets explicitly")
+                if not target["eligible"]:
+                    if compile_only and name is None:
+                        # Cargo skips feature-gated targets for broad compile
+                        # selectors. The full inventory retains them as ineligible.
+                        continue
+                    raise Rejected(f"selected target {target['package']}::{target['name']} requires {target['required_features']}; enable its features")
+                item = dict(target, flag=flag, id=f"{target['package']}::{flag}::{target['name']}")
+                if item not in selected:
+                    selected.append(item)
+    for index, (selector, name) in enumerate(selectors):
+        if name is not None and index not in matched:
+            raise Rejected(f"required target was not found: {selector} {name}")
+    if not selected:
+        raise Rejected("selected test target inventory is empty")
+    return sorted(selected, key=lambda target: target["id"])
+
+
+def observe_tests(list_log, run_log, filters):
+    listed = re.findall(r"^(.+): test$", list_log, re.MULTILINE)
+    required = [name for name in listed if not filters or any(value in name for value in filters)]
+    events = list(json_objects(run_log))
+    started = [event["name"] for event in events if event.get("type") == "test" and event.get("event") == "started"]
+    passed = [event["name"] for event in events if event.get("type") == "test" and event.get("event") == "ok"]
+    failed = [event.get("name") for event in events if event.get("type") == "test" and event.get("event") in ("failed", "ignored")]
+    suites = [event for event in events if event.get("type") == "suite" and event.get("event") in ("ok", "failed")]
+    expected = collections.Counter(required)
+    reasons = []
+    if not required or len(required) != len(set(required)):
+        reasons.append("required test inventory is empty or contains duplicate IDs")
+    if collections.Counter(started) != expected or collections.Counter(passed) != expected:
+        reasons.append("required, started, and passed test inventories differ")
+    if failed or len(suites) != 1 or any(
+        suite.get("event") != "ok" or suite.get("failed") != 0 or suite.get("ignored") != 0
+        or suite.get("passed") != len(required)
+        or suite.get("filtered_out") != len(listed) - len(required) for suite in suites
+    ):
+        reasons.append("missing suite completion, failed/ignored test, or inconsistent suite totals")
+    return {"discovered": sorted(listed), "required": sorted(required), "started": sorted(started),
+            "passed": sorted(passed), "failed_or_ignored": failed, "suites": suites, "reasons": reasons}
+
+
+def qualify(args, gates, receipt):
+    packages, workspace, selectors, scope_features = parse_scope(args.scope)
+    feature_args = scope_features + (["--features", args.features] if args.features else [])
+    if args.all_features:
+        feature_args.append("--all-features")
+    if args.no_default_features:
+        feature_args.append("--no-default-features")
+    source_paths = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "crates", "spec", ".cargo", "evidence"]
+    changed = git("diff", "HEAD", "--name-only", "--", *source_paths)
+    untracked = git("ls-files", "--others", "--exclude-standard", "--", *source_paths)
+    if changed or untracked:
+        raise Rejected("commit compilation inputs before qualification; clean RCH baseline would omit:\n" + changed + "\n" + untracked)
+    head = git("rev-parse", "HEAD")
+    receipt["subject"] = {"head": head, "tree": git("rev-parse", "HEAD^{tree}"),
+                          "dirty_inventory": git("status", "--porcelain", "--untracked-files=no"),
+                          "lockfile_sha256": digest((ROOT / "Cargo.lock").read_bytes()),
+                          "toolchain_sha256": digest((ROOT / "rust-toolchain.toml").read_bytes()),
+                          "source_mode": "RCH clean-overlay --no-overlay"}
+    pin = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
+    if args.toolchain and args.toolchain != pin:
+        raise Rejected("--toolchain must equal rust-toolchain.toml")
+    receipt["configuration"] = {"toolchain": pin, "profile": "dev" if args.check_only or args.clippy else "test",
+                                "features": feature_args, "scope": args.scope, "target": args.target,
+                                "filters": args.filter, "worker_requested": args.worker,
+                                "test_threads": args.test_threads, "jobs": args.jobs,
+                                "build_environment": {key: os.environ[key] for key in (
+                                    "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
+                                    "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET"
+                                ) if key in os.environ}}
+    # Metadata is read-only and does not compile. All three profiles are frozen;
+    # successful execution of one never earns evidence for another.
+    inventories = {}
+    metadata = {}
+    metadata_checks = []
+    for name, flags in (("default", []), ("modern-only", ["--no-default-features"]),
+                        ("all-features", ["--all-features"]), ("selected", feature_args)):
+        path = gates.output / f"metadata-{name}.json"
+        argv = ["cargo", f"+{pin}", "metadata", "--locked", "--format-version", "1", *flags]
+        metadata_checks.append((name, redirected(argv, path, gates.output / f"metadata-{name}.log")))
+        metadata[name] = path
+    gates.run("cargo-metadata", metadata_checks)
+    for name, path in metadata.items():
+        inventories[name] = target_inventory(json.loads(path.read_text()))
+    write_json(gates.output / "target-inventories.json", inventories)
+    if (git("rev-parse", "HEAD") != head or git("diff", "HEAD", "--name-only", "--", *source_paths)
+            or git("ls-files", "--others", "--exclude-standard", "--", *source_paths)):
+        raise Rejected("compilation inputs moved while freezing metadata")
+    selected = select_targets(inventories["selected"], packages, workspace, selectors,
+                              compile_only=args.check_only or args.clippy)
+    receipt["required_targets"] = [target["id"] for target in selected]
+    receipt["metadata_scope"] = (
+        "Cargo metadata resolves workspace feature unification. Eligibility is a candidate inventory, "
+        "not proof that a per-package execution enables a target. Every selected test target is "
+        "compiled, discovered and run explicitly; a skipped/empty target cannot pass."
     )
-if 'RECEIPT_END' not in raw:
-    reasons.append('remote script did not reach its end marker: early abort')
-# In check-only mode there is no test count to judge, so PL-1's zero-run rule
-# does not apply and the compile status is the whole verdict.
-check_only = field('CHECK_RC') is not None
-if check_only:
-    if field('CHECK_RC') != '0':
-        reasons.append(f'cargo check FAILED with {field("ERRORS")} error(s)')
-    if field('WARNINGS') not in (None, '0'):
-        warnings.append(f'{field("WARNINGS")} warning(s); this workspace lints at -D warnings')
-else:
-    if not suites:
-        reasons.append('no libtest suite event: nothing reported a count')
-    if events and passed + failed + ignored != len(events):
-        reasons.append(f'suite totals ({passed + failed + ignored}) disagree with '
-                       f'{len(events)} per-test events: the parse is incomplete')
-    if passed == 0:
-        reasons.append('passed==0: a zero-run green is RED (PL-1)')
-    if failed:
-        reasons.append(f'{failed} test(s) FAILED')
-# NOT invalidating. The receipt is anchored to the manifest DIGEST, which pins
-# the blobs the worker actually compiled; a later local edit cannot retroactively
-# change what was measured. In this repository parallel lanes commit several
-# times a minute, so treating any local movement as invalidation would make
-# every receipt INVALID and the instrument useless. What movement does mean is
-# that the receipt no longer describes the CURRENT tree, which is recorded as a
-# warning and as subject_still_current so a reader cannot miss it.
-still_current = head_before == head_after and dirty_before == dirty_after
-if not still_current:
-    warnings.append('local source moved after the sync: this receipt describes the '
-                    'manifest digest above, NOT the current working tree')
-if not check_only and field('RUN_RC') not in (None, '0') and not failed:
-    reasons.append(f'runner exited {field("RUN_RC")} without reporting any failure: early abort')
-if ignored:
-    warnings.append(f'{ignored} test(s) ignored and therefore NOT executed: '
-                    f'an #[ignore] body is not evidence. {ignored_ids[:5]}')
-if filtered and not filters.strip():
-    warnings.append(f'{filtered} test(s) filtered out with no --filter requested')
-elif filtered:
-    warnings.append(f'{filtered} test(s) filtered out by the requested --filter; '
-                    f'this receipt covers the selected subset only, not a full batch')
-# PL-1 exact test-set equality, scoped to what was actually REQUESTED. An
-# unfiltered run must execute everything it discovered. A --filter run must
-# execute every discovered test the filter selects -- comparing against the
-# whole discovered set would make every targeted run INVALID and teach the
-# reader to ignore the verdict, which is worse than not checking.
-if not check_only and discovered and executed:
-    wanted = [f for f in filters.split() if f]
-    if wanted:
-        expected = [d for d in discovered if any(f in d for f in wanted)]
-        label = f'selected by {wanted}'
-    else:
-        expected = discovered
-        label = 'discovered'
-    missing = sorted(set(expected) - set(executed))
-    unexpected = sorted(set(executed) - set(expected))
-    if missing:
-        reasons.append(f'{len(missing)} test(s) {label} never ran, e.g. {missing[:3]}')
-    if unexpected:
-        reasons.append(f'{len(unexpected)} test(s) ran that were not {label}, '
-                       f'e.g. {unexpected[:3]}')
-    if not expected:
-        reasons.append(f'no discovered test matched {wanted}: a filter that selects '
-                       f'nothing is a zero-run green (PL-1)')
+    write_json(gates.output / "required-targets.json", selected)
+    rch = shutil.which("rch")
+    if not rch:
+        raise Rejected("installed rch is unavailable")
+    prefix = [rch, "--json", "exec", "--base", head, "--clean-overlay", "--no-overlay"]
+    if args.worker:
+        prefix += ["--worker", args.worker]
+    prefix += ["--"]
+    cargo_base = ["cargo", f"+{pin}"]
+    common = ["--locked", "-j", str(args.jobs), *feature_args]
+    if args.target:
+        common += ["--target", args.target]
 
-# --scope is handed to cargo verbatim, so it may legitimately carry its own
-# feature flags. When it does, reporting features as "(default)" is a FALSE
-# provenance field on an otherwise honest receipt: PL-3 binds a claim to the
-# feature set, and this one would have under-recorded it.
-#
-# Observed 2026-10-11: a sweep passing --all-features inside --scope recorded
-# features "(default)" while discovering 516 tests in a target that yields 322
-# under legacy-2024-11-05,tasks,proxy. The flag had plainly taken effect. The
-# scope string preserved the truth, but the field a reader checks did not.
-#
-# This only widens what the field REPORTS. It does not change what cargo runs,
-# and it never invents a feature that is not in one of the two places a feature
-# can be selected.
-scope_feature_flags = [
-    flag for flag in ('--all-features', '--no-default-features')
-    if flag in scope.split()
-]
-if '--features' in scope.split():
-    scope_feature_flags.append('--features (see scope)')
-if features and scope_feature_flags:
-    effective_features = f'{features} + in scope: {" ".join(scope_feature_flags)}'
-elif scope_feature_flags:
-    effective_features = f'in scope: {" ".join(scope_feature_flags)}'
-else:
-    effective_features = features or '(default)'
+    def remote(label, argv, target_ids):
+        stdout = gates.output / f"{label}.rch.json"
+        stderr = gates.output / f"{label}.log"
+        command = "RCH_REQUIRE_REMOTE=1 RCH_VISIBILITY=summary CARGO_TERM_COLOR=never " + redirected(prefix + argv, stdout, stderr)
+        gates.run(label, [(label, command)], target_ids)
+        envelopes = [item for item in json_objects(stdout.read_text()) if "outcome" in item]
+        if len(envelopes) != 1 or any(item.get("location") != "remote" or item.get("outcome") != "completed"
+                                     or item.get("remote_exit_code") != 0 for item in envelopes):
+            raise Rejected(f"{label}: RCH did not confirm completed remote execution")
+        receipt.setdefault("remote_runs", []).append(envelopes[0])
+        return stderr.read_text(errors="replace")
 
-receipt = {
-    'subject': {
-        'head_before': head_before, 'head_after': head_after, 'tree': tree,
-        'dirty_digest_before': dirty_before, 'dirty_digest_after': dirty_after,
-        'dirty_inventory': 'dirty-before.txt',
-        'manifest_paths': manifest_paths,
-        'manifest_files': manifest_files,
-        'manifest_digest_local': manifest_local,
-        'manifest_digest_worker': manifest_remote,
-        'manifest_agrees': manifest_remote == manifest_local,
-    },
-    'configuration': {
-        'worker': worker, 'worker_host': field('HOST'), 'remote_dir': remote_dir,
-        'toolchain': toolchain, 'rustc': field('RUSTC'),
-        'rustc_commit': field('COMMIT_HASH'), 'host_target': field('TARGET'),
-        # Recorded separately from `toolchain` because they are separate inputs:
-        # this is what the compile resolved, `toolchain` is what the probe asked.
-        'rust_toolchain_toml_channel': pinned_channel or '(unreadable)',
-        'compiler_bound': not unbound and bool(pinned_channel) and pinned_channel == toolchain,
-        'profile': profile, 'scope': scope, 'features': effective_features,
-        'test_threads': threads or '(default)', 'filters': filters or '(none)',
-        'scheduler': 'none: direct ssh, bypassing the RCH queue',
-        # Capacity belongs on every receipt, green ones included: it is how a
-        # later reader tells a subject failure from a worker that ran out of room.
-        'disk_avail_kb': field('DISK_AVAIL_KB'),
-        'disk_pct_used': field('DISK_PCT_USED'),
-    },
-    'counts': {
-        'discovered_listed': field('DISCOVERED'),
-        'executed_named': len(executed), 'json_events': field('JSON_EVENTS'),
-        'passed': passed, 'failed': failed, 'ignored': ignored, 'filtered_out': filtered,
-    },
-    'test_ids': {'discovered': discovered, 'executed': executed,
-                 'ignored': ignored_ids, 'failed': failed_ids},
-    'beads': [b for b in beads.split(',') if b],
-    'mode': 'check-only (compile gate)' if check_only else 'test run',
-    'verdict': 'INVALID' if reasons else 'GREEN',
-    'invalidating_reasons': reasons,
-    'warnings': warnings,
-    'subject_still_current': still_current,
-    'note': ('Evidence only. This records no batch_verify verdict, closes no Bead and '
-             'grants no capability credit: those are separate revision-bound decisions '
-             'reserved to the orchestrator (RH-7, PL-4).'),
-}
-(root / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+    if args.check_only or args.clippy:
+        scope = ["--workspace"] if workspace else [value for name in packages for value in ("-p", name)]
+        for flag, name in selectors:
+            scope.append(flag)
+            if name is not None:
+                scope.append(name)
+        command = "clippy" if args.clippy else "check"
+        argv = cargo_base + [command, *common, *scope]
+        if args.clippy:
+            argv += ["--", "-D", "warnings"]
+        remote(command, argv, receipt["required_targets"])
+        receipt["mode"] = "compile-only; no tests executed"
+        return
+    receipt["mode"] = "selected test targets"
+    receipt["doctests"] = "not selected; only explicitly inventoried libtest targets are covered"
+    for index, target in enumerate(selected):
+        flags = ["-p", target["package"], target["flag"]]
+        if target["flag"] != "--lib":
+            flags.append(target["name"])
+        argv = cargo_base + ["test", *common, *flags]
+        label = f"target-{index:03d}"
+        remote(label + "-compile", argv + ["--no-run"], [target["id"]])
+        listing = remote(label + "-list", argv + ["--", "--list"], [target["id"]])
+        execution = remote(label + "-run", argv + ["--", "-Z", "unstable-options", "--format", "json",
+                                                   "--test-threads", str(args.test_threads), *args.filter], [target["id"]])
+        observed = observe_tests(listing, execution, args.filter)
+        receipt.setdefault("test_targets", {})[target["id"]] = observed
+        write_json(gates.output / f"{label}-tests.json", observed)
+        if observed["reasons"]:
+            raise Rejected(f"{target['id']}: " + "; ".join(observed["reasons"]))
+    if set(receipt.get("test_targets", {})) != set(receipt["required_targets"]):
+        raise Rejected("required test target inventory differs from executed target inventory")
+    discovered = [name for target in receipt["test_targets"].values() for name in target["discovered"]]
+    unmatched = [value for value in args.filter if not any(value in name for name in discovered)]
+    if unmatched:
+        raise Rejected(f"requested filters matched no discovered test: {unmatched}")
 
-print('== receipt ==')
-print(f'verdict             {receipt["verdict"]}')
-print(f'manifest agrees     {receipt["subject"]["manifest_agrees"]}')
-print(f'discovered/executed {field("DISCOVERED")}/{len(executed)}')
-print(f'passed/failed/ignored/filtered  {passed}/{failed}/{ignored}/{filtered}')
-for r in reasons:
-    print(f'  INVALID: {r}')
-for w in warnings:
-    print(f'  warn:    {w}')
-for name in failed_ids[:15]:
-    print(f'  FAILED: {name}')
-if check_only and field('CHECK_RC') != '0':
-    print('\n-- first diagnostics --')
-    for line in [l for l in raw.split('\n') if l.startswith(('error', '  -->'))][:40]:
-        print(f'  {line}')
-print(f'\nreceipt.json -> {root}/receipt.json')
-# Retain and print the complete receipt before propagating its rejection.
-sys.exit(1 if reasons else 0)
+
+def main():
+    parser = argparse.ArgumentParser(prog="scripts/verify_batch.sh", description="Fail-closed installed DSR → RCH qualification. Logs are retained; no Beads are closed.")
+    parser.add_argument("--scope", help="e.g. '-p fastmcp-rust --lib' or '--workspace --all-targets'")
+    parser.add_argument("--features", default="")
+    parser.add_argument("--all-features", action="store_true")
+    parser.add_argument("--no-default-features", action="store_true")
+    parser.add_argument("--filter", action="append", default=[])
+    parser.add_argument("--alias", choices=ALIASES, default="fastmcp_rust")
+    parser.add_argument("--worker", help="RCH worker ID; never an SSH hostname")
+    parser.add_argument("--target", help="explicit Rust target triple")
+    parser.add_argument("--toolchain", help="must match the repository pin")
+    parser.add_argument("--test-threads", type=int, default=1)
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--check-only", action="store_true")
+    parser.add_argument("--clippy", action="store_true")
+    parser.add_argument("--beads", default="")
+    parser.add_argument("--out", help="parent directory for a fresh retained run directory")
+    parser.add_argument("--self-test-dsr-contract", action="store_true")
+    args = parser.parse_args(sys.argv[2:])
+    if not args.self_test_dsr_contract and not args.scope:
+        parser.error("--scope is required")
+    if args.jobs < 1 or args.test_threads < 1:
+        parser.error("--jobs and --test-threads must be positive")
+    if args.filter and (args.check_only or args.clippy):
+        parser.error("--filter is only valid for test execution")
+    if args.out:
+        Path(args.out).mkdir(parents=True, exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix="fastmcp-verify-", dir=args.out)).resolve()
+    receipt = {"verdict": "INVALID", "script_sha256": digest(SCRIPT.read_bytes()),
+               "beads": [value for value in args.beads.split(",") if value],
+               "note": "Evidence only; no gate verdict, closure, capability credit, or maturity promotion."}
+    gates = None
+    try:
+        gates = Gates(output, args.alias)
+        installed = Path(gates.dsr).resolve()
+        receipt["installed_dsr"] = {"path": str(installed), "sha256": digest(installed.read_bytes())}
+        quality_module = installed.parent / "src" / "quality_gates.sh"
+        if quality_module.is_file():
+            receipt["installed_dsr"]["quality_module_sha256"] = digest(quality_module.read_bytes())
+        if args.self_test_dsr_contract:
+            self_test(gates)
+            receipt["mode"] = "installed-DSR configuration self-test; no Rust or MCP proof"
+        else:
+            qualify(args, gates, receipt)
+        receipt["verdict"] = "GREEN"
+    except (Rejected, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+        receipt["reason"] = str(error)
+        print(f"INVALID: {error}", file=sys.stderr)
+    finally:
+        receipt["dsr_runs"] = gates.runs if gates is not None else []
+        if "subject" in receipt:
+            receipt["subject"]["head_after"] = git("rev-parse", "HEAD")
+            receipt["subject"]["source_claim"] = "the frozen committed revision, not subsequent working-tree edits"
+        write_json(output / "receipt.json", receipt)
+        print(f"artifacts: {output}", flush=True)
+    return 0 if receipt["verdict"] == "GREEN" else 1
+
+
+raise SystemExit(main())
 PY
-status=$?
-printf '\nartifacts: %s\n' "$OUT"
-exit "$status"
