@@ -417,7 +417,7 @@ fn setup_test_server_and_client() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("e2e-test-server")
         .with_version("1.0.0")
-        .build_server_builder();
+        .build();
 
     let server = builder
         .tool(GreetingToolHandler)
@@ -441,7 +441,7 @@ fn setup_auth_server_and_client<P: fastmcp_rust::AuthProvider + 'static>(
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name(server_name)
         .with_version("1.0.0")
-        .build_server_builder();
+        .build();
 
     let server = builder
         .tool(GreetingToolHandler)
@@ -1344,7 +1344,7 @@ fn e2e_mixed_operations() {
 fn e2e_server_with_tools_only() {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("tools-only")
-        .build_server_builder();
+        .build();
 
     let server = builder.tool(GreetingToolHandler).build();
 
@@ -1367,7 +1367,7 @@ fn e2e_server_with_tools_only() {
 fn e2e_server_with_resources_only() {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("resources-only")
-        .build_server_builder();
+        .build();
 
     let server = builder.resource(TextFileResourceHandlerResource).build();
 
@@ -1388,7 +1388,7 @@ fn e2e_server_with_resources_only() {
 fn e2e_server_with_prompts_only() {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("prompts-only")
-        .build_server_builder();
+        .build();
 
     let server = builder.prompt(GreetingPromptHandlerPrompt).build();
 
@@ -1409,7 +1409,7 @@ fn e2e_server_with_prompts_only() {
 fn e2e_empty_server() {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("empty-server")
-        .build_server_builder();
+        .build();
 
     let server = builder.build();
 
@@ -1430,8 +1430,7 @@ fn e2e_empty_server() {
 
 #[test]
 fn e2e_custom_client_info() {
-    let (builder, client_transport, server_transport) =
-        TestServer::builder().build_server_builder();
+    let (builder, client_transport, server_transport) = TestServer::builder().build();
 
     let server = builder.tool(GreetingToolHandler).build();
 

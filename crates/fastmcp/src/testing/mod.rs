@@ -17,9 +17,9 @@
 //!
 //! #[test]
 //! fn test_tool_call() {
-//!     // Create a test server with real handlers
-//!     let (router, client_transport, server_transport) = TestServer::builder()
-//!         .build();
+//!     // Create a configured test server
+//!     let (builder, client_transport, server_transport) = TestServer::builder().build();
+//!     let server = builder.build();
 //!
 //!     // Create a test client
 //! }

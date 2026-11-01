@@ -92,7 +92,7 @@ fn spawn_stress_server(
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name(name)
         .with_version("1.0.0")
-        .build_server_builder();
+        .build();
 
     let server = builder
         .tool(EchoTool)

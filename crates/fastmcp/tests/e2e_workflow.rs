@@ -580,7 +580,7 @@ fn setup_workflow_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("workflow-test-server")
         .with_version("2.0.0")
-        .build_server_builder();
+        .build();
 
     let server = builder
         .tool(EchoTool)
@@ -1428,7 +1428,7 @@ fn workflow_two_independent_servers() {
     // Server A: tools only
     let (builder_a, client_a_transport, server_a_transport) = TestServer::builder()
         .with_name("server-a")
-        .build_server_builder();
+        .build();
     let server_a = builder_a.tool(EchoTool).build();
     let handle_a = spawn_runtime_server(server_a, server_a_transport, "server A loop");
     server_joins.push(handle_a);
@@ -1436,7 +1436,7 @@ fn workflow_two_independent_servers() {
     // Server B: resources only
     let (builder_b, client_b_transport, server_b_transport) = TestServer::builder()
         .with_name("server-b")
-        .build_server_builder();
+        .build();
     let server_b = builder_b.resource(StatusResource).build();
     let handle_b = spawn_runtime_server(server_b, server_b_transport, "server B loop");
     server_joins.push(handle_b);
@@ -1573,7 +1573,7 @@ fn workflow_server_name_and_version() {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("custom-name")
         .with_version("9.8.7")
-        .build_server_builder();
+        .build();
 
     let server = builder.tool(EchoTool).build();
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
@@ -1588,8 +1588,7 @@ fn workflow_server_name_and_version() {
 
 #[test]
 fn workflow_capabilities_match_handlers() {
-    let (builder, client_transport, server_transport) =
-        TestServer::builder().build_server_builder();
+    let (builder, client_transport, server_transport) = TestServer::builder().build();
 
     let server = builder.tool(EchoTool).resource(StatusResource).build();
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
@@ -1610,8 +1609,7 @@ fn workflow_capabilities_match_handlers() {
 
 #[test]
 fn workflow_custom_client_info_accepted() {
-    let (builder, client_transport, server_transport) =
-        TestServer::builder().build_server_builder();
+    let (builder, client_transport, server_transport) = TestServer::builder().build();
 
     let server = builder.tool(EchoTool).build();
     let handle = spawn_runtime_server(server, server_transport, "workflow server loop");
@@ -4880,7 +4878,7 @@ fn setup_tool_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("tool-test-server")
         .with_version("1.0.0")
-        .build_server_builder();
+        .build();
 
     let server = builder
         .tool(EchoTool)
@@ -5508,7 +5506,7 @@ fn setup_resource_test_server() -> TestHarness {
     let (builder, client_transport, server_transport) = TestServer::builder()
         .with_name("resource-test-server")
         .with_version("1.0.0")
-        .build_server_builder();
+        .build();
 
     let server = builder
         .resource(PlainTextResource)

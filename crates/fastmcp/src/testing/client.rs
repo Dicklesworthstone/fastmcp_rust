@@ -30,9 +30,8 @@ use fastmcp_transport::memory::MemoryTransport;
 /// ```ignore
 /// use fastmcp_rust::testing::prelude::*;
 ///
-/// let (router, client_transport, server_transport) = TestServer::builder()
-///     .with_tool(my_tool)
-///     .build();
+/// let (builder, client_transport, server_transport) = TestServer::builder().build();
+/// let server = builder.tool(my_tool).build();
 /// // Run server in a background thread (omitted here). Prefer using the
 /// // higher-level E2E harness helpers in this crate which join threads on drop.
 ///
