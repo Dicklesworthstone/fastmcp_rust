@@ -381,25 +381,54 @@ mod https_tests;
 #[cfg(all(test, feature = "legacy-2024-11-05"))]
 mod era_tests {
     use super::*;
-    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
+    use fastmcp_protocol::{ClientCapabilities, CoreDispatchError, FinalRequestMeta};
     use serde_json::json;
 
     #[test]
     fn modern_looking_metadata_cannot_retag_a_legacy_typed_catalog() {
-        for method in ["tools/list", "resources/list", "resources/templates/list", "prompts/list"] {
+        for method in [
+            "tools/list",
+            "resources/list",
+            "resources/templates/list",
+            "prompts/list",
+        ] {
             let params = json!({"_meta": FinalRequestMeta::new(ClientCapabilities::default())});
-            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
-                let request = CoreRequest::decode(era, method, Some(&params)).unwrap();
-                assert_eq!(request.era(), era);
-                let result = Traversal::new(
-                    request, "era", ManagedCoreLimits::default(), CatalogLimits::default(), 8 * 1024 * 1024,
-                );
-                if era == ProtocolEra::Modern2026 {
-                    assert!(result.is_ok());
-                } else {
-                    assert!(matches!(result, Err(DpopCatalogError::InvalidRequest)));
-                }
-            }
+            let request =
+                CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&params)).unwrap();
+            assert_eq!(request.era(), ProtocolEra::Modern2026);
+            assert!(
+                Traversal::new(
+                    request,
+                    "era",
+                    ManagedCoreLimits::default(),
+                    CatalogLimits::default(),
+                    8 * 1024 * 1024,
+                )
+                .is_ok()
+            );
+
+            // Identical metadata cannot turn a legacy request into a modern one.
+            assert!(matches!(
+                CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&params)),
+                Err(CoreDispatchError::CrossEraRequestMetadata { method: rejected })
+                    if rejected == method
+            ));
+
+            // Also exercise the traversal boundary with a valid legacy request,
+            // so early decoder rejection cannot hide a missing traversal guard.
+            let request =
+                CoreRequest::decode(ProtocolEra::Legacy2024, method, Some(&json!({}))).unwrap();
+            assert_eq!(request.era(), ProtocolEra::Legacy2024);
+            assert!(matches!(
+                Traversal::new(
+                    request,
+                    "era",
+                    ManagedCoreLimits::default(),
+                    CatalogLimits::default(),
+                    8 * 1024 * 1024,
+                ),
+                Err(DpopCatalogError::InvalidRequest)
+            ));
         }
     }
 }
@@ -407,8 +436,8 @@ mod era_tests {
 #[cfg(test)]
 mod streaming_tests {
     use super::*;
-    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
     use crate::http_auth::rpc::ManagedCoreEvent;
+    use fastmcp_protocol::{ClientCapabilities, FinalRequestMeta};
     use serde_json::json;
 
     const TARGET: &str = "https://mcp.example/mcp";
