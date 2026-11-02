@@ -2420,6 +2420,14 @@ fn is_removed_legacy_method(method: &str) -> bool {
     )
 }
 
+fn modern_only_initialize_error() -> JsonRpcError {
+    JsonRpcError {
+        code: McpErrorCode::MethodNotFound.into(),
+        message: MODERN_ONLY_INITIALIZE_MESSAGE.to_owned(),
+        data: Some(serde_json::json!({ "supported": [MODERN_PROTOCOL_VERSION] })),
+    }
+}
+
 /// Stateless per-request refusal for a request on a modern stdio connection
 /// that does not carry exact MCP 2026-07-28 metadata.
 ///
@@ -2439,6 +2447,7 @@ fn modern_request_version_refusal(request: &JsonRpcRequest) -> Option<JsonRpcRes
                 "requested": requested,
             })),
         },
+        None if request.method == "initialize" => modern_only_initialize_error(),
         None if is_removed_legacy_method(&request.method) => JsonRpcError {
             code: McpErrorCode::MethodNotFound.into(),
             message: "Method not found".to_owned(),
@@ -17031,16 +17040,10 @@ impl Server {
             && request.validate().is_ok()
             && inbound.request_id() == request_id_to_u64(request.id.as_ref())
         {
-            return request.id.clone().map(|id| {
-                JsonRpcResponse::error(
-                    Some(id),
-                    JsonRpcError {
-                        code: (-32601).into(),
-                        message: MODERN_ONLY_INITIALIZE_MESSAGE.to_owned(),
-                        data: Some(serde_json::json!({ "supported": ["2026-07-28"] })),
-                    },
-                )
-            });
+            return request
+                .id
+                .clone()
+                .map(|id| JsonRpcResponse::error(Some(id), modern_only_initialize_error()));
         }
         self.dispatch_stateless_owned_with_cancellation(
             inbound,
@@ -17483,16 +17486,10 @@ impl Server {
             {
                 return protocol_era_refusal(request);
             }
-            return request.id.clone().map(|id| {
-                JsonRpcResponse::error(
-                    Some(id),
-                    JsonRpcError {
-                        code: (-32601).into(),
-                        message: MODERN_ONLY_INITIALIZE_MESSAGE.to_owned(),
-                        data: Some(serde_json::json!({ "supported": ["2026-07-28"] })),
-                    },
-                )
-            });
+            return request
+                .id
+                .clone()
+                .map(|id| JsonRpcResponse::error(Some(id), modern_only_initialize_error()));
         }
         self.dispatch_stateless_with_cancellation(
             inbound,
@@ -40490,7 +40487,7 @@ mod lib_unit_tests {
 
     #[cfg(not(feature = "legacy-2024-11-05"))]
     #[test]
-    fn no_legacy_stdio_refuses_the_opening_envelope_before_a_second_request_or_dispatch() {
+    fn no_legacy_stdio_refuses_initialize_without_blocking_modern_follow_up() {
         // A no-legacy build cannot select Auto, so the legacy opening below
         // meets the ModernOnly default rather than a dual-era classifier.
         assert!(matches!(
@@ -40499,20 +40496,40 @@ mod lib_unit_tests {
         ));
         let (result, receive_calls, sent) = no_legacy_stdio_script(
             exact_legacy_initialize_request(917, serde_json::json!("1.0.0")),
-            JsonRpcMessage::Request(JsonRpcRequest::new(
-                "tools/list",
-                Some(serde_json::json!({})),
-                918_i64,
-            )),
+            modern_discovery_request(918),
         );
 
-        assert!(
-            result.is_err(),
-            "a no-legacy stdio opening must be terminal"
+        result.expect("a refused initialize must leave the fixed modern connection usable");
+        assert_eq!(
+            receive_calls, 3,
+            "the refusal, modern follow-up, and closing receive must reach the loop"
         );
         assert_eq!(
-            receive_calls, 1,
-            "the legacy opening must not admit a follow-up request into dispatch"
+            sent.len(),
+            2,
+            "each request must receive exactly one response"
+        );
+        let JsonRpcMessage::Response(refusal) = &sent[0] else {
+            panic!("initialize must receive a JSON-RPC refusal: {sent:?}");
+        };
+        assert_eq!(refusal.id, Some(917_i64.into()));
+        assert!(refusal.result.is_none());
+        let error = refusal.error.as_ref().expect("initialize must be refused");
+        assert_eq!(error.code, fastmcp_protocol::JsonInteger::from(-32601));
+        assert_eq!(error.message, MODERN_ONLY_INITIALIZE_MESSAGE);
+        assert_eq!(
+            error.data,
+            Some(serde_json::json!({ "supported": [MODERN_PROTOCOL_VERSION] }))
+        );
+        assert!(
+            matches!(
+                &sent[1],
+                JsonRpcMessage::Response(response)
+                    if response.id == Some(918_i64.into())
+                        && response.error.is_none()
+                        && response.result.is_some()
+            ),
+            "the same modern follow-up as the positive control must succeed: {sent:?}"
         );
         assert!(
             sent.iter().all(|message| !matches!(
@@ -40536,12 +40553,19 @@ mod lib_unit_tests {
             receive_calls, 3,
             "both requests and the closing receive must reach the loop"
         );
+        assert_eq!(
+            sent.len(),
+            2,
+            "each request must receive exactly one response"
+        );
         for id in [917_i64, 918] {
             assert!(
                 sent.iter().any(|message| matches!(
                     message,
                     JsonRpcMessage::Response(response)
-                        if response.id == Some(id.into()) && response.error.is_none()
+                        if response.id == Some(id.into())
+                            && response.error.is_none()
+                            && response.result.is_some()
                 )),
                 "request {id} must be dispatched and answered: {sent:?}"
             );
