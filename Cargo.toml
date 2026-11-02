@@ -44,7 +44,7 @@ rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
 # signal-free process-group existence probes after a managed leader is reaped.
 # The non-Unix std::process pipe path remains explicitly frame-boundary-only.
-rustix = { version = "=1.1.5", default-features = false }
+rustix = { version = "=1.1.6", default-features = false }
 
 # Serialization (only these)
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -53,7 +53,7 @@ serde_json = { version = "=1.0.154", features = ["arbitrary_precision"] }
 serde_yaml = { version = "=0.9.34" }
 
 # Logging (facade only, zero-cost when disabled)
-log = { version = "=0.4.34" }
+log = { version = "=0.4.35" }
 
 # Opaque cursor encoding for pagination
 base64 = { version = "=0.23.1" }
@@ -66,7 +66,7 @@ flate2 = { version = "=1.1.10" }
 chrono = { version = "=0.4.45", default-features = false, features = ["std", "clock"] }
 
 # File watching
-notify = { version = "=8.2.0" }
+notify = { version = "=8.2.1" }
 glob = { version = "=0.3.4" }
 
 # Console output
