@@ -1437,9 +1437,8 @@ fn workflow_two_independent_servers() {
     server_joins.push(handle_a);
 
     // Server B: resources only
-    let (builder_b, client_b_transport, server_b_transport) = TestServer::builder()
-        .with_name("server-b")
-        .build();
+    let (builder_b, client_b_transport, server_b_transport) =
+        TestServer::builder().with_name("server-b").build();
     let server_b = builder_b.resource(StatusResource).build();
     let handle_b = spawn_runtime_server(server_b, server_b_transport, "server B loop");
     server_joins.push(handle_b);

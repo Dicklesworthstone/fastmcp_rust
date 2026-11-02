@@ -252,6 +252,8 @@ use asupersync::{
 use execution::{MrtrDriver, MrtrDriverLimits};
 use fastmcp_core::runtime::poll_on_cx;
 use fastmcp_core::{McpContext, McpError, McpErrorCode, McpRequestCancellation, McpResult};
+#[cfg(any(test, feature = "websocket-experimental"))]
+use fastmcp_protocol::ServerDiscoverRequest;
 use fastmcp_protocol::common_types::{
     ContentBlock, EmbeddedResourceContents, JsonInteger, OpenMetadata, RawIcon,
 };
@@ -299,8 +301,6 @@ use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
     ServerExtensionDiscovery,
 };
-#[cfg(any(test, feature = "websocket-experimental"))]
-use fastmcp_protocol::ServerDiscoverRequest;
 use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverResult};
 
 use crate::session::mcp_apps_activation_receipt;
