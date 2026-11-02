@@ -1754,6 +1754,11 @@ pub trait ToolHandler: Send + Sync {
     /// Asynchronously calls the tool through the final result surface.
     ///
     /// The default delegates to [`Self::call_final`].
+    /// This is a direct complete-result hook. Modern router dispatch uses
+    /// [`Self::call_final_outcome_async_in_request`] instead; handwritten async
+    /// handlers must override [`Self::call_final_outcome_async`] or its
+    /// request-owned counterpart to be awaited by that path. `#[tool]`
+    /// generates the bridge between these hooks automatically.
     fn call_final_async<'a>(
         &'a self,
         ctx: &'a McpContext,

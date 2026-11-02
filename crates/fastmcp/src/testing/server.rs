@@ -135,11 +135,8 @@ mod tests {
     use asupersync::Cx;
     use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
     use fastmcp_core::{McpContext, McpOutcome, McpResult, Outcome};
-    use fastmcp_protocol::{
-        CompleteResult, Content, FinalCallToolResult, JsonRpcMessage, JsonRpcRequest,
-        JsonRpcResponse, Tool,
-    };
-    use fastmcp_server::{BoxFuture, ToolExecutionMode, ToolHandler};
+    use fastmcp_protocol::{Content, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, Tool};
+    use fastmcp_server::{BoxFuture, FinalToolOutcome, ToolExecutionMode, ToolHandler};
     use serde_json::json;
 
     /// The test owns the runtime; both the production pump and client borrow it.
@@ -280,11 +277,11 @@ mod tests {
             Ok(vec![Content::text("effect completed")])
         }
 
-        fn call_final_async<'a>(
+        fn call_final_outcome_async<'a>(
             &'a self,
             ctx: &'a McpContext,
             arguments: serde_json::Value,
-        ) -> BoxFuture<'a, McpOutcome<CompleteResult<FinalCallToolResult>>> {
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
             Box::pin(async move {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 let _settlement = Settlement(Arc::clone(&self.settled));
@@ -293,7 +290,7 @@ mod tests {
                     return Outcome::Err(fastmcp_core::McpError::request_cancelled());
                 }
                 match self.call_final(ctx, arguments) {
-                    Ok(result) => Outcome::Ok(result),
+                    Ok(result) => Outcome::Ok(FinalToolOutcome::Complete(result)),
                     Err(error) => Outcome::Err(error),
                 }
             })

@@ -165,6 +165,8 @@
 //! ```
 
 #![forbid(unsafe_code)]
+// Native transport and caller-owned test pump futures require deeper Send proofs.
+#![recursion_limit = "256"]
 
 // `proc-macro-crate` reports `FoundCrate::Itself` for every target belonging
 // to this package, including examples and integration tests. Keep one
