@@ -3033,7 +3033,10 @@ exec sleep 5
         let script = r#"
 IFS= read -r discover || exit 80
 case "$discover" in *'"method":"server/discover"'*) ;; *) exit 81;; esac
-case "$discover" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *) exit 82;; esac
+case "$discover" in *'"io.modelcontextprotocol/clientCapabilities":'"$3"*) ;; *)
+    printf 'discovery capability mismatch: expected %s; received %s\n' "$3" "$discover" >&2
+    exit 82;;
+esac
 printf '%s\n' "$1"
 IFS= read -r original || exit 83
 case "$original" in *'"method":"'"$4"'"'*) ;; *) exit 84;; esac
@@ -3074,7 +3077,7 @@ exit 0
                 "inputRequests":{
                     "e":{"method":"elicitation/create","params":{
                         "mode":"url","message":"Open the review page",
-                        "elicitationId":"stdio-review","url":"https://example.com/review"
+                        "url":"https://example.com/review"
                     }},
                     "r":{"method":"roots/list"},
                     "s":{"method":"sampling/createMessage","params":{"messages":[],"maxTokens":9}}

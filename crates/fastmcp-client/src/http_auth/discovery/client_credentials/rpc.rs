@@ -643,6 +643,8 @@ pub(super) mod tests {
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
+            // Accepted sockets can inherit the listener's nonblocking mode.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

@@ -299,7 +299,9 @@ use fastmcp_protocol::{
     ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionDirection, ExtensionSettings,
     ServerExtensionDiscovery,
 };
-use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverRequest, ServerDiscoverResult};
+#[cfg(any(test, feature = "websocket-experimental"))]
+use fastmcp_protocol::ServerDiscoverRequest;
+use fastmcp_protocol::{SERVER_DISCOVER_METHOD, ServerDiscoverResult};
 
 use crate::session::mcp_apps_activation_receipt;
 
@@ -18616,15 +18618,12 @@ impl Client {
         self.timeout_policy.validate()?;
         let modern = self.handshake_era() == ProtocolEra::Modern2026;
         let (method, params) = if modern {
-            let params =
-                serde_json::to_value(ServerDiscoverRequest::default()).map_err(|error| {
-                    McpError::internal_error(format!(
-                        "Failed to serialize discovery parameters: {error}"
-                    ))
-                })?;
+            // Discovery has no method-specific parameters. A typed default's
+            // empty capabilities would be treated as an inbound override and
+            // erase the configured callback capabilities during decoration.
             (
                 SERVER_DISCOVER_METHOD,
-                self.with_modern_request_metadata(params)?,
+                self.with_modern_request_metadata(serde_json::json!({}))?,
             )
         } else {
             let params = InitializeParams {
@@ -23363,13 +23362,7 @@ impl Client {
         _client_info: ClientInfo,
         _capabilities: ClientCapabilities,
     ) -> McpResult<ClientInitialization> {
-        let params = serde_json::to_value(ServerDiscoverRequest::default())
-            .map_err(|error| {
-                McpError::internal_error(format!(
-                    "Failed to serialize modern server/discover parameters: {error}"
-                ))
-            })
-            .and_then(|params| self.with_modern_request_metadata(params))?;
+        let params = self.with_modern_request_metadata(serde_json::json!({}))?;
         let received = self.send_prepared_request(SERVER_DISCOVER_METHOD, params)?;
         self.decode_modern_discovery_initialization(received)
     }
@@ -23383,13 +23376,7 @@ impl Client {
         _client_info: ClientInfo,
         _capabilities: ClientCapabilities,
     ) -> McpResult<Result<ClientInitialization, AutoStdioFallbackSignal>> {
-        let params = serde_json::to_value(ServerDiscoverRequest::default())
-            .map_err(|error| {
-                McpError::internal_error(format!(
-                    "Failed to serialize modern server/discover parameters: {error}"
-                ))
-            })
-            .and_then(|params| self.with_modern_request_metadata(params))?;
+        let params = self.with_modern_request_metadata(serde_json::json!({}))?;
         match self.send_modern_discovery_probe(params)? {
             Ok(received) => self
                 .decode_modern_discovery_initialization(received)
@@ -44536,6 +44523,8 @@ exec sleep 2
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // Do not inherit a nonblocking peer mode on BSD platforms.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();

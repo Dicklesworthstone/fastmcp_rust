@@ -763,6 +763,8 @@ mod tests {
                     Err(error) => panic!("accept failed: {error}"),
                 }
             };
+            // This peer uses bounded blocking reads after nonblocking accept.
+            socket.set_nonblocking(false).unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
