@@ -35,8 +35,34 @@ def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
 
 
-def git(*args):
-    return subprocess.check_output(["git", "-C", str(ROOT), *args]).decode().strip()
+def git(*args, root=ROOT):
+    return subprocess.check_output(["git", "-C", str(root), *args]).decode().strip()
+
+
+def workspace_source_paths(manifest):
+    # readme_examples.rs compiles the root README through include_str!.
+    paths = {"Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "README.md", "spec", ".cargo", "evidence"}
+    members = manifest.get("workspace", {}).get("members", [])
+    if not members:
+        raise Rejected("workspace member inventory is empty")
+    for member in members:
+        path = Path(member)
+        if path.is_absolute() or ".." in path.parts:
+            raise Rejected(f"workspace member is outside the clean-revision source boundary: {member}")
+        # Guard each member's top-level directory, including new source files
+        # and siblings selected by member globs. A top-level glob needs the
+        # whole repository boundary rather than a guessed subset of matches.
+        first = path.parts[0] if path.parts else "."
+        paths.add("." if any(char in first for char in "*?[") else first)
+    return sorted(paths)
+
+
+def admit_source_inputs(root, paths):
+    changed = git("diff", "HEAD", "--name-only", "--", *paths, root=root)
+    untracked = git("ls-files", "--others", "--exclude-standard", "--", *paths, root=root)
+    if changed or untracked:
+        raise Rejected("commit compilation inputs before qualification; clean RCH baseline would omit:\n"
+                       + changed + "\n" + untracked)
 
 
 def json_objects(text):
@@ -224,6 +250,63 @@ def self_test(gates):
     if not uses_libtest(positive, target) or uses_libtest(negative, target):
         raise Rejected("manifest harness declaration was ignored")
     print("PASS custom_harness_manifest_negative")
+    source_admission_self_test(gates.output)
+
+
+def source_admission_self_test(output):
+    # Real Git admission over isolated files; this is source-guard proof only.
+    # All fixture repositories and diagnostics are retained, never cleaned up.
+    fixture = output / "tooling-source-fixture"
+    source = fixture / "tools" / "xtask" / "src" / "main.rs"
+    source.parent.mkdir(parents=True)
+    (fixture / "Cargo.toml").write_text('[workspace]\nmembers = ["tools/xtask"]\n')
+    (fixture / "README.md").write_text("# Source admission fixture\n")
+    (fixture / "tools" / "xtask" / "Cargo.toml").write_text(
+        '[package]\nname = "qualification-source-probe"\nversion = "0.0.0"\n'
+    )
+    source.write_text("fn main() {}\n")
+    commands = [
+        ["git", "-C", str(fixture), "init", "--initial-branch", "main"],
+        ["git", "-C", str(fixture), "add", "Cargo.toml", "README.md", "tools/xtask"],
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=FastMCP source admission probe",
+         "-c", "user.email=source-probe@example.invalid", "-C", str(fixture), "commit",
+         "--no-gpg-sign", "-m", "Source admission fixture"],
+    ]
+    with (output / "tooling-source-fixture.log").open("w") as log:
+        for command in commands:
+            subprocess.run(command, stdout=log, stderr=log, check=True)
+        untracked_fixture = output / "untracked-tooling-source-fixture"
+        subprocess.run(["git", "clone", "--local", str(fixture), str(untracked_fixture)],
+                       stdout=log, stderr=log, check=True)
+        readme_fixture = output / "readme-source-fixture"
+        subprocess.run(["git", "clone", "--local", str(fixture), str(readme_fixture)],
+                       stdout=log, stderr=log, check=True)
+    manifest = tomllib.loads(git("show", "HEAD:Cargo.toml", root=fixture))
+    paths = workspace_source_paths(manifest)
+    admit_source_inputs(fixture, paths)
+    print("PASS clean_tooling_source_positive")
+    admit_source_inputs(readme_fixture, paths)
+    print("PASS clean_root_readme_positive")
+    source.write_text("fn main() {}\n// changed tooling source\n")
+    untracked = untracked_fixture / "tools" / "xtask" / "src" / "new.rs"
+    untracked.write_text("// new tooling input\n")
+    (readme_fixture / "README.md").write_text("# Source admission fixture\nChanged compiled README.\n")
+    observed = {"guarded_paths": paths, "clean": "accepted", "negative_reasons": {}}
+    for name, root, expected in (
+        ("dirty_tooling_source_negative", fixture, "tools/xtask/src/main.rs"),
+        ("untracked_tooling_source_negative", untracked_fixture, "tools/xtask/src/new.rs"),
+        ("dirty_root_readme_negative", readme_fixture, "README.md"),
+    ):
+        try:
+            admit_source_inputs(root, paths)
+        except Rejected as error:
+            if expected not in str(error):
+                raise Rejected(f"source admission refused for the wrong reason: {error}") from error
+            observed["negative_reasons"][name] = str(error)
+        else:
+            raise Rejected(f"source admission silently omitted a compiled input: {name}")
+        print(f"PASS {name}")
+    write_json(output / "tooling-source-admission.json", observed)
 
 
 def parse_scope(text):
@@ -374,16 +457,14 @@ def qualify(args, gates, receipt):
         feature_args.append("--all-features")
     if args.no_default_features:
         feature_args.append("--no-default-features")
-    source_paths = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "crates", "spec", ".cargo", "evidence"]
-    changed = git("diff", "HEAD", "--name-only", "--", *source_paths)
-    untracked = git("ls-files", "--others", "--exclude-standard", "--", *source_paths)
-    if changed or untracked:
-        raise Rejected("commit compilation inputs before qualification; clean RCH baseline would omit:\n" + changed + "\n" + untracked)
     head = git("rev-parse", "HEAD")
+    source_paths = workspace_source_paths(tomllib.loads(git("show", f"{head}:Cargo.toml")))
+    admit_source_inputs(ROOT, source_paths)
     receipt["subject"] = {"head": head, "tree": git("rev-parse", "HEAD^{tree}"),
                           "dirty_inventory": git("status", "--porcelain", "--untracked-files=no"),
                           "lockfile_sha256": digest((ROOT / "Cargo.lock").read_bytes()),
                           "toolchain_sha256": digest((ROOT / "rust-toolchain.toml").read_bytes()),
+                          "source_paths": source_paths,
                           "source_mode": "RCH clean-overlay --no-overlay"}
     pin = tomllib.loads((ROOT / "rust-toolchain.toml").read_text())["toolchain"]["channel"]
     if args.toolchain and args.toolchain != pin:
@@ -411,9 +492,9 @@ def qualify(args, gates, receipt):
     for name, path in metadata.items():
         inventories[name] = target_inventory(json.loads(path.read_text()))
     write_json(gates.output / "target-inventories.json", inventories)
-    if (git("rev-parse", "HEAD") != head or git("diff", "HEAD", "--name-only", "--", *source_paths)
-            or git("ls-files", "--others", "--exclude-standard", "--", *source_paths)):
+    if git("rev-parse", "HEAD") != head:
         raise Rejected("compilation inputs moved while freezing metadata")
+    admit_source_inputs(ROOT, source_paths)
     selected = select_targets(inventories["selected"], packages, workspace, selectors,
                               compile_only=args.check_only or args.clippy)
     receipt["required_targets"] = [target["id"] for target in selected]
