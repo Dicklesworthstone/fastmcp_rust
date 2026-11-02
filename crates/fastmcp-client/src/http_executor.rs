@@ -39,8 +39,11 @@ use fastmcp_protocol::extensions::ExtensionDirection;
 use fastmcp_protocol::extensions::OFFICIAL_TASKS_RESULT_DISCRIMINATOR;
 use fastmcp_protocol::extensions::{McpAppsClientSettings, OFFICIAL_MCP_APPS_EXTENSION_ID};
 use fastmcp_protocol::methods::{
-    Final2026Direction, Final2026EnvelopeKind, Final2026Peer, NOTIFICATIONS_PROGRESS,
-    PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN, TOOLS_CALL, final_2026_07_28_method,
+    Final2026Direction, Final2026EnvelopeKind, Final2026Peer, NOTIFICATIONS_CANCELLED,
+    NOTIFICATIONS_PROGRESS, NOTIFICATIONS_PROMPTS_LIST_CHANGED,
+    NOTIFICATIONS_RESOURCES_LIST_CHANGED, NOTIFICATIONS_RESOURCES_UPDATED,
+    NOTIFICATIONS_TOOLS_LIST_CHANGED, PROMPTS_GET, RESOURCES_READ, SUBSCRIPTIONS_LISTEN,
+    TOOLS_CALL, final_2026_07_28_method,
 };
 use fastmcp_protocol::protocol_policy::{
     HttpModernProbe, HttpProbeBody, MODERN_PROTOCOL_VERSION, ProtocolEra, ProtocolPolicy,
@@ -62,8 +65,7 @@ use fastmcp_protocol::{
     ClientCapabilities, ClientInfo, CompleteResult, CoreDispatchError, CoreRequest, CoreResult,
     FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_CLIENT_INFO_META_KEY, FINAL_LOG_LEVEL_META_KEY,
     FINAL_SUBSCRIPTION_ID_META_KEY, FinalCancelledNotificationParams, FinalCoreResult,
-    FinalNotificationError,
-    FinalProgressNotificationParams, FinalRequestMeta,
+    FinalNotificationError, FinalProgressNotificationParams, FinalRequestMeta,
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenResult,
     InputRequiredResult, JsonInteger, JsonRpcAdmissionError, JsonRpcMessage, JsonRpcRequest,
     JsonRpcResponse, RequestId, SERVER_DISCOVER, ServerDiscoverResult, ServerNotification,
@@ -1610,7 +1612,35 @@ impl ModernHttpSubscriptionListener {
                     }
                     None => ServerNotification::decode(&request),
                 }
-                .map_err(ModernHttpSubscriptionListenError::NotificationAdmission)?;
+                .map_err(|error| {
+                    // Strict notification decoding also validates reserved metadata.
+                    // Preserve the listener's owner diagnostic when that validation
+                    // rejects an otherwise recognizable subscription event. This
+                    // does not admit the notification or mutate listener state.
+                    if request.is_notification()
+                        && matches!(
+                            request.method.as_str(),
+                            NOTIFICATIONS_CANCELLED
+                                | NOTIFICATIONS_RESOURCES_LIST_CHANGED
+                                | NOTIFICATIONS_TOOLS_LIST_CHANGED
+                                | NOTIFICATIONS_PROMPTS_LIST_CHANGED
+                                | NOTIFICATIONS_RESOURCES_UPDATED
+                        )
+                        && let Some(owner) = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params.get("_meta"))
+                            .and_then(|meta| meta.get(FINAL_SUBSCRIPTION_ID_META_KEY))
+                        && serde_json::from_value::<RequestId>(owner.clone())
+                            .ok()
+                            .and_then(|id| id.correlation_key().ok())
+                            .is_none()
+                    {
+                        ModernHttpSubscriptionListenError::EventInvalidId
+                    } else {
+                        ModernHttpSubscriptionListenError::NotificationAdmission(error)
+                    }
+                })?;
                 match notification {
                     ServerNotification::SubscriptionsAcknowledged(acknowledgement) => {
                         if self.accepted_filter.is_some() {
@@ -5219,6 +5249,9 @@ pub enum ClientHttpConnectionError {
     /// The ready legacy SSE reader has stopped, so it cannot accept another
     /// locally owned request.
     LegacyPersistentReceiverStopped,
+    /// The receive task stopped after an SSE or callback failure. The first
+    /// cause is retained for every waiter and later admission attempt.
+    LegacyPersistentReceiverFailed(Arc<LegacySseHttpClientError>),
     /// Too many ready-client legacy requests are awaiting their SSE responses.
     LegacyPersistentResponseQueueFull,
     /// The request-scoped legacy HTTP control surface is unavailable on a
@@ -5336,6 +5369,9 @@ impl fmt::Display for ClientHttpConnectionError {
             Self::LegacyCallbackConfiguration(error) => error.fmt(formatter),
             Self::LegacyPersistentReceiverStopped => formatter
                 .write_str("ready legacy SSE receiver has stopped"),
+            Self::LegacyPersistentReceiverFailed(error) => {
+                write!(formatter, "ready legacy SSE receiver failed: {error}")
+            }
             Self::LegacyPersistentResponseQueueFull => formatter
                 .write_str("ready legacy SSE response queue is full"),
             Self::LegacyRequestOperationRequiresLegacy => formatter
@@ -5399,6 +5435,7 @@ impl std::error::Error for ClientHttpConnectionError {
         match self {
             Self::Modern(error) => Some(error),
             Self::Legacy(error) => Some(error),
+            Self::LegacyPersistentReceiverFailed(error) => Some(error.as_ref()),
             Self::LegacyResponseStreamEnded { .. }
             | Self::LegacyUnexpectedMessage { .. }
             | Self::LegacyResponseIdMismatch { .. }
@@ -9607,8 +9644,8 @@ struct LegacySsePersistentState {
     pending_since: Option<Time>,
     /// Wakes a reader already blocked on a quiet SSE body when the guard changes.
     reader_waker: Option<Waker>,
-    /// Preserve the first lifetime refusal after dropping all response senders.
-    lifetime_expiry: Option<LegacySseLifetimeExpiry>,
+    /// Preserve the first failure after dropping all response senders.
+    failure: Option<Arc<LegacySseHttpClientError>>,
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -9627,23 +9664,35 @@ impl LegacySsePersistentState {
     }
 
     fn stopped_error(&self) -> ClientHttpConnectionError {
-        match self.lifetime_expiry {
-            Some(expiry) => ClientHttpConnectionError::Legacy(expiry.error()),
+        match self.failure.as_ref() {
+            Some(error)
+                if matches!(
+                    error.as_ref(),
+                    LegacySseHttpClientError::SseStreamLifetimeExpired
+                ) =>
+            {
+                ClientHttpConnectionError::Legacy(
+                    LegacySseHttpClientError::SseStreamLifetimeExpired,
+                )
+            }
+            Some(error)
+                if matches!(
+                    error.as_ref(),
+                    LegacySseHttpClientError::SseIdleLifetimeExceeded
+                ) =>
+            {
+                ClientHttpConnectionError::Legacy(LegacySseHttpClientError::SseIdleLifetimeExceeded)
+            }
+            Some(error) => {
+                ClientHttpConnectionError::LegacyPersistentReceiverFailed(Arc::clone(error))
+            }
             None => ClientHttpConnectionError::LegacyPersistentReceiverStopped,
         }
     }
 
-    fn stop_with_error(&mut self, error: &LegacySseHttpClientError) {
+    fn stop_with_error(&mut self, error: LegacySseHttpClientError) {
         if !self.stopped {
-            self.lifetime_expiry = match error {
-                LegacySseHttpClientError::SseStreamLifetimeExpired => {
-                    Some(LegacySseLifetimeExpiry::Absolute)
-                }
-                LegacySseHttpClientError::SseIdleLifetimeExceeded => {
-                    Some(LegacySseLifetimeExpiry::Idle)
-                }
-                _ => None,
-            };
+            self.failure = Some(Arc::new(error));
         }
         self.stop();
     }
@@ -9654,23 +9703,6 @@ impl LegacySsePersistentState {
         self.cancelled_response_ids.clear();
         self.notifications.clear();
         self.pending_changed();
-    }
-}
-
-#[cfg(feature = "legacy-2024-11-05")]
-#[derive(Clone, Copy)]
-enum LegacySseLifetimeExpiry {
-    Idle,
-    Absolute,
-}
-
-#[cfg(feature = "legacy-2024-11-05")]
-impl LegacySseLifetimeExpiry {
-    const fn error(self) -> LegacySseHttpClientError {
-        match self {
-            Self::Idle => LegacySseHttpClientError::SseIdleLifetimeExceeded,
-            Self::Absolute => LegacySseHttpClientError::SseStreamLifetimeExpired,
-        }
     }
 }
 
@@ -9772,12 +9804,12 @@ impl LegacySseReverseCallbackDispatcher {
             };
             let response = crate::reverse_request_response(response_id, result);
             if callback_state.claim_response_if_open(&callback_id, &cancellation) {
-                if outbound.send(&callback_cx, &response).await.is_err() {
+                if let Err(error) = outbound.send(&callback_cx, &response).await {
                     callback_state.cancel_all();
                     persistent_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .stop();
+                        .stop_with_error(error.error);
                 }
             }
             callback_state.complete(&callback_id, &cancellation);
@@ -9815,11 +9847,11 @@ impl LegacySseReverseCallbackDispatcher {
         }
         let task = cx
             .spawn(move |response_cx| async move {
-                if outbound.send(&response_cx, &response).await.is_err() {
+                if let Err(error) = outbound.send(&response_cx, &response).await {
                     persistent_state
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .stop();
+                        .stop_with_error(error.error);
                 }
             })
             .map_err(|_| {
@@ -10056,9 +10088,19 @@ impl LegacySsePersistentReceiver {
             .spawn(move |child_cx| async move {
                 loop {
                     if child_cx.checkpoint().is_err() {
+                        task_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .stop_with_error(LegacySseHttpClientError::Cancelled);
                         break;
                     }
-                    if task_reverse_callbacks.reap_finished_tasks().is_err() {
+                    if let Err(error) = task_reverse_callbacks.reap_finished_tasks() {
+                        task_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .stop_with_error(LegacySseHttpClientError::ReverseCallbackFailed(
+                                error,
+                            ));
                         break;
                     }
                     if task_state
@@ -10070,12 +10112,18 @@ impl LegacySsePersistentReceiver {
                     }
                     let message = match next_legacy_sse_message(&mut reader, &child_cx).await {
                         Ok(Some(message)) => message,
-                        Ok(None) => break,
+                        Ok(None) => {
+                            task_state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .stop_with_error(LegacySseHttpClientError::StreamGenerationEnded);
+                            break;
+                        }
                         Err(error) => {
                             task_state
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .stop_with_error(&error);
+                                .stop_with_error(error);
                             break;
                         }
                     };
@@ -10142,15 +10190,19 @@ impl LegacySsePersistentReceiver {
                                 break;
                             };
                             if let LegacySseReverseRequestDispatch::Immediate(response) = dispatch
-                                && task_reverse_callbacks
-                                    .send_immediate(
-                                        &child_cx,
-                                        task_outbound.clone(),
-                                        Arc::clone(&task_state),
-                                        response,
-                                    )
-                                    .is_err()
+                                && let Err(error) = task_reverse_callbacks.send_immediate(
+                                    &child_cx,
+                                    task_outbound.clone(),
+                                    Arc::clone(&task_state),
+                                    response,
+                                )
                             {
+                                task_state
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .stop_with_error(
+                                        LegacySseHttpClientError::ReverseCallbackFailed(error),
+                                    );
                                 task_reverse_callbacks.close();
                                 break;
                             }
@@ -10259,9 +10311,9 @@ impl LegacySsePersistentReceiver {
         parameters: serde_json::Value,
         request_id: RequestId,
     ) -> Result<LegacyHttpRequest, ClientHttpConnectionError> {
-        let key = request_id
-            .correlation_key()
-            .map_err(|_| ClientHttpConnectionError::LegacyPersistentReceiverStopped)?;
+        let key = request_id.correlation_key().map_err(|_| {
+            ClientHttpConnectionError::Legacy(LegacySseHttpClientError::MessageEncodingFailed)
+        })?;
         let deadline = Arc::new(std::sync::Mutex::new(
             LegacyHttpRequestDeadline::new(
                 &self.clock_cx,
@@ -11058,6 +11110,8 @@ pub enum LegacySseHttpClientError {
     InvalidEndpointConfiguration,
     /// The caller's context was cancelled.
     Cancelled,
+    /// A connection-owned reverse callback task failed during retirement.
+    ReverseCallbackFailed(McpError),
     /// Native HTTP setup, framing, or body consumption failed.
     Executor(ModernHttpExecutorError),
     /// The SSE GET endpoint returned a redirect, which must not be followed.
@@ -11130,6 +11184,9 @@ pub enum LegacySseHttpClientError {
 impl fmt::Display for LegacySseHttpClientError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ReverseCallbackFailed(error) => {
+                write!(formatter, "legacy reverse callback failed: {error}")
+            }
             Self::MissingSseTarget => formatter.write_str("the plan has no legacy SSE GET target"),
             Self::MissingMessagePostTarget => {
                 formatter.write_str("the plan has no legacy message POST target")
@@ -11241,6 +11298,7 @@ impl std::error::Error for LegacySseHttpClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Executor(error) => Some(error),
+            Self::ReverseCallbackFailed(error) => Some(error),
             Self::MissingSseTarget
             | Self::MissingMessagePostTarget
             | Self::InvalidEndpointConfiguration
@@ -13524,6 +13582,134 @@ mod tests {
         assert!(runtime_block_on(receiver.recv(&Cx::for_request())).is_err());
     }
 
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn persistent_receiver_preserves_first_failure_and_error_source() {
+        let (mut state, _) = persistent_state_with_waiter(RequestId::Number(43), VecDeque::new());
+        state.stop_with_error(LegacySseHttpClientError::MessageDecodeFailed);
+        let first = state.stopped_error();
+        state.stop_with_error(LegacySseHttpClientError::Cancelled);
+        state.stop();
+        let later = state.stopped_error();
+        let (
+            ClientHttpConnectionError::LegacyPersistentReceiverFailed(first),
+            ClientHttpConnectionError::LegacyPersistentReceiverFailed(later),
+        ) = (&first, &later)
+        else {
+            panic!("receiver must retain its concrete failure");
+        };
+        assert!(Arc::ptr_eq(first, later));
+        assert!(matches!(
+            first.as_ref(),
+            LegacySseHttpClientError::MessageDecodeFailed
+        ));
+        assert!(state.stopped);
+        assert!(state.pending.is_empty());
+        assert!(
+            std::error::Error::source(&state.stopped_error())
+                .unwrap()
+                .is::<LegacySseHttpClientError>()
+        );
+
+        // Changing only the first cause keeps the established lifetime API.
+        let mut state = LegacySsePersistentState::default();
+        state.stop_with_error(LegacySseHttpClientError::SseIdleLifetimeExceeded);
+        state.stop_with_error(LegacySseHttpClientError::MessageDecodeFailed);
+        assert!(matches!(
+            state.stopped_error(),
+            ClientHttpConnectionError::Legacy(LegacySseHttpClientError::SseIdleLifetimeExceeded)
+        ));
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn persistent_receiver_callback_post_failure_retains_http_status() {
+        for immediate in [false, true] {
+            for status in [202, 503] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = format!("http://{}/legacy-message", listener.local_addr().unwrap());
+                let (done, stopped) = mpsc::sync_channel(1);
+                let peer = thread::spawn(move || {
+                    let mut stream = accept_legacy_test_peer(
+                        &listener,
+                        &stopped,
+                        Instant::now() + LEGACY_TEST_PEER_BOUND,
+                    )
+                    .unwrap()
+                    .expect("dispatcher must publish its response");
+                    let request = read_request(&mut stream);
+                    let message: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(message["id"], 7);
+                    assert_eq!(message["result"], serde_json::json!({"ack":true}));
+                    write_response(&mut stream, status, "application/json", b"");
+                });
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let (state, _) =
+                    persistent_state_with_waiter(RequestId::Number(43), VecDeque::new());
+                let state = Arc::new(std::sync::Mutex::new(state));
+                let dispatcher = super::LegacySseReverseCallbackDispatcher::new();
+                let outbound = super::LegacySseHttpOutbound {
+                    advertised_message_post_target: target,
+                    post_client: super::native_http_client(),
+                };
+                let invoked = Arc::new(AtomicUsize::new(0));
+                if immediate {
+                    dispatcher
+                        .send_immediate(
+                            &cx,
+                            outbound,
+                            Arc::clone(&state),
+                            JsonRpcMessage::Response(JsonRpcResponse::success(
+                                RequestId::Number(7),
+                                serde_json::json!({"ack":true}),
+                            )),
+                        )
+                        .unwrap();
+                } else {
+                    let calls = Arc::clone(&invoked);
+                    dispatcher
+                        .dispatch::<(), serde_json::Value>(
+                            &cx,
+                            RequestId::Number(7),
+                            (),
+                            Arc::new(move |_, _, ()| {
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                Box::pin(async { Ok(serde_json::json!({"ack":true})) })
+                            }),
+                            outbound,
+                            Arc::clone(&state),
+                        )
+                        .unwrap();
+                }
+                runtime.block_on(async {
+                    let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+                    while dispatcher.reap_finished_tasks().unwrap() != 0 {
+                        assert!(Instant::now() < deadline, "callback POST must settle");
+                        asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                    }
+                });
+                assert_eq!(invoked.load(Ordering::SeqCst), usize::from(!immediate));
+                let state = state.lock().unwrap();
+                assert_eq!(state.stopped, status == 503);
+                assert_eq!(state.pending.len(), usize::from(status == 202));
+                if status == 503 {
+                    assert!(matches!(state.stopped_error(),
+                        ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref source)
+                        if matches!(source.as_ref(), LegacySseHttpClientError::MessagePostRejected { status: 503 })
+                    ));
+                } else {
+                    assert!(state.failure.is_none());
+                }
+                assert!(cx.checkpoint().is_ok());
+                drop(state);
+                drop(done);
+                peer.join().unwrap();
+            }
+        }
+    }
+
     thread_local! {
         /// Keeps response bodies and connection-owned receive tasks under the
         /// same live runtime across the sequential `block_on` calls made by
@@ -13556,6 +13742,9 @@ mod tests {
             }
             match listener.accept() {
                 Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|error| format!("set legacy peer blocking mode: {error}"))?;
                     stream
                         .set_read_timeout(Some(LEGACY_TEST_PEER_BOUND))
                         .map_err(|error| format!("set legacy peer read timeout: {error}"))?;
@@ -18874,9 +19063,9 @@ mod tests {
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
-    #[test]
-    fn public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle() {
+    fn public_http_client_auto_legacy_lifecycle_case(end_generation: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local Auto fallback listener");
+        listener.set_nonblocking(true).unwrap();
         let address = listener
             .local_addr()
             .expect("read local Auto fallback address");
@@ -18884,8 +19073,17 @@ mod tests {
         let sse_target = format!("http://{address}/legacy-sse");
         let message_target = format!("http://{address}/legacy-message");
         let advertised_message_target = message_target.clone();
+        let (done, finished) = mpsc::sync_channel(1);
+        let (end_stream, end_requested) = mpsc::sync_channel(1);
+        let (ended, stream_ended) = mpsc::sync_channel(1);
         let server = thread::spawn(move || {
-            let (mut probe, _) = listener.accept().expect("accept disposable modern probe");
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let accept = || {
+                accept_legacy_test_peer(&listener, &finished, deadline)
+                    .expect("bounded legacy peer accept")
+                    .expect("client still owns the legacy peer")
+            };
+            let mut probe = accept();
             let probe_request = read_request(&mut probe);
             assert!(probe_request.head.starts_with("POST /mcp HTTP/1.1\r\n"));
             assert!(
@@ -18895,7 +19093,7 @@ mod tests {
             );
             write_response(&mut probe, 404, "text/plain", b"");
 
-            let (mut sse, _) = listener.accept().expect("accept fresh legacy SSE GET");
+            let mut sse = accept();
             let sse_request = read_request(&mut sse);
             assert!(sse_request.head.starts_with("GET /legacy-sse HTTP/1.1\r\n"));
             assert!(
@@ -18912,9 +19110,7 @@ mod tests {
                 &format!("event: endpoint\ndata: {advertised_message_target}\n\n"),
             );
 
-            let (mut initialize_post, _) = listener
-                .accept()
-                .expect("accept exact legacy initialize POST");
+            let mut initialize_post = accept();
             let initialize_request = read_request(&mut initialize_post);
             assert!(
                 initialize_request
@@ -18941,11 +19137,7 @@ mod tests {
                 &mut sse,
                 "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"legacy-server\",\"version\":\"1.0.0\"}}}\n\n",
             );
-            finish_chunked_sse(&mut sse);
-
-            let (mut initialized_post, _) = listener
-                .accept()
-                .expect("accept exact legacy initialized notification");
+            let mut initialized_post = accept();
             let initialized_request = read_request(&mut initialized_post);
             let initialized =
                 serde_json::from_slice::<serde_json::Value>(&initialized_request.body)
@@ -18959,21 +19151,55 @@ mod tests {
                     .contains("MCP-Protocol-Version: 2026-07-28\r\n")
             );
             write_response(&mut initialized_post, 202, "application/json", b"");
+            if end_generation {
+                end_requested.recv_timeout(LEGACY_TEST_PEER_BOUND).unwrap();
+                finish_chunked_sse(&mut sse);
+                ended.send(()).unwrap();
+                finished.recv_timeout(LEGACY_TEST_PEER_BOUND).unwrap();
+                assert!(
+                    matches!(listener.accept(), Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock),
+                    "an ended generation cannot authorize another POST"
+                );
+            } else {
+                let mut post = accept();
+                let request = read_request(&mut post);
+                assert!(
+                    request
+                        .head
+                        .starts_with("POST /legacy-message HTTP/1.1\r\n")
+                );
+                assert!(!request.head.contains("MCP-Protocol-Version:"));
+                assert!(!request.head.contains("MCP-Session-Id:"));
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(request["id"], 2);
+                assert_eq!(request["method"], "tools/list");
+                assert!(request["params"].get("_meta").is_none());
+                write_response(&mut post, 202, "application/json", b"");
+                write_chunked_sse_event(
+                    &mut sse,
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}\n\n",
+                );
+                finished.recv_timeout(LEGACY_TEST_PEER_BOUND).unwrap();
+                finish_chunked_sse_allowing_closed_peer(&mut sse);
+            }
         });
 
-        let cx = Cx::for_request();
-        let client = runtime_block_on(
-            ClientBuilder::new()
-                .client_info("public-http-client", "1.0.0")
-                .protocol_plan(plan(
-                    &modern_target,
-                    &sse_target,
-                    &message_target,
-                    ProtocolPolicy::Auto,
-                ))
-                .connect_http_client_with_cx(&cx),
-        )
-        .expect("the public client completes the exact fresh legacy lifecycle");
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let mut client = runtime
+            .block_on(
+                ClientBuilder::new()
+                    .client_info("public-http-client", "1.0.0")
+                    .protocol_plan(plan(
+                        &modern_target,
+                        &sse_target,
+                        &message_target,
+                        ProtocolPolicy::Auto,
+                    ))
+                    .connect_http_client_with_cx(&cx),
+            )
+            .expect("the public client completes the exact fresh legacy lifecycle");
         assert_eq!(client.selected_protocol_era(), ProtocolEra::Legacy2024);
         assert_eq!(
             client.connection().protocol_version(),
@@ -18988,7 +19214,59 @@ mod tests {
         );
         assert!(client.legacy_server_capabilities().is_some());
         assert!(client.server_discovery().is_none());
+        if end_generation {
+            end_stream.send(()).unwrap();
+            stream_ended.recv_timeout(LEGACY_TEST_PEER_BOUND).unwrap();
+            let receiver = client.connection().legacy_persistent_receiver().unwrap();
+            // Drive the caller-owned receive task to the observed EOF before
+            // attempting another POST. This is a bounded synchronization point,
+            // not the negative's assertion: the public operation below must fail.
+            runtime.block_on(async {
+                let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+                while !receiver.state.lock().unwrap().stopped {
+                    assert!(Instant::now() < deadline, "receive task must observe EOF");
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+            });
+            let Err(error) =
+                runtime.block_on(client.request(&cx, "tools/list", serde_json::json!({})))
+            else {
+                panic!("an ended generation cannot service the next request");
+            };
+            assert!(matches!(error, crate::HttpClientError::Connection(
+                ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref source)
+            ) if matches!(source.as_ref(), LegacySseHttpClientError::StreamGenerationEnded)));
+            assert!(receiver.state.lock().unwrap().pending.is_empty());
+        } else {
+            let response = runtime
+                .block_on(client.request(&cx, "tools/list", serde_json::json!({})))
+                .expect("ready legacy client must service a post-initialize request");
+            let super::ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) = response
+            else {
+                panic!("exact legacy request must return its correlated response");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(2)));
+            assert!(response.error.is_none());
+            assert_eq!(response.result, Some(serde_json::json!({"tools":[]})));
+        }
+        assert!(
+            cx.checkpoint().is_ok(),
+            "receiver shutdown cannot cancel its caller"
+        );
+        done.send(()).unwrap();
         server.join().expect("Auto fallback server must join");
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_client_auto_falls_back_to_ready_exact_legacy_lifecycle() {
+        public_http_client_auto_legacy_lifecycle_case(false);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_http_client_auto_rejects_ended_legacy_generation() {
+        public_http_client_auto_legacy_lifecycle_case(true);
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
