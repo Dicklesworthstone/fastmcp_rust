@@ -2275,9 +2275,16 @@ mod tests {
     #[test]
     fn bounded_split_send_commits_large_frame_and_restores_flags() {
         for initially_nonblocking in [false, true] {
-            let (writer, peer) = UnixStream::pair().unwrap();
+            let (writer, mut peer) = UnixStream::pair().unwrap();
             writer.set_nonblocking(initially_nonblocking).unwrap();
             peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            // Darwin's first write(2) sets the kernel-owned FWASWRITTEN bit.
+            // Prime that state before comparing exact descriptor flags; keep
+            // the actual NONBLOCK restoration assertion below unchanged.
+            assert_eq!(rustix::io::write(&writer, b"x").unwrap(), 1);
+            let mut priming_byte = [0];
+            peer.read_exact(&mut priming_byte).unwrap();
+            assert_eq!(priming_byte, *b"x");
             let flags = fcntl_getfl(&writer).unwrap();
             let (receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
             let message = JsonRpcMessage::Response(JsonRpcResponse::success(
@@ -2318,6 +2325,12 @@ mod tests {
             .set_write_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        // Snapshot after the kernel's first-write bookkeeping, as in the
+        // successful-send pair; no descriptor flags are masked from equality.
+        assert_eq!(rustix::io::write(&writer, b"x").unwrap(), 1);
+        let mut priming_byte = [0];
+        peer.read_exact(&mut priming_byte).unwrap();
+        assert_eq!(priming_byte, *b"x");
         let flags = fcntl_getfl(&writer).unwrap();
         let (receiver, mut sender) = StdioTransport::new(std::io::empty(), writer).into_split();
         let message = JsonRpcMessage::Response(JsonRpcResponse::success(
