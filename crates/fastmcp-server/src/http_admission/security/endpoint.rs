@@ -620,10 +620,59 @@ mod tests {
     }
 
     #[test]
+    fn peer_cancellation_withholds_committed_subscription_control() {
+        run_secured_subscription(|cx| async move {
+            for equivalent_numeric in [false, true] {
+                let (_endpoint, mut stream, _) = secured_listen_fixture(&cx).await;
+                let sender = stream.stream.as_ref().unwrap().sender();
+                let (request_id, subscription_id) = if equivalent_numeric {
+                    (
+                        serde_json::from_str::<serde_json::Value>("7e0").unwrap(),
+                        serde_json::from_str::<serde_json::Value>("7.0").unwrap(),
+                    )
+                } else {
+                    (serde_json::json!(7), serde_json::json!(7))
+                };
+                sender
+                    .send_subscription_cancellation(
+                        &cx,
+                        fastmcp_protocol::JsonRpcRequest::notification(
+                            "notifications/cancelled",
+                            Some(serde_json::json!({
+                                "requestId": request_id,
+                                "_meta": {
+                                    "io.modelcontextprotocol/subscriptionId": subscription_id,
+                                },
+                            })),
+                        ),
+                    )
+                    .unwrap();
+                assert!(sender.request_cancellation().cancel_by_peer());
+                assert!(
+                    matches!(
+                        next_secured_event(&cx, &mut stream).await,
+                        Err(SecuredHttpEndpointError::BodyFailed)
+                    ),
+                    "peer withdrawal must withhold the committed control; equivalent_numeric={equivalent_numeric}"
+                );
+                assert!(
+                    !stream.finished,
+                    "a withheld terminal cannot authorize clean EOF"
+                );
+                assert!(stream.stream.is_none());
+                assert!(matches!(
+                    next_secured_event(&cx, &mut stream).await,
+                    Err(SecuredHttpEndpointError::BodyClosed)
+                ));
+                stream.close(&cx).await;
+                assert!(cx.checkpoint().is_ok());
+            }
+        });
+    }
+
+    #[test]
     fn generic_subscription_controls_cannot_finish_a_secured_response() {
         run_secured_subscription(|cx| async move {
-            let (endpoint, mut stream, _) = secured_listen_fixture(&cx).await;
-            let sender = stream.stream.as_ref().unwrap().sender();
             for params in [
                 serde_json::json!({"requestId": 8, "_meta": {"io.modelcontextprotocol/subscriptionId": 8}}),
                 serde_json::json!({"requestId": 7, "_meta": {"io.modelcontextprotocol/subscriptionId": 8}}),
@@ -631,8 +680,11 @@ mod tests {
                 serde_json::json!({"requestId": "7", "_meta": {"io.modelcontextprotocol/subscriptionId": "7"}}),
                 serde_json::json!({"requestId": 7}),
                 serde_json::json!({"requestId": 7, "_meta": {"io.modelcontextprotocol/subscriptionId": null}}),
-                serde_json::json!({"requestId": 7, "_meta": {"io.modelcontextprotocol/subscriptionId": 7}}),
             ] {
+                // Each refusal retires this response owner. A fresh stream
+                // proves every malformed or foreign control is withheld.
+                let (_endpoint, mut stream, _) = secured_listen_fixture(&cx).await;
+                let sender = stream.stream.as_ref().unwrap().sender();
                 sender
                     .send_notification(
                         &cx,
@@ -642,13 +694,50 @@ mod tests {
                         ),
                     )
                     .unwrap();
-                let event = next_secured_event(&cx, &mut stream).await.unwrap().unwrap();
-                let event: serde_json::Value = serde_json::from_str(&event.data).unwrap();
-                assert_eq!(event["params"], params);
-                assert!(!stream.finished, "generic control has no terminal commit authority");
-                assert!(!stream.stream.as_ref().unwrap().is_finished());
-                assert!(stream.stream().is_none());
+                assert!(
+                    matches!(
+                        next_secured_event(&cx, &mut stream).await,
+                        Err(SecuredHttpEndpointError::BodyFailed)
+                    ),
+                    "invalid subscription control must be withheld: {params}"
+                );
+                assert!(
+                    !stream.finished,
+                    "a refused generic control cannot authorize clean EOF"
+                );
+                assert!(stream.stream.is_none());
+                assert!(matches!(
+                    next_secured_event(&cx, &mut stream).await,
+                    Err(SecuredHttpEndpointError::BodyClosed)
+                ));
+                stream.close(&cx).await;
+                assert!(cx.checkpoint().is_ok());
             }
+
+            let (endpoint, mut stream, _) = secured_listen_fixture(&cx).await;
+            let sender = stream.stream.as_ref().unwrap().sender();
+            let params = serde_json::json!({
+                "requestId": 7,
+                "_meta": {"io.modelcontextprotocol/subscriptionId": 7},
+            });
+            sender
+                .send_notification(
+                    &cx,
+                    fastmcp_protocol::JsonRpcRequest::notification(
+                        "notifications/cancelled",
+                        Some(params.clone()),
+                    ),
+                )
+                .unwrap();
+            let event = next_secured_event(&cx, &mut stream).await.unwrap().unwrap();
+            let event: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+            assert_eq!(event["params"], params);
+            assert!(
+                !stream.finished,
+                "generic control has no terminal commit authority"
+            );
+            assert!(!stream.stream.as_ref().unwrap().is_finished());
+            assert!(stream.stream().is_none());
             // A queued generic control must not drain the registry's terminal
             // receipt when the real cancellation is committed behind it.
             sender

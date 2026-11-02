@@ -4986,6 +4986,23 @@ fn pop_guarded_sse_body_event(
         let Some(event) = pop_sse_body_event(response)? else {
             return Ok(None);
         };
+        if response.is_finished()
+            && !response
+                .cancellation()
+                .request_cancellation()
+                .is_peer_cancel_requested()
+            && final_subscription_terminal_event(&event)
+        {
+            // The transport validated both IDs when its dedicated sender
+            // committed this terminal. Popping it finishes the body and
+            // cancels the shared request token before returning the frame.
+            // That cancellation cannot revoke the control which caused it;
+            // an earlier peer cancellation still wins and withholds it.
+            // Generic notifications never finish the transport body, even
+            // when their payload spells an otherwise valid cancellation.
+            delivery.mark_cancellation_enqueued();
+            return Ok(Some(event));
+        }
         if delivery.allows_subscription_sse_event(&event) {
             return Ok(Some(event));
         }
@@ -5380,6 +5397,11 @@ impl FinalSubscriptionTransportAdmission {
                 owned && (subscription_id.is_none() || correlated)
             } else if !correlated {
                 false
+            } else if notification.method == "notifications/cancelled" {
+                // Subscription metadata alone cannot authorize a control for
+                // another request. Generic controls still have no terminal
+                // authority, but both IDs must name this response owner.
+                final_subscription_terminal_notification(notification)
             } else if notification.method == "notifications/resources/updated" {
                 match ServerNotification::decode(notification) {
                     Ok(ServerNotification::ResourceUpdated(params)) => {
@@ -20591,6 +20613,7 @@ impl Server {
                     }
                 }
 
+                #[cfg(feature = "console")]
                 let start_time = Instant::now();
 
                 // Handle the message
@@ -20916,6 +20939,7 @@ impl Server {
                     ));
                 }
 
+                #[cfg(feature = "console")]
                 let duration = start_time.elapsed();
 
                 if let Some(response) = response_opt {
@@ -50193,10 +50217,26 @@ mod lib_unit_tests {
             ),
         ));
         let mut task = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(write.as_mut().poll(&mut task).is_pending());
+        // WriteAll cooperatively yields after a bounded number of writes.
+        // Drive the same pinned operation until its successful flush actually
+        // requests shutdown, without advancing the operation's clock.
+        for _ in 0..=bytes.len() {
+            assert!(write.as_mut().poll(&mut task).is_pending());
+            if shutdown.is_requested() {
+                break;
+            }
+        }
+        assert!(
+            shutdown.is_requested(),
+            "the completed frame must reach flush"
+        );
         assert_eq!(*control.bytes.lock().unwrap(), bytes);
         let polls = control.polls.load(Ordering::Acquire);
         let deadline = *fixture.delivery.native_shutdown_deadline.lock().unwrap();
+        assert!(
+            deadline.is_some(),
+            "shutdown must establish the fixed drain deadline"
+        );
         // Reconstruct the interval timeout while retaining the completed I/O.
         clock.advance_to(asupersync::Time::from_millis(21));
         assert!(write.as_mut().poll(&mut task).is_pending());
