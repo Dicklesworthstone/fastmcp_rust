@@ -908,7 +908,10 @@ impl ExtensionHandlerRegistry {
         request: &JsonRpcRequest,
     ) -> Result<Value, ExtensionHandlerInvocationError> {
         let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
-        handler
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        let response = handler
             .invoke(
                 context,
                 request
@@ -916,7 +919,11 @@ impl ExtensionHandlerRegistry {
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({})),
             )
-            .map_err(ExtensionHandlerInvocationError::Handler)
+            .map_err(ExtensionHandlerInvocationError::Handler)?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        Ok(response)
     }
 
     /// Admits and awaits a typed handler without entering another runtime.
@@ -1152,6 +1159,44 @@ mod tests {
     #[test]
     fn async_extension_dispatch_rejects_callback_cancelled_result() {
         async_extension_dispatch_probe(false, true);
+    }
+
+    #[test]
+    fn sync_extension_dispatch_cancellation_before_and_after_handler() {
+        for cancelled_before_dispatch in [true, false] {
+            let (descriptors, id) = tasks_descriptors();
+            let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::clone(&calls);
+            handlers
+                .register(
+                    id.clone(),
+                    "tasks/get",
+                    move |context: &McpContext, request: GetTaskRequest| {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(context.request_cancellation().cancel());
+                        get_task(context, request)
+                    },
+                )
+                .unwrap();
+            handlers.freeze().unwrap();
+            let negotiated = negotiated_tasks(handlers.descriptor_registry(), &id);
+            let context = McpContext::new(Cx::for_testing(), 71);
+            if cancelled_before_dispatch {
+                assert!(context.request_cancellation().cancel());
+            }
+            let request = JsonRpcRequest::new("tasks/get", Some(json!({"value": 41})), 71_i64);
+            assert!(matches!(
+                handlers.invoke(&context, &negotiated, ProtocolEra::Modern2026, &id, &request),
+                Err(ExtensionHandlerInvocationError::Handler(error))
+                    if error.code == McpErrorCode::RequestCancelled
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!cancelled_before_dispatch),
+                "a pre-cancelled request has no effect; cancellation in a handler discards its result"
+            );
+        }
     }
 
     fn primary_tasks_descriptor_with_direction(
