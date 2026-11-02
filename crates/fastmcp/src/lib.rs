@@ -180,6 +180,17 @@ extern crate self as fastmcp_rust;
 /// the facade re-exports above rather than couple themselves to these names.
 #[doc(hidden)]
 pub mod __private {
+    /// Narrow vocabulary emitted by the external extension attribute.
+    #[cfg(feature = "extension-authoring")]
+    pub mod extensions {
+        pub use fastmcp_core::McpResult;
+        pub use fastmcp_server::BoxFuture;
+        pub use fastmcp_server::extensions::authoring::{
+            ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
+            ExtensionRegistration,
+        };
+    }
+
     /// The exact core vocabulary emitted by the handler macros.
     ///
     /// Keep this list explicit. This namespace is reachable from downstream
@@ -479,6 +490,11 @@ pub mod server {
     #[cfg(all(feature = "proxy", feature = "tasks"))]
     pub use fastmcp_server::{ProxyFinalTaskListener, ProxyFinalTaskListenerEvent};
 }
+
+/// Serialization traits and derives for facade-only typed consumers.
+/// Use `#[serde(crate = "fastmcp_rust::serde")]` with re-exported derives,
+/// replacing `fastmcp_rust` with the dependency alias when it is renamed.
+pub use serde;
 
 /// JSON values and objects used by the protocol's schema-open and exact legacy
 /// adapter surfaces. Re-exporting these keeps one-crate consumers from having
@@ -1138,6 +1154,8 @@ pub use fastmcp_client::{http_executor, mcp_config};
 
 // Re-export macros
 pub use fastmcp_derive::{JsonSchema, prompt, resource, tool};
+#[cfg(feature = "extension-authoring")]
+pub use fastmcp_derive::extension;
 
 /// Auto-policy composition helpers.
 ///
@@ -2353,6 +2371,15 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Installs a sealed typed extension before this server is frozen.
+        #[cfg(feature = "extension-authoring")]
+        pub fn extension(
+            self,
+            registration: crate::extensions::authoring::ExtensionRegistration,
+        ) -> Result<Self, crate::ServerExtensionConfigurationError> {
+            self.inner.extension(registration).map(|inner| Self { inner })
+        }
+
         pub fn extension_registry<R>(
             self,
             handlers: crate::ExtensionHandlerRegistry,
@@ -3026,6 +3053,21 @@ pub mod modern {
     /// an Apps-enabled transitive dependency must not make MCP Apps names
     /// available through an Apps-disabled facade.
     pub mod extensions {
+        /// Capability-restricted, compile-linked extension authoring.
+        ///
+        /// Install a registration with [`super::ServerBuilder::extension`].
+        /// Its context exposes negotiated settings and cancellation observation,
+        /// and cannot grant access to the runtime, credentials, or raw ingress.
+        /// This initial surface supports typed client-to-server request methods;
+        /// notification authoring remains outside this contract.
+        #[cfg(feature = "extension-authoring")]
+        pub mod authoring {
+            pub use fastmcp_server::extensions::authoring::{
+                ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
+                ExtensionRegistration,
+            };
+        }
+
         pub use fastmcp_protocol::extensions::{
             ClientExtensionDiscovery, EffectiveExtensionSettings, ExtensionDescriptor,
             ExtensionDescriptorRegistry, ExtensionDirection, ExtensionDiscovery,
@@ -7279,6 +7321,15 @@ pub mod modern {
             self.inner
                 .mcp_apps_tool(handler)
                 .map(|inner| Self { inner })
+        }
+
+        /// Installs a sealed typed extension before this server is frozen.
+        #[cfg(feature = "extension-authoring")]
+        pub fn extension(
+            self,
+            registration: extensions::authoring::ExtensionRegistration,
+        ) -> Result<Self, ServerExtensionConfigurationError> {
+            self.inner.extension(registration).map(|inner| Self { inner })
         }
 
         /// Installs final-only extension handlers and discovery settings.

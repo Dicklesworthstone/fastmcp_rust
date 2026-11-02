@@ -689,6 +689,21 @@ impl ServerBuilder {
         self.protocol_policy
     }
 
+    /// Installs a typed extension through the ordinary modern admission path.
+    ///
+    /// The registration owns its schemas, settings resolver, and restricted
+    /// handlers. Installation grants no request authority: every call must
+    /// advertise compatible settings and pass authentication and schema checks.
+    /// The resulting server freezes the registration before serving traffic.
+    #[cfg(feature = "extension-authoring")]
+    pub fn extension(
+        self,
+        registration: crate::extensions::authoring::ExtensionRegistration,
+    ) -> Result<Self, ServerExtensionConfigurationError> {
+        let (handlers, discovery, resolver) = registration.into_parts();
+        self.extension_registry(handlers, discovery, resolver)
+    }
+
     /// Installs the server's modern-only extension handlers and discovery settings.
     ///
     /// Descriptor registration remains mutable only until [`Self::build`]. The

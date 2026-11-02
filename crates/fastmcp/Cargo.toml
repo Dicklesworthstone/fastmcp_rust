@@ -47,6 +47,12 @@ apps = [
     "fastmcp-derive/apps",
     "fastmcp-console/apps",
 ]
+# Safe compile-linked extension authoring is opt-in independently of the
+# built-in profiles. Its handlers receive only the sealed request context.
+extension-authoring = [
+    "fastmcp-server/extension-authoring",
+    "fastmcp-derive/extension-authoring",
+]
 proxy = ["fastmcp-server/proxy", "fastmcp-console/proxy"]
 proxy-legacy = [
     "proxy",

@@ -15219,8 +15219,9 @@ impl Server {
     /// Dispatches an already-negotiated modern extension request.
     ///
     /// This public seam preserves the caller's request-owned context and only
-    /// invokes a handler when its descriptor is active in the supplied frozen
-    /// current-exchange capability set.
+    /// invokes a handler when its descriptor is active in a freshly negotiated
+    /// current-request capability set. The supplied set must match that result;
+    /// a receipt retained from a different request cannot activate this one.
     pub fn dispatch_negotiated_extension(
         &self,
         request_ctx: &McpContext,
@@ -15231,12 +15232,13 @@ impl Server {
         let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
         };
-        if negotiated.active(extension_id).is_none() {
+        let current = self.validate_extension_request_binding(request_ctx, negotiated, request)?;
+        if current.active(extension_id).is_none() {
             return Err(McpError::invalid_params(
                 "Extension request is not admitted",
             ));
         }
-        self.invoke_negotiated_extension(request_ctx, negotiated, extension_id, request)
+        self.invoke_negotiated_extension(request_ctx, &current, extension_id, request)
     }
 
     /// Dispatches a negotiated extension on the caller's runtime, including
@@ -15252,11 +15254,43 @@ impl Server {
         let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
         };
-        if negotiated.active(extension_id).is_none() {
+        let current = self.validate_extension_request_binding(request_ctx, negotiated, request)?;
+        if current.active(extension_id).is_none() {
             return Err(McpError::invalid_params(
                 "Extension request is not admitted",
             ));
         }
+        self.invoke_negotiated_extension_async(request_ctx, &current, extension_id, request)
+            .await
+    }
+
+    fn validate_extension_request_binding(
+        &self,
+        request_ctx: &McpContext,
+        supplied: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
+        request: &JsonRpcRequest,
+    ) -> McpResult<fastmcp_protocol::extensions::NegotiatedExtensionSet> {
+        request_ctx.ensure_live()?;
+        let client = final_client_extension_discovery(request)?;
+        let current = self
+            .negotiate_extensions(&client)
+            .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
+        request_ctx.ensure_live()?;
+        if &current != supplied {
+            return Err(McpError::invalid_params(
+                "Extension negotiation does not match the current request",
+            ));
+        }
+        Ok(current)
+    }
+
+    async fn invoke_negotiated_extension_async(
+        &self,
+        request_ctx: &McpContext,
+        negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
+        extension_id: &ExtensionId,
+        request: &JsonRpcRequest,
+    ) -> McpResult<serde_json::Value> {
         let mut request = request.clone();
         remove_modern_protocol_metadata(&mut request);
         let runtime = self
@@ -15292,17 +15326,15 @@ impl Server {
         request: &JsonRpcRequest,
     ) -> McpResult<serde_json::Value> {
         require_exact_modern_extension_metadata(request)?;
-        if self
-            .registered_extension_handler_id(&request.method)?
-            .is_none()
-        {
+        request_ctx.ensure_live()?;
+        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
-        }
+        };
         let client = final_client_extension_discovery(request)?;
         let negotiated = self
             .negotiate_extensions(&client)
             .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
-        self.dispatch_negotiated_extension_async(request_ctx, &negotiated, request)
+        self.invoke_negotiated_extension_async(request_ctx, &negotiated, extension_id, request)
             .await
     }
 
@@ -15317,6 +15349,7 @@ impl Server {
         // extension handler: admission requires the exact final-era marker
         // carried by the current request.
         require_exact_modern_extension_metadata(request)?;
+        request_ctx.ensure_live()?;
         let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
             return Err(McpError::method_not_found(&request.method));
         };
@@ -15724,7 +15757,8 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback(&request_ctx, &admission_request)
+                        self.dispatch_extension_fallback_async(&request_ctx, &admission_request)
+                            .await
                     }
                     result => result,
                 }
@@ -27450,6 +27484,242 @@ mod lib_unit_tests {
             .expect("notification descendant probe completes");
     }
 
+    fn request_binding_extension_server(
+        calls: Arc<AtomicUsize>,
+        resolutions: Arc<AtomicUsize>,
+        cancel_during_handler: bool,
+    ) -> Server {
+        use fastmcp_protocol::extensions::{
+            ExtensionDescriptor, ExtensionDirection, ExtensionFallbackPolicy,
+            ExtensionHttpEraDisposition, ExtensionMethodDescriptor, ExtensionNegotiationResolver,
+            ExtensionSettingsSchema,
+        };
+
+        let id = ExtensionId::parse("com.example/request-binding").unwrap();
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        descriptors
+            .register(ExtensionDescriptor {
+                id: id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: "binding-client-v1".to_owned(),
+                    codec_id: "binding-client-v1".to_owned(),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: "binding-server-v1".to_owned(),
+                    codec_id: "binding-server-v1".to_owned(),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: "binding-resolver-v1".to_owned(),
+                    version: 1,
+                    fallback: ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: Some(ExtensionMethodDescriptor {
+                    name: "com.example/request-bound".to_owned(),
+                    direction: ExtensionDirection::ClientToServer,
+                    http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+                    legacy_fallback: false,
+                }),
+                notification: None,
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .unwrap();
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        handlers
+            .register(
+                id.clone(),
+                "com.example/request-bound",
+                move |context: &McpContext, request: serde_json::Value| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if cancel_during_handler {
+                        assert!(context.request_cancellation().cancel());
+                    }
+                    Ok(serde_json::json!({"value": request["value"]}))
+                },
+            )
+            .unwrap();
+        Server::new("request-binding", "1.0.0")
+            .extension_registry(
+                handlers,
+                ServerExtensionDiscovery {
+                    extensions: BTreeMap::from([(
+                        id,
+                        ExtensionSettings::new(serde_json::json!({"supported": true})).unwrap(),
+                    )]),
+                },
+                move |_descriptor: &ExtensionDescriptor,
+                      client: &ExtensionSettings,
+                      _server: &ExtensionSettings|
+                      -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                    resolutions.fetch_add(1, Ordering::SeqCst);
+                    Ok(client.clone())
+                },
+            )
+            .unwrap()
+            .build()
+    }
+
+    fn request_binding_extension_request(revision: u64) -> JsonRpcRequest {
+        JsonRpcRequest::new(
+            "com.example/request-bound",
+            Some(serde_json::json!({
+                "value": 41,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"com.example/request-binding": {"revision": revision}}
+                    }
+                }
+            })),
+            71_i64,
+        )
+    }
+
+    fn exercise_extension_request_binding(asynchronous: bool) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let server = request_binding_extension_server(Arc::clone(&calls), resolutions, false);
+        let context = McpContext::new(Cx::for_testing(), 71);
+        let original = request_binding_extension_request(1);
+        let negotiated = server
+            .negotiate_extensions(&final_client_extension_discovery(&original).unwrap())
+            .unwrap();
+        let invoke = |negotiated: &_, request: &_| {
+            if asynchronous {
+                block_on(server.dispatch_negotiated_extension_async(
+                    &context, negotiated, request,
+                ))
+            } else {
+                server.dispatch_negotiated_extension(&context, negotiated, request)
+            }
+        };
+        assert_eq!(
+            invoke(&negotiated, &original).unwrap(),
+            serde_json::json!({"value": 41})
+        );
+
+        // Change only this request's capability evidence. A previously active
+        // receipt cannot replace an omitted or differently negotiated setting.
+        let changed = request_binding_extension_request(2);
+        let mut omitted = original.clone();
+        omitted.params.as_mut().unwrap()["_meta"]
+            ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({});
+        for rejected in [&omitted, &changed] {
+            let before = serde_json::to_value(rejected).unwrap();
+            assert_eq!(
+                invoke(&negotiated, rejected).unwrap_err().code,
+                McpErrorCode::InvalidParams
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no rejected handler effect");
+            assert_eq!(serde_json::to_value(rejected).unwrap(), before);
+        }
+
+        let fresh = server
+            .negotiate_extensions(&final_client_extension_discovery(&changed).unwrap())
+            .unwrap();
+        assert_ne!(fresh, negotiated);
+        assert_eq!(
+            invoke(&fresh, &changed).unwrap(),
+            serde_json::json!({"value": 41}),
+            "the changed settings remain usable with their current binding"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn extension_request_binding_sync_rejects_stale_capabilities() {
+        exercise_extension_request_binding(false);
+    }
+
+    #[test]
+    fn extension_request_binding_async_rejects_stale_capabilities() {
+        exercise_extension_request_binding(true);
+    }
+
+    #[test]
+    fn extension_request_binding_cancellation_precedes_resolver_and_handler() {
+        for asynchronous in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            let server = request_binding_extension_server(
+                Arc::clone(&calls),
+                Arc::clone(&resolutions),
+                false,
+            );
+            let request = request_binding_extension_request(1);
+            let negotiated = server
+                .negotiate_extensions(&final_client_extension_discovery(&request).unwrap())
+                .unwrap();
+            assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+            let context = McpContext::new(Cx::for_testing(), 71);
+            assert!(context.request_cancellation().cancel());
+            let result = if asynchronous {
+                block_on(server.dispatch_negotiated_extension_async(
+                    &context,
+                    &negotiated,
+                    &request,
+                ))
+            } else {
+                server.dispatch_negotiated_extension(&context, &negotiated, &request)
+            };
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn extension_request_binding_discards_cancelled_handler_result() {
+        for asynchronous in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let server = request_binding_extension_server(
+                Arc::clone(&calls),
+                Arc::new(AtomicUsize::new(0)),
+                true,
+            );
+            let request = request_binding_extension_request(1);
+            let negotiated = server
+                .negotiate_extensions(&final_client_extension_discovery(&request).unwrap())
+                .unwrap();
+            let context = McpContext::new(Cx::for_testing(), 71);
+            let result = if asynchronous {
+                block_on(server.dispatch_negotiated_extension_async(
+                    &context,
+                    &negotiated,
+                    &request,
+                ))
+            } else {
+                server.dispatch_negotiated_extension(&context, &negotiated, &request)
+            };
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn extension_request_binding_fallback_resolves_once_per_request() {
+        for asynchronous in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            let server = request_binding_extension_server(
+                Arc::clone(&calls),
+                Arc::clone(&resolutions),
+                false,
+            );
+            let request = request_binding_extension_request(1);
+            let context = McpContext::new(Cx::for_testing(), 71);
+            let result = if asynchronous {
+                block_on(server.dispatch_extension_fallback_async(&context, &request))
+            } else {
+                server.dispatch_extension_fallback(&context, &request)
+            };
+            assert_eq!(result.unwrap(), serde_json::json!({"value": 41}));
+            assert_eq!(resolutions.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[cfg(feature = "tasks")]
     fn extension_registry_test_server(calls: Arc<AtomicUsize>) -> Server {
         let mut descriptors = ExtensionDescriptorRegistry::new();
@@ -27565,6 +27835,99 @@ mod lib_unit_tests {
             discovery["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
             serde_json::json!({})
         );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn modern_extension_stateless_dispatch_awaits_async_handler() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        let tasks_id = register_official_tasks_extension(&mut descriptors).unwrap();
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let handler_calls = Arc::clone(&calls);
+        let handler_polls = Arc::clone(&polls);
+        handlers
+            .register_async(
+                tasks_id.clone(),
+                "tasks/get",
+                move |context: &McpContext, request: serde_json::Value| {
+                    let calls = Arc::clone(&handler_calls);
+                    let polls = Arc::clone(&handler_polls);
+                    Box::pin(async move {
+                        assert_eq!(context.request_id(), 71);
+                        assert!(context.cx().blocking_pool_handle().is_none());
+                        context.checkpoint()?;
+                        let mut yielded = false;
+                        std::future::poll_fn(|task| {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            if yielded {
+                                std::task::Poll::Ready(())
+                            } else {
+                                yielded = true;
+                                task.waker().wake_by_ref();
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                        context.checkpoint()?;
+                        let value = request["value"]
+                            .as_u64()
+                            .ok_or_else(|| McpError::invalid_params("missing value"))?;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!({"next": value + 1}))
+                    })
+                },
+            )
+            .unwrap();
+        let server = Server::new("async-stateless-extension", "1.0.0")
+            .extension_registry(
+                handlers,
+                ServerExtensionDiscovery {
+                    extensions: BTreeMap::from([(tasks_id, official_tasks_empty_settings())]),
+                },
+                |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+                 _client: &ExtensionSettings,
+                 _server: &ExtensionSettings|
+                 -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                    Ok(official_tasks_empty_settings())
+                },
+            )
+            .unwrap()
+            .build();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned runtime installs its context");
+            let inbound = InboundRequestContext::new(cx, 71, InboundRequestTransport::Memory);
+            let request = extension_tasks_get_request(serde_json::json!({}));
+            let response = server
+                .dispatch_stateless(&inbound, &request)
+                .await
+                .expect("request returns a response after the handler yields");
+            assert!(response.error.is_none(), "{response:?}");
+            assert_eq!(response.result, Some(serde_json::json!({"next": 42})));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+
+            let mut omitted = request;
+            omitted.params.as_mut().unwrap()["_meta"]
+                ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({});
+            let rejected = server
+                .dispatch_stateless(&inbound, &omitted)
+                .await
+                .expect("omitted capability returns an error response");
+            assert_eq!(
+                rejected.error.unwrap().code,
+                i32::from(McpErrorCode::InvalidParams).into()
+            );
+            assert!(rejected.result.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(feature = "tasks")]

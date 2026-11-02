@@ -6,6 +6,10 @@
 //! descriptor registry before invoking that handler. Router integration owns
 //! the wire boundary separately.
 
+/// Typed, capability-restricted handlers for compile-linked external extensions.
+#[cfg(feature = "extension-authoring")]
+pub mod authoring;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
@@ -15,7 +19,7 @@ use crate::BoxFuture;
 use fastmcp_core::{McpContext, McpError, McpResult};
 use fastmcp_protocol::extensions::{
     ExtensionDispatchError, ExtensionRegistryError, MAX_EXTENSION_MEMBER_NAME_BYTES,
-    NegotiatedExtensionSet, ServerExtensionDiscovery,
+    NegotiatedExtension, NegotiatedExtensionSet, ServerExtensionDiscovery,
 };
 #[cfg(feature = "apps")]
 use fastmcp_protocol::extensions::{
@@ -159,6 +163,26 @@ trait ErasedExtensionHandler: Send + Sync {
         parameters: Value,
     ) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move { self.invoke(context, parameters) })
+    }
+
+    /// Receives the exact negotiated binding after frozen-registry admission.
+    fn invoke_admitted(
+        &self,
+        context: &McpContext,
+        _negotiated: &NegotiatedExtension,
+        parameters: Value,
+    ) -> McpResult<Value> {
+        self.invoke(context, parameters)
+    }
+
+    /// Preserves existing asynchronous callbacks while admitting typed settings.
+    fn invoke_admitted_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        _negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        self.invoke_async(context, parameters)
     }
 }
 
@@ -908,15 +932,28 @@ impl ExtensionHandlerRegistry {
         request: &JsonRpcRequest,
     ) -> Result<Value, ExtensionHandlerInvocationError> {
         let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
-        handler
-            .invoke(
+        let admitted = negotiated.active(extension_id).ok_or_else(|| {
+            ExtensionHandlerInvocationError::Protocol(ExtensionDispatchError::InactiveCapability(
+                extension_id.to_string(),
+            ))
+        })?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        let response = handler
+            .invoke_admitted(
                 context,
+                admitted,
                 request
                     .params
                     .clone()
                     .unwrap_or_else(|| serde_json::json!({})),
             )
-            .map_err(ExtensionHandlerInvocationError::Handler)
+            .map_err(ExtensionHandlerInvocationError::Handler)?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        Ok(response)
     }
 
     /// Admits and awaits a typed handler without entering another runtime.
@@ -930,12 +967,18 @@ impl ExtensionHandlerRegistry {
         request: &JsonRpcRequest,
     ) -> Result<Value, ExtensionHandlerInvocationError> {
         let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
+        let admitted = negotiated.active(extension_id).ok_or_else(|| {
+            ExtensionHandlerInvocationError::Protocol(ExtensionDispatchError::InactiveCapability(
+                extension_id.to_string(),
+            ))
+        })?;
         context
             .ensure_live()
             .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
         let response = handler
-            .invoke_async(
+            .invoke_admitted_async(
                 context,
+                admitted,
                 request
                     .params
                     .clone()
@@ -1152,6 +1195,44 @@ mod tests {
     #[test]
     fn async_extension_dispatch_rejects_callback_cancelled_result() {
         async_extension_dispatch_probe(false, true);
+    }
+
+    #[test]
+    fn sync_extension_dispatch_cancellation_before_and_after_handler() {
+        for cancelled_before_dispatch in [true, false] {
+            let (descriptors, id) = tasks_descriptors();
+            let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let handler_calls = Arc::clone(&calls);
+            handlers
+                .register(
+                    id.clone(),
+                    "tasks/get",
+                    move |context: &McpContext, request: GetTaskRequest| {
+                        handler_calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(context.request_cancellation().cancel());
+                        get_task(context, request)
+                    },
+                )
+                .unwrap();
+            handlers.freeze().unwrap();
+            let negotiated = negotiated_tasks(handlers.descriptor_registry(), &id);
+            let context = McpContext::new(Cx::for_testing(), 71);
+            if cancelled_before_dispatch {
+                assert!(context.request_cancellation().cancel());
+            }
+            let request = JsonRpcRequest::new("tasks/get", Some(json!({"value": 41})), 71_i64);
+            assert!(matches!(
+                handlers.invoke(&context, &negotiated, ProtocolEra::Modern2026, &id, &request),
+                Err(ExtensionHandlerInvocationError::Handler(error))
+                    if error.code == McpErrorCode::RequestCancelled
+            ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!cancelled_before_dispatch),
+                "a pre-cancelled request has no effect; cancellation in a handler discards its result"
+            );
+        }
     }
 
     fn primary_tasks_descriptor_with_direction(
