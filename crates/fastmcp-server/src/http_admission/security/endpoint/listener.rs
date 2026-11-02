@@ -301,6 +301,7 @@ impl BoundSecuredHttpServer {
         async move {
             let bound = self.inner;
             let server = Arc::clone(&bound.endpoint.server);
+            #[cfg(feature = "console")]
             server.init_rich_logging();
             if let Some(stats) = &server.stats {
                 stats.connection_opened();
