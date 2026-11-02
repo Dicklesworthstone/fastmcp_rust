@@ -1397,8 +1397,10 @@ mod tests {
             .blocking_threads(0, 0)
             .build()
             .unwrap();
-        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         runtime.block_on(async {
+            // The current-thread root is a registered obligation holder;
+            // a request-only Cx cannot commit the setup messages.
+            let healthy = Cx::current().unwrap();
             asupersync::time::timeout(healthy.now(), Duration::from_secs(3), async {
                 let (mut client, mut peer) = connected(&healthy).await;
                 let live = McpRequestCancellation::new();

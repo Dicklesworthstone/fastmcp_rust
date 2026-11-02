@@ -629,24 +629,77 @@ mod tests {
         #[test]
         fn ready_channel_commit_does_not_require_unused_timer_authority() {
             for operation in 0..3 {
+                let clock = Arc::new(VirtualClock::new());
+                let timer = TimerDriverHandle::with_virtual_clock(clock);
+                let runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(timer.clone())
+                    .build()
+                    .unwrap();
+                let deadline = Time::from_nanos(10_000_000);
+                let parent =
+                    runtime.request_cx_with_budget(Budget::INFINITE.with_deadline(deadline));
+                let observed_timer = timer.clone();
+                // Spawn inherits the finite deadline and real timer driver, and
+                // registers a live holder for two-phase channel obligations.
+                let mut task = parent
+                    .spawn(move |cx| async move {
+                        assert_eq!(cx.budget().deadline, Some(deadline));
+                        assert!(cx.timer_driver().is_some());
+                        let cx = &cx;
+                        let (mut client, mut server) =
+                            create_memory_transport_pair_with_capacity(1);
+                        if operation == 0 {
+                            client.send(cx, &request(71)).unwrap();
+                        }
+                        scoped(cx, no_time(), || match operation {
+                            0 => assert_eq!(
+                                json(&ready(server.recv_async(cx)).unwrap()),
+                                json(&request(71))
+                            ),
+                            1 => ready(client.send_async(cx, &request(71))).unwrap(),
+                            2 => ready(client.reserve_send_async(cx))
+                                .unwrap()
+                                .send(&request(71))
+                                .unwrap(),
+                            _ => unreachable!(),
+                        });
+                        assert_eq!(observed_timer.pending_count(), 0);
+                        if operation != 0 {
+                            assert_eq!(json(&server.recv(cx).unwrap()), json(&request(71)));
+                        }
+                        assert!(!client.is_closed() && !server.is_closed());
+                    })
+                    .unwrap();
+                runtime.block_on(task.join(&parent)).unwrap();
+                assert_eq!(timer.pending_count(), 0);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+
+        #[test]
+        fn unregistered_request_context_cannot_publish_a_ready_channel_message() {
+            for reserve in [false, true] {
                 with_deadline(|cx, _clock, timer| {
                     let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
-                    let live = Cx::for_testing();
-                    if operation == 0 {
-                        client.send(&live, &request(71)).unwrap();
-                    }
-                    scoped(cx, no_time(), || {
-                        match operation {
-                            0 => assert_eq!(json(&ready(server.recv_async(cx)).unwrap()), json(&request(71))),
-                            1 => ready(client.send_async(cx, &request(71))).unwrap(),
-                            2 => ready(client.reserve_send_async(cx)).unwrap().send(&request(71)).unwrap(),
-                            _ => unreachable!(),
+                    let result = scoped(cx, no_time(), || {
+                        if reserve {
+                            ready(client.reserve_send_async(cx)).map(|permit| permit.abort())
+                        } else {
+                            ready(client.send_async(cx, &request(71)))
                         }
                     });
+                    let Err(TransportError::Io(error)) = result else {
+                        panic!("an unregistered task cannot hold a send obligation");
+                    };
+                    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+                    assert_eq!(
+                        error.to_string(),
+                        "memory transport send obligation admission refused: obligation holder is no longer live"
+                    );
                     assert_eq!(timer.pending_count(), 0);
-                    if operation != 0 {
-                        assert_eq!(json(&server.recv(&live).unwrap()), json(&request(71)));
-                    }
+                    assert!(poll(pin!(server.recv_async(cx)), Waker::noop()).is_pending());
+                    assert_eq!(timer.pending_count(), 0);
                     assert!(!client.is_closed() && !server.is_closed());
                 });
             }
