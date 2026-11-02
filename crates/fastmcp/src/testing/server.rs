@@ -333,7 +333,7 @@ mod tests {
                 assert_eq!(completed.load(Ordering::SeqCst), 0, "no late effect");
                 assert_eq!(
                     response.error.expect("deadline error").code,
-                    i32::from(fastmcp_core::McpErrorCode::RequestCancelled)
+                    i32::from(fastmcp_core::McpErrorCode::RequestCancelled).into()
                 );
             } else {
                 assert!(response.error.is_none(), "{response:?}");

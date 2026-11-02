@@ -10,6 +10,9 @@
 //! - Resource template listing
 //! - Client info propagation
 
+// The HTTP server future's Send proof traverses the complete dispatch stack.
+#![recursion_limit = "256"]
+
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io::{Read, Write};
