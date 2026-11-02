@@ -4,6 +4,7 @@
 //! - `#[tool]` - Define a tool handler
 //! - `#[resource]` - Define a resource handler
 //! - `#[prompt]` - Define a prompt handler
+//! - `#[extension]` - Define a sealed typed extension handler (`extension-authoring`)
 //!
 //! MCP 2026-07-28 support is under implementation and remains unverified. The
 //! public protocol constant is still `2024-11-05`, and macro source presence
@@ -62,6 +63,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "extension-authoring")]
+mod extension;
+
 use std::collections::HashMap;
 
 use proc_macro::TokenStream;
@@ -73,6 +77,41 @@ use syn::{
     Attribute, FnArg, Ident, ItemFn, Lit, LitStr, Meta, Pat, Token, Type, parse::Parse,
     parse::ParseStream, parse_macro_input,
 };
+
+/// Defines a typed extension handler using the sealed facade contract.
+///
+/// The function takes `ExtensionContext<'_, Settings>` by value followed by an
+/// owned request, and returns `McpResult<Response>`. Both synchronous and async
+/// functions are supported; the generated adapter runs in the caller's future.
+/// The generated `FunctionNameExtension` unit struct has a `register` method
+/// that installs its typed handler into an `ExtensionBuilder` before freeze.
+///
+/// Required attributes are `method`, `params_schema`, and `result_schema`, all
+/// string literals. Cargo dependency renames are resolved automatically. Use
+/// `crate = "facade_alias"` to select one actual facade dependency when multiple
+/// facade dependencies are declared. Component crates are never a fallback.
+///
+/// ```ignore
+/// #[extension(
+///     method = "com.example/search",
+///     params_schema = "com.example/SearchRequest",
+///     result_schema = "com.example/SearchResponse",
+/// )]
+/// async fn search(
+///     context: ExtensionContext<'_, SearchSettings>,
+///     request: SearchRequest,
+/// ) -> McpResult<SearchResponse> {
+///     context.checkpoint()?;
+///     Ok(SearchResponse { query: request.query })
+/// }
+/// ```
+#[cfg(feature = "extension-authoring")]
+#[proc_macro_attribute]
+pub fn extension(attr: TokenStream, item: TokenStream) -> TokenStream {
+    extension::expand(attr.into(), item.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
 
 /// Crate paths used by handler macro expansions.
 ///

@@ -21,6 +21,7 @@ proc-macro = true
 # Cargo does not unify proc-macro host features with target features.
 apps = ["fastmcp-protocol/apps"]
 tasks = []
+extension-authoring = ["dep:toml"]
 
 [dependencies]
 fastmcp-protocol.workspace = true
@@ -28,6 +29,7 @@ proc-macro2 = "=1.0.107"
 proc-macro-crate.workspace = true
 quote = "=1.0.47"
 syn = { version = "=3.0.9", features = ["full", "parsing", "extra-traits"] }
+toml = { workspace = true, optional = true }
 
 [lints]
 workspace = true

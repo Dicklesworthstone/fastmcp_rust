@@ -1164,6 +1164,96 @@ standard streams are handles.
 
 ---
 
+## Typed extension handlers (opt-in, current source tree)
+
+The `extension-authoring` feature adds typed extension settings, request and
+response schemas, and `#[extension]` handlers. Enable it from the current Git
+source; the dependency can be renamed, and no component crates are required:
+
+```toml
+[dependencies]
+fm = { package = "fastmcp-rust", git = "https://github.com/Dicklesworthstone/fastmcp_rust", branch = "main", default-features = false, features = ["extension-authoring"] }
+```
+
+This complete program constructs and installs an asynchronous echo handler:
+
+```rust
+use fm::extensions::authoring::{ExtensionBuilder, ExtensionContext};
+use fm::serde::{Deserialize, Serialize};
+use fm::{JsonSchema, McpResult, extension, modern};
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(crate = "fm::serde", deny_unknown_fields)]
+struct Settings {}
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(crate = "fm::serde", deny_unknown_fields)]
+struct Message {
+    value: u32,
+}
+
+#[extension(
+    method = "com.example/echo",
+    params_schema = "echo-params-v1",
+    result_schema = "echo-result-v1"
+)]
+async fn echo(
+    context: ExtensionContext<'_, Settings>,
+    request: Message,
+) -> McpResult<Message> {
+    context.checkpoint()?;
+    Ok(request)
+}
+
+fn main() {
+    let builder = ExtensionBuilder::<Settings, Settings, Settings>::new(
+        "com.example/typed-echo",
+        1,
+        "empty-settings-v1",
+        "empty-settings-v1",
+        Settings {},
+        |_client, server| Ok(server),
+    )
+    .expect("admitted typed settings");
+    let registration = EchoExtension
+        .register(builder)
+        .expect("typed handler registration")
+        .build()
+        .expect("sealed extension registration");
+    let _server = modern::ServerBuilder::new("typed-echo", "1.0")
+        .extension(registration)
+        .expect("extension installation")
+        .try_build()
+        .expect("frozen server");
+}
+```
+
+The resolver receives typed client and server settings and returns the effective
+settings exposed by `context.settings()`. The explicit `serde(crate = "fm::serde")`
+keeps the derives valid with only the renamed facade dependency. Use the resulting
+server with an existing caller-owned `serve_*` path to handle requests; the program
+above only constructs the server and creates no runtime or transport.
+
+Activation requires both sides to opt in on each request. The server advertises
+the installed extension, and the client must include compatible settings in the
+request's `_meta["io.modelcontextprotocol/clientCapabilities"].extensions` object.
+For this example, that object contains `"com.example/typed-echo": {}`. Missing or
+incompatible settings refuse the call before the handler runs. Settings and
+request payloads are schema checked before callbacks; returned responses are
+schema checked before publication. Framework `_meta` is removed before decoding
+the typed request, so `deny_unknown_fields` applies to the application payload.
+
+`ExtensionContext` provides typed settings, immutable descriptor information,
+cancellation and deadline observations, and `checkpoint()`. It exposes no raw
+`McpContext`, `Cx`, credentials, or registry access. The initial authoring scope is
+modern client-to-server requests with bilateral activation; notifications and
+legacy extension methods are outside this surface. One registration can contain
+multiple typed methods. Installation does not merge an existing extension
+registry. These construction and admission APIs do not imply complete extension
+qualification.
+
+---
+
 ## Architecture
 
 ```
