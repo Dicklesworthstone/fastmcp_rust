@@ -139,13 +139,34 @@ fn cancelled_staging_wait_retains_the_same_one_use_completion_and_charge() {
         let directory = Directory::new();
         let current = binding("one");
         let store = open(&cx, &lane, &directory, Vault::default(), current.clone()).await;
+        // Receiving the open result does not join its worker. Isolate the
+        // staging charge only after that opening worker releases its lease.
+        asupersync::time::timeout_at(cx.now().saturating_add_nanos(2_000_000_000), async {
+            while lane.snapshot().unwrap().operations != 0 {
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("opening worker must release its charge before staging");
+        assert_eq!(
+            lane.snapshot().unwrap(),
+            CredentialIoSnapshot {
+                slots: 1,
+                operations: 0,
+                closes: 0,
+                reserved_bytes: 0,
+            }
+        );
         let mut staging = store
             .try_load_restart(&cx, current, 1, TaskResumeRestartPolicy::default())
             .unwrap();
+        let charged = lane.snapshot().unwrap();
+        assert_eq!(charged.operations, 1);
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
         assert!(matches!(staging.wait(&cancelled).await, Err(CredentialIoError::WaitCancelled)));
         assert_eq!(lane.snapshot().unwrap().operations, 1);
+        assert_eq!(lane.snapshot().unwrap(), charged);
         let (store, staged) = staging.wait(&cx).await.unwrap().into_parts();
         assert!(staged.unwrap().plan().is_empty());
         assert!(matches!(staging.wait(&cx).await, Err(CredentialIoError::AlreadyReceived)));
