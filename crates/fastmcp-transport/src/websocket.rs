@@ -8240,12 +8240,7 @@ mod tests {
             let reader: &[u8] = &[];
             let mut transport = WsTransport::new(reader, &mut write_buf);
 
-            let request = JsonRpcRequest {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                id: Some(RequestId::Number(1)),
-                method: "test".to_string(),
-                params: None,
-            };
+            let request = JsonRpcRequest::new("test", None, 1);
 
             transport.send_request(&cx, &request).unwrap();
         }

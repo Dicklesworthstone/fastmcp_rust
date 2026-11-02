@@ -308,8 +308,8 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             return Err(TransportError::Closed);
         }
         let bytes = match message {
-            JsonRpcMessage::Request(req) => self.codec.encode_request(req)?,
-            JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
+            JsonRpcMessage::Request(req) => self.codec.encode_ndjson_request(req)?,
+            JsonRpcMessage::Response(resp) => self.codec.encode_ndjson_response(resp)?,
         };
         self.write_encoded(&bytes)
     }
@@ -852,8 +852,8 @@ impl<R: Read, W: Write + AsFd> StdioTransport<R, W> {
             return Err(TransportError::Timeout);
         }
         let bytes = match message {
-            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
-            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+            JsonRpcMessage::Request(request) => self.codec.encode_ndjson_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_ndjson_response(response)?,
         };
         let writer = self.writer.as_ref().ok_or(TransportError::Closed)?;
         if let Err(error) = crate::async_io::write_all_fd_until(writer, &bytes, deadline) {
@@ -895,8 +895,8 @@ impl<R> StdioTransport<R, std::process::ChildStdin> {
         message: &JsonRpcMessage,
     ) -> Result<(), TransportError> {
         let bytes = match message {
-            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
-            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+            JsonRpcMessage::Request(request) => self.codec.encode_ndjson_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_ndjson_response(response)?,
         };
         self.try_write_atomic_control(&bytes)
     }
@@ -1191,8 +1191,12 @@ impl<W: Write> StdioSendPermit<'_, W> {
             return Err(TransportError::Closed);
         }
         let bytes = match message {
-            JsonRpcMessage::Request(request) => self.send_half.codec.encode_request(request)?,
-            JsonRpcMessage::Response(response) => self.send_half.codec.encode_response(response)?,
+            JsonRpcMessage::Request(request) => {
+                self.send_half.codec.encode_ndjson_request(request)?
+            }
+            JsonRpcMessage::Response(response) => {
+                self.send_half.codec.encode_ndjson_response(response)?
+            }
         };
         self.send_half.write_encoded(&bytes)
     }
@@ -1202,7 +1206,7 @@ impl<W: Write> StdioSendPermit<'_, W> {
         if self.send_half.is_closed() {
             return Err(TransportError::Closed);
         }
-        let bytes = self.send_half.codec.encode_request(request)?;
+        let bytes = self.send_half.codec.encode_ndjson_request(request)?;
         self.send_half.write_encoded(&bytes)
     }
 
@@ -1211,7 +1215,7 @@ impl<W: Write> StdioSendPermit<'_, W> {
         if self.send_half.is_closed() {
             return Err(TransportError::Closed);
         }
-        let bytes = self.send_half.codec.encode_response(response)?;
+        let bytes = self.send_half.codec.encode_ndjson_response(response)?;
         self.send_half.write_encoded(&bytes)
     }
 }
@@ -1233,8 +1237,12 @@ impl<W: Write + AsFd> StdioSendPermit<'_, W> {
             return Err(TransportError::Timeout);
         }
         let bytes = match message {
-            JsonRpcMessage::Request(request) => self.send_half.codec.encode_request(request)?,
-            JsonRpcMessage::Response(response) => self.send_half.codec.encode_response(response)?,
+            JsonRpcMessage::Request(request) => {
+                self.send_half.codec.encode_ndjson_request(request)?
+            }
+            JsonRpcMessage::Response(response) => {
+                self.send_half.codec.encode_ndjson_response(response)?
+            }
         };
         let writer = self
             .send_half
@@ -1319,8 +1327,8 @@ impl StdioSendHalf<std::process::ChildStdin> {
         message: &JsonRpcMessage,
     ) -> Result<(), TransportError> {
         let bytes = match message {
-            JsonRpcMessage::Request(request) => self.codec.encode_request(request)?,
-            JsonRpcMessage::Response(response) => self.codec.encode_response(response)?,
+            JsonRpcMessage::Request(request) => self.codec.encode_ndjson_request(request)?,
+            JsonRpcMessage::Response(response) => self.codec.encode_ndjson_response(response)?,
         };
         self.try_write_atomic_control(&bytes)
     }
@@ -1368,7 +1376,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             return Err(TransportError::Closed);
         }
         stdio_checkpoint(cx)?;
-        let bytes = self.codec.encode_request(request)?;
+        let bytes = self.codec.encode_ndjson_request(request)?;
         self.write_encoded(&bytes)
     }
 
@@ -1382,7 +1390,7 @@ impl<R: Read, W: Write> StdioTransport<R, W> {
             return Err(TransportError::Closed);
         }
         stdio_checkpoint(cx)?;
-        let bytes = self.codec.encode_response(response)?;
+        let bytes = self.codec.encode_ndjson_response(response)?;
         self.write_encoded(&bytes)
     }
 }
@@ -1526,8 +1534,8 @@ impl Transport for AsyncStdioTransport {
         stdio_checkpoint(cx)?;
 
         let bytes = match message {
-            JsonRpcMessage::Request(req) => self.codec.encode_request(req)?,
-            JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
+            JsonRpcMessage::Request(req) => self.codec.encode_ndjson_request(req)?,
+            JsonRpcMessage::Response(resp) => self.codec.encode_ndjson_response(resp)?,
         };
 
         // The checkpoint above admits one complete frame commit. Every commit
@@ -1616,7 +1624,7 @@ impl AsyncStdioTransport {
         }
         stdio_checkpoint(cx)?;
 
-        let bytes = self.codec.encode_request(request)?;
+        let bytes = self.codec.encode_ndjson_request(request)?;
 
         self.write_encoded(&bytes)
     }
@@ -1632,7 +1640,7 @@ impl AsyncStdioTransport {
         }
         stdio_checkpoint(cx)?;
 
-        let bytes = self.codec.encode_response(response)?;
+        let bytes = self.codec.encode_ndjson_response(response)?;
 
         self.write_encoded(&bytes)
     }
@@ -3637,6 +3645,156 @@ mod tests {
     // =========================================================================
     // E2E Stdio NDJSON Tests (bd-2kv / bd-swyn)
     // =========================================================================
+
+    #[test]
+    fn raw_source_line_break_refusal_preserves_direct_and_split_writers() {
+        const SOURCE: &str = r#"{"z":1.20e+4,"escaped\/key":"line\nquoted \u0022","a":-0}"#;
+        let cx = Cx::for_testing();
+        let valid = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .unwrap();
+        let expected = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/source\",\"params\":{SOURCE}}}\n"
+        )
+        .into_bytes();
+        for line_break in ["\n", "\r", "\r\n"] {
+            let pretty = format!("{{{line_break}{}", &SOURCE[1..]);
+            let rejected = JsonRpcRequest::notification_with_raw_params(
+                "notifications/source",
+                pretty.clone(),
+                pretty.len(),
+            )
+            .unwrap();
+            for path in ["generic", "direct", "permit", "permit-request"] {
+                let mut transport = StdioTransport::new(std::io::empty(), Vec::new());
+                for (request, reject) in [(&rejected, true), (&valid, false)] {
+                    let result = match path {
+                        "generic" => transport.send(&cx, &JsonRpcMessage::Request(request.clone())),
+                        "direct" => transport.send_request_direct(&cx, request),
+                        "permit" => transport
+                            .reserve_send(&cx)
+                            .unwrap()
+                            .send(&JsonRpcMessage::Request(request.clone())),
+                        "permit-request" => {
+                            transport.reserve_send(&cx).unwrap().send_request(request)
+                        }
+                        _ => unreachable!("fixed test paths"),
+                    };
+                    if reject {
+                        assert!(
+                            matches!(result, Err(TransportError::Codec(CodecError::Json(_)))),
+                            "{path}"
+                        );
+                        assert!(transport.writer.as_ref().unwrap().is_empty(), "{path}");
+                    } else {
+                        result.unwrap();
+                        assert_eq!(transport.writer.as_ref().unwrap(), &expected, "{path}");
+                    }
+                    assert!(!transport.closed, "{path}");
+                }
+            }
+            for path in ["generic", "permit", "permit-request"] {
+                let (receiver, mut sender) =
+                    StdioTransport::new(std::io::empty(), Vec::new()).into_split();
+                for (request, reject) in [(&rejected, true), (&valid, false)] {
+                    let result = match path {
+                        "generic" => sender.send(&cx, &JsonRpcMessage::Request(request.clone())),
+                        "permit" => sender
+                            .reserve_send(&cx)
+                            .unwrap()
+                            .send(&JsonRpcMessage::Request(request.clone())),
+                        "permit-request" => sender.reserve_send(&cx).unwrap().send_request(request),
+                        _ => unreachable!("fixed test paths"),
+                    };
+                    if reject {
+                        assert!(
+                            matches!(result, Err(TransportError::Codec(CodecError::Json(_)))),
+                            "{path}"
+                        );
+                        assert!(sender.writer.as_ref().unwrap().is_empty(), "{path}");
+                    } else {
+                        result.unwrap();
+                        assert_eq!(sender.writer.as_ref().unwrap(), &expected, "{path}");
+                    }
+                    assert!(!sender.is_closed(), "{path}");
+                    assert!(!receiver.is_closed(), "{path}");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_source_line_break_refusal_preserves_deadline_writers() {
+        const SOURCE: &str = r#"{"z":1.20e+4,"escaped\/key":"line\nquoted \u0022","a":-0}"#;
+        let cx = Cx::for_testing();
+        let valid = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .unwrap();
+        let expected = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/source\",\"params\":{SOURCE}}}\n"
+        );
+        for line_break in ["\n", "\r", "\r\n"] {
+            let pretty = format!("{{{line_break}{}", &SOURCE[1..]);
+            let rejected = JsonRpcRequest::notification_with_raw_params(
+                "notifications/source",
+                pretty.clone(),
+                pretty.len(),
+            )
+            .unwrap();
+            for reserved in [false, true] {
+                let (writer, mut peer) = UnixStream::pair().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                let flags = fcntl_getfl(&writer).unwrap();
+                let (receiver, mut sender) =
+                    StdioTransport::new(std::io::empty(), writer).into_split();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let message = JsonRpcMessage::Request(rejected.clone());
+                let result = if reserved {
+                    sender
+                        .reserve_send(&cx)
+                        .unwrap()
+                        .send_until(&message, deadline)
+                } else {
+                    sender.send_until(&cx, &message, deadline)
+                };
+                assert!(matches!(
+                    result,
+                    Err(TransportError::Codec(CodecError::Json(_)))
+                ));
+                assert_eq!(fcntl_getfl(sender.writer.as_ref().unwrap()).unwrap(), flags);
+                assert_eq!(
+                    peer.read(&mut [0_u8; 1]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                assert!(!sender.is_closed());
+                assert!(!receiver.is_closed());
+                let message = JsonRpcMessage::Request(valid.clone());
+                if reserved {
+                    sender
+                        .reserve_send(&cx)
+                        .unwrap()
+                        .send_until(&message, deadline)
+                        .unwrap();
+                } else {
+                    sender.send_until(&cx, &message, deadline).unwrap();
+                }
+                peer.set_nonblocking(false).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut received = String::new();
+                BufReader::new(peer).read_line(&mut received).unwrap();
+                assert_eq!(received, expected);
+                assert!(!sender.is_closed());
+                assert!(!receiver.is_closed());
+            }
+        }
+    }
 
     #[test]
     fn e2e_ndjson_multiple_messages_in_sequence() {

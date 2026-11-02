@@ -388,8 +388,8 @@ async fn send<W: AsyncWrite + Unpin>(
     }
     stdio_checkpoint(cx)?;
     let bytes = match message {
-        JsonRpcMessage::Request(request) => codec.encode_request(request)?,
-        JsonRpcMessage::Response(response) => codec.encode_response(response)?,
+        JsonRpcMessage::Request(request) => codec.encode_ndjson_request(request)?,
+        JsonRpcMessage::Response(response) => codec.encode_ndjson_response(response)?,
     };
     let mut commit = WriteCommit {
         writer,
@@ -1222,6 +1222,61 @@ mod tests {
             ready(writer.send_async(&cx, &request(92))),
             Err(TransportError::Closed)
         ));
+    }
+
+    #[test]
+    fn raw_source_line_break_refusal_preserves_async_writers() {
+        const SOURCE: &str = r#"{"z":1.20e+4,"escaped\/key":"line\nquoted \u0022","a":-0}"#;
+        let cx = Cx::for_testing();
+        let valid = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .unwrap();
+        let expected = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/source\",\"params\":{SOURCE}}}\n"
+        )
+        .into_bytes();
+        for line_break in ["\n", "\r", "\r\n"] {
+            let pretty = format!("{{{line_break}{}", &SOURCE[1..]);
+            let rejected = JsonRpcRequest::notification_with_raw_params(
+                "notifications/source",
+                pretty.clone(),
+                pretty.len(),
+            )
+            .unwrap();
+            let output = Output::new(usize::MAX);
+            let mut transport =
+                AsyncStdioTransport::from_io(&b""[..], TestWriter(Arc::clone(&output)));
+            assert!(matches!(
+                ready(transport.send_async(&cx, &JsonRpcMessage::Request(rejected.clone()))),
+                Err(TransportError::Codec(CodecError::Json(_)))
+            ));
+            assert!(output.bytes.lock().unwrap().is_empty());
+            assert!(!transport.is_closed());
+            assert!(!output.dropped.load(Ordering::SeqCst));
+            ready(transport.send_async(&cx, &JsonRpcMessage::Request(valid.clone()))).unwrap();
+            assert_eq!(*output.bytes.lock().unwrap(), expected);
+            assert!(!transport.is_closed());
+
+            let output = Output::new(usize::MAX);
+            let (reader, mut writer) =
+                AsyncStdioTransport::from_io(&b""[..], TestWriter(Arc::clone(&output)))
+                    .into_split();
+            assert!(matches!(
+                ready(writer.send_async(&cx, &JsonRpcMessage::Request(rejected))),
+                Err(TransportError::Codec(CodecError::Json(_)))
+            ));
+            assert!(output.bytes.lock().unwrap().is_empty());
+            assert!(!writer.is_closed());
+            assert!(!reader.is_closed());
+            assert!(!output.dropped.load(Ordering::SeqCst));
+            ready(writer.send_async(&cx, &JsonRpcMessage::Request(valid.clone()))).unwrap();
+            assert_eq!(*output.bytes.lock().unwrap(), expected);
+            assert!(!writer.is_closed());
+            assert!(!reader.is_closed());
+        }
     }
 
     #[test]

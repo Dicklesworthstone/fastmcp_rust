@@ -1,6 +1,7 @@
 //! Message codec for framing JSON-RPC messages.
 //!
-//! MCP uses newline-delimited JSON (NDJSON) for message framing.
+//! Complete-frame encoders preserve admitted JSON source. Stdio uses the
+//! NDJSON encoders, which reject embedded line breaks before I/O.
 
 use fastmcp_protocol::{
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, MAX_JSONRPC_STRING_ID_ENCODED_BYTES,
@@ -728,7 +729,10 @@ impl Codec {
         }
     }
 
-    /// Encodes a request to bytes.
+    /// Encodes a complete request, preserving raw source and appending LF.
+    ///
+    /// Raw parameters may contain JSON whitespace line breaks. Use
+    /// [`Self::encode_ndjson_request`] for a newline-delimited transport.
     ///
     /// # Errors
     ///
@@ -740,7 +744,9 @@ impl Codec {
         self.encode_value(request)
     }
 
-    /// Encodes a response to bytes.
+    /// Encodes a complete response, preserving raw source and appending LF.
+    ///
+    /// Use [`Self::encode_ndjson_response`] for a newline-delimited transport.
     ///
     /// # Errors
     ///
@@ -750,6 +756,46 @@ impl Codec {
             CodecError::Json(<serde_json::Error as serde::ser::Error>::custom(message))
         })?;
         self.encode_value(response)
+    }
+
+    /// Encodes a request as exactly one newline-delimited JSON frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or oversized messages, or raw source
+    /// containing literal CR/LF. Escaped line breaks in JSON strings are valid.
+    pub fn encode_ndjson_request(&self, request: &JsonRpcRequest) -> Result<Vec<u8>, CodecError> {
+        Self::require_ndjson_frame(self.encode_request(request)?)
+    }
+
+    /// Encodes a response as exactly one newline-delimited JSON frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or oversized messages, or raw source
+    /// containing literal CR/LF. Escaped line breaks in JSON strings are valid.
+    pub fn encode_ndjson_response(
+        &self,
+        response: &JsonRpcResponse,
+    ) -> Result<Vec<u8>, CodecError> {
+        Self::require_ndjson_frame(self.encode_response(response)?)
+    }
+
+    fn require_ndjson_frame(frame: Vec<u8>) -> Result<Vec<u8>, CodecError> {
+        // Both complete-frame encoders append exactly one delimiter. Inspect
+        // the entire JSON document before a stdio writer can commit any bytes;
+        // compacting through Value would discard the retained source spelling.
+        if frame[..frame.len() - 1]
+            .iter()
+            .any(|byte| matches!(byte, b'\r' | b'\n'))
+        {
+            return Err(CodecError::Json(
+                <serde_json::Error as serde::ser::Error>::custom(
+                    "NDJSON message contains an embedded line break",
+                ),
+            ));
+        }
+        Ok(frame)
     }
 
     fn encode_value<T: serde::Serialize>(&self, value: &T) -> Result<Vec<u8>, CodecError> {
@@ -1431,6 +1477,78 @@ mod tests {
         // Everything before \n should be valid JSON
         let json_part = &encoded[..encoded.len() - 1];
         let _: JsonRpcRequest = serde_json::from_slice(json_part).expect("valid JSON");
+    }
+
+    #[test]
+    fn ndjson_raw_source_refuses_line_breaks_without_changing_complete_frames() {
+        const SOURCE: &str = r#"{"z":1.20e+4,"escaped\/key":"line\nquoted \u0022","a":-0}"#;
+        let codec = Codec::new();
+        let valid = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .unwrap();
+        let expected = format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/source\",\"params\":{SOURCE}}}\n"
+        )
+        .into_bytes();
+        for line_break in ["\n", "\r", "\r\n"] {
+            let pretty = format!("{{{line_break}{}", &SOURCE[1..]);
+            let request = JsonRpcRequest::notification_with_raw_params(
+                "notifications/source",
+                pretty.clone(),
+                pretty.len(),
+            )
+            .expect("literal whitespace is valid complete-frame JSON");
+            let complete = codec.encode_request(&request).unwrap();
+            assert_eq!(
+                complete,
+                format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/source\",\"params\":{pretty}}}\n"
+                )
+                .into_bytes()
+            );
+            assert!(codec.decode_complete_message(&complete).is_ok());
+            assert!(matches!(
+                codec.encode_ndjson_request(&request),
+                Err(CodecError::Json(_))
+            ));
+            assert_eq!(codec.encode_request(&request).unwrap(), complete);
+            let encoded = codec.encode_ndjson_request(&valid).unwrap();
+            assert_eq!(encoded, expected);
+            assert!(!encoded[..encoded.len() - 1].contains(&b'\n'));
+            assert!(!encoded[..encoded.len() - 1].contains(&b'\r'));
+            assert_eq!(Codec::new().decode(&encoded).unwrap().len(), 1);
+        }
+
+        let response = JsonRpcResponse::success(
+            RequestId::Number(7),
+            serde_json::json!({"text": "escaped\nline\rbreak"}),
+        );
+        let encoded_response = codec.encode_response(&response).unwrap();
+        assert_eq!(
+            codec.encode_ndjson_response(&response).unwrap(),
+            encoded_response
+        );
+        let mut bounded = Codec::new();
+        bounded.set_max_message_size(expected.len() - 1);
+        assert_eq!(bounded.encode_ndjson_request(&valid).unwrap(), expected);
+        bounded.set_max_message_size(expected.len() - 2);
+        assert!(matches!(
+            bounded.encode_ndjson_request(&valid),
+            Err(CodecError::MessageTooLarge(_))
+        ));
+        bounded.set_max_message_size(encoded_response.len() - 1);
+        assert_eq!(
+            bounded.encode_ndjson_response(&response).unwrap(),
+            encoded_response
+        );
+        bounded.set_max_message_size(encoded_response.len() - 2);
+        assert!(matches!(
+            bounded.encode_ndjson_response(&response),
+            Err(CodecError::MessageTooLarge(_))
+        ));
     }
 
     #[test]

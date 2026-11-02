@@ -414,7 +414,7 @@ impl From<CodecError> for TransportError {
 // Two-Phase Send Protocol
 // =============================================================================
 
-/// A permit returned after a send-cancellation preflight.
+/// An NDJSON send permit returned after a send-cancellation preflight.
 ///
 /// `reserve_send` checks cancellation and gives the permit an exclusive borrow
 /// of the transport's writer and codec. Consuming the permit encodes, writes,
@@ -491,8 +491,8 @@ impl<'a, W: std::io::Write> SendPermit<'a, W> {
     /// terminal.
     pub fn send(self, message: &JsonRpcMessage) -> Result<(), TransportError> {
         let bytes = match message {
-            JsonRpcMessage::Request(req) => self.codec.encode_request(req)?,
-            JsonRpcMessage::Response(resp) => self.codec.encode_response(resp)?,
+            JsonRpcMessage::Request(req) => self.codec.encode_ndjson_request(req)?,
+            JsonRpcMessage::Response(resp) => self.codec.encode_ndjson_response(resp)?,
         };
 
         self.commit(&bytes)
@@ -507,7 +507,7 @@ impl<'a, W: std::io::Write> SendPermit<'a, W> {
     /// Returns an error if encoding, writing, or flushing fails. An I/O error
     /// can occur after a partial write and latches the transport terminal.
     pub fn send_request(self, request: &JsonRpcRequest) -> Result<(), TransportError> {
-        let bytes = self.codec.encode_request(request)?;
+        let bytes = self.codec.encode_ndjson_request(request)?;
         self.commit(&bytes)
     }
 
@@ -520,7 +520,7 @@ impl<'a, W: std::io::Write> SendPermit<'a, W> {
     /// Returns an error if encoding, writing, or flushing fails. An I/O error
     /// can occur after a partial write and latches the transport terminal.
     pub fn send_response(self, response: &JsonRpcResponse) -> Result<(), TransportError> {
-        let bytes = self.codec.encode_response(response)?;
+        let bytes = self.codec.encode_ndjson_response(response)?;
         self.commit(&bytes)
     }
 }

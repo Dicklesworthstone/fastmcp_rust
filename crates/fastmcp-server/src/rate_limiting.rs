@@ -950,12 +950,7 @@ mod tests {
     }
 
     fn test_request(method: &str) -> JsonRpcRequest {
-        JsonRpcRequest {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            method: method.to_string(),
-            params: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        }
+        JsonRpcRequest::new(method, None, 1)
     }
 
     /// Live partitions are scoped by client AND method (aced504); tests that

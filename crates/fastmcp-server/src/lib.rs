@@ -7073,8 +7073,16 @@ fn tag_task_subscription_notification(
         notification.params.meta,
         subscription_id,
     )?);
-    serde_json::from_value(serde_json::to_value(notification).map_err(McpError::from)?)
-        .map_err(McpError::from)
+    let params = serde_json::to_string(&notification.params).map_err(McpError::from)?;
+    JsonRpcRequest::notification_with_raw_params(
+        fastmcp_protocol::TASK_STATUS_NOTIFICATION,
+        params,
+        // The untagged event was already bounded. Allow owner metadata here;
+        // publish_prepared still enforces the original full event-byte limit
+        // and retires an overflowing subscription through its usual path.
+        2 * MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES,
+    )
+    .map_err(|error| McpError::internal_error(error.to_string()))
 }
 
 /// One exact-2024 HTTP request admitted before it waits for the session mutex.
@@ -26586,6 +26594,14 @@ mod lib_unit_tests {
     /// terminal EOF: an extra notification after the response is a fourth
     /// parsed frame, not an overlooked substring.
     fn live_http_chunked_sse_messages(response: &[u8]) -> Result<Vec<JsonRpcMessage>, String> {
+        live_http_chunked_sse_messages_with_source(response)
+            .map(|messages| messages.into_iter().map(|(message, _)| message).collect())
+    }
+
+    /// Keeps each admitted message paired with its original SSE data bytes.
+    fn live_http_chunked_sse_messages_with_source(
+        response: &[u8],
+    ) -> Result<Vec<(JsonRpcMessage, &str)>, String> {
         let mut remaining = live_http_response_body(response)?;
         let mut messages = Vec::new();
         loop {
@@ -26627,11 +26643,12 @@ mod lib_unit_tests {
                     "live SSE message event did not carry one JSON-RPC data line".to_owned(),
                 );
             }
-            messages.push(
+            messages.push((
                 Codec::new()
                     .decode_complete_message(data[0].as_bytes())
                     .map_err(|error| format!("live SSE JSON-RPC event was invalid: {error}"))?,
-            );
+                data[0],
+            ));
         }
     }
 
@@ -45405,6 +45422,9 @@ mod lib_unit_tests {
     }
 
     #[cfg(feature = "tasks")]
+    const AUTH_TASK_COMPLETED_RESULT_SOURCE: &str = r#"{"x-first":1.20e+4,"content":[{"type":"text","text":"owner input consumed"}],"x-zero":-0,"escaped\/key":"quoted \u0022 value","x-last":123456789012345678901234567890}"#;
+
+    #[cfg(feature = "tasks")]
     struct AuthTaskSupervisor;
 
     #[cfg(feature = "tasks")]
@@ -45426,7 +45446,10 @@ mod lib_unit_tests {
                         )?;
                     }
                     FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                        accepted.complete_task(serde_json::from_value(serde_json::json!({"content": [{"type": "text", "text": "owner input consumed"}]})).unwrap(), None)?;
+                        accepted.complete_task(
+                            serde_json::from_str(AUTH_TASK_COMPLETED_RESULT_SOURCE).unwrap(),
+                            None,
+                        )?;
                     }
                 }
                 Ok(())
@@ -45645,6 +45668,33 @@ mod lib_unit_tests {
                         if terminal == "completed" {
                             let task = serde_json::to_value(&terminal_events[0].params.task).unwrap();
                             assert_eq!(task["result"]["content"][0]["text"], "owner input consumed");
+                            let completed_sources =
+                                live_http_chunked_sse_messages_with_source(&received)?
+                                    .into_iter()
+                                    .filter_map(|(message, source)| {
+                                        let JsonRpcMessage::Request(request) = message else {
+                                            return None;
+                                        };
+                                        (request.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION
+                                            && request
+                                                .params
+                                                .as_ref()
+                                                .and_then(|params| params.get("status"))
+                                                .and_then(serde_json::Value::as_str)
+                                                == Some("completed"))
+                                        .then_some(source)
+                                    })
+                                    .collect::<Vec<_>>();
+                            assert_eq!(completed_sources.len(), 1);
+                            let raw_envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                                serde_json::from_str(completed_sources[0]).unwrap();
+                            let raw_params: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                                serde_json::from_str(raw_envelope["params"].get()).unwrap();
+                            assert_eq!(
+                                raw_params["result"].get().as_bytes(),
+                                AUTH_TASK_COMPLETED_RESULT_SOURCE.as_bytes(),
+                                "the native Task SSE event must retain the application's exact completed result"
+                            );
                         }
                         eprintln!("{}", serde_json::json!({"proof": "auth_00_local_task_owner", "subject": subject, "task_id": task_id, "terminal": terminal, "subscription_events": events.len(), "subscription_frame_sha256": sha256_bounded(&received, 65_536).unwrap().as_bytes(), "negative": plant_foreign_caller}));
                     }
@@ -60427,6 +60477,144 @@ mod lib_unit_tests {
             1
         );
         assert_eq!(frames.load(Ordering::Acquire), 2);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_task_subscription_owner_tagged_byte_limit_preserves_queue_retirement() {
+        let task_id = fastmcp_protocol::FinalTaskId::parse("task-byte-boundary").unwrap();
+        let owner_id = RequestId::String("s".repeat(254));
+        owner_id.validate().unwrap();
+        let event = |padding| {
+            serde_json::from_value::<FinalTaskStatusNotification>(serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": fastmcp_protocol::TASK_STATUS_NOTIFICATION,
+                "params": {
+                    "taskId": task_id,
+                    "status": "completed",
+                    "createdAt": "2026-07-28T12:00:00.000Z",
+                    "lastUpdatedAt": "2026-07-28T12:00:01.000Z",
+                    "ttlMs": null,
+                    "result": { "content": [], "padding": "x".repeat(padding) },
+                    "_meta": { FINAL_SUBSCRIPTION_ID_META_KEY: 1 },
+                }
+            }))
+            .unwrap()
+        };
+        let empty = event(0);
+        let source_overhead = serde_json::to_vec(&empty).unwrap().len();
+        let tagged_overhead =
+            serde_json::to_vec(&tag_task_subscription_notification(&empty, &owner_id).unwrap())
+                .unwrap()
+                .len();
+        let exact_padding = MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES - tagged_overhead;
+        let source_bound_padding = MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES - source_overhead;
+        for padding in [exact_padding, exact_padding + 1, source_bound_padding] {
+            let registry = Arc::new(FinalSubscriptionRegistry::default());
+            let mut requested = SubscriptionFilter::default();
+            set_task_subscription_ids(&mut requested, vec![task_id.clone()]).unwrap();
+            let target_frames = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&target_frames);
+            let target_cancellation = McpRequestCancellation::new();
+            let target = registry
+                .open(
+                    owner_id.clone(),
+                    requested.clone(),
+                    true,
+                    None,
+                    target_cancellation.clone(),
+                    None,
+                    Arc::new(move |frame| captured.lock().unwrap().push(frame)),
+                )
+                .unwrap();
+            let sibling_frames = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&sibling_frames);
+            let sibling_cancellation = McpRequestCancellation::new();
+            let sibling = registry
+                .open(
+                    RequestId::Number(1),
+                    requested,
+                    true,
+                    None,
+                    sibling_cancellation.clone(),
+                    None,
+                    Arc::new(move |frame| captured.lock().unwrap().push(frame)),
+                )
+                .unwrap();
+            assert_eq!(target_frames.lock().unwrap().len(), 1);
+            assert_eq!(sibling_frames.lock().unwrap().len(), 1);
+            let notification = event(padding);
+            let untagged_bytes = final_subscription_event_bytes(&notification)
+                .expect("every source event fits before owner metadata is replaced");
+            let tagged = tag_task_subscription_notification(&notification, &owner_id)
+                .expect("tagging must leave final event overflow to queue admission");
+            let tagged_bytes = serde_json::to_vec(&tagged).unwrap().len();
+            let fits = padding == exact_padding;
+            assert_eq!(
+                tagged_bytes,
+                MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES + padding - exact_padding
+            );
+            if padding == source_bound_padding {
+                assert_eq!(untagged_bytes, MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES);
+                let raw: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                    serde_json::from_slice(&serde_json::to_vec(&tagged).unwrap()).unwrap();
+                assert!(raw["params"].get().len() > MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES);
+            }
+            assert_eq!(
+                registry.publish_task(notification).unwrap(),
+                1 + usize::from(fits)
+            );
+            assert_eq!(target_frames.lock().unwrap().len(), 1 + usize::from(fits));
+            assert_eq!(sibling_frames.lock().unwrap().len(), 2);
+            if fits {
+                let delivered = target_frames.lock().unwrap()[1].clone();
+                assert_eq!(delivered.method, fastmcp_protocol::TASK_STATUS_NOTIFICATION);
+                assert_eq!(
+                    serde_json::to_vec(&delivered).unwrap().len(),
+                    MAX_FINAL_SUBSCRIPTION_QUEUED_BYTES
+                );
+                assert_eq!(
+                    delivered.params.as_ref().unwrap()["taskId"],
+                    serde_json::json!(task_id)
+                );
+                assert_eq!(
+                    delivered.params.as_ref().unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+                    serde_json::to_value(&owner_id).unwrap()
+                );
+            }
+            let sibling_event = sibling_frames.lock().unwrap()[1].clone();
+            assert_eq!(
+                sibling_event.method,
+                fastmcp_protocol::TASK_STATUS_NOTIFICATION
+            );
+            assert_eq!(
+                sibling_event.params.as_ref().unwrap()["taskId"],
+                serde_json::json!(task_id)
+            );
+            assert_eq!(
+                sibling_event.params.as_ref().unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+                serde_json::json!(1)
+            );
+            assert_eq!(target_cancellation.is_cancel_requested(), !fits);
+            assert!(!sibling_cancellation.is_cancel_requested());
+            let state = registry.inner.lock().unwrap();
+            assert_eq!(state.entries.contains_key(&target.key), fits);
+            assert!(state.entries.contains_key(&sibling.key));
+            drop(state);
+            assert_eq!(
+                *target.election.phase.lock().unwrap(),
+                if fits {
+                    FinalSubscriptionPhase::Active
+                } else {
+                    FinalSubscriptionPhase::PeerTerminated
+                }
+            );
+            for lease in [&target, &sibling] {
+                let queue = lease.election.opening_events.lock().unwrap();
+                assert!(queue.events.is_empty());
+                assert_eq!((queue.retained_events, queue.retained_bytes), (0, 0));
+            }
+        }
     }
 
     #[test]

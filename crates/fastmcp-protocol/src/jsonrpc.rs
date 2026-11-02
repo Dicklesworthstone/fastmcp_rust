@@ -4,7 +4,7 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use serde::de::Error as _;
-use serde::ser::Error as _;
+use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -341,10 +341,9 @@ impl JsonRpcRequest {
     /// sidecar for method-specific ingress decoding.
     ///
     /// The returned `String`, when present, is the exact JSON source of the
-    /// request's `params` member. It is deliberately separate from
-    /// [`JsonRpcRequest`] so existing public struct literals and ordinary
-    /// typed request APIs retain their established shape. A consumer may only
-    /// attach this source to the returned request after comparing its
+    /// request's `params` member. Ingress keeps it separate from the mutable
+    /// routing view. A consumer may only attach this source to the returned
+    /// request after comparing its
     /// materialized `params` value; final core dispatch performs that equality
     /// check before it uses the raw source.
     ///
@@ -1179,30 +1178,64 @@ impl std::fmt::Display for RequestId {
 }
 
 /// JSON-RPC 2.0 request.
-#[derive(Debug, Clone, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct JsonRpcRequest {
     /// Protocol version (always "2.0").
-    #[serde(
-        serialize_with = "serialize_jsonrpc_version",
-        deserialize_with = "deserialize_jsonrpc_version"
-    )]
     pub jsonrpc: Cow<'static, str>,
     /// Method name.
     pub method: String,
     /// Request parameters.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
     /// Request ID (absent for notifications).
     ///
     /// An explicit JSON `null` is rejected instead of being conflated with an
     /// absent member. Notifications omit `id` entirely.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_request_id",
-        skip_serializing_if = "Option::is_none"
-    )]
     pub id: Option<RequestId>,
+    // Explicitly source-preserving construction binds both views to the same
+    // admitted document. Ordinary typed construction and ingress retain none.
+    retained_params: Option<std::sync::Arc<RetainedRequestParams>>,
+}
+
+struct RetainedRequestParams {
+    source: Box<RawValue>,
+    value: Value,
+}
+
+impl std::fmt::Debug for RetainedRequestParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Public params may since have been redacted. Never expose their old
+        // contents through the private serialization snapshot.
+        formatter
+            .debug_struct("RetainedRequestParams")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Serialize for JsonRpcRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        let mut members = serializer.serialize_map(Some(
+            2 + usize::from(self.params.is_some()) + usize::from(self.id.is_some()),
+        ))?;
+        members.serialize_entry("jsonrpc", &self.jsonrpc)?;
+        members.serialize_entry("method", &self.method)?;
+        if let Some(params) = &self.params {
+            if let Some(retained) = &self.retained_params
+                && params == &retained.value
+            {
+                members.serialize_entry("params", &retained.source)?;
+            } else {
+                members.serialize_entry("params", params)?;
+            }
+        }
+        if let Some(id) = &self.id {
+            members.serialize_entry("id", id)?;
+        }
+        members.end()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1249,6 +1282,7 @@ impl<'a> JsonRpcRequestRawWire<'a> {
                 method: self.method,
                 params,
                 id: self.id,
+                retained_params: None,
             },
             self.params,
         ))
@@ -1264,6 +1298,7 @@ impl JsonRpcRequest {
             method: method.into(),
             params,
             id: Some(id.into()),
+            retained_params: None,
         }
     }
 
@@ -1275,7 +1310,50 @@ impl JsonRpcRequest {
             method: method.into(),
             params,
             id: None,
+            retained_params: None,
         }
+    }
+
+    /// Creates a notification retaining the exact admitted parameter value.
+    ///
+    /// Direct JSON serialization preserves member order, escapes and numeric
+    /// lexemes while the public `params` value remains unchanged. Mutating it
+    /// causes serialization to use the current value instead; envelope fields
+    /// always use their current values. Conversion through `serde_json::Value`
+    /// does not preserve source representation.
+    ///
+    /// `document_byte_limit` bounds the parameter document before decoding.
+    /// Transports must still enforce their complete encoded-message limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, duplicate-bearing or over-limit JSON,
+    /// or parameters that violate method-specific raw admission.
+    pub fn notification_with_raw_params(
+        method: impl Into<String>,
+        params: String,
+        document_byte_limit: usize,
+    ) -> Result<Self, JsonRpcAdmissionError> {
+        admit_raw_json_document(
+            params.as_bytes(),
+            document_byte_limit,
+            RawJsonTopLevel::AnyValue,
+        )
+        .map_err(|failure| JsonRpcAdmissionError::Raw(failure.error()))?;
+        let method = method.into();
+        crate::messages::validate_raw_final_completion_params(&method, &params)
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        let value: Value =
+            serde_json::from_str(&params).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        let source =
+            RawValue::from_string(params).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        Ok(Self {
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
+            method,
+            params: Some(value.clone()),
+            id: None,
+            retained_params: Some(std::sync::Arc::new(RetainedRequestParams { source, value })),
+        })
     }
 
     /// Creates the MCP lifecycle `notifications/initialized` notification.
@@ -2268,6 +2346,156 @@ mod tests {
         assert_eq!(value["method"], "tools/call");
         assert_eq!(value["params"]["name"], "greet");
         assert_eq!(value["id"], 2);
+    }
+
+    #[test]
+    fn request_raw_params_preserve_source_and_current_envelope() {
+        const SOURCE: &str = r#"{"z":1.20e+4,"result":{"escaped\/key":"quoted \u0022 value","negativeZero":-0,"integer":123456789012345678901234567890},"a":null}"#;
+        let original = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .expect("bounded raw params are admitted");
+        let mut changed = original.clone();
+        changed.method = "notifications/changed".to_owned();
+        changed.id = Some(RequestId::String("current-owner".to_owned()));
+
+        for request in [&original, &original.clone(), &changed, &changed.clone()] {
+            let encoded = serde_json::to_string(request).unwrap();
+            let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(raw["params"].get(), SOURCE);
+            let envelope: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(envelope["jsonrpc"], JSONRPC_VERSION);
+            assert_eq!(envelope["method"], request.method);
+            assert_eq!(
+                envelope.get("id"),
+                request
+                    .id
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .unwrap()
+                    .as_ref()
+            );
+            assert_eq!(envelope.get("params"), request.params.as_ref());
+        }
+        assert_eq!(original.method, "notifications/source");
+        assert!(original.id.is_none());
+        changed.jsonrpc = Cow::Borrowed("1.0");
+        assert!(serde_json::to_string(&changed).is_err());
+        assert!(serde_json::to_string(&original).is_ok());
+    }
+
+    #[test]
+    fn request_raw_params_mutations_never_emit_stale_source() {
+        const SENTINEL: &str = "retained-private-source-sentinel";
+        const SOURCE: &str = r#"{"z":1.20e+4,"nested":{"token":"retained-private-source-sentinel","items":[1,2]},"scalar":"original","_meta":{"owner":"original"}}"#;
+        let original = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .unwrap();
+        let mut nested = original.params.clone().unwrap();
+        nested["nested"]["items"][0] = json!(99);
+        let mut scalar = original.params.clone().unwrap();
+        scalar["scalar"] = json!("changed");
+        let mut metadata = original.params.clone().unwrap();
+        metadata["_meta"]["owner"] = json!("current-owner");
+        for (name, params) in [
+            ("nested", Some(nested)),
+            ("scalar", Some(scalar)),
+            ("metadata", Some(metadata)),
+            ("replacement", Some(json!(73))),
+            ("removed", None),
+        ] {
+            let mut changed = original.clone();
+            changed.params = params.clone();
+            for request in [&changed, &changed.clone()] {
+                let encoded = serde_json::to_string(request).unwrap();
+                let envelope: Value = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(envelope.get("params"), params.as_ref(), "{name}");
+                let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                    serde_json::from_str(&encoded).unwrap();
+                if let Some(current) = &params {
+                    assert_eq!(
+                        raw["params"].get(),
+                        serde_json::to_string(current).unwrap(),
+                        "{name} must serialize current params"
+                    );
+                    assert_ne!(raw["params"].get(), SOURCE, "{name}");
+                } else {
+                    assert!(!raw.contains_key("params"));
+                }
+            }
+            let original_wire = serde_json::to_string(&original).unwrap();
+            let original_raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(&original_wire).unwrap();
+            assert_eq!(original_raw["params"].get(), SOURCE);
+        }
+
+        for params in [Some(json!({"redacted": true})), None] {
+            let mut redacted = original.clone();
+            redacted.params = params;
+            for request in [&redacted, &redacted.clone()] {
+                assert!(!format!("{request:?}").contains(SENTINEL));
+                assert!(!serde_json::to_string(request).unwrap().contains(SENTINEL));
+            }
+        }
+        assert!(format!("{original:?}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn request_raw_params_reject_invalid_duplicate_and_oversized_source() {
+        const VALID: &str = r#"{"payload":{"value":1}}"#;
+        const MALFORMED: &str = r#"{"payload":{"value":1,}}"#;
+        const DUPLICATE: &str = r#"{"payload":{"value":1,"\u0076alue":2}}"#;
+        let original = JsonRpcRequest::notification_with_raw_params(
+            "notifications/source",
+            VALID.to_owned(),
+            VALID.len(),
+        )
+        .unwrap();
+        let original_wire = serde_json::to_string(&original).unwrap();
+        for (source, limit, expected) in [
+            (
+                MALFORMED,
+                MALFORMED.len(),
+                RawJsonAdmissionError::InvalidSyntax,
+            ),
+            (
+                DUPLICATE,
+                DUPLICATE.len(),
+                RawJsonAdmissionError::DuplicateObjectMember,
+            ),
+            (
+                VALID,
+                VALID.len() - 1,
+                RawJsonAdmissionError::DocumentTooLarge,
+            ),
+        ] {
+            assert!(matches!(
+                JsonRpcRequest::notification_with_raw_params(
+                    "notifications/source",
+                    source.to_owned(),
+                    limit,
+                ),
+                Err(JsonRpcAdmissionError::Raw(error)) if error == expected
+            ));
+            assert_eq!(serde_json::to_string(&original).unwrap(), original_wire);
+            let sibling = JsonRpcRequest::notification_with_raw_params(
+                "notifications/source",
+                VALID.to_owned(),
+                VALID.len(),
+            )
+            .expect("valid sibling remains admissible at its exact byte bound");
+            assert_eq!(serde_json::to_string(&sibling).unwrap(), original_wire);
+            let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(&serde_json::to_string(&sibling).unwrap()).unwrap();
+            assert_eq!(raw["params"].get(), VALID);
+        }
     }
 
     #[test]
