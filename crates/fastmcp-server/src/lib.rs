@@ -15749,7 +15749,8 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback(&request_ctx, &admission_request)
+                        self.dispatch_extension_fallback_async(&request_ctx, &admission_request)
+                            .await
                     }
                     result => result,
                 }
@@ -27817,6 +27818,99 @@ mod lib_unit_tests {
             discovery["capabilities"]["extensions"]["io.modelcontextprotocol/tasks"],
             serde_json::json!({})
         );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn modern_extension_stateless_dispatch_awaits_async_handler() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let mut descriptors = ExtensionDescriptorRegistry::new();
+        let tasks_id = register_official_tasks_extension(&mut descriptors).unwrap();
+        let mut handlers = ExtensionHandlerRegistry::new(descriptors);
+        let handler_calls = Arc::clone(&calls);
+        let handler_polls = Arc::clone(&polls);
+        handlers
+            .register_async(
+                tasks_id.clone(),
+                "tasks/get",
+                move |context: &McpContext, request: serde_json::Value| {
+                    let calls = Arc::clone(&handler_calls);
+                    let polls = Arc::clone(&handler_polls);
+                    Box::pin(async move {
+                        assert_eq!(context.request_id(), 71);
+                        assert!(context.cx().blocking_pool_handle().is_none());
+                        context.checkpoint()?;
+                        let mut yielded = false;
+                        std::future::poll_fn(|task| {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            if yielded {
+                                std::task::Poll::Ready(())
+                            } else {
+                                yielded = true;
+                                task.waker().wake_by_ref();
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await;
+                        context.checkpoint()?;
+                        let value = request["value"]
+                            .as_u64()
+                            .ok_or_else(|| McpError::invalid_params("missing value"))?;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(serde_json::json!({"next": value + 1}))
+                    })
+                },
+            )
+            .unwrap();
+        let server = Server::new("async-stateless-extension", "1.0.0")
+            .extension_registry(
+                handlers,
+                ServerExtensionDiscovery {
+                    extensions: BTreeMap::from([(tasks_id, official_tasks_empty_settings())]),
+                },
+                |_descriptor: &fastmcp_protocol::ExtensionDescriptor,
+                 _client: &ExtensionSettings,
+                 _server: &ExtensionSettings|
+                 -> Result<ExtensionSettings, ExtensionNegotiationError> {
+                    Ok(official_tasks_empty_settings())
+                },
+            )
+            .unwrap()
+            .build();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller-owned runtime installs its context");
+            let inbound = InboundRequestContext::new(cx, 71, InboundRequestTransport::Memory);
+            let request = extension_tasks_get_request(serde_json::json!({}));
+            let response = server
+                .dispatch_stateless(&inbound, &request)
+                .await
+                .expect("request returns a response after the handler yields");
+            assert!(response.error.is_none(), "{response:?}");
+            assert_eq!(response.result, Some(serde_json::json!({"next": 42})));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+
+            let mut omitted = request;
+            omitted.params.as_mut().unwrap()["_meta"]
+                ["io.modelcontextprotocol/clientCapabilities"] = serde_json::json!({});
+            let rejected = server
+                .dispatch_stateless(&inbound, &omitted)
+                .await
+                .expect("omitted capability returns an error response");
+            assert_eq!(
+                rejected.error.unwrap().code,
+                i32::from(McpErrorCode::InvalidParams).into()
+            );
+            assert!(rejected.result.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(feature = "tasks")]
