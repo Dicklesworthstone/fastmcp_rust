@@ -19192,7 +19192,7 @@ mod tests {
                         error,
                         crate::HttpClientError::Connection(ClientHttpConnectionError::Modern(
                             ModernHttpClientError::Negotiation(
-                                ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly
+                                crate::ClientHttpNegotiationError::ModernProbeForbiddenForLegacyOnly
                             )
                         ))
                     ));
