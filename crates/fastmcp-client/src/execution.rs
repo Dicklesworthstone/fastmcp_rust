@@ -2249,9 +2249,9 @@ where
                 return Err(error);
             }
         };
-        let (raw_result, raw_progress_params) = match source {
+        let (raw_result, raw_progress_params) = match source.as_deref() {
             Some(source) => {
-                let raw_result = match exact_result_source_from_admitted_frame(&message, &source) {
+                let raw_result = match exact_result_source_from_admitted_frame(&message, source) {
                     Ok(raw_result) => raw_result,
                     Err(error) => {
                         state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
@@ -2259,7 +2259,7 @@ where
                     }
                 };
                 let raw_progress_params =
-                    match progress_params_source_from_admitted_frame(&message, &source) {
+                    match progress_params_source_from_admitted_frame(&message, source) {
                         Ok(raw_progress_params) => raw_progress_params,
                         Err(error) => {
                             state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
@@ -2270,7 +2270,15 @@ where
             }
             None => (None, None),
         };
-        self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
+        self.route_inbound_message_locked(
+            cx,
+            &mut state,
+            message,
+            raw_result,
+            raw_progress_params,
+            #[cfg(feature = "tasks")]
+            source.as_deref(),
+        )
     }
 
     /// Drives one source-preserving peer frame through the correlation registry.
@@ -2307,7 +2315,15 @@ where
                     return Err(error);
                 }
             };
-        self.route_inbound_message_locked(cx, &mut state, message, raw_result, raw_progress_params)
+        self.route_inbound_message_locked(
+            cx,
+            &mut state,
+            message,
+            raw_result,
+            raw_progress_params,
+            #[cfg(feature = "tasks")]
+            Some(&source),
+        )
     }
 
     fn claim_ingress_owner_locked(
@@ -2350,6 +2366,7 @@ where
         message: JsonRpcMessage,
         raw_result: Option<String>,
         raw_progress_params: Option<String>,
+        #[cfg(feature = "tasks")] source: Option<&[u8]>,
     ) -> McpResult<()> {
         if message.validate().is_err() {
             let error = McpError::invalid_request("Peer sent an invalid JSON-RPC message");
@@ -2386,7 +2403,8 @@ where
                     #[cfg(feature = "tasks")]
                     let handled = self
                         .route_task_subscription_acknowledgement_locked(state, &request)?
-                        || self.route_task_subscription_notification_locked(state, &request)?
+                        || self
+                            .route_task_subscription_notification_locked(state, &request, source)?
                         || self.route_stream_notification_locked(
                             state,
                             &request,
@@ -3657,6 +3675,7 @@ where
         &self,
         state: &mut ExecutorState<T>,
         notification: &JsonRpcRequest,
+        source: Option<&[u8]>,
     ) -> McpResult<bool> {
         if notification.id.is_some()
             || notification.method != TASK_STATUS_NOTIFICATION
@@ -3664,14 +3683,19 @@ where
         {
             return Ok(false);
         }
-        let Some(params) = notification.params.clone() else {
+        let Some(params) = notification.params.as_ref() else {
             return Ok(false);
         };
-        let task_notification: TaskStatusNotification = serde_json::from_value(serde_json::json!({
-            "jsonrpc": fastmcp_protocol::JSONRPC_VERSION,
-            "method": TASK_STATUS_NOTIFICATION,
-            "params": params,
-        }))
+        // Native ingress carries the same admitted source as the typed frame.
+        // Reconstructing it from params would lose the completed result bytes.
+        let task_notification: TaskStatusNotification = match source {
+            Some(source) => serde_json::from_slice(source),
+            None => serde_json::from_value(serde_json::json!({
+                "jsonrpc": fastmcp_protocol::JSONRPC_VERSION,
+                "method": TASK_STATUS_NOTIFICATION,
+                "params": params,
+            })),
+        }
         .map_err(|_| McpError::invalid_request("Tasks subscription event is invalid"))?;
         let Some(subscription_id) = task_notification
             .params
@@ -8661,6 +8685,197 @@ mod tests {
         assert_eq!(executor.state.borrow().transport.sent.len(), 2);
         assert_eq!(executor.terminal_records().len(), 0);
         assert_eq!(executor.take_cancellation_events().len(), 0);
+    }
+
+    #[cfg(feature = "tasks")]
+    enum TaskNotificationSourceMutation {
+        MalformedResult,
+        ForeignOwner,
+        WrongTask,
+    }
+
+    #[cfg(feature = "tasks")]
+    fn assert_task_subscription_completed_source(mutation: Option<TaskNotificationSourceMutation>) {
+        const RESULT: &str = r#"{"x-first":1.20e+4,"content":[],"x-zero":-0,"escaped\/key":"quoted \u0022 value","x-last":123456789012345678901234567890}"#;
+        let source = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":73}},"taskId":"task-73","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{RESULT},"diagnostic":{{"opaque":true}}}}}}"#
+        );
+        let frame = |source: &str| {
+            ReceivedTransportFrame::admit(source.as_bytes().to_vec().into_boxed_slice())
+                .expect("the control is a bounded, valid JSON-RPC notification")
+        };
+        let cx = Cx::for_testing();
+        let task_id = TaskId::parse("task-73").unwrap();
+        let executor = RequestExecutor::with_result_peer_era(
+            ScriptedTransport::new([]),
+            ResultPeerEra::Modern,
+        );
+        let mut subscription = executor
+            .execute_tasks_subscription(&cx, tasks_subscription_request(73, &task_id))
+            .unwrap();
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(tasks_subscription_acknowledgement(73, &task_id)),
+            )
+            .unwrap();
+        let before_pending = executor.pending_records();
+        let before_filter = serde_json::to_value(
+            executor
+                .tasks_subscription_acknowledgement(&subscription)
+                .unwrap(),
+        )
+        .unwrap();
+
+        if let Some(mutation) = mutation {
+            let (changed, expected_error) = match mutation {
+                TaskNotificationSourceMutation::MalformedResult => (
+                    source.replace(r#""content":[]"#, r#""content":{}"#),
+                    Some("Tasks subscription event is invalid"),
+                ),
+                TaskNotificationSourceMutation::ForeignOwner => (
+                    source.replace(
+                        r#""io.modelcontextprotocol/subscriptionId":73"#,
+                        r#""io.modelcontextprotocol/subscriptionId":74"#,
+                    ),
+                    None,
+                ),
+                TaskNotificationSourceMutation::WrongTask => (
+                    source.replace(r#""taskId":"task-73""#, r#""taskId":"task-74""#),
+                    Some("Tasks subscription event taskId is outside the acknowledged filter"),
+                ),
+            };
+            let routed = executor.drive_frame(&cx, frame(&changed));
+            if let Some(message) = expected_error {
+                let error = routed.expect_err("the invalid owned Task event must be refused");
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert_eq!(error.message, message);
+                assert!(executor.take_notifications().is_empty());
+            } else {
+                routed.expect("an unowned event remains unrelated notification traffic");
+                let unowned = executor.take_notifications();
+                assert_eq!(unowned.len(), 1);
+                assert_eq!(unowned[0].method, TASK_STATUS_NOTIFICATION);
+                assert_eq!(
+                    unowned[0].params.as_ref().unwrap()["_meta"][FINAL_SUBSCRIPTION_ID_META_KEY],
+                    serde_json::json!(74)
+                );
+            }
+            assert_eq!(
+                executor.pending_records(),
+                before_pending,
+                "a rejected or foreign event must not renew the owned deadline"
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    executor
+                        .tasks_subscription_acknowledgement(&subscription)
+                        .unwrap(),
+                )
+                .unwrap(),
+                before_filter
+            );
+            assert!(
+                executor
+                    .take_tasks_subscription_notifications(&subscription)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+            assert!(executor.terminal_records().is_empty());
+            assert!(executor.take_cancellation_events().is_empty());
+        }
+
+        executor
+            .drive_frame(&cx, frame(&source))
+            .expect("the original matching event remains admissible after the control");
+        let notifications = executor
+            .take_tasks_subscription_notifications(&subscription)
+            .unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert_eq!(notifications[0].params.task.base().task_id, task_id);
+        let Task::Completed { result, .. } = &notifications[0].params.task else {
+            panic!("the owned event must retain its completed Task branch");
+        };
+        assert_eq!(
+            serde_json::to_string(result).unwrap(),
+            RESULT,
+            "admitted frame source must retain result member order, escapes, and number lexemes"
+        );
+        assert_eq!(
+            notifications[0].params.additional["diagnostic"],
+            serde_json::json!({"opaque": true})
+        );
+        let after_pending = executor.pending_records();
+        assert_eq!(after_pending.len(), 1);
+        assert_eq!(
+            after_pending[0].absolute_deadline,
+            before_pending[0].absolute_deadline
+        );
+        assert_eq!(
+            serde_json::to_value(
+                executor
+                    .tasks_subscription_acknowledgement(&subscription)
+                    .unwrap(),
+            )
+            .unwrap(),
+            before_filter
+        );
+        assert!(executor.take_notifications().is_empty());
+        executor
+            .drive_frame(
+                &cx,
+                source_frame(response(
+                    73,
+                    serde_json::json!({
+                        "resultType": "complete",
+                        "_meta": {"io.modelcontextprotocol/subscriptionId": 73},
+                    }),
+                )),
+            )
+            .unwrap();
+        let accepted = executor
+            .try_take_tasks_subscription_terminal(&mut subscription)
+            .unwrap()
+            .expect("the matching owner consumes its terminal response");
+        assert_eq!(
+            task_subscription_ids(&accepted).unwrap(),
+            Some(vec![task_id])
+        );
+        assert!(executor.pending_records().is_empty());
+        assert!(executor.state.borrow().task_subscriptions.is_empty());
+        assert_eq!(executor.state.borrow().transport.sent.len(), 1);
+        assert!(executor.terminal_records().is_empty());
+        assert!(executor.take_cancellation_events().is_empty());
+        assert!(cx.checkpoint().is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_subscription_preserves_exact_completed_result_source() {
+        assert_task_subscription_completed_source(None);
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_subscription_rejects_malformed_result_without_mutation() {
+        assert_task_subscription_completed_source(Some(
+            TaskNotificationSourceMutation::MalformedResult,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_subscription_foreign_owner_preserves_owned_state() {
+        assert_task_subscription_completed_source(Some(
+            TaskNotificationSourceMutation::ForeignOwner,
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "tasks")]
+    fn unit_task_01_executor_subscription_wrong_task_preserves_owned_state() {
+        assert_task_subscription_completed_source(Some(TaskNotificationSourceMutation::WrongTask));
     }
 
     #[test]

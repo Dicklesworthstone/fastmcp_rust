@@ -156,15 +156,42 @@ fn shared_discovery_and_get_admission_enforce_the_remaining_aggregate_byte() {
 #[test]
 fn opaque_peer_intervals_lengthen_local_minimum_without_overflow_or_shortening() {
     let now = Time::from_nanos(5_000_000_000);
-    for (hint, nanos) in [(None, 1_000_000_000), (Some("1"), 1_000_000_000),
-        (Some("2500"), 2_500_000_000), (Some("2.5e3"), 2_500_000_000)] {
-        assert_eq!(next_poll_time(now, &working(hint), Duration::from_secs(1)).unwrap(),
-            now.saturating_add_nanos(nanos));
+    for (hint, nanos) in [
+        (None, 1_000_000_000),
+        (Some("1"), 1_000_000_000),
+        (Some("2500"), 2_500_000_000),
+        (Some("2.5e3"), 2_500_000_000),
+    ] {
+        assert_eq!(
+            next_poll_time(now, &working(hint), Duration::from_secs(1)).unwrap(),
+            now.saturating_add_nanos(nanos)
+        );
     }
-    assert_eq!(next_poll_time(now, &working(Some("18446744073709551615")),
-        Duration::from_secs(1)).unwrap(), Time::from_nanos(u64::MAX));
-    assert!(matches!(next_poll_time(now, &working(Some("18446744073709551616")),
-        Duration::from_secs(1)), Err(DpopTaskWaitError::InvalidPollInterval)));
+    assert_eq!(
+        next_poll_time(
+            now,
+            &working(Some("18446744073709551615")),
+            Duration::from_secs(1)
+        )
+        .unwrap(),
+        Time::from_nanos(u64::MAX)
+    );
+    let accepted = working(Some("18446744073709551615"));
+    let accepted_wire = serde_json::to_string(&accepted).unwrap();
+    let overflow_wire = accepted_wire.replace(
+        r#""pollIntervalMs":18446744073709551615"#,
+        r#""pollIntervalMs":18446744073709551616"#,
+    );
+    assert_ne!(overflow_wire, accepted_wire);
+    assert!(
+        serde_json::from_str::<Task>(&overflow_wire).is_err(),
+        "the composed duration profile rejects overflow before a Task can reach the wait driver"
+    );
+    assert_eq!(serde_json::to_string(&accepted).unwrap(), accepted_wire);
+    assert_eq!(
+        next_poll_time(now, &accepted, Duration::from_secs(1)).unwrap(),
+        Time::from_nanos(u64::MAX)
+    );
 }
 
 fn environment() -> (Runtime, Cx, TimerDriverHandle, Arc<VirtualClock>, DpopHttpClient, DpopCredential) {

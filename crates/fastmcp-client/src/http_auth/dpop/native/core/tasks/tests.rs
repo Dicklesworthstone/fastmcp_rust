@@ -107,18 +107,73 @@ fn preparation_stamps_both_requests_and_preserves_method_owned_arguments() {
 
 #[test]
 fn input_answers_require_the_observed_ledger_before_discovery() {
-    assert!(Prepared::new(TARGET, metadata(), operation(update()), ManagedCoreLimits::default(), 8192).is_ok());
-    for answers in [json!({"other":{"roots":[]}}), json!({"roots":{"action":"accept"}})] {
-        let request = ManagedTaskRequest::Update { task: Box::new(input_task()),
-            input_responses: serde_json::from_value(answers).unwrap() };
-        assert!(matches!(Prepared::new(TARGET, metadata(), operation(request), ManagedCoreLimits::default(), 8192),
-            Err(DpopTasksError::Task(ManagedTasksError::InvalidInputResponses))));
+    assert!(
+        Prepared::new(
+            TARGET,
+            metadata(),
+            operation(update()),
+            ManagedCoreLimits::default(),
+            8192
+        )
+        .is_ok()
+    );
+    for answers in [
+        json!({"other":{"roots":[]}}),
+        json!({"roots":{"roots":[]},"other":{"action":"accept"}}),
+    ] {
+        let request = ManagedTaskRequest::Update {
+            task: Box::new(input_task()),
+            input_responses: serde_json::from_value(answers.clone()).unwrap(),
+        };
+        let prepared = Prepared::new(
+            TARGET,
+            metadata(),
+            operation(request),
+            ManagedCoreLimits::default(),
+            8192,
+        )
+        .expect("unknown or already satisfied keys do not invalidate outstanding answers");
+        let body: Value = serde_json::from_slice(prepared.operation_wire.body()).unwrap();
+        assert_eq!(body["method"], TASK_UPDATE);
+        assert_eq!(body["params"]["taskId"], "task-one");
+        assert_eq!(body["params"]["inputResponses"], answers);
+    }
+    for answers in [
+        json!({"roots":{"action":"accept"}}),
+        json!({"roots":{"action":"accept"},"other":{"roots":[]}}),
+    ] {
+        let request = ManagedTaskRequest::Update {
+            task: Box::new(input_task()),
+            input_responses: serde_json::from_value(answers).unwrap(),
+        };
+        assert!(matches!(
+            Prepared::new(
+                TARGET,
+                metadata(),
+                operation(request),
+                ManagedCoreLimits::default(),
+                8192
+            ),
+            Err(DpopTasksError::Task(
+                ManagedTasksError::InvalidInputResponses
+            ))
+        ));
     }
     let working: Task = serde_json::from_str(&format!("{{{TASK_FIELDS}}}")).unwrap();
-    let request = ManagedTaskRequest::Update { task: Box::new(working),
-        input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap() };
-    assert!(matches!(Prepared::new(TARGET, metadata(), operation(request), ManagedCoreLimits::default(), 8192),
-        Err(DpopTasksError::Task(ManagedTasksError::UpdateRequiresInput))));
+    let request = ManagedTaskRequest::Update {
+        task: Box::new(working),
+        input_responses: serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap(),
+    };
+    assert!(matches!(
+        Prepared::new(
+            TARGET,
+            metadata(),
+            operation(request),
+            ManagedCoreLimits::default(),
+            8192
+        ),
+        Err(DpopTasksError::Task(ManagedTasksError::UpdateRequiresInput))
+    ));
 }
 
 #[test]

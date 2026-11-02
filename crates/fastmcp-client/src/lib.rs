@@ -9434,14 +9434,18 @@ where
                                 "WebSocket subscription received a Tasks event without an acknowledged Tasks filter",
                             ).await),
                         };
-                        let task_notification = match serde_json::to_value(request)
-                            .and_then(serde_json::from_value::<FinalTaskStatusNotification>)
-                        {
-                            Ok(notification) => notification,
-                            Err(_) => return Err(self.close_after_protocol_error(cx,
-                                "WebSocket subscription received an invalid Tasks event",
-                            ).await),
-                        };
+                        let task_notification =
+                            match serde_json::from_slice::<FinalTaskStatusNotification>(
+                                frame.source(),
+                            ) {
+                                Ok(notification) => notification,
+                                Err(_) => return Err(self
+                                    .close_after_protocol_error(
+                                        cx,
+                                        "WebSocket subscription received an invalid Tasks event",
+                                    )
+                                    .await),
+                            };
                         let subscription_id = task_notification
                             .params
                             .meta
@@ -10218,10 +10222,8 @@ where
         let Some(subscription) = self.live_task_subscription.as_mut() else {
             return Ok(false);
         };
-        let task_notification = serde_json::from_value::<FinalTaskStatusNotification>(
-            serde_json::to_value(request).map_err(|_| {
-                McpError::invalid_request("WebSocket subscription received an invalid Tasks event")
-            })?,
+        let task_notification = serde_json::from_slice::<FinalTaskStatusNotification>(
+            frame.source(),
         )
         .map_err(|_| {
             McpError::invalid_request("WebSocket subscription received an invalid Tasks event")
@@ -23074,22 +23076,17 @@ impl Client {
                                 ));
                         }
                     };
-                    let notification: FinalTaskStatusNotification = match serde_json::from_value(
-                        serde_json::to_value(&request).map_err(|error| {
-                            McpError::internal_error(format!(
-                                "Failed to inspect Tasks subscription event: {error}"
-                            ))
-                        })?,
-                    ) {
-                        Ok(notification) => notification,
-                        Err(_) => {
-                            return Err(self.terminate_connection(
-                                subscription_listener_protocol_error(
-                                    "Subscription listener received an invalid Tasks event",
-                                ),
-                            ));
-                        }
-                    };
+                    let notification: FinalTaskStatusNotification =
+                        match serde_json::from_slice(frame.source()) {
+                            Ok(notification) => notification,
+                            Err(_) => {
+                                return Err(self.terminate_connection(
+                                    subscription_listener_protocol_error(
+                                        "Subscription listener received an invalid Tasks event",
+                                    ),
+                                ));
+                            }
+                        };
                     let subscription_id = notification
                         .params
                         .meta
@@ -32870,15 +32867,51 @@ exec sleep 2
             let cx = Cx::current().expect("test runtime installs caller context");
             for response_id in ["2", "2.0", "2e0"] {
                 let (client_io, mut peer_io) = async_websocket_pair();
-                write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1e0")).await;
+                let filter = SubscriptionFilter {
+                    tools_list_changed: Some(true),
+                    ..SubscriptionFilter::default()
+                };
+                #[cfg(feature = "tasks")]
+                let filter = {
+                    let mut filter = filter;
+                    fastmcp_protocol::set_task_subscription_ids(
+                        &mut filter,
+                        vec![FinalTaskId::parse("task-73").unwrap()],
+                    )
+                    .unwrap();
+                    filter
+                };
+                let discovery = raw_modern_discovery_source("1e0");
+                #[cfg(feature = "tasks")]
+                let discovery = discovery.replace(
+                    r#""capabilities":{}"#,
+                    r#""capabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}}"#,
+                );
+                write_server_text_frame(&mut peer_io, &discovery).await;
                 write_server_text_frame(
                     &mut peer_io,
-                    r#"{"jsonrpc":"2.0","method":"notifications/subscriptions/acknowledged","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2},"notifications":{"toolsListChanged":true}}}"#,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/subscriptions/acknowledged",
+                        "params": {
+                            "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                            "notifications": filter,
+                        },
+                    })
+                    .to_string(),
                 )
                 .await;
                 write_server_text_frame(
                     &mut peer_io,
                     r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2}}}"#,
+                )
+                .await;
+                #[cfg(feature = "tasks")]
+                write_server_text_frame(
+                    &mut peer_io,
+                    &format!(
+                        r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"taskId":"task-73","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null,"result":{TASK_SUBSCRIPTION_COLLECTOR_RESULT}}}}}"#
+                    ),
                 )
                 .await;
                 write_server_text_frame(
@@ -32897,17 +32930,24 @@ exec sleep 2
                 )
                 .await
                 .expect("modern client connects before subscription");
-                let collector = client
-                    .listen_subscriptions_typed(
-                        &cx,
-                        SubscriptionFilter {
-                            tools_list_changed: Some(true),
-                            ..SubscriptionFilter::default()
-                        },
-                    )
-                    .await
-                    .expect("typed subscription retains its admitted stream for every numeric ID spelling");
+                let collector = client.listen_subscriptions_typed(&cx, filter).await.expect(
+                    "typed subscription retains its admitted stream for every numeric ID spelling",
+                );
                 assert_eq!(collector.notifications.len(), 1);
+                assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
+                #[cfg(feature = "tasks")]
+                {
+                    assert_eq!(collector.task_notifications.len(), 1);
+                    let notification = &collector.task_notifications[0];
+                    assert_eq!(notification.params.task.base().task_id.as_str(), "task-73");
+                    let FinalTask::Completed { result, .. } = &notification.params.task else {
+                        panic!("the collector must preserve the completed Task branch");
+                    };
+                    assert_eq!(
+                        serde_json::to_string(result).unwrap(),
+                        TASK_SUBSCRIPTION_COLLECTOR_RESULT
+                    );
+                }
                 client.close(&cx).await.expect("close subscription client");
             }
         });
@@ -54065,6 +54105,9 @@ while IFS= read -r unexpected; do exit 31; done
         )
     }
 
+    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    const TASK_SUBSCRIPTION_COLLECTOR_RESULT: &str = r#"{"x-first":1.20e+4,"content":[],"x-zero":-0,"escaped\/key":"quoted \u0022 value","x-last":123456789012345678901234567890}"#;
+
     #[cfg(unix)]
     #[cfg(feature = "tasks")]
     fn modern_tasks_subscriptions_listen_client_script(
@@ -54081,6 +54124,9 @@ while IFS= read -r unexpected; do exit 31; done
         let task_notification = format!(
             r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"taskId":"{notification_task_id}","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null}}}}"#
         );
+        let completed_notification = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"_meta":{{"io.modelcontextprotocol/subscriptionId":2}},"taskId":"{notification_task_id}","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null,"result":{TASK_SUBSCRIPTION_COLLECTOR_RESULT}}}}}"#
+        );
         format!(
             "IFS= read -r first || exit 1; \
              case \"$first\" in *server/discover*io.modelcontextprotocol/protocolVersion*2026-07-28*) \
@@ -54093,6 +54139,7 @@ while IFS= read -r unexpected; do exit 31; done
              case \"$request\" in *'\"extensions\":{{\"io.modelcontextprotocol/tasks\":{{}}}}'*) ;; *) exit 1 ;; esac; \
              printf '%s\\n' '{acknowledgement}'; \
              printf '%s\\n' '{task_notification}'; \
+             printf '%s\\n' '{completed_notification}'; \
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":2}}}}}}'"
         )
     }
@@ -59398,10 +59445,26 @@ exec sleep 2
             .expect("negotiated Tasks event remains request-owned and typed");
         assert_eq!(collector.accepted_filter.tools_list_changed, Some(true));
         assert!(collector.notifications.is_empty());
-        assert_eq!(collector.task_notifications.len(), 1);
+        assert_eq!(collector.task_notifications.len(), 2);
         assert_eq!(
             collector.task_notifications[0].params.task.base().task_id,
             task_id
+        );
+        assert!(matches!(
+            &collector.task_notifications[0].params.task,
+            FinalTask::Working(_)
+        ));
+        assert_eq!(
+            collector.task_notifications[1].params.task.base().task_id,
+            task_id
+        );
+        let FinalTask::Completed { result, .. } = &collector.task_notifications[1].params.task
+        else {
+            panic!("the collector must retain the completed event after its working event");
+        };
+        assert_eq!(
+            serde_json::to_string(result).unwrap(),
+            TASK_SUBSCRIPTION_COLLECTOR_RESULT
         );
         client.close().expect("modern Tasks client cleanup");
     }

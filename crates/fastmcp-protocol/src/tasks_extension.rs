@@ -1504,20 +1504,13 @@ impl Serialize for TaskStatusNotification {
     where
         S: Serializer,
     {
-        let mut members = Map::new();
-        members.insert(
-            "jsonrpc".to_owned(),
-            Value::String(JSONRPC_VERSION.to_owned()),
-        );
-        members.insert(
-            "method".to_owned(),
-            Value::String(TASK_STATUS_NOTIFICATION.to_owned()),
-        );
-        members.insert(
-            "params".to_owned(),
-            serde_json::to_value(&self.params).map_err(serde::ser::Error::custom)?,
-        );
-        Value::Object(members).serialize(serializer)
+        let mut members = serializer.serialize_map(Some(3))?;
+        members.serialize_entry("jsonrpc", JSONRPC_VERSION)?;
+        members.serialize_entry("method", TASK_STATUS_NOTIFICATION)?;
+        // Serialize the typed params directly: completed results retain their
+        // admitted member order, escapes, and numeric spellings as RawValue.
+        members.serialize_entry("params", &self.params)?;
+        members.end()
     }
 }
 
@@ -1975,6 +1968,61 @@ mod tests {
         let mut null_status_message = wire;
         null_status_message["statusMessage"] = Value::Null;
         assert!(serde_json::from_value::<GetTaskResult>(null_status_message).is_err());
+    }
+
+    #[test]
+    fn task_status_notification_preserves_exact_completed_result_and_rejects_malformed_result() {
+        const RESULT: &str = r#"{"x-first":1.20e+4,"content":[],"x-zero":-0,"escaped\/key":"quoted \u0022 value","x-last":123456789012345678901234567890}"#;
+        let wire = format!(
+            r#"{{"jsonrpc":"2.0","method":"notifications/tasks","params":{{"taskId":"task-1","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"result":{RESULT},"_meta":{{"io.modelcontextprotocol/subscriptionId":73}},"x-notification":{{"preserved":true}}}}}}"#
+        );
+        let notification: TaskStatusNotification =
+            serde_json::from_str(&wire).expect("completed notification admits its exact source");
+        let Task::Completed { result, .. } = &notification.params.task else {
+            panic!("the completed notification must retain its result");
+        };
+        assert_eq!(serde_json::to_string(result).unwrap(), RESULT);
+
+        #[derive(Deserialize)]
+        struct RawNotification {
+            params: RawParams,
+        }
+        #[derive(Deserialize)]
+        struct RawParams {
+            result: Box<RawValue>,
+        }
+        let encoded = serde_json::to_string(&notification).expect("notification serializes");
+        let raw: RawNotification = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            raw.params.result.get(),
+            RESULT,
+            "the notification envelope must not reorder or normalize its nested result"
+        );
+        let round_trip: TaskStatusNotification = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            round_trip
+                .params
+                .meta
+                .as_ref()
+                .unwrap()
+                .get("io.modelcontextprotocol/subscriptionId"),
+            Some(&serde_json::json!(73))
+        );
+        assert_eq!(
+            round_trip.params.additional["x-notification"],
+            serde_json::json!({"preserved": true})
+        );
+
+        let malformed = wire.replace(r#""content":[]"#, r#""content":{}"#);
+        assert!(
+            serde_json::from_str::<TaskStatusNotification>(&malformed).is_err(),
+            "changing only the known result content kind must reject the notification"
+        );
+        assert_eq!(
+            serde_json::to_string(&notification).unwrap(),
+            encoded,
+            "rejecting malformed content must not mutate the accepted notification"
+        );
     }
 
     #[test]

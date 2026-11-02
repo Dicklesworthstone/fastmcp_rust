@@ -1918,7 +1918,7 @@ mod tests {
                 "echo",
                 json!({"type":"object","properties":{
                     "region":{"type":"string","x-mcp-header":"Region"},
-                    "count":{"type":"number","x-mcp-header":"Count"},
+                    "count":{"type":"integer","x-mcp-header":"Count"},
                     "enabled":{"type":"boolean","x-mcp-header":"Enabled"},
                     "secret":{"type":"string","writeOnly":true}
                 }}),
