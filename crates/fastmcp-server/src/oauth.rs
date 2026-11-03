@@ -4842,7 +4842,7 @@ impl OAuthServer {
         }
         Ok(DevelopmentAccessTokenIntrospection {
             active: true,
-            scope: Some(stored.scopes.join(" ")),
+            scope: (!stored.scopes.is_empty()).then(|| stored.scopes.join(" ")),
             client_id: Some(stored.client_id.clone()),
             token_type: Some(stored.token_type.as_str()),
             sub: stored.subject.clone(),
@@ -5975,6 +5975,21 @@ mod tests {
             serde_json::to_value(development_introspect(&server, &unbound.access_token)).unwrap(),
             serde_json::json!({ "active": false })
         );
+        let (code, _) = server
+            .authorize(&AuthorizationRequest {
+                resource: Some(TEST_MCP_RESOURCE.to_owned()),
+                ..bounded_authorization_request("introspection-token-client")
+            })
+            .unwrap();
+        let scope_free = server
+            .token(&resource_code_exchange_request(
+                "introspection-token-client", &code, TEST_MCP_RESOURCE,
+            ))
+            .unwrap();
+        let scope_free = development_introspect(&server, &scope_free.access_token);
+        assert!(scope_free.is_active());
+        assert!(scope_free.scope().is_none());
+        assert!(serde_json::to_value(scope_free).unwrap().get("scope").is_none());
         assert!(development_introspect(&server, &issued.access_token).is_active());
     }
 

@@ -767,3 +767,280 @@ fn private_key_login_composes_with_typed_tasks_and_subscriptions() {
         PrivateCase::Tasks,
     );
 }
+
+
+mod logout {
+    use super::*;
+    use fastmcp_client::http_auth::discovery::client_credentials::ClientCredentialsRemoteRevocation as RemoteRevocation;
+    use fastmcp_client::http_auth::discovery::client_credentials::private_key_jwt::RevocationAssertionAudience;
+
+    fn run_logout<F: Future<Output = ()>>(scenario: impl FnOnce(Cx) -> F) {
+        RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                asupersync::time::timeout_at(
+                    cx.now().saturating_add_nanos(30_000_000_000),
+                    Box::pin(scenario(cx)),
+                )
+                .await
+                .expect("native JWT logout must settle within its finite bound");
+            });
+    }
+
+    fn plan(
+        peer: &Peer,
+        signer: Arc<ExternalRs256Signer>,
+        grant_audience: ClientAssertionAudience,
+        revoke_audience: Option<RevocationAssertionAudience>,
+    ) -> ClientCredentialsPlan {
+        let mut registration = registration(peer, &signer, grant_audience);
+        if let Some(audience) = revoke_audience {
+            registration = registration
+                .with_trusted_revocation(format!("{}/revoke", peer.origin()), audience)
+                .unwrap();
+        }
+        let root = Certificate::from_pem(ROOT).unwrap().remove(0);
+        let issuer = TrustedOAuthIssuer::new(peer.issuer())
+            .unwrap()
+            .with_root_certificate(root.clone())
+            .unwrap();
+        ClientCredentialsPlan::private_key_jwt(
+            issuer,
+            registration,
+            signer,
+            vec!["read".to_owned()],
+        )
+        .unwrap()
+        .with_resource_root_certificate(root)
+        .unwrap()
+        .with_timeout(Duration::from_secs(15))
+        .unwrap()
+        .with_renewal_leeway(Duration::ZERO)
+        .unwrap()
+    }
+
+    fn metadata(peer: &Peer) -> Value {
+        let mut document = issuer_document(peer);
+        document["revocation_endpoint"] = json!(format!("{}/revoke", peer.origin()));
+        document["revocation_endpoint_auth_methods_supported"] = json!(["private_key_jwt"]);
+        document["revocation_endpoint_auth_signing_alg_values_supported"] = json!(["RS256"]);
+        document
+    }
+
+    async fn receive_revocation(
+        peer: &Peer,
+        signer: &ExternalRs256Signer,
+        audience: RevocationAssertionAudience,
+    ) -> (TlsStream<TcpStream>, String) {
+        let (tls, start, headers, bytes) = peer.request().await;
+        assert_eq!(start, "POST /revoke HTTP/1.1");
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("cookie") && !headers.contains_key("referer"));
+        assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
+        assert_eq!(headers["accept-encoding"], "identity");
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let fields = form(body);
+        assert_eq!(body.split('&').count(), fields.len());
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields["token"], "access-one");
+        assert_eq!(fields["token_type_hint"], "access_token");
+        assert_eq!(fields["client_assertion_type"], JWT_BEARER_ASSERTION_TYPE);
+        assert!(!fields.contains_key("client_id") && !fields.contains_key("client_secret"));
+        assert!(!fields.contains_key("grant_type") && !fields.contains_key("resource"));
+        let assertion = &fields["client_assertion"];
+        assert_eq!(assertion.split('.').next().unwrap(), HEADER);
+        let keys =
+            AdmittedRsaJwks::from_json(signer.canonical_public_jwks().unwrap().as_bytes()).unwrap();
+        let verified = verify_compact_jws_rs256(assertion, &keys).unwrap();
+        assert_eq!(verified.header().kid(), KID);
+        let claims = verified.claims();
+        assert_eq!(claims.as_object().unwrap().len(), 6);
+        assert_eq!(claims["iss"], "service-client");
+        assert_eq!(claims["sub"], "service-client");
+        let expected = match audience {
+            RevocationAssertionAudience::Issuer => peer.issuer(),
+            RevocationAssertionAudience::RevocationEndpoint => {
+                format!("{}/revoke", peer.origin())
+            }
+        };
+        assert_eq!(claims["aud"], expected);
+        let issued = claims["iat"].as_u64().unwrap();
+        let expiry = claims["exp"].as_u64().unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert!(issued <= now && expiry > now && expiry - issued <= 60);
+        let jti = claims["jti"].as_str().unwrap().to_owned();
+        assert_eq!(jti.len(), 64);
+        assert!(jti.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        (tls, jti)
+    }
+
+    #[test]
+    fn private_key_logout_uses_fresh_assertions_and_an_independent_exact_audience() {
+        for (grant_audience, revoke_audience) in [
+            (
+                ClientAssertionAudience::TokenEndpoint,
+                RevocationAssertionAudience::Issuer,
+            ),
+            (
+                ClientAssertionAudience::Issuer,
+                RevocationAssertionAudience::RevocationEndpoint,
+            ),
+        ] {
+            run_logout(|cx| async move {
+                let peer = Peer::new().await;
+                let (backend, signer) = TestSigner::create();
+                let plan = plan(&peer, signer.clone(), grant_audience, Some(revoke_audience));
+                let good = metadata(&peer);
+                let mut wrong = good.clone();
+                wrong["revocation_endpoint"] = json!(format!("{}/other", peer.origin()));
+                let ((), refused) =
+                    Box::pin(pair(serve_metadata(&peer, &wrong), plan.discover(&cx))).await;
+                assert!(matches!(refused, Err(Error::InvalidRegistration)));
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+                peer.quiet();
+
+                let ((), client) =
+                    Box::pin(pair(serve_metadata(&peer, &good), plan.discover(&cx))).await;
+                let client = client.unwrap();
+                let (grant_jti, generation) =
+                    Box::pin(acquire_jwt(&peer, &signer, grant_audience, &client, &cx, 300)).await;
+                assert_eq!(generation, 1);
+                let snapshot = client.credential(&cx).await.unwrap();
+                let extracted = snapshot.credential().clone();
+                let clone = client.clone();
+                let server = async {
+                    let (mut tls, jti) =
+                        receive_revocation(&peer, &signer, revoke_audience).await;
+                    assert!(snapshot.credential().is_revoked() && extracted.is_revoked());
+                    assert!(matches!(clone.credential(&cx).await, Err(Error::Closed)));
+                    tls.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                    tls.shutdown().await.unwrap();
+                    jti
+                };
+                let (revoke_jti, report) = Box::pin(pair(server, client.logout(&cx))).await;
+                assert_ne!(grant_jti, revoke_jti);
+                let report = report.unwrap();
+                assert!(report.local_closed());
+                assert_eq!(report.remote(), RemoteRevocation::Acknowledged);
+                assert!(matches!(clone.logout(&cx).await, Err(Error::Closed)));
+                assert_eq!(extracted.authorization_for_target(client.resource()), None);
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(backend.in_flight.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+                peer.quiet();
+            });
+        }
+    }
+
+    #[test]
+    fn private_key_logout_does_not_inherit_method_algorithm_or_registration_authority() {
+        for case in 0..3 {
+            run_logout(|cx| async move {
+                let peer = Peer::new().await;
+                let (backend, signer) = TestSigner::create();
+                let audience = ClientAssertionAudience::Issuer;
+                let revoke_audience = (case != 0)
+                    .then_some(RevocationAssertionAudience::RevocationEndpoint);
+                let plan = plan(&peer, signer.clone(), audience, revoke_audience);
+                let mut document = metadata(&peer);
+                if case == 1 {
+                    document
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("revocation_endpoint_auth_methods_supported");
+                }
+                if case == 2 {
+                    document["revocation_endpoint_auth_signing_alg_values_supported"] =
+                        json!(["ES256"]);
+                }
+                let ((), client) =
+                    Box::pin(pair(serve_metadata(&peer, &document), plan.discover(&cx))).await;
+                let client = client.unwrap();
+                Box::pin(acquire_jwt(&peer, &signer, audience, &client, &cx, 300)).await;
+                let snapshot = client.credential(&cx).await.unwrap();
+                let report = client.logout(&cx).await.unwrap();
+                assert!(report.local_closed());
+                assert_eq!(
+                    report.remote(),
+                    if case == 0 {
+                        RemoteRevocation::RegistrationUnavailable
+                    } else {
+                        RemoteRevocation::AuthenticationUnavailable
+                    }
+                );
+                assert!(snapshot.credential().is_revoked());
+                assert!(matches!(client.credential(&cx).await, Err(Error::Closed)));
+                assert!(matches!(client.logout(&cx).await, Err(Error::Closed)));
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                peer.quiet();
+            });
+        }
+    }
+
+    #[test]
+    fn private_key_logout_signer_failure_cancellation_and_drop_never_fall_back_or_reopen() {
+        for mode in [1, 2, 3, 5, 6, 7] {
+            run_logout(|cx| async move {
+                let peer = Peer::new().await;
+                let (backend, signer) = TestSigner::create();
+                let audience = ClientAssertionAudience::Issuer;
+                let plan = plan(
+                    &peer,
+                    signer.clone(),
+                    audience,
+                    Some(RevocationAssertionAudience::RevocationEndpoint),
+                );
+                let document = metadata(&peer);
+                let ((), client) =
+                    Box::pin(pair(serve_metadata(&peer, &document), plan.discover(&cx))).await;
+                let client = client.unwrap();
+                Box::pin(acquire_jwt(&peer, &signer, audience, &client, &cx, 300)).await;
+                let snapshot = client.credential(&cx).await.unwrap();
+                backend.mode.store(if mode >= 6 { 4 } else { mode }, Ordering::SeqCst);
+                if mode < 6 {
+                    let report = client.logout(&cx).await.unwrap();
+                    assert!(report.local_closed());
+                    assert_eq!(report.remote(), RemoteRevocation::Failed);
+                } else {
+                    let cancellation = McpRequestCancellation::new();
+                    let mut pending =
+                        Box::pin(client.logout_with_cancellation(&cx, &cancellation));
+                    poll_fn(|task| {
+                        assert!(pending.as_mut().poll(task).is_pending());
+                        if backend.in_flight.load(Ordering::SeqCst) == 1 {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    if mode == 7 {
+                        drop(pending);
+                    } else {
+                        cancellation.cancel();
+                        let report = pending.await.unwrap();
+                        assert!(report.local_closed());
+                        assert_eq!(report.remote(), RemoteRevocation::Cancelled);
+                    }
+                }
+                assert!(snapshot.credential().is_revoked());
+                assert!(matches!(client.credential(&cx).await, Err(Error::Closed)));
+                assert!(matches!(client.logout(&cx).await, Err(Error::Closed)));
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(backend.in_flight.load(Ordering::SeqCst), 0);
+                assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+                peer.quiet();
+            });
+        }
+    }
+}

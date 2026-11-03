@@ -48,6 +48,19 @@ pub enum ClientAssertionAudience {
     TokenEndpoint,
 }
 
+/// Separate out-of-band audience agreement for RFC 7009 authentication.
+/// Selecting a token-grant audience never selects a revocation audience.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevocationAssertionAudience {
+    Issuer,
+    RevocationEndpoint,
+}
+
+struct RevocationRegistration {
+    endpoint: String,
+    audience: RevocationAssertionAudience,
+}
+
 /// An immutable, finite-lived operator import, NOT an attestation receipt.
 /// The JSON document contains `issuer`, `token_endpoint`, `resource`,
 /// `client_id`, `grant_types`, `token_endpoint_auth_method`,
@@ -64,6 +77,7 @@ pub struct PrivateKeyJwtRegistration {
     generation: u64,
     valid_until: Instant,
     audience: ClientAssertionAudience,
+    revocation: Option<RevocationRegistration>,
 }
 
 #[derive(Deserialize)]
@@ -148,7 +162,31 @@ impl PrivateKeyJwtRegistration {
             generation,
             valid_until,
             audience,
+            revocation: None,
         })
+    }
+
+    /// Imports an additional, independently agreed revocation endpoint and
+    /// assertion audience for this exact registration/key generation. This is
+    /// operator-trusted policy, not a value inferred from issuer discovery.
+    /// The discovered endpoint must later match these bytes exactly. Its
+    /// private-key method and RS256 advertisement are checked independently
+    /// from token-endpoint metadata. No new registration lifetime is granted.
+    pub fn with_trusted_revocation(
+        mut self,
+        revocation_endpoint: impl Into<String>,
+        audience: RevocationAssertionAudience,
+    ) -> Result<Self, ClientCredentialsError> {
+        let revocation_endpoint = revocation_endpoint.into();
+        let _ = endpoint(&revocation_endpoint)?;
+        if self.revocation.is_some() || Instant::now() >= self.valid_until {
+            return Err(ClientCredentialsError::InvalidRegistration);
+        }
+        self.revocation = Some(RevocationRegistration {
+            endpoint: revocation_endpoint,
+            audience,
+        });
+        Ok(self)
     }
 
     pub fn generation(&self) -> u64 {
@@ -275,6 +313,91 @@ impl PrivateKeyJwtAuthentication {
         if client_id != self.registration.client_id || resource != &self.registration.resource {
             return Err(ClientCredentialsError::InvalidRegistration);
         }
+        let (assertion, assertion_deadline) = self
+            .assertion(cx, deadline, self.registration.audience())
+            .await?;
+        let body = form(&[
+            ("grant_type", "client_credentials"),
+            ("resource", resource.as_str()),
+            ("scope", &scopes.join(" ")),
+            ("client_assertion_type", JWT_BEARER_ASSERTION_TYPE),
+            ("client_assertion", &assertion),
+        ])
+        .into_bytes();
+        if body.len() > super::MAX_TOKEN_BYTES {
+            return Err(ClientCredentialsError::RequestTooLarge);
+        }
+        // Pinned draft: sub carries client identity. No form client_id, secret,
+        // Authorization header, caller-supplied JOSE field or compact assertion.
+        Ok(PreparedMachineGrant {
+            body,
+            authorization: None,
+            deadline: assertion_deadline,
+        })
+    }
+
+    pub(super) fn admits_revocation(
+        &self,
+        endpoint: &str,
+    ) -> Result<bool, ClientCredentialsError> {
+        self.check()?;
+        let Some(registered) = &self.registration.revocation else {
+            return Ok(false);
+        };
+        if registered.endpoint != endpoint {
+            return Err(ClientCredentialsError::InvalidRegistration);
+        }
+        Ok(true)
+    }
+
+    pub(super) async fn prepare_revocation(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+        endpoint: &CanonicalHttpUrl,
+        token: &str,
+    ) -> Result<PreparedMachineGrant, ClientCredentialsError> {
+        self.check()?;
+        let registered = self
+            .registration
+            .revocation
+            .as_ref()
+            .ok_or(ClientCredentialsError::InvalidRegistration)?;
+        // Discovery compared exact metadata bytes. Canonical endpoint equality
+        // here confirms transport routing without rewriting the signed audience.
+        if CanonicalHttpUrl::parse(&registered.endpoint).ok().as_ref() != Some(endpoint) {
+            return Err(ClientCredentialsError::InvalidRegistration);
+        }
+        let audience = match registered.audience {
+            RevocationAssertionAudience::Issuer => self.registration.issuer.as_str(),
+            RevocationAssertionAudience::RevocationEndpoint => registered.endpoint.as_str(),
+        };
+        let (assertion, assertion_deadline) = self.assertion(cx, deadline, audience).await?;
+        let body = form(&[
+            ("token", token),
+            ("token_type_hint", "access_token"),
+            ("client_assertion_type", JWT_BEARER_ASSERTION_TYPE),
+            ("client_assertion", &assertion),
+        ])
+        .into_bytes();
+        if body.len() > super::MAX_TOKEN_BYTES {
+            return Err(ClientCredentialsError::RequestTooLarge);
+        }
+        Ok(PreparedMachineGrant {
+            body,
+            authorization: None,
+            deadline: assertion_deadline,
+        })
+    }
+
+    async fn assertion(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+        audience: &str,
+    ) -> Result<(String, Time), ClientCredentialsError> {
+        self.check()?;
+        check_context(cx, deadline)?;
         let started = SystemTime::now();
         let issued_at = started
             .duration_since(UNIX_EPOCH)
@@ -319,7 +442,7 @@ impl PrivateKeyJwtAuthentication {
                 out
             });
         let claims = BoundedJwsClaims::from_value(&json!({
-            "iss": client_id, "sub": client_id, "aud": self.registration.audience(),
+            "iss": self.registration.client_id, "sub": self.registration.client_id, "aud": audience,
             "iat": issued_at, "exp": expires_at, "jti": jti,
         }))
         .map_err(|_| ClientCredentialsError::AssertionSigning)?;
@@ -338,25 +461,7 @@ impl PrivateKeyJwtAuthentication {
         if SystemTime::now() >= wall_expiry || candidate.binding() != self.registration.binding {
             return Err(ClientCredentialsError::AssertionSigning);
         }
-        let assertion = candidate.into_compact_jws();
-        let body = form(&[
-            ("grant_type", "client_credentials"),
-            ("resource", resource.as_str()),
-            ("scope", &scopes.join(" ")),
-            ("client_assertion_type", JWT_BEARER_ASSERTION_TYPE),
-            ("client_assertion", &assertion),
-        ])
-        .into_bytes();
-        if body.len() > super::MAX_TOKEN_BYTES {
-            return Err(ClientCredentialsError::RequestTooLarge);
-        }
-        // Pinned draft: sub carries client identity. No form client_id, secret,
-        // Authorization header, caller-supplied JOSE field or compact assertion.
-        Ok(PreparedMachineGrant {
-            body,
-            authorization: None,
-            deadline: assertion_deadline,
-        })
+        Ok((candidate.into_compact_jws(), assertion_deadline))
     }
 }
 
@@ -379,6 +484,9 @@ impl ClientCredentialsPlan {
             return Err(ClientCredentialsError::InvalidRegistration);
         }
         issuer.endpoint(&registration.token_endpoint)?;
+        if let Some(revocation) = &registration.revocation {
+            issuer.endpoint(&revocation.endpoint)?;
+        }
         let discovery = OAuthDiscoveryPlan::new(
             registration.resource.clone(),
             vec![issuer],

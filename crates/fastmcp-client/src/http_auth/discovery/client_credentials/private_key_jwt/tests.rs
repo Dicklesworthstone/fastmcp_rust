@@ -291,3 +291,169 @@ fn selecting_basic_does_not_silently_switch_methods_when_both_are_advertised() {
     ));
     assert_eq!(basic.authentication.method(), "client_secret_basic");
 }
+
+
+#[test]
+fn revocation_registration_keeps_audience_and_exact_endpoint_separate_from_token_auth() {
+    let (signer, backend) = signer(0xa1, binding());
+    let document = document(&signer);
+    for audience in [
+        RevocationAssertionAudience::Issuer,
+        RevocationAssertionAudience::RevocationEndpoint,
+    ] {
+        let registered = registration(&document, ClientAssertionAudience::TokenEndpoint)
+            .unwrap()
+            .with_trusted_revocation("https://ISSUER.example:443/revoke", audience)
+            .unwrap();
+        assert_eq!(registered.audience(), "https://issuer.example/token");
+        assert_eq!(registered.revocation.as_ref().unwrap().audience, audience);
+        assert_eq!(registered.revocation.as_ref().unwrap().endpoint, "https://ISSUER.example:443/revoke");
+        let selected = PrivateKeyJwtAuthentication::new(registered, signer.clone()).unwrap();
+        assert!(selected.admits_revocation("https://ISSUER.example:443/revoke").unwrap());
+        assert!(matches!(
+            selected.admits_revocation("https://issuer.example/revoke"),
+            Err(ClientCredentialsError::InvalidRegistration)
+        ));
+    }
+    for endpoint in [
+        "http://issuer.example/revoke",
+        "https://issuer.example/revoke?token=x",
+        "https://issuer.example/revoke#fragment",
+        "https://user@issuer.example/revoke",
+    ] {
+        assert!(registration(&document, ClientAssertionAudience::Issuer).unwrap()
+            .with_trusted_revocation(endpoint, RevocationAssertionAudience::Issuer).is_err());
+    }
+    let registered = registration(&document, ClientAssertionAudience::Issuer).unwrap()
+        .with_trusted_revocation("https://issuer.example/revoke", RevocationAssertionAudience::Issuer)
+        .unwrap();
+    assert!(registered.with_trusted_revocation(
+        "https://issuer.example/revoke", RevocationAssertionAudience::RevocationEndpoint,
+    ).is_err());
+    assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn revocation_jwt_metadata_requires_its_own_method_algorithm_and_registration() {
+    use super::super::lifetime::{RevocationTarget, admit_revocation};
+    let (signer, backend) = signer(0xa1, binding());
+    let registered = registration(&document(&signer), ClientAssertionAudience::TokenEndpoint)
+        .unwrap()
+        .with_trusted_revocation(
+            "https://issuer.example/revoke", RevocationAssertionAudience::RevocationEndpoint,
+        ).unwrap();
+    let plan = ClientCredentialsPlan::private_key_jwt(
+        TrustedOAuthIssuer::new("https://issuer.example").unwrap(),
+        registered, signer.clone(), vec!["read".to_owned()],
+    ).unwrap();
+    let good = serde_json::json!({
+        "revocation_endpoint":"https://issuer.example/revoke",
+        "revocation_endpoint_auth_methods_supported":["private_key_jwt"],
+        "revocation_endpoint_auth_signing_alg_values_supported":["RS256"]
+    });
+    let admit = |value: &Value| admit_revocation(
+        &plan.discovery.issuers[0], &serde_json::to_vec(value).unwrap(), &plan.authentication,
+    );
+    assert!(matches!(admit(&good), Ok(RevocationTarget::Endpoint(_))));
+    let mut default_basic = good.clone();
+    default_basic.as_object_mut().unwrap().remove("revocation_endpoint_auth_methods_supported");
+    assert!(matches!(admit(&default_basic), Ok(RevocationTarget::AuthenticationUnavailable)));
+    let mut unsupported = good.clone();
+    unsupported["revocation_endpoint_auth_signing_alg_values_supported"] = json!(["ES256"]);
+    assert!(matches!(admit(&unsupported), Ok(RevocationTarget::AuthenticationUnavailable)));
+    let mut absent = good.clone();
+    absent.as_object_mut().unwrap().remove("revocation_endpoint_auth_signing_alg_values_supported");
+    assert!(admit(&absent).is_err());
+    let missing_registration = self::plan(&document(&signer), signer).unwrap();
+    assert!(matches!(
+        admit_revocation(
+            &missing_registration.discovery.issuers[0],
+            &serde_json::to_vec(&good).unwrap(),
+            &missing_registration.authentication,
+        ),
+        Ok(RevocationTarget::RegistrationUnavailable)
+    ));
+    assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn expired_private_key_registration_refuses_logout_before_closure_or_custody_transfer() {
+    use super::super::{
+        ClientCredentialsClient, ClientCredentialsRemoteRevocation, ClientInner, ServiceToken,
+        TokenState,
+    };
+    use crate::http_auth::BoundBearerCredential;
+    use asupersync::sync::Mutex;
+    use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use fastmcp_core::McpRequestCancellation;
+    use std::task::{Context, Poll, Waker};
+
+    for expired in [false, true] {
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0).with_timer_driver(timer).build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (signer, backend) = signer(0xa1, binding());
+        let mut plan = plan(&document(&signer), signer).unwrap();
+        if expired {
+            let MachineAuthentication::PrivateKeyJwt(selected) = &mut plan.authentication else {
+                panic!("private-key registration required");
+            };
+            Arc::get_mut(selected).unwrap().registration.valid_until = Instant::now();
+        }
+        let closed = McpRequestCancellation::new();
+        let expires_at = Instant::now() + Duration::from_secs(60);
+        let bearer = BoundBearerCredential::bind_with_expiry(
+            plan.discovery.resource.clone(), "cached-access", expires_at,
+        ).unwrap().for_owner(&closed).unwrap();
+        let client = ClientCredentialsClient {
+            inner: Arc::new(ClientInner {
+                resource: plan.discovery.resource,
+                token_endpoint: CanonicalHttpUrl::parse("https://issuer.example/token").unwrap(),
+                client_id: "registered-service".to_owned(),
+                scopes: vec!["read".to_owned()],
+                authentication: plan.authentication,
+                issuer_roots: vec![],
+                resource_tls: None,
+                timeout: Duration::from_secs(10),
+                maximum_lifetime: Duration::from_secs(60),
+                leeway: Duration::ZERO,
+                closed,
+                pending: AtomicUsize::new(0),
+                state: Arc::new(Mutex::new(TokenState {
+                    current: Some(ServiceToken {
+                        bearer: bearer.clone(),
+                        scopes: vec!["read".to_owned()],
+                        expires_at,
+                        renew_after: expires_at,
+                    }),
+                    generation: 1,
+                    ..TokenState::default()
+                })),
+            }),
+        };
+        let mut logout = Box::pin(client.logout(&cx));
+        let mut task = Context::from_waker(Waker::noop());
+        match (expired, logout.as_mut().poll(&mut task)) {
+            (true, Poll::Ready(Err(ClientCredentialsError::InvalidRegistration))) => {
+                assert!(!client.inner.closed.is_cancel_requested());
+                assert!(!bearer.is_revoked());
+                assert!(client.inner.state.try_lock_owned().unwrap().current.is_some());
+            }
+            (false, Poll::Ready(Ok(report))) => {
+                assert_eq!(report.remote(), ClientCredentialsRemoteRevocation::EndpointUnavailable);
+                assert!(client.inner.closed.is_cancel_requested());
+                assert!(bearer.is_revoked());
+                assert!(client.inner.state.try_lock_owned().unwrap().current.is_none());
+            }
+            _ => panic!("registration preflight must precede every logout effect"),
+        }
+        drop(logout);
+        assert_eq!(backend.0.load(Ordering::SeqCst), 0);
+        client.close();
+        drop(client);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+}

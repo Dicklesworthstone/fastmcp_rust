@@ -18,7 +18,7 @@ use asupersync::net::{TcpListener, TcpStream};
 use asupersync::tls::{
     Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder, TlsStream,
 };
-use fastmcp_client::http_auth::discovery::TrustedOAuthIssuer;
+use fastmcp_client::http_auth::discovery::{OAuthDiscoveryError, TrustedOAuthIssuer};
 use fastmcp_client::http_auth::discovery::client_credentials::rpc::{
     ClientCredentialsCoreError, ManagedCoreEvent, ManagedCoreLimits,
 };
@@ -28,11 +28,13 @@ use fastmcp_client::http_auth::discovery::client_credentials::subscriptions::{
 };
 use fastmcp_client::http_auth::discovery::client_credentials::{
     CLIENT_CREDENTIALS_EXTENSION, ClientCredentialsClient, ClientCredentialsError as Error,
-    ClientCredentialsPlan, ClientCredentialsSnapshot, ClientSecretAuthenticationMethod,
+    ClientCredentialsPlan, ClientCredentialsRemoteRevocation as RemoteRevocation,
+    ClientCredentialsSnapshot, ClientSecretAuthenticationMethod,
 };
 use fastmcp_client::http_auth::rpc::ManagedCoreError;
 use fastmcp_client::http_auth::{BoundBearerCredential, CanonicalHttpUrl};
 use fastmcp_client::sse::SseLimits;
+use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     ClientCapabilities, CoreRequest, FinalRequestMeta, RequestId, SubscriptionFilter,
@@ -331,6 +333,9 @@ impl Peer {
         (socket, request, headers, bytes[end..].to_vec())
     }
     async fn metadata(&self) {
+        self.metadata_with_revocation(&json!({})).await;
+    }
+    async fn metadata_with_revocation(&self, additional: &Value) {
         let (mut socket, head, headers, body) = self.request().await;
         assert!(head.starts_with("GET /.well-known/oauth-protected-resource/mcp "));
         assert!(!headers.contains_key("authorization") && body.is_empty());
@@ -339,8 +344,12 @@ impl Peer {
         let (mut socket, head, headers, body) = self.request().await;
         assert!(head.starts_with("GET /.well-known/oauth-authorization-server/issuer "));
         assert!(!headers.contains_key("authorization") && body.is_empty());
-        json_reply(&mut socket, &json!({"issuer":format!("{}/issuer",self.origin()),"token_endpoint":format!("{}/token",self.origin()),
-            "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post"],"scopes_supported":["read"]}).to_string()).await;
+        let mut document = json!({"issuer":format!("{}/issuer",self.origin()),"token_endpoint":format!("{}/token",self.origin()),
+            "grant_types_supported":["client_credentials"],"token_endpoint_auth_methods_supported":["client_secret_basic","client_secret_post"],"scopes_supported":["read"]});
+        for (name, value) in additional.as_object().unwrap() {
+            document[name] = value.clone();
+        }
+        json_reply(&mut socket, &document.to_string()).await;
     }
     async fn grant_request(
         &self,
@@ -391,6 +400,54 @@ impl Peer {
             (client, snapshot)
         };
         Box::pin(pair(server, application)).await.1
+    }
+    async fn connect_revocation(
+        &self,
+        cx: &Cx,
+        method: ClientSecretAuthenticationMethod,
+        additional: &Value,
+        lifetime: Duration,
+    ) -> (ClientCredentialsClient, ClientCredentialsSnapshot) {
+        let server = async {
+            self.metadata_with_revocation(additional).await;
+            self.grant(method, ACCESS).await;
+        };
+        let application = async {
+            let client = self.plan(lifetime, method).discover(cx).await.unwrap();
+            let snapshot = client.credential(cx).await.unwrap();
+            (client, snapshot)
+        };
+        Box::pin(pair(server, application)).await.1
+    }
+    async fn revocation_request(
+        &self,
+        method: ClientSecretAuthenticationMethod,
+        token: &str,
+    ) -> TlsStream<TcpStream> {
+        let (socket, head, headers, body) = self.request().await;
+        assert_eq!(head, "POST /revoke HTTP/1.1");
+        assert_eq!(headers["content-type"], "application/x-www-form-urlencoded");
+        assert_eq!(headers["accept-encoding"], "identity");
+        assert!(!headers.contains_key("cookie") && !headers.contains_key("referer"));
+        let fields = form(&body);
+        assert_eq!(fields["token"], token);
+        assert_eq!(fields["token_type_hint"], "access_token");
+        assert!(!fields.contains_key("resource") && !fields.contains_key("scope"));
+        assert!(!fields.contains_key("grant_type") && !fields.contains_key("refresh_token"));
+        match method {
+            ClientSecretAuthenticationMethod::Basic => {
+                assert_eq!(headers["authorization"], BASIC);
+                assert_eq!(fields.len(), 2);
+            }
+            ClientSecretAuthenticationMethod::Post => {
+                assert!(!headers.contains_key("authorization"));
+                assert_eq!(fields["client_id"], "service-client");
+                assert_eq!(fields["client_secret"], "service-secret");
+                assert_eq!(fields.len(), 4);
+            }
+        }
+        assert_eq!(body.split(|byte| *byte == b'&').count(), fields.len());
+        socket
     }
     async fn rpc(&self, method: &str, token: &str, tasks: bool) -> (TlsStream<TcpStream>, Value) {
         let (socket, head, headers, body) = self.request().await;
@@ -891,6 +948,292 @@ fn ordinary_machine_expiry_still_renews_and_old_revocation_does_not_cancel_the_n
         assert_eq!(peer.grants.load(Ordering::SeqCst), 2);
         assert_eq!(peer.rpcs.load(Ordering::SeqCst), 2);
         client.close();
+        peer.quiet();
+    });
+}
+
+fn revocation_metadata(peer: &Peer, method: Option<&str>) -> Value {
+    let mut metadata = json!({"revocation_endpoint":format!("{}/revoke", peer.origin())});
+    if let Some(method) = method {
+        metadata["revocation_endpoint_auth_methods_supported"] = json!([method]);
+    }
+    metadata
+}
+
+#[test]
+fn machine_logout_uses_exact_password_authentication_and_accepts_basic_metadata_default() {
+    for (method, advertised) in [
+        (ClientSecretAuthenticationMethod::Basic, None),
+        (ClientSecretAuthenticationMethod::Basic, Some("client_secret_basic")),
+        (ClientSecretAuthenticationMethod::Post, Some("client_secret_post")),
+    ] {
+        run(|cx| async move {
+            let peer = Peer::new().await;
+            let metadata = revocation_metadata(&peer, advertised);
+            let (client, snapshot) = Box::pin(peer.connect_revocation(
+                &cx, method, &metadata, Duration::from_secs(120),
+            )).await;
+            let clone = client.clone();
+            let extracted = snapshot.credential().clone();
+            let server = async {
+                let mut socket = peer.revocation_request(method, ACCESS).await;
+                assert!(snapshot.credential().is_revoked() && extracted.is_revoked());
+                assert!(matches!(clone.credential(&cx).await, Err(Error::Closed)));
+                // RFC 7009 makes content inert, even when it resembles an error.
+                let body = r#"{"error":"ignored-peer-canary"}"#;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            };
+            let ((), report) = Box::pin(pair(server, client.logout(&cx))).await;
+            let report = report.unwrap();
+            assert!(report.local_closed());
+            assert_eq!(report.remote(), RemoteRevocation::Acknowledged);
+            assert!(!format!("{report:?}").contains("ignored-peer-canary"));
+            assert_eq!(extracted.authorization_for_target(client.resource()), None);
+            assert!(matches!(clone.logout(&cx).await, Err(Error::Closed)));
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+            assert_eq!(peer.rpcs.load(Ordering::SeqCst), 0);
+            assert!(cx.checkpoint().is_ok());
+            peer.quiet();
+        });
+    }
+}
+
+#[test]
+fn machine_logout_distinguishes_no_token_absent_endpoint_and_unsupported_method() {
+    for case in 0..3 {
+        run(|cx| async move {
+            let peer = Peer::new().await;
+            let method = if case == 2 { ClientSecretAuthenticationMethod::Post }
+                else { ClientSecretAuthenticationMethod::Basic };
+            let metadata = if case == 1 { json!({}) } else { revocation_metadata(&peer, None) };
+            let plan = peer.plan(Duration::from_secs(120), method);
+            let ((), client) = Box::pin(pair(peer.metadata_with_revocation(&metadata), plan.discover(&cx))).await;
+            let client = client.unwrap();
+            let snapshot = if case == 0 { None } else {
+                Some(Box::pin(pair(peer.grant(method, ACCESS), client.credential(&cx))).await.1.unwrap())
+            };
+            let report = client.logout(&cx).await.unwrap();
+            assert!(report.local_closed());
+            assert_eq!(report.remote(), match case {
+                0 => RemoteRevocation::NoToken,
+                1 => RemoteRevocation::EndpointUnavailable,
+                _ => RemoteRevocation::AuthenticationUnavailable,
+            });
+            if let Some(snapshot) = snapshot {
+                assert!(snapshot.credential().is_revoked());
+                assert_eq!(snapshot.credential().authorization_for_target(client.resource()), None);
+            }
+            assert!(matches!(client.credential(&cx).await, Err(Error::Closed)));
+            assert!(matches!(client.logout(&cx).await, Err(Error::Closed)));
+            assert_eq!(peer.grants.load(Ordering::SeqCst), usize::from(case != 0));
+            peer.quiet();
+        });
+    }
+}
+
+#[test]
+fn machine_logout_precancellation_and_missing_runtime_preserve_cached_authority() {
+    run(|cx| async move {
+        let peer = Peer::new().await;
+        let method = ClientSecretAuthenticationMethod::Basic;
+        let metadata = revocation_metadata(&peer, None);
+        let (client, snapshot) = Box::pin(peer.connect_revocation(
+            &cx, method, &metadata, Duration::from_secs(120),
+        )).await;
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(client.logout_with_cancellation(&cx, &cancellation).await,
+            Err(Error::Discovery(OAuthDiscoveryError::Cancelled))));
+        assert!(matches!(client.logout(&Cx::for_testing()).await,
+            Err(Error::Discovery(OAuthDiscoveryError::RuntimeUnavailable))));
+        drop(client.logout(&cx));
+        assert!(!snapshot.credential().is_revoked());
+        assert!(snapshot.credential().authorization_for_target(client.resource()).is_some());
+        assert_eq!(client.credential(&cx).await.unwrap().generation(), snapshot.generation());
+        peer.quiet();
+        let server = async {
+            let mut socket = peer.revocation_request(method, ACCESS).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        };
+        let ((), report) = Box::pin(pair(server, client.logout(&cx))).await;
+        assert_eq!(report.unwrap().remote(), RemoteRevocation::Acknowledged);
+        assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+        peer.quiet();
+    });
+}
+
+#[test]
+fn machine_logout_status_loss_and_body_bounds_never_restore_or_replay_access() {
+    for status in [204, 400, 307, 503, 0, 200] {
+        run(|cx| async move {
+            let peer = Peer::new().await;
+            let method = ClientSecretAuthenticationMethod::Basic;
+            let metadata = revocation_metadata(&peer, None);
+            let (client, snapshot) = Box::pin(peer.connect_revocation(
+                &cx, method, &metadata, Duration::from_secs(120),
+            )).await;
+            let server = async {
+                let mut socket = peer.revocation_request(method, ACCESS).await;
+                if status != 0 {
+                    let body = if status == 200 { "x".repeat(8192) }
+                        else if status == 204 { String::new() }
+                        else { "ignored-secret-canary".to_owned() };
+                    let redirect = if status == 307 { format!("Location: {}/forbidden\r\n", peer.origin()) } else { String::new() };
+                    let response = format!("HTTP/1.1 {status} Test\r\n{redirect}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    // A body-limit refusal may close while the fixture writes.
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            };
+            let ((), report) = Box::pin(pair(server, client.logout(&cx))).await;
+            let report = report.unwrap();
+            assert!(report.local_closed());
+            assert_eq!(report.remote(), if status == 0 || status == 200 {
+                RemoteRevocation::Uncertain
+            } else { RemoteRevocation::Rejected { status } });
+            assert!(!format!("{report:?}").contains("ignored-secret-canary"));
+            assert!(snapshot.credential().is_revoked());
+            assert!(matches!(client.logout(&cx).await, Err(Error::Closed)));
+            assert!(matches!(client.credential(&cx).await, Err(Error::Closed)));
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+            peer.quiet();
+        });
+    }
+}
+
+#[test]
+fn machine_logout_cancel_and_drop_close_a_quiet_native_exchange_without_replay() {
+    for abandon in [false, true] {
+        run(|cx| async move {
+            let peer = Peer::new().await;
+            let method = ClientSecretAuthenticationMethod::Basic;
+            let metadata = revocation_metadata(&peer, None);
+            let (client, snapshot) = Box::pin(peer.connect_revocation(
+                &cx, method, &metadata, Duration::from_secs(120),
+            )).await;
+            let cancellation = McpRequestCancellation::new();
+            let (ready, mut entered) = oneshot::channel();
+            let server = async {
+                let socket = peer.revocation_request(method, ACCESS).await;
+                ready.send_blocking(()).unwrap();
+                closed(socket).await;
+            };
+            let application = async {
+                let mut logout = Box::pin(client.logout_with_cancellation(&cx, &cancellation));
+                let mut entered = Box::pin(entered.recv(&cx));
+                let mut probe = None;
+                poll_fn(|task| {
+                    let observed = probe.get_or_insert_with(|| Arc::new(WakeProbe {
+                        parent: task.waker().clone(), wakes: AtomicUsize::new(0),
+                    }));
+                    let waker = Waker::from(observed.clone());
+                    assert!(logout.as_mut().poll(&mut Context::from_waker(&waker)).is_pending());
+                    entered.as_mut().poll(task)
+                }).await.unwrap();
+                assert!(snapshot.credential().is_revoked());
+                // A concurrent caller cannot gain another revocation attempt.
+                assert!(matches!(client.clone().logout(&cx).await, Err(Error::Closed)));
+                if abandon { drop(logout); } else {
+                    let probe = probe.unwrap();
+                    let before = probe.wakes.load(Ordering::SeqCst);
+                    cancellation.cancel();
+                    assert!(probe.wakes.load(Ordering::SeqCst) > before,
+                        "quiet exchange must register the logout cancellation wake");
+                    assert_eq!(logout.await.unwrap().remote(), RemoteRevocation::Cancelled);
+                }
+                assert!(matches!(client.credential(&cx).await, Err(Error::Closed)));
+            };
+            Box::pin(pair(server, application)).await;
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 1);
+            assert!(cx.checkpoint().is_ok());
+            peer.quiet();
+        });
+    }
+}
+
+#[test]
+fn machine_logout_interrupts_initial_or_replacement_acquisition_without_publishing_it() {
+    for cached in [false, true] {
+        run(|cx| async move {
+            let peer = Peer::new().await;
+            let method = ClientSecretAuthenticationMethod::Basic;
+            let metadata = revocation_metadata(&peer, None);
+            let plan = peer.plan(Duration::from_secs(1), method);
+            let ((), client) = Box::pin(pair(peer.metadata_with_revocation(&metadata), plan.discover(&cx))).await;
+            let client = client.unwrap();
+            let old = if cached {
+                let ((), snapshot) = Box::pin(pair(peer.grant(method, ACCESS), client.credential(&cx))).await;
+                let snapshot = snapshot.unwrap();
+                asupersync::time::sleep(cx.now(), snapshot.expires_at().saturating_duration_since(Instant::now()) + Duration::from_millis(10)).await;
+                Some(snapshot)
+            } else { None };
+            let (ready, mut entered) = oneshot::channel();
+            let server = async {
+                let socket = peer.grant_request(method).await;
+                ready.send_blocking(()).unwrap();
+                closed(socket).await;
+                if cached {
+                    let mut socket = peer.revocation_request(method, ACCESS).await;
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    socket.shutdown().await.unwrap();
+                }
+            };
+            let application = async {
+                let mut acquiring = Box::pin(client.credential(&cx));
+                let mut entered = Box::pin(entered.recv(&cx));
+                poll_fn(|task| {
+                    assert!(acquiring.as_mut().poll(task).is_pending());
+                    entered.as_mut().poll(task)
+                }).await.unwrap();
+                let (grant, report) = Box::pin(pair(acquiring, client.logout(&cx))).await;
+                assert!(matches!(grant, Err(Error::Closed)));
+                assert_eq!(report.unwrap().remote(), if cached { RemoteRevocation::Acknowledged } else { RemoteRevocation::NoToken });
+                if let Some(snapshot) = old { assert!(snapshot.credential().is_revoked()); }
+                assert!(matches!(client.credential(&cx).await, Err(Error::Closed)));
+            };
+            Box::pin(pair(server, application)).await;
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 1 + usize::from(cached));
+            peer.quiet();
+        });
+    }
+}
+
+#[test]
+fn machine_revocation_discovery_rejects_untrusted_or_malformed_metadata_before_acquisition() {
+    run(|cx| async move {
+        let peer = Peer::new().await;
+        let method = ClientSecretAuthenticationMethod::Basic;
+        let plan = peer.plan(Duration::from_secs(120), method);
+        for (field, value) in [
+            ("revocation_endpoint", json!("http://127.0.0.1/revoke")),
+            ("revocation_endpoint", json!("https://untrusted.example/revoke")),
+            ("revocation_endpoint", Value::Null),
+            ("revocation_endpoint_auth_methods_supported", Value::Null),
+            ("revocation_endpoint_auth_methods_supported", json!(["client_secret_basic", "client_secret_basic"])),
+            ("revocation_endpoint_auth_methods_supported", json!(["private_key_jwt"])),
+            ("revocation_endpoint_auth_signing_alg_values_supported", json!(["none"])),
+        ] {
+            let mut metadata = revocation_metadata(&peer, None);
+            metadata[field] = value;
+            let ((), result) = Box::pin(pair(peer.metadata_with_revocation(&metadata), plan.discover(&cx))).await;
+            assert!(result.is_err());
+            assert_eq!(peer.grants.load(Ordering::SeqCst), 0);
+            peer.quiet();
+        }
+        let metadata = revocation_metadata(&peer, None);
+        let ((), client) = Box::pin(pair(peer.metadata_with_revocation(&metadata), plan.discover(&cx))).await;
+        let client = client.unwrap();
+        let ((), snapshot) = Box::pin(pair(peer.grant(method, ACCESS), client.credential(&cx))).await;
+        assert!(snapshot.is_ok());
+        let server = async {
+            let mut socket = peer.revocation_request(method, ACCESS).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        };
+        let ((), report) = Box::pin(pair(server, client.logout(&cx))).await;
+        assert_eq!(report.unwrap().remote(), RemoteRevocation::Acknowledged);
         peer.quiet();
     });
 }

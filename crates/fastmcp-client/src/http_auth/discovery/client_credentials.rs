@@ -30,6 +30,7 @@ mod acquisition;
 // Observe token-local revocation during both dispatch and replacement grants.
 mod lifetime;
 use lifetime::unless_revoked;
+pub use lifetime::{ClientCredentialsLogoutReport, ClientCredentialsRemoteRevocation};
 
 use std::fmt;
 use std::future::{Future, poll_fn};
@@ -402,6 +403,7 @@ impl ClientCredentialsPlan {
             .await?;
         let token_endpoint =
             admit_machine_issuer(&self.discovery, issuer, &body, &self.authentication)?;
+        let revocation = lifetime::admit_revocation(issuer, &body, &self.authentication)?;
         check_context(cx, deadline)?;
         self.authentication.check()?;
         Ok(ClientCredentialsClient {
@@ -422,7 +424,10 @@ impl ClientCredentialsPlan {
                 leeway: self.leeway,
                 closed: McpRequestCancellation::new(),
                 pending: AtomicUsize::new(0),
-                state: Arc::new(Mutex::new(TokenState::default())),
+                state: Arc::new(Mutex::new(TokenState {
+                    revocation,
+                    ..TokenState::default()
+                })),
             }),
         })
     }
@@ -514,6 +519,8 @@ struct TokenState {
     current: Option<ServiceToken>,
     generation: u64,
     flight: Option<Arc<acquisition::GrantFlight>>,
+    // Selected once by discovery; acquisition never replaces this policy.
+    revocation: lifetime::RevocationTarget,
 }
 struct ServiceToken {
     bearer: BoundBearerCredential,
@@ -583,6 +590,8 @@ impl ClientCredentialsClient {
 
     /// Irreversible local closure, not an issuer revocation request. Old
     /// snapshots withhold new headers. Already-sent bytes cannot be recalled.
+    /// Use [`Self::logout`] to also attempt remote retirement of the retained
+    /// access token before discarding it.
     pub fn close(&self) {
         self.inner.closed.cancel();
         if let Ok(mut state) = self.inner.state.try_lock_owned() {
