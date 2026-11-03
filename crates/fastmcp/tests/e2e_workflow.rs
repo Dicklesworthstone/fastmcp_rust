@@ -3033,7 +3033,9 @@ fn public_final_task_retention_boundary(expire_first: bool) {
                 clock_origin + Duration::from_millis(store_clock.load(Ordering::SeqCst) as u64)
             }),
         )
-        .expect("bounded public store with application-owned retention clock"),
+        .expect("bounded public store with application-owned retention clock")
+        .with_owner_capacity(2, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+        .expect("retention race explicitly admits both tasks for its one owner"),
     );
     let runtime = FinalTaskRuntime::new(
         store.clone(),

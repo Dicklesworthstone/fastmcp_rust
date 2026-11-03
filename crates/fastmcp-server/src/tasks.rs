@@ -2438,6 +2438,11 @@ const FINAL_TASK_CANCELLATION_RESERVE_BYTES: usize =
 /// this reserve. Fixed execution errors fit within the reserved space.
 /// Live task metadata leaves 17 bytes unused within its 1 MiB member ceiling
 /// for the same status/timestamp transition.
+/// Retained count and bytes also have independent per-principal ceilings.
+/// Authenticated tasks use their immutable stored principal fingerprint;
+/// all tasks without a principal share one bounded embedding partition.
+/// Terminal results remain charged until expiry or authorized reclamation.
+/// [`Self::with_owner_capacity`] configures these ceilings before first use.
 /// These are encoded payload bounds, not decoded heap, active application
 /// memory, framework-wide memory, or persistent-storage guarantees.
 pub struct InMemoryFinalTaskStore {
@@ -2503,27 +2508,42 @@ struct InMemoryFinalTaskPayloadCharge {
     initial_work: usize,
     accepted_inputs: usize,
     cancellation_reserve: usize,
+    owner: Option<[u8; 32]>,
 }
 
 struct InMemoryFinalTaskPayloadAdmission {
     total: usize,
     reserved: usize,
+    owner: Option<[u8; 32]>,
+    owner_charge: InMemoryFinalTaskOwnerCharge,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, serde::Serialize)]
+struct InMemoryFinalTaskOwnerCharge {
+    tasks: usize,
+    bytes: usize,
 }
 
 struct InMemoryFinalTaskPayloadAccounting {
     limit: usize,
+    max_tasks_per_owner: usize,
+    max_bytes_per_owner: usize,
     total: usize,
     reserved: usize,
     records: BTreeMap<FinalTaskId, InMemoryFinalTaskPayloadCharge>,
+    owners: BTreeMap<Option<[u8; 32]>, InMemoryFinalTaskOwnerCharge>,
 }
 
 impl Default for InMemoryFinalTaskPayloadAccounting {
     fn default() -> Self {
         Self {
             limit: InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
+            max_tasks_per_owner: InMemoryFinalTaskStore::DEFAULT_MAX_TASKS_PER_OWNER,
+            max_bytes_per_owner: InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
             total: 0,
             reserved: 0,
             records: BTreeMap::new(),
+            owners: BTreeMap::new(),
         }
     }
 }
@@ -2533,8 +2553,38 @@ impl InMemoryFinalTaskPayloadAccounting {
         &self,
         task_id: &FinalTaskId,
         replacement: InMemoryFinalTaskPayloadCharge,
+        principal: Option<Sha256Digest>,
     ) -> McpResult<InMemoryFinalTaskPayloadAdmission> {
         let previous = self.records.get(task_id);
+        let owner = principal.map(Sha256Digest::into_bytes);
+        if previous.is_some_and(|charge| charge.owner != owner) {
+            return Err(McpError::internal_error(
+                "In-memory final task quota owner changed",
+            ));
+        }
+        let owner_before = self.owners.get(&owner).copied().unwrap_or_default();
+        let owner_tasks = owner_before
+            .tasks
+            .checked_add(usize::from(previous.is_none()));
+        let previous_bytes = previous.map_or(Some(0), |charge| {
+            charge.total.checked_add(charge.cancellation_reserve)
+        });
+        let owner_bytes = previous_bytes
+            .and_then(|bytes| owner_before.bytes.checked_sub(bytes))
+            .and_then(|bytes| bytes.checked_add(replacement.total))
+            .and_then(|bytes| bytes.checked_add(replacement.cancellation_reserve));
+        let owner_charge = match owner_tasks.zip(owner_bytes) {
+            Some((tasks, bytes))
+                if tasks <= self.max_tasks_per_owner && bytes <= self.max_bytes_per_owner =>
+            {
+                InMemoryFinalTaskOwnerCharge { tasks, bytes }
+            }
+            _ => {
+                return Err(McpError::invalid_params(
+                    "In-memory final task owner capacity reached",
+                ));
+            }
+        };
         let total = self
             .total
             .checked_sub(previous.map_or(0, |charge| charge.total))
@@ -2549,7 +2599,12 @@ impl InMemoryFinalTaskPayloadAccounting {
                     .checked_add(reserved)
                     .is_some_and(|bytes| bytes <= self.limit) =>
             {
-                Ok(InMemoryFinalTaskPayloadAdmission { total, reserved })
+                Ok(InMemoryFinalTaskPayloadAdmission {
+                    total,
+                    reserved,
+                    owner,
+                    owner_charge,
+                })
             }
             _ => Err(McpError::invalid_params(
                 "In-memory final task payload byte capacity reached",
@@ -2560,10 +2615,12 @@ impl InMemoryFinalTaskPayloadAccounting {
     fn commit(
         &mut self,
         task_id: FinalTaskId,
-        replacement: InMemoryFinalTaskPayloadCharge,
+        mut replacement: InMemoryFinalTaskPayloadCharge,
         admission: InMemoryFinalTaskPayloadAdmission,
     ) {
+        replacement.owner = admission.owner;
         self.records.insert(task_id, replacement);
+        self.owners.insert(admission.owner, admission.owner_charge);
         self.total = admission.total;
         self.reserved = admission.reserved;
     }
@@ -2581,6 +2638,9 @@ impl InMemoryFinalTaskPayloadAccounting {
             }
             charge.total -= released;
             self.total -= released;
+            if let Some(owner) = self.owners.get_mut(&charge.owner) {
+                owner.bytes -= released;
+            }
         }
     }
 
@@ -2588,6 +2648,13 @@ impl InMemoryFinalTaskPayloadAccounting {
         if let Some(charge) = self.records.remove(task_id) {
             self.total -= charge.total;
             self.reserved -= charge.cancellation_reserve;
+            if let Some(owner) = self.owners.get_mut(&charge.owner) {
+                owner.tasks -= 1;
+                owner.bytes -= charge.total + charge.cancellation_reserve;
+                if owner.tasks == 0 {
+                    self.owners.remove(&charge.owner);
+                }
+            }
         }
     }
 }
@@ -2747,6 +2814,7 @@ fn prepare_in_memory_final_task_payload_charge(
         } else {
             0
         },
+        owner: None,
     })
 }
 
@@ -2839,10 +2907,59 @@ const IN_MEMORY_FINAL_TASK_HANDOFF_LEASE: StdDuration = StdDuration::from_secs(3
 const IN_MEMORY_FINAL_TASK_HANDOFF_HEARTBEAT: StdDuration = StdDuration::from_secs(10);
 
 impl InMemoryFinalTaskStore {
+    /// Default maximum retained tasks in one immutable principal partition.
+    pub const DEFAULT_MAX_TASKS_PER_OWNER: usize = 1_024;
+    /// Maximum configurable retained tasks in one principal partition.
+    pub const HARD_MAX_TASKS_PER_OWNER: usize = 16_384;
     /// Default aggregate compact-JSON payload capacity: 64 MiB.
     pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1_024 * 1_024;
     /// Maximum configurable aggregate compact-JSON payload capacity: 512 MiB.
     pub const HARD_MAX_PAYLOAD_BYTES: usize = 512 * 1_024 * 1_024;
+
+    /// Sets immutable retained count and encoded-payload limits per owner.
+    ///
+    /// Both limits must be positive and no larger than the store's deployment
+    /// capacity; the count also cannot exceed 16,384. Defaults are half the
+    /// deployment capacity, rounded down with a floor of one task/byte, capped
+    /// at 1,024 tasks / 64 MiB. The default store therefore permits 512 tasks
+    /// and 32 MiB per owner. A one-task/byte store necessarily shares its full
+    /// capacity with one owner. Payload accounting
+    /// includes the same task/notification/descriptor/input copies as the
+    /// deployment quota, plus reserved mandatory terminal-transition bytes.
+    /// Completion releases execution resources, never retained count or data.
+    ///
+    /// The immutable authenticated principal, not peer metadata or a worker
+    /// lease owner, selects the quota partition. Trusted embedding operations
+    /// without a principal share one partition and cannot evade its ceiling
+    /// by changing Task IDs. This method grants no authorization and must be
+    /// called before the store has ever admitted a task.
+    pub fn with_owner_capacity(
+        mut self,
+        max_tasks_per_owner: usize,
+        max_payload_bytes_per_owner: usize,
+    ) -> McpResult<Self> {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.next_generation != 0 || state.retention_journal.next_sequence != 0 {
+            return Err(McpError::invalid_params(
+                "Task owner capacity requires an unused task store",
+            ));
+        }
+        if max_tasks_per_owner == 0
+            || max_tasks_per_owner > self.max_tasks.min(Self::HARD_MAX_TASKS_PER_OWNER)
+            || max_payload_bytes_per_owner == 0
+            || max_payload_bytes_per_owner > state.payload_accounting.limit
+        {
+            return Err(McpError::invalid_params(
+                "Task owner capacities must be positive and within deployment limits",
+            ));
+        }
+        state.payload_accounting.max_tasks_per_owner = max_tasks_per_owner;
+        state.payload_accounting.max_bytes_per_owner = max_payload_bytes_per_owner;
+        Ok(self)
+    }
 
     /// Configures the separate bounded process-local reclamation journal.
     /// This consumes an empty store, so policy cannot change underneath an
@@ -2938,6 +3055,12 @@ impl InMemoryFinalTaskStore {
             state: Mutex::new(InMemoryFinalTaskState {
                 payload_accounting: InMemoryFinalTaskPayloadAccounting {
                     limit: max_payload_bytes,
+                    max_tasks_per_owner: (max_tasks / 2)
+                        .max(1)
+                        .min(Self::DEFAULT_MAX_TASKS_PER_OWNER),
+                    max_bytes_per_owner: (max_payload_bytes / 2)
+                        .max(1)
+                        .min(Self::DEFAULT_MAX_PAYLOAD_BYTES),
                     ..InMemoryFinalTaskPayloadAccounting::default()
                 },
                 ..InMemoryFinalTaskState::default()
@@ -2953,6 +3076,26 @@ impl InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .payload_accounting
             .limit
+    }
+
+    /// Returns the immutable retained-record ceiling for each owner partition.
+    #[must_use]
+    pub fn max_tasks_per_owner(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .payload_accounting
+            .max_tasks_per_owner
+    }
+
+    /// Returns each owner's encoded-payload ceiling, including terminal reserve.
+    #[must_use]
+    pub fn max_payload_bytes_per_owner(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .payload_accounting
+            .max_bytes_per_owner
     }
 
     /// Returns retained compact-JSON payload bytes after expiry reclamation.
@@ -3042,7 +3185,10 @@ impl InMemoryFinalTaskStore {
             0,
             None,
         )?;
-        let retained_payload_bytes = state.payload_accounting.admit(&task_id, payload_charge)?;
+        let retained_payload_bytes =
+            state
+                .payload_accounting
+                .admit(&task_id, payload_charge, principal)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
         state
             .payload_accounting
@@ -3345,7 +3491,10 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             0,
             input_key_history.as_ref(),
         )?;
-        let retained_payload_bytes = state.payload_accounting.admit(&task_id, payload_charge)?;
+        let retained_payload_bytes =
+            state
+                .payload_accounting
+                .admit(&task_id, payload_charge, None)?;
         let generation = next_in_memory_final_task_generation(&mut state)?;
         state
             .payload_accounting
@@ -4670,7 +4819,11 @@ fn replace_in_memory_final_task(
             .as_ref()
             .or_else(|| state.input_key_history.get(&task_id)),
     )?;
-    let retained_payload_bytes = state.payload_accounting.admit(&task_id, payload_charge)?;
+    let retained_payload_bytes = state.payload_accounting.admit(
+        &task_id,
+        payload_charge,
+        state.authenticated_principals.get(&task_id).copied(),
+    )?;
     let generation = next_in_memory_final_task_generation(state)?;
     state
         .payload_accounting
@@ -9726,7 +9879,12 @@ mod tests {
     }
 
     fn concurrent_task_fixture(concurrency: usize, tasks: usize) -> ConcurrentTaskFixture {
-        let store = Arc::new(InMemoryFinalTaskStore::new(tasks).unwrap());
+        let store = Arc::new(
+            InMemoryFinalTaskStore::new(tasks)
+                .unwrap()
+                .with_owner_capacity(tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                .unwrap(),
+        );
         let task_ids = (0..tasks)
             .map(|index| {
                 let task =
@@ -11956,7 +12114,9 @@ mod tests {
         (
             Arc::new(
                 InMemoryFinalTaskStore::with_clock(max_tasks, clock)
-                    .expect("positive bounded store capacity is valid"),
+                    .expect("positive bounded store capacity is valid")
+                    .with_owner_capacity(max_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                    .expect("the expiry fixture explicitly shares its aggregate capacity"),
             ),
             now,
         )
@@ -11981,6 +12141,9 @@ mod tests {
                 "payloadTotal": state.payload_accounting.total,
                 "payloadReserved": state.payload_accounting.reserved,
                 "payloadLimit": state.payload_accounting.limit,
+                "ownerCountLimit": state.payload_accounting.max_tasks_per_owner,
+                "ownerByteLimit": state.payload_accounting.max_bytes_per_owner,
+                "ownerCharges": state.payload_accounting.owners.iter().collect::<Vec<_>>(),
                 "payloadCharges": state.payload_accounting.records,
                 "workDescriptor": state.work_descriptors.get(task_id).map(FinalTaskWorkDescriptor::as_value),
                 "initialWork": state.initial_work.get(task_id).map(FinalTaskWorkDescriptor::as_value),
@@ -12016,6 +12179,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut total = 0;
         let mut reserved = 0;
+        let mut owners: BTreeMap<Option<[u8; 32]>, InMemoryFinalTaskOwnerCharge> = BTreeMap::new();
         for (task_id, task) in &state.tasks {
             let mut actual = encoded_final_task_test_bytes(task)
                 + encoded_final_task_test_bytes(
@@ -12054,11 +12218,421 @@ mod tests {
             );
             reserved += expected_reserve;
             total += actual;
+            let owner = state.authenticated_principals.get(task_id).copied().map(Sha256Digest::into_bytes);
+            assert_eq!(state.payload_accounting.records[task_id].owner, owner);
+            let owner_charge = owners.entry(owner).or_default();
+            owner_charge.tasks += 1;
+            owner_charge.bytes += actual + expected_reserve;
         }
         assert_eq!(state.payload_accounting.records.len(), state.tasks.len());
         assert_eq!(state.payload_accounting.total, total);
         assert_eq!(state.payload_accounting.reserved, reserved);
         assert!(total + reserved <= state.payload_accounting.limit);
+        assert_eq!(state.payload_accounting.owners, owners);
+        for owner in owners.values() {
+            assert!(owner.tasks <= state.payload_accounting.max_tasks_per_owner);
+            assert!(owner.bytes <= state.payload_accounting.max_bytes_per_owner);
+        }
+    }
+
+    mod owner_quotas {
+        use super::*;
+
+        fn principal(subject: &str, revision: u32) -> Sha256Digest {
+            let mut auth = fastmcp_core::AuthContext::with_subject(subject);
+            auth.scopes = vec![format!("tasks:revision:{revision}")];
+            auth.claims = Some(serde_json::json!({"policy_revision": revision}));
+            task_request_principal(&McpContext::new(Cx::for_testing(), 1).with_auth(auth))
+                .unwrap()
+                .unwrap()
+        }
+
+        fn insert(
+            store: &InMemoryFinalTaskStore,
+            task: FinalTask,
+            owner: Option<Sha256Digest>,
+        ) -> McpResult<FinalTaskSnapshot> {
+            let notification = final_task_notification(&task);
+            match owner {
+                Some(owner) => store.create_task_with_authenticated_work(
+                    task,
+                    notification,
+                    final_test_work_descriptor(),
+                    owner,
+                ),
+                None => {
+                    store.create_task_with_work(task, notification, final_test_work_descriptor())
+                }
+            }
+        }
+
+        fn charge(task: &FinalTask) -> usize {
+            encoded_final_task_test_bytes(task)
+                + encoded_final_task_test_bytes(&final_task_notification(task))
+                + 2 * encoded_final_task_test_bytes(final_test_work_descriptor().as_value())
+                + FINAL_TASK_CANCELLATION_RESERVE_BYTES
+        }
+
+        #[test]
+        fn task_owner_defaults_reserve_capacity_and_configuration_is_immutable() {
+            let store = InMemoryFinalTaskStore::default();
+            assert_eq!(store.max_tasks_per_owner(), 512);
+            assert_eq!(store.max_payload_bytes_per_owner(), 32 * 1_024 * 1_024);
+            let tiny = InMemoryFinalTaskStore::with_payload_capacity(1, 1).unwrap();
+            assert_eq!(tiny.max_tasks_per_owner(), 1);
+            assert_eq!(tiny.max_payload_bytes_per_owner(), 1);
+            for (tasks, bytes) in [(0, 1), (1, 0), (5, 1), (1, 8_193)] {
+                assert!(
+                    InMemoryFinalTaskStore::with_payload_capacity(4, 8_192)
+                        .unwrap()
+                        .with_owner_capacity(tasks, bytes)
+                        .is_err()
+                );
+            }
+            assert!(
+                InMemoryFinalTaskStore::new(20_000)
+                    .unwrap()
+                    .with_owner_capacity(16_385, 1)
+                    .is_err()
+            );
+            let configured = InMemoryFinalTaskStore::with_payload_capacity(4, 8_192)
+                .unwrap()
+                .with_owner_capacity(4, 8_192)
+                .unwrap();
+            assert_eq!(configured.max_tasks_per_owner(), 4);
+            assert_eq!(configured.max_payload_bytes_per_owner(), 8_192);
+            insert(
+                &configured,
+                final_working_task_with_ttl("owner-policy-fixed", 60_000),
+                None,
+            )
+            .unwrap();
+            assert!(configured.with_owner_capacity(1, 1).is_err());
+        }
+
+        #[test]
+        fn task_owner_count_is_shared_across_auth_rotation_and_preserves_other_owners() {
+            let store = InMemoryFinalTaskStore::new(4).unwrap();
+            let alice = principal("alice", 1);
+            let refreshed = principal("alice", 2);
+            assert_eq!(alice, refreshed);
+            let first = final_working_task_with_ttl("owner-count-first", 60_000);
+            let first_id = first.base().task_id.clone();
+            insert(&store, first, Some(alice)).unwrap();
+            insert(
+                &store,
+                final_working_task_with_ttl("owner-count-second", 60_000),
+                Some(refreshed),
+            )
+            .unwrap();
+            let rejected = final_working_task_with_ttl("owner-count-refused", 60_000);
+            let before = final_task_restoration_snapshot(&store, &first_id);
+            assert!(insert(&store, rejected.clone(), Some(refreshed)).is_err());
+            assert_eq!(final_task_restoration_snapshot(&store, &first_id), before);
+            assert!(store.get_task(&rejected.base().task_id).unwrap().is_none());
+            insert(&store, rejected, Some(principal("bob", 1))).unwrap();
+            assert_eq!(store.task_count(), 3);
+            assert_final_task_payload_accounting(&store);
+
+            // Unprotected embedding calls share one bounded partition; peer
+            // task-ID changes and the bare-create path cannot create owners.
+            let shared = InMemoryFinalTaskStore::new(2).unwrap();
+            let first = final_working_task_with_ttl("embedding-one", 60_000);
+            shared
+                .create_task(first.clone(), final_task_notification(&first))
+                .unwrap();
+            let second = final_working_task_with_ttl("embedding-two", 60_000);
+            let before = final_task_restoration_snapshot(&shared, &first.base().task_id);
+            assert!(insert(&shared, second, None).is_err());
+            assert_eq!(
+                final_task_restoration_snapshot(&shared, &first.base().task_id),
+                before
+            );
+            assert_final_task_payload_accounting(&shared);
+        }
+
+        #[test]
+        fn task_owner_byte_growth_is_atomic_and_shrink_releases_only_its_partition() {
+            let mut first = final_working_task_with_ttl("owner-bytes-first", 60_000);
+            if let FinalTask::Working(base) = &mut first {
+                base.status_message = Some(String::new());
+            }
+            let mut grown = first.clone();
+            if let FinalTask::Working(base) = &mut grown {
+                base.status_message = Some("x".repeat(100));
+            }
+            let limit = charge(&grown);
+            let store = InMemoryFinalTaskStore::with_payload_capacity(4, 2 * limit).unwrap();
+            assert_eq!(store.max_payload_bytes_per_owner(), limit);
+            let alice = principal("alice", 1);
+            let bob = principal("bob", 1);
+            let initial = insert(&store, first.clone(), Some(alice)).unwrap();
+            let second = final_working_task_with_ttl("owner-bytes-other", 60_000);
+            let second_id = second.base().task_id.clone();
+            insert(&store, second, Some(bob)).unwrap();
+            assert!(
+                store
+                    .replace_task_if_current(
+                        &initial,
+                        grown.clone(),
+                        final_task_notification(&grown),
+                    )
+                    .unwrap()
+            );
+            let current = store
+                .get_task_snapshot(&first.base().task_id)
+                .unwrap()
+                .unwrap();
+            let before = final_task_restoration_snapshot(&store, &first.base().task_id);
+            let other_before = final_task_restoration_snapshot(&store, &second_id);
+            if let FinalTask::Working(base) = &mut grown {
+                base.status_message.as_mut().unwrap().push('x');
+            }
+            assert!(
+                store
+                    .replace_task_if_current(
+                        &current,
+                        grown.clone(),
+                        final_task_notification(&grown),
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                final_task_restoration_snapshot(&store, &first.base().task_id),
+                before
+            );
+            assert_eq!(
+                final_task_restoration_snapshot(&store, &second_id),
+                other_before
+            );
+            let oversized_result = FinalTask::Completed {
+                base: transition_terminal_final_task_base(
+                    first.base().clone(),
+                    FinalTaskStatus::Completed,
+                    None,
+                )
+                .unwrap(),
+                result: serde_json::from_value(serde_json::json!({
+                    "content": [{"type": "text", "text": "x".repeat(limit)}]
+                }))
+                .unwrap(),
+            };
+            assert!(
+                store
+                    .replace_task_if_current(
+                        &current,
+                        oversized_result.clone(),
+                        final_task_notification(&oversized_result),
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                final_task_restoration_snapshot(&store, &first.base().task_id),
+                before
+            );
+            let bob_before =
+                store.state.lock().unwrap().payload_accounting.owners[&Some(bob.into_bytes())];
+            assert!(
+                store
+                    .replace_task_if_current(
+                        &current,
+                        first.clone(),
+                        final_task_notification(&first),
+                    )
+                    .unwrap()
+            );
+            let state = store.state.lock().unwrap();
+            assert_eq!(
+                state.payload_accounting.owners[&Some(alice.into_bytes())].bytes,
+                charge(&first)
+            );
+            assert_eq!(
+                state.payload_accounting.owners[&Some(bob.into_bytes())],
+                bob_before
+            );
+            drop(state);
+            assert_final_task_payload_accounting(&store);
+        }
+
+        #[test]
+        fn task_owner_input_growth_rejection_preserves_input_ledger_and_worker_handoff() {
+            let store = Arc::new(InMemoryFinalTaskStore::with_payload_capacity(4, 8_192).unwrap());
+            let runtime = final_task_runtime(store.clone(), Arc::new(AtomicBool::new(false)));
+            let task = final_working_task_with_ttl("owner-input", 60_000);
+            let task_id = task.base().task_id.clone();
+            insert(&store, task, Some(principal("alice", 1))).unwrap();
+            runtime
+                .require_input(&task_id, final_roots_request(), None)
+                .unwrap();
+            let before = final_task_restoration_snapshot(&store, &task_id);
+            let oversized = final_roots_input_with_encoded_bytes("roots", 4_096);
+            assert!(runtime.update_task(&task_id, &oversized).is_err());
+            assert_eq!(final_task_restoration_snapshot(&store, &task_id), before);
+            let admitted = final_roots_input_with_encoded_bytes("roots", 256);
+            runtime.update_task(&task_id, &admitted).unwrap();
+            assert!(matches!(
+                store.get_task(&task_id).unwrap(),
+                Some(FinalTask::Working(_))
+            ));
+            assert_eq!(
+                store.state.lock().unwrap().accepted_inputs[&task_id],
+                admitted
+            );
+            assert_final_task_payload_accounting(&store);
+        }
+
+        #[test]
+        fn task_owner_rebinding_cannot_move_a_retained_charge() {
+            let store = InMemoryFinalTaskStore::new(4).unwrap();
+            let task = final_working_task_with_ttl("owner-rebinding", 60_000);
+            let current = insert(&store, task.clone(), Some(principal("alice", 1))).unwrap();
+            // Plant a changed backend owner independently of the immutable
+            // charge. A future writer may not silently transfer quota to it.
+            store
+                .state
+                .lock()
+                .unwrap()
+                .authenticated_principals
+                .insert(task.base().task_id.clone(), principal("bob", 1));
+            let before = final_task_restoration_snapshot(&store, &task.base().task_id);
+            assert!(store.replace_task_if_current(
+                &current, task.clone(), final_task_notification(&task),
+            ).is_err());
+            assert_eq!(
+                final_task_restoration_snapshot(&store, &task.base().task_id),
+                before
+            );
+        }
+
+        #[test]
+        fn task_owner_full_quota_keeps_terminal_headroom_and_reclaims_exactly_once() {
+            let task = final_working_task_with_ttl("owner-terminal", 60_000);
+            let limit = charge(&task);
+            let store = InMemoryFinalTaskStore::with_payload_capacity(2, 2 * limit).unwrap();
+            let owner = principal("alice", 1);
+            let current = insert(&store, task.clone(), Some(owner)).unwrap();
+            let mut cancelled_base = task.base().clone();
+            cancelled_base.status = FinalTaskStatus::Cancelled;
+            let cancelled = FinalTask::Cancelled(cancelled_base);
+            let terminal = store
+                .request_cancellation_and_clear_input_if_current(
+                    &current,
+                    cancelled.clone(),
+                    final_task_notification(&cancelled),
+                )
+                .unwrap()
+                .unwrap();
+            let next = final_working_task_with_ttl("owner-followup", 60_000);
+            assert!(
+                insert(&store, next.clone(), Some(owner)).is_err(),
+                "terminal results retain the owner count quota"
+            );
+            let cx = Cx::for_testing();
+            assert!(matches!(
+                store
+                    .reclaim_terminal_task_if_current(
+                        &cx,
+                        &task.base().task_id,
+                        terminal.generation(),
+                        TaskRetentionReason::OperatorRequest,
+                    )
+                    .unwrap(),
+                TaskRetentionReclamation::Reclaimed(_)
+            ));
+            assert!(
+                store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .payload_accounting
+                    .owners
+                    .is_empty()
+            );
+            insert(&store, next.clone(), Some(owner)).unwrap();
+            let before = final_task_restoration_snapshot(&store, &next.base().task_id);
+            assert!(matches!(
+                store
+                    .reclaim_terminal_task_if_current(
+                        &cx,
+                        &task.base().task_id,
+                        terminal.generation(),
+                        TaskRetentionReason::OperatorRequest,
+                    )
+                    .unwrap(),
+                TaskRetentionReclamation::AlreadyReclaimed(_)
+            ));
+            assert_eq!(
+                final_task_restoration_snapshot(&store, &next.base().task_id),
+                before
+            );
+            assert_final_task_payload_accounting(&store);
+        }
+
+        #[test]
+        fn task_owner_expiry_releases_count_bytes_and_partition_cardinality() {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock = now.clone();
+            let store =
+                InMemoryFinalTaskStore::with_clock(2, Arc::new(move || *clock.lock().unwrap()))
+                    .unwrap();
+            let owner = principal("alice", 1);
+            let first = final_working_task_with_ttl("owner-expiring", 100);
+            let second = final_working_task_with_ttl("owner-replacement", 100);
+            insert(&store, first, Some(owner)).unwrap();
+            assert!(insert(&store, second.clone(), Some(owner)).is_err());
+            *now.lock().unwrap() += StdDuration::from_millis(100);
+            assert_eq!(store.task_count(), 0);
+            assert_eq!(store.retained_payload_bytes(), 0);
+            assert!(
+                store
+                    .state
+                    .lock()
+                    .unwrap()
+                    .payload_accounting
+                    .owners
+                    .is_empty()
+            );
+            insert(&store, second, Some(owner)).unwrap();
+            assert_eq!(store.task_count(), 1);
+            assert_final_task_payload_accounting(&store);
+        }
+
+        #[test]
+        fn task_owner_concurrent_admission_cannot_oversubscribe_one_partition() {
+            let store = Arc::new(
+                InMemoryFinalTaskStore::new(4)
+                    .unwrap()
+                    .with_owner_capacity(1, 65_536)
+                    .unwrap(),
+            );
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let accepted = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|index| {
+                        let store = store.clone();
+                        let barrier = barrier.clone();
+                        scope.spawn(move || {
+                            let owner = principal(if index < 4 { "alice" } else { "bob" }, index);
+                            let task =
+                                final_working_task_with_ttl(&format!("owner-race-{index}"), 60_000);
+                            barrier.wait();
+                            usize::from(insert(&store, task, Some(owner)).is_ok())
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .sum::<usize>()
+            });
+            assert_eq!(accepted, 2);
+            assert_eq!(store.task_count(), 2);
+            assert_eq!(
+                store.state.lock().unwrap().payload_accounting.owners.len(),
+                2
+            );
+            assert_final_task_payload_accounting(&store);
+        }
     }
 
     fn final_roots_input_with_encoded_bytes(key: &str, bytes: usize) -> FinalTaskInputResponses {
@@ -14279,7 +14853,10 @@ mod tests {
             + encoded_final_task_test_bytes(&final_task_notification(&grown))
             + 2 * descriptor_bytes
             + FINAL_TASK_CANCELLATION_RESERVE_BYTES;
-        let insufficient = InMemoryFinalTaskStore::with_payload_capacity(2, limit - 1).unwrap();
+        let insufficient = InMemoryFinalTaskStore::with_payload_capacity(2, limit - 1)
+            .unwrap()
+            .with_owner_capacity(2, limit - 1)
+            .unwrap();
         let before = final_task_restoration_snapshot(&insufficient, &task_id);
         assert!(
             insufficient
@@ -14302,6 +14879,8 @@ mod tests {
             limit,
             Arc::new(move || *clock.lock().unwrap()),
         )
+        .unwrap()
+        .with_owner_capacity(2, limit)
         .unwrap();
         store
             .create_task_with_work(
@@ -14483,6 +15062,8 @@ mod tests {
                     1,
                     initial_bytes + FINAL_TASK_CANCELLATION_RESERVE_BYTES,
                 )
+                .unwrap()
+                .with_owner_capacity(1, initial_bytes + FINAL_TASK_CANCELLATION_RESERVE_BYTES)
                 .unwrap(),
             );
             store
@@ -14544,6 +15125,8 @@ mod tests {
                     capacity,
                     Arc::new(move || *clock.lock().unwrap()),
                 )
+                .unwrap()
+                .with_owner_capacity(2, capacity)
                 .unwrap(),
             );
             store
@@ -14900,6 +15483,8 @@ mod tests {
                     *clock.lock().unwrap()
                 }),
             )
+            .unwrap()
+            .with_owner_capacity(maximum_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
             .unwrap()
             .with_retention_policy(policy)
             .unwrap();
@@ -16830,6 +17415,8 @@ mod tests {
             limits,
             Arc::new(move || *clock_reader.lock().unwrap()),
         )
+        .unwrap()
+        .with_owner_capacity(4, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
         .unwrap();
         (Arc::new(store), clock)
     }
@@ -17295,6 +17882,8 @@ mod tests {
             .unwrap(),
             Arc::new(move || *reader.lock().unwrap()),
         )
+        .unwrap()
+        .with_owner_capacity(2, payload + FINAL_TASK_CANCELLATION_RESERVE_BYTES)
         .unwrap();
         store
             .create_task(task.clone(), final_task_notification(&task))
@@ -17546,6 +18135,11 @@ mod tests {
                     )
                     .unwrap(),
                     Arc::new(move || *reader.lock().unwrap()),
+                )
+                .unwrap()
+                .with_owner_capacity(
+                    expired_count + 1,
+                    InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES,
                 )
                 .unwrap(),
             );
