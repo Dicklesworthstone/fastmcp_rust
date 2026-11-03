@@ -451,18 +451,21 @@ pub mod server {
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
         FinalResourceReadCacheHintProvenance, FinalRoots, FinalRootsContextExt, FinalSampling,
         FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
-        HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown, HttpShutdownSettlement,
-        InboundRequestContext, InboundRequestTransport, LifespanHooks, LoggingConfig, Middleware,
-        MiddlewareDecision, ModernConnection, MountResult, NotificationSender, PendingRequests,
-        ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
-        ServerExtensionConfigurationError, ServerHttpEndpoint, ServerHttpEndpointError,
-        ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
-        ServerHttpSseResponse, ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier,
-        StatsSnapshot, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
-        ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
-        TransportRootsProvider, TransportSamplingSender, UriParams, caching,
-        create_context_with_progress, create_context_with_progress_and_senders, oauth, oidc,
-        providers, rate_limiting, transform,
+        HttpConnectionAdmissionError, HttpConnectionAdmissionPermit, HttpConnectionAdmissionProbe,
+        HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerConfig, HttpServerShutdown,
+        HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
+        LoggingConfig, Middleware, MiddlewareDecision, ModernConnection, MountResult,
+        NotificationSender, OperatorConnectionCapacity, OperatorConnectionCounters,
+        OperatorLifecycle, OperatorProfile, OperatorReadiness, OperatorReason, OperatorSnapshot,
+        OperatorSnapshotError, OperatorSnapshotSource, PendingRequests, ProgressNotificationSender,
+        PromptHandler, RequestSender, ResourceHandler, Router, ServerExtensionConfigurationError,
+        ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
+        ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse,
+        ServerLaunchPolicyError, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
+        TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind, ToolExecutionMode,
+        ToolHandler, TrafficVerbosity, TransportElicitationSender, TransportRootsProvider,
+        TransportSamplingSender, UriParams, caching, create_context_with_progress,
+        create_context_with_progress_and_senders, oauth, oidc, providers, rate_limiting, transform,
     };
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
@@ -922,16 +925,20 @@ pub use fastmcp_server::{
     BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
     FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalRoots,
     FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,
-    FinalToolSchemaAuthority, HttpNonquiescentShutdown, HttpServerConfig, HttpServerShutdown,
-    HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, Middleware,
-    MiddlewareDecision, ModernConnection, MountResult, NotificationSender, PendingRequests,
-    ProgressNotificationSender, PromptHandler, RequestSender, ResourceHandler, Router,
-    ServerHttpEndpoint, ServerHttpEndpointError, ServerHttpEndpointResponse,
-    ServerHttpRequestCancellation, ServerHttpSession, ServerHttpSseResponse, ServerStats, Session,
-    StaticTokenVerifier, StatsSnapshot, SubscriptionListenHandle, TagFilters, TokenAuthProvider,
-    TokenVerifier, ToolErrorKind, ToolExecutionMode, ToolHandler, TrafficVerbosity,
-    TransportElicitationSender, TransportRootsProvider, TransportSamplingSender, UriParams,
-    create_context_with_progress, create_context_with_progress_and_senders,
+    FinalToolSchemaAuthority, HttpConnectionAdmissionError, HttpConnectionAdmissionPermit,
+    HttpConnectionAdmissionProbe, HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerConfig,
+    HttpServerShutdown, HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport,
+    Middleware, MiddlewareDecision, ModernConnection, MountResult, NotificationSender,
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorProfile,
+    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
+    OperatorSnapshotSource, PendingRequests, ProgressNotificationSender, PromptHandler,
+    RequestSender, ResourceHandler, Router, ServerHttpEndpoint, ServerHttpEndpointError,
+    ServerHttpEndpointResponse, ServerHttpRequestCancellation, ServerHttpSession,
+    ServerHttpSseResponse, ServerStats, Session, StaticTokenVerifier, StatsSnapshot,
+    SubscriptionListenHandle, TagFilters, TokenAuthProvider, TokenVerifier, ToolErrorKind,
+    ToolExecutionMode, ToolHandler, TrafficVerbosity, TransportElicitationSender,
+    TransportRootsProvider, TransportSamplingSender, UriParams, create_context_with_progress,
+    create_context_with_progress_and_senders,
 };
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_server::{
@@ -2656,6 +2663,12 @@ pub mod auto {
     }
 
     impl HttpServer {
+        /// Retains bounded observations and connection admission for this listener.
+        #[must_use]
+        pub fn operator_handle(&self) -> crate::HttpOperatorHandle {
+            self.inner.operator_handle()
+        }
+
         pub fn local_addr(&self) -> McpResult<std::net::SocketAddr> {
             self.inner.local_addr()
         }
@@ -7618,6 +7631,12 @@ pub mod modern {
     }
 
     impl HttpServer {
+        /// Retains bounded observations and connection admission for this listener.
+        #[must_use]
+        pub fn operator_handle(&self) -> crate::HttpOperatorHandle {
+            self.inner.operator_handle()
+        }
+
         /// Returns the address selected for this final-only listener.
         pub fn local_addr(&self) -> McpResult<std::net::SocketAddr> {
             self.inner.local_addr()
@@ -8490,6 +8509,12 @@ pub mod legacy_2024 {
     }
 
     impl HttpServer {
+        /// Retains bounded observations and connection admission for this listener.
+        #[must_use]
+        pub fn operator_handle(&self) -> crate::HttpOperatorHandle {
+            self.inner.operator_handle()
+        }
+
         /// Returns the address selected for this exact legacy listener.
         pub fn local_addr(&self) -> McpResult<std::net::SocketAddr> {
             self.inner.local_addr()

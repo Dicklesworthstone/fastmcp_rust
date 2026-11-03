@@ -84,6 +84,12 @@ mod state;
 pub mod stats;
 pub mod uri;
 
+pub use stats::{
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorProfile,
+    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
+    OperatorSnapshotSource,
+};
+
 /// Immutable protocol-limit snapshots and cumulative logical-exchange admission.
 pub mod limits {
     use std::collections::HashMap;

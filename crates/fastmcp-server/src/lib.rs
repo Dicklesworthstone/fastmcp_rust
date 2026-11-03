@@ -113,7 +113,11 @@ pub use extensions::{
 };
 #[cfg(feature = "console")]
 pub use fastmcp_console::config::{BannerStyle, ConsoleConfig, TrafficVerbosity};
-pub use fastmcp_core::stats::{ServerStats, StatsSnapshot};
+pub use fastmcp_core::stats::{
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorProfile,
+    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
+    OperatorSnapshotSource, ServerStats, StatsSnapshot,
+};
 use fastmcp_protocol::{
     MAX_CLIENT_REGISTRATION_BYTES, SecurityDocumentKind, admit_security_document,
 };
@@ -7865,35 +7869,221 @@ fn expire_live_modern_http_sessions(registry: &LiveModernHttpSessionRegistry) {
 struct HttpConnectionLimiter {
     limit: usize,
     active: AtomicUsize,
+    generation: u64,
+    profile: OperatorProfile,
+    state: Mutex<HttpConnectionAdmissionState>,
+}
+
+const MAX_HTTP_CONNECTION_PROBES: usize = 64;
+const MAX_HTTP_CONNECTION_PROBE_LIFETIME: Duration = Duration::from_secs(30);
+static NEXT_HTTP_OPERATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+struct HttpConnectionProbeRecord {
+    id: u64,
+    deadline: Instant,
+    context: HttpOperatorContext,
+    queued: bool,
+}
+
+struct HttpConnectionAdmissionState {
+    lifecycle: OperatorLifecycle,
+    listener_context: Option<HttpOperatorContext>,
+    next_probe_id: u64,
+    probes: Vec<HttpConnectionProbeRecord>,
+    counters: OperatorConnectionCounters,
+}
+
+fn increment_operator_counter(counter: &mut u64, overflowed: &mut bool) {
+    match counter.checked_add(1) {
+        Some(next) => *counter = next,
+        None => *overflowed = true,
+    }
+}
+
+#[derive(Clone)]
+struct HttpOperatorContext {
+    cx: Cx,
+    deadline: Option<asupersync::Time>,
+}
+
+impl HttpOperatorContext {
+    fn capture(cx: &Cx) -> Self {
+        Self {
+            cx: cx.clone(),
+            deadline: cx.budget().deadline,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cx.published_cancel_requested()
+    }
+
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| self.cx.now() >= deadline)
+    }
 }
 
 impl HttpConnectionLimiter {
-    const fn new(limit: usize) -> Self {
+    fn new(limit: usize) -> Self {
         Self {
             limit,
             active: AtomicUsize::new(0),
+            generation: 0,
+            profile: OperatorProfile::Auto,
+            state: Mutex::new(HttpConnectionAdmissionState {
+                lifecycle: OperatorLifecycle::Running,
+                listener_context: None,
+                next_probe_id: 1,
+                probes: Vec::new(),
+                counters: OperatorConnectionCounters::default(),
+            }),
+        }
+    }
+
+    fn for_http(limit: usize, policy: ProtocolPolicy) -> McpResult<Self> {
+        let generation = NEXT_HTTP_OPERATOR_GENERATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| McpError::internal_error("HTTP listener generation exhausted"))?;
+        let mut limiter = Self::new(limit);
+        limiter.generation = generation;
+        limiter.profile = match policy {
+            ProtocolPolicy::ModernOnly => OperatorProfile::Modern,
+            ProtocolPolicy::LegacyOnly => OperatorProfile::Legacy2024,
+            ProtocolPolicy::Auto => OperatorProfile::Auto,
+        };
+        limiter
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .lifecycle = OperatorLifecycle::Starting;
+        Ok(limiter)
+    }
+
+    fn reap_probes(&self, state: &mut HttpConnectionAdmissionState, now: Instant) {
+        if state.lifecycle == OperatorLifecycle::Running
+            && state
+                .listener_context
+                .as_ref()
+                .is_some_and(|context| context.cancelled() || context.expired())
+        {
+            state.lifecycle = OperatorLifecycle::Stopping;
+            self.revoke_probes(state);
+        }
+        state.probes.retain(|probe| {
+            let cancelled = probe.context.cancelled();
+            let expired = now >= probe.deadline || probe.context.expired();
+            if cancelled || expired {
+                self.active.fetch_sub(1, Ordering::AcqRel);
+                let counters = &mut state.counters;
+                increment_operator_counter(&mut counters.released, &mut counters.overflowed);
+                if cancelled {
+                    increment_operator_counter(&mut counters.cancelled, &mut counters.overflowed);
+                } else {
+                    increment_operator_counter(&mut counters.expired, &mut counters.overflowed);
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn revoke_probes(&self, state: &mut HttpConnectionAdmissionState) {
+        let count = state.probes.len();
+        state.probes.clear();
+        self.active.fetch_sub(count, Ordering::AcqRel);
+        let counters = &mut state.counters;
+        for _ in 0..count {
+            increment_operator_counter(&mut counters.released, &mut counters.overflowed);
+            increment_operator_counter(&mut counters.shutdown_revoked, &mut counters.overflowed);
+        }
+    }
+
+    fn start_serving(&self, cx: &Cx) {
+        let context = HttpOperatorContext::capture(cx);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.lifecycle == OperatorLifecycle::Starting {
+            state.lifecycle = if context.cancelled() || context.expired() {
+                OperatorLifecycle::Stopping
+            } else {
+                OperatorLifecycle::Running
+            };
+            state.listener_context = Some(context);
+        }
+    }
+
+    fn set_lifecycle(&self, lifecycle: OperatorLifecycle) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (state.lifecycle, lifecycle) {
+            (OperatorLifecycle::Starting, OperatorLifecycle::Running)
+            | (
+                OperatorLifecycle::Starting | OperatorLifecycle::Running,
+                OperatorLifecycle::Stopping,
+            )
+            | (_, OperatorLifecycle::Stopped) => state.lifecycle = lifecycle,
+            _ => return,
+        }
+        if matches!(
+            lifecycle,
+            OperatorLifecycle::Stopping | OperatorLifecycle::Stopped
+        ) {
+            self.revoke_probes(&mut state);
+        }
+        if lifecycle == OperatorLifecycle::Stopped {
+            state.listener_context = None;
         }
     }
 
     fn try_acquire(self: &Arc<Self>) -> Option<HttpConnectionPermit> {
-        let mut active = self.active.load(Ordering::Acquire);
-        loop {
-            if active >= self.limit {
-                return None;
-            }
-            match self.active.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(HttpConnectionPermit {
-                        limiter: Arc::clone(self),
-                    });
-                }
-                Err(observed) => active = observed,
-            }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.reap_probes(&mut state, Instant::now());
+        if state.lifecycle != OperatorLifecycle::Running {
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.rejected, &mut counters.overflowed);
+            return None;
+        }
+        if let Some(index) = state.probes.iter().position(|probe| probe.queued) {
+            // The probe already charged this exact limiter. Removing its expiry
+            // record transfers that charge to the connection lifetime; expiry
+            // can never reclaim a slot after the native accept consumes it.
+            state.probes.remove(index);
+        } else if self.active.load(Ordering::Acquire) < self.limit {
+            self.active.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.rejected, &mut counters.overflowed);
+            return None;
+        }
+        let counters = &mut state.counters;
+        increment_operator_counter(&mut counters.accepted, &mut counters.overflowed);
+        Some(HttpConnectionPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+
+    fn release_probe(&self, id: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.reap_probes(&mut state, Instant::now());
+        if let Some(index) = state.probes.iter().position(|probe| probe.id == id) {
+            state.probes.remove(index);
+            self.active.fetch_sub(1, Ordering::AcqRel);
+            let counters = &mut state.counters;
+            increment_operator_counter(&mut counters.released, &mut counters.overflowed);
         }
     }
 }
@@ -7904,7 +8094,517 @@ struct HttpConnectionPermit {
 
 impl Drop for HttpConnectionPermit {
     fn drop(&mut self) {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+        let counters = &mut state.counters;
+        increment_operator_counter(&mut counters.released, &mut counters.overflowed);
+    }
+}
+
+/// A typed refusal from the HTTP connection-slot admission probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpConnectionAdmissionError {
+    /// The listener has not entered service or has started stopping.
+    NotServing,
+    /// The caller's cancellation authority has been revoked.
+    Cancelled,
+    /// The monotonic reservation deadline has elapsed.
+    DeadlineExpired,
+    /// A reservation may live for at most thirty seconds.
+    DeadlineTooFar,
+    /// All connection slots are charged.
+    Capacity,
+    /// The fixed bound of sixty-four unconsumed probes has been reached.
+    ProbeCapacity,
+    /// The reservation was already consumed or revoked.
+    ReservationNotHeld,
+    /// A unique reservation identifier cannot be represented without wrapping.
+    IdentifierExhausted,
+}
+
+impl std::fmt::Display for HttpConnectionAdmissionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::NotServing => "HTTP listener is not serving",
+            Self::Cancelled => "HTTP connection probe was cancelled",
+            Self::DeadlineExpired => "HTTP connection probe expired",
+            Self::DeadlineTooFar => "HTTP connection probe lifetime exceeds thirty seconds",
+            Self::Capacity => "HTTP connection capacity is exhausted",
+            Self::ProbeCapacity => "HTTP connection probe capacity is exhausted",
+            Self::ReservationNotHeld => "HTTP connection reservation is no longer held",
+            Self::IdentifierExhausted => "HTTP connection reservation identity exhausted",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for HttpConnectionAdmissionError {}
+
+/// Retained, exporter-neutral observation and admission handle for one HTTP listener.
+///
+/// Snapshot capture does not wait for the admission mutex, emits no bytes, and
+/// acquires no capacity. Built-in wall and virtual clocks support bounded
+/// capture. An application-supplied runtime clock must also return promptly
+/// without blocking, panicking, or calling listener/operator APIs: deadline
+/// reconciliation consults that clock while the admission cell is held.
+/// The handle can outlive `BoundHttpServer` to observe its stopped state.
+/// This contributor covers connection admission only, not authentication,
+/// request-byte limits, task readiness, or overall process health.
+#[derive(Clone)]
+pub struct HttpOperatorHandle {
+    limiter: Arc<HttpConnectionLimiter>,
+}
+
+impl HttpOperatorHandle {
+    /// Returns a probe sharing the native listener's exact connection limiter.
+    #[must_use]
+    pub fn admission_probe(&self) -> HttpConnectionAdmissionProbe {
+        HttpConnectionAdmissionProbe {
+            limiter: Arc::clone(&self.limiter),
+        }
+    }
+}
+
+impl OperatorSnapshotSource for HttpOperatorHandle {
+    fn operator_snapshot(&self) -> Result<OperatorSnapshot, OperatorSnapshotError> {
+        let mut state = match self.limiter.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Err(OperatorSnapshotError::Busy),
+        };
+        let captured_at = Instant::now();
+        // Context budgets were captured before admission. Reconciliation reads
+        // published cancellation and the runtime clock only; custom clocks must
+        // obey HttpOperatorHandle's bounded, non-reentrant clock contract.
+        self.limiter.reap_probes(&mut state, captured_at);
+        let reserved = state.probes.len();
+        Ok(OperatorSnapshot::http_connections(
+            captured_at,
+            self.limiter.generation,
+            self.limiter.profile,
+            state.lifecycle,
+            OperatorConnectionCapacity {
+                limit: self.limiter.limit,
+                active: self
+                    .limiter
+                    .active
+                    .load(Ordering::Acquire)
+                    .saturating_sub(reserved),
+                reserved,
+            },
+            state.counters,
+        ))
+    }
+}
+
+/// Optional one-shot connection admission, distinct from an observational snapshot.
+///
+/// A successful acquisition charges one slot in the live native listener. It
+/// reserves no request-body budget and grants no protocol, peer, or authorization
+/// authority. Call `admit_next_connection` on the permit to hand the slot to the
+/// next incoming connection, or drop it to release the slot.
+#[derive(Clone)]
+pub struct HttpConnectionAdmissionProbe {
+    limiter: Arc<HttpConnectionLimiter>,
+}
+
+impl HttpConnectionAdmissionProbe {
+    /// Reserves one connection slot until the supplied monotonic deadline.
+    ///
+    /// Cancellation/expiry is reconciled before every native admission, capture,
+    /// or handoff. No background timer or private executor is created.
+    /// Runtime clocks must satisfy [`HttpOperatorHandle`]'s nonblocking,
+    /// non-reentrant clock contract.
+    pub fn acquire(
+        &self,
+        cx: &Cx,
+        deadline: Instant,
+    ) -> Result<HttpConnectionAdmissionPermit, HttpConnectionAdmissionError> {
+        let context = HttpOperatorContext::capture(cx);
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Sample only after owning admission: waiting for another admission
+        // must not turn an expired or cancelled intent into a fresh charge.
+        let now = Instant::now();
+        self.limiter.reap_probes(&mut state, now);
+        if context.cancelled() {
+            return Err(HttpConnectionAdmissionError::Cancelled);
+        }
+        if deadline <= now || context.expired() {
+            return Err(HttpConnectionAdmissionError::DeadlineExpired);
+        }
+        if deadline.duration_since(now) > MAX_HTTP_CONNECTION_PROBE_LIFETIME {
+            return Err(HttpConnectionAdmissionError::DeadlineTooFar);
+        }
+        if state.lifecycle != OperatorLifecycle::Running {
+            return Err(HttpConnectionAdmissionError::NotServing);
+        }
+        if self.limiter.active.load(Ordering::Acquire) >= self.limiter.limit {
+            return Err(HttpConnectionAdmissionError::Capacity);
+        }
+        if state.probes.len() >= MAX_HTTP_CONNECTION_PROBES {
+            return Err(HttpConnectionAdmissionError::ProbeCapacity);
+        }
+        let id = state.next_probe_id;
+        state.next_probe_id = id
+            .checked_add(1)
+            .ok_or(HttpConnectionAdmissionError::IdentifierExhausted)?;
+        state.probes.push(HttpConnectionProbeRecord {
+            id,
+            deadline,
+            context: context.clone(),
+            queued: false,
+        });
+        self.limiter.active.fetch_add(1, Ordering::AcqRel);
+        let counters = &mut state.counters;
+        increment_operator_counter(&mut counters.probes_acquired, &mut counters.overflowed);
+        Ok(HttpConnectionAdmissionPermit {
+            limiter: Arc::clone(&self.limiter),
+            id,
+            deadline,
+            context,
+            live: true,
+        })
+    }
+}
+
+/// Non-cloneable, generation-bound reservation of one real connection slot.
+///
+/// Dropping an untransferred permit releases exactly once. After a successful
+/// handoff the listener owns it until expiry, cancellation, shutdown, or native
+/// accept. An accepted connection retains its charge until its work settles,
+/// even if the original probe deadline subsequently passes.
+#[must_use = "drop to release the slot, or hand it to the next incoming connection"]
+pub struct HttpConnectionAdmissionPermit {
+    limiter: Arc<HttpConnectionLimiter>,
+    id: u64,
+    deadline: Instant,
+    context: HttpOperatorContext,
+    live: bool,
+}
+
+impl std::fmt::Debug for HttpConnectionAdmissionPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HttpConnectionAdmissionPermit")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpConnectionAdmissionPermit {
+    /// Transfers this slot to the next connection admitted by this exact listener.
+    ///
+    /// The handoff promises no particular peer or request: the native accept loop
+    /// consumes queued reservations before fresh capacity. Every ordinary HTTP,
+    /// authentication, body-size, and protocol admission check still runs.
+    pub fn admit_next_connection(mut self) -> Result<(), HttpConnectionAdmissionError> {
+        let mut state = self
+            .limiter
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        self.limiter.reap_probes(&mut state, now);
+        if self.context.cancelled() {
+            return Err(HttpConnectionAdmissionError::Cancelled);
+        }
+        if now >= self.deadline || self.context.expired() {
+            return Err(HttpConnectionAdmissionError::DeadlineExpired);
+        }
+        if state.lifecycle != OperatorLifecycle::Running {
+            return Err(HttpConnectionAdmissionError::NotServing);
+        }
+        let record = state
+            .probes
+            .iter_mut()
+            .find(|probe| probe.id == self.id)
+            .ok_or(HttpConnectionAdmissionError::ReservationNotHeld)?;
+        record.queued = true;
+        self.live = false;
+        Ok(())
+    }
+}
+
+impl Drop for HttpConnectionAdmissionPermit {
+    fn drop(&mut self) {
+        if self.live {
+            self.limiter.release_probe(self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod http_operator_tests {
+    use super::*;
+
+    fn running(limit: usize) -> (Arc<HttpConnectionLimiter>, HttpOperatorHandle) {
+        let limiter =
+            Arc::new(HttpConnectionLimiter::for_http(limit, ProtocolPolicy::ModernOnly).unwrap());
+        limiter.start_serving(&Cx::for_testing());
+        let handle = HttpOperatorHandle {
+            limiter: Arc::clone(&limiter),
+        };
+        (limiter, handle)
+    }
+
+    fn capture(handle: &HttpOperatorHandle) -> OperatorSnapshot {
+        OperatorSnapshot::capture(handle).unwrap()
+    }
+
+    #[test]
+    fn http_operator_readiness_is_structural_and_shutdown_never_reopens() {
+        let limiter =
+            Arc::new(HttpConnectionLimiter::for_http(1, ProtocolPolicy::ModernOnly).unwrap());
+        let handle = HttpOperatorHandle {
+            limiter: Arc::clone(&limiter),
+        };
+        let cx = Cx::for_testing();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let starting = capture(&handle);
+        assert_eq!(starting.readiness(), OperatorReadiness::Starting);
+        assert_eq!(
+            handle.admission_probe().acquire(&cx, deadline).unwrap_err(),
+            HttpConnectionAdmissionError::NotServing
+        );
+        limiter.start_serving(&cx);
+        let permit = handle.admission_probe().acquire(&cx, deadline).unwrap();
+        let full = capture(&handle);
+        assert_eq!(full.readiness(), OperatorReadiness::Ready);
+        assert!(full.connections().is_saturated());
+        assert_eq!(full.connections().reserved, 1);
+        assert_eq!(full.connections().active, 0);
+        assert_eq!(
+            handle.admission_probe().acquire(&cx, deadline).unwrap_err(),
+            HttpConnectionAdmissionError::Capacity
+        );
+        assert_eq!(capture(&handle).counters(), full.counters());
+        drop(permit);
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+        assert_eq!(capture(&handle).counters().released, 1);
+        limiter.set_lifecycle(OperatorLifecycle::Stopping);
+        limiter.start_serving(&cx);
+        assert_eq!(capture(&handle).readiness(), OperatorReadiness::Stopping);
+        assert!(limiter.try_acquire().is_none());
+        limiter.set_lifecycle(OperatorLifecycle::Stopped);
+        limiter.start_serving(&cx);
+        let stopped = capture(&handle);
+        assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+        assert_eq!(stopped.readiness(), OperatorReadiness::NotReady);
+        assert_eq!(
+            stopped.configuration_generation(),
+            starting.configuration_generation()
+        );
+    }
+
+    #[test]
+    fn http_operator_probe_handoff_retains_consumed_slot_past_expiry() {
+        let (limiter, handle) = running(1);
+        let cx = Cx::for_testing();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let permit = handle.admission_probe().acquire(&cx, deadline).unwrap();
+        assert!(
+            limiter.try_acquire().is_none(),
+            "a held probe really charges native capacity"
+        );
+        permit.admit_next_connection().unwrap();
+        let connection = limiter
+            .try_acquire()
+            .expect("handoff uses the already charged last slot");
+        assert_eq!(capture(&handle).connections().active, 1);
+        assert_eq!(capture(&handle).connections().reserved, 0);
+        {
+            let mut state = limiter.state.lock().unwrap();
+            limiter.reap_probes(&mut state, deadline + Duration::from_secs(1));
+        }
+        cx.cancel_with(CancelKind::User, None);
+        assert_eq!(
+            capture(&handle).connections().active,
+            1,
+            "probe expiry/cancellation cannot reclaim consumed work"
+        );
+        assert!(limiter.try_acquire().is_none());
+        drop(connection);
+        let final_snapshot = capture(&handle);
+        assert_eq!(final_snapshot.connections().in_use(), 0);
+        assert_eq!(final_snapshot.counters().accepted, 1);
+        assert_eq!(final_snapshot.counters().released, 1);
+        assert_eq!(final_snapshot.counters().expired, 0);
+    }
+
+    #[test]
+    fn http_operator_expiry_cancellation_and_shutdown_release_exactly_once() {
+        let (limiter, handle) = running(1);
+        let cx = Cx::for_testing();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let expired = handle.admission_probe().acquire(&cx, deadline).unwrap();
+        {
+            let mut state = limiter.state.lock().unwrap();
+            limiter.reap_probes(&mut state, deadline);
+        }
+        drop(expired);
+        assert_eq!(capture(&handle).counters().expired, 1);
+        assert_eq!(capture(&handle).counters().released, 1);
+        let cancelled_cx = Cx::for_testing();
+        let cancelled = handle
+            .admission_probe()
+            .acquire(&cancelled_cx, deadline)
+            .unwrap();
+        cancelled_cx.cancel_with(CancelKind::User, None);
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+        drop(cancelled);
+        assert_eq!(capture(&handle).counters().cancelled, 1);
+        assert_eq!(capture(&handle).counters().released, 2);
+        handle
+            .admission_probe()
+            .acquire(&cx, deadline)
+            .unwrap()
+            .admit_next_connection()
+            .unwrap();
+        limiter.set_lifecycle(OperatorLifecycle::Stopping);
+        limiter.set_lifecycle(OperatorLifecycle::Stopped);
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+        assert_eq!(capture(&handle).counters().shutdown_revoked, 1);
+        assert_eq!(capture(&handle).counters().released, 3);
+    }
+
+    #[test]
+    fn http_operator_probe_is_bounded_nonblocking_and_listener_cancel_fences_admission() {
+        let (limiter, handle) = running(MAX_HTTP_CONNECTION_PROBES + 1);
+        let cx = Cx::for_testing();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let permits = (0..MAX_HTTP_CONNECTION_PROBES)
+            .map(|_| handle.admission_probe().acquire(&cx, deadline).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            handle.admission_probe().acquire(&cx, deadline).unwrap_err(),
+            HttpConnectionAdmissionError::ProbeCapacity
+        );
+        {
+            let _held = limiter.state.lock().unwrap();
+            assert_eq!(
+                OperatorSnapshot::capture(&handle),
+                Err(OperatorSnapshotError::Busy)
+            );
+        }
+        drop(permits);
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+        let owner = Cx::for_testing();
+        let limiter =
+            Arc::new(HttpConnectionLimiter::for_http(1, ProtocolPolicy::ModernOnly).unwrap());
+        limiter.start_serving(&owner);
+        let handle = HttpOperatorHandle {
+            limiter: Arc::clone(&limiter),
+        };
+        handle
+            .admission_probe()
+            .acquire(&cx, deadline)
+            .unwrap()
+            .admit_next_connection()
+            .unwrap();
+        owner.cancel_with(CancelKind::Shutdown, None);
+        assert!(limiter.try_acquire().is_none());
+        let snapshot = capture(&handle);
+        assert_eq!(snapshot.readiness(), OperatorReadiness::Stopping);
+        assert_eq!(snapshot.connections().in_use(), 0);
+        assert_eq!(snapshot.counters().shutdown_revoked, 1);
+    }
+
+    #[test]
+    fn http_operator_last_slot_is_atomic_and_counters_saturate() {
+        let (limiter, handle) = running(1);
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let threads = (0..8)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let probe = handle.admission_probe();
+                std::thread::spawn(move || {
+                    let cx = Cx::for_testing();
+                    barrier.wait();
+                    probe.acquire(&cx, Instant::now() + Duration::from_secs(5))
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let results = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(capture(&handle).connections().reserved, 1);
+        drop(results);
+        {
+            let mut state = limiter.state.lock().unwrap();
+            state.counters.accepted = u64::MAX;
+        }
+        let connection = limiter.try_acquire().unwrap();
+        let snapshot = capture(&handle);
+        assert_eq!(snapshot.counters().accepted, u64::MAX);
+        assert!(snapshot.counters().overflowed);
+        drop(connection);
+        assert_eq!(capture(&handle).connections().in_use(), 0);
+    }
+
+    #[test]
+    fn http_operator_probe_rechecks_liveness_after_admission_contention() {
+        for cancel in [false, true] {
+            let (limiter, handle) = running(1);
+            let cx = Cx::for_testing();
+            let worker_cx = cx.clone();
+            let deadline = Instant::now()
+                + if cancel {
+                    Duration::from_secs(5)
+                } else {
+                    Duration::from_millis(40)
+                };
+            let held = limiter.state.lock().unwrap();
+            let probe = handle.admission_probe();
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                entered.send(()).unwrap();
+                probe.acquire(&worker_cx, deadline)
+            });
+            waiting.recv().unwrap();
+            // Hold the actual admission primitive while the intent becomes
+            // invalid. Sampling before this wait must never authorize a slot.
+            std::thread::sleep(Duration::from_millis(60));
+            if cancel {
+                cx.cancel_with(CancelKind::User, None);
+            }
+            drop(held);
+            assert_eq!(
+                worker.join().unwrap().unwrap_err(),
+                if cancel {
+                    HttpConnectionAdmissionError::Cancelled
+                } else {
+                    HttpConnectionAdmissionError::DeadlineExpired
+                }
+            );
+            assert_eq!(capture(&handle).connections().in_use(), 0);
+            assert_eq!(capture(&handle).counters().probes_acquired, 0);
+        }
+        let (_limiter, handle) = running(1);
+        let expired = Cx::for_testing_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO),
+        );
+        assert!(
+            !expired.published_cancel_requested(),
+            "deadline refusal does not require a published cancellation"
+        );
+        assert_eq!(
+            handle
+                .admission_probe()
+                .acquire(&expired, Instant::now() + Duration::from_secs(5))
+                .unwrap_err(),
+            HttpConnectionAdmissionError::DeadlineExpired
+        );
+        assert_eq!(capture(&handle).connections().in_use(), 0);
     }
 }
 
@@ -8282,6 +8982,20 @@ pub struct BoundHttpServer {
 }
 
 impl BoundHttpServer {
+    /// Retains bounded listener observations and optional real connection probes.
+    ///
+    /// A bound listener reports `Starting` until `serve` completes startup.
+    /// The returned handle remains usable after shutdown and never writes to
+    /// the MCP transport, installs a health route, or inherits peer credentials.
+    /// Application-supplied runtime clocks must obey [`HttpOperatorHandle`]'s
+    /// bounded, non-reentrant clock contract during deadline reconciliation.
+    #[must_use]
+    pub fn operator_handle(&self) -> HttpOperatorHandle {
+        HttpOperatorHandle {
+            limiter: Arc::clone(&self.connection_limiter),
+        }
+    }
+
     /// Returns the address selected by the operating system for this listener.
     pub fn local_addr(&self) -> McpResult<SocketAddr> {
         self.listener.local_addr().map_err(|error| {
@@ -8337,6 +9051,7 @@ impl BoundHttpServer {
                 u64::try_from(MODERN_HTTP_SESSION_REAP_INTERVAL.as_nanos()).unwrap_or(u64::MAX);
             let mut last_session_reap = cx.now();
             let mut connection_children = HttpConnectionChildren::default();
+            self.connection_limiter.start_serving(cx);
             let result = loop {
                 connection_children.reap_finished();
                 if cx.checkpoint().is_err() {
@@ -8427,6 +9142,8 @@ impl BoundHttpServer {
                     Err(error) => break Err(error),
                 }
             };
+            self.connection_limiter
+                .set_lifecycle(OperatorLifecycle::Stopping);
             connection_shutdown.request();
             // Closing stateless issuance is a latched registry fence, not merely a
             // purge. A handler racing shutdown therefore cannot mint a new
@@ -8496,6 +9213,13 @@ impl BoundHttpServer {
                 }
             }
         }
+    }
+}
+
+impl Drop for BoundHttpServer {
+    fn drop(&mut self) {
+        self.connection_limiter
+            .set_lifecycle(OperatorLifecycle::Stopped);
     }
 }
 
@@ -9433,6 +10157,10 @@ impl Server {
             McpError::internal_error(format!("HTTP listener bind failed: {error}"))
         })?;
         let max_connections = self.http_config.max_connections;
+        let connection_limiter = Arc::new(HttpConnectionLimiter::for_http(
+            max_connections,
+            self.protocol_policy,
+        )?);
         #[cfg(feature = "legacy-2024-11-05")]
         let local_addr = listener.local_addr().map_err(|error| {
             McpError::internal_error(format!("HTTP listener address unavailable: {error}"))
@@ -9453,7 +10181,7 @@ impl Server {
             #[cfg(feature = "legacy-2024-11-05")]
             legacy_sessions: Arc::new(Mutex::new(HashMap::new())),
             modern_sessions: Arc::new(LiveModernHttpSessionRegistryState::new()),
-            connection_limiter: Arc::new(HttpConnectionLimiter::new(max_connections)),
+            connection_limiter,
         })
     }
 
@@ -49736,6 +50464,193 @@ mod lib_unit_tests {
             let shutdown =
                 serve.map_err(|error| format!("connection-limit server failed: {error}"))?;
             require_quiescent_http_shutdown(shutdown, "connection limit").await?;
+            Ok(())
+        });
+    }
+
+    async fn live_http_operator_handoff_probe(
+        cx: &Cx,
+        reject_untransferred: bool,
+    ) -> Result<(), String> {
+        let bound = Server::new("operator-secret-canary", "1.0.0")
+            .protocol_policy(ProtocolPolicy::ModernOnly)
+            .http_config(HttpServerConfig::new().max_connections(1))
+            .build()
+            .bind_http(cx, "127.0.0.1:0")
+            .await
+            .map_err(|error| error.to_string())?;
+        let address = bound.local_addr().map_err(|error| error.to_string())?;
+        let operator = bound.operator_handle();
+        let starting = OperatorSnapshot::capture(&operator).map_err(|error| error.to_string())?;
+        if starting.readiness() != OperatorReadiness::Starting {
+            return Err("binding alone reported a ready serving loop".into());
+        }
+        let observed = operator.clone();
+        let caller = cx.clone();
+        let mut client = cx
+            .spawn(move |client_cx| async move {
+                struct CancelListenerOnDrop(Cx);
+                impl Drop for CancelListenerOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel_with(CancelKind::User, None);
+                    }
+                }
+                let _cancel_listener = CancelListenerOnDrop(caller.clone());
+                let timeout = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if OperatorSnapshot::capture(&observed)
+                        .is_ok_and(|snapshot| snapshot.lifecycle() == OperatorLifecycle::Running)
+                    {
+                        break;
+                    }
+                    if Instant::now() >= timeout {
+                        return Err("HTTP listener did not publish running state".to_owned());
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                let permit = observed
+                    .admission_probe()
+                    .acquire(&client_cx, Instant::now() + Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                let full =
+                    OperatorSnapshot::capture(&observed).map_err(|error| error.to_string())?;
+                if full.readiness() != OperatorReadiness::Ready
+                    || full.connections().reserved != 1
+                    || !full.connections().is_saturated()
+                {
+                    return Err("live probe did not reserve the real last connection slot".into());
+                }
+                if reject_untransferred {
+                    let mut rejected = AsyncTcpStream::connect(address)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let mut bytes = Vec::new();
+                    read_live_http_to_end(
+                        &mut rejected,
+                        &mut bytes,
+                        "untransferred operator slot rejection",
+                    )
+                    .await?;
+                    if !bytes.is_empty() {
+                        return Err("an untransferred probe allowed a native connection".into());
+                    }
+                }
+                permit
+                    .admit_next_connection()
+                    .map_err(|error| error.to_string())?;
+                let mut admitted = AsyncTcpStream::connect(address)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                admitted
+                    .write_all(
+                        b"GET /health HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut response = Vec::new();
+                read_live_http_to_end(
+                    &mut admitted,
+                    &mut response,
+                    "transferred operator connection",
+                )
+                .await?;
+                if !response.starts_with(b"HTTP/1.1 200") {
+                    return Err(format!(
+                        "the reserved native connection did not dispatch: {response:?}"
+                    ));
+                }
+                loop {
+                    if let Ok(snapshot) = OperatorSnapshot::capture(&observed)
+                        && snapshot.connections().in_use() == 0
+                    {
+                        if snapshot.counters().accepted != 1
+                            || snapshot.counters().released != 1
+                            || snapshot.counters().rejected != u64::from(reject_untransferred)
+                        {
+                            return Err(
+                                "native admission/settlement counters did not match the sockets"
+                                    .into(),
+                            );
+                        }
+                        if format!("{snapshot:?}").contains("operator-secret-canary") {
+                            return Err("operator snapshot retained application identity".into());
+                        }
+                        break;
+                    }
+                    if Instant::now() >= timeout {
+                        return Err(
+                            "native connection did not release its transferred reservation".into(),
+                        );
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                observed
+                    .admission_probe()
+                    .acquire(&client_cx, Instant::now() + Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?
+                    .admit_next_connection()
+                    .map_err(|error| error.to_string())?;
+                caller.cancel_with(CancelKind::User, None);
+                Ok::<(), String>(())
+            })
+            .map_err(|error| error.to_string())?;
+        let serving = bound.serve(cx).await;
+        client
+            .join(cx)
+            .await
+            .map_err(|error| format!("operator peer failed: {error:?}"))??;
+        require_quiescent_http_shutdown(
+            serving.map_err(|error| error.to_string())?,
+            "operator connection handoff",
+        )
+        .await?;
+        let stopped = OperatorSnapshot::capture(&operator).map_err(|error| error.to_string())?;
+        if stopped.lifecycle() != OperatorLifecycle::Stopped
+            || stopped.readiness() != OperatorReadiness::NotReady
+            || stopped.connections().in_use() != 0
+            || stopped.counters().shutdown_revoked != 1
+            || stopped.configuration_generation() != starting.configuration_generation()
+        {
+            return Err(
+                "listener shutdown did not revoke its queued reservation in the same generation"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn live_http_operator_transferred_last_slot_runs_native_connection() {
+        run_live_http_test(|cx| async move { live_http_operator_handoff_probe(&cx, false).await });
+    }
+
+    #[test]
+    fn live_http_operator_untransferred_last_slot_rejects_native_connection() {
+        run_live_http_test(|cx| async move { live_http_operator_handoff_probe(&cx, true).await });
+    }
+
+    #[test]
+    fn live_http_operator_dropped_bound_listener_never_reports_ready() {
+        run_live_http_test(|cx| async move {
+            let bound = Server::new("operator-unstarted", "1.0.0")
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| error.to_string())?;
+            let operator = bound.operator_handle();
+            let starting =
+                OperatorSnapshot::capture(&operator).map_err(|error| error.to_string())?;
+            if starting.lifecycle() != OperatorLifecycle::Starting {
+                return Err("unstarted bound listener had a serving lifecycle".into());
+            }
+            drop(bound);
+            let stopped =
+                OperatorSnapshot::capture(&operator).map_err(|error| error.to_string())?;
+            if stopped.lifecycle() != OperatorLifecycle::Stopped
+                || stopped.readiness() != OperatorReadiness::NotReady
+            {
+                return Err("dropping a bound listener did not fence readiness".into());
+            }
             Ok(())
         });
     }

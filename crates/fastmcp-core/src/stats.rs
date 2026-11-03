@@ -4,6 +4,257 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+/// Frozen protocol policy for one observed endpoint generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorProfile {
+    /// Only MCP 2026-07-28 is admitted.
+    Modern,
+    /// Only MCP 2024-11-05 is admitted.
+    Legacy2024,
+    /// The endpoint negotiates between the supported protocol eras.
+    Auto,
+}
+
+/// Lifecycle of the specific contributor named by a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorLifecycle {
+    /// Bound or configured, but its serving future has not entered service.
+    Starting,
+    /// The serving future has completed startup and can admit work.
+    Running,
+    /// New admission is fenced while already admitted work drains.
+    Stopping,
+    /// The listener lifetime has ended; retained children may still settle.
+    Stopped,
+}
+
+/// Structural readiness, independent of time-varying last-slot availability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorReadiness {
+    /// The serving future has not completed startup.
+    Starting,
+    /// The contributor is structurally capable of admitting work.
+    Ready,
+    /// A structural precondition prevents admission.
+    NotReady,
+    /// Shutdown has fenced admission.
+    Stopping,
+}
+
+/// Closed, identity-free reason vocabulary for core listener observations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorReason {
+    /// The listener has not entered its serving loop.
+    StartupPending,
+    /// The configured connection capacity is zero.
+    ConnectionCapacityDisabled,
+    /// All configured connection slots are currently charged.
+    ConnectionCapacitySaturated,
+    /// The listener is draining admitted work.
+    ListenerStopping,
+    /// The listener lifetime has ended.
+    ListenerStopped,
+}
+
+/// Fixed-size connection gauges from the same admission critical section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorConnectionCapacity {
+    /// Immutable maximum number of charged connection slots.
+    pub limit: usize,
+    /// Slots retained by accepted connection work.
+    pub active: usize,
+    /// Slots held by unconsumed admission probes, including queued handoffs.
+    pub reserved: usize,
+}
+
+impl OperatorConnectionCapacity {
+    /// Currently charged slots; snapshots never promise future availability.
+    #[must_use]
+    pub const fn in_use(self) -> usize {
+        self.active.saturating_add(self.reserved)
+    }
+
+    /// Whether every configured slot is currently charged.
+    #[must_use]
+    pub const fn is_saturated(self) -> bool {
+        self.in_use() >= self.limit
+    }
+}
+
+/// Fixed-cardinality, saturating counters for one listener generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperatorConnectionCounters {
+    /// Native connections admitted, including transferred probe reservations.
+    pub accepted: u64,
+    /// Native connections refused by connection admission.
+    pub rejected: u64,
+    /// Probe reservations successfully acquired.
+    pub probes_acquired: u64,
+    /// Charged slots released by connection completion or reservation settlement.
+    pub released: u64,
+    /// Unconsumed reservations reclaimed after their monotonic deadline.
+    pub expired: u64,
+    /// Unconsumed reservations reclaimed after caller cancellation.
+    pub cancelled: u64,
+    /// Unconsumed reservations revoked by listener shutdown.
+    pub shutdown_revoked: u64,
+    /// At least one counter reached its representable ceiling.
+    pub overflowed: bool,
+}
+
+/// Snapshot collection could not immediately copy its bounded contributor state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorSnapshotError {
+    /// Admission currently owns the contributor cell; retry a later observation.
+    Busy,
+}
+
+impl std::fmt::Display for OperatorSnapshotError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("operator snapshot contributor is busy")
+    }
+}
+
+impl std::error::Error for OperatorSnapshotError {}
+
+/// Exporter-neutral source of bounded, typed operational observations.
+///
+/// Capturing a snapshot never reserves admission or invokes protocol dispatch.
+/// Exporters consume the returned value after all contributor locks are released.
+pub trait OperatorSnapshotSource {
+    /// Attempts a non-waiting capture of the contributor's current generation.
+    fn operator_snapshot(&self) -> Result<OperatorSnapshot, OperatorSnapshotError>;
+}
+
+/// Immutable, privacy-safe observation of one HTTP connection-admission generation.
+///
+/// Schema 1 covers HTTP listener lifecycle and connection slots. It makes no
+/// assertion about process-wide executor progress, credentials, durable task
+/// workers, per-request byte budgets, or other contributors not represented here.
+/// In particular, `Ready` may coincide with saturation: only an acquired live
+/// admission permit reserves capacity. No address, peer identity, error text,
+/// request data, wall-clock time, or dynamic label appears in this value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorSnapshot {
+    captured_at: Instant,
+    configuration_generation: u64,
+    profile: OperatorProfile,
+    lifecycle: OperatorLifecycle,
+    readiness: OperatorReadiness,
+    reasons: [Option<OperatorReason>; 2],
+    connections: OperatorConnectionCapacity,
+    counters: OperatorConnectionCounters,
+}
+
+impl OperatorSnapshot {
+    /// Version of the fixed HTTP-listener observation schema.
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    /// Captures through a shipped contributor without acquiring an admission slot.
+    pub fn capture(
+        source: &(impl OperatorSnapshotSource + ?Sized),
+    ) -> Result<Self, OperatorSnapshotError> {
+        source.operator_snapshot()
+    }
+
+    /// Constructs a bounded HTTP-listener observation from one coherent cell.
+    ///
+    /// Contributor implementations must copy these values under the same
+    /// generation/admission synchronization; exporters do not construct live state.
+    #[must_use]
+    pub fn http_connections(
+        captured_at: Instant,
+        configuration_generation: u64,
+        profile: OperatorProfile,
+        lifecycle: OperatorLifecycle,
+        connections: OperatorConnectionCapacity,
+        counters: OperatorConnectionCounters,
+    ) -> Self {
+        let (readiness, reason) = match lifecycle {
+            OperatorLifecycle::Starting => (
+                OperatorReadiness::Starting,
+                Some(OperatorReason::StartupPending),
+            ),
+            OperatorLifecycle::Running if connections.limit == 0 => (
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::ConnectionCapacityDisabled),
+            ),
+            OperatorLifecycle::Running => (OperatorReadiness::Ready, None),
+            OperatorLifecycle::Stopping => (
+                OperatorReadiness::Stopping,
+                Some(OperatorReason::ListenerStopping),
+            ),
+            OperatorLifecycle::Stopped => (
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::ListenerStopped),
+            ),
+        };
+        Self {
+            captured_at,
+            configuration_generation,
+            profile,
+            lifecycle,
+            readiness,
+            reasons: [
+                reason,
+                connections
+                    .is_saturated()
+                    .then_some(OperatorReason::ConnectionCapacitySaturated),
+            ],
+            connections,
+            counters,
+        }
+    }
+
+    /// Monotonic capture instant; not a wall-clock timestamp or portable identity.
+    #[must_use]
+    pub const fn captured_at(&self) -> Instant {
+        self.captured_at
+    }
+
+    /// Opaque process-local identity of the immutable listener configuration.
+    #[must_use]
+    pub const fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    /// Frozen protocol policy of the observed listener.
+    #[must_use]
+    pub const fn profile(&self) -> OperatorProfile {
+        self.profile
+    }
+
+    /// Listener lifecycle at capture.
+    #[must_use]
+    pub const fn lifecycle(&self) -> OperatorLifecycle {
+        self.lifecycle
+    }
+
+    /// Structural connection readiness, independent of saturation.
+    #[must_use]
+    pub const fn readiness(&self) -> OperatorReadiness {
+        self.readiness
+    }
+
+    /// Fixed-size reason set; no peer-controlled strings can be inserted.
+    #[must_use]
+    pub const fn reasons(&self) -> &[Option<OperatorReason>; 2] {
+        &self.reasons
+    }
+
+    /// Connection capacity charged at the same capture generation.
+    #[must_use]
+    pub const fn connections(&self) -> OperatorConnectionCapacity {
+        self.connections
+    }
+
+    /// Fixed counters, with an explicit saturation indicator.
+    #[must_use]
+    pub const fn counters(&self) -> OperatorConnectionCounters {
+        self.counters
+    }
+}
+
 /// Thread-safe server statistics collector.
 #[derive(Debug, Clone)]
 pub struct ServerStats {
@@ -208,6 +459,77 @@ pub struct StatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_snapshot_keeps_structural_readiness_distinct_from_saturation() {
+        let now = Instant::now();
+        for profile in [
+            OperatorProfile::Modern,
+            OperatorProfile::Legacy2024,
+            OperatorProfile::Auto,
+        ] {
+            for (lifecycle, readiness, reason) in [
+                (
+                    OperatorLifecycle::Starting,
+                    OperatorReadiness::Starting,
+                    Some(OperatorReason::StartupPending),
+                ),
+                (OperatorLifecycle::Running, OperatorReadiness::Ready, None),
+                (
+                    OperatorLifecycle::Stopping,
+                    OperatorReadiness::Stopping,
+                    Some(OperatorReason::ListenerStopping),
+                ),
+                (
+                    OperatorLifecycle::Stopped,
+                    OperatorReadiness::NotReady,
+                    Some(OperatorReason::ListenerStopped),
+                ),
+            ] {
+                for reserved in [0, 1] {
+                    let snapshot = OperatorSnapshot::http_connections(
+                        now,
+                        7,
+                        profile,
+                        lifecycle,
+                        OperatorConnectionCapacity {
+                            limit: 1,
+                            active: 0,
+                            reserved,
+                        },
+                        OperatorConnectionCounters::default(),
+                    );
+                    assert_eq!(snapshot.readiness(), readiness);
+                    assert_eq!(snapshot.reasons()[0], reason);
+                    assert_eq!(snapshot.connections().is_saturated(), reserved == 1);
+                    assert_eq!(
+                        snapshot.reasons()[1],
+                        (reserved == 1).then_some(OperatorReason::ConnectionCapacitySaturated)
+                    );
+                    assert_eq!(snapshot.configuration_generation(), 7);
+                    assert_eq!(snapshot.captured_at(), now);
+                    assert_eq!(snapshot.profile(), profile);
+                }
+            }
+            let disabled = OperatorSnapshot::http_connections(
+                now,
+                8,
+                profile,
+                OperatorLifecycle::Running,
+                OperatorConnectionCapacity {
+                    limit: 0,
+                    active: 0,
+                    reserved: 0,
+                },
+                OperatorConnectionCounters::default(),
+            );
+            assert_eq!(disabled.readiness(), OperatorReadiness::NotReady);
+            assert_eq!(
+                disabled.reasons()[0],
+                Some(OperatorReason::ConnectionCapacityDisabled)
+            );
+        }
+    }
 
     #[test]
     fn shared_statistics_keep_success_failure_and_cancellation_distinct() {
