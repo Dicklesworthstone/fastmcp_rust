@@ -187,6 +187,7 @@ pub mod __private {
         pub use fastmcp_server::BoxFuture;
         pub use fastmcp_server::extensions::authoring::{
             ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
+            ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
             ExtensionRegistration,
         };
     }
@@ -3058,12 +3059,12 @@ pub mod modern {
         /// Install a registration with [`super::ServerBuilder::extension`].
         /// Its context exposes negotiated settings and cancellation observation,
         /// and cannot grant access to the runtime, credentials, or raw ingress.
-        /// This initial surface supports typed client-to-server request methods;
-        /// notification authoring remains outside this contract.
+        /// This surface supports typed client-to-server requests and notifications.
         #[cfg(feature = "extension-authoring")]
         pub mod authoring {
             pub use fastmcp_server::extensions::authoring::{
                 ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
+                ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
                 ExtensionRegistration,
             };
         }

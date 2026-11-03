@@ -15035,7 +15035,7 @@ impl Server {
             .ok_or_else(|| McpError::invalid_params("Extension notification is not active"))?;
         // Authorization precedes the user-supplied compatibility resolver and
         // middleware. No earlier request or transport identity activates it.
-        catch_extension_unwind(|| {
+        let authorized = catch_extension_unwind(|| {
             runtime
                 .handlers
                 .authorize_notification(context, id, &notification)
@@ -15102,7 +15102,7 @@ impl Server {
                 }
                 runtime
                     .handlers
-                    .invoke_notification_async(context, &negotiated, id, &notification)
+                    .invoke_notification_async(context, &negotiated, id, &notification, authorized)
                     .await
             });
             let mut timer = std::pin::pin!(asupersync::time::Sleep::new(deadline));

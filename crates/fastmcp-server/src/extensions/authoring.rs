@@ -5,8 +5,9 @@
 //! its request lifetime. Neither the registration nor the handler context grants
 //! access to the registry, raw protocol data, credentials, or an executor.
 //!
-//! This initial surface supports modern client-to-server requests with bilateral
-//! settings. It does not install notification handlers or legacy fallbacks.
+//! Requests use bilateral settings. A notification supplies its own bounded
+//! settings proof in an explicitly registered metadata field on every HTTP
+//! POST. Neither path installs legacy fallbacks or grants transport authority.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -18,9 +19,11 @@ use fastmcp_core::{McpContext, McpError, McpResult, sha256_bounded};
 use fastmcp_protocol::extensions::{
     ExtensionDescriptor as ProtocolDescriptor, ExtensionDescriptorRegistry,
     ExtensionHttpEraDisposition, ExtensionId, ExtensionMethodDescriptor, ExtensionNegotiationError,
-    ExtensionNegotiationResolver, ExtensionSettings, ExtensionSettingsCompatibilityResolver,
-    ExtensionSettingsSchema, MAX_EXTENSION_MEMBER_NAME_BYTES,
-    MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, NegotiatedExtension, ServerExtensionDiscovery,
+    ExtensionNegotiationResolver, ExtensionNotificationDescriptor, ExtensionSettings,
+    ExtensionSettingsCompatibilityResolver, ExtensionSettingsSchema,
+    MAX_EXTENSION_MEMBER_NAME_BYTES, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, NegotiatedExtension,
+    NotificationActivationProofDescriptor, NotificationActivationProofLocation,
+    ServerExtensionDiscovery,
 };
 use fastmcp_protocol::schema::{
     AdmittedSchema, JsonSchemaType, MAX_SCHEMA_INSTANCE_BYTES, SchemaGenerator, admit_final_schema,
@@ -30,12 +33,15 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{ErasedExtensionHandler, ExtensionHandlerRegistry};
+use super::{
+    AuthorizedNotificationPayload, ErasedExtensionHandler, ExtensionHandlerRegistry,
+    NotificationAuthorizer, RegisteredNotificationHandler,
+};
 use crate::BoxFuture;
 
 pub use fastmcp_protocol::{ExtensionDirection, ExtensionFallbackPolicy};
 
-/// Maximum request methods retained by one authoring registration.
+/// Maximum request and notification entries retained by one registration.
 pub const MAX_AUTHORING_METHODS: usize = 64;
 /// Aggregate encoded schema budget for one registration, including settings.
 pub const MAX_AUTHORING_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
@@ -91,6 +97,61 @@ impl ExtensionMethod {
     }
 }
 
+/// An immutable typed notification with current-message activation settings.
+///
+/// The proof is always inside notification-role `params._meta`. Application
+/// parameters are decoded separately, so the settings object cannot supply
+/// application fields or turn request metadata into notification authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionNotification {
+    name: String,
+    parameter_schema_id: String,
+    activation_metadata_key: String,
+}
+
+impl ExtensionNotification {
+    /// Exact extension-owned notification name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Identity of the compiled application-parameter schema.
+    #[must_use]
+    pub fn parameter_schema_id(&self) -> &str {
+        &self.parameter_schema_id
+    }
+
+    /// Exact namespaced key inside `params._meta` carrying client settings.
+    #[must_use]
+    pub fn activation_metadata_key(&self) -> &str {
+        &self.activation_metadata_key
+    }
+
+    /// Direction of this compiled notification entry.
+    #[must_use]
+    pub const fn direction(&self) -> ExtensionDirection {
+        ExtensionDirection::ClientToServer
+    }
+
+    /// Both current-message and configured server settings must be compatible.
+    #[must_use]
+    pub const fn fallback(&self) -> ExtensionFallbackPolicy {
+        ExtensionFallbackPolicy::RejectOneSided
+    }
+
+    fn protocol_notification(&self) -> ExtensionNotificationDescriptor {
+        ExtensionNotificationDescriptor {
+            name: self.name.clone(),
+            direction: self.direction(),
+            activation_proof: Some(NotificationActivationProofDescriptor::SelfContained {
+                location: NotificationActivationProofLocation::Metadata,
+                key: self.activation_metadata_key.clone(),
+            }),
+        }
+    }
+}
+
 /// The sealed, immutable declaration supplied to an extension handler.
 ///
 /// Construction belongs to [`ExtensionBuilder`]. Its ordered method entries and
@@ -103,6 +164,7 @@ pub struct ExtensionDescriptor {
     client_settings_schema_id: String,
     server_settings_schema_id: String,
     methods: Vec<ExtensionMethod>,
+    notification: Option<ExtensionNotification>,
 }
 
 impl ExtensionDescriptor {
@@ -134,6 +196,14 @@ impl ExtensionDescriptor {
     #[must_use]
     pub fn methods(&self) -> &[ExtensionMethod] {
         &self.methods
+    }
+
+    /// The optional notification declared alongside this extension's requests.
+    ///
+    /// The protocol registry supports one notification per extension descriptor.
+    #[must_use]
+    pub const fn notification(&self) -> Option<&ExtensionNotification> {
+        self.notification.as_ref()
     }
 }
 
@@ -271,6 +341,124 @@ where
     }
 }
 
+/// A borrowed notification invocation without runtime or credential authority.
+///
+/// The framework constructs it only after current-message proof admission,
+/// transport authentication, the explicit operation policy, settings negotiation,
+/// and parameter-schema validation. No request/discovery from an earlier
+/// exchange can activate this context. It cannot be constructed or cloned by
+/// application code, retained beyond the callback, or used to send a response.
+///
+/// ```compile_fail
+/// use fastmcp_server::extensions::authoring::ExtensionNotificationContext;
+/// fn raw_runtime(context: ExtensionNotificationContext<'_, ()>) {
+///     let _ = context.cx();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use fastmcp_server::extensions::authoring::ExtensionNotificationContext;
+/// fn credentials(context: ExtensionNotificationContext<'_, ()>) {
+///     let _ = context.auth();
+/// }
+/// ```
+pub struct ExtensionNotificationContext<'a, Settings> {
+    context: &'a McpContext,
+    descriptor: &'a ExtensionDescriptor,
+    notification: &'a ExtensionNotification,
+    settings: &'a Settings,
+}
+
+impl<Settings> ExtensionNotificationContext<'_, Settings> {
+    /// Frozen declaration admitted for this invocation.
+    #[must_use]
+    pub const fn descriptor(&self) -> &ExtensionDescriptor {
+        self.descriptor
+    }
+
+    /// Typed settings resolved from this notification's own activation proof.
+    #[must_use]
+    pub const fn settings(&self) -> &Settings {
+        self.settings
+    }
+
+    /// Exact admitted notification method.
+    #[must_use]
+    pub fn method(&self) -> &str {
+        self.notification.name()
+    }
+
+    /// Immutable schema, direction, and activation-proof metadata.
+    #[must_use]
+    pub const fn notification_descriptor(&self) -> &ExtensionNotification {
+        self.notification
+    }
+
+    /// Checks cancellation/deadline and charges the ordinary request checkpoint.
+    pub fn checkpoint(&self) -> McpResult<()> {
+        self.context
+            .checkpoint()
+            .map_err(|_| McpError::request_cancelled())
+    }
+
+    /// Whether this notification's request lifetime is no longer live.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.context.is_cancelled()
+    }
+
+    /// Whether the request's own deadline has elapsed.
+    #[must_use]
+    pub fn deadline_expired(&self) -> bool {
+        self.context.deadline_expired()
+    }
+
+    /// Remaining monotonic lifetime; this cannot extend the request deadline.
+    #[must_use]
+    pub fn remaining_time(&self) -> Option<Duration> {
+        self.context.budget().deadline.map(|deadline| {
+            Duration::from_nanos(
+                deadline
+                    .as_nanos()
+                    .saturating_sub(self.context.cx().now().as_nanos()),
+            )
+        })
+    }
+}
+
+/// An asynchronous notification callback polled on the caller-owned runtime.
+///
+/// Completion produces no JSON-RPC result. The HTTP acknowledgement is emitted
+/// by the existing transport only after this callback and its request lifetime
+/// have settled; the callback receives no write or detached-task capability.
+pub trait ExtensionNotificationHandler<Notification, Settings>: Send + Sync {
+    /// Executes one admitted notification using the sealed borrowed context.
+    fn handle<'a>(
+        &'a self,
+        context: ExtensionNotificationContext<'a, Settings>,
+        notification: Notification,
+    ) -> BoxFuture<'a, McpResult<()>>;
+}
+
+impl<Notification, Settings, Handler> ExtensionNotificationHandler<Notification, Settings>
+    for Handler
+where
+    Handler: for<'a> Fn(
+            ExtensionNotificationContext<'a, Settings>,
+            Notification,
+        ) -> BoxFuture<'a, McpResult<()>>
+        + Send
+        + Sync,
+{
+    fn handle<'a>(
+        &'a self,
+        context: ExtensionNotificationContext<'a, Settings>,
+        notification: Notification,
+    ) -> BoxFuture<'a, McpResult<()>> {
+        self(context, notification)
+    }
+}
+
 #[derive(Clone)]
 struct CompiledSchema {
     admitted: Arc<AdmittedSchema>,
@@ -286,6 +474,12 @@ type HandlerFactory =
 struct PendingMethod {
     parameter_digest: [u8; 32],
     result_digest: [u8; 32],
+    factory: Box<HandlerFactory>,
+}
+
+struct PendingNotification {
+    parameter_digest: [u8; 32],
+    authorize: Box<NotificationAuthorizer>,
     factory: Box<HandlerFactory>,
 }
 
@@ -305,6 +499,7 @@ pub struct ExtensionBuilder<ClientSettings, ServerSettings, Settings> {
     schema_bytes: usize,
     schema_identities: BTreeMap<String, [u8; 32]>,
     pending: Vec<PendingMethod>,
+    pending_notification: Option<PendingNotification>,
     marker: PhantomData<fn(ClientSettings, ServerSettings) -> Settings>,
 }
 
@@ -398,6 +593,7 @@ where
                 client_settings_schema_id,
                 server_settings_schema_id,
                 methods: Vec::new(),
+                notification: None,
             },
             server_settings,
             resolve,
@@ -407,6 +603,7 @@ where
             schema_bytes,
             schema_identities,
             pending: Vec::new(),
+            pending_notification: None,
             marker: PhantomData,
         })
     }
@@ -426,9 +623,11 @@ impl<ClientSettings, ServerSettings, Settings>
     /// The registration has no public registry/codec access. Install it with
     /// the server builder before building/freezing the server.
     pub fn build(self) -> McpResult<ExtensionRegistration> {
-        let first = self.descriptor.methods.first().ok_or_else(|| {
-            McpError::invalid_params("extension authoring requires at least one request method")
-        })?;
+        if self.descriptor.methods.is_empty() && self.descriptor.notification.is_none() {
+            return Err(McpError::invalid_params(
+                "extension authoring requires a request or notification method",
+            ));
+        }
         let digest = self.contract_digest()?;
         let digest = hex_digest(&digest);
         let protocol = ProtocolDescriptor {
@@ -446,8 +645,12 @@ impl<ClientSettings, ServerSettings, Settings>
                 version: self.descriptor.version,
                 fallback: ExtensionFallbackPolicy::RejectOneSided,
             },
-            method: Some(first.protocol_method()),
-            notification: None,
+            method: self.descriptor.methods.first().map(ExtensionMethod::protocol_method),
+            notification: self
+                .descriptor
+                .notification
+                .as_ref()
+                .map(ExtensionNotification::protocol_notification),
             result_discriminator: None,
             routing_headers: Vec::new(),
             stdio_correlation: None,
@@ -481,6 +684,23 @@ impl<ClientSettings, ServerSettings, Settings>
                     McpError::invalid_params("extension handler registration was rejected")
                 })?;
         }
+        if let Some(pending) = self.pending_notification {
+            let notification = descriptor.notification.as_ref().ok_or_else(|| {
+                McpError::internal_error("typed notification descriptor is unavailable")
+            })?;
+            handlers
+                .register_notification_handler(
+                    descriptor.id.clone(),
+                    notification.name.clone(),
+                    RegisteredNotificationHandler {
+                        authorize: pending.authorize,
+                        handler: (pending.factory)(Arc::clone(&descriptor)),
+                    },
+                )
+                .map_err(|_| {
+                    McpError::invalid_params("extension notification registration was rejected")
+                })?;
+        }
         let discovery = ServerExtensionDiscovery {
             extensions: BTreeMap::from([(descriptor.id.clone(), self.server_settings)]),
         };
@@ -501,7 +721,9 @@ impl<ClientSettings, ServerSettings, Settings>
         parameter_schema_id: String,
         result_schema_id: String,
     ) -> McpResult<(ExtensionMethod, CompiledSchema, CompiledSchema, usize)> {
-        if self.pending.len() >= MAX_AUTHORING_METHODS {
+        if self.pending.len() + usize::from(self.pending_notification.is_some())
+            >= MAX_AUTHORING_METHODS
+        {
             return Err(McpError::invalid_params("extension method budget exceeded"));
         }
         let method = checked_identity(method)?;
@@ -521,6 +743,11 @@ impl<ClientSettings, ServerSettings, Settings>
             .methods
             .iter()
             .any(|entry| entry.name == method)
+            || self
+                .descriptor
+                .notification
+                .as_ref()
+                .is_some_and(|entry| entry.name == method)
         {
             return Err(McpError::invalid_params(
                 "duplicate extension request method",
@@ -567,6 +794,66 @@ impl<ClientSettings, ServerSettings, Settings>
         ))
     }
 
+    fn prepare_notification<Notification: JsonSchemaType>(
+        &self,
+        method: String,
+        parameter_schema_id: String,
+        activation_metadata_key: String,
+    ) -> McpResult<(ExtensionNotification, CompiledSchema, usize)> {
+        if self.pending_notification.is_some() {
+            return Err(McpError::invalid_params(
+                "extension authoring supports one notification per descriptor",
+            ));
+        }
+        if self.pending.len() >= MAX_AUTHORING_METHODS {
+            return Err(McpError::invalid_params("extension method budget exceeded"));
+        }
+        let method = checked_identity(method)?;
+        let activation_metadata_key = checked_identity(activation_metadata_key)?;
+        let prefix = self
+            .descriptor
+            .id
+            .as_str()
+            .split_once('/')
+            .map(|(prefix, _)| prefix);
+        for name in [&method, &activation_metadata_key] {
+            if name.split_once('/').map(|(prefix, _)| prefix) != prefix || name.ends_with('/') {
+                return Err(McpError::invalid_params(
+                    "extension notification and activation key must use their owning namespace",
+                ));
+            }
+        }
+        if self
+            .descriptor
+            .methods
+            .iter()
+            .any(|entry| entry.name == method)
+        {
+            return Err(McpError::invalid_params("duplicate extension method name"));
+        }
+        let parameter_schema_id = checked_identity(parameter_schema_id)?;
+        let parameter_schema = compile_schema::<Notification>()?;
+        if self
+            .schema_identities
+            .get(&parameter_schema_id)
+            .is_some_and(|existing| existing != &parameter_schema.digest)
+        {
+            return Err(McpError::invalid_params(
+                "extension schema identity names conflicting schemas",
+            ));
+        }
+        let total = add_schema_bytes(self.schema_bytes, parameter_schema.bytes)?;
+        Ok((
+            ExtensionNotification {
+                name: method,
+                parameter_schema_id,
+                activation_metadata_key,
+            },
+            parameter_schema,
+            total,
+        ))
+    }
+
     fn contract_digest(&self) -> McpResult<[u8; 32]> {
         let methods: Vec<_> = self
             .descriptor
@@ -585,6 +872,22 @@ impl<ClientSettings, ServerSettings, Settings>
                 )
             })
             .collect();
+        let notification = self
+            .descriptor
+            .notification
+            .as_ref()
+            .zip(self.pending_notification.as_ref())
+            .map(|(notification, pending)| {
+                (
+                    notification.name.as_str(),
+                    "client-to-server",
+                    notification.parameter_schema_id.as_str(),
+                    "metadata",
+                    notification.activation_metadata_key.as_str(),
+                    "reject-one-sided",
+                    pending.parameter_digest,
+                )
+            });
         let subject = (
             "fastmcp.ext-dev.authoring-contract.v1",
             self.descriptor.id.as_str(),
@@ -595,6 +898,7 @@ impl<ClientSettings, ServerSettings, Settings>
             self.server_schema.digest,
             self.effective_schema.digest,
             methods,
+            notification,
         );
         let bytes = encode_bytes(&subject, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)?;
         sha256_bounded(&bytes, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)
@@ -725,6 +1029,114 @@ where
         self.schema_bytes = total;
         Ok(self)
     }
+
+    /// Registers one typed asynchronous client-to-server HTTP notification.
+    ///
+    /// Every message supplies this extension's typed client settings in the
+    /// exact `params._meta[activation_metadata_key]` field. The framework admits
+    /// that proof, authenticates the transport, validates application parameters,
+    /// and runs the explicit `authorize` policy before settings negotiation and
+    /// handler dispatch. The policy receives only typed application parameters;
+    /// endpoint identity/scope rules remain part of transport authorization.
+    /// There is no implicit public allow policy and no prior-request activation.
+    ///
+    /// The handler receives a sealed notification context and returns `()`;
+    /// normal HTTP dispatch emits an empty 202 only after scoped completion.
+    /// This registration does not enable legacy or unsolicited stdio ingress.
+    pub fn typed_notification<Notification, Handler, Authorize>(
+        mut self,
+        method: impl Into<String>,
+        parameter_schema_id: impl Into<String>,
+        activation_metadata_key: impl Into<String>,
+        authorize: Authorize,
+        handler: Handler,
+    ) -> McpResult<Self>
+    where
+        Notification: DeserializeOwned + JsonSchemaType + Send + 'static,
+        Handler: ExtensionNotificationHandler<Notification, Settings> + 'static,
+        Authorize: Fn(&Notification) -> McpResult<()> + Send + Sync + 'static,
+    {
+        let (notification, parameter_schema, total) = self.prepare_notification::<Notification>(
+            method.into(),
+            parameter_schema_id.into(),
+            activation_metadata_key.into(),
+        )?;
+        let policy_schema = Arc::clone(&parameter_schema.admitted);
+        let effective_schema = Arc::clone(&self.effective_schema.admitted);
+        retain_schema_identity(
+            &mut self.schema_identities,
+            &notification.parameter_schema_id,
+            parameter_schema.digest,
+        )?;
+        self.pending_notification = Some(PendingNotification {
+            parameter_digest: parameter_schema.digest,
+            authorize: notification_authorizer::<Notification, Authorize>(policy_schema, authorize),
+            factory: Box::new(move |descriptor| {
+                Box::new(TypedAsyncNotification::<Notification, Settings, Handler> {
+                    binding: NotificationBinding {
+                        descriptor,
+                        effective_schema,
+                    },
+                    handler,
+                    marker: PhantomData,
+                })
+            }),
+        });
+        self.descriptor.notification = Some(notification);
+        self.schema_bytes = total;
+        Ok(self)
+    }
+
+    /// Registers a synchronous notification with the same admission and policy.
+    ///
+    /// The callback still runs inside the ordinary asynchronous HTTP request
+    /// lifetime. No response value, runtime bridge, or detached worker is added.
+    pub fn typed_notification_sync<Notification, Handler, Authorize>(
+        mut self,
+        method: impl Into<String>,
+        parameter_schema_id: impl Into<String>,
+        activation_metadata_key: impl Into<String>,
+        authorize: Authorize,
+        handler: Handler,
+    ) -> McpResult<Self>
+    where
+        Notification: DeserializeOwned + JsonSchemaType + Send + 'static,
+        Handler: for<'a> Fn(ExtensionNotificationContext<'a, Settings>, Notification) -> McpResult<()>
+            + Send
+            + Sync
+            + 'static,
+        Authorize: Fn(&Notification) -> McpResult<()> + Send + Sync + 'static,
+    {
+        let (notification, parameter_schema, total) = self.prepare_notification::<Notification>(
+            method.into(),
+            parameter_schema_id.into(),
+            activation_metadata_key.into(),
+        )?;
+        let policy_schema = Arc::clone(&parameter_schema.admitted);
+        let effective_schema = Arc::clone(&self.effective_schema.admitted);
+        retain_schema_identity(
+            &mut self.schema_identities,
+            &notification.parameter_schema_id,
+            parameter_schema.digest,
+        )?;
+        self.pending_notification = Some(PendingNotification {
+            parameter_digest: parameter_schema.digest,
+            authorize: notification_authorizer::<Notification, Authorize>(policy_schema, authorize),
+            factory: Box::new(move |descriptor| {
+                Box::new(TypedSyncNotification::<Notification, Settings, Handler> {
+                    binding: NotificationBinding {
+                        descriptor,
+                        effective_schema,
+                    },
+                    handler,
+                    marker: PhantomData,
+                })
+            }),
+        });
+        self.descriptor.notification = Some(notification);
+        self.schema_bytes = total;
+        Ok(self)
+    }
 }
 
 /// One-shot installation produced by a typed authoring builder.
@@ -799,18 +1211,7 @@ impl HandlerBinding {
                 "extension handler has no matching admitted descriptor",
             ));
         }
-        let Value::Object(mut parameters) = parameters else {
-            return Err(McpError::invalid_params(
-                "extension request parameters must be an object",
-            ));
-        };
-        parameters.remove("_meta");
-        let parameters = Value::Object(parameters);
-        self.parameter_schema.validate(&parameters).map_err(|_| {
-            McpError::invalid_params("extension request does not satisfy its parameter schema")
-        })?;
-        let request = serde_json::from_value(parameters)
-            .map_err(|_| McpError::invalid_params("extension request typed decoding failed"))?;
+        let request = decode_parameters(context, &self.parameter_schema, parameters)?;
         let settings = decode_settings(
             negotiated.effective_settings().settings(),
             &self.effective_schema,
@@ -932,6 +1333,166 @@ where
         parameters: Value,
     ) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move { self.invoke_admitted(context, negotiated, parameters) })
+    }
+}
+
+fn decode_parameters<Parameters: DeserializeOwned>(
+    context: &McpContext,
+    schema: &AdmittedSchema,
+    parameters: Value,
+) -> McpResult<Parameters> {
+    ensure_live(context)?;
+    let Value::Object(mut parameters) = parameters else {
+        return Err(McpError::invalid_params(
+            "extension request parameters must be an object",
+        ));
+    };
+    parameters.remove("_meta");
+    let parameters = Value::Object(parameters);
+    schema.validate(&parameters).map_err(|_| {
+        McpError::invalid_params("extension request does not satisfy its parameter schema")
+    })?;
+    let typed = serde_json::from_value(parameters)
+        .map_err(|_| McpError::invalid_params("extension request typed decoding failed"))?;
+    ensure_live(context)?;
+    Ok(typed)
+}
+
+fn notification_authorizer<Notification, Authorize>(
+    schema: Arc<AdmittedSchema>,
+    authorize: Authorize,
+) -> Box<NotificationAuthorizer>
+where
+    Notification: DeserializeOwned + Send + 'static,
+    Authorize: Fn(&Notification) -> McpResult<()> + Send + Sync + 'static,
+{
+    Box::new(
+        move |context, parameters| -> McpResult<AuthorizedNotificationPayload> {
+            let notification = decode_parameters(context, &schema, parameters.clone())?;
+            authorize(&notification)?;
+            ensure_live(context)?;
+            Ok(Some(Box::new(notification)))
+        },
+    )
+}
+
+struct NotificationBinding {
+    descriptor: Arc<ExtensionDescriptor>,
+    effective_schema: Arc<AdmittedSchema>,
+}
+
+impl NotificationBinding {
+    fn prepare<Notification: Send + 'static, Settings: DeserializeOwned>(
+        &self,
+        context: &McpContext,
+        negotiated: &NegotiatedExtension,
+        authorized: AuthorizedNotificationPayload,
+    ) -> McpResult<(Notification, Settings)> {
+        ensure_live(context)?;
+        if negotiated.id() != &self.descriptor.id {
+            return Err(McpError::invalid_request(
+                "extension notification has no matching admitted descriptor",
+            ));
+        }
+        let notification = authorized
+            .and_then(|value| value.downcast::<Notification>().ok())
+            .ok_or_else(|| {
+                McpError::invalid_request(
+                    "extension notification requires its authorized typed payload",
+                )
+            })?;
+        let settings = decode_settings(
+            negotiated.effective_settings().settings(),
+            &self.effective_schema,
+        )?;
+        ensure_live(context)?;
+        Ok((*notification, settings))
+    }
+
+    fn context<'a, Settings>(
+        &'a self,
+        context: &'a McpContext,
+        settings: &'a Settings,
+    ) -> McpResult<ExtensionNotificationContext<'a, Settings>> {
+        let notification = self.descriptor.notification.as_ref().ok_or_else(|| {
+            McpError::internal_error("typed notification descriptor is unavailable")
+        })?;
+        Ok(ExtensionNotificationContext {
+            context,
+            descriptor: &self.descriptor,
+            notification,
+            settings,
+        })
+    }
+}
+
+struct TypedAsyncNotification<Notification, Settings, Handler> {
+    binding: NotificationBinding,
+    handler: Handler,
+    marker: PhantomData<fn(Notification, Settings)>,
+}
+
+impl<Notification, Settings, Handler> ErasedExtensionHandler
+    for TypedAsyncNotification<Notification, Settings, Handler>
+where
+    Notification: DeserializeOwned + Send + 'static,
+    Settings: DeserializeOwned + Send + Sync + 'static,
+    Handler: ExtensionNotificationHandler<Notification, Settings>,
+{
+    fn invoke(&self, _context: &McpContext, _parameters: Value) -> McpResult<Value> {
+        Err(unbound_handler())
+    }
+
+    fn invoke_authorized_notification_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        _parameters: &'a Value,
+        authorized: AuthorizedNotificationPayload,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        Box::pin(async move {
+            let (notification, settings) = self.binding.prepare(context, negotiated, authorized)?;
+            self.handler
+                .handle(self.binding.context(context, &settings)?, notification)
+                .await?;
+            ensure_live(context)?;
+            Ok(Value::Null)
+        })
+    }
+}
+
+struct TypedSyncNotification<Notification, Settings, Handler> {
+    binding: NotificationBinding,
+    handler: Handler,
+    marker: PhantomData<fn(Notification, Settings)>,
+}
+
+impl<Notification, Settings, Handler> ErasedExtensionHandler
+    for TypedSyncNotification<Notification, Settings, Handler>
+where
+    Notification: DeserializeOwned + Send + 'static,
+    Settings: DeserializeOwned,
+    Handler: for<'a> Fn(ExtensionNotificationContext<'a, Settings>, Notification) -> McpResult<()>
+        + Send
+        + Sync,
+{
+    fn invoke(&self, _context: &McpContext, _parameters: Value) -> McpResult<Value> {
+        Err(unbound_handler())
+    }
+
+    fn invoke_authorized_notification_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        _parameters: &'a Value,
+        authorized: AuthorizedNotificationPayload,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        Box::pin(async move {
+            let (notification, settings) = self.binding.prepare(context, negotiated, authorized)?;
+            (self.handler)(self.binding.context(context, &settings)?, notification)?;
+            ensure_live(context)?;
+            Ok(Value::Null)
+        })
     }
 }
 
@@ -1714,6 +2275,504 @@ mod tests {
             "official methods are unavailable to application authoring"
         );
         ordinary_registration(builder());
+    }
+
+    const NOTIFICATION: &str = "dev.example/changed";
+    const ACTIVATION: &str = "dev.example/activation";
+
+    fn notification_frame(value: i64, scale: u32) -> JsonRpcRequest {
+        JsonRpcRequest::notification(
+            NOTIFICATION,
+            Some(json!({"value": value, "_meta": {(ACTIVATION): {"scale": scale}}})),
+        )
+    }
+
+    fn notification_registration(
+        calls: Arc<AtomicUsize>,
+        authorized: Arc<AtomicUsize>,
+    ) -> ExtensionRegistration {
+        builder()
+            .typed_notification_sync::<Input, _, _>(
+                NOTIFICATION,
+                "notification-input-v1",
+                ACTIVATION,
+                move |input| {
+                    authorized.fetch_add(1, Ordering::SeqCst);
+                    if input.value == 13 {
+                        return Err(McpError::new(
+                            McpErrorCode::ResourceForbidden,
+                            "operation denied",
+                        ));
+                    }
+                    Ok(())
+                },
+                move |context, input| {
+                    context.checkpoint()?;
+                    assert_eq!(context.descriptor().id(), ID);
+                    assert_eq!(context.method(), NOTIFICATION);
+                    assert_eq!(
+                        context.notification_descriptor().activation_metadata_key(),
+                        ACTIVATION
+                    );
+                    assert_eq!(
+                        context.notification_descriptor().direction(),
+                        ExtensionDirection::ClientToServer
+                    );
+                    assert_eq!(
+                        context.notification_descriptor().parameter_schema_id(),
+                        "notification-input-v1"
+                    );
+                    assert!(!context.is_cancelled());
+                    assert!(!context.deadline_expired());
+                    calls.fetch_add(
+                        usize::try_from(input.value).expect("schema bounds nonnegative input")
+                            * usize::try_from(context.settings().scale).expect("bounded scale"),
+                        Ordering::SeqCst,
+                    );
+                    Ok(())
+                },
+            )
+            .expect("typed notification installs")
+            .build()
+            .expect("notification-only registration seals")
+    }
+
+    impl Harness {
+        async fn notify(&mut self, notification: &JsonRpcRequest) -> McpResult<()> {
+            let settings = self
+                .handlers
+                .descriptor_registry()
+                .notification_activation_settings(
+                    &self.id,
+                    &notification.method,
+                    notification.params.as_ref().unwrap_or(&Value::Null),
+                )
+                .map_err(|_| McpError::invalid_params("invalid notification activation"))?;
+            let context = self.context.clone();
+            let authorized =
+                self.handlers
+                    .authorize_notification(&context, &self.id, notification)?;
+            let negotiated = self
+                .negotiate(Value::Object(settings.as_object().clone()))
+                .map_err(|_| McpError::invalid_params("incompatible notification settings"))?;
+            self.handlers
+                .invoke_notification_async(
+                    &context,
+                    &negotiated,
+                    &self.id,
+                    notification,
+                    authorized,
+                )
+                .await
+        }
+    }
+
+    #[test]
+    fn typed_notification_authoring_admits_current_proof_and_settings() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let mut harness = Harness::new(notification_registration(
+            Arc::clone(&calls),
+            Arc::clone(&authorized),
+        ));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        harness.context = McpContext::new(
+            runtime.request_cx_with_budget(asupersync::Budget::default()),
+            41,
+        );
+        runtime.block_on(async {
+            harness
+                .notify(&notification_frame(7, 3))
+                .await
+                .expect("first proof admits");
+            harness
+                .notify(&notification_frame(7, 2))
+                .await
+                .expect("fresh settings are used");
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 35);
+        assert_eq!(authorized.load(Ordering::SeqCst), 2);
+        let notification = harness
+            .handlers
+            .descriptor_registry()
+            .notification_descriptor(&harness.id, NOTIFICATION)
+            .unwrap();
+        assert_eq!(notification.direction, ExtensionDirection::ClientToServer);
+        assert!(
+            harness
+                .handlers
+                .descriptor_registry()
+                .method_descriptor(&harness.id, NOTIFICATION)
+                .is_none()
+        );
+        let negotiated = harness.negotiate(json!({"scale": 2})).unwrap();
+        assert!(
+            negotiated
+                .admit_notification(
+                    harness.handlers.descriptor_registry(),
+                    ProtocolEra::Legacy2024,
+                    &harness.id,
+                    NOTIFICATION,
+                    ExtensionDirection::ClientToServer,
+                )
+                .is_err()
+        );
+        assert!(
+            negotiated
+                .admit_notification(
+                    harness.handlers.descriptor_registry(),
+                    ProtocolEra::Modern2026,
+                    &harness.id,
+                    NOTIFICATION,
+                    ExtensionDirection::ServerToClient,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn typed_notification_authoring_rejects_invalid_activation_before_effects() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let mut harness = Harness::new(notification_registration(
+            Arc::clone(&calls),
+            Arc::clone(&authorized),
+        ));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        harness.context = McpContext::new(
+            runtime.request_cx_with_budget(asupersync::Budget::default()),
+            41,
+        );
+        runtime.block_on(async {
+            harness.notify(&notification_frame(1, 1)).await.unwrap();
+            let baseline = notification_frame(7, 2);
+            let mut missing = baseline.clone();
+            missing.params.as_mut().unwrap()["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove(ACTIVATION);
+            let mut request_shaped = baseline.clone();
+            request_shaped.id = Some(42_i64.into());
+            let mut wrong_method = baseline.clone();
+            wrong_method.method = "dev.example/unregistered".to_owned();
+            let mut bad_type = baseline.clone();
+            bad_type.params.as_mut().unwrap()["value"] = json!("payload-canary");
+            let mut extra = baseline.clone();
+            extra.params.as_mut().unwrap()["unknown"] = json!(true);
+            let mut wrong_proof = baseline.clone();
+            wrong_proof.params.as_mut().unwrap()["_meta"][ACTIVATION] = json!({"scale":"bad"});
+            let mut oversized = baseline.clone();
+            oversized.params.as_mut().unwrap()["_meta"][ACTIVATION]["padding"] =
+                json!("x".repeat(MAX_AUTHORING_SETTINGS_BYTES));
+            for rejected in [
+                missing,
+                request_shaped,
+                wrong_method,
+                bad_type,
+                extra,
+                wrong_proof,
+                oversized,
+                notification_frame(101, 2),
+                notification_frame(7, 5),
+                notification_frame(13, 2),
+            ] {
+                let before = calls.load(Ordering::SeqCst);
+                assert!(harness.notify(&rejected).await.is_err(), "{rejected:?}");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    before,
+                    "refusal invokes no handler"
+                );
+                harness
+                    .notify(&notification_frame(1, 1))
+                    .await
+                    .expect("same owner remains usable");
+            }
+            let before = calls.load(Ordering::SeqCst);
+            assert!(harness.context.request_cancellation().cancel());
+            assert!(harness.notify(&baseline).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+        });
+    }
+
+    fn inert_notification(builder: Builder, key: &str) -> McpResult<Builder> {
+        builder.typed_notification_sync::<Input, _, _>(
+            NOTIFICATION,
+            "input-v1",
+            key,
+            |_| Ok(()),
+            |context, _| context.checkpoint(),
+        )
+    }
+
+    #[test]
+    fn typed_notification_authoring_bounds_and_binds_contract() {
+        let baseline = receipt(
+            inert_notification(builder(), ACTIVATION)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(
+            baseline,
+            receipt(
+                inert_notification(builder(), ACTIVATION)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            )
+        );
+        assert_ne!(
+            baseline,
+            receipt(
+                inert_notification(builder(), "dev.example/another-proof")
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            )
+        );
+        assert_ne!(
+            baseline,
+            receipt(
+                inert_notification(builder_version(2), ACTIVATION)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+            )
+        );
+        assert!(inert_notification(builder(), "foreign.example/activation").is_err());
+        assert!(
+            inert_notification(
+                inert_notification(builder(), ACTIVATION).unwrap(),
+                ACTIVATION
+            )
+            .is_err()
+        );
+
+        let different_schema = builder()
+            .typed_notification_sync::<TighterInput, _, _>(
+                NOTIFICATION,
+                "input-v1",
+                ACTIVATION,
+                |_| Ok(()),
+                |context, _| context.checkpoint(),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_ne!(
+            baseline,
+            receipt(different_schema),
+            "same schema name cannot conceal new bounds"
+        );
+
+        for request_count in [MAX_AUTHORING_METHODS - 1, MAX_AUTHORING_METHODS] {
+            let mut candidate = builder();
+            for index in 0..request_count {
+                candidate = candidate
+                    .typed_request_sync::<Input, Output, _>(
+                        format!("dev.example/request-{index}"),
+                        "input-v1",
+                        "output-v1",
+                        multiply,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                inert_notification(candidate, ACTIVATION).is_ok(),
+                request_count < MAX_AUTHORING_METHODS
+            );
+        }
+        let mut candidate = inert_notification(builder(), ACTIVATION).unwrap();
+        for index in 0..MAX_AUTHORING_METHODS - 1 {
+            candidate = candidate
+                .typed_request_sync::<Input, Output, _>(
+                    format!("dev.example/request-{index}"),
+                    "input-v1",
+                    "output-v1",
+                    multiply,
+                )
+                .unwrap();
+        }
+        assert!(
+            candidate
+                .typed_request_sync::<Input, Output, _>(
+                    "dev.example/overflow",
+                    "input-v1",
+                    "output-v1",
+                    multiply,
+                )
+                .is_err(),
+            "notification also charges the shared entry budget"
+        );
+    }
+
+    #[test]
+    fn typed_notification_authoring_preserves_request_registration() {
+        let combined = inert_notification(builder(), ACTIVATION)
+            .unwrap()
+            .typed_request_sync::<Input, Output, _>(METHOD, "input-v1", "output-v1", multiply)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(combined.descriptor().methods().len(), 1);
+        assert_eq!(
+            combined.descriptor().notification().unwrap().name(),
+            NOTIFICATION
+        );
+        let mut harness = Harness::new(combined);
+        assert_eq!(
+            harness.invoke(json!({"value": 3}), 2).unwrap(),
+            json!({"product": 6})
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime
+            .block_on(harness.notify(&notification_frame(3, 2)))
+            .unwrap();
+        let wrong_envelope =
+            JsonRpcRequest::new(NOTIFICATION, notification_frame(3, 2).params, 41_i64);
+        let negotiated = harness.negotiate(json!({"scale":2})).unwrap();
+        assert!(
+            harness
+                .handlers
+                .invoke(
+                    &harness.context,
+                    &negotiated,
+                    ProtocolEra::Modern2026,
+                    &harness.id,
+                    &wrong_envelope
+                )
+                .is_err()
+        );
+        assert!(
+            inert_notification(builder(), ACTIVATION)
+                .unwrap()
+                .typed_request_sync::<Input, Output, _>(
+                    NOTIFICATION,
+                    "input-v1",
+                    "output-v1",
+                    multiply,
+                )
+                .is_err(),
+            "request and notification names cannot alias"
+        );
+    }
+
+    #[test]
+    fn typed_notification_authoring_authorizes_exact_decoded_value_once() {
+        static DECODED: AtomicUsize = AtomicUsize::new(0);
+
+        struct StatefulInput {
+            value: i64,
+        }
+
+        impl<'de> Deserialize<'de> for StatefulInput {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let input = Input::deserialize(deserializer)?;
+                let prior = DECODED.fetch_add(1, Ordering::SeqCst);
+                Ok(Self {
+                    value: input.value + i64::try_from(prior).expect("bounded test decoding count"),
+                })
+            }
+        }
+
+        impl JsonSchemaType for StatefulInput {
+            fn schema_body(generator: &mut SchemaGenerator) -> Value {
+                Input::schema_body(generator)
+            }
+        }
+
+        DECODED.store(0, Ordering::SeqCst);
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let execution_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(AtomicUsize::new(0));
+        let policy = Arc::clone(&policy_calls);
+        let executions = Arc::clone(&execution_calls);
+        let effect = Arc::clone(&observed);
+        let registration = builder()
+            .typed_notification_sync::<StatefulInput, _, _>(
+                NOTIFICATION,
+                "stateful-input-v1",
+                ACTIVATION,
+                move |input| {
+                    policy.fetch_add(1, Ordering::SeqCst);
+                    if input.value != 7 {
+                        return Err(McpError::new(
+                            McpErrorCode::ResourceForbidden,
+                            "typed operation denied",
+                        ));
+                    }
+                    Ok(())
+                },
+                move |context, input| {
+                    context.checkpoint()?;
+                    executions.fetch_add(1, Ordering::SeqCst);
+                    effect.store(usize::try_from(input.value).unwrap(), Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut harness = Harness::new(registration);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        harness.context = McpContext::new(
+            runtime.request_cx_with_budget(asupersync::Budget::default()),
+            41,
+        );
+        let frame = notification_frame(7, 2);
+        runtime.block_on(harness.notify(&frame)).unwrap();
+        assert_eq!(
+            DECODED.load(Ordering::SeqCst),
+            1,
+            "the authorized value is never deserialized again"
+        );
+        assert_eq!(
+            policy_calls.load(Ordering::SeqCst),
+            1,
+            "operation policy is not repeated"
+        );
+        assert_eq!(execution_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observed.load(Ordering::SeqCst),
+            7,
+            "execution receives exactly the approved instance"
+        );
+
+        // Even identical bytes on another invocation cannot reuse custody.
+        DECODED.store(0, Ordering::SeqCst);
+        let negotiated = harness.negotiate(json!({"scale":2})).unwrap();
+        let authorized = harness
+            .handlers
+            .authorize_notification(&harness.context, &harness.id, &frame)
+            .unwrap();
+        let cloned_frame = frame.clone();
+        assert!(
+            runtime
+                .block_on(harness.handlers.invoke_notification_async(
+                    &harness.context,
+                    &negotiated,
+                    &harness.id,
+                    &cloned_frame,
+                    authorized,
+                ))
+                .is_err()
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 7);
+        assert_eq!(DECODED.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            execution_calls.load(Ordering::SeqCst),
+            1,
+            "a cloned invocation cannot consume another invocation's authorization"
+        );
     }
 
     #[test]

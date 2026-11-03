@@ -10,6 +10,7 @@
 #[cfg(feature = "extension-authoring")]
 pub mod authoring;
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
@@ -183,6 +184,24 @@ trait ErasedExtensionHandler: Send + Sync {
         parameters: Value,
     ) -> BoxFuture<'a, McpResult<Value>> {
         self.invoke_async(context, parameters)
+    }
+
+    /// Consumes authorization custody for this exact notification invocation.
+    fn invoke_authorized_notification_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        parameters: &'a Value,
+        authorized: AuthorizedNotificationPayload,
+    ) -> BoxFuture<'a, McpResult<Value>> {
+        if authorized.is_some() {
+            return Box::pin(async {
+                Err(McpError::invalid_request(
+                    "Extension notification authorization is invalid",
+                ))
+            });
+        }
+        self.invoke_admitted_async(context, negotiated, parameters.clone())
     }
 }
 
@@ -449,7 +468,21 @@ impl std::error::Error for ExtensionHandlerInvocationError {
     }
 }
 
-type NotificationAuthorizer = dyn Fn(&McpContext, &Value) -> McpResult<()> + Send + Sync;
+type AuthorizedNotificationPayload = Option<Box<dyn Any + Send>>;
+type NotificationAuthorizer =
+    dyn Fn(&McpContext, &Value) -> McpResult<AuthorizedNotificationPayload> + Send + Sync;
+
+/// Request-local, single-use custody of an authorized notification payload.
+///
+/// Binding references prevent even an equal cloned message or context from
+/// borrowing another invocation's authorization. No token can be constructed,
+/// cloned, serialized, or reused by an application handler.
+pub(crate) struct AuthorizedNotification<'a> {
+    key: ExtensionHandlerKey,
+    context: &'a McpContext,
+    notification: &'a JsonRpcRequest,
+    payload: AuthorizedNotificationPayload,
+}
 
 struct RegisteredNotificationHandler {
     authorize: Box<NotificationAuthorizer>,
@@ -681,7 +714,10 @@ impl ExtensionHandlerRegistry {
             extension_id,
             method.into(),
             RegisteredNotificationHandler {
-                authorize: Box::new(authorize),
+                authorize: Box::new(move |context, parameters| {
+                    authorize(context, parameters)?;
+                    Ok(None)
+                }),
                 handler: Box::new(SerdeExtensionHandler::<Request, (), Handler> {
                     handler,
                     marker: PhantomData,
@@ -715,7 +751,10 @@ impl ExtensionHandlerRegistry {
             extension_id,
             method.into(),
             RegisteredNotificationHandler {
-                authorize: Box::new(authorize),
+                authorize: Box::new(move |context, parameters| {
+                    authorize(context, parameters)?;
+                    Ok(None)
+                }),
                 handler: Box::new(AsyncSerdeExtensionHandler::<Request, (), Handler> {
                     handler,
                     marker: PhantomData,
@@ -753,12 +792,12 @@ impl ExtensionHandlerRegistry {
         Ok(())
     }
 
-    pub(crate) fn authorize_notification(
+    pub(crate) fn authorize_notification<'a>(
         &self,
-        context: &McpContext,
+        context: &'a McpContext,
         extension_id: &ExtensionId,
-        notification: &JsonRpcRequest,
-    ) -> McpResult<()> {
+        notification: &'a JsonRpcRequest,
+    ) -> McpResult<AuthorizedNotification<'a>> {
         if !self.frozen || notification.id.is_some() {
             return Err(McpError::invalid_request(
                 "Extension notification is not admitted",
@@ -772,10 +811,14 @@ impl ExtensionHandlerRegistry {
         context
             .ensure_live()
             .map_err(|_| McpError::request_cancelled())?;
-        (handler.authorize)(
+        let parameters = notification.params.as_ref().unwrap_or(&Value::Null);
+        let payload = (handler.authorize)(context, parameters)?;
+        Ok(AuthorizedNotification {
+            key,
             context,
-            notification.params.as_ref().unwrap_or(&Value::Null),
-        )
+            notification,
+            payload,
+        })
     }
 
     pub(crate) async fn invoke_notification_async(
@@ -784,6 +827,7 @@ impl ExtensionHandlerRegistry {
         negotiated: &NegotiatedExtensionSet,
         extension_id: &ExtensionId,
         notification: &JsonRpcRequest,
+        authorized: AuthorizedNotification<'_>,
     ) -> McpResult<()> {
         if !self.frozen || notification.id.is_some() {
             return Err(McpError::invalid_request(
@@ -799,7 +843,19 @@ impl ExtensionHandlerRegistry {
                 ExtensionDirection::ClientToServer,
             )
             .map_err(|_| McpError::invalid_params("Extension notification is not active"))?;
+        let admitted = negotiated
+            .active(extension_id)
+            .ok_or_else(|| McpError::invalid_params("Extension notification is not active"))?;
         let key = ExtensionHandlerKey::new(extension_id.clone(), &notification.method);
+        let parameters = notification.params.as_ref().unwrap_or(&Value::Null);
+        if authorized.key != key
+            || !std::ptr::eq(authorized.context, context)
+            || !std::ptr::eq(authorized.notification, notification)
+        {
+            return Err(McpError::invalid_request(
+                "Extension notification authorization is invalid",
+            ));
+        }
         let handler = self
             .notification_handlers
             .get(&key)
@@ -809,7 +865,12 @@ impl ExtensionHandlerRegistry {
             .map_err(|_| McpError::request_cancelled())?;
         handler
             .handler
-            .invoke_async(context, notification.params.clone().unwrap_or(Value::Null))
+            .invoke_authorized_notification_async(
+                context,
+                admitted,
+                parameters,
+                authorized.payload,
+            )
             .await?;
         context
             .ensure_live()
