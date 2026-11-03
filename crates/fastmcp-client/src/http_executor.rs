@@ -398,6 +398,14 @@ const MAX_PERSISTENT_LEGACY_RESPONSE_WAITERS: usize = 64;
 #[cfg(feature = "legacy-2024-11-05")]
 const MAX_PERSISTENT_LEGACY_REVERSE_CALLBACKS: usize = 16;
 
+/// Pending request POSTs, late-response cancellation controls, reverse replies,
+/// and one connection-owned notification share one bounded generation gate.
+#[cfg(feature = "legacy-2024-11-05")]
+const MAX_PERSISTENT_LEGACY_POSTS: usize = MAX_PERSISTENT_LEGACY_RESPONSE_WAITERS
+    + MAX_QUEUED_LEGACY_CANCELLED_RESPONSE_IDS
+    + MAX_PERSISTENT_LEGACY_REVERSE_CALLBACKS
+    + 1;
+
 /// Final-only metadata keys that exact 2024-11-05 public requests must reject
 /// before opening their legacy message POST.
 #[cfg(feature = "legacy-2024-11-05")]
@@ -5180,9 +5188,12 @@ impl LegacyHttpRequest {
             &mut state,
             &self.key,
             self.commit.request_id.clone(),
-        )?;
+        );
+        let gate = Arc::clone(&state.post_gate);
+        drop(state);
+        gate.wake_stopped_posts();
         self.terminal = true;
-        Ok(retirement)
+        retirement
     }
 }
 
@@ -7049,13 +7060,23 @@ impl ClientHttpConnection {
                     reject_final_only_legacy_request_metadata(parameters)?;
                 }
                 if let Some(receiver) = persistent_receiver {
-                    let state = receiver
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if state.stopped {
-                        return Err(state.stopped_error());
-                    }
+                    let message = JsonRpcMessage::Request(JsonRpcRequest::notification(
+                        method,
+                        parameters,
+                    ));
+                    return receiver.outbound.send(cx, &message).await.map_err(|error| {
+                        let state = receiver
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if state.stopped
+                            && matches!(error.error, LegacySseHttpClientError::StreamGenerationEnded)
+                        {
+                            state.stopped_error()
+                        } else {
+                            ClientHttpConnectionError::Legacy(error.error)
+                        }
+                    });
                 }
                 client
                     .send(
@@ -9452,6 +9473,185 @@ pub struct LegacySseHttpClient {
 struct LegacySseHttpOutbound {
     advertised_message_post_target: String,
     post_client: HttpClient,
+    generation: Option<Arc<LegacySsePostGate>>,
+}
+
+/// Serializes generation invalidation with each nonblocking native POST poll.
+/// A send that was already polled may have reached the peer; invalidation closes
+/// that exchange but never promises to undo its effect or authorizes a retry.
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Default)]
+struct LegacySsePostGate {
+    state: std::sync::Mutex<LegacySsePostGateState>,
+    stopped: McpRequestCancellation,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Default)]
+struct LegacySsePostGateState {
+    closed: bool,
+    active: usize,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacySsePostGate {
+    fn admit(self: &Arc<Self>) -> Result<LegacySsePostPermit, LegacySseOutboundSendError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.closed {
+            return Err(LegacySseOutboundSendError::not_submitted(
+                LegacySseHttpClientError::StreamGenerationEnded,
+            ));
+        }
+        if state.active >= MAX_PERSISTENT_LEGACY_POSTS {
+            return Err(LegacySseOutboundSendError::not_submitted(
+                LegacySseHttpClientError::MessagePostCapacityExceeded {
+                    maximum_posts: MAX_PERSISTENT_LEGACY_POSTS,
+                },
+            ));
+        }
+        state.active += 1;
+        Ok(LegacySsePostPermit(Arc::clone(self)))
+    }
+
+    fn invalidate(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed = true;
+    }
+
+    /// The caller releases the receiver-state lock before notifying arbitrary
+    /// caller wakers. Invalidation itself is already authoritative.
+    fn wake_stopped_posts(&self) {
+        let closed = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed;
+        if closed {
+            self.stopped.cancel();
+        }
+    }
+
+    fn poll_send<F: Future>(
+        &self,
+        future: Pin<&mut F>,
+        wake: &Arc<LegacySsePostWake>,
+        task_cx: &mut Context<'_>,
+        polled: &mut bool,
+    ) -> Result<Poll<F::Output>, LegacySseOutboundSendError> {
+        // Native HTTP may clone or invoke its waker while polling. Give it an
+        // Arc-backed forwarding waker that defers user code until this gate is
+        // unlocked, including on unwind. No user handler is polled here.
+        let polling = LegacySsePostPoll::begin(wake, task_cx.waker());
+        let native_waker = Waker::from(Arc::clone(wake));
+        let mut native_cx = Context::from_waker(&native_waker);
+        let result = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.closed {
+                Err(LegacySseOutboundSendError {
+                    error: LegacySseHttpClientError::StreamGenerationEnded,
+                    request_may_have_reached_peer: *polled,
+                })
+            } else {
+                *polled = true;
+                Ok(future.poll(&mut native_cx))
+            }
+        };
+        drop(polling);
+        result
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+struct LegacySsePostPermit(Arc<LegacySsePostGate>);
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl Drop for LegacySsePostPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active -= 1;
+    }
+}
+
+/// Waking a native future must not run a caller's arbitrary Wake implementation
+/// under the generation gate. Arc clones/drops of this adapter are inert.
+#[cfg(feature = "legacy-2024-11-05")]
+#[derive(Default)]
+struct LegacySsePostWake {
+    parent: std::sync::Mutex<Option<Arc<Waker>>>,
+    // These two flags use one sequentially consistent order: a concurrent
+    // wake and poll exit must not both miss the other's publication.
+    polling: AtomicBool,
+    notified: AtomicBool,
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl LegacySsePostWake {
+    fn deliver(&self) {
+        if !self.notified.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let parent = self
+            .parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(parent) = parent {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parent.wake_by_ref()));
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl std::task::Wake for LegacySsePostWake {
+    fn wake(self: Arc<Self>) {
+        Self::wake_by_ref(&self);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.notified.store(true, Ordering::SeqCst);
+        if !self.polling.load(Ordering::SeqCst) {
+            self.deliver();
+        }
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+struct LegacySsePostPoll<'a>(&'a LegacySsePostWake);
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl<'a> LegacySsePostPoll<'a> {
+    fn begin(wake: &'a LegacySsePostWake, parent: &Waker) -> Self {
+        let parent = Arc::new(parent.clone());
+        let previous = wake
+            .parent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace(parent);
+        drop(previous);
+        wake.polling.store(true, Ordering::SeqCst);
+        wake.notified.store(false, Ordering::SeqCst);
+        Self(wake)
+    }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+impl Drop for LegacySsePostPoll<'_> {
+    fn drop(&mut self) {
+        self.0.polling.store(false, Ordering::SeqCst);
+        self.0.deliver();
+    }
 }
 
 /// One failed exact-2024 message POST together with whether the peer might
@@ -9507,6 +9707,9 @@ impl Drop for LegacyPendingPost<'_> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let _ =
                 retire_abandoned_persistent_waiter(&mut state, self.key, self.request_id.clone());
+            let gate = Arc::clone(&state.post_gate);
+            drop(state);
+            gate.wake_stopped_posts();
         }
     }
 }
@@ -9646,6 +9849,7 @@ struct LegacySsePersistentState {
     reader_waker: Option<Waker>,
     /// Preserve the first failure after dropping all response senders.
     failure: Option<Arc<LegacySseHttpClientError>>,
+    post_gate: Arc<LegacySsePostGate>,
 }
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -9698,12 +9902,32 @@ impl LegacySsePersistentState {
     }
 
     fn stop(&mut self) {
+        self.post_gate.invalidate();
         self.stopped = true;
         self.pending.clear();
         self.cancelled_response_ids.clear();
         self.notifications.clear();
         self.pending_changed();
     }
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+fn stop_legacy_persistent_state(
+    state: &std::sync::Mutex<LegacySsePersistentState>,
+    error: Option<LegacySseHttpClientError>,
+) {
+    let gate = {
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(error) = error {
+            state.stop_with_error(error);
+        } else {
+            state.stop();
+        }
+        Arc::clone(&state.post_gate)
+    };
+    gate.wake_stopped_posts();
 }
 
 /// Retires a caller that stopped waiting while preserving ownership of its
@@ -9806,10 +10030,7 @@ impl LegacySseReverseCallbackDispatcher {
             if callback_state.claim_response_if_open(&callback_id, &cancellation) {
                 if let Err(error) = outbound.send(&callback_cx, &response).await {
                     callback_state.cancel_all();
-                    persistent_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .stop_with_error(error.error);
+                    stop_legacy_persistent_state(&persistent_state, Some(error.error));
                 }
             }
             callback_state.complete(&callback_id, &cancellation);
@@ -9848,10 +10069,7 @@ impl LegacySseReverseCallbackDispatcher {
         let task = cx
             .spawn(move |response_cx| async move {
                 if let Err(error) = outbound.send(&response_cx, &response).await {
-                    persistent_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .stop_with_error(error.error);
+                    stop_legacy_persistent_state(&persistent_state, Some(error.error));
                 }
             })
             .map_err(|_| {
@@ -10056,7 +10274,7 @@ impl LegacySsePersistentReceiver {
     fn start(
         cx: &Cx,
         mut reader: LegacySseResponseStream,
-        outbound: LegacySseHttpOutbound,
+        mut outbound: LegacySseHttpOutbound,
         client_capabilities: ClientCapabilities,
         reverse_request_handlers: ReverseRequestHandlers,
         request_timeout_policy: RequestTimeoutPolicy,
@@ -10065,6 +10283,12 @@ impl LegacySsePersistentReceiver {
             .validate_legacy_capabilities(&client_capabilities)
             .map_err(ClientHttpConnectionError::LegacyCallbackConfiguration)?;
         let state = Arc::new(std::sync::Mutex::new(LegacySsePersistentState::default()));
+        outbound.generation = Some(Arc::clone(
+            &state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .post_gate,
+        ));
         reader.persistent_state = Some(Arc::clone(&state));
         let task_state = Arc::clone(&state);
         let task_outbound = outbound.clone();
@@ -10088,19 +10312,17 @@ impl LegacySsePersistentReceiver {
             .spawn(move |child_cx| async move {
                 loop {
                     if child_cx.checkpoint().is_err() {
-                        task_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .stop_with_error(LegacySseHttpClientError::Cancelled);
+                        stop_legacy_persistent_state(
+                            &task_state,
+                            Some(LegacySseHttpClientError::Cancelled),
+                        );
                         break;
                     }
                     if let Err(error) = task_reverse_callbacks.reap_finished_tasks() {
-                        task_state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .stop_with_error(LegacySseHttpClientError::ReverseCallbackFailed(
-                                error,
-                            ));
+                        stop_legacy_persistent_state(
+                            &task_state,
+                            Some(LegacySseHttpClientError::ReverseCallbackFailed(error)),
+                        );
                         break;
                     }
                     if task_state
@@ -10113,17 +10335,14 @@ impl LegacySsePersistentReceiver {
                     let message = match next_legacy_sse_message(&mut reader, &child_cx).await {
                         Ok(Some(message)) => message,
                         Ok(None) => {
-                            task_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .stop_with_error(LegacySseHttpClientError::StreamGenerationEnded);
+                            stop_legacy_persistent_state(
+                                &task_state,
+                                Some(LegacySseHttpClientError::StreamGenerationEnded),
+                            );
                             break;
                         }
                         Err(error) => {
-                            task_state
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .stop_with_error(error);
+                            stop_legacy_persistent_state(&task_state, Some(error));
                             break;
                         }
                     };
@@ -10197,12 +10416,10 @@ impl LegacySsePersistentReceiver {
                                     response,
                                 )
                             {
-                                task_state
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .stop_with_error(
-                                        LegacySseHttpClientError::ReverseCallbackFailed(error),
-                                    );
+                                stop_legacy_persistent_state(
+                                    &task_state,
+                                    Some(LegacySseHttpClientError::ReverseCallbackFailed(error)),
+                                );
                                 task_reverse_callbacks.close();
                                 break;
                             }
@@ -10273,10 +10490,7 @@ impl LegacySsePersistentReceiver {
                         }
                     }
                 }
-                task_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .stop();
+                stop_legacy_persistent_state(&task_state, None);
                 task_reverse_callbacks.close();
             })
             .map_err(|error| match error {
@@ -10385,8 +10599,19 @@ impl LegacySsePersistentReceiver {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.stopped {
+                return Err(if matches!(error, LegacySseHttpClientError::StreamGenerationEnded) {
+                    state.stopped_error()
+                } else {
+                    ClientHttpConnectionError::Legacy(error)
+                });
+            }
             if request_may_have_reached_peer {
-                retire_abandoned_persistent_waiter(&mut state, &key, request_id)?;
+                let retired = retire_abandoned_persistent_waiter(&mut state, &key, request_id);
+                let gate = Arc::clone(&state.post_gate);
+                drop(state);
+                gate.wake_stopped_posts();
+                retired?;
             } else {
                 state.pending.remove(&key);
                 state.pending_changed();
@@ -10465,10 +10690,7 @@ impl LegacySsePersistentReceiver {
 impl Drop for LegacySsePersistentReceiver {
     fn drop(&mut self) {
         self.reverse_callbacks.close();
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stop();
+        stop_legacy_persistent_state(&self.state, None);
         self.task.abort();
     }
 }
@@ -10922,6 +11144,7 @@ impl LegacySseHttpClient {
         LegacySseHttpOutbound {
             advertised_message_post_target: self.advertised_message_post_target.clone(),
             post_client: self.post_client.clone(),
+            generation: None,
         }
     }
 
@@ -10998,6 +11221,34 @@ impl LegacySseHttpClient {
 #[cfg(feature = "legacy-2024-11-05")]
 impl LegacySseHttpOutbound {
     async fn send(
+        &self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), LegacySseOutboundSendError> {
+        let Some(generation) = self.generation.as_ref() else {
+            return self.send_native(cx, message).await;
+        };
+        let _permit = generation.admit()?;
+        let wake = Arc::new(LegacySsePostWake::default());
+        let mut stopped = std::pin::pin!(generation.stopped.cancelled());
+        let mut exchange = std::pin::pin!(self.send_native(cx, message));
+        let mut polled = false;
+        poll_fn(|task_cx| {
+            if stopped.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(LegacySseOutboundSendError {
+                    error: LegacySseHttpClientError::StreamGenerationEnded,
+                    request_may_have_reached_peer: polled,
+                }));
+            }
+            match generation.poll_send(exchange.as_mut(), &wake, task_cx, &mut polled) {
+                Ok(result) => result,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await
+    }
+
+    async fn send_native(
         &self,
         cx: &Cx,
         message: &JsonRpcMessage,
@@ -11101,8 +11352,7 @@ async fn next_legacy_sse_message(
 
 /// Errors emitted by the exact legacy SSE GET plus advertised POST client.
 #[derive(Debug)]
-pub enum LegacySseHttpClientError {
-    /// The immutable plan omitted its legacy SSE GET target.
+pub enum LegacySseHttpClientError {    /// The immutable plan omitted its legacy SSE GET target.
     MissingSseTarget,
     /// The immutable plan omitted its legacy message POST target.
     MissingMessagePostTarget,
@@ -11152,6 +11402,8 @@ pub enum LegacySseHttpClientError {
     MessagePostRedirect { status: u16 },
     /// The legacy POST endpoint did not acknowledge the JSON-RPC envelope.
     MessagePostRejected { status: u16 },
+    /// The live stream already owns the maximum number of pending POSTs.
+    MessagePostCapacityExceeded { maximum_posts: usize },
     /// A legacy SSE `message` event was not a strict JSON-RPC envelope.
     MessageDecodeFailed,
     /// A ready high-level client owns this connection's SSE reader.
@@ -11257,6 +11509,10 @@ impl fmt::Display for LegacySseHttpClientError {
                     "legacy message POST was rejected with status {status}"
                 )
             }
+            Self::MessagePostCapacityExceeded { maximum_posts } => write!(
+                formatter,
+                "legacy SSE generation already owns {maximum_posts} pending message POSTs"
+            ),
             Self::MessageDecodeFailed => formatter.write_str("legacy SSE message was not JSON-RPC"),
             Self::ReceiverOwnedByReadyClient => {
                 formatter.write_str("legacy SSE reader is owned by the ready HTTP client")
@@ -11320,6 +11576,7 @@ impl std::error::Error for LegacySseHttpClientError {
             | Self::MessageEncodingFailed
             | Self::MessagePostRedirect { .. }
             | Self::MessagePostRejected { .. }
+            | Self::MessagePostCapacityExceeded { .. }
             | Self::MessageDecodeFailed
             | Self::ReceiverOwnedByReadyClient
             | Self::PendingSseEventCountExceeded { .. }
@@ -13653,6 +13910,7 @@ mod tests {
                 let outbound = super::LegacySseHttpOutbound {
                     advertised_message_post_target: target,
                     post_client: super::native_http_client(),
+                    generation: Some(Arc::clone(&state.lock().unwrap().post_gate)),
                 };
                 let invoked = Arc::new(AtomicUsize::new(0));
                 if immediate {
@@ -13708,6 +13966,220 @@ mod tests {
                 peer.join().unwrap();
             }
         }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_generation_gate_refuses_post_before_first_io() {
+        for invalidate in [false, true] {
+            let gate = Arc::new(super::LegacySsePostGate::default());
+            let permit = gate.admit().ok().expect("live generation admits a POST");
+            let writes = AtomicUsize::new(0);
+            let mut native = std::pin::pin!(poll_fn(|_| {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(())
+            }));
+            // Plant EOF after admission but before the native exchange's first
+            // poll. Only this dimension differs from the live positive.
+            if invalidate {
+                gate.invalidate();
+                gate.wake_stopped_posts();
+            }
+            let wake = Arc::new(super::LegacySsePostWake::default());
+            let mut polled = false;
+            let result = gate.poll_send(
+                native.as_mut(),
+                &wake,
+                &mut Context::from_waker(Waker::noop()),
+                &mut polled,
+            );
+            if invalidate {
+                let error = result.err().expect("stopped generation refuses the poll");
+                assert!(matches!(
+                    error.error,
+                    LegacySseHttpClientError::StreamGenerationEnded
+                ));
+                assert!(!error.request_may_have_reached_peer);
+                assert!(!polled);
+            } else {
+                assert!(matches!(result, Ok(Poll::Ready(()))));
+                assert!(polled);
+            }
+            assert_eq!(writes.load(Ordering::SeqCst), usize::from(!invalidate));
+            drop(permit);
+            assert_eq!(gate.state.lock().unwrap().active, 0);
+        }
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_generation_stop_wakes_pending_posts() {
+        let state = std::sync::Mutex::new(LegacySsePersistentState::default());
+        let gate = Arc::clone(&state.lock().unwrap().post_gate);
+        let permit = gate.admit().ok().expect("live generation admits one send");
+        let wake = Arc::new(CountingWake::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut stopped = std::pin::pin!(gate.stopped.cancelled());
+        assert!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+
+        super::stop_legacy_persistent_state(
+            &state,
+            Some(LegacySseHttpClientError::MessageDecodeFailed),
+        );
+
+        assert!(
+            wake.0.load(Ordering::SeqCst) > 0,
+            "EOF/error must wake a quiet pending POST"
+        );
+        assert!(
+            stopped
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        assert!(matches!(state.lock().unwrap().stopped_error(),
+            ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref error)
+            if matches!(error.as_ref(), LegacySseHttpClientError::MessageDecodeFailed)));
+        drop(permit);
+        assert_eq!(gate.state.lock().unwrap().active, 0);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_generation_post_limit_and_drop_release_exactly_once() {
+        let gate = Arc::new(super::LegacySsePostGate::default());
+        let mut permits = (0..super::MAX_PERSISTENT_LEGACY_POSTS)
+            .map(|_| gate.admit().ok().expect("each admitted POST owns a slot"))
+            .collect::<Vec<_>>();
+        let error = gate.admit().err().expect("one more send must be refused");
+        assert!(matches!(
+            error.error,
+            LegacySseHttpClientError::MessagePostCapacityExceeded {
+                maximum_posts: super::MAX_PERSISTENT_LEGACY_POSTS,
+            }
+        ));
+        assert!(!error.request_may_have_reached_peer);
+        assert_eq!(
+            gate.state.lock().unwrap().active,
+            super::MAX_PERSISTENT_LEGACY_POSTS
+        );
+        drop(permits.pop());
+        let replacement = gate
+            .admit()
+            .ok()
+            .expect("dropping one POST restores its slot");
+        drop(replacement);
+        drop(permits);
+        assert_eq!(gate.state.lock().unwrap().active, 0);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_generation_gate_defers_reentrant_wakes_until_unlocked() {
+        struct StopOnWake {
+            gate: Arc<super::LegacySsePostGate>,
+            calls: AtomicUsize,
+        }
+        impl Wake for StopOnWake {
+            fn wake(self: Arc<Self>) {
+                self.gate.invalidate();
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let gate = Arc::new(super::LegacySsePostGate::default());
+        let parent = Arc::new(StopOnWake {
+            gate: Arc::clone(&gate),
+            calls: AtomicUsize::new(0),
+        });
+        let parent_waker = Waker::from(Arc::clone(&parent));
+        let wake = Arc::new(super::LegacySsePostWake::default());
+        let mut native = std::pin::pin!(poll_fn(|cx| {
+            cx.waker().wake_by_ref();
+            Poll::Ready(())
+        }));
+        let mut polled = false;
+        assert!(matches!(
+            gate.poll_send(
+                native.as_mut(),
+                &wake,
+                &mut Context::from_waker(&parent_waker),
+                &mut polled,
+            ),
+            Ok(Poll::Ready(()))
+        ));
+        assert_eq!(parent.calls.load(Ordering::SeqCst), 1);
+        assert!(gate.state.lock().unwrap().closed);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn legacy_generation_gate_preserves_live_concurrent_posts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/legacy-message", listener.local_addr().unwrap());
+        let (done, stopped) = mpsc::sync_channel(1);
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + LEGACY_TEST_PEER_BOUND;
+            let mut posts = Vec::new();
+            let mut ids = Vec::new();
+            for _ in 0..2 {
+                let mut post = accept_legacy_test_peer(&listener, &stopped, deadline)
+                    .unwrap()
+                    .expect("both requests reach the peer before either acknowledgement");
+                let message: serde_json::Value =
+                    serde_json::from_slice(&read_request(&mut post).body).unwrap();
+                ids.push(message["id"].as_u64().unwrap());
+                posts.push(post);
+            }
+            ids.sort_unstable();
+            assert_eq!(ids, [1, 2]);
+            for post in &mut posts {
+                write_response(post, 202, "application/json", b"");
+            }
+        });
+        let gate = Arc::new(super::LegacySsePostGate::default());
+        let outbound = super::LegacySseHttpOutbound {
+            advertised_message_post_target: target,
+            post_client: super::native_http_client(),
+            generation: Some(Arc::clone(&gate)),
+        };
+        let runtime = RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let first = JsonRpcMessage::Request(JsonRpcRequest::new("tools/list", None, 1_i64));
+            let second = JsonRpcMessage::Request(JsonRpcRequest::new("tools/list", None, 2_i64));
+            let mut first = std::pin::pin!(outbound.send(&cx, &first));
+            let mut second = std::pin::pin!(outbound.send(&cx, &second));
+            let mut first_done = false;
+            let mut second_done = false;
+            let sends = poll_fn(|task| {
+                if !first_done && let Poll::Ready(result) = first.as_mut().poll(task) {
+                    assert!(result.is_ok());
+                    first_done = true;
+                }
+                if !second_done && let Poll::Ready(result) = second.as_mut().poll(task) {
+                    assert!(result.is_ok());
+                    second_done = true;
+                }
+                if first_done && second_done {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            });
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), sends)
+                .await
+                .expect("both native POSTs settle");
+        });
+        assert_eq!(gate.state.lock().unwrap().active, 0);
+        assert!(cx.checkpoint().is_ok());
+        drop(done);
+        peer.join().unwrap();
     }
 
     thread_local! {
@@ -19267,6 +19739,155 @@ mod tests {
     #[test]
     fn public_http_client_auto_rejects_ended_legacy_generation() {
         public_http_client_auto_legacy_lifecycle_case(true);
+    }
+
+    #[cfg(feature = "legacy-2024-11-05")]
+    #[test]
+    fn public_legacy_receiver_eof_cancels_pending_message_posts() {
+        // Exercise a quiet response-head wait and a quiet response-body wait.
+        // Each negative differs from its positive only in whether the peer ends
+        // the generation before completing its POST acknowledgement.
+        for waiting_for_body in [false, true] {
+            for end_generation in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let address = listener.local_addr().unwrap();
+                let modern = format!("http://{address}/mcp");
+                let sse_target = format!("http://{address}/legacy-sse");
+                let message_target = format!("http://{address}/legacy-message");
+                let advertised = message_target.clone();
+                let (done, finished) = mpsc::sync_channel(1);
+                let peer = thread::spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    let accept = || {
+                        accept_legacy_test_peer(&listener, &finished, deadline)
+                            .unwrap()
+                            .expect("client owns this fixture")
+                    };
+                    let mut sse = accept();
+                    assert!(
+                        read_request(&mut sse)
+                            .head
+                            .starts_with("GET /legacy-sse HTTP/1.1")
+                    );
+                    begin_chunked_sse(&mut sse);
+                    write_chunked_sse_event(
+                        &mut sse,
+                        &format!("event: endpoint\ndata: {advertised}\n\n"),
+                    );
+                    let mut initialize = accept();
+                    let initialize: serde_json::Value = {
+                        let body = read_request(&mut initialize).body;
+                        write_response(&mut initialize, 202, "application/json", b"");
+                        serde_json::from_slice(&body).unwrap()
+                    };
+                    assert_eq!(initialize["method"], "initialize");
+                    let response = serde_json::json!({
+                        "jsonrpc": "2.0", "id": initialize["id"],
+                        "result": {"protocolVersion":"2024-11-05", "capabilities":{},
+                                   "serverInfo":{"name":"generation-peer","version":"1"}}
+                    });
+                    write_chunked_sse_event(
+                        &mut sse,
+                        &format!("event: message\ndata: {response}\n\n"),
+                    );
+                    let mut initialized = accept();
+                    let initialized_message: serde_json::Value =
+                        serde_json::from_slice(&read_request(&mut initialized).body).unwrap();
+                    assert_eq!(initialized_message["method"], "notifications/initialized");
+                    write_response(&mut initialized, 202, "application/json", b"");
+
+                    let mut post = accept();
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_request(&mut post).body).unwrap();
+                    assert_eq!(request["method"], "tools/list");
+                    if waiting_for_body {
+                        post.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: 1\r\n\r\n").unwrap();
+                        post.flush().unwrap();
+                    }
+                    if end_generation {
+                        finish_chunked_sse(&mut sse);
+                        // Keep the POST socket quiet until the client reports
+                        // completion. Socket closure is not what wakes its wait.
+                        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+                        let mut bytes = [0; 1];
+                        post.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        match post.read(&mut bytes) {
+                            Ok(0) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                            other => panic!("abandoned POST socket must close: {other:?}"),
+                        }
+                    } else {
+                        if waiting_for_body {
+                            post.write_all(b" ").unwrap();
+                            post.flush().unwrap();
+                        } else {
+                            write_response(&mut post, 202, "application/json", b"");
+                        }
+                        let response = serde_json::json!({
+                            "jsonrpc":"2.0", "id":request["id"], "result":{"tools":[]}
+                        });
+                        write_chunked_sse_event(
+                            &mut sse,
+                            &format!("event: message\ndata: {response}\n\n"),
+                        );
+                        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+                        finish_chunked_sse_allowing_closed_peer(&mut sse);
+                    }
+                    assert!(
+                        matches!(listener.accept(), Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock),
+                        "no retry or stale cancellation POST"
+                    );
+                });
+                let runtime = RuntimeBuilder::current_thread().build().unwrap();
+                let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let mut client = runtime
+                    .block_on(
+                        ClientBuilder::new()
+                            .protocol_plan(plan(
+                                &modern,
+                                &sse_target,
+                                &message_target,
+                                ProtocolPolicy::LegacyOnly,
+                            ))
+                            .connect_http_client_with_cx(&cx),
+                    )
+                    .unwrap();
+                let receiver = client.connection().legacy_persistent_receiver().unwrap();
+                let result = runtime
+                    .block_on(asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(4),
+                        client.request(&cx, "tools/list", serde_json::json!({})),
+                    ))
+                    .expect("SSE invalidation wakes a quiet native POST");
+                if end_generation {
+                    assert!(matches!(result,
+                        Err(crate::HttpClientError::Connection(ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref error)))
+                        if matches!(error.as_ref(), LegacySseHttpClientError::StreamGenerationEnded)));
+                } else {
+                    let super::ClientHttpResponse::Legacy(JsonRpcMessage::Response(response)) =
+                        result.unwrap()
+                    else {
+                        panic!("live generation returns its correlated result");
+                    };
+                    assert_eq!(response.result, Some(serde_json::json!({"tools":[]})));
+                }
+                {
+                    let state = receiver.state.lock().unwrap();
+                    assert!(state.pending.is_empty());
+                    assert!(state.cancelled_response_ids.is_empty());
+                    assert_eq!(state.post_gate.state.lock().unwrap().active, 0);
+                }
+                assert!(
+                    cx.checkpoint().is_ok(),
+                    "stopping one generation cannot cancel its caller"
+                );
+                done.send(()).unwrap();
+                peer.join().unwrap();
+            }
+        }
     }
 
     #[cfg(feature = "legacy-2024-11-05")]
