@@ -17094,6 +17094,7 @@ pub struct StdioRequestExecutor {
     peer_era: ProtocolEra,
     modern_request_meta: Option<Arc<FinalRequestMeta>>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+    negotiated_extensions: Option<Arc<fastmcp_protocol::extensions::NegotiatedExtensionSet>>,
 }
 
 impl std::fmt::Debug for StdioRequestExecutor {
@@ -17108,6 +17109,7 @@ impl std::fmt::Debug for StdioRequestExecutor {
 /// One request committed through [`StdioRequestExecutor`].
 pub struct StdioRequestExecution {
     execution: RequestExecution<SelectedStdioTransport>,
+    require_result_source: bool,
 }
 
 /// One source-preserving final core request on the shared stdio ingress.
@@ -17229,6 +17231,7 @@ impl StdioRequestExecutor {
         timeout_policy: RequestTimeoutPolicy,
         modern_request_meta: Option<FinalRequestMeta>,
         client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+        negotiated_extensions: Option<fastmcp_protocol::extensions::NegotiatedExtensionSet>,
     ) -> Self {
         Self {
             executor: RequestExecutor::with_protocol_era(transport, peer_era),
@@ -17237,6 +17240,7 @@ impl StdioRequestExecutor {
             peer_era,
             modern_request_meta: modern_request_meta.map(Arc::new),
             client_extension_runtime,
+            negotiated_extensions: negotiated_extensions.map(Arc::new),
         }
     }
 
@@ -17272,13 +17276,104 @@ impl StdioRequestExecutor {
             .is_some_and(|runtime| runtime.owns_method(&method))
         {
             return Err(McpError::invalid_params(
-                "Registered final extension methods require Client::request_final_extension",
+                "Registered final extension methods require an admitted final extension API",
             ));
         }
         let params = self.decorate_modern_request_parameters(params)?;
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         self.execute_request(cx, JsonRpcRequest::new(method, params, id))
+    }
+
+    /// Commits one admitted extension request without waiting for its result.
+    ///
+    /// Clones share the selected connection's frozen extension negotiation,
+    /// request-ID allocator, bounded response registry and cancellation path.
+    /// The exact extension owner, method and direction must be active before
+    /// an ID or waiter is allocated or any bytes are written. Exact-2024
+    /// connections cannot select this path.
+    ///
+    /// Every call stamps the locally configured protocol version, identity,
+    /// capabilities and extension settings. Caller metadata cannot replace
+    /// those negotiated fields; unrelated metadata such as a progress token
+    /// remains request-local. The returned handle uses the same sole ingress
+    /// driver, [`Client::drive_multiplexed_stdio`], as ordinary requests.
+    /// Use [`Self::try_take_response_with_raw_result`] to retain the extension
+    /// result's exact admitted JSON source. Dropping the handle requests only
+    /// that execution's cancellation.
+    pub fn execute_final_extension(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        mut parameters: serde_json::Value,
+    ) -> McpResult<StdioRequestExecution> {
+        if let Some(error) = self.executor.terminal_error() {
+            return Err(error);
+        }
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if self.peer_era != ProtocolEra::Modern2026 {
+            return Err(McpError::invalid_params(
+                "Final client extensions are unavailable in exact MCP 2024-11-05",
+            ));
+        }
+        let runtime = self.client_extension_runtime.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "No builder-owned final client extension registry is configured",
+            )
+        })?;
+        let negotiated = self.negotiated_extensions.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "Final client extension settings were not negotiated by server/discover",
+            )
+        })?;
+        runtime.admit_method(negotiated, extension_id, method)?;
+
+        let configured_metadata = self.modern_request_meta.as_ref().ok_or_else(|| {
+            McpError::internal_error("Negotiated stdio client metadata is unavailable")
+        })?;
+        let mut configured_metadata =
+            serde_json::to_value(configured_metadata.as_ref()).map_err(|_| {
+                McpError::internal_error("Modern request metadata could not be encoded")
+            })?;
+        let configured = configured_metadata.as_object_mut().ok_or_else(|| {
+            McpError::internal_error("Modern request metadata did not encode as an object")
+        })?;
+        let capabilities = configured
+            .get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                McpError::internal_error("Modern request metadata omitted client capabilities")
+            })?;
+        let extensions = capabilities
+            .entry("extensions")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                McpError::internal_error("Modern client extensions must be an object")
+            })?;
+        extensions.extend(runtime.client_wire_extensions());
+
+        let parameters_object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Modern MCP requests require object parameters")
+        })?;
+        let metadata = parameters_object
+            .entry("_meta")
+            .or_insert_with(|| serde_json::json!({}))
+            .as_object_mut()
+            .ok_or_else(|| {
+                McpError::invalid_params("Modern MCP request metadata must be an object")
+            })?;
+        metadata.extend(std::mem::take(configured));
+
+        let id = next_stdio_request_id(&self.next_id)?;
+        let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
+        let mut execution =
+            self.execute_request(cx, JsonRpcRequest::new(method, Some(parameters), id))?;
+        execution.require_result_source = true;
+        Ok(execution)
     }
 
     fn execute_request(
@@ -17292,7 +17387,10 @@ impl StdioRequestExecutor {
         let execution = self
             .executor
             .execute_with_timeout_policy(cx, request, timeout_policy)?;
-        Ok(StdioRequestExecution { execution })
+        Ok(StdioRequestExecution {
+            execution,
+            require_result_source: false,
+        })
     }
 
     /// Commits a modern listener with bounded subscription-specific deadlines.
@@ -17310,7 +17408,10 @@ impl StdioRequestExecutor {
         let execution =
             self.executor
                 .execute_subscription_with_timeout_policy(cx, request, timeout_policy)?;
-        Ok(StdioRequestExecution { execution })
+        Ok(StdioRequestExecution {
+            execution,
+            require_result_source: false,
+        })
     }
 
     fn record_subscription_activity(&self, execution: &StdioRequestExecution) -> McpResult<bool> {
@@ -17361,7 +17462,10 @@ impl StdioRequestExecutor {
         request: JsonRpcRequest,
     ) -> McpResult<StdioRequestExecution> {
         let execution = self.executor.execute_tasks_subscription(cx, request)?;
-        Ok(StdioRequestExecution { execution })
+        Ok(StdioRequestExecution {
+            execution,
+            require_result_source: false,
+        })
     }
 
     /// Allocates and commits one prepared final Tasks subscription request.
@@ -17399,7 +17503,10 @@ impl StdioRequestExecutor {
                 JsonRpcRequest::new("subscriptions/listen", Some(parameters), id),
                 timeout_policy,
             )?;
-        Ok(StdioRequestExecution { execution })
+        Ok(StdioRequestExecution {
+            execution,
+            require_result_source: false,
+        })
     }
 
     /// Returns the filter acknowledged for an active Tasks subscription.
@@ -17457,13 +17564,8 @@ impl StdioRequestExecutor {
         &self,
         execution: &mut StdioRequestExecution,
     ) -> McpResult<Option<JsonRpcResponse>> {
-        let Some(response) = self.executor.try_take_response(&mut execution.execution)? else {
-            return Ok(None);
-        };
-        if let Some(error) = response.error.clone() {
-            return Err(json_rpc_error_to_mcp(error));
-        }
-        Ok(Some(response))
+        self.try_take_response_with_raw_result(execution)
+            .map(|response| response.map(|(response, _)| response))
     }
 
     /// Takes one already-routed final response with its exact admitted result
@@ -17490,6 +17592,13 @@ impl StdioRequestExecutor {
         };
         if let Some(error) = response.error.clone() {
             return Err(json_rpc_error_to_mcp(error));
+        }
+        if execution.require_result_source && raw_result.is_none() {
+            let error = McpError::invalid_request(
+                "Peer final extension response lost its admitted result source",
+            );
+            self.fail_connection(error.clone());
+            return Err(error);
         }
         Ok(Some((response, raw_result, stream)))
     }
@@ -19379,6 +19488,7 @@ impl Client {
             self.timeout_policy,
             modern_request_meta,
             self.session.client_extension_runtime().cloned(),
+            self.session.negotiated_extensions().cloned(),
         ));
     }
 
@@ -55368,6 +55478,299 @@ while IFS= read -r unexpected; do exit 31; done
 
     #[cfg(unix)]
     #[test]
+    fn clt_ext_stdio_executor_runs_concurrent_negotiated_requests() {
+        let (extension_id, registry, client_discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let discovery = modern_raw_extension_discovery_response(
+            "multiplexed-extension-server",
+            Some(serde_json::json!({ "mode": "raw" })),
+        );
+        let first_source = r#"{"resultType":"complete","owner":"first","exact":7.30e-2}"#;
+        let second_source = r#"{"resultType":"complete","owner":"second","exact":1.20e+4}"#;
+        let script = format!(
+            "IFS= read -r discovery || exit 1; \\
+             printf '%s\\n' '{discovery}'; \\
+             IFS= read -r first || exit 1; IFS= read -r second || exit 1; \\
+             for request in \"$first\" \"$second\"; do \\
+               case \"$request\" in *'\"method\":\"example/echo\"'*) ;; *) exit 1 ;; esac; \\
+               case \"$request\" in *'\"com.example/raw\":{{\"mode\":\"raw\"}}'*) ;; *) exit 1 ;; esac; \\
+               case \"$request\" in *'\"name\":\"multiplexed-extension-client\"'*) ;; *) exit 1 ;; esac; \\
+               case \"$request\" in *'\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\"'*) ;; *) exit 1 ;; esac; \\
+               case \"$request\" in *forged*|*untrusted*) exit 1 ;; esac; \\
+             done; \\
+             case \"$first\" in *'\"com.example/note\":\"preserved\"'*) ;; *) exit 1 ;; esac; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{second_source}}}'; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{first_source}}}'; \\
+             exec sleep 2"
+        );
+        let cx = Cx::for_request();
+        let mut client = block_on(
+            ClientBuilder::new()
+                .client_info("multiplexed-extension-client", "1.0.0")
+                .extension_registry(registry, client_discovery, || accept_raw_extension_settings)
+                .expect("frozen extension configuration")
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+        )
+        .expect("modern extension discovery");
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let mut first = executor
+            .execute_final_extension(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({
+                    "input": "first",
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "forged",
+                        "io.modelcontextprotocol/clientInfo": {"name": "untrusted", "version": "0"},
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {
+                                "com.example/raw": {"mode": "forged"},
+                                "com.example/forged": {}
+                            }
+                        },
+                        "com.example/note": "preserved"
+                    }
+                }),
+            )
+            .expect("first admitted extension starts without reading a response");
+        let mut second = executor
+            .clone()
+            .execute_final_extension(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({"input": "second"}),
+            )
+            .expect("a cloned executor starts the second extension concurrently");
+        assert_eq!(first.request_id(), &RequestId::Number(2));
+        assert_eq!(second.request_id(), &RequestId::Number(3));
+        assert_eq!(executor.executor.pending_records().len(), 2);
+        assert!(executor.try_take_response(&mut first).unwrap().is_none());
+
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        let (second_result, second_raw) = executor
+            .try_take_response_with_raw_result(&mut second)
+            .unwrap()
+            .expect("second response remains attached to its own handle");
+        assert_eq!(second_result.result.unwrap()["owner"], "second");
+        assert_eq!(second_raw.as_deref(), Some(second_source));
+        let (first_result, first_raw) = executor
+            .try_take_response_with_raw_result(&mut first)
+            .unwrap()
+            .expect("first response remains attached to its own handle");
+        assert_eq!(first_result.result.unwrap()["owner"], "first");
+        assert_eq!(first_raw.as_deref(), Some(first_source));
+        assert!(executor.executor.pending_records().is_empty());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_stdio_executor_rejects_before_id_or_waiter_allocation() {
+        for rejected in [
+            "owner",
+            "method",
+            "direction",
+            "inactive",
+            "parameters",
+            "metadata",
+            "cancelled",
+        ] {
+            let (extension_id, registry, client_discovery) = raw_extension_configuration(
+                if rejected == "direction" {
+                    ExtensionDirection::ServerToClient
+                } else {
+                    ExtensionDirection::ClientToServer
+                },
+                fastmcp_protocol::extensions::ExtensionFallbackPolicy::ClientInactiveFallback,
+            );
+            let script = modern_raw_extension_no_contact_client_script(
+                (rejected != "inactive").then(|| serde_json::json!({"mode": "raw"})),
+            );
+            let mut client = block_on(
+                ClientBuilder::new()
+                    .extension_registry(registry, client_discovery, || {
+                        accept_raw_extension_settings
+                    })
+                    .unwrap()
+                    .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+            )
+            .unwrap();
+            let next_id = client.next_id.load(Ordering::SeqCst);
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let owner = if rejected == "owner" {
+                fastmcp_protocol::ExtensionId::parse("com.example/foreign").unwrap()
+            } else {
+                extension_id
+            };
+            let parameters = match rejected {
+                "parameters" => serde_json::json!([]),
+                "metadata" => serde_json::json!({"_meta": []}),
+                _ => serde_json::json!({}),
+            };
+            let cx = Cx::for_request();
+            if rejected == "cancelled" {
+                cx.set_cancel_requested(true);
+            }
+            let error = executor
+                .execute_final_extension(
+                    &cx,
+                    &owner,
+                    if rejected == "method" {
+                        "example/other"
+                    } else {
+                        "example/echo"
+                    },
+                    parameters,
+                )
+                .expect_err(rejected);
+            assert_eq!(
+                error.code,
+                if rejected == "cancelled" {
+                    McpErrorCode::RequestCancelled
+                } else {
+                    McpErrorCode::InvalidParams
+                },
+                "{rejected}"
+            );
+            assert_eq!(client.next_id.load(Ordering::SeqCst), next_id, "{rejected}");
+            assert!(executor.executor.pending_records().is_empty(), "{rejected}");
+            assert!(executor.executor.terminal_error().is_none(), "{rejected}");
+            client.close().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_stdio_executor_drop_cancels_only_its_request() {
+        let (extension_id, registry, client_discovery) = raw_extension_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+        );
+        let discovery = modern_raw_extension_discovery_response(
+            "multiplexed-extension-server",
+            Some(serde_json::json!({ "mode": "raw" })),
+        );
+        let script = format!(
+            "IFS= read -r discovery || exit 1; printf '%s\\n' '{discovery}'; \\
+             IFS= read -r first || exit 1; IFS= read -r second || exit 1; \\
+             IFS= read -r cancellation || exit 1; \\
+             case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) ;; *) exit 1 ;; esac; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"owner\":\"abandoned\"}}}}'; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{{\"owner\":\"survivor\"}}}}'; \\
+             IFS= read -r third || exit 1; \\
+             case \"$third\" in *'\"method\":\"example/echo\"'*'\"id\":4'*) ;; *) exit 1 ;; esac; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{{\"owner\":\"later\"}}}}'; \\
+             exec sleep 2"
+        );
+        let cx = Cx::for_request();
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, client_discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+        )
+        .unwrap();
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let first = executor
+            .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+            .unwrap();
+        let mut second = executor
+            .clone()
+            .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+            .unwrap();
+        drop(first);
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        let result = executor.try_take_response(&mut second).unwrap().unwrap();
+        assert_eq!(result.result.unwrap()["owner"], "survivor");
+        assert!(executor.executor.terminal_error().is_none());
+        let mut third = executor
+            .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+            .unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        assert_eq!(
+            executor
+                .try_take_response(&mut third)
+                .unwrap()
+                .unwrap()
+                .result
+                .unwrap()["owner"],
+            "later"
+        );
+        assert!(executor.executor.pending_records().is_empty());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_stdio_executor_requires_original_result_source() {
+        for preserve_source in [true, false] {
+            let (extension_id, registry, client_discovery) = raw_extension_configuration(
+                ExtensionDirection::ClientToServer,
+                fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+            );
+            let discovery = modern_raw_extension_discovery_response(
+                "multiplexed-extension-server",
+                Some(serde_json::json!({ "mode": "raw" })),
+            );
+            let script = format!(
+                "IFS= read -r discovery || exit 1; printf '%s\\n' '{discovery}'; \\
+                 IFS= read -r first || exit 1; IFS= read -r second || exit 1; \\
+                 exec sleep 2"
+            );
+            let cx = Cx::for_request();
+            let mut client = block_on(
+                ClientBuilder::new()
+                    .extension_registry(registry, client_discovery, || {
+                        accept_raw_extension_settings
+                    })
+                    .unwrap()
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+            )
+            .unwrap();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let mut first = executor
+                .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+                .unwrap();
+            let mut second = executor
+                .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+                .unwrap();
+            // Plant loss of the raw sidecar at the internal ingress seam.
+            // The same public extension consumer must fail closed instead of
+            // reconstructing source from a potentially lossy typed value.
+            executor
+                .executor
+                .route_response_with_raw_result(
+                    &cx,
+                    JsonRpcResponse::success(
+                        RequestId::Number(2),
+                        serde_json::json!({"value": true}),
+                    ),
+                    preserve_source.then(|| r#"{"value":true}"#.to_owned()),
+                )
+                .unwrap();
+            let result = executor.try_take_response(&mut first);
+            if preserve_source {
+                assert_eq!(result.unwrap().unwrap().result.unwrap()["value"], true);
+                assert!(executor.try_take_response(&mut second).unwrap().is_none());
+            } else {
+                assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                assert_eq!(
+                    executor.try_take_response(&mut second).unwrap_err().code,
+                    McpErrorCode::InvalidRequest
+                );
+            }
+            client.close().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn clt_ext_raw_resolver_is_fresh_for_each_negotiation_retry() {
         let (_extension_id, registry, client_discovery) = raw_extension_configuration(
             ExtensionDirection::ClientToServer,
@@ -55630,6 +56033,17 @@ while IFS= read -r unexpected; do exit 31; done
         let executor = client
             .multiplexed_stdio_executor()
             .expect("exact legacy initialization still exposes raw stdio executor");
+        let error = executor
+            .execute_final_extension(
+                &Cx::for_request(),
+                &extension_id,
+                "example/echo",
+                serde_json::json!({}),
+            )
+            .expect_err("the admitted extension executor never activates on exact legacy");
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id_before);
+        assert!(executor.executor.pending_records().is_empty());
         let error = executor
             .execute(
                 &Cx::for_request(),
