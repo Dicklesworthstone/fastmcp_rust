@@ -142,5 +142,9 @@ rustix = { workspace = true, features = ["fs", "process", "std"] }
 
 # FND-01 CLI-NO-UREQ / CLI-NO-SEMVER: no eager network update client.
 
+[dev-dependencies]
+# Production CLI entry owns its explicit top-level runtime; this is test-only.
+fastmcp-core = { workspace = true, features = ["test-runtime"] }
+
 [lints]
 workspace = true

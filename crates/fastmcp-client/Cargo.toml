@@ -53,6 +53,8 @@ fastmcp-protocol = { workspace = true, features = ["jose"] }
 rustix = { workspace = true, features = ["std", "event", "fs", "process"] }
 
 [dev-dependencies]
+# The private runtime bridge exists only in test builds, never the product graph.
+fastmcp-core = { workspace = true, features = ["test-runtime"] }
 # Test-only context construction; production callers supply or inherit a Cx.
 asupersync = { workspace = true, features = ["test-internals"] }
 

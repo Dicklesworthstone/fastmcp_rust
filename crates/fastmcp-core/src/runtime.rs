@@ -2,44 +2,28 @@
 //!
 //! This module provides the [`ProcessGenerationGuard`] that every
 //! process-local protector, handle store, limiter, and supervisor must be
-//! bound to before it becomes usable (FND-04), and a small `block_on` bridge.
+//! bound to before it becomes usable (FND-04), plus caller-context polling and
+//! blocking-lane diagnostics.
 //!
-//! # Status of the `block_on` bridge
+//! # Test runtime
 //!
-//! This helper was introduced for the `#[tool]`/`#[resource]`/`#[prompt]`
-//! macros, and that is no longer what it is. The macros expand to a directly
-//! awaited handler future and assert as much:
-//! `crates/fastmcp-macros/src/lib.rs` requires that no expansion contains
-//! `block_on` or a `runtime::` path. The FastMCP CLI drives its own explicit
-//! top-level runtime and asserts that production never reaches
-//! `fastmcp_core::runtime::block_on`.
+//! The `block_on` helper and its private runtime are compiled only for this
+//! crate's unit tests or with the explicit `test-runtime` feature. Workspace
+//! test consumers activate that feature through dev-dependencies; no product
+//! feature or normal dependency enables it. The ordinary library has neither
+//! a private runtime nor a `block_on` export.
 //!
-//! What remains is a thread-local blocking bridge still exported
-//! unconditionally from this library's public API — `pub mod runtime` plus
-//! `pub use runtime::block_on` in `lib.rs`, neither `cfg(test)`-gated — in a
-//! crate whose stated premise is that FastMCP never creates its own runtime.
-//! FND-04 requires that production `block_on`, out-of-band `Cx` construction,
-//! and private runtimes be non-exported and test-only, or have their
-//! production reachability removed. That has not happened yet, and
-//! `FND-04-B-07 production-deny-inventory` in
-//! `crates/fastmcp/tests/fnd_04_runtime_conformance.rs` measures the gap
-//! rather than asserting it away. The remaining consumers are cross-crate
-//! test modules (for example `fastmcp-protocol`'s `jose.rs`), so gating the
-//! export is a cross-crate change tracked separately; it is deliberately not
-//! attempted here.
-//!
-//! The runtime is configured with a platform I/O reactor (epoll on Linux,
-//! kqueue on macOS, IOCP on Windows) so that async network I/O works
-//! correctly inside `block_on`. `Runtime::block_on` itself installs an
-//! ambient `Cx` (backed by the runtime's drivers — including the reactor
-//! we attach below) before polling, so asupersync networking primitives
-//! can discover the I/O driver via `Cx::current()` without us having to
-//! build a context out of band.
+//! Applications own their top-level asupersync runtime and supply its `Cx`.
+//! The macros await handler futures directly. [`poll_on_cx`] retains the
+//! supplied runtime's drivers, identity, cancellation, and capability ceiling;
+//! it does not construct or re-enter a runtime.
 
 /// Process-bound authenticated encryption for ephemeral protected state.
 pub mod envelope;
 
-use std::cell::{Cell, OnceCell};
+use std::cell::Cell;
+#[cfg(any(test, feature = "test-runtime"))]
+use std::cell::OnceCell;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -47,9 +31,10 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
-use asupersync::runtime::Runtime;
-use asupersync::runtime::RuntimeBuilder;
+#[cfg(any(test, feature = "test-runtime"))]
 use asupersync::runtime::reactor::create_reactor;
+#[cfg(any(test, feature = "test-runtime"))]
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 
 use crate::crypto::{RandomDrawError, SECURITY_IDENTIFIER_BYTES, draw_security_identifier};
 
@@ -448,6 +433,7 @@ impl ProcessGenerationGuard {
 /// on `Cx::spawn_blocking`; it is not a general-purpose worker pool, so the
 /// ceiling stays small, host-independent and deterministic. Threads are created
 /// only when blocking work is admitted and retire when idle.
+#[cfg(any(test, feature = "test-runtime"))]
 const MAX_BLOCKING_THREADS: usize = 16;
 
 thread_local! {
@@ -457,6 +443,7 @@ thread_local! {
     /// on the calling thread. Sharing one current-thread runtime across
     /// concurrent blocking adapters can couple an adapter to a reactor being
     /// driven by another thread and starve sibling tasks on that runtime.
+    #[cfg(any(test, feature = "test-runtime"))]
     static RUNTIME: OnceCell<Runtime> = const { OnceCell::new() };
     static BRIDGE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     /// Whether the live bridge entry on this thread was made from INSIDE a task
@@ -525,7 +512,7 @@ pub fn enter_blocking_lane() -> BlockingLaneGuard {
 /// Reports whether an async operation awaited here is being driven by a bridge
 /// that would block the only thread able to complete it.
 ///
-/// True when [`block_on`] was entered from inside a task context on a thread
+/// True when a blocking bridge was entered from inside a task context on a thread
 /// that is not a dedicated blocking lane. In that position the bridge occupies
 /// the driver, so an operation whose completion arrives through that driver --
 /// a reverse request to the peer, for instance -- can never become ready, and
@@ -533,8 +520,9 @@ pub fn enter_blocking_lane() -> BlockingLaneGuard {
 ///
 /// This reports a POSITION, not an outcome. A caller that can return an error
 /// should use it to name the situation instead of parking; it deliberately does
-/// not gate [`block_on`] itself, whose signature has no error channel and whose
-/// other uses are unaffected.
+/// not gate [`poll_on_cx`] itself, whose signature has no error channel and whose
+/// other uses are unaffected. The test-only `block_on` helper records the same
+/// entry condition.
 #[must_use]
 pub fn bridge_would_starve_its_driver() -> bool {
     BRIDGE_NESTED_IN_TASK.with(Cell::get) && BLOCKING_LANE_DEPTH.with(Cell::get) == 0
@@ -574,6 +562,9 @@ impl Drop for BridgeEntry {
 
 /// Blocks the current thread on the provided future.
 ///
+/// Available only to unit tests or with the explicit `test-runtime` feature.
+/// Production callers must own their runtime and pass its `Cx` instead.
+///
 /// Uses a lazily initialized, per-thread asupersync runtime that has a platform
 /// I/O reactor enabled. The runtime's own `block_on` installs an ambient `Cx`
 /// carrying the runtime drivers (I/O, timer, blocking pool, entropy,
@@ -593,6 +584,7 @@ impl Drop for BridgeEntry {
 /// recursive calls on the same thread: an already-running current-thread
 /// executor cannot safely be driven recursively. Both normal completion and
 /// unwinding release the entry so that later independent calls remain usable.
+#[cfg(any(test, feature = "test-runtime"))]
 pub fn block_on<F: Future>(future: F) -> F::Output {
     // Installation is mandatory, not conditional on another subsystem having
     // installed a guard. Otherwise the first bridge could mint a reactor and
@@ -676,8 +668,8 @@ pub(crate) fn ambient_capability_ceiling() -> CapMask {
 /// `cx`, without creating or entering a runtime.
 ///
 /// This is the synchronous bridge for code that already owns a request or
-/// connection `Cx` but must return synchronously. Unlike [`block_on`] it builds
-/// no private runtime: I/O registers on `cx`'s driver, timers read `cx`'s
+/// connection `Cx` but must return synchronously. Unlike the test-only `block_on`
+/// helper, it builds no private runtime: I/O registers on `cx`'s driver, timers read `cx`'s
 /// clock, and children spawned through `cx` join `cx`'s region. The caller's
 /// runtime is not driven while this thread waits, so the loop re-polls at least
 /// every millisecond and readiness that no driver delivers is still observed.
@@ -686,13 +678,13 @@ pub(crate) fn ambient_capability_ceiling() -> CapMask {
 /// including cleanup. Supplying a broader retained `cx` cannot restore an
 /// effect denied by the context from which this bridge was entered.
 ///
-/// The entry is recorded exactly as [`block_on`] records its own, so
+/// The entry is recorded exactly as the test-only `block_on` records its own, so
 /// [`bridge_would_starve_its_driver`] still names a reverse request that could
 /// only complete through the thread this bridge occupies.
 ///
 /// # Panics
 ///
-/// Panics on a nested bridge on the same thread, like [`block_on`].
+/// Panics on a nested bridge on the same thread.
 pub fn poll_on_cx<F: Future>(cx: &asupersync::Cx, future: F) -> F::Output {
     use std::sync::Arc;
     use std::task::{Context, Poll, Wake, Waker};

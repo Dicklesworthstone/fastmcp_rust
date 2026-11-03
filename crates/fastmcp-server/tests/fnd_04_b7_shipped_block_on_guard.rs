@@ -20,7 +20,8 @@
 //! WIDENED TO THE LIBRARY GRAPH. `guard_library_crate` applies the same scan to
 //! every file each of `GUARDED_CRATES` ships, found by walking `mod` declarations
 //! from `src/lib.rs`. It also refuses library-side runtime construction. The one
-//! exemption is `fastmcp_core::block_on`'s own body. The workspace zero is
+//! exemption is `fastmcp_core::block_on`'s explicitly test-gated body. Removing
+//! that gate is itself a refusal. The workspace zero is
 //! `fnd_04_b7_library_graph_has_no_block_on_or_runtime_construction`.
 //!
 //! The counting rules mirror `tools/shipped_block_on_census.py`, which is the
@@ -113,7 +114,7 @@ fn fnd_04_b7_shipped_block_on_guard_four_files_are_zero() {
 }
 
 /// The workspace zero. No guarded library crate's shipped graph calls
-/// `block_on` or builds a runtime, except `fastmcp_core::block_on`'s own body.
+/// `block_on` or builds a runtime, except the explicitly test-gated helper body.
 /// The same instrument refuses a single planted site
 /// (`fnd_04_b7_library_graph_planted_negative`) and fails closed
 /// (`fnd_04_b7_library_graph_fails_closed`), so this zero is not a blind one.
@@ -499,9 +500,9 @@ fn fnd_04_b7_library_graph_planted_negative() {
     );
 }
 
-/// `fastmcp_core::block_on`'s own body is the one exemption, and it covers that
-/// body only. The definition really does call and build (so the exemption is
-/// doing work), and a second call elsewhere in the same file is refused.
+/// The explicitly test-gated `fastmcp_core::block_on` body is the one exemption,
+/// and it covers that body only. The definition really does call and build (so
+/// the exemption is doing work), and a second call elsewhere is refused.
 #[test]
 fn fnd_04_b7_library_graph_exempts_only_the_bridge_definition() {
     let root = repository_root();
@@ -526,5 +527,87 @@ fn fnd_04_b7_library_graph_exempts_only_the_bridge_definition() {
             path: BRIDGE_DEFINITION.0.to_owned(),
             lines: vec![line],
         }]),
+    );
+}
+
+/// The identical helper with only its test-runtime gate removed must be denied.
+/// A permanent function-name exemption would miss this production regression.
+#[test]
+fn fnd_04_b7_library_graph_rejects_unguarded_test_runtime() {
+    let root = repository_root();
+    let runtime = root.join(BRIDGE_DEFINITION.0);
+    let pristine = disk(&runtime).expect("the bridge's file is readable");
+    guard_library_crate(&root, "crates/fastmcp-core", &disk)
+        .expect("the test-gated baseline is admitted");
+    let gated_definition = "#[cfg(any(test, feature = \"test-runtime\"))]\npub fn block_on";
+    assert_eq!(pristine.matches(gated_definition).count(), 1);
+    let planted = pristine.replacen(gated_definition, "pub fn block_on", 1);
+    let objections = guard_library_crate(
+        &root,
+        "crates/fastmcp-core",
+        &substituting(&runtime, &planted),
+    )
+    .expect_err("removing only the gate must expose the private runtime to the guard");
+    assert!(objections.iter().any(|objection| matches!(
+        objection,
+        Objection::ShippedCallSites { path, lines }
+            if path == BRIDGE_DEFINITION.0 && !lines.is_empty()
+    )));
+    assert!(objections.iter().any(|objection| matches!(
+        objection,
+        Objection::RuntimeConstruction { path, lines }
+            if path == BRIDGE_DEFINITION.0 && !lines.is_empty()
+    )));
+}
+
+/// Test feature unification must not become a normal dependency or facade
+/// feature. Reading manifests is deliberate: this test's own graph enables
+/// test-runtime and cannot establish what a normal consumer links.
+#[test]
+fn fnd_04_b7_private_runtime_feature_has_only_development_consumers() {
+    let root = repository_root();
+    let mut manifests = vec!["Cargo.toml".to_owned()];
+    manifests.extend(
+        GUARDED_CRATES
+            .iter()
+            .chain([&"crates/fastmcp-cli"])
+            .map(|directory| format!("{directory}/Cargo.toml")),
+    );
+    let mut declarations = 0;
+    let mut consumers = 0;
+    for relative in manifests {
+        let manifest = disk(&root.join(&relative)).expect("every manifest must be readable");
+        let mut section = "";
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with('[') {
+                section = line;
+            }
+            if !line.contains("test-runtime") {
+                continue;
+            }
+            if relative == "crates/fastmcp-core/Cargo.toml"
+                && section == "[features]"
+                && line == "test-runtime = []"
+            {
+                declarations += 1;
+                continue;
+            }
+            assert_eq!(
+                section, "[dev-dependencies]",
+                "{relative}: a product feature or normal dependency enables the private test runtime"
+            );
+            consumers += 1;
+        }
+    }
+    assert_eq!(
+        declarations, 1,
+        "the test helper feature is explicitly declared"
+    );
+    assert_eq!(
+        consumers, 6,
+        "each internal test consumer opts in explicitly"
     );
 }

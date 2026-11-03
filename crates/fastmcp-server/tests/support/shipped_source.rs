@@ -376,9 +376,9 @@ pub(crate) const GUARDED_CRATES: [&str; 8] = [
     "crates/fastmcp",
 ];
 
-/// `fastmcp_core::block_on` builds and drives a runtime by definition. The body
-/// of that one function is the only library-side exemption; the rest of its
-/// file is scanned like any other.
+/// `fastmcp_core::block_on` is an opt-in test helper. Its body is exempt only
+/// while the explicit test-only gate remains attached; removing the gate makes
+/// its runtime construction and entry ordinary forbidden library code.
 pub(crate) const BRIDGE_DEFINITION: (&str, &str) =
     ("crates/fastmcp-core/src/runtime.rs", "pub fn block_on");
 
@@ -626,7 +626,7 @@ pub(crate) fn guard_library_crate(
     let mut objections = Vec::new();
     for file in &files {
         let exempt = (file.relative == BRIDGE_DEFINITION.0)
-            .then(|| exempt_lines(&file.source, BRIDGE_DEFINITION.1))
+            .then(|| test_runtime_bridge_lines(&file.source, BRIDGE_DEFINITION.1))
             .flatten();
         let outside = |line: &usize| exempt.as_ref().is_none_or(|range| !range.contains(line));
         let calls: Vec<usize> = shipped_block_on_sites(&file.source)
@@ -657,10 +657,18 @@ pub(crate) fn guard_library_crate(
     }
 }
 
-/// The 1-based line range of the item whose masked text begins with `item`.
-fn exempt_lines(source: &str, item: &str) -> Option<std::ops::RangeInclusive<usize>> {
+/// The 1-based line range of the opt-in test bridge, never an unguarded item.
+/// The exact gate is deliberately fail-closed: an unknown feature expression
+/// cannot silently widen this one exception to the production runtime rule.
+fn test_runtime_bridge_lines(source: &str, item: &str) -> Option<std::ops::RangeInclusive<usize>> {
     let masked = mask_non_code(source);
     let at = masked.find(item)?;
+    if !source[..at]
+        .trim_end()
+        .ends_with("#[cfg(any(test, feature = \"test-runtime\"))]")
+    {
+        return None;
+    }
     let open = at + masked[at..].find('{')?;
     let close = balanced_end(masked.as_bytes(), open)?;
     let line_of = |offset: usize| masked[..offset].matches('\n').count() + 1;

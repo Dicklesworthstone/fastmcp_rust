@@ -54,6 +54,31 @@ mod limit_01_rows;
 pub mod logging;
 /// AUTH-00 B security-partition admission and non-oracular lookup.
 pub mod partition;
+#[cfg_attr(
+    not(feature = "test-runtime"),
+    doc = r#"
+Ordinary consumers retain process-generation and caller-context APIs:
+
+```
+use fastmcp_core::runtime::{ProcessGenerationGuard, poll_on_cx};
+use fastmcp_core::{Cx, McpContext};
+
+fn from_caller(cx: Cx) -> McpContext {
+    McpContext::new(cx, 1)
+}
+```
+
+The near-identical root and module imports cannot obtain a private runtime:
+
+```compile_fail,E0432
+use fastmcp_core::block_on;
+```
+
+```compile_fail,E0432
+use fastmcp_core::runtime::block_on;
+```
+"#
+)]
 pub mod runtime;
 mod state;
 pub mod stats;
@@ -2243,6 +2268,7 @@ pub use limits::{
     ProtocolLimit, ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, QuotaPartitionKey,
     SealedAdmissionKeyError,
 };
+#[cfg(any(test, feature = "test-runtime"))]
 pub use runtime::block_on;
 // Process-generation IDENTITY, surfaced at the crate root so the facade can
 // forward these names without forwarding the module that declares them.

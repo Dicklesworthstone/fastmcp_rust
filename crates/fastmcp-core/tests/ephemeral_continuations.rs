@@ -671,13 +671,13 @@ fn bd_6rfrg_sampling_bridged_from_a_task_position_is_diagnosed() {
     // The one variable: a task context installed before the bridge is entered.
     let _ambient = Cx::set_current(Some(Cx::for_testing()));
     // NOTE: the predicate is deliberately NOT asserted here. It reads state that
-    // `block_on` records at bridge ENTRY, so outside the bridge it is false by
+    // `poll_on_cx` records at bridge ENTRY, so outside the bridge it is false by
     // construction and an assertion on it would pin the wrong moment. The first
     // draft of this test asserted `p() || !p()` to show it was publicly
     // callable -- a tautology that cannot fail, which is the exact defect class
     // this bead's own G5 was written to forbid. Public callability is proven by
     // this file compiling, not by an assert.
-    let error = fastmcp_core::block_on(ctx.sample("bd-6rfrg probe", 16))
+    let error = fastmcp_core::runtime::poll_on_cx(ctx.cx(), ctx.sample("bd-6rfrg probe", 16))
         .expect_err("sampling bridged from a task position must not report success");
     assert!(
         error.message.contains("block_on"),
@@ -699,7 +699,7 @@ fn bd_6rfrg_sampling_bridged_from_a_task_position_is_diagnosed() {
 #[test]
 fn bd_6rfrg_the_same_bridge_outside_a_task_position_is_not_diagnosed() {
     let ctx = bd_6rfrg_sampling_context();
-    let error = fastmcp_core::block_on(ctx.sample("bd-6rfrg probe", 16))
+    let error = fastmcp_core::runtime::poll_on_cx(ctx.cx(), ctx.sample("bd-6rfrg probe", 16))
         .expect_err("the no-op sampling sender always reports an error");
     assert!(
         !error.message.contains("block_on"),
@@ -761,7 +761,8 @@ fn bd_6rfrg_roots_list(task_position: bool) -> (fastmcp_core::McpResult<usize>, 
         std::sync::Arc::new(CountingRoots(std::sync::Arc::clone(&calls))),
     );
     let _ambient = task_position.then(|| Cx::set_current(Some(Cx::for_testing())));
-    let result = fastmcp_core::block_on(ctx.list_roots()).map(|roots| roots.len());
+    let result =
+        fastmcp_core::runtime::poll_on_cx(ctx.cx(), ctx.list_roots()).map(|roots| roots.len());
     (result, calls.load(std::sync::atomic::Ordering::SeqCst))
 }
 
@@ -771,8 +772,11 @@ fn bd_6rfrg_elicitation(task_position: bool) -> (fastmcp_core::McpError, usize) 
         std::sync::Arc::new(CountingElicitation(std::sync::Arc::clone(&calls))),
     );
     let _ambient = task_position.then(|| Cx::set_current(Some(Cx::for_testing())));
-    let error = fastmcp_core::block_on(ctx.elicit_form("bd-6rfrg probe", serde_json::json!({})))
-        .expect_err("both arms end in an error");
+    let error = fastmcp_core::runtime::poll_on_cx(
+        ctx.cx(),
+        ctx.elicit_form("bd-6rfrg probe", serde_json::json!({})),
+    )
+    .expect_err("both arms end in an error");
     (error, calls.load(std::sync::atomic::Ordering::SeqCst))
 }
 

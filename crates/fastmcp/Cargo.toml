@@ -130,6 +130,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# Do not expose this internal runtime helper through any facade feature.
+fastmcp-core = { workspace = true, features = ["test-runtime"] }
 trybuild.workspace = true
 # Internal facade tests may exercise deterministic lab behavior without making
 # it part of the facade's default public dependency graph.

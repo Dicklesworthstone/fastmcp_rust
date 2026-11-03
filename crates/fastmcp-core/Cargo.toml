@@ -12,6 +12,11 @@ documentation = "https://docs.rs/fastmcp-core"
 keywords = ["mcp", "context", "cancellation", "budget", "asupersync"]
 categories = ["development-tools", "network-programming"]
 
+[features]
+# Internal test harness only. Production entry points take the caller's Cx
+# and never create a private runtime. Do not forward this from product features.
+test-runtime = []
+
 [dependencies]
 asupersync.workspace = true
 serde.workspace = true

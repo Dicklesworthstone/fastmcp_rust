@@ -31,6 +31,8 @@ ring = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }
 
 [dev-dependencies]
+# JOSE tests drive their futures without exposing a product runtime bridge.
+fastmcp-core = { workspace = true, features = ["test-runtime"] }
 # Integration tests link only against this crate plus its dev-dependencies, so
 # the conformance oracle in tests/spec_2026_07_28_oracle.rs needs its own
 # handle on serde_json to read the vendored official example corpus. Already a

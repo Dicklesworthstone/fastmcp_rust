@@ -82,6 +82,8 @@ argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "p
 # Crypto flows through fastmcp-core; Redis Tasks belongs to a later package.
 
 [dev-dependencies]
+# The private runtime bridge exists only in test builds, never the product graph.
+fastmcp-core = { workspace = true, features = ["test-runtime"] }
 fastmcp-derive.workspace = true
 # The OIDC external-custody adapter is exercised with a real RS256 operation
 # only in the cfg(test) module; this never enters the shipped server graph.

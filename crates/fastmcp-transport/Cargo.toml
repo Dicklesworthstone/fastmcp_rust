@@ -37,6 +37,8 @@ serde_json.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "std"] }
 
 [dev-dependencies]
+# The private runtime bridge exists only in test builds, never the product graph.
+fastmcp-core = { workspace = true, features = ["test-runtime"] }
 # Test-only context construction; transport production APIs receive `&Cx`.
 asupersync = { workspace = true, features = ["test-internals"] }
 
