@@ -1,4 +1,4 @@
-//! E2E tests for `fastmcp test`.
+//! E2E tests for connection probes, inspection, and single MCP operations.
 
 #![cfg(unix)]
 
@@ -1777,6 +1777,730 @@ fn run_modern_fixture_with_request(request: &str) -> Output {
 }
 
 #[cfg(unix)]
+const SINGLE_OPERATION_STDIO_FIXTURE: &str = r#"
+expected_method=$1
+response_member=$2
+response_body=$3
+operation_seen=0
+while IFS= read -r request; do
+    printf 'FASTMCP_E2E_WIRE %s\n' "$request" >&2
+    id=${request##*\"id\":}
+    id=${id%\}}
+    case "$id" in '' | *[!0-9]*) exit 1 ;; esac
+    case "$request" in
+        *'"method":"server/discover"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"prompts":{}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
+            ;;
+        *"\"method\":\"$expected_method\""*)
+            [ "$operation_seen" = 0 ] || exit 1
+            operation_seen=1
+            printf '{"jsonrpc":"2.0","id":%s,"%s":%s}\n' "$id" "$response_member" "$response_body"
+            ;;
+        *) exit 1 ;;
+    esac
+done
+[ "$operation_seen" = 1 ] || exit 1
+printf 'FASTMCP_OPERATION_EOF\n' >&2
+"#;
+
+fn operation_method(command: &str) -> &'static str {
+    match command {
+        "call" => "tools/call",
+        "read" => "resources/read",
+        "prompt" => "prompts/get",
+        _ => panic!("unknown operation fixture command"),
+    }
+}
+
+fn run_stdio_operation_fixture(
+    command: &str,
+    target: &str,
+    arguments: Option<&str>,
+    response_member: &str,
+    response_body: &str,
+) -> Output {
+    let mut args = vec![
+        command,
+        target,
+        "--server",
+        "/bin/sh",
+        "--server-arg=-c",
+        "--server-arg",
+        SINGLE_OPERATION_STDIO_FIXTURE,
+        "--server-arg",
+        "fastmcp-operation-fixture",
+        "--server-arg",
+        operation_method(command),
+        "--server-arg",
+        response_member,
+        "--server-arg",
+        response_body,
+        "--protocol-policy",
+        "modern-only",
+        "--json",
+        "--timeout",
+        "5",
+    ];
+    if let Some(arguments) = arguments {
+        args.extend(["--arguments", arguments]);
+    }
+    run_cli(&args)
+}
+
+fn run_http_operation_fixture(
+    command: &str,
+    target: &str,
+    arguments: Option<&str>,
+    response_member: &str,
+    response_body: &str,
+    json: bool,
+) -> (Output, Vec<serde_json::Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind operation HTTP fixture");
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let method = operation_method(command);
+    let response_member = response_member.to_owned();
+    let response_body = response_body.to_owned();
+    let (finished, finish) = mpsc::channel();
+    let (sent, received) = mpsc::channel();
+    let fixture = spawn_loopback_fixture_with_deadline(
+        "single operation HTTP fixture",
+        Duration::from_secs(10),
+        move |deadline| {
+            let mut wire = Vec::new();
+            let mut stream =
+                accept_h1_fixture_connection(&listener, deadline, "operation discovery");
+            let (head, request) = read_h1_json_request(&mut stream, deadline);
+            assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert_eq!(request["method"], "server/discover");
+            write_h1_json_response(
+                &mut stream,
+                deadline,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}},"resources":{{}},"prompts":{{}}}},"ttlMs":0,"cacheScope":"private"}}}}"#,
+                    request["id"],
+                ),
+            );
+            wire.push(request);
+            drop(stream);
+            let mut stream = accept_h1_fixture_connection(&listener, deadline, "operation request");
+            let (head, request) = read_h1_json_request(&mut stream, deadline);
+            assert!(head.starts_with("POST /mcp HTTP/1.1\r\n"));
+            assert_eq!(request["method"], method);
+            write_h1_json_response(
+                &mut stream,
+                deadline,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"{response_member}":{response_body}}}"#,
+                    request["id"],
+                ),
+            );
+            wire.push(request);
+            drop(stream);
+            // Keep the route live through CLI termination: a failed action or
+            // input_required must never silently cause another connection.
+            loop {
+                let done = finish.try_recv().is_ok();
+                match listener.accept() {
+                    Ok(_) => panic!("single operation command retried or continued the action"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("operation retry observer failed: {error}"),
+                }
+                if done {
+                    break;
+                }
+                std::thread::park_timeout(fixture_wait(deadline, "observe no operation replay"));
+            }
+            sent.send(wire).expect("report observed operation requests");
+        },
+    );
+    let mut args = vec![
+        command,
+        target,
+        "--http-url",
+        &url,
+        "--protocol-policy",
+        "modern-only",
+        "--timeout",
+        "5",
+    ];
+    if let Some(arguments) = arguments {
+        args.extend(["--arguments", arguments]);
+    }
+    if json {
+        args.push("--json");
+    }
+    let output = run_cli(&args);
+    finished.send(()).expect("operation observer remains alive");
+    wait_for_loopback_fixture(fixture, "single operation HTTP fixture");
+    (output, received.recv().expect("observed HTTP wire"))
+}
+
+const OPERATION_CALL_RESULT: &str = r#"{"resultType":"complete","content":[{"type":"text","text":"echoed"}],"com.example/exact":{"negativeZero":-0,"decimal":1.2300,"large":9007199254740993}}"#;
+const OPERATION_READ_RESULT: &str = r#"{"resultType":"complete","contents":[{"uri":"demo://status","mimeType":"text/plain","text":"healthy"}],"ttlMs":0,"cacheScope":"private"}"#;
+const OPERATION_PROMPT_RESULT: &str = r#"{"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":"Hello Ada"}}]}"#;
+
+#[test]
+fn e2e_cli_operations_stdio_invoke_read_and_prompt_once() {
+    for (command, target, arguments, result, payload, expected) in [
+        (
+            "call",
+            "echo",
+            Some(r#"{"message":"literal; $(no shell)"}"#),
+            OPERATION_CALL_RESULT,
+            "content",
+            "echoed",
+        ),
+        (
+            "read",
+            "demo://status",
+            None,
+            OPERATION_READ_RESULT,
+            "contents",
+            "healthy",
+        ),
+        (
+            "prompt",
+            "greeting",
+            Some(r#"{"name":"Ada"}"#),
+            OPERATION_PROMPT_RESULT,
+            "messages",
+            "Hello Ada",
+        ),
+    ] {
+        let output = run_stdio_operation_fixture(command, target, arguments, "result", result);
+        assert!(
+            output.status.success(),
+            "{command} failed: {}",
+            stderr_str(&output)
+        );
+        let rendered: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one MCP result JSON document");
+        assert_eq!(rendered["resultType"], "complete");
+        let text = if command == "prompt" {
+            &rendered[payload][0]["content"]["text"]
+        } else {
+            &rendered[payload][0]["text"]
+        };
+        assert_eq!(text, expected);
+        let wire = observed_protocol_wire(&output);
+        assert_eq!(wire.len(), 2, "one discovery and one action only");
+        assert_eq!(wire[1]["method"], operation_method(command));
+        let target_key = if command == "read" { "uri" } else { "name" };
+        assert_eq!(wire[1]["params"][target_key], target);
+        if let Some(arguments) = arguments {
+            assert_eq!(
+                wire[1]["params"]["arguments"],
+                serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+            );
+        } else {
+            assert!(wire[1]["params"].get("arguments").is_none());
+        }
+        assert!(
+            stderr_str(&output).contains("FASTMCP_OPERATION_EOF"),
+            "stdio transport must close before success"
+        );
+        if command == "call" {
+            for spelling in [
+                r#""negativeZero":-0"#,
+                r#""decimal":1.2300"#,
+                "9007199254740993",
+            ] {
+                assert!(
+                    stdout_str(&output).contains(spelling),
+                    "admitted result lexemes must survive: {spelling}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn e2e_cli_operations_http_invoke_read_and_prompt_once() {
+    for (command, target, arguments, result, payload) in [
+        (
+            "call",
+            "echo",
+            Some(r#"{"message":"literal"}"#),
+            OPERATION_CALL_RESULT,
+            "content",
+        ),
+        (
+            "read",
+            "demo://status",
+            None,
+            OPERATION_READ_RESULT,
+            "contents",
+        ),
+        (
+            "prompt",
+            "greeting",
+            Some(r#"{"name":"Ada"}"#),
+            OPERATION_PROMPT_RESULT,
+            "messages",
+        ),
+    ] {
+        let (output, wire) =
+            run_http_operation_fixture(command, target, arguments, "result", result, true);
+        assert!(
+            output.status.success(),
+            "{command} failed: {}",
+            stderr_str(&output)
+        );
+        let rendered: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one MCP result JSON document");
+        assert_eq!(rendered["resultType"], "complete");
+        assert_eq!(rendered[payload].as_array().unwrap().len(), 1);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(
+            wire[1]["params"][if command == "read" { "uri" } else { "name" }],
+            target
+        );
+        assert_eq!(
+            wire[1]["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"],
+            "2026-07-28"
+        );
+        if let Some(arguments) = arguments {
+            assert_eq!(
+                wire[1]["params"]["arguments"],
+                serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+            );
+        }
+        if command == "call" {
+            assert!(stdout_str(&output).contains(r#""decimal":1.2300"#));
+            assert!(stdout_str(&output).contains(r#""negativeZero":-0"#));
+        }
+    }
+}
+
+#[test]
+fn e2e_cli_operations_refuse_invalid_arguments_and_resource_before_contact() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let observer = spawn_forbidden_http_contact_observer(
+        listener,
+        Arc::clone(&contacts),
+        "operation preflight",
+    );
+    for (command, target, arguments) in [
+        (
+            "call",
+            "echo",
+            Some(r#"{"nested":{"secret":"opaque-first","secret":"opaque-second"}}"#),
+        ),
+        ("call", "echo", Some("[]")),
+        ("call", "echo", Some("null")),
+        ("prompt", "greeting", Some(r#"{"name":7}"#)),
+        ("read", "relative/resource", None),
+    ] {
+        let mut args = vec![
+            command,
+            target,
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--json",
+        ];
+        if let Some(arguments) = arguments {
+            args.extend(["--arguments", arguments]);
+        }
+        let output = run_cli(&args);
+        assert!(!output.status.success(), "invalid caller input must fail");
+        let error: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one diagnostic error document");
+        assert_eq!(error["command"], command);
+        assert_eq!(error["success"], false);
+        for secret in ["opaque-first", "opaque-second"] {
+            assert!(!stdout_str(&output).contains(secret));
+            assert!(!stderr_str(&output).contains(secret));
+        }
+    }
+    stop_forbidden_http_contact_observer(observer, "operation preflight");
+    assert_eq!(
+        contacts.load(Ordering::SeqCst),
+        0,
+        "invalid inputs must not start discovery"
+    );
+    let output = run_cli(&[
+        "call",
+        "echo",
+        "--server",
+        "/bin/sh",
+        "--server-arg=-c",
+        "--server-arg",
+        "printf 'FORBIDDEN_OPERATION_SPAWN\\n' >&2",
+        "--protocol-policy",
+        "modern-only",
+        "--arguments",
+        r#"{"x":1,"x":2}"#,
+    ]);
+    assert!(!output.status.success());
+    assert!(!stderr_str(&output).contains("FORBIDDEN_OPERATION_SPAWN"));
+}
+
+#[test]
+fn e2e_cli_operations_preserve_tool_errors_and_input_required_without_replay() {
+    let tool_error = r#"{"resultType":"complete","content":[{"type":"text","text":"tool refused"}],"isError":true}"#;
+    let input_required = r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"retry-state"}"#;
+    for (command, target, result, discriminator) in [
+        ("call", "echo", tool_error, "complete"),
+        ("call", "echo", input_required, "input_required"),
+        ("read", "demo://status", input_required, "input_required"),
+        ("prompt", "greeting", input_required, "input_required"),
+    ] {
+        let (output, wire) =
+            run_http_operation_fixture(command, target, None, "result", result, true);
+        assert!(
+            !output.status.success(),
+            "non-completed operation must exit nonzero"
+        );
+        let rendered: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("the admitted result remains the only JSON document");
+        assert_eq!(rendered["resultType"], discriminator);
+        assert_eq!(wire.len(), 2, "only one action may be dispatched");
+        assert!(
+            stderr_str(&output).contains(if discriminator == "complete" {
+                "isError=true"
+            } else {
+                "input_required"
+            })
+        );
+    }
+    let output = run_stdio_operation_fixture("call", "echo", None, "result", tool_error);
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["isError"], true);
+    assert_eq!(observed_protocol_wire(&output).len(), 2);
+    assert!(stderr_str(&output).contains("FASTMCP_OPERATION_EOF"));
+}
+
+#[test]
+fn e2e_cli_operations_redact_terminal_results_and_reflected_failures() {
+    let result = r#"{"resultType":"complete","content":[{"type":"text","text":"Bearer peer-secret\u001b[31m"}],"structuredContent":{"api_key":"opaque-sensitive-value","visible":"safe"}}"#;
+    let (text, _) = run_http_operation_fixture("call", "echo", None, "result", result, false);
+    assert!(text.status.success(), "{}", stderr_str(&text));
+    assert!(stdout_str(&text).contains("tools/call: complete (MCP 2026-07-28)"));
+    assert!(stdout_str(&text).contains("safe"));
+    assert!(!stdout_str(&text).contains("peer-secret"));
+    assert!(!stdout_str(&text).contains("opaque-sensitive-value"));
+    assert!(!text.stdout.contains(&0x1b));
+    let (json, _) = run_http_operation_fixture("call", "echo", None, "result", result, true);
+    assert!(json.status.success());
+    let typed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(
+        typed["structuredContent"]["api_key"], "opaque-sensitive-value",
+        "machine result content is not a diagnostic preview"
+    );
+    let error =
+        r#"{"code":-32602,"message":"opaque-reflected-value\u001b[31m","data":{"exit_code":0}}"#;
+    let (failed, wire) = run_http_operation_fixture("call", "echo", None, "error", error, true);
+    assert!(!failed.status.success());
+    assert_eq!(wire.len(), 2);
+    assert!(!stdout_str(&failed).contains("opaque-reflected-value"));
+    assert!(!stderr_str(&failed).contains("opaque-reflected-value"));
+    let document: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(document["schema"], "fastmcp.cli.error/v2");
+    assert_eq!(document["success"], false);
+    assert_eq!(document["exitCode"], 1);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn e2e_cli_operations_legacy_call_preserves_the_selected_result_era() {
+    const LEGACY_OPERATION: &str = r#"
+state=initialize
+while IFS= read -r request; do
+    printf 'FASTMCP_E2E_WIRE %s\n' "$request" >&2
+    case "$state:$request" in
+        initialized:*'"method":"notifications/initialized"'*) state=call; continue ;;
+    esac
+    id=${request##*\"id\":}
+    id=${id%\}}
+    case "$id" in '' | *[!0-9]*) exit 1 ;; esac
+    case "$state:$request" in
+        initialize:*'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"legacy-operation","version":"1"}}}\n' "$id"
+            state=initialized
+            ;;
+        call:*'"method":"tools/call"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"legacy-result"}]}}\n' "$id"
+            state=done
+            ;;
+        *) exit 1 ;;
+    esac
+done
+[ "$state" = done ]
+"#;
+    let output = run_cli(&[
+        "call",
+        "echo",
+        "--server",
+        "/bin/sh",
+        "--server-arg=-c",
+        "--server-arg",
+        LEGACY_OPERATION,
+        "--arguments",
+        r#"{"message":"legacy"}"#,
+        "--protocol-policy",
+        "legacy-only",
+        "--json",
+        "--timeout",
+        "5",
+    ]);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    let result: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("legacy result JSON");
+    assert!(result.get("resultType").is_none());
+    assert_eq!(result["content"][0]["text"], "legacy-result");
+    let wire = observed_protocol_wire(&output);
+    assert_eq!(wire.len(), 3);
+    assert_eq!(wire[0]["method"], "initialize");
+    assert_eq!(wire[0]["params"]["protocolVersion"], "2024-11-05");
+    assert_eq!(wire[1]["method"], "notifications/initialized");
+    assert_eq!(wire[2]["method"], "tools/call");
+    assert_eq!(wire[2]["params"]["arguments"]["message"], "legacy");
+    for request in &wire {
+        assert_no_final_metadata(request);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_argument_file_admission_preserves_input_and_refuses_duplicates() {
+    use std::io::Seek as _;
+    use std::os::fd::AsRawFd as _;
+    let mut file = std::fs::File::from(
+        rustix::fs::memfd_create(
+            "fastmcp-operation-arguments",
+            rustix::fs::MemfdFlags::CLOEXEC,
+        )
+        .expect("anonymous regular argument file"),
+    );
+    file.write_all(br#"{"message":"from-file"}"#).unwrap();
+    let path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
+    let args = [
+        "call",
+        "echo",
+        "--server",
+        "/bin/sh",
+        "--server-arg=-c",
+        "--server-arg",
+        SINGLE_OPERATION_STDIO_FIXTURE,
+        "--server-arg",
+        "fastmcp-file-fixture",
+        "--server-arg",
+        "tools/call",
+        "--server-arg",
+        "result",
+        "--server-arg",
+        OPERATION_CALL_RESULT,
+        "--arguments-file",
+        &path,
+        "--protocol-policy",
+        "modern-only",
+        "--json",
+        "--timeout",
+        "5",
+    ];
+    let output = run_cli(&args);
+    assert!(output.status.success(), "{}", stderr_str(&output));
+    assert_eq!(
+        observed_protocol_wire(&output)[1]["params"]["arguments"]["message"],
+        "from-file"
+    );
+    file.set_len(0).unwrap();
+    file.rewind().unwrap();
+    file.write_all(br#"{"message":"from-file","message":"duplicate-private"}"#)
+        .unwrap();
+    let refused = run_cli(&args);
+    assert!(!refused.status.success());
+    assert!(
+        observed_protocol_wire(&refused).is_empty(),
+        "duplicate file input must be rejected before spawn/discovery"
+    );
+    assert!(!stdout_str(&refused).contains("duplicate-private"));
+    assert!(!stderr_str(&refused).contains("duplicate-private"));
+    let refused = run_cli(&[
+        "call",
+        "echo",
+        "--server",
+        "/bin/sh",
+        "--server-arg=-c",
+        "--server-arg",
+        "printf 'FORBIDDEN_FILE_SPAWN\\n' >&2",
+        "--arguments-file",
+        "/dev/null",
+        "--protocol-policy",
+        "modern-only",
+        "--json",
+    ]);
+    assert!(!refused.status.success(), "non-regular input is refused");
+    assert!(!stderr_str(&refused).contains("FORBIDDEN_FILE_SPAWN"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_timeout_after_dispatch_stops_owned_descendants_without_replay() {
+    const SILENT_OPERATION: &str = r#"
+while IFS= read -r request; do
+    printf 'FASTMCP_E2E_WIRE %s\n' "$request" >&2
+    id=${request##*\"id\":}
+    id=${id%\}}
+    case "$request" in
+        *'"method":"server/discover"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}}\n' "$id"
+            ;;
+        *'"method":"tools/call"'*)
+            /bin/sleep 3600 &
+            printf 'FASTMCP_OPERATION_DESCENDANT=%s\n' "$!" >&2
+            wait "$!"
+            ;;
+        *) exit 1 ;;
+    esac
+done
+"#;
+    let mut command = Command::new(fastmcp_bin());
+    command.args([
+        "call",
+        "echo",
+        "--server",
+        "/bin/sh",
+        "--server-arg=-c",
+        "--server-arg",
+        SILENT_OPERATION,
+        "--protocol-policy",
+        "modern-only",
+        "--json",
+        "--timeout",
+        "1",
+    ]);
+    let started = Instant::now();
+    let output = run_with_deadline(command, Duration::from_secs(8)).unwrap_or_else(|expired| {
+        panic!(
+            "operation failed its timeout/cleanup bound: {:?}",
+            expired.cleanup_error
+        )
+    });
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(8));
+    let wire = observed_protocol_wire(&output);
+    assert_eq!(
+        wire.len(),
+        2,
+        "one discovery and one dispatched action, without replay"
+    );
+    assert_eq!(wire[1]["method"], "tools/call");
+    let error: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one failure document");
+    assert_eq!(error["command"], "call");
+    assert_eq!(error["success"], false);
+    let stderr = stderr_str(&output);
+    assert!(
+        !stderr.contains("cleanup could not be verified"),
+        "{stderr}"
+    );
+    let pid = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("FASTMCP_OPERATION_DESCENDANT="))
+        .and_then(|value| value.parse::<u32>().ok())
+        .expect("the effectful request was received before timing out");
+    let state =
+        read_linux_process_state_and_group(pid).expect("inspect owned descendant after CLI exit");
+    assert!(
+        state.is_none_or(|(state, _)| matches!(state, 'Z' | 'X' | 'x')),
+        "timed-out operation left its descendant alive"
+    );
+}
+
+#[test]
+fn e2e_cli_operations_http_timeout_closes_the_dispatched_request_without_replay() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let (finished, finish) = mpsc::channel();
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&dispatched);
+    let closed = Arc::new(AtomicBool::new(false));
+    let observed_closed = Arc::clone(&closed);
+    let fixture = spawn_loopback_fixture_with_deadline(
+        "silent HTTP operation",
+        Duration::from_secs(8),
+        move |deadline| {
+            let mut stream =
+                accept_h1_fixture_connection(&listener, deadline, "silent HTTP discovery");
+            let (_, request) = read_h1_json_request(&mut stream, deadline);
+            assert_eq!(request["method"], "server/discover");
+            write_h1_json_response(
+                &mut stream,
+                deadline,
+                &format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}}}},"ttlMs":0,"cacheScope":"private"}}}}"#,
+                    request["id"],
+                ),
+            );
+            drop(stream);
+            let mut stream =
+                accept_h1_fixture_connection(&listener, deadline, "silent HTTP action");
+            let (_, request) = read_h1_json_request(&mut stream, deadline);
+            assert_eq!(request["method"], "tools/call");
+            observed.fetch_add(1, Ordering::SeqCst);
+            let mut byte = [0_u8; 1];
+            assert_eq!(
+                read_h1_fixture_chunk(
+                    &mut stream,
+                    &mut byte,
+                    deadline,
+                    "timed out HTTP stream must close"
+                ),
+                0
+            );
+            observed_closed.store(true, Ordering::SeqCst);
+            loop {
+                let done = finish.try_recv().is_ok();
+                match listener.accept() {
+                    Ok(_) => panic!("timed-out action must not reconnect or retry"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("timeout retry observer failed: {error}"),
+                }
+                if done {
+                    break;
+                }
+                std::thread::park_timeout(fixture_wait(deadline, "observe no timeout replay"));
+            }
+        },
+    );
+    let mut command = Command::new(fastmcp_bin());
+    command.args([
+        "call",
+        "echo",
+        "--http-url",
+        &url,
+        "--protocol-policy",
+        "modern-only",
+        "--json",
+        "--timeout",
+        "1",
+    ]);
+    let output = run_with_deadline(command, Duration::from_secs(6)).unwrap_or_else(|expired| {
+        panic!(
+            "HTTP operation exceeded its timeout: {:?}",
+            expired.cleanup_error
+        )
+    });
+    assert!(!output.status.success());
+    finished.send(()).expect("timeout observer alive");
+    wait_for_loopback_fixture(fixture, "silent HTTP operation");
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "timed-out request socket must close"
+    );
+    let failure: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("timeout diagnostic JSON");
+    assert_eq!(failure["command"], "call");
+    assert_eq!(failure["success"], false);
+}
+
 #[test]
 fn e2e_test_json_report_against_static_protocol_fixture() {
     // Use a deterministic stdio peer as the subprocess being tested.

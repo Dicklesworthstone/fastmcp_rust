@@ -3,6 +3,7 @@
 //! Commands:
 //! - `run` - Run an MCP server
 //! - `inspect` - Inspect a server's capabilities
+//! - `call`, `read`, `prompt` - Invoke tools, read resources, and render prompts
 //! - `install` - Install server config for Claude Desktop etc.
 //! - `test` - Exercise a local server with per-request idle/absolute timeouts
 //! - `tasks` - Get/watch/update/cancel official tasks (requires `tasks` feature)
@@ -111,6 +112,9 @@ const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
     "Commands: ",
     "run Run an MCP server binary ",
     "inspect Inspect an MCP server's capabilities ",
+    "call Invoke one MCP tool ",
+    "read Read one MCP resource ",
+    "prompt Render one MCP prompt ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
     "test Test MCP server connectivity ",
@@ -126,6 +130,9 @@ const EXPECTED_CLI_ROOT_HELP_PREFIX: &str = concat!(
     "Commands: ",
     "run Run an MCP server binary ",
     "inspect Inspect an MCP server's capabilities ",
+    "call Invoke one MCP tool ",
+    "read Read one MCP resource ",
+    "prompt Render one MCP prompt ",
     "tasks Get, watch, update, or cancel an official MCP task ",
     "install Install server configuration into Claude Desktop or other clients ",
     "list List configured MCP servers ",
@@ -667,6 +674,42 @@ enum Commands {
         protocol_policy: CliProtocolPolicy,
     },
 
+    /// Invoke one MCP tool.
+    ///
+    /// Sends the action once. A tool error exits nonzero while retaining its
+    /// result; input_required is reported without automatically retrying.
+    Call {
+        /// Exact tool name.
+        name: String,
+        #[command(flatten)]
+        connection: OperationConnection,
+        #[command(flatten)]
+        arguments: OperationArguments,
+    },
+
+    /// Read one MCP resource.
+    ///
+    /// Sends the absolute URI unchanged to resources/read. The CLI does not
+    /// fetch the URI independently or follow an input_required continuation.
+    Read {
+        /// Absolute resource URI, including custom schemes.
+        uri: String,
+        #[command(flatten)]
+        connection: OperationConnection,
+    },
+
+    /// Render one MCP prompt.
+    ///
+    /// Prompt arguments must be a JSON object whose values are strings.
+    Prompt {
+        /// Exact prompt name.
+        name: String,
+        #[command(flatten)]
+        connection: OperationConnection,
+        #[command(flatten)]
+        arguments: OperationArguments,
+    },
+
     /// Get, watch, update, or cancel an official MCP task.
     #[cfg(feature = "tasks")]
     Tasks {
@@ -843,6 +886,9 @@ impl Commands {
             | Self::Dev {
                 protocol_policy, ..
             } => Some(*protocol_policy),
+            Self::Call { connection, .. }
+            | Self::Read { connection, .. }
+            | Self::Prompt { connection, .. } => Some(connection.protocol_policy),
             Self::List { .. } => None,
             #[cfg(feature = "tasks")]
             Self::Tasks { .. } => Some(CliProtocolPolicy::ModernOnly),
@@ -858,10 +904,58 @@ impl Commands {
                 format: InspectFormat::Json,
                 ..
             } => Some("inspect"),
+            Self::Call { connection, .. } if connection.json => Some("call"),
+            Self::Read { connection, .. } if connection.json => Some("read"),
+            Self::Prompt { connection, .. } if connection.json => Some("prompt"),
             Self::Test { json: true, .. } => Some("test"),
             _ => None,
         }
     }
+}
+
+/// A single selected-era operation owns its explicit connection and timeout.
+#[derive(clap::Args)]
+struct OperationConnection {
+    /// Stdio executable (Unix only); choose this or explicit HTTP endpoints.
+    #[arg(long, conflicts_with_all = ["http_url", "legacy_sse_url", "legacy_message_url"])]
+    server: Option<String>,
+    /// Argument passed literally to the stdio server (repeatable).
+    #[arg(long, requires = "server", allow_hyphen_values = true)]
+    server_arg: Vec<String>,
+    /// Explicit modern Streamable HTTP MCP POST endpoint.
+    #[arg(long, value_name = "URL")]
+    http_url: Option<String>,
+    /// Read a bearer token from a regular file (at most 16 KiB); HTTPS only.
+    #[arg(long, value_name = "PATH", requires = "http_url")]
+    bearer_token_file: Option<PathBuf>,
+    /// Explicit MCP 2024-11-05 SSE GET endpoint (requires the legacy feature).
+    #[arg(long, value_name = "URL")]
+    legacy_sse_url: Option<String>,
+    /// Explicit MCP 2024-11-05 message POST endpoint (requires the legacy feature).
+    #[arg(long, value_name = "URL")]
+    legacy_message_url: Option<String>,
+    /// Protocol-policy selection for this connection.
+    #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
+    protocol_policy: CliProtocolPolicy,
+    /// Emit the admitted MCP result JSON, including its unredacted content.
+    #[arg(long)]
+    json: bool,
+    /// Connection and request budget in seconds (1-900).
+    /// Unix stdout pipes share the remaining budget; other platforms may block
+    /// on output. Bounded subprocess cleanup may continue after expiry.
+    #[arg(long, default_value_t = 30,
+        value_parser = clap::value_parser!(u64).range(1..=900))]
+    timeout: u64,
+}
+
+#[derive(clap::Args, Default)]
+struct OperationArguments {
+    /// JSON object of arguments (at most 1 MiB); use a file for sensitive input.
+    #[arg(long, value_name = "JSON", conflicts_with = "arguments_file")]
+    arguments: Option<String>,
+    /// Read arguments from a regular JSON object file (at most 1 MiB).
+    #[arg(long, value_name = "PATH")]
+    arguments_file: Option<PathBuf>,
 }
 
 /// Tasks never fall back to a legacy custom task protocol.
@@ -1220,6 +1314,41 @@ async fn run_cli(cx: &Cx, cli: Cli) -> McpResult<()> {
     }
 
     match cli.command {
+        Commands::Call {
+            name,
+            connection,
+            arguments,
+        } => {
+            Box::pin(cmd_operation(
+                cx,
+                &connection,
+                CoreOperation::Call(&name),
+                &arguments,
+            ))
+            .await
+        }
+        Commands::Read { uri, connection } => {
+            Box::pin(cmd_operation(
+                cx,
+                &connection,
+                CoreOperation::Read(&uri),
+                &OperationArguments::default(),
+            ))
+            .await
+        }
+        Commands::Prompt {
+            name,
+            connection,
+            arguments,
+        } => {
+            Box::pin(cmd_operation(
+                cx,
+                &connection,
+                CoreOperation::Prompt(&name),
+                &arguments,
+            ))
+            .await
+        }
         #[cfg(feature = "tasks")]
         Commands::Tasks { connection, action } => {
             Box::pin(cmd_tasks(cx, &connection, &action)).await
@@ -6039,6 +6168,496 @@ fn http_client_builder(
         builder = builder.http_bearer_credential(credential);
     }
     Ok(builder)
+}
+
+#[derive(Clone, Copy)]
+enum CoreOperation<'a> {
+    Call(&'a str),
+    Read(&'a str),
+    Prompt(&'a str),
+}
+
+impl CoreOperation<'_> {
+    const fn method(self) -> &'static str {
+        match self {
+            Self::Call(_) => "tools/call",
+            Self::Read(_) => "resources/read",
+            Self::Prompt(_) => "prompts/get",
+        }
+    }
+
+    fn parameters(self, arguments: &OperationArguments) -> McpResult<serde_json::Value> {
+        let arguments = read_operation_arguments(arguments)?;
+        let mut parameters = serde_json::Map::new();
+        match self {
+            Self::Read(uri) => {
+                if arguments.is_some() {
+                    return Err(fastmcp_core::McpError::invalid_params(
+                        "resources/read does not accept tool or prompt arguments",
+                    ));
+                }
+                fastmcp_protocol::AbsoluteUri::parse(uri).map_err(|_| {
+                    fastmcp_core::McpError::invalid_params(
+                        "read requires a structurally valid absolute resource URI",
+                    )
+                })?;
+                parameters.insert("uri".to_owned(), uri.into());
+            }
+            Self::Call(name) | Self::Prompt(name) => {
+                if name.is_empty() || name.len() > 1024 || name.chars().any(char::is_control) {
+                    return Err(fastmcp_core::McpError::invalid_params(
+                        "tool and prompt names must contain 1-1024 UTF-8 bytes and no control characters",
+                    ));
+                }
+                parameters.insert("name".to_owned(), name.into());
+                if let Some(arguments) = arguments {
+                    if matches!(self, Self::Prompt(_))
+                        && arguments.values().any(|value| !value.is_string())
+                    {
+                        return Err(fastmcp_core::McpError::invalid_params(
+                            "prompt arguments must be a JSON object with string values",
+                        ));
+                    }
+                    parameters.insert("arguments".to_owned(), arguments.into());
+                }
+            }
+        }
+        Ok(parameters.into())
+    }
+}
+
+/// Admit the original document before a JSON map can discard duplicate members.
+/// No peer connection or subprocess exists while caller input is admitted.
+fn read_operation_arguments(
+    arguments: &OperationArguments,
+) -> McpResult<Option<serde_json::Map<String, serde_json::Value>>> {
+    const MAX_ARGUMENT_BYTES: usize = 1024 * 1024;
+    let invalid = || {
+        fastmcp_core::McpError::invalid_params(
+            "arguments must be one JSON object of at most 1 MiB with no duplicate members; --arguments-file must name a readable regular file",
+        )
+    };
+    let bytes = match (&arguments.arguments, &arguments.arguments_file) {
+        (None, None) => return Ok(None),
+        (Some(_), Some(_)) => return Err(invalid()),
+        (Some(document), None) => {
+            if document.len() > MAX_ARGUMENT_BYTES {
+                return Err(invalid());
+            }
+            document.as_bytes().to_vec()
+        }
+        (None, Some(path)) => {
+            #[cfg(unix)]
+            let file = {
+                use rustix::fs::{Mode, OFlags};
+                File::from(
+                    rustix::fs::open(
+                        path,
+                        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                        Mode::empty(),
+                    )
+                    .map_err(|_| invalid())?,
+                )
+            };
+            #[cfg(not(unix))]
+            let file = {
+                if !std::fs::metadata(path).map_err(|_| invalid())?.is_file() {
+                    return Err(invalid());
+                }
+                File::open(path).map_err(|_| invalid())?
+            };
+            let metadata = file.metadata().map_err(|_| invalid())?;
+            if !metadata.is_file() || metadata.len() > MAX_ARGUMENT_BYTES as u64 {
+                return Err(invalid());
+            }
+            let mut bytes = Vec::new();
+            file.take(MAX_ARGUMENT_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| invalid())?;
+            if bytes.len() > MAX_ARGUMENT_BYTES {
+                return Err(invalid());
+            }
+            bytes
+        }
+    };
+    fastmcp_protocol::admit_raw_jsonrpc_document(&bytes, MAX_ARGUMENT_BYTES)
+        .map_err(|_| invalid())?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    match value {
+        serde_json::Value::Object(arguments) => Ok(Some(arguments)),
+        _ => Err(invalid()),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OperationBudget {
+    deadline: std::time::Instant,
+}
+
+impl OperationBudget {
+    fn new(timeout: u64) -> McpResult<Self> {
+        if !(1..=900).contains(&timeout) {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "operation timeout must be between 1 and 900 seconds",
+            ));
+        }
+        let deadline = std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(timeout))
+            .ok_or_else(Self::timeout_error)?;
+        Ok(Self { deadline })
+    }
+
+    fn remaining(self, cx: &Cx) -> McpResult<std::time::Duration> {
+        cx.checkpoint()
+            .map_err(|_| fastmcp_core::McpError::request_cancelled())?;
+        self.deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|remaining| *remaining >= std::time::Duration::from_millis(1))
+            .ok_or_else(Self::timeout_error)
+    }
+
+    fn timeout_error() -> fastmcp_core::McpError {
+        fastmcp_core::McpError::internal_error(
+            "MCP operation reached --timeout; completion is unknown and no action was retried",
+        )
+    }
+
+    fn request_policy(
+        remaining: std::time::Duration,
+    ) -> McpResult<fastmcp_client::RequestTimeoutPolicy> {
+        let millis = u64::try_from(remaining.as_millis()).map_err(|_| Self::timeout_error())?;
+        // This duration comes only from the caller's admitted --timeout and
+        // original local deadline, never from protocol-controlled metadata.
+        fastmcp_client::RequestTimeoutPolicy::from_application_timeout_ms(millis)
+    }
+}
+
+/// Peer errors can reflect arguments, content, or credentials without a
+/// recognizable secret label. Preserve the typed code and cleanup fact only.
+fn operation_failure(
+    error: fastmcp_core::McpError,
+    message: &'static str,
+) -> fastmcp_core::McpError {
+    if error
+        .data
+        .as_ref()
+        .and_then(|data| data.get(CLIENT_CLEANUP_UNVERIFIED_DATA_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        fastmcp_core::McpError::with_data(
+            error.code,
+            format!("{message}; subprocess cleanup could not be verified"),
+            serde_json::json!({CLIENT_CLEANUP_UNVERIFIED_DATA_KEY: true}),
+        )
+    } else {
+        fastmcp_core::McpError::new(error.code, message)
+    }
+}
+
+async fn cmd_operation(
+    cx: &Cx,
+    connection: &OperationConnection,
+    operation: CoreOperation<'_>,
+    arguments: &OperationArguments,
+) -> McpResult<()> {
+    let budget = OperationBudget::new(connection.timeout)?;
+    budget.remaining(cx)?;
+    validate_cli_protocol_policy(connection.protocol_policy)?;
+    let parameters = operation.parameters(arguments)?;
+    let has_http = connection.http_url.is_some()
+        || connection.legacy_sse_url.is_some()
+        || connection.legacy_message_url.is_some();
+    if connection.server.is_some() == has_http {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "operation requires either --server or explicit HTTP endpoints",
+        ));
+    }
+    let result = if let Some(server) = connection.server.as_deref() {
+        if connection.bearer_token_file.is_some() {
+            return Err(fastmcp_core::McpError::invalid_params(
+                "--bearer-token-file requires an HTTPS --http-url",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            Box::pin(stdio_operation(
+                cx,
+                connection,
+                server,
+                operation.method(),
+                parameters,
+                budget,
+            ))
+            .await?
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = server;
+            return Err(fastmcp_core::McpError::invalid_params(
+                "owned stdio operations require Unix process-group cleanup; use explicit HTTP endpoints on this platform",
+            ));
+        }
+    } else {
+        Box::pin(http_operation(
+            cx,
+            connection,
+            operation.method(),
+            parameters,
+            budget,
+        ))
+        .await?
+    };
+    let outcome = operation_outcome(operation.method(), &result)?;
+    let output = render_operation_result(&result, outcome, connection.json)?;
+    write_operation_output(cx, budget, &output)?;
+    match outcome {
+        OperationOutcome::ToolError => Err(fastmcp_core::McpError::internal_error(
+            "tool returned isError=true; its result was emitted and no action was retried",
+        )),
+        OperationOutcome::InputRequired => Err(fastmcp_core::McpError::invalid_request(
+            "operation returned input_required; its result was emitted without submitting responses or retrying",
+        )),
+        OperationOutcome::Complete => Ok(()),
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskAccepted => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+async fn stdio_operation(
+    cx: &Cx,
+    connection: &OperationConnection,
+    server: &str,
+    method: &'static str,
+    parameters: serde_json::Value,
+    budget: OperationBudget,
+) -> McpResult<fastmcp_protocol::CoreResult> {
+    let remaining = budget.remaining(cx)?;
+    let args = connection
+        .server_arg
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut client = client_builder_for_protocol_policy(connection.protocol_policy)?
+        .owned_process_group(true)
+        // Keep a non-Auto handshake in the first-use future below, so the
+        // caller retains the client for explicit cleanup if that future expires.
+        .auto_initialize(true)
+        // One attempt: only the protocol plan may authorize a legacy discovery
+        // fallback. A dispatched application request is never replayed.
+        .connection_retry_policy(
+            1,
+            std::time::Duration::ZERO,
+            remaining.min(std::time::Duration::from_secs(120)),
+        )?
+        .request_timeout_policy(OperationBudget::request_policy(remaining)?)
+        .connect_stdio_with_cx(cx, server, &args)
+        .await
+        .map_err(|error| {
+            operation_failure(error, "could not establish the stdio MCP connection")
+        })?;
+    let acquisition = async {
+        let remaining = budget.remaining(cx)?;
+        client.set_request_timeout_policy(OperationBudget::request_policy(remaining)?)?;
+        let cancellation = fastmcp_core::McpRequestCancellation::new();
+        asupersync::time::timeout(
+            cx.now(),
+            remaining,
+            Box::pin(client.request_core_with_cx(cx, &cancellation, method, parameters)),
+        )
+        .await
+        .map_err(|_| OperationBudget::timeout_error())?
+        .map_err(|error| operation_failure(error, "MCP request failed; no action was retried"))
+    }
+    .await;
+    // Cleanup owns a separate bounded settlement phase, including after the
+    // original command deadline. Never drop the whole client in a timeout race.
+    finish_inspect_acquisition_async(acquisition, client.close_with_cx(cx))
+        .await
+        .map_err(|error| {
+            if error.data.as_ref().is_some_and(|data| {
+                data.get(CLIENT_CLEANUP_UNVERIFIED_DATA_KEY)
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+            }) {
+                operation_failure(error, "MCP stdio operation failed; no action was retried")
+            } else {
+                error
+            }
+        })
+}
+
+async fn http_operation(
+    cx: &Cx,
+    connection: &OperationConnection,
+    method: &'static str,
+    parameters: serde_json::Value,
+    budget: OperationBudget,
+) -> McpResult<fastmcp_protocol::CoreResult> {
+    let plan = http_inspect_protocol_plan(
+        connection.http_url.as_deref(),
+        connection.legacy_sse_url.as_deref(),
+        connection.legacy_message_url.as_deref(),
+        connection.protocol_policy,
+    )?;
+    let builder = http_client_builder(plan, connection.bearer_token_file.as_deref())?;
+    let remaining = budget.remaining(cx)?;
+    asupersync::time::timeout(
+        cx.now(),
+        remaining,
+        Box::pin(async {
+            let mut client = builder
+                .request_timeout_policy(OperationBudget::request_policy(remaining)?)
+                .connect_http_client_with_cx(cx)
+                .await
+                .map_err(|_| {
+                    fastmcp_core::McpError::internal_error(
+                        "could not establish the HTTP MCP connection",
+                    )
+                })?;
+            budget.remaining(cx)?;
+            let cancellation = fastmcp_core::McpRequestCancellation::new();
+            // One core dispatch; no MRTR retry, authentication retry, or fallback
+            // after this action starts. Dropping the future closes its HTTP stream.
+            client
+                .request_final_core_with_cancellation(cx, &cancellation, method, parameters)
+                .await
+                .map_err(|_| {
+                    fastmcp_core::McpError::internal_error(
+                        "MCP HTTP request failed; no action was retried",
+                    )
+                })
+        }),
+    )
+    .await
+    .map_err(|_| OperationBudget::timeout_error())?
+}
+
+#[derive(Clone, Copy)]
+enum OperationOutcome {
+    Complete,
+    ToolError,
+    InputRequired,
+    #[cfg(feature = "tasks")]
+    TaskAccepted,
+}
+
+fn operation_outcome(
+    method: &str,
+    result: &fastmcp_protocol::CoreResult,
+) -> McpResult<OperationOutcome> {
+    use fastmcp_protocol::{CoreResult, FinalCoreResult, LegacyCoreResult};
+    if result.method() != method {
+        return Err(fastmcp_core::McpError::internal_error(
+            "MCP operation received a different method's result",
+        ));
+    }
+    match result {
+        CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) => {
+            Ok(if result.payload.is_error {
+                OperationOutcome::ToolError
+            } else {
+                OperationOutcome::Complete
+            })
+        }
+        CoreResult::Legacy(LegacyCoreResult::ToolsCall(result)) => Ok(if result.is_error {
+            OperationOutcome::ToolError
+        } else {
+            OperationOutcome::Complete
+        }),
+        CoreResult::Final(
+            FinalCoreResult::ResourcesRead { .. } | FinalCoreResult::PromptsGet { .. },
+        )
+        | CoreResult::Legacy(
+            LegacyCoreResult::ResourcesRead(_) | LegacyCoreResult::PromptsGet(_),
+        ) => Ok(OperationOutcome::Complete),
+        CoreResult::Final(
+            FinalCoreResult::ToolsCallInputRequired { .. }
+            | FinalCoreResult::ResourcesReadInputRequired { .. }
+            | FinalCoreResult::PromptsGetInputRequired { .. },
+        ) => Ok(OperationOutcome::InputRequired),
+        #[cfg(feature = "tasks")]
+        CoreResult::Final(FinalCoreResult::ToolsCallTask { .. }) => {
+            Ok(OperationOutcome::TaskAccepted)
+        }
+        _ => Err(fastmcp_core::McpError::internal_error(
+            "MCP operation received an unsupported result family",
+        )),
+    }
+}
+
+fn render_operation_result(
+    result: &fastmcp_protocol::CoreResult,
+    outcome: OperationOutcome,
+    json: bool,
+) -> McpResult<String> {
+    let encoded = result.encode().map_err(|_| {
+        fastmcp_core::McpError::internal_error("could not encode the admitted MCP result")
+    })?;
+    if json {
+        // Keep admitted open members and exact numeric lexemes. Routing this
+        // through serde_json::Value or a diagnostic renderer changes the result.
+        return Ok(encoded);
+    }
+    let status = match outcome {
+        OperationOutcome::Complete => "complete",
+        OperationOutcome::ToolError => "tool error",
+        OperationOutcome::InputRequired => "input required; no continuation submitted",
+        #[cfg(feature = "tasks")]
+        OperationOutcome::TaskAccepted => "task accepted; completion has not been observed",
+    };
+    let version = match result.era() {
+        ProtocolEra::Modern2026 => "2026-07-28",
+        ProtocolEra::Legacy2024 => "2024-11-05",
+    };
+    let preview = match serde_json::from_str::<serde_json::Value>(&encoded) {
+        Ok(value) => serde_json::to_string_pretty(&bounded_json_preview_inner(
+            &value,
+            0,
+            &mut JsonPreviewBudget::default(),
+        ))
+        .map_err(|_| fastmcp_core::McpError::internal_error("could not render MCP result preview"))?,
+        // The exact result algebra can carry numbers outside serde_json's
+        // preview range. Preserve the result and report this display limit.
+        Err(_) => "Result exceeds the terminal preview's numeric range; use --json for the admitted result.".to_owned(),
+    };
+    Ok(format!(
+        "{}: {status} (MCP {version})\n{preview}",
+        result.method()
+    ))
+}
+
+fn write_operation_output(cx: &Cx, budget: OperationBudget, output: &str) -> McpResult<()> {
+    let total_bytes = output.len().saturating_add(1);
+    if total_bytes > CLI_OUTPUT_MAX_BYTES {
+        return Err(output_too_large("MCP operation result", total_bytes));
+    }
+    let remaining = budget.remaining(cx)?;
+    let mut bytes = Vec::with_capacity(total_bytes);
+    bytes.extend_from_slice(output.as_bytes());
+    bytes.push(b'\n');
+    STDOUT_STARTED.store(true, std::sync::atomic::Ordering::Release);
+    #[cfg(unix)]
+    fastmcp_transport::AsyncStdout::new()
+        .write_all_bounded(&bytes, remaining)
+        .map_err(|_| {
+            fastmcp_core::McpError::internal_error("could not write MCP operation result")
+        })?;
+    #[cfg(not(unix))]
+    {
+        let _ = remaining;
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        stdout
+            .write_all(&bytes)
+            .and_then(|()| stdout.flush())
+            .map_err(|_| {
+                fastmcp_core::McpError::internal_error("could not write MCP operation result")
+            })?;
+    }
+    budget.remaining(cx)?;
+    Ok(())
 }
 
 #[cfg(feature = "tasks")]
@@ -13305,6 +13924,45 @@ fn get_cline_config_path() -> McpResult<PathBuf> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn operation_timeout_policy_accepts_the_published_range_without_extending_progress() {
+        for seconds in [1, 300, 301, 900] {
+            let duration = std::time::Duration::from_secs(seconds);
+            let policy = OperationBudget::request_policy(duration).expect("admitted local timeout");
+            assert_eq!(policy.idle_timeout(), duration);
+            assert_eq!(policy.absolute_timeout(), duration);
+            assert!(!policy.resets_idle_on_matching_progress());
+            assert!(OperationBudget::new(seconds).is_ok());
+            assert!(
+                Cli::try_parse_from([
+                    "fastmcp",
+                    "call",
+                    "echo",
+                    "--server",
+                    "server",
+                    "--timeout",
+                    &seconds.to_string(),
+                ])
+                .is_ok()
+            );
+        }
+        for seconds in [0, 901] {
+            assert!(OperationBudget::new(seconds).is_err());
+            assert!(
+                Cli::try_parse_from([
+                    "fastmcp",
+                    "call",
+                    "echo",
+                    "--server",
+                    "server",
+                    "--timeout",
+                    &seconds.to_string(),
+                ])
+                .is_err()
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]
