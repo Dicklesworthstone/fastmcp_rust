@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fmt::Write as _;
 use std::future::{Future, poll_fn};
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -36,6 +36,11 @@ use fastmcp_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[cfg(feature = "websocket-experimental")]
+mod websocket;
+#[cfg(feature = "websocket-experimental")]
+pub use websocket::McpAppsWebSocketClientWirePolicy;
 
 /// Aggregate encoded-data budget for this View's isolated tool catalog,
 /// pagination, and retained Host request outcomes. Shared descriptors are
@@ -808,6 +813,39 @@ impl McpAppsWireHostConfiguration {
     }
 }
 
+/// Bounded cleanup owned by a native forwarding transport.
+///
+/// The Host drives this only outside request-owned policy work: after a View
+/// cancellation has committed, and before it receives another View frame.
+/// Its constructors are private so an embedder cannot insert an unbounded
+/// effect future into that cancellation boundary. Custom policies use the
+/// empty default; wrappers may delegate their native forwarding policy's
+/// handle without changing its cleanup authority or original deadline.
+#[derive(Default)]
+pub struct McpAppsWireHostCleanup<'operation> {
+    future: Option<
+        Pin<Box<dyn Future<Output = Result<(), McpAppsHostError>> + Send + 'operation>>,
+    >,
+}
+
+impl<'operation> McpAppsWireHostCleanup<'operation> {
+    #[cfg(feature = "websocket-experimental")]
+    fn native(
+        future: impl Future<Output = Result<(), McpAppsHostError>> + Send + 'operation,
+    ) -> Self {
+        Self {
+            future: Some(Box::pin(future)),
+        }
+    }
+
+    async fn settle(self) -> Result<(), McpAppsHostError> {
+        match self.future {
+            Some(future) => future.await,
+            None => Ok(()),
+        }
+    }
+}
+
 /// Browser-neutral effect policy for the closed wire Host.
 ///
 /// The default methods deliberately perform no embedder effect. Reused core
@@ -951,6 +989,17 @@ pub trait McpAppsWireHostPolicy {
         _params: &McpAppsCancelledControlParams,
     ) -> Result<(), McpAppsHostError> {
         Ok(())
+    }
+
+    /// Returns retained native transport cleanup after request work is dropped.
+    ///
+    /// This immediate hook cannot perform asynchronous work itself. Only a
+    /// built-in transport can construct a nonempty cleanup handle. The Host
+    /// drives it after synchronous cancellation commitment, and again before
+    /// the next frame if a previous drive was dropped. Effect wrappers must
+    /// delegate this to the forwarding owner.
+    fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
+        McpAppsWireHostCleanup::default()
     }
 
     async fn approve_view_teardown(&mut self) -> bool {
@@ -1318,6 +1367,10 @@ impl<P: McpAppsWireHostPolicy, E: McpAppsWireHostEffects> McpAppsWireHostPolicy
     ) -> Result<(), McpAppsHostError> {
         self.forwarding.cancelled(cx, request_id, params)?;
         self.effects.cancelled(cx, request_id, params)
+    }
+
+    fn transport_cleanup(&mut self) -> McpAppsWireHostCleanup<'_> {
+        self.forwarding.transport_cleanup()
     }
 
     async fn approve_view_teardown(&mut self) -> bool {
@@ -2536,7 +2589,26 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     /// this method concurrently receives one matching cancellation and drops
     /// that work before committing the cancellation disposition. Other frames
     /// are deferred and replayed after the request reaches a terminal result.
+    /// Retained native transport cleanup runs after that synchronous commit
+    /// and before another frame is admitted. Dropping this drive preserves
+    /// native cleanup for the next drive; it does not itself commit a View
+    /// cancellation or release an outstanding View correlation.
     pub async fn process_next(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
+        let cleanup = self.policy.transport_cleanup().settle().await;
+        if let Err(error) = cleanup {
+            self.disconnect_view();
+            return Err(error);
+        }
+        let result = self.process_next_frame(cx).await;
+        let cleanup = self.policy.transport_cleanup().settle().await;
+        if cleanup.is_err() {
+            self.disconnect_view();
+        }
+        // Preserve the original operation error if its cleanup also failed.
+        result.and(cleanup)
+    }
+
+    async fn process_next_frame(&mut self, cx: &Cx) -> Result<(), McpAppsHostError> {
         if self.disconnected {
             self.disconnect_view();
             return Err(McpAppsHostError::Transport(

@@ -197,6 +197,8 @@ pub use leg_neg_stdio::{
 };
 #[cfg(all(feature = "apps", feature = "tasks"))]
 pub use mcp_apps::McpAppsServerTaskPolicy;
+#[cfg(all(feature = "apps", feature = "websocket-experimental"))]
+pub use mcp_apps::McpAppsWebSocketClientWirePolicy;
 #[cfg(feature = "apps")]
 pub use mcp_apps::{
     McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
@@ -204,9 +206,9 @@ pub use mcp_apps::{
     McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
     McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport, McpAppsViewCallToolResult,
     McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost,
-    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
-    McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
-    mcp_apps_in_memory_wire_pair,
+    McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+    McpAppsWireHostPolicy, McpAppsWireHostResponse, McpAppsWireHostWithEffects,
+    mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
 };
 pub use mcp_config::claude_desktop_config_path;
 pub use negotiation::{

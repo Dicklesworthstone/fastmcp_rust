@@ -332,6 +332,8 @@ pub mod client {
         LegacyHttpRequest, LegacyHttpRequestCommit, LegacySseHttpClient, LegacySseHttpClientError,
     };
     /// MCP Apps client APIs are available only with the Apps extension.
+    #[cfg(all(feature = "apps", feature = "websocket-experimental"))]
+    pub use crate::McpAppsWebSocketClientWirePolicy;
     #[cfg(feature = "apps")]
     pub use crate::{
         McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
@@ -339,7 +341,8 @@ pub mod client {
         McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
         McpAppsViewCallToolResult, McpAppsViewTool, McpAppsViewToolsPage,
-        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
+        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
+        McpAppsWireHostConfiguration,
         McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostResponse,
         McpAppsWireHostWithEffects, mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
@@ -1098,6 +1101,8 @@ pub use fastmcp_client::{
 
 #[cfg(all(feature = "apps", feature = "tasks"))]
 pub use fastmcp_client::McpAppsServerTaskPolicy;
+#[cfg(all(feature = "apps", feature = "websocket-experimental"))]
+pub use fastmcp_client::McpAppsWebSocketClientWirePolicy;
 #[cfg(feature = "apps")]
 pub use fastmcp_client::{
     McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
@@ -1105,8 +1110,9 @@ pub use fastmcp_client::{
     McpAppsHttpClientWirePolicy, McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
     McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport, McpAppsViewCallToolResult,
     McpAppsViewTool, McpAppsViewToolsPage, McpAppsWireBridgeTransport, McpAppsWireHost,
-    McpAppsWireHostConfiguration, McpAppsWireHostEffects, McpAppsWireHostPolicy,
-    McpAppsWireHostResponse, McpAppsWireHostWithEffects, mcp_apps_in_memory_pair,
+    McpAppsWireHostCleanup, McpAppsWireHostConfiguration, McpAppsWireHostEffects,
+    McpAppsWireHostPolicy, McpAppsWireHostResponse, McpAppsWireHostWithEffects,
+    mcp_apps_in_memory_pair,
     mcp_apps_in_memory_wire_pair,
 };
 // `mcp_apps_bridge` is forwarded because the list immediately above already
@@ -1233,7 +1239,8 @@ pub mod auto {
     pub use fastmcp_client::{
         McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHostError,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
-        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
+        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
+        McpAppsWireHostConfiguration,
         McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostWithEffects,
         mcp_apps_in_memory_wire_pair,
     };
@@ -3213,13 +3220,16 @@ pub mod modern {
 
     #[cfg(all(feature = "apps", feature = "tasks"))]
     pub use fastmcp_client::McpAppsServerTaskPolicy;
+    #[cfg(all(feature = "apps", feature = "websocket-experimental"))]
+    pub use fastmcp_client::McpAppsWebSocketClientWirePolicy;
     #[cfg(feature = "apps")]
     pub use fastmcp_client::{
         McpAppsBridgeTransport, McpAppsCatalogBinding, McpAppsClientWirePolicy, McpAppsHost,
         McpAppsHostConfiguration, McpAppsHostError, McpAppsHostPolicy, McpAppsHttpClientWirePolicy,
         McpAppsInMemoryHostTransport, McpAppsInMemoryViewTransport,
         McpAppsInMemoryWireHostTransport, McpAppsInMemoryWireViewTransport,
-        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostConfiguration,
+        McpAppsWireBridgeTransport, McpAppsWireHost, McpAppsWireHostCleanup,
+        McpAppsWireHostConfiguration,
         McpAppsWireHostEffects, McpAppsWireHostPolicy, McpAppsWireHostWithEffects,
         mcp_apps_in_memory_pair, mcp_apps_in_memory_wire_pair,
     };
@@ -3578,6 +3588,47 @@ pub mod modern {
         #[must_use]
         pub const fn session(&self) -> &fastmcp_client::ClientSession {
             self.inner.session()
+        }
+
+        /// Reports live bilateral Apps activation on this caller-upgraded stream.
+        #[cfg(feature = "apps")]
+        #[must_use]
+        pub fn mcp_apps_active(&self) -> bool {
+            self.inner.mcp_apps_active()
+        }
+
+        /// Starts a closed Apps Host whose reused core methods, MRTR rounds
+        /// and explicitly approved Tasks share this modern WebSocket client.
+        /// The caller supplies the separate View carrier and any effect policy
+        /// through the returned Host's with_effects method.
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_wire_host<T>(
+            &mut self,
+            transport: T,
+            configuration: McpAppsWireHostConfiguration,
+        ) -> Result<McpAppsWireHost<T, McpAppsWebSocketClientWirePolicy<'_, IO>>, McpAppsHostError>
+        where
+            T: McpAppsWireBridgeTransport,
+            IO: Send + 'static,
+        {
+            self.inner.mcp_apps_wire_host(transport, configuration)
+        }
+
+        /// Starts an activated Apps Host with explicit embedder forwarding.
+        /// Construction grants no model, renderer or server-access consent.
+        #[cfg(feature = "apps")]
+        pub fn mcp_apps_wire_host_with_policy<T, P>(
+            &self,
+            transport: T,
+            configuration: McpAppsWireHostConfiguration,
+            policy: P,
+        ) -> Result<McpAppsWireHost<T, P>, McpAppsHostError>
+        where
+            T: McpAppsWireBridgeTransport,
+            P: McpAppsWireHostPolicy,
+        {
+            self.inner
+                .mcp_apps_wire_host_with_policy(transport, configuration, policy)
         }
 
         /// Returns the sealed modern era.
