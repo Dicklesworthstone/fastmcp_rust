@@ -334,6 +334,7 @@ pub struct OAuthHttpRoutes {
     authorization_path: String,
     token_path: String,
     revocation_path: String,
+    introspection_path: Option<String>,
     registration_path: Option<String>,
     #[cfg(feature = "builtin-auth-server")]
     oidc: Option<OidcHttpRoutes>,
@@ -383,6 +384,7 @@ impl std::fmt::Debug for OAuthHttpRoutes {
             .field("authorization_path", &self.authorization_path)
             .field("token_path", &self.token_path)
             .field("revocation_path", &self.revocation_path)
+            .field("introspection_path", &self.introspection_path)
             .field("registration_path", &self.registration_path);
         #[cfg(feature = "builtin-auth-server")]
         debug
@@ -439,12 +441,16 @@ pub struct OAuthAuthorizationServerMetadata {
     pub token_endpoint: String,
     pub revocation_endpoint: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub introspection_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub registration_endpoint: Option<String>,
     pub response_types_supported: [&'static str; 1],
     pub response_modes_supported: [&'static str; 1],
     pub grant_types_supported: Vec<&'static str>,
     pub token_endpoint_auth_methods_supported: Vec<&'static str>,
     pub revocation_endpoint_auth_methods_supported: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub introspection_endpoint_auth_methods_supported: Option<Vec<&'static str>>,
     pub code_challenge_methods_supported: [&'static str; 1],
     pub authorization_response_iss_parameter_supported: bool,
 }
@@ -457,7 +463,9 @@ impl OAuthHttpRoutes {
     /// `/oauth/authorize`, `/oauth/token`, and `/oauth/revoke`. RFC 8414
     /// metadata is additionally served at the well-known path derived from
     /// the exact configured issuer. Neither location is inferred from Host
-    /// or forwarded headers.
+    /// or forwarded headers. The development access-token introspection route
+    /// `/oauth/introspect` is installed only when explicitly enabled in the
+    /// issuer configuration; every caller also needs its own resource grant.
     pub fn new(
         server: Arc<OAuthServer>,
         public_endpoint_base: impl Into<String>,
@@ -496,6 +504,9 @@ impl OAuthHttpRoutes {
         let authorization_path = route_path("authorize");
         let token_path = route_path("token");
         let revocation_path = route_path("revoke");
+        let introspection_path = server
+            .development_token_introspection_enabled()
+            .then(|| route_path("introspect"));
         // RFC 8414 section 3.1 inserts the suffix before the issuer path,
         // removing terminating slashes only for this derived location. The
         // metadata issuer and RFC 9207 response preserve the configured value.
@@ -507,6 +518,7 @@ impl OAuthHttpRoutes {
             Some(authorization_path.as_str()),
             Some(token_path.as_str()),
             Some(revocation_path.as_str()),
+            introspection_path.as_deref(),
             registration_path.as_deref(),
         ]
         .contains(&Some(metadata_path.as_str()))
@@ -522,6 +534,7 @@ impl OAuthHttpRoutes {
             authorization_path,
             token_path,
             revocation_path,
+            introspection_path,
             registration_path,
             #[cfg(feature = "builtin-auth-server")]
             oidc: None,
@@ -568,6 +581,7 @@ impl OAuthHttpRoutes {
             Some(self.authorization_path()),
             Some(self.token_path()),
             Some(self.revocation_path()),
+            self.introspection_path(),
             self.registration_path(),
         ];
         let oidc_paths = [
@@ -622,6 +636,10 @@ impl OAuthHttpRoutes {
             authorization_endpoint: format!("{base}/authorize"),
             token_endpoint: format!("{base}/token"),
             revocation_endpoint: format!("{base}/revoke"),
+            introspection_endpoint: self
+                .introspection_path
+                .as_ref()
+                .map(|_| format!("{base}/introspect")),
             registration_endpoint: self
                 .registration_path
                 .as_ref()
@@ -631,6 +649,10 @@ impl OAuthHttpRoutes {
             grant_types_supported: self.server.supported_grant_types(),
             token_endpoint_auth_methods_supported: methods.clone(),
             revocation_endpoint_auth_methods_supported: methods,
+            introspection_endpoint_auth_methods_supported: self
+                .introspection_path
+                .as_ref()
+                .map(|_| vec!["client_secret_basic"]),
             code_challenge_methods_supported: ["S256"],
             authorization_response_iss_parameter_supported: true,
         })
@@ -654,6 +676,12 @@ impl OAuthHttpRoutes {
         &self.revocation_path
     }
 
+    /// Returns the opt-in development access-token introspection route.
+    #[must_use]
+    pub fn introspection_path(&self) -> Option<&str> {
+        self.introspection_path.as_deref()
+    }
+
     /// Returns the native public-client registration route when enabled.
     #[must_use]
     pub fn registration_path(&self) -> Option<&str> {
@@ -669,6 +697,7 @@ impl OAuthHttpRoutes {
             || path == self.authorization_path
             || path == self.token_path
             || path == self.revocation_path
+            || self.introspection_path.as_deref() == Some(path)
             || self.registration_path.as_deref() == Some(path)
             || {
                 #[cfg(feature = "builtin-auth-server")]
@@ -701,6 +730,7 @@ impl OAuthHttpRoutes {
                 Some(self.authorization_path()),
                 Some(self.token_path()),
                 Some(self.revocation_path()),
+                self.introspection_path(),
                 self.registration_path(),
             ]
             .contains(&Some(occupied))
@@ -1174,6 +1204,17 @@ pub struct OAuthServerConfig {
     /// authentication, or an official-draft MCP extension advertisement.
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     pub allow_development_client_credentials: bool,
+    /// Enables RFC 7662 access-token introspection for the single-process
+    /// development issuer. Each caller must separately hold a
+    /// [`DevelopmentTokenIntrospectionGrant`] on its confidential HTTP Basic
+    /// registration. Ordinary OAuth registration or browser scopes grant no
+    /// introspection rights.
+    ///
+    /// This uses the same in-memory token, expiry, registration and revocation
+    /// authority as local verification. It does not provide durable state,
+    /// production issuer qualification, or refresh-token introspection.
+    #[cfg(feature = "builtin-auth-server")]
+    pub allow_development_token_introspection: bool,
     /// Minimum PKCE code verifier length (default: 43, min: 43, max: 128).
     pub min_code_verifier_length: usize,
     /// Maximum PKCE code verifier length.
@@ -1220,6 +1261,8 @@ impl Default for OAuthServerConfig {
             allow_public_clients: true,
             #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
             allow_development_client_credentials: false,
+            #[cfg(feature = "builtin-auth-server")]
+            allow_development_token_introspection: false,
             min_code_verifier_length: PKCE_CODE_VERIFIER_MIN_BYTES,
             max_code_verifier_length: PKCE_CODE_VERIFIER_MAX_BYTES,
             max_clients: DEFAULT_MAX_OAUTH_CLIENTS,
@@ -1448,6 +1491,43 @@ impl TokenEndpointAuthMethod {
     }
 }
 
+/// Administrative permission to inspect access tokens for one exact resource.
+///
+/// This grant belongs to the single-process development issuer. It is supplied
+/// by trusted deployment configuration, never by a token, request parameter,
+/// browser scope or dynamic client registration. Only a confidential HTTP
+/// Basic client registration can carry it. Register a separate caller for a
+/// different resource instead of widening a permission at request time.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone, PartialEq, Eq)]
+pub struct DevelopmentTokenIntrospectionGrant {
+    resource: CanonicalResourceId,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl DevelopmentTokenIntrospectionGrant {
+    /// Admits the exact resource whose access tokens this caller may inspect.
+    pub fn new(resource: CanonicalResourceId) -> Result<Self, OAuthError> {
+        validate_optional_authorization_resource(Some(resource.as_str()))?;
+        Ok(Self { resource })
+    }
+
+    /// Returns the resource fixed by the administrator at registration time.
+    #[must_use]
+    pub fn resource(&self) -> &CanonicalResourceId {
+        &self.resource
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl std::fmt::Debug for DevelopmentTokenIntrospectionGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevelopmentTokenIntrospectionGrant")
+            .field("resource_len", &self.resource.as_str().len())
+            .finish()
+    }
+}
+
 /// Administrative authorization for one machine client at one exact resource.
 ///
 /// This is deliberately separate from browser redirect and consent scopes.
@@ -1608,6 +1688,8 @@ pub struct OAuthClient {
     pub allowed_scopes: HashSet<String>,
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
+    #[cfg(feature = "builtin-auth-server")]
+    development_token_introspection: Option<DevelopmentTokenIntrospectionGrant>,
     /// Client name (for display).
     pub name: Option<String>,
     /// Client description.
@@ -1719,6 +1801,9 @@ pub struct OAuthClientMetadata {
     /// Explicit machine authorization, independent of browser scopes.
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     pub development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
+    /// Explicit access-token introspection permission for one exact resource.
+    #[cfg(feature = "builtin-auth-server")]
+    pub development_token_introspection: Option<DevelopmentTokenIntrospectionGrant>,
     /// Client name (for display).
     pub name: Option<String>,
     /// Client description.
@@ -1754,6 +1839,8 @@ impl From<&OAuthClient> for OAuthClientMetadata {
             allowed_scopes: client.allowed_scopes.clone(),
             #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
             development_client_credentials: client.development_client_credentials.clone(),
+            #[cfg(feature = "builtin-auth-server")]
+            development_token_introspection: client.development_token_introspection.clone(),
             name: client.name.clone(),
             description: client.description.clone(),
             registered_at: client.registered_at,
@@ -1847,10 +1934,11 @@ impl OAuthClient {
             ));
         }
 
-        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
-        let requires_redirect = self.development_client_credentials.is_none();
-        #[cfg(not(all(feature = "builtin-auth-server", feature = "oauth-client-credentials")))]
         let requires_redirect = true;
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        let requires_redirect = requires_redirect && self.development_client_credentials.is_none();
+        #[cfg(feature = "builtin-auth-server")]
+        let requires_redirect = requires_redirect && self.development_token_introspection.is_none();
         #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
         if self.development_client_credentials.is_some()
             && (self.client_type != ClientType::Confidential
@@ -1858,6 +1946,16 @@ impl OAuthClient {
         {
             return Err(OAuthError::InvalidRequest(
                 "development machine clients require confidential HTTP Basic registration"
+                    .to_string(),
+            ));
+        }
+        #[cfg(feature = "builtin-auth-server")]
+        if self.development_token_introspection.is_some()
+            && (self.client_type != ClientType::Confidential
+                || self.token_endpoint_auth_method != TokenEndpointAuthMethod::ClientSecretBasic)
+        {
+            return Err(OAuthError::InvalidRequest(
+                "development introspection callers require confidential HTTP Basic registration"
                     .to_string(),
             ));
         }
@@ -1956,6 +2054,8 @@ pub struct OAuthClientBuilder {
     allowed_scopes: HashSet<String>,
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
+    #[cfg(feature = "builtin-auth-server")]
+    development_token_introspection: Option<DevelopmentTokenIntrospectionGrant>,
     name: Option<String>,
     description: Option<String>,
 }
@@ -1991,6 +2091,8 @@ impl OAuthClientBuilder {
             allowed_scopes: HashSet::new(),
             #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
             development_client_credentials: None,
+            #[cfg(feature = "builtin-auth-server")]
+            development_token_introspection: None,
             name: None,
             description: None,
         }
@@ -2026,6 +2128,22 @@ impl OAuthClientBuilder {
         grant: DevelopmentClientCredentialsGrant,
     ) -> Self {
         self.development_client_credentials = Some(grant);
+        self
+    }
+
+    /// Permits access-token introspection for exactly the grant's resource.
+    ///
+    /// This does not authorize obtaining tokens, browser consent or inspecting
+    /// refresh tokens. An introspection-only caller may omit redirect URIs.
+    /// The issuer must separately opt in through
+    /// [`OAuthServerConfig::allow_development_token_introspection`].
+    #[cfg(feature = "builtin-auth-server")]
+    #[must_use]
+    pub fn development_token_introspection(
+        mut self,
+        grant: DevelopmentTokenIntrospectionGrant,
+    ) -> Self {
+        self.development_token_introspection = Some(grant);
         self
     }
 
@@ -2108,6 +2226,8 @@ impl OAuthClientBuilder {
             allowed_scopes: self.allowed_scopes,
             #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
             development_client_credentials: self.development_client_credentials,
+            #[cfg(feature = "builtin-auth-server")]
+            development_token_introspection: self.development_token_introspection,
             name: self.name,
             description: self.description,
             registered_at: SystemTime::now(),
@@ -2359,6 +2479,105 @@ impl OAuthToken {
         self.expires_at
             .saturating_duration_since(Instant::now())
             .as_secs()
+    }
+}
+
+/// RFC 7662 response from the development issuer's authoritative access-token
+/// lookup. An inactive response serializes as exactly `{"active":false}`.
+///
+/// Active metadata is limited to the caller's administratively authorized
+/// resource. It never contains an access token, refresh token, client secret,
+/// grant-family identifier or registration epoch. Optional Unix `iat` and
+/// `exp` claims are deliberately absent: this development store enforces
+/// monotonic lifetimes and does not retain an authoritative wall-clock epoch.
+/// Revalidate at each authorization decision; the HTTP response is `no-store`
+/// and makes no validity promise after the lookup completes.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone, serde::Serialize)]
+pub struct DevelopmentAccessTokenIntrospection {
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_type: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aud: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iss: Option<String>,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl DevelopmentAccessTokenIntrospection {
+    fn inactive() -> Self {
+        Self {
+            active: false,
+            scope: None,
+            client_id: None,
+            token_type: None,
+            sub: None,
+            aud: None,
+            iss: None,
+        }
+    }
+
+    /// Whether the token was live and authorized for this caller's resource
+    /// at the authoritative lookup.
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Space-separated approved scopes, present only for an active token.
+    #[must_use]
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
+    }
+
+    /// The client that obtained the access token, not the introspection caller.
+    #[must_use]
+    pub fn client_id(&self) -> Option<&str> {
+        self.client_id.as_deref()
+    }
+
+    /// The active access token's OAuth token type.
+    #[must_use]
+    pub fn token_type(&self) -> Option<&str> {
+        self.token_type
+    }
+
+    /// Approved resource owner, when the active grant has one.
+    #[must_use]
+    pub fn subject(&self) -> Option<&str> {
+        self.sub.as_deref()
+    }
+
+    /// Exact resource shared by the active token and the caller's permission.
+    #[must_use]
+    pub fn resource(&self) -> Option<&str> {
+        self.aud.as_deref()
+    }
+
+    /// Exact configured issuer, present only for an active token.
+    #[must_use]
+    pub fn issuer(&self) -> Option<&str> {
+        self.iss.as_deref()
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl std::fmt::Debug for DevelopmentAccessTokenIntrospection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevelopmentAccessTokenIntrospection")
+            .field("active", &self.active)
+            .field("scope_present", &self.scope.is_some())
+            .field("client_id_present", &self.client_id.is_some())
+            .field("subject_present", &self.sub.is_some())
+            .field("resource_present", &self.aud.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -4526,6 +4745,112 @@ impl OAuthServer {
     // Token Introspection
     // -------------------------------------------------------------------------
 
+    pub(crate) fn development_token_introspection_enabled(&self) -> bool {
+        #[cfg(feature = "builtin-auth-server")]
+        {
+            self.config.allow_development_token_introspection
+        }
+        #[cfg(not(feature = "builtin-auth-server"))]
+        {
+            false
+        }
+    }
+
+    /// Authenticates one explicitly permitted resource server and introspects
+    /// an opaque access token in the single-process development issuer.
+    ///
+    /// Both the caller's current registration and its exact resource grant
+    /// are checked before inspecting token state. Ordinary confidential or
+    /// public clients have no implicit permission. A permitted caller sees
+    /// only an inactive response for unknown, foreign-resource, audience-less,
+    /// expired, revoked or refresh tokens, including prior registrations and
+    /// grant families invalidated by refresh-token reuse.
+    ///
+    /// Authentication, resource permission, token-owner registration and all
+    /// liveness checks share one nonblocking authoritative read guard. A busy
+    /// or unavailable store returns an error, never a cached success. This
+    /// operation does not clean up, consume, rotate or revoke any state.
+    #[cfg(feature = "builtin-auth-server")]
+    pub fn introspect_development_access_token(
+        &self,
+        token: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        method: TokenEndpointAuthMethod,
+    ) -> Result<DevelopmentAccessTokenIntrospection, OAuthError> {
+        self.config.validate()?;
+        validate_client_authentication_admission(client_id, client_secret)?;
+        if token.is_empty()
+            || token.len() > MAX_OAUTH_PARAMETER_VALUE_BYTES
+            || token.chars().any(char::is_control)
+        {
+            return Err(OAuthError::InvalidRequest(
+                "introspection token is outside admitted bounds".to_string(),
+            ));
+        }
+        let authentication_failed = || {
+            OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
+        };
+        if !self.config.allow_development_token_introspection {
+            return Err(authentication_failed());
+        }
+        let state = self.state.try_read().map_err(|_| {
+            OAuthError::TemporarilyUnavailable("OAuth issuer state is unavailable".to_string())
+        })?;
+        let caller_epoch =
+            authenticate_client_or_dummy(&state, client_id, client_secret, method)?;
+        let caller = state.clients.get(client_id).ok_or_else(authentication_failed)?;
+        if caller.registration_epoch != caller_epoch
+            || caller.metadata.client_type != ClientType::Confidential
+            || method != TokenEndpointAuthMethod::ClientSecretBasic
+        {
+            return Err(authentication_failed());
+        }
+        let grant = caller
+            .metadata
+            .development_token_introspection
+            .as_ref()
+            .ok_or_else(authentication_failed)?;
+
+        let Some(digest) = validate_and_digest_opaque_credential(
+            CredentialKind::AccessToken,
+            token,
+            "introspection token is invalid",
+        )
+        .ok() else {
+            return Ok(DevelopmentAccessTokenIntrospection::inactive());
+        };
+        if state.revoked_tokens.contains_key(&digest) {
+            return Ok(DevelopmentAccessTokenIntrospection::inactive());
+        }
+        let Some(stored) = state.access_tokens.get(&digest) else {
+            return Ok(DevelopmentAccessTokenIntrospection::inactive());
+        };
+        // Sample after lock acquisition and authentication. No state can be
+        // re-registered or revoked between these checks and the response copy.
+        let now = Instant::now();
+        if stored.is_refresh_token
+            || stored.issued_at > now
+            || stored.expires_at <= now
+            || stored.family_expires_at <= now
+            || stored.resource.as_deref() != Some(grant.resource.as_str())
+            || !state.clients.get(&stored.client_id).is_some_and(|owner| {
+                owner.registration_epoch == stored.registration_epoch
+            })
+        {
+            return Ok(DevelopmentAccessTokenIntrospection::inactive());
+        }
+        Ok(DevelopmentAccessTokenIntrospection {
+            active: true,
+            scope: Some(stored.scopes.join(" ")),
+            client_id: Some(stored.client_id.clone()),
+            token_type: Some(stored.token_type.as_str()),
+            sub: stored.subject.clone(),
+            aud: stored.resource.clone(),
+            iss: Some(self.config.issuer.clone()),
+        })
+    }
+
     /// Validates an access token and returns its metadata.
     ///
     /// This is used internally and by the [`OAuthTokenVerifier`].
@@ -5460,6 +5785,346 @@ mod tests {
             fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
         )
         .expect("trusted test resource")
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn development_introspection_caller(client_id: &str, resource: &str) -> OAuthClient {
+        OAuthClient::builder(client_id)
+            .secret("introspection-caller-secret")
+            .development_token_introspection(
+                DevelopmentTokenIntrospectionGrant::new(configured_resource(resource)).unwrap(),
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn development_introspection_fixture(enabled: bool) -> (OAuthServer, TokenResponse) {
+        let server = OAuthServer::try_with_approval_backend(
+            OAuthServerConfig {
+                allow_development_token_introspection: enabled,
+                ..OAuthServerConfig::default()
+            },
+            Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact)),
+        )
+        .unwrap();
+        server
+            .register_client(
+                OAuthClient::builder("introspection-token-client")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        for (caller, resource) in [
+            ("resource-reader", TEST_MCP_RESOURCE),
+            ("other-resource-reader", "https://other.example/api"),
+        ] {
+            server
+                .register_client(development_introspection_caller(caller, resource))
+                .unwrap();
+        }
+        server
+            .register_client(
+                OAuthClient::builder("ordinary-confidential-client")
+                    .secret("introspection-caller-secret")
+                    .redirect_uri("http://127.0.0.1/callback")
+                    .scope("read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (code, _) = server
+            .authorize(&approved_resource_request("introspection-token-client"))
+            .unwrap();
+        let issued = server
+            .token(&resource_code_exchange_request(
+                "introspection-token-client",
+                &code,
+                TEST_MCP_RESOURCE,
+            ))
+            .unwrap();
+        (server, issued)
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn development_introspect(
+        server: &OAuthServer,
+        token: &str,
+    ) -> DevelopmentAccessTokenIntrospection {
+        server
+            .introspect_development_access_token(
+                token,
+                "resource-reader",
+                Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap()
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_introspection_requires_explicit_confidential_basic_permission() {
+        let grant = DevelopmentTokenIntrospectionGrant::new(configured_resource(TEST_MCP_RESOURCE))
+            .unwrap();
+        assert_eq!(grant.resource().as_str(), TEST_MCP_RESOURCE);
+        assert!(!format!("{grant:?}").contains(TEST_MCP_RESOURCE));
+        assert!(
+            OAuthClient::builder("public-reader")
+                .redirect_uri("http://127.0.0.1/callback")
+                .development_token_introspection(grant.clone())
+                .build()
+                .is_err()
+        );
+        assert!(
+            OAuthClient::builder("post-reader")
+                .secret("reader-secret")
+                .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretPost)
+                .development_token_introspection(grant)
+                .build()
+                .is_err()
+        );
+
+        let (server, issued) = development_introspection_fixture(true);
+        let metadata = server.get_client("resource-reader").unwrap();
+        assert!(metadata.redirect_uris.is_empty());
+        assert!(metadata.allowed_scopes.is_empty());
+        assert_eq!(
+            metadata.development_token_introspection.unwrap().resource().as_str(),
+            TEST_MCP_RESOURCE
+        );
+        let mut mutated = development_introspection_caller("mutated-reader", TEST_MCP_RESOURCE);
+        mutated.token_endpoint_auth_method = TokenEndpointAuthMethod::ClientSecretPost;
+        assert!(server.register_client(mutated).is_err());
+
+        for (client_id, secret, method) in [
+            ("ordinary-confidential-client", Some("introspection-caller-secret"), TokenEndpointAuthMethod::ClientSecretBasic),
+            ("introspection-token-client", None, TokenEndpointAuthMethod::None),
+            ("unknown-reader", Some("introspection-caller-secret"), TokenEndpointAuthMethod::ClientSecretBasic),
+            ("resource-reader", Some("wrong-secret"), TokenEndpointAuthMethod::ClientSecretBasic),
+            ("resource-reader", Some("introspection-caller-secret"), TokenEndpointAuthMethod::ClientSecretPost),
+        ] {
+            let error = server
+                .introspect_development_access_token(&issued.access_token, client_id, secret, method)
+                .unwrap_err();
+            assert!(matches!(error, OAuthError::InvalidClient(_)));
+            assert_eq!(error.description(), OAUTH_CLIENT_AUTHENTICATION_ERROR);
+        }
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_introspection_exposes_only_live_exact_resource_metadata() {
+        let (server, issued) = development_introspection_fixture(true);
+        let active = development_introspect(&server, &issued.access_token);
+        assert!(active.is_active());
+        assert_eq!(active.client_id(), Some("introspection-token-client"));
+        assert_eq!(active.scope(), Some("read"));
+        assert_eq!(active.token_type(), Some("bearer"));
+        assert_eq!(active.subject(), Some("approved-subject"));
+        assert_eq!(active.resource(), Some(TEST_MCP_RESOURCE));
+        assert_eq!(active.issuer(), Some("https://fastmcp.invalid/"));
+        let wire = serde_json::to_value(&active).unwrap();
+        assert_eq!(wire, serde_json::json!({
+            "active": true,
+            "scope": "read",
+            "client_id": "introspection-token-client",
+            "token_type": "bearer",
+            "sub": "approved-subject",
+            "aud": TEST_MCP_RESOURCE,
+            "iss": "https://fastmcp.invalid/"
+        }));
+        let debug = format!("{active:?}");
+        for sensitive in [
+            issued.access_token.as_str(),
+            issued.refresh_token.as_deref().unwrap(),
+            "introspection-caller-secret",
+            "approved-subject",
+            TEST_MCP_RESOURCE,
+        ] {
+            assert!(!debug.contains(sensitive));
+        }
+        assert!(!wire.to_string().contains(&issued.access_token));
+        assert!(!wire.to_string().contains(issued.refresh_token.as_deref().unwrap()));
+
+        let unknown = base64url_encode(&[0x55; 32]);
+        for token in [unknown.as_str(), "foreign-token", issued.refresh_token.as_deref().unwrap()] {
+            assert_eq!(
+                serde_json::to_value(development_introspect(&server, token)).unwrap(),
+                serde_json::json!({ "active": false })
+            );
+        }
+        let foreign = server
+            .introspect_development_access_token(
+                &issued.access_token,
+                "other-resource-reader",
+                Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            )
+            .unwrap();
+        assert_eq!(serde_json::to_value(foreign).unwrap(), serde_json::json!({ "active": false }));
+        let (code, _) = server
+            .authorize(&bounded_authorization_request("introspection-token-client"))
+            .unwrap();
+        let unbound = server
+            .token(&bounded_code_exchange_request("introspection-token-client", &code))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(development_introspect(&server, &unbound.access_token)).unwrap(),
+            serde_json::json!({ "active": false })
+        );
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_introspection_is_nonblocking_and_does_not_clean_or_extend_state() {
+        let (server, issued) = development_introspection_fixture(true);
+        let canary = insert_expired_authorization_code_cleanup_canary(&server, "introspection-token-client");
+        let digest = access_token_digest(&issued.access_token);
+        let original = server.state.read().unwrap().access_tokens[&digest].clone();
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+        {
+            let state = server.state.read().unwrap();
+            assert!(state.authorization_codes.contains_key(&canary));
+            assert_retained_token_unchanged(&original, &state.access_tokens[&digest]);
+        }
+        {
+            let _held_mutation = server.state.write().unwrap();
+            assert!(matches!(
+                server.introspect_development_access_token(
+                    &issued.access_token, "resource-reader",
+                    Some("introspection-caller-secret"),
+                    TokenEndpointAuthMethod::ClientSecretBasic,
+                ),
+                Err(OAuthError::TemporarilyUnavailable(_))
+            ));
+        }
+        for boundary in ["access-expiry", "family-expiry", "owner-epoch", "not-yet-issued"] {
+            let mut candidate = original.clone();
+            match boundary {
+                "access-expiry" => candidate.metadata.expires_at = Instant::now(),
+                "family-expiry" => candidate.family_expires_at = Instant::now(),
+                "owner-epoch" => candidate.registration_epoch = test_registration_epoch(0x99),
+                "not-yet-issued" => candidate.metadata.issued_at = Instant::now() + Duration::from_secs(60),
+                _ => unreachable!(),
+            }
+            server.state.write().unwrap().access_tokens.insert(digest, candidate.clone());
+            assert_eq!(
+                serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(),
+                serde_json::json!({ "active": false }), "{boundary}"
+            );
+            let state = server.state.read().unwrap();
+            assert!(state.authorization_codes.contains_key(&canary));
+            assert_retained_token_unchanged(&candidate, &state.access_tokens[&digest]);
+        }
+        server.state.write().unwrap().access_tokens.insert(digest, original);
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_introspection_tracks_rotation_family_revocation_and_reuse() {
+        for reuse_old_refresh in [false, true] {
+            let (server, issued) = development_introspection_fixture(true);
+            let refresh = issued.refresh_token.as_deref().unwrap();
+            let rotated = server
+                .token(&bounded_refresh_request("introspection-token-client", refresh))
+                .unwrap();
+            assert!(development_introspect(&server, &rotated.access_token).is_active());
+            assert_eq!(
+                serde_json::to_value(development_introspect(&server, rotated.refresh_token.as_deref().unwrap())).unwrap(),
+                serde_json::json!({ "active": false })
+            );
+            if reuse_old_refresh {
+                assert!(matches!(
+                    server.token(&bounded_refresh_request("introspection-token-client", refresh)),
+                    Err(OAuthError::InvalidGrant(_))
+                ));
+            } else {
+                server.revoke(
+                    rotated.refresh_token.as_deref().unwrap(), "introspection-token-client",
+                    None, TokenEndpointAuthMethod::None,
+                ).unwrap();
+            }
+            for token in [&issued.access_token, &rotated.access_token] {
+                assert_eq!(
+                    serde_json::to_value(development_introspect(&server, token)).unwrap(),
+                    serde_json::json!({ "active": false })
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_introspection_caller_and_owner_reregistration_retire_old_authority() {
+        let (server, issued) = development_introspection_fixture(true);
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+        server.unregister_client("resource-reader").unwrap();
+        server.register_client(
+            OAuthClient::builder("resource-reader")
+                .secret("introspection-caller-secret")
+                .redirect_uri("http://127.0.0.1/callback")
+                .build().unwrap(),
+        ).unwrap();
+        assert!(matches!(
+            server.introspect_development_access_token(
+                &issued.access_token, "resource-reader", Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            ), Err(OAuthError::InvalidClient(_))
+        ));
+        server.unregister_client("resource-reader").unwrap();
+        server.register_client(development_introspection_caller(
+            "resource-reader", "https://other.example/api",
+        )).unwrap();
+        assert!(!development_introspect(&server, &issued.access_token).is_active());
+        server.unregister_client("resource-reader").unwrap();
+        server.register_client(development_introspection_caller("resource-reader", TEST_MCP_RESOURCE)).unwrap();
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+
+        server.unregister_client("introspection-token-client").unwrap();
+        server.register_client(
+            OAuthClient::builder("introspection-token-client")
+                .redirect_uri("http://127.0.0.1/callback").scope("read").build().unwrap(),
+        ).unwrap();
+        assert_eq!(
+            serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(),
+            serde_json::json!({ "active": false })
+        );
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_introspection_routes_and_metadata_require_issuer_opt_in() {
+        for enabled in [false, true] {
+            let (server, issued) = development_introspection_fixture(enabled);
+            let routes = OAuthHttpRoutes::new(Arc::new(server), "https://fastmcp.invalid/oauth").unwrap();
+            let metadata = serde_json::to_value(routes.authorization_server_metadata().unwrap()).unwrap();
+            assert_eq!(routes.has_path("/oauth/introspect"), enabled);
+            assert_eq!(routes.introspection_path(), enabled.then_some("/oauth/introspect"));
+            if enabled {
+                assert_eq!(metadata["introspection_endpoint"], "https://fastmcp.invalid/oauth/introspect");
+                assert_eq!(
+                    metadata["introspection_endpoint_auth_methods_supported"],
+                    serde_json::json!(["client_secret_basic"])
+                );
+                assert!(routes.validate_non_overlapping_paths(["/oauth/introspect"]).is_err());
+                assert!(development_introspect(routes.server(), &issued.access_token).is_active());
+            } else {
+                assert!(metadata.get("introspection_endpoint").is_none());
+                assert!(metadata.get("introspection_endpoint_auth_methods_supported").is_none());
+                assert!(routes.validate_non_overlapping_paths(["/oauth/introspect"]).is_ok());
+                assert!(matches!(
+                    routes.server().introspect_development_access_token(
+                        &issued.access_token, "resource-reader", Some("introspection-caller-secret"),
+                        TokenEndpointAuthMethod::ClientSecretBasic,
+                    ), Err(OAuthError::InvalidClient(_))
+                ));
+            }
+        }
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]

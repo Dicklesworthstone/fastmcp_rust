@@ -12279,6 +12279,74 @@ fn oidc_userinfo_challenge(status: HttpStatus, error: Option<&'static str>) -> H
     )
 }
 
+/// RFC 7662 development access-token introspection. This endpoint accepts only
+/// the administratively registered HTTP Basic resource-server identity; the
+/// token being inspected never authorizes the request itself.
+#[cfg(feature = "builtin-auth-server")]
+fn oauth_development_introspection_response(
+    routes: &OAuthHttpRoutes,
+    request: &asupersync::http::h1::Request,
+    authorization_header: Option<&str>,
+) -> HttpResponse {
+    if !matches!(request.method, Http1Method::Post) {
+        return oauth_http_method_not_allowed("POST");
+    }
+    if let Err(response) = oauth_form_content_type(request) {
+        return oauth_http_no_store(response);
+    }
+    let mut admission = match OAuthParameterAdmission::admit(
+        OAuthParameterEndpoint::IntrospectionForm,
+        &request.body,
+    ) {
+        Ok(admission) => admission,
+        Err(_) => return oauth_http_invalid_request(),
+    };
+    let token = match oauth_required_parameter(&mut admission, OAuthParameterName::Token) {
+        Ok(token) => zeroize::Zeroizing::new(token),
+        Err(error) => return oauth_http_error(error),
+    };
+    // RFC 7662 section 2.3 uses 401 for failed caller authentication. The
+    // existing token/revocation form-authentication 400 rule does not apply.
+    let Some(authorization_header) = authorization_header else {
+        return oauth_http_client_authentication_rejection();
+    };
+    let scheme = authorization_header
+        .trim_matches([' ', '\t'])
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("");
+    if !scheme.eq_ignore_ascii_case("basic") {
+        // Multiple credential locations are malformed even when the header
+        // scheme is unsupported. A lone unsupported scheme is failed caller
+        // authentication and receives the same challenge as a wrong secret.
+        if admission.parameters().iter().any(|parameter| {
+            parameter.is_defined() && matches!(parameter.name(), "client_id" | "client_secret")
+        }) {
+            return oauth_http_invalid_request();
+        }
+        return oauth_http_client_authentication_rejection();
+    }
+    let (client_id, client_secret, method) =
+        match oauth_http_client_credentials(&mut admission, Some(authorization_header)) {
+            Ok(credentials) => credentials,
+            Err(response) => return response,
+        };
+    let client_secret = client_secret.map(zeroize::Zeroizing::new);
+    // The admitted token_type_hint is advisory. Only access tokens are
+    // supported here; a hint cannot reinterpret a refresh token or select a
+    // different resource, issuer, token namespace or caller permission.
+    match routes.server().introspect_development_access_token(
+        &token,
+        &client_id,
+        client_secret.as_ref().map(|secret| secret.as_str()),
+        method,
+    ) {
+        Ok(response) => oauth_http_no_store(HttpResponse::ok().with_json(&response)),
+        Err(OAuthError::InvalidClient(_)) => oauth_http_client_authentication_rejection(),
+        Err(error) => oauth_http_error(error),
+    }
+}
+
 fn dispatch_oauth_h1_request(
     routes: &OAuthHttpRoutes,
     request: &asupersync::http::h1::Request,
@@ -12402,6 +12470,10 @@ fn dispatch_oauth_h1_request(
     if !raw_query.is_empty() {
         return oauth_http_invalid_request();
     }
+    #[cfg(feature = "builtin-auth-server")]
+    if routes.introspection_path() == Some(raw_path) {
+        return oauth_development_introspection_response(routes, request, authorization_header);
+    }
     if raw_path == routes.token_path() {
         if !matches!(request.method, Http1Method::Post) {
             return oauth_http_method_not_allowed("POST");
@@ -12480,6 +12552,7 @@ struct OAuthNativeH1RouteLimits {
     authorization: String,
     token: String,
     revocation: String,
+    introspection: Option<String>,
     registration: Option<String>,
     #[cfg(feature = "builtin-auth-server")]
     oidc_discovery: Option<String>,
@@ -12496,6 +12569,7 @@ impl OAuthNativeH1RouteLimits {
             authorization: routes.authorization_path().to_owned(),
             token: routes.token_path().to_owned(),
             revocation: routes.revocation_path().to_owned(),
+            introspection: routes.introspection_path().map(str::to_owned),
             registration: routes.registration_path().map(str::to_owned),
             #[cfg(feature = "builtin-auth-server")]
             oidc_discovery: routes
@@ -12524,7 +12598,10 @@ impl OAuthNativeH1RouteLimits {
             }
         } {
             Some(0)
-        } else if path == self.token || path == self.revocation {
+        } else if path == self.token
+            || path == self.revocation
+            || self.introspection.as_deref() == Some(path)
+        {
             Some(oauth::MAX_OAUTH_FORM_BODY_BYTES)
         } else if self.registration.as_deref() == Some(path) {
             Some(MAX_CLIENT_REGISTRATION_BYTES)
@@ -44480,6 +44557,453 @@ mod lib_unit_tests {
             trailers: Vec::new(),
             peer_addr: None,
         }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn native_development_introspection_fixture(
+        enabled: bool,
+    ) -> (OAuthHttpRoutes, String, String, String) {
+        let oauth = Arc::new(
+            oauth::OAuthServer::try_with_approval_backend(
+                oauth::OAuthServerConfig {
+                    allow_development_token_introspection: enabled,
+                    ..oauth::OAuthServerConfig::default()
+                },
+                Arc::new(NativeBasicConsent),
+            )
+            .unwrap(),
+        );
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder("introspection-token-client")
+                    .secret("token-owner-secret")
+                    .redirect_uri("https://client.example.test/callback")
+                    .scope("read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        for (caller, resource) in [
+            ("native-resource-reader", "https://resource.example/api"),
+            ("native-other-reader", "https://other.example/api"),
+        ] {
+            let endpoint = fastmcp_core::CanonicalHttpUrl::parse(resource).unwrap();
+            let resource = fastmcp_core::CanonicalResourceId::parse_for_endpoint(
+                resource,
+                &endpoint,
+                fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
+            )
+            .unwrap();
+            oauth
+                .register_client(
+                    oauth::OAuthClient::builder(caller)
+                        .secret("native-reader-secret")
+                        .development_token_introspection(
+                            oauth::DevelopmentTokenIntrospectionGrant::new(resource).unwrap(),
+                        )
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        oauth
+            .register_client(
+                oauth::OAuthClient::builder("native-ordinary-client")
+                    .secret("native-reader-secret")
+                    .redirect_uri("https://client.example.test/callback")
+                    .scope("read")
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (code, _) = oauth
+            .authorize(&oauth::AuthorizationRequest {
+                response_type: "code".to_owned(),
+                client_id: "introspection-token-client".to_owned(),
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                scopes: vec!["read".to_owned()],
+                resource: Some("https://resource.example/api".to_owned()),
+                state: None,
+                code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_owned(),
+                code_challenge_method: oauth::CodeChallengeMethod::S256,
+            })
+            .unwrap();
+        let form = format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=https%3A%2F%2Fclient.example.test%2Fcallback&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&resource=https%3A%2F%2Fresource.example%2Fapi"
+        );
+        let owner_basic =
+            native_oauth_basic_header("introspection-token-client:token-owner-secret");
+        let reader_basic =
+            native_oauth_basic_header("native-resource-reader:native-reader-secret");
+        let routes =
+            OAuthHttpRoutes::new(oauth, "https://fastmcp.invalid/oauth").unwrap();
+        (routes, form, owner_basic, reader_basic)
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_development_introspection_is_resource_bound_and_hints_are_advisory() {
+        let (routes, code_form, owner_basic, reader_basic) =
+            native_development_introspection_fixture(true);
+        let request =
+            native_oauth_form_request(routes.token_path(), &code_form, Some(&owner_basic));
+        let issued = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
+        assert_eq!(issued.status, HttpStatus::OK);
+        let issued: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let access = issued["access_token"].as_str().unwrap();
+        let refresh = issued["refresh_token"].as_str().unwrap();
+        let path = routes.introspection_path().unwrap();
+        for hint in ["", "&token_type_hint=access_token", "&token_type_hint=refresh_token",
+            "&token_type_hint=unrecognized"] {
+            let request =
+                native_oauth_form_request(path, &format!("token={access}{hint}"), Some(&reader_basic));
+            let response = dispatch_oauth_h1_request(&routes, &request, path, "");
+            assert_eq!(response.status, HttpStatus::OK);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+                serde_json::json!({
+                    "active": true,
+                    "scope": "read",
+                    "client_id": "introspection-token-client",
+                    "token_type": "bearer",
+                    "sub": "native-basic-owner",
+                    "aud": "https://resource.example/api",
+                    "iss": "https://fastmcp.invalid/"
+                })
+            );
+            assert_eq!(response.headers.get("cache-control").map(String::as_str), Some("no-store"));
+            assert_eq!(response.headers.get("pragma").map(String::as_str), Some("no-cache"));
+            let body = std::str::from_utf8(&response.body).unwrap();
+            assert!(!body.contains(access));
+            assert!(!body.contains(refresh));
+            assert!(!body.contains("native-reader-secret"));
+        }
+        let other_basic = native_oauth_basic_header("native-other-reader:native-reader-secret");
+        for (token, basic, suffix) in [
+            (access, other_basic.as_str(), "&resource=https%3A%2F%2Fresource.example%2Fapi"),
+            (refresh, reader_basic.as_str(), "&token_type_hint=access_token"),
+            ("unknown-token", reader_basic.as_str(), ""),
+        ] {
+            let request =
+                native_oauth_form_request(path, &format!("token={token}{suffix}"), Some(basic));
+            let response = dispatch_oauth_h1_request(&routes, &request, path, "");
+            assert_eq!(response.status, HttpStatus::OK);
+            assert_eq!(response.body.as_slice(), br#"{"active":false}"#);
+        }
+        assert!(routes.server().validate_access_token(access).is_some());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_development_introspection_separates_bad_authentication_from_malformed_input() {
+        let (routes, code_form, owner_basic, reader_basic) =
+            native_development_introspection_fixture(true);
+        let request =
+            native_oauth_form_request(routes.token_path(), &code_form, Some(&owner_basic));
+        let issued = dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
+        let issued: serde_json::Value = serde_json::from_slice(&issued.body).unwrap();
+        let access = issued["access_token"].as_str().unwrap();
+        let path = routes.introspection_path().unwrap();
+        let form = format!("token={access}");
+        let wrong = native_oauth_basic_header("native-resource-reader:wrong-secret");
+        let ordinary = native_oauth_basic_header("native-ordinary-client:native-reader-secret");
+        let bearer = format!("Bearer {access}");
+        for authorization in [
+            None,
+            Some(wrong.as_str()),
+            Some(ordinary.as_str()),
+            Some(bearer.as_str()),
+            Some("Digest unrelated"),
+            Some(""),
+            Some("Basic malformed!"),
+        ] {
+            let request = native_oauth_form_request(path, &form, authorization);
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&routes, &request, path, ""),
+                HttpStatus::UNAUTHORIZED,
+                "invalid_client",
+                Some("Basic realm=\"oauth\""),
+            );
+        }
+        let body_credentials = format!(
+            "{form}&client_id=native-resource-reader&client_secret=native-reader-secret"
+        );
+        let request = native_oauth_form_request(path, &body_credentials, None);
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, path, ""),
+            HttpStatus::UNAUTHORIZED,
+            "invalid_client",
+            Some("Basic realm=\"oauth\""),
+        );
+        for authorization in [&reader_basic, &bearer] {
+            for polluted in [
+                format!("{form}&client_id="),
+                format!("{form}&client_secret=native-reader-secret"),
+                format!("{form}&%74oken="),
+            ] {
+                let request = native_oauth_form_request(path, &polluted, Some(authorization));
+                assert_native_oauth_error(
+                    &dispatch_oauth_h1_request(&routes, &request, path, ""),
+                    HttpStatus::BAD_REQUEST,
+                    "invalid_request",
+                    None,
+                );
+            }
+        }
+        let mut duplicate = native_oauth_form_request(path, &form, Some(&reader_basic));
+        duplicate.headers.push(("authorization".to_owned(), reader_basic.clone()));
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &duplicate, path, ""),
+            HttpStatus::BAD_REQUEST,
+            "invalid_request",
+            None,
+        );
+        for malformed in ["token=", "token=%0A", "token=%", "token=%FF"] {
+            let request = native_oauth_form_request(path, malformed, Some(&reader_basic));
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&routes, &request, path, ""),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            );
+        }
+        let request = native_oauth_form_request(path, &form, Some(&reader_basic));
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, path, "token=untrusted"),
+            HttpStatus::BAD_REQUEST,
+            "invalid_request",
+            None,
+        );
+        let response = dispatch_oauth_h1_request(&routes, &request, path, "");
+        assert_eq!(response.status, HttpStatus::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["active"],
+            true
+        );
+        assert!(routes.server().validate_access_token(access).is_some());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn native_development_introspection_rejects_oversized_body_at_header_admission() {
+        let (routes, _, _, _) = native_development_introspection_fixture(true);
+        let limits = OAuthNativeH1RouteLimits::from_routes(&routes);
+        assert_eq!(
+            limits.body_limit_for_path("/oauth/introspect"),
+            Some(oauth::MAX_OAUTH_FORM_BODY_BYTES)
+        );
+        let header = format!(
+            "POST /oauth/introspect HTTP/1.1\r\nHost: loopback\r\nContent-Length: {}\r\n\r\n",
+            oauth::MAX_OAUTH_FORM_BODY_BYTES + 1
+        );
+        let mut source = BytesMut::from(header.as_bytes());
+        let original = source.clone();
+        let mut codec = NativeHttp1Codec::new(
+            4 * oauth::MAX_OAUTH_FORM_BODY_BYTES,
+            Some(&routes),
+        );
+        assert!(matches!(codec.decode(&mut source), Err(Http1DecodeError::BodyTooLarge)));
+        assert_eq!(source, original, "body was neither requested nor consumed");
+        let exact_header = format!(
+            "POST /oauth/introspect HTTP/1.1\r\nHost: loopback\r\nContent-Length: {}\r\n\r\n",
+            oauth::MAX_OAUTH_FORM_BODY_BYTES
+        );
+        let mut codec = NativeHttp1Codec::new(
+            4 * oauth::MAX_OAUTH_FORM_BODY_BYTES,
+            Some(&routes),
+        );
+        assert!(codec.decode(&mut BytesMut::from(exact_header.as_bytes())).unwrap().is_none());
+        let (disabled, _, _, _) = native_development_introspection_fixture(false);
+        assert_eq!(
+            OAuthNativeH1RouteLimits::from_routes(&disabled)
+                .body_limit_for_path("/oauth/introspect"),
+            None
+        );
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn live_http_development_introspection_uses_authoritative_issuer_state() {
+        run_live_http_test(|cx| async move {
+            let (routes, code_form, owner_basic, reader_basic) =
+                native_development_introspection_fixture(true);
+            let metadata_path = routes.metadata_path().to_owned();
+            let bound = Server::new("live-development-introspection", "1.0.0")
+                .oauth_http_routes(routes)
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("introspection listener failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("introspection address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let mut client = cx
+                .spawn(move |_client_cx| async move {
+                    let result = async {
+                        let request = |path: &str, form: &str, authorization: &str| {
+                            format!(
+                                "POST {path} HTTP/1.1\r\nHost: loopback\r\nAuthorization: {authorization}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{form}",
+                                form.len(),
+                            )
+                            .into_bytes()
+                        };
+                        let metadata = live_http_exchange(
+                            address,
+                            format!(
+                                "GET {metadata_path} HTTP/1.1\r\nHost: loopback\r\nConnection: close\r\n\r\n"
+                            )
+                            .into_bytes(),
+                        )
+                        .await?;
+                        let metadata: serde_json::Value =
+                            serde_json::from_slice(live_http_response_body(&metadata)?)
+                                .map_err(|_| "introspection metadata was not JSON".to_owned())?;
+                        if metadata["introspection_endpoint"]
+                            != "https://fastmcp.invalid/oauth/introspect"
+                            || metadata["introspection_endpoint_auth_methods_supported"]
+                                != serde_json::json!(["client_secret_basic"])
+                        {
+                            return Err("introspection discovery did not describe its route".to_owned());
+                        }
+                        let issued = live_http_exchange(
+                            address,
+                            request("/oauth/token", &code_form, &owner_basic),
+                        )
+                        .await?;
+                        if !issued.starts_with(b"HTTP/1.1 200") {
+                            return Err("introspection fixture token exchange failed".to_owned());
+                        }
+                        let issued: serde_json::Value =
+                            serde_json::from_slice(live_http_response_body(&issued)?)
+                                .map_err(|_| "introspection token response was not JSON".to_owned())?;
+                        let access = issued["access_token"].as_str()
+                            .ok_or_else(|| "introspection fixture omitted access token".to_owned())?;
+                        let refresh = issued["refresh_token"].as_str()
+                            .ok_or_else(|| "introspection fixture omitted refresh token".to_owned())?;
+                        let active = live_http_exchange(
+                            address,
+                            request(
+                                "/oauth/introspect",
+                                &format!("token={access}&token_type_hint=refresh_token"),
+                                &reader_basic,
+                            ),
+                        )
+                        .await?;
+                        if !active.starts_with(b"HTTP/1.1 200")
+                            || live_http_response_header(&active, "cache-control")? != "no-store"
+                            || live_http_response_header(&active, "pragma")? != "no-cache"
+                            || serde_json::from_slice::<serde_json::Value>(
+                                live_http_response_body(&active)?,
+                            ).map_err(|_| "active introspection was not JSON".to_owned())?
+                                != serde_json::json!({
+                                    "active": true, "scope": "read",
+                                    "client_id": "introspection-token-client",
+                                    "token_type": "bearer", "sub": "native-basic-owner",
+                                    "aud": "https://resource.example/api",
+                                    "iss": "https://fastmcp.invalid/"
+                                })
+                        {
+                            return Err("active introspection did not preserve authorized facts".to_owned());
+                        }
+                        let other_basic =
+                            native_oauth_basic_header("native-other-reader:native-reader-secret");
+                        for (token, authorization) in [
+                            (access, other_basic.as_str()),
+                            (refresh, reader_basic.as_str()),
+                        ] {
+                            let inactive = live_http_exchange(
+                                address,
+                                request(
+                                    "/oauth/introspect",
+                                    &format!("token={token}&token_type_hint=access_token"),
+                                    authorization,
+                                ),
+                            )
+                            .await?;
+                            if !inactive.starts_with(b"HTTP/1.1 200")
+                                || live_http_response_body(&inactive)? != br#"{"active":false}"#
+                            {
+                                return Err("introspection exposed a foreign or refresh token".to_owned());
+                            }
+                        }
+                        let ordinary =
+                            native_oauth_basic_header("native-ordinary-client:native-reader-secret");
+                        let bearer = format!("Bearer {access}");
+                        for authorization in [ordinary.as_str(), bearer.as_str()] {
+                            let denied = live_http_exchange(
+                                address,
+                                request("/oauth/introspect", &format!("token={access}"), authorization),
+                            )
+                            .await?;
+                            if !denied.starts_with(b"HTTP/1.1 401")
+                                || live_http_response_header(&denied, "www-authenticate")?
+                                    != "Basic realm=\"oauth\""
+                                || live_http_response_body(&denied)? != br#"{"error":"invalid_client"}"#
+                            {
+                                return Err("introspection admitted an unauthorized caller".to_owned());
+                            }
+                        }
+                        let malformed = live_http_exchange(
+                            address,
+                            request(
+                                "/oauth/introspect",
+                                &format!("token={access}&%74oken="),
+                                &reader_basic,
+                            ),
+                        )
+                        .await?;
+                        if !malformed.starts_with(b"HTTP/1.1 400")
+                            || live_http_response_body(&malformed)? != br#"{"error":"invalid_request"}"#
+                        {
+                            return Err("introspection did not reject duplicate token input".to_owned());
+                        }
+                        let oversized = live_http_exchange(
+                            address,
+                            format!(
+                                "POST /oauth/introspect HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                oauth::MAX_OAUTH_FORM_BODY_BYTES + 1,
+                            ).into_bytes(),
+                        )
+                        .await?;
+                        if !oversized.starts_with(b"HTTP/1.1 400") {
+                            return Err("introspection waited for or accepted an oversized body".to_owned());
+                        }
+                        let revoked = live_http_exchange(
+                            address,
+                            request("/oauth/revoke", &format!("token={access}"), &owner_basic),
+                        )
+                        .await?;
+                        if !revoked.starts_with(b"HTTP/1.1 200") {
+                            return Err("introspection fixture revocation failed".to_owned());
+                        }
+                        let inactive = live_http_exchange(
+                            address,
+                            request("/oauth/introspect", &format!("token={access}"), &reader_basic),
+                        )
+                        .await?;
+                        if !inactive.starts_with(b"HTTP/1.1 200")
+                            || live_http_response_body(&inactive)? != br#"{"active":false}"#
+                        {
+                            return Err("introspection retained a revoked authorization".to_owned());
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    caller_cx.cancel_with(
+                        CancelKind::User,
+                        Some("development introspection lifecycle complete"),
+                    );
+                    result
+                })
+                .map_err(|error| format!("introspection client spawn failed: {error}"))?;
+            let serve = bound.serve(&cx).await;
+            client.join(&cx).await
+                .map_err(|error| format!("introspection client failed: {error:?}"))??;
+            let shutdown =
+                serve.map_err(|error| format!("introspection server failed: {error}"))?;
+            require_quiescent_http_shutdown(shutdown, "development introspection lifecycle").await
+        });
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
