@@ -65,6 +65,13 @@ async fn unless_revoked<T>(
             return Poll::Ready(Err(OAuthSessionError::LoginRequired));
         }
         let result = operation.as_mut().poll(task);
+        // Native refresh quarantines its old access signal on terminal failure.
+        // Preserve that already-sanitized failure rather than replacing it with
+        // a secondary LoginRequired; it cannot publish a replacement. Revocation
+        // still wins over pending work or a successfully produced candidate.
+        if matches!(&result, Poll::Ready(Err(_))) {
+            return result;
+        }
         // A ready refresh may have installed a pair during this poll. Keep the
         // session quarantined rather than publishing it after old-token revocation.
         if revocation.is_cancel_requested() {
@@ -196,6 +203,25 @@ mod tests {
             }
             assert_eq!(drops.load(Ordering::SeqCst), 1);
         }
+    }
+
+    #[test]
+    fn terminal_refresh_failure_preserves_its_error_after_quarantining_access() {
+        let credential = credential();
+        let mut wait = Box::pin(unless_revoked(&credential.revoked, async {
+            credential.revoke();
+            Err::<(), _>(OAuthSessionError::OAuth(
+                crate::http_auth::oauth::OAuthError::InvalidTokenResponse,
+            ))
+        }));
+        assert!(matches!(
+            wait.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Err(OAuthSessionError::OAuth(
+                crate::http_auth::oauth::OAuthError::InvalidTokenResponse
+            )))
+        ));
+        drop(wait);
+        assert!(credential.is_revoked());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use super::super::tests as native;
-use super::super::{bind_loopback, within};
+use super::super::{admit_token_response, bind_loopback, within};
 use super::*;
 use crate::http_auth::CanonicalHttpUrl;
 use crate::http_auth::secure_file::slot::coordinator::{
@@ -164,6 +164,20 @@ fn live_grant_transfer_is_single_use_and_keeps_original_access_expiry() {
     assert_eq!(credentials.expires_at(), expiry);
 }
 
+#[test]
+fn revoked_live_grant_cannot_transfer_its_retained_refresh_token() {
+    let configuration = native::config();
+    let mut credentials = native::renewable_grant(&configuration);
+    let expiry = credentials.expires_at();
+    credentials.bearer_credential().clone().revoke();
+    assert_eq!(
+        credentials.take_refresh_grant().err(),
+        Some(OAuthError::RefreshUnavailable)
+    );
+    assert_eq!(credentials.refresh_token.as_deref(), Some("refresh-one"));
+    assert_eq!(credentials.expires_at(), expiry);
+}
+
 // Fault-injection doubles ONLY. TestVault models a remote opaque-envelope
 // service while TestAnchor models its independently retained CAS state. These
 // are not encryption/anchor implementations or provider qualification evidence.
@@ -178,6 +192,7 @@ struct VaultState {
     refuse_seal: bool,
     oversized_seal: bool,
     corrupt_open: bool,
+    revoke_on_seal: Option<crate::http_auth::BoundBearerCredential>,
 }
 impl OAuthGrantProtector for TestVault {
     type Plaintext = Vec<u8>;
@@ -191,6 +206,9 @@ impl OAuthGrantProtector for TestVault {
             .map_err(|_| OAuthGrantProtectionError::Cancelled)?;
         let mut state = self.0.lock().unwrap();
         state.seals += 1;
+        if let Some(credential) = state.revoke_on_seal.take() {
+            credential.revoke();
+        }
         if state.refuse_seal {
             return Err(OAuthGrantProtectionError::Unavailable);
         }
@@ -478,6 +496,41 @@ fn refused_sealing_and_oversized_envelopes_preserve_live_refresh_ownership() {
 }
 
 #[test]
+fn revoked_live_grants_cannot_enter_storage_before_or_during_sealing() {
+    for during_sealing in [false, true] {
+        let cx = Cx::for_testing();
+        let configuration = native::config();
+        let client = OAuthClient::new(configuration.clone());
+        let fixture = Fixture::new();
+        let mut store = fixture.open(&cx, &client).unwrap();
+        let mut credentials = native::renewable_grant(&configuration);
+        let original = credentials.bearer_credential().clone();
+        if during_sealing {
+            fixture.vault.0.lock().unwrap().revoke_on_seal = Some(original.clone());
+        } else {
+            original.revoke();
+        }
+        assert_eq!(
+            store.store_refresh(&cx, &fixture.authorization, None, &mut credentials),
+            Err(OAuthRefreshStoreError::RefreshUnavailable)
+        );
+        assert!(original.is_revoked());
+        assert_eq!(credentials.refresh_token.as_deref(), Some("refresh-one"));
+        assert_eq!(
+            fixture.vault.0.lock().unwrap().seals,
+            usize::from(during_sealing)
+        );
+        assert_eq!(store.revision(), None);
+        assert_eq!(fixture.sequence(), 0);
+        assert!(!fixture.directory.join("grant").exists());
+        assert_eq!(
+            credentials.take_refresh_grant().err(),
+            Some(OAuthError::RefreshUnavailable)
+        );
+    }
+}
+
+#[test]
 fn wrong_authorization_and_malformed_plaintext_cannot_consume_stored_grants() {
     let cx = Cx::for_testing();
     let configuration = native::config();
@@ -628,7 +681,7 @@ fn stale_revision_and_cancelled_store_preserve_grants_and_provider_state() {
 
 #[test]
 fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narrowing() {
-    for rotate in [false, true] {
+    for successor in [Some("rotated-refresh"), Some("refresh-one"), None, Some("")] {
         asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
             let cx = Cx::current().unwrap();
             let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
@@ -672,11 +725,14 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
                 assert_eq!(form["refresh_token"], "refresh-one");
                 assert_eq!(form["client_id"], "native-client");
                 assert_eq!(form["resource"], "https://mcp.example/mcp");
-                let body = if rotate {
-                    r#"{"access_token":"resumed-access","token_type":"Bearer","expires_in":120,"refresh_token":"rotated-refresh","scope":"tools:read"}"#
-                } else {
-                    r#"{"access_token":"resumed-access","token_type":"Bearer","expires_in":120,"scope":"tools:read"}"#
-                };
+                let mut body = serde_json::json!({
+                    "access_token": "resumed-access", "token_type": "Bearer",
+                    "expires_in": 120, "scope": "tools:read"
+                });
+                if let Some(successor) = successor {
+                    body["refresh_token"] = serde_json::json!(successor);
+                }
+                let body = serde_json::to_string(&body).unwrap();
                 let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 tls.write_all(reply.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
                 tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
@@ -685,11 +741,17 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
             let (server, result) =
                 Box::pin(native::pair(server, client.refresh_grant(&cx, grant))).await;
             assert_eq!(server, Ok(()));
-            let credentials = result.unwrap();
-            assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer resumed-access".to_owned()));
-            assert_eq!(credentials.refresh_token.as_deref(), Some(if rotate { "rotated-refresh" } else { "refresh-one" }));
-            assert_eq!(credentials.scopes(), ["tools:read".to_owned()]);
-            assert!(credentials.expires_at() <= Instant::now() + Duration::from_secs(120));
+            if successor == Some("rotated-refresh") {
+                let credentials = result.unwrap();
+                assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer resumed-access".to_owned()));
+                assert_eq!(credentials.refresh_token.as_deref(), Some("rotated-refresh"));
+                assert_eq!(credentials.scopes(), ["tools:read".to_owned()]);
+                assert!(credentials.expires_at() <= Instant::now() + Duration::from_secs(120));
+            } else {
+                assert_eq!(result.err(), Some(OAuthError::InvalidTokenResponse));
+            }
+            let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(listener.poll_accept(&mut task).is_pending(), "a consumed stored grant cannot be replayed");
             drop(fixture);
         });
     }

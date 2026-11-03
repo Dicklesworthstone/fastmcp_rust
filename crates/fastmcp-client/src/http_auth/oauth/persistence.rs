@@ -30,7 +30,7 @@ use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 
 use super::{
     OAuthClient, OAuthClientConfiguration, OAuthCredentials, OAuthError, TOKEN_TIMEOUT,
-    admit_token_response, encode_form, operation_deadline, valid_opaque, validate_scopes,
+    admit_refresh_response, encode_form, operation_deadline, valid_opaque, validate_scopes,
 };
 use crate::http_auth::secure_file::SecureAtomicFile;
 use crate::http_auth::secure_file::slot::coordinator::{
@@ -169,7 +169,13 @@ impl OAuthRefreshGrant {
 impl OAuthCredentials {
     /// Transfers renewal ownership while leaving the current access token and
     /// its ORIGINAL expiry unchanged. A second transfer cannot replay it.
+    /// Already revoked credentials cannot transfer renewal ownership. A
+    /// completed handoff is independent of later token-local access revocation;
+    /// its new owner must retire that custody and any live session separately.
     pub fn take_refresh_grant(&mut self) -> Result<OAuthRefreshGrant, OAuthError> {
+        if self.access.is_revoked() {
+            return Err(OAuthError::RefreshUnavailable);
+        }
         let refresh = self
             .refresh_token
             .as_deref()
@@ -178,6 +184,9 @@ impl OAuthCredentials {
             .map_err(|_| OAuthError::InvalidTokenResponse)?;
         let configuration = self.configuration.clone();
         let scopes = self.scopes.clone();
+        if self.access.is_revoked() {
+            return Err(OAuthError::RefreshUnavailable);
+        }
         let refresh_token = self
             .refresh_token
             .take()
@@ -199,8 +208,13 @@ impl OAuthClient {
     ///
     /// Cancellation, rejection, malformed replies, and lost responses consume
     /// the handoff. Never restore its old protected bytes to retry a token that
-    /// the issuer may already have rotated. An omitted replacement refresh
-    /// token retains the old token only after successful response admission.
+    /// the issuer may already have rotated. This public client requires one
+    /// nonempty, byte-distinct successor refresh token; omission or repetition
+    /// is a terminal failure and cannot recreate the consumed handoff.
+    ///
+    /// A persistent handoff owns no old access credential or live session.
+    /// Their owners must retire them separately on renewal failure; this method
+    /// cannot recall previously delivered bearer clones or cross-process access.
     pub async fn refresh_grant(
         &self,
         cx: &Cx,
@@ -229,11 +243,13 @@ impl OAuthClient {
         if cx.now() >= deadline {
             return Err(OAuthError::TimedOut);
         }
-        let mut credentials =
-            admit_token_response(&self.configuration, &grant.scopes, &response, started)?;
-        if credentials.refresh_token.is_none() {
-            credentials.refresh_token = Some(grant.refresh_token);
-        }
+        let credentials = admit_refresh_response(
+            &self.configuration,
+            &grant.scopes,
+            &grant.refresh_token,
+            &response,
+            started,
+        )?;
         if cx.checkpoint().is_err() {
             return Err(OAuthError::Cancelled);
         }
@@ -351,8 +367,10 @@ impl<A: CredentialCommitAnchor, P: OAuthGrantProtector> OAuthRefreshStore<A, P> 
     /// revision; replacing a different lineage is never an implicit overwrite.
     ///
     /// Binding, authorization, encoding and provider preflight failures leave
-    /// the source grant untouched. Immediately before storage mutation becomes
-    /// possible, its refresh token is removed. ANY later failure leaves it
+    /// the source grant untouched. Already revoked access credentials cannot
+    /// export their retained refresh token, including revocation during provider
+    /// sealing. Immediately before storage mutation becomes possible, its
+    /// refresh token is removed. ANY later failure leaves it
     /// removed, including an uncertain commit, to prevent two usable copies.
     /// Reopen/reconcile custody rather than restoring the old live token.
     pub fn store_refresh(
@@ -368,6 +386,9 @@ impl<A: CredentialCommitAnchor, P: OAuthGrantProtector> OAuthRefreshStore<A, P> 
         }
         if expected != self.slot.revision() {
             return Err(OAuthRefreshStoreError::RevisionMismatch);
+        }
+        if credentials.access.is_revoked() {
+            return Err(OAuthRefreshStoreError::RefreshUnavailable);
         }
         let refresh_token = credentials
             .refresh_token
@@ -390,6 +411,9 @@ impl<A: CredentialCommitAnchor, P: OAuthGrantProtector> OAuthRefreshStore<A, P> 
         let protected = self.protector.seal(cx, &binding, &encoding)?;
         self.admit_protected(&protected)?;
         checkpoint(cx)?;
+        if credentials.access.is_revoked() {
+            return Err(OAuthRefreshStoreError::RefreshUnavailable);
+        }
         // Do not put this back on error: a storage reply can be lost after the
         // write is durable. The coordinator owns the only safe reconciliation.
         let _transferred = credentials

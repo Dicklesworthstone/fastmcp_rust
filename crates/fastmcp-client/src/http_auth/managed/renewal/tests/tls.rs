@@ -184,6 +184,10 @@ impl Peer {
         let body = format!(
             r#"{{"access_token":"{access}","refresh_token":"{refresh}","token_type":"Bearer","expires_in":3600}}"#,
         );
+        Self::reply_body(stream, &body).await;
+    }
+
+    async fn reply_body(stream: &mut Stream, body: &str) {
         let wire = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len(),
@@ -236,6 +240,9 @@ impl Peer {
 #[derive(Clone, Copy)]
 enum Case {
     Complete,
+    OmittedRotation,
+    RepeatedRotation,
+    EmptyRotation,
     RevokeHead,
     RevokeBody,
     CancelOwner,
@@ -247,6 +254,9 @@ enum Case {
 fn native_shared_renewal_preserves_revocation_single_flight_and_quarantine() {
     for case in [
         Case::Complete,
+        Case::OmittedRotation,
+        Case::RepeatedRotation,
+        Case::EmptyRotation,
         Case::RevokeHead,
         Case::RevokeBody,
         Case::CancelOwner,
@@ -299,6 +309,18 @@ fn native_shared_renewal_preserves_revocation_single_flight_and_quarantine() {
                                 Peer::reply(&mut stream, "replacement-access", "replacement-refresh").await;
                                 return;
                             }
+                            Case::OmittedRotation => {
+                                Peer::reply_body(&mut stream, r#"{"access_token":"replacement-access","token_type":"Bearer","expires_in":3600}"#).await;
+                                return;
+                            }
+                            Case::RepeatedRotation => {
+                                Peer::reply(&mut stream, "replacement-access", "original-refresh").await;
+                                return;
+                            }
+                            Case::EmptyRotation => {
+                                Peer::reply(&mut stream, "replacement-access", "").await;
+                                return;
+                            }
                             Case::RevokeBody => {
                                 stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{").await.unwrap();
                                 stream.flush().await.unwrap();
@@ -320,6 +342,7 @@ fn native_shared_renewal_preserves_revocation_single_flight_and_quarantine() {
                             let replacement = queued.unwrap();
                             assert_eq!(replacement.generation(), 2);
                             assert_eq!(replacement.credential().authorization_for_target(session.resource()).as_deref(), Some("Bearer replacement-access"));
+                            assert!(!original.credential().is_revoked(), "valid rotation preserves existing access snapshots");
                             // An old signal cannot invalidate a handoff already admitted.
                             original.credential().revoke();
                             assert_eq!(session.credential(&cx).await.unwrap().generation(), 2);
@@ -335,10 +358,14 @@ fn native_shared_renewal_preserves_revocation_single_flight_and_quarantine() {
                                 assert!(matches!(owner.unwrap(), Err(OAuthSessionError::Cancelled)));
                             } else if matches!(case, Case::Abandon) {
                                 assert!(owner.is_none());
+                            } else if matches!(case, Case::OmittedRotation | Case::RepeatedRotation | Case::EmptyRotation) {
+                                assert!(matches!(owner.unwrap(), Err(OAuthSessionError::OAuth(OAuthError::InvalidTokenResponse))));
                             } else {
                                 assert!(matches!(owner.unwrap(), Err(OAuthSessionError::LoginRequired)));
                             }
                             assert!(matches!(queued, Err(OAuthSessionError::LoginRequired)));
+                            assert!(original.credential().is_revoked());
+                            assert!(original.credential().authorization_for_target(session.resource()).is_none());
                             {
                                 let state = session.inner.state.try_lock_owned().unwrap();
                                 let state = state.as_ref().unwrap();

@@ -403,29 +403,55 @@ fn renewal_consumes_exchanges_and_persists_before_delivering_fresh_access() {
 }
 
 #[test]
-fn renewal_omitted_rotation_persists_the_same_lineage_only_after_issuer_success() {
-    run(|cx| async move {
-        let (listener, client) = peer().await;
-        let fixture = Fixture::new();
-        let store = fixture.seed(&cx, &client).await;
-        let mut renewal = fixture.begin(&cx, &client, store);
-        let body = r#"{"access_token":"renewed-access","token_type":"Bearer","expires_in":120,"scope":"tools:read"}"#;
-        let ((), result) = native::pair(token_reply(&listener, Some(body)), renewal.run(&cx)).await;
-        result.unwrap();
-        let OAuthRefreshRenewalCustody::Complete { store, .. } = renewal.into_custody() else {
-            panic!("completed custody");
-        };
-        let (store, grant) = store
-            .take_refresh(&cx, fixture.auth)
-            .unwrap()
-            .wait(&cx)
-            .await
-            .unwrap()
-            .into_parts();
-        assert_eq!(grant.unwrap().unwrap().refresh_token, "refresh-one");
-        close(&cx, store).await;
-        quiet(&listener);
-    });
+fn renewal_missing_identical_or_empty_rotation_stops_without_restoring_consumed_custody() {
+    for body in [
+        r#"{"access_token":"renewed-access","token_type":"Bearer","expires_in":120,"scope":"tools:read"}"#,
+        r#"{"access_token":"renewed-access","token_type":"Bearer","expires_in":120,"refresh_token":"refresh-one","scope":"tools:read"}"#,
+        r#"{"access_token":"renewed-access","token_type":"Bearer","expires_in":120,"refresh_token":"","scope":"tools:read"}"#,
+    ] {
+        run(|cx| async move {
+            let (listener, client) = peer().await;
+            let fixture = Fixture::new();
+            let store = fixture.seed(&cx, &client).await;
+            let mut renewal = fixture.begin(&cx, &client, store);
+            let ((), result) =
+                native::pair(token_reply(&listener, Some(body)), renewal.run(&cx)).await;
+            assert!(matches!(
+                result,
+                Err(OAuthRefreshRenewalError::Context(
+                    OAuthError::InvalidTokenResponse
+                ))
+            ));
+            assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::Stopped);
+            assert!(matches!(
+                renewal.run(&cx).await,
+                Err(OAuthRefreshRenewalError::Stopped)
+            ));
+            quiet(&listener);
+            let OAuthRefreshRenewalCustody::Stopped {
+                store: Some(store),
+                credentials: None,
+            } = renewal.into_custody()
+            else {
+                panic!("invalid rotation cannot publish access or retain its old refresh token");
+            };
+            assert_eq!(store.revision().unwrap().generation(), 2);
+            assert_eq!(fixture.provider.0.lock().unwrap().seals, 1);
+            assert_eq!(fixture.provider.0.lock().unwrap().writes, 4);
+            close(&cx, store).await;
+            let store = fixture.open(&cx, &client).await;
+            let (store, grant) = store
+                .take_refresh(&cx, fixture.auth)
+                .unwrap()
+                .wait(&cx)
+                .await
+                .unwrap()
+                .into_parts();
+            assert!(grant.unwrap().is_none());
+            close(&cx, store).await;
+            quiet(&listener);
+        });
+    }
 }
 
 #[test]

@@ -29,7 +29,9 @@ use fastmcp_core::crypto::{
     HmacSha256Key, HmacSha256Tag, SecurityIdentifier, draw_hmac_sha256_key,
     draw_security_identifier, sha256_bounded,
 };
-use fastmcp_core::{AccessToken, CanonicalResourceId, CanonicalResourceIdPolicy};
+use fastmcp_core::{
+    AccessToken, CanonicalResourceId, CanonicalResourceIdPolicy, McpRequestCancellation,
+};
 use serde::{Deserialize, Deserializer};
 
 use super::{BoundBearerCredential, CanonicalHttpUrl};
@@ -313,6 +315,56 @@ impl OAuthCredentials {
     }
 }
 
+// Custody has already transferred when this guard is installed. A failure or
+// abandoned future must retire access clones as well as the consumed refresh
+// token. A successfully admitted rotation preserves existing access snapshots
+// and their original expiry; managed renewal still watches that old signal.
+struct RefreshFailureQuarantine {
+    revoked: McpRequestCancellation,
+    armed: bool,
+}
+
+impl RefreshFailureQuarantine {
+    fn new(revoked: McpRequestCancellation) -> Self {
+        Self {
+            revoked,
+            armed: true,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RefreshFailureQuarantine {
+    fn drop(&mut self) {
+        if self.armed {
+            self.revoked.cancel();
+        }
+    }
+}
+
+async fn while_refresh_live<T>(
+    revoked: &McpRequestCancellation,
+    operation: impl Future<Output = Result<T, OAuthError>>,
+) -> Result<T, OAuthError> {
+    let mut revoked_wait = std::pin::pin!(revoked.cancelled());
+    let mut operation = std::pin::pin!(operation);
+    poll_fn(|task| {
+        if revoked.is_cancel_requested() || revoked_wait.as_mut().poll(task).is_ready() {
+            return Poll::Ready(Err(OAuthError::RefreshUnavailable));
+        }
+        let result = operation.as_mut().poll(task);
+        if revoked.is_cancel_requested() {
+            Poll::Ready(Err(OAuthError::RefreshUnavailable))
+        } else {
+            result
+        }
+    })
+    .await
+}
+
 /// Native OAuth driver. All I/O is polled under the supplied `Cx`, without
 /// creating another runtime, detached task, browser subprocess, or global client.
 #[derive(Clone, Debug)]
@@ -410,13 +462,18 @@ impl OAuthClient {
     /// Exclusive access to the credentials serializes refresh operations. A
     /// successful response replaces the complete token pair at once. Narrowed
     /// scopes become the next refresh ceiling; they cannot silently re-expand.
-    /// When the issuer omits a new refresh token, the previous one is retained.
+    /// This public client requires a nonempty successor refresh token that is
+    /// byte-distinct from the presented token. Omission or repetition is a
+    /// terminal rotation failure, never permission to retain the old token.
     ///
     /// After dispatch becomes possible, failure or cancellation discards the
-    /// old refresh token rather than retrying a possibly consumed/rotated token.
-    /// The previous access token and its original expiry remain unchanged;
-    /// `has_refresh_token()` becomes false and another login is required for
-    /// future renewal. Preflight failures leave the entire credential untouched.
+    /// old refresh token and revokes every clone of the previous access token.
+    /// Dropping an in-flight refresh has the same quarantine effect. Another
+    /// explicit login is required; no possibly consumed token is replayed.
+    /// Preflight failures leave custody untouched. Access expiry permits renewal,
+    /// but local revocation prevents dispatch and interrupts a quiet exchange.
+    /// A valid rotation preserves old access snapshots until their original
+    /// expiry or explicit revocation; it does not extend their lifetime.
     pub async fn refresh(
         &self,
         cx: &Cx,
@@ -424,8 +481,10 @@ impl OAuthClient {
     ) -> Result<(), OAuthError> {
         let deadline = operation_deadline(cx, TOKEN_TIMEOUT)?;
         let (body, previous_refresh) = self.prepare_refresh(credentials)?;
+        let mut quarantine = RefreshFailureQuarantine::new(credentials.access.revoked.clone());
         let started = Instant::now();
-        let response = self.exchange(cx, deadline, body).await?;
+        let response =
+            while_refresh_live(&quarantine.revoked, self.exchange(cx, deadline, body)).await?;
         // Do not publish a new token pair after the caller has cancelled.
         if cx.checkpoint().is_err() {
             return Err(OAuthError::Cancelled);
@@ -441,7 +500,11 @@ impl OAuthClient {
         if cx.now() >= deadline {
             return Err(OAuthError::TimedOut);
         }
+        if quarantine.revoked.is_cancel_requested() {
+            return Err(OAuthError::RefreshUnavailable);
+        }
         std::mem::swap(credentials, &mut replacement);
+        quarantine.complete();
         Ok(())
     }
 
@@ -451,6 +514,9 @@ impl OAuthClient {
     ) -> Result<(String, String), OAuthError> {
         if credentials.configuration != self.configuration {
             return Err(OAuthError::CredentialBindingMismatch);
+        }
+        if credentials.access.is_revoked() {
+            return Err(OAuthError::RefreshUnavailable);
         }
         let previous = credentials
             .refresh_token
@@ -467,6 +533,9 @@ impl OAuthClient {
             fields.push(("scope", scope.as_str()));
         }
         let body = encode_form(&fields)?;
+        if credentials.access.is_revoked() {
+            return Err(OAuthError::RefreshUnavailable);
+        }
         // All fallible local validation precedes this ownership transfer. Once
         // an exchange is possible, cancellation cannot put this secret back.
         let previous = credentials
@@ -483,12 +552,13 @@ impl OAuthClient {
         response: &[u8],
         started: Instant,
     ) -> Result<OAuthCredentials, OAuthError> {
-        let mut replacement =
-            admit_token_response(&self.configuration, &previous.scopes, response, started)?;
-        if replacement.refresh_token.is_none() {
-            replacement.refresh_token = Some(previous_refresh);
-        }
-        Ok(replacement)
+        admit_refresh_response(
+            &self.configuration,
+            &previous.scopes,
+            &previous_refresh,
+            response,
+            started,
+        )
     }
 
     async fn exchange(&self, cx: &Cx, deadline: Time, body: String) -> Result<Vec<u8>, OAuthError> {
@@ -1078,6 +1148,27 @@ struct TokenResponse {
     resource: Option<String>,
     #[serde(default, deserialize_with = "present")]
     error: Option<String>,
+}
+
+// OAuthClientConfiguration admits only the native public `none` profile.
+// Share its mandatory rotation rule between live and persisted renewal; the
+// initial authorization-code response may still omit a refresh token.
+fn admit_refresh_response(
+    configuration: &OAuthClientConfiguration,
+    scope_ceiling: &[String],
+    previous_refresh: &str,
+    bytes: &[u8],
+    started: Instant,
+) -> Result<OAuthCredentials, OAuthError> {
+    let replacement = admit_token_response(configuration, scope_ceiling, bytes, started)?;
+    let successor = replacement
+        .refresh_token
+        .as_deref()
+        .ok_or(OAuthError::InvalidTokenResponse)?;
+    if successor == previous_refresh {
+        return Err(OAuthError::InvalidTokenResponse);
+    }
+    Ok(replacement)
 }
 
 fn admit_token_response(
@@ -1690,21 +1781,32 @@ mod tests {
     }
 
     #[test]
-    fn refresh_without_rotation_retains_the_previous_token_only_after_valid_admission() {
+    fn refresh_admission_requires_a_distinct_public_client_successor() {
         let config = config();
         let client = OAuthClient::new(config.clone());
-        let mut grant = renewable_grant(&config);
-        let (_, previous) = client.prepare_refresh(&mut grant).unwrap();
-        let replacement = client
-            .admit_refresh(
-                &grant,
-                previous,
-                br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120}"#,
-                Instant::now(),
-            )
-            .unwrap();
-        assert_eq!(replacement.refresh_token.as_deref(), Some("refresh-one"));
-        assert_eq!(replacement.scopes, config.scopes);
+        for response in [
+            br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120}"#.as_slice(),
+            br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120,"refresh_token":"refresh-one"}"#,
+            br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120,"refresh_token":""}"#,
+            br#"{"access_token":"access-two","token_type":"Bearer","expires_in":120,"refresh_token":null}"#,
+        ] {
+            let mut grant = renewable_grant(&config);
+            let (_, previous) = client.prepare_refresh(&mut grant).unwrap();
+            assert_eq!(
+                client.admit_refresh(&grant, previous, response, Instant::now()).err(),
+                Some(OAuthError::InvalidTokenResponse)
+            );
+            assert!(!grant.has_refresh_token());
+        }
+        // Initial authorization remains allowed to issue a nonrenewable grant.
+        let initial = admit_token_response(
+            &config,
+            &config.scopes,
+            br#"{"access_token":"access-only","token_type":"Bearer","expires_in":120}"#,
+            Instant::now(),
+        )
+        .unwrap();
+        assert!(!initial.has_refresh_token());
     }
 
     #[test]
@@ -1733,6 +1835,13 @@ mod tests {
             );
             assert_eq!(grant.expires_at, expiry_before);
         }
+        grant.access.revoke();
+        assert_eq!(
+            OAuthClient::new(config).prepare_refresh(&mut grant).err(),
+            Some(OAuthError::RefreshUnavailable)
+        );
+        assert_eq!(grant.refresh_token.as_deref(), Some("refresh-one"));
+        assert_eq!(grant.expires_at, expiry_before);
     }
 
     #[test]
@@ -1742,8 +1851,9 @@ mod tests {
         let mut grant = renewable_grant(&config);
         let access_before = grant.access.authorization_for_target(&config.resource);
         let expiry_before = grant.expires_at;
-        // The transport owns the body and previous token after this point.
-        // Losing that future has the same ownership outcome as a lost reply.
+        // Preparation transfers refresh bytes. The public driver immediately
+        // adds access quarantine before its first await; this helper-level
+        // check proves the consumed refresh token alone cannot be restored.
         drop(client.prepare_refresh(&mut grant).unwrap());
         assert_eq!(
             client.prepare_refresh(&mut grant).err(),
@@ -1992,6 +2102,149 @@ mod tests {
     }
 
     #[test]
+    fn native_https_public_refresh_requires_rotation_and_quarantines_old_access_on_failure() {
+        for successor in [Some("refresh-two"), Some("refresh-one"), None, Some("")] {
+            asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let mut credentials = renewable_grant(&configuration);
+                let original = credentials.bearer_credential().clone();
+                let expiry_before = credentials.expires_at();
+                let acceptor = test_acceptor();
+                let server = within(&cx, deadline, async {
+                    let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor.accept(socket).await.map_err(|_| OAuthError::TransportFailed)?;
+                    let (head, form) = read_token_request(&mut tls).await?;
+                    assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                    assert!(!head.to_ascii_lowercase().contains("authorization:"));
+                    assert_eq!(form["grant_type"], "refresh_token");
+                    assert_eq!(form["refresh_token"], "refresh-one");
+                    assert_eq!(form["resource"], configuration.resource.as_str());
+                    let mut body = serde_json::json!({
+                        "access_token": "access-two", "token_type": "Bearer",
+                        "expires_in": 120, "scope": "tools:read"
+                    });
+                    if let Some(successor) = successor {
+                        body["refresh_token"] = serde_json::json!(successor);
+                    }
+                    let body = serde_json::to_string(&body).unwrap();
+                    let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    tls.write_all(reply.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
+                    tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                    Ok(())
+                });
+                let (server, result) = Box::pin(pair(server, client.refresh(&cx, &mut credentials))).await;
+                assert_eq!(server, Ok(()));
+                if successor == Some("refresh-two") {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(credentials.refresh_token.as_deref(), Some("refresh-two"));
+                    assert_eq!(credentials.scopes(), ["tools:read"]);
+                    assert_eq!(credentials.access.authorization_for_target(&configuration.resource).as_deref(), Some("Bearer access-two"));
+                    assert!(!original.is_revoked());
+                    assert_eq!(original.expires_at(), Some(expiry_before));
+                    assert_eq!(original.authorization_for_target(&configuration.resource).as_deref(), Some("Bearer access-one"));
+                } else {
+                    assert_eq!(result, Err(OAuthError::InvalidTokenResponse));
+                    assert!(original.is_revoked());
+                    assert!(original.authorization_for_target(&configuration.resource).is_none());
+                    assert!(credentials.access.authorization_for_target(&configuration.resource).is_none());
+                    assert_eq!(credentials.expires_at(), expiry_before);
+                    assert!(!credentials.has_refresh_token());
+                    assert_eq!(client.refresh(&cx, &mut credentials).await, Err(OAuthError::RefreshUnavailable));
+                }
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(listener.poll_accept(&mut task).is_pending(), "rotation failure cannot replay the old refresh token");
+            });
+        }
+    }
+
+    #[test]
+    fn native_public_refresh_refuses_pre_revoked_access_before_network_or_custody_transfer() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint =
+                    url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let mut credentials = renewable_grant(&configuration);
+                let expiry_before = credentials.expires_at();
+                credentials.bearer_credential().clone().revoke();
+                assert_eq!(
+                    client.refresh(&cx, &mut credentials).await,
+                    Err(OAuthError::RefreshUnavailable)
+                );
+                assert_eq!(credentials.refresh_token.as_deref(), Some("refresh-one"));
+                assert_eq!(credentials.expires_at(), expiry_before);
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(listener.poll_accept(&mut task).is_pending());
+            });
+    }
+
+    #[test]
+    fn native_public_refresh_revocation_wakes_a_quiet_exchange_and_retires_its_custody() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let cx = Cx::current().unwrap();
+                let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint =
+                    url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let mut credentials = renewable_grant(&configuration);
+                let original = credentials.bearer_credential().clone();
+                let acceptor = test_acceptor();
+                let server = within(&cx, deadline, async {
+                    let (socket, _) = listener
+                        .accept()
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor
+                        .accept(socket)
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    let (_, form) = read_token_request(&mut tls).await?;
+                    assert_eq!(form["refresh_token"], "refresh-one");
+                    original.revoke();
+                    // No response bytes or timer activity drive this wakeup. The
+                    // abandoned native exchange must release its owned socket.
+                    let mut byte = [0];
+                    assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
+                    Ok(())
+                });
+                let (server, result) =
+                    Box::pin(pair(server, client.refresh(&cx, &mut credentials))).await;
+                assert_eq!(server, Ok(()));
+                assert_eq!(result, Err(OAuthError::RefreshUnavailable));
+                assert!(original.is_revoked());
+                assert!(!credentials.has_refresh_token());
+                assert!(
+                    credentials
+                        .access
+                        .authorization_for_target(&configuration.resource)
+                        .is_none()
+                );
+                assert_eq!(
+                    client.refresh(&cx, &mut credentials).await,
+                    Err(OAuthError::RefreshUnavailable)
+                );
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(listener.poll_accept(&mut task).is_pending());
+            });
+    }
+
+    #[test]
     fn lost_https_refresh_reply_and_redirect_never_replay_a_consumed_token() {
         for redirect in [false, true] {
             asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
@@ -2002,7 +2255,8 @@ mod tests {
                 configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
                 let client = OAuthClient::new(configuration.clone());
                 let mut credentials = renewable_grant(&configuration);
-                let before = credentials.access.authorization_for_target(&configuration.resource);
+                let original = credentials.bearer_credential().clone();
+                assert!(original.authorization_for_target(&configuration.resource).is_some());
                 let expires_before = credentials.expires_at;
                 let acceptor = test_acceptor();
                 let server = within(&cx, deadline, async {
@@ -2021,7 +2275,9 @@ mod tests {
                 let (server, result) = pair(server, client.refresh(&cx, &mut credentials)).await;
                 assert_eq!(server, Ok(()));
                 assert_eq!(result, Err(if redirect { OAuthError::TokenEndpointRejected } else { OAuthError::TransportFailed }));
-                assert_eq!(credentials.access.authorization_for_target(&configuration.resource), before);
+                assert!(original.is_revoked());
+                assert!(original.authorization_for_target(&configuration.resource).is_none());
+                assert!(credentials.access.authorization_for_target(&configuration.resource).is_none());
                 assert_eq!(credentials.expires_at, expires_before);
                 assert!(!credentials.has_refresh_token());
                 assert_eq!(client.refresh(&cx, &mut credentials).await, Err(OAuthError::RefreshUnavailable));
