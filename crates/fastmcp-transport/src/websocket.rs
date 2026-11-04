@@ -8388,12 +8388,10 @@ mod tests {
                 assert_eq!(req.id, Some(RequestId::Number(expected_id)));
 
                 // Send response
-                let response = JsonRpcResponse {
-                    jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                    result: Some(serde_json::json!({"ok": true})),
-                    error: None,
-                    id: req.id,
-                };
+                let response = JsonRpcResponse::success(
+                    req.id.expect("request has an ID"),
+                    serde_json::json!({"ok": true}),
+                );
                 transport.send_response(&cx, &response).unwrap();
             }
         }
@@ -8606,12 +8604,10 @@ mod tests {
                 assert_eq!(req.method, "initialize");
 
                 // Send response (unmasked)
-                let response = JsonRpcResponse {
-                    jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                    result: Some(serde_json::json!({"capabilities": {}})),
-                    error: None,
-                    id: Some(RequestId::Number(1)),
-                };
+                let response = JsonRpcResponse::success(
+                    RequestId::Number(1),
+                    serde_json::json!({"capabilities": {}}),
+                );
                 transport.send_response(&cx, &response).unwrap();
             }
         }

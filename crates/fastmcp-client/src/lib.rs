@@ -49972,39 +49972,32 @@ exec sleep 30
         let valid = JsonRpcResponse::success(RequestId::Number(1), serde_json::Value::Null);
         assert!(validate_response_envelope(&valid).is_ok());
 
-        let wrong_version = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Owned("2.1".to_string()),
-            ..valid.clone()
-        };
+        let mut wrong_version = valid.clone();
+        wrong_version.jsonrpc = std::borrow::Cow::Owned("2.1".to_string());
         assert!(validate_response_envelope(&wrong_version).is_err());
 
-        let both = JsonRpcResponse {
-            error: Some(JsonRpcError {
-                code: (-32_603).into(),
-                message: "failure".to_string(),
-                data: None,
-            }),
-            ..valid.clone()
-        };
+        let mut both = valid.clone();
+        both.error = Some(JsonRpcError {
+            code: (-32_603).into(),
+            message: "failure".to_string(),
+            data: None,
+        });
         assert!(validate_response_envelope(&both).is_err());
 
-        let neither = JsonRpcResponse {
-            result: None,
-            error: None,
-            ..valid
-        };
+        let mut neither = valid;
+        neither.result = None;
+        neither.error = None;
         assert!(validate_response_envelope(&neither).is_err());
     }
 
     #[test]
     fn response_validation_diagnostics_do_not_echo_peer_values() {
         let version_canary = "PEER-VERSION-SECRET-CANARY\r\n";
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Owned(version_canary.to_string()),
-            result: Some(serde_json::Value::Null),
-            error: None,
-            id: Some(RequestId::String("PEER-ID-SECRET-CANARY\n".to_string())),
-        };
+        let mut response = JsonRpcResponse::success(
+            RequestId::String("PEER-ID-SECRET-CANARY\n".to_string()),
+            serde_json::Value::Null,
+        );
+        response.jsonrpc = std::borrow::Cow::Owned(version_canary.to_string());
 
         let envelope_error =
             validate_response_envelope(&response).expect_err("an invalid version must fail closed");
@@ -51980,12 +51973,8 @@ exec sleep 30
         let mut waiter = registry
             .register(RequestId::Number(7))
             .expect("register waiter");
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Owned("1.0".to_string()),
-            result: Some(serde_json::Value::Null),
-            error: None,
-            id: Some(RequestId::Number(7)),
-        };
+        let mut response = JsonRpcResponse::success(RequestId::Number(7), serde_json::Value::Null);
+        response.jsonrpc = std::borrow::Cow::Owned("1.0".to_string());
 
         assert_eq!(registry.route(response), ResponseRoute::InvalidEnvelope);
         let error = waiter

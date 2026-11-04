@@ -1615,12 +1615,8 @@ mod tests {
             Err(CodecError::Json(_))
         ));
 
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(RequestId::Number(1)),
-        };
+        let mut response = JsonRpcResponse::success(RequestId::Number(1), serde_json::Value::Null);
+        response.result = None;
         assert!(matches!(
             codec.encode_response(&response),
             Err(CodecError::Json(_))

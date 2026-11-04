@@ -3623,12 +3623,11 @@ mod tests {
     fn prewrite_codec_failure_does_not_close_stdio_transport() {
         let mut transport = StdioTransport::new(Cursor::new(Vec::new()), Vec::new());
         let cx = Cx::for_testing();
-        let invalid = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        };
+        let mut invalid = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::Value::Null,
+        );
+        invalid.result = None;
 
         assert!(matches!(
             transport.send_response_direct(&cx, &invalid),
@@ -4322,12 +4321,10 @@ mod tests {
             let mut transport = StdioTransport::new(reader, &mut output);
             let cx = Cx::for_testing();
 
-            let response = JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!({"ok": true})),
-                error: None,
-                id: Some(fastmcp_protocol::RequestId::Number(42)),
-            };
+            let response = JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(42),
+                serde_json::json!({"ok": true}),
+            );
             transport.send_response_direct(&cx, &response).unwrap();
         }
 
@@ -4346,12 +4343,10 @@ mod tests {
         let cx = Cx::for_testing();
         cx.set_cancel_requested(true);
 
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!(null)),
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        };
+        let response = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::Value::Null,
+        );
         let result = transport.send_response_direct(&cx, &response);
         assert!(matches!(result, Err(TransportError::Cancelled)));
     }
@@ -4365,12 +4360,10 @@ mod tests {
             let mut transport = StdioTransport::new(reader, &mut output);
             let cx = Cx::for_testing();
 
-            let response = JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!({"status": "done"})),
-                error: None,
-                id: Some(fastmcp_protocol::RequestId::Number(1)),
-            };
+            let response = JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(1),
+                serde_json::json!({"status": "done"}),
+            );
             transport
                 .send(&cx, &JsonRpcMessage::Response(response))
                 .unwrap();
@@ -4404,12 +4397,10 @@ mod tests {
             let cx = Cx::for_testing();
 
             let permit = transport.reserve_send(&cx).unwrap();
-            let response = JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!({"v": 1})),
-                error: None,
-                id: Some(fastmcp_protocol::RequestId::Number(1)),
-            };
+            let response = JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(1),
+                serde_json::json!({"v": 1}),
+            );
             permit.send_response(&response).unwrap();
         }
 

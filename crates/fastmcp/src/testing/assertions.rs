@@ -368,12 +368,7 @@ mod tests {
             message: "Method not found".to_string(),
             data: None,
         };
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(JSONRPC_VERSION),
-            id: Some(RequestId::Number(1)),
-            result: None,
-            error: Some(error),
-        };
+        let response = JsonRpcResponse::error(Some(RequestId::Number(1)), error);
         assert_json_rpc_valid(&JsonRpcMessage::Response(response.clone()));
         assert_json_rpc_error(&response, Some((-32601).into()));
     }
@@ -467,12 +462,7 @@ mod tests {
             message: "Invalid request".to_string(),
             data: None,
         };
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(JSONRPC_VERSION),
-            id: Some(RequestId::Number(1)),
-            result: None,
-            error: Some(error),
-        };
+        let response = JsonRpcResponse::error(Some(RequestId::Number(1)), error);
         // None code means we only check that it IS an error, not the code value
         assert_json_rpc_error(&response, None);
     }
@@ -534,12 +524,7 @@ mod tests {
             message: "Method not found".to_string(),
             data: None,
         };
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(JSONRPC_VERSION),
-            id: Some(RequestId::Number(1)),
-            result: None,
-            error: Some(error),
-        };
+        let response = JsonRpcResponse::error(Some(RequestId::Number(1)), error);
         // Error responses skip MCP-specific checks and return early
         assert_mcp_compliant("tools/list", &response);
     }

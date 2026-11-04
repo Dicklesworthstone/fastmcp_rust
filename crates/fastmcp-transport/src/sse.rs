@@ -45,7 +45,7 @@
 //! writer.write_endpoint("http://localhost:8080/mcp/messages")?;
 //!
 //! // Send JSON-RPC responses as message events
-//! let response = JsonRpcResponse { /* ... */ };
+//! let response = JsonRpcResponse::success(1_i64.into(), serde_json::json!({}));
 //! writer.write_response(&response)?;
 //! ```
 //!
@@ -2358,12 +2358,12 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
         assert_eq!(writer.inner().len(), 0);
         assert_eq!(writer.event_counter, 0);
 
-        let invalid = JsonRpcMessage::Response(JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        });
+        let mut invalid = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::Value::Null,
+        );
+        invalid.result = None;
+        let invalid = JsonRpcMessage::Response(invalid);
         assert!(matches!(
             writer.write_message(&cx, &invalid),
             Err(TransportError::Codec(CodecError::Json(_)))
@@ -2598,12 +2598,10 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
         let mut writer = SseWriter::new(write_buffer);
 
         let cx = Cx::for_testing();
-        let message = JsonRpcMessage::Response(JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({"status": "ok"})),
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        });
+        let message = JsonRpcMessage::Response(JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::json!({"status": "ok"}),
+        ));
 
         writer.write_message(&cx, &message).unwrap();
         let written = writer.into_inner();
@@ -2682,12 +2680,10 @@ event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"valid\",\"id\":2}\n\n";
 
         // 2. Send a few responses
         for i in 1..=3 {
-            let response = JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!({"count": i})),
-                error: None,
-                id: Some(fastmcp_protocol::RequestId::Number(i)),
-            };
+            let response = JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(i),
+                serde_json::json!({"count": i}),
+            );
             writer.write_response(&cx, &response).unwrap();
         }
 
@@ -2783,12 +2779,10 @@ data: {\"jsonrpc\":\"2.0\",\"method\":\"test\"}\n\
         }
 
         // Send a response (triggers endpoint event first)
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({"capabilities": {}})),
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        };
+        let response = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::json!({"capabilities": {}}),
+        );
         transport
             .send(&cx, &JsonRpcMessage::Response(response))
             .unwrap();
@@ -2943,12 +2937,10 @@ data: }\n\
 
         // Write three messages — IDs should be 1, 2, 3
         for _ in 0..3 {
-            let msg = JsonRpcMessage::Response(JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!(null)),
-                error: None,
-                id: Some(fastmcp_protocol::RequestId::Number(1)),
-            });
+            let msg = JsonRpcMessage::Response(JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(1),
+                serde_json::Value::Null,
+            ));
             writer.write_message(&cx, &msg).unwrap();
         }
 
@@ -3072,12 +3064,11 @@ event: endpoint\ndata: http://localhost/post\n\n";
         let mut transport =
             SseClientTransport::new(Cursor::new(Vec::<u8>::new()), Vec::<u8>::new());
         let cx = Cx::for_testing();
-        let invalid = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        };
+        let mut invalid = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::Value::Null,
+        );
+        invalid.result = None;
 
         assert!(matches!(
             transport.send(&cx, &JsonRpcMessage::Response(invalid)),

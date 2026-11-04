@@ -10484,12 +10484,8 @@ Content-Length: {}\r\n\
             assert_eq!(req.id, Some(RequestId::Number(1)));
 
             // Send response
-            let response = JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: Some(serde_json::json!({"tools": []})),
-                error: None,
-                id: Some(RequestId::Number(1)),
-            };
+            let response =
+                JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"tools": []}));
             transport
                 .send(&cx, &JsonRpcMessage::Response(response))
                 .unwrap();
@@ -10907,12 +10903,10 @@ Content-Length: {}\r\n\
         assert!(handler.parse_request(&request).is_ok());
 
         // Response content type is always application/json
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({})),
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        };
+        let response = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::json!({}),
+        );
         let http_response = handler.create_response(&response, None);
         assert_eq!(
             http_response.headers.get("content-type"),
@@ -11012,12 +11006,7 @@ Content-Length: {}\r\n\
         }
 
         // Send a response
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({})),
-            error: None,
-            id: Some(RequestId::Number(2)),
-        };
+        let response = JsonRpcResponse::success(RequestId::Number(2), serde_json::json!({}));
         transport
             .send(&cx, &JsonRpcMessage::Response(response))
             .unwrap();
@@ -12028,18 +12017,8 @@ Content-Length: {}\r\n\
         let mut transport = StreamableHttpTransport::new();
         let cx = Cx::for_testing();
 
-        let first = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({"seq": 1})),
-            error: None,
-            id: Some(RequestId::Number(1)),
-        };
-        let second = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({"seq": 2})),
-            error: None,
-            id: Some(RequestId::Number(2)),
-        };
+        let first = JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"seq": 1}));
+        let second = JsonRpcResponse::success(RequestId::Number(2), serde_json::json!({"seq": 2}));
 
         transport
             .send(&cx, &JsonRpcMessage::Response(first))
@@ -12080,18 +12059,9 @@ Content-Length: {}\r\n\
         let mut transport =
             StreamableHttpTransport::with_capacity(1).expect("capacity one is valid");
         let cx = Cx::for_testing();
-        let first = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({"ok": true})),
-            error: None,
-            id: Some(RequestId::Number(1)),
-        };
-        let second = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: Some(serde_json::json!({"ok": true})),
-            error: None,
-            id: Some(RequestId::Number(2)),
-        };
+        let first = JsonRpcResponse::success(RequestId::Number(1), serde_json::json!({"ok": true}));
+        let second =
+            JsonRpcResponse::success(RequestId::Number(2), serde_json::json!({"ok": true}));
 
         transport
             .send(&cx, &JsonRpcMessage::Response(first))
@@ -12148,12 +12118,11 @@ Content-Length: {}\r\n\
         ));
         assert_eq!(transport.pending_requests(), 0);
 
-        let invalid_response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(fastmcp_protocol::RequestId::Number(1)),
-        };
+        let mut invalid_response = JsonRpcResponse::success(
+            fastmcp_protocol::RequestId::Number(1),
+            serde_json::Value::Null,
+        );
+        invalid_response.result = None;
         assert!(matches!(
             transport.send(&cx, &JsonRpcMessage::Response(invalid_response)),
             Err(TransportError::Codec(CodecError::Json(_)))
@@ -12863,12 +12832,9 @@ Content-Length: {}\r\n\
         let mut transport = HttpTransport::new(reader, &mut output);
 
         // Send should respect cancellation
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: None,
-        };
+        let mut response = JsonRpcResponse::success(1_i64.into(), serde_json::Value::Null);
+        response.result = None;
+        response.id = None;
         let result = transport.send(&cx, &JsonRpcMessage::Response(response));
         assert!(matches!(result, Err(TransportError::Cancelled)));
 
@@ -12890,12 +12856,9 @@ Content-Length: {}\r\n\
         transport.close(&cx).unwrap();
 
         // Operations should fail after close
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: None,
-        };
+        let mut response = JsonRpcResponse::success(1_i64.into(), serde_json::Value::Null);
+        response.result = None;
+        response.id = None;
         let result = transport.send(&cx, &JsonRpcMessage::Response(response));
         assert!(matches!(result, Err(TransportError::Closed)));
     }

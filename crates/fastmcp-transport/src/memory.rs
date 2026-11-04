@@ -678,12 +678,8 @@ mod tests {
     fn memory_send_rejects_invalid_typed_message_before_queueing() {
         let (mut client, server) = MemoryTransportBuilder::new().max_message_size(1024).build();
         let cx = Cx::for_testing();
-        let invalid = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(RequestId::Number(1)),
-        };
+        let mut invalid = JsonRpcResponse::success(RequestId::Number(1), serde_json::Value::Null);
+        invalid.result = None;
 
         assert!(matches!(
             client.send(&cx, &JsonRpcMessage::Response(invalid)),

@@ -5537,12 +5537,8 @@ mod tests {
         let pr = PendingRequests::new();
         let (id, receiver) = pr.register_with_cancellation(None).unwrap();
         // A response with no id
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
-            id: None,
-            result: Some(serde_json::json!(null)),
-            error: None,
-        };
+        let mut response = JsonRpcResponse::success(id.clone(), serde_json::Value::Null);
+        response.id = None;
         assert!(!pr.route_response(&response));
         assert_eq!(pr.in_flight_len(), 1);
 
@@ -5557,12 +5553,7 @@ mod tests {
         let (id, receiver) = pr.register_with_cancellation(None).unwrap();
 
         // An explicit JSON null is a present and valid success result.
-        let response = JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed("2.0"),
-            id: Some(id),
-            result: Some(serde_json::Value::Null),
-            error: None,
-        };
+        let response = JsonRpcResponse::success(id, serde_json::Value::Null);
         assert!(pr.route_response(&response));
 
         let result = receive_pending(receiver).unwrap();
@@ -5588,12 +5579,10 @@ mod tests {
         for (result, error, version) in cases {
             let pr = PendingRequests::new();
             let (id, receiver) = pr.register_with_cancellation(None).unwrap();
-            let response = JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(version),
-                result,
-                error,
-                id: Some(id),
-            };
+            let mut response = JsonRpcResponse::success(id, serde_json::Value::Null);
+            response.jsonrpc = std::borrow::Cow::Borrowed(version);
+            response.result = result;
+            response.error = error;
 
             assert!(pr.route_response(&response));
             let error = receive_pending(receiver).unwrap_err();

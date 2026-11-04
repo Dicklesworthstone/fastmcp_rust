@@ -287,12 +287,10 @@ fn bench_transport_codec() {
         1,
     );
 
-    let response = fastmcp_protocol::JsonRpcResponse {
-        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-        result: Some(serde_json::json!({"content": [{"type": "text", "text": "hello"}]})),
-        error: None,
-        id: Some(fastmcp_protocol::RequestId::Number(1)),
-    };
+    let response = fastmcp_protocol::JsonRpcResponse::success(
+        fastmcp_protocol::RequestId::Number(1),
+        serde_json::json!({"content": [{"type": "text", "text": "hello"}]}),
+    );
 
     let codec = Codec::new();
 
@@ -321,12 +319,10 @@ fn bench_transport_codec() {
 
     // Large message
     let large_content = "x".repeat(10_000);
-    let large_response = fastmcp_protocol::JsonRpcResponse {
-        jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-        result: Some(serde_json::json!({"content": [{"type": "text", "text": large_content}]})),
-        error: None,
-        id: Some(fastmcp_protocol::RequestId::Number(1)),
-    };
+    let large_response = fastmcp_protocol::JsonRpcResponse::success(
+        fastmcp_protocol::RequestId::Number(1),
+        serde_json::json!({"content": [{"type": "text", "text": large_content}]}),
+    );
 
     benchmark("Encode large response (10KB)", 10_000, || {
         let _ = codec.encode_response(&large_response);

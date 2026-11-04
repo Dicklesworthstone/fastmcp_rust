@@ -449,6 +449,7 @@ pub fn decode_strict_jsonrpc_response(
         result,
         error: wire.error,
         id: wire.id,
+        retained_result: None,
     };
     response
         .validate()
@@ -1601,7 +1602,7 @@ struct JsonRpcResponseWire {
 }
 
 /// JSON-RPC 2.0 response.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct JsonRpcResponse {
     /// Protocol version (always "2.0").
     pub jsonrpc: Cow<'static, str>,
@@ -1611,6 +1612,33 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
     /// Request ID this is responding to.
     pub id: Option<RequestId>,
+    // Explicitly source-preserving construction binds both views to the same
+    // admitted document. Ordinary typed construction and ingress retain none.
+    retained_result: Option<std::sync::Arc<RetainedResponseResult>>,
+}
+
+struct RetainedResponseResult {
+    source: Box<RawValue>,
+    value: Value,
+}
+
+impl std::fmt::Debug for RetainedResponseResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Middleware may have redacted the public result since construction.
+        // Never expose its former contents through this private snapshot.
+        formatter
+            .debug_struct("RetainedResponseResult")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for JsonRpcResponse {
+    fn eq(&self, other: &Self) -> bool {
+        self.jsonrpc == other.jsonrpc
+            && self.result == other.result
+            && self.error == other.error
+            && self.id == other.id
+    }
 }
 
 impl Serialize for JsonRpcResponse {
@@ -1620,13 +1648,24 @@ impl Serialize for JsonRpcResponse {
     {
         self.validate().map_err(S::Error::custom)?;
 
-        JsonRpcResponseWire {
-            jsonrpc: self.jsonrpc.clone(),
-            result: self.result.clone(),
-            error: self.error.clone(),
-            id: self.id.clone(),
+        let mut members = serializer.serialize_map(Some(2 + usize::from(self.id.is_some())))?;
+        members.serialize_entry("jsonrpc", &self.jsonrpc)?;
+        if let Some(result) = &self.result {
+            if let Some(retained) = &self.retained_result
+                && result == &retained.value
+            {
+                members.serialize_entry("result", &retained.source)?;
+            } else {
+                members.serialize_entry("result", result)?;
+            }
         }
-        .serialize(serializer)
+        if let Some(error) = &self.error {
+            members.serialize_entry("error", error)?;
+        }
+        if let Some(id) = &self.id {
+            members.serialize_entry("id", id)?;
+        }
+        members.end()
     }
 }
 
@@ -1641,6 +1680,7 @@ impl<'de> Deserialize<'de> for JsonRpcResponse {
             result: wire.result,
             error: wire.error,
             id: wire.id,
+            retained_result: None,
         };
         response.validate().map_err(D::Error::custom)?;
         Ok(response)
@@ -1656,7 +1696,52 @@ impl JsonRpcResponse {
             result: Some(result),
             error: None,
             id: Some(id),
+            retained_result: None,
         }
+    }
+
+    /// Creates a success response retaining the exact admitted result value.
+    ///
+    /// Direct JSON serialization preserves member order, escapes and numeric
+    /// lexemes while the public `result` value remains unchanged. Mutating it
+    /// causes serialization to use the current value instead; envelope fields
+    /// always use their current values. Conversion through `serde_json::Value`
+    /// does not preserve source representation.
+    ///
+    /// `document_byte_limit` bounds the result document before decoding.
+    /// Transports must still enforce their complete encoded-message limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, duplicate-bearing or over-limit JSON,
+    /// or an invalid request ID.
+    pub fn success_with_raw_result(
+        id: RequestId,
+        result: String,
+        document_byte_limit: usize,
+    ) -> Result<Self, JsonRpcAdmissionError> {
+        admit_raw_json_document(
+            result.as_bytes(),
+            document_byte_limit,
+            RawJsonTopLevel::AnyValue,
+        )
+        .map_err(|failure| JsonRpcAdmissionError::Raw(failure.error()))?;
+        id.validate()
+            .map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        let value: Value =
+            serde_json::from_str(&result).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        let source =
+            RawValue::from_string(result).map_err(|_| JsonRpcAdmissionError::InvalidEnvelope)?;
+        Ok(Self {
+            jsonrpc: Cow::Borrowed(JSONRPC_VERSION),
+            result: Some(value.clone()),
+            error: None,
+            id: Some(id),
+            retained_result: Some(std::sync::Arc::new(RetainedResponseResult {
+                source,
+                value,
+            })),
+        })
     }
 
     /// Creates an error response.
@@ -1667,6 +1752,7 @@ impl JsonRpcResponse {
             result: None,
             error: Some(error),
             id,
+            retained_result: None,
         }
     }
 
@@ -2791,6 +2877,200 @@ mod tests {
     }
 
     #[test]
+    fn response_raw_result_preserves_source_and_current_envelope() {
+        const SOURCE: &str = r#"{"z":1.20e+4,"nested":{"escaped\/key":"quoted \u0022 value","negativeZero":-0,"integer":123456789012345678901234567890},"a":null}"#;
+        let original = JsonRpcResponse::success_with_raw_result(
+            RequestId::Number(1),
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .expect("bounded raw result is admitted");
+        let typed =
+            JsonRpcResponse::success(RequestId::Number(1), serde_json::from_str(SOURCE).unwrap());
+        assert_eq!(original, typed, "source retention does not change equality");
+        assert_eq!(original, original.clone());
+
+        let mut changed = original.clone();
+        changed.id = Some(RequestId::String("current-owner".to_owned()));
+        for response in [&original, &original.clone(), &changed, &changed.clone()] {
+            let encoded = serde_json::to_string(response).unwrap();
+            let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(raw["result"].get(), SOURCE);
+            let envelope: Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(envelope["jsonrpc"], JSONRPC_VERSION);
+            assert_eq!(envelope["id"], serde_json::to_value(&response.id).unwrap());
+            assert_eq!(envelope.get("result"), response.result.as_ref());
+            assert!(!envelope.as_object().unwrap().contains_key("error"));
+        }
+        assert_eq!(original.id, Some(RequestId::Number(1)));
+        changed.jsonrpc = Cow::Borrowed("1.0");
+        assert!(serde_json::to_string(&changed).is_err());
+        assert!(serde_json::to_string(&original).is_ok());
+    }
+
+    #[test]
+    fn response_raw_result_accepts_null_and_other_json_values() {
+        for source in ["null", "true", "-0", r#""\u0061\/b""#, "[1.20e+4, null]"] {
+            let response = JsonRpcResponse::success_with_raw_result(
+                RequestId::Number(1),
+                source.to_owned(),
+                source.len(),
+            )
+            .expect("a success result may be any JSON value");
+            assert_eq!(response.result, Some(serde_json::from_str(source).unwrap()));
+            assert!(response.error.is_none());
+            let encoded = serde_json::to_string(&response).unwrap();
+            let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(raw["result"].get(), source);
+            assert_eq!(
+                serde_json::from_str::<JsonRpcResponse>(&encoded).unwrap(),
+                response
+            );
+        }
+    }
+
+    #[test]
+    fn response_raw_result_mutations_never_emit_stale_source() {
+        const SENTINEL: &str = "retained-private-result-sentinel";
+        const SOURCE: &str = r#"{"z":1.20e+4,"nested":{"token":"retained-private-result-sentinel","items":[1,2]},"scalar":"original","_meta":{"owner":"original"}}"#;
+        let original = JsonRpcResponse::success_with_raw_result(
+            RequestId::Number(1),
+            SOURCE.to_owned(),
+            SOURCE.len(),
+        )
+        .unwrap();
+        let mut nested = original.result.clone().unwrap();
+        nested["nested"]["items"][0] = json!(99);
+        let mut scalar = original.result.clone().unwrap();
+        scalar["scalar"] = json!("changed");
+        let mut metadata = original.result.clone().unwrap();
+        metadata["_meta"]["owner"] = json!("current-owner");
+        for (name, result) in [
+            ("nested", nested),
+            ("scalar", scalar),
+            ("metadata", metadata),
+            ("replacement", json!({"redacted": true})),
+            ("null", Value::Null),
+        ] {
+            let mut changed = original.clone();
+            changed.result = Some(result.clone());
+            for response in [&changed, &changed.clone()] {
+                let encoded = serde_json::to_string(response).unwrap();
+                let envelope: Value = serde_json::from_str(&encoded).unwrap();
+                assert_eq!(envelope.get("result"), Some(&result), "{name}");
+                let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+                    serde_json::from_str(&encoded).unwrap();
+                assert_eq!(
+                    raw["result"].get(),
+                    serde_json::to_string(&result).unwrap(),
+                    "{name}"
+                );
+                assert_ne!(raw["result"].get(), SOURCE);
+                if !result.to_string().contains(SENTINEL) {
+                    assert!(!format!("{response:?}").contains(SENTINEL));
+                    assert!(!encoded.contains(SENTINEL));
+                }
+            }
+        }
+
+        let mut failure = original.clone();
+        failure.result = None;
+        failure.error = Some(JsonRpcError {
+            code: (-32_603).into(),
+            message: "redacted failure".to_owned(),
+            data: None,
+        });
+        failure.id = None;
+        for response in [&failure, &failure.clone()] {
+            let encoded = serde_json::to_string(response).unwrap();
+            let envelope: Value = serde_json::from_str(&encoded).unwrap();
+            assert!(envelope.get("result").is_none());
+            assert!(envelope.get("error").is_some());
+            assert!(envelope.get("id").is_none());
+            assert!(!format!("{response:?}").contains(SENTINEL));
+            assert!(!encoded.contains(SENTINEL));
+        }
+        let mut invalid = original.clone();
+        invalid.result = None;
+        assert!(serde_json::to_string(&invalid).is_err());
+        invalid = original.clone();
+        invalid.error = failure.error;
+        assert!(serde_json::to_string(&invalid).is_err());
+        let raw: std::collections::BTreeMap<String, Box<RawValue>> =
+            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        assert_eq!(raw["result"].get(), SOURCE);
+    }
+
+    #[test]
+    fn response_raw_result_rejects_invalid_duplicate_and_oversized_source() {
+        const VALID: &str = r#"{"payload":{"value":1}}"#;
+        const MALFORMED: &str = r#"{"payload":{"value":1,}}"#;
+        const DUPLICATE: &str = r#"{"payload":{"value":1,"\u0076alue":2}}"#;
+        let original = JsonRpcResponse::success_with_raw_result(
+            RequestId::Number(1),
+            VALID.to_owned(),
+            VALID.len(),
+        )
+        .unwrap();
+        let original_wire = serde_json::to_string(&original).unwrap();
+        for (source, limit, expected) in [
+            (
+                MALFORMED,
+                MALFORMED.len(),
+                RawJsonAdmissionError::InvalidSyntax,
+            ),
+            (
+                DUPLICATE,
+                DUPLICATE.len(),
+                RawJsonAdmissionError::DuplicateObjectMember,
+            ),
+            (
+                VALID,
+                VALID.len() - 1,
+                RawJsonAdmissionError::DocumentTooLarge,
+            ),
+        ] {
+            assert!(matches!(
+                JsonRpcResponse::success_with_raw_result(
+                    RequestId::Number(1), source.to_owned(), limit,
+                ),
+                Err(JsonRpcAdmissionError::Raw(error)) if error == expected
+            ));
+            assert_eq!(serde_json::to_string(&original).unwrap(), original_wire);
+            let sibling = JsonRpcResponse::success_with_raw_result(
+                RequestId::Number(1),
+                VALID.to_owned(),
+                VALID.len(),
+            )
+            .expect("valid sibling remains admissible at its exact byte bound");
+            assert_eq!(serde_json::to_string(&sibling).unwrap(), original_wire);
+        }
+        for id in [
+            RequestId::Integer("1.5".to_owned()),
+            RequestId::String("x".repeat(256)),
+        ] {
+            assert!(matches!(
+                JsonRpcResponse::success_with_raw_result(id, VALID.to_owned(), VALID.len()),
+                Err(JsonRpcAdmissionError::InvalidEnvelope)
+            ));
+        }
+    }
+
+    #[test]
+    fn response_ingress_keeps_raw_result_in_explicit_admission_sidecar() {
+        let source = r#"{"z":1.20e+4,"a":"\u0061"}"#;
+        let encoded = format!(r#"{{"jsonrpc":"2.0","result":{source},"id":1}}"#);
+        let typed: JsonRpcResponse = serde_json::from_str(&encoded).unwrap();
+        assert!(typed.retained_result.is_none());
+        let admission = decode_strict_jsonrpc_response(encoded.as_bytes(), encoded.len()).unwrap();
+        assert_eq!(admission.raw_result(), Some(source));
+        assert!(admission.response().retained_result.is_none());
+        assert_eq!(admission.response(), &typed);
+    }
+
+    #[test]
     fn response_rejects_both_or_neither_outcome_members() {
         for raw in [
             r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32603,"message":"failure"},"id":1}"#,
@@ -2810,6 +3090,7 @@ mod tests {
                 data: None,
             }),
             id: Some(RequestId::Number(1)),
+            retained_result: None,
         };
         assert!(serde_json::to_value(both).is_err());
 
@@ -2818,6 +3099,7 @@ mod tests {
             result: None,
             error: None,
             id: Some(RequestId::Number(1)),
+            retained_result: None,
         };
         assert!(serde_json::to_value(neither).is_err());
     }
@@ -2839,6 +3121,7 @@ mod tests {
             result: Some(Value::Null),
             error: None,
             id: None,
+            retained_result: None,
         };
 
         assert_eq!(

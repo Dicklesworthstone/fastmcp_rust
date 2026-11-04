@@ -612,12 +612,9 @@ mod tests {
         let (mut client, server) = create_memory_transport_pair_with_capacity(1);
         let cx = Cx::for_testing();
         client.send(&cx, &request(1)).unwrap();
-        let invalid = JsonRpcMessage::Response(JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(RequestId::Number(2)),
-        });
+        let mut invalid = JsonRpcResponse::success(RequestId::Number(2), serde_json::Value::Null);
+        invalid.result = None;
+        let invalid = JsonRpcMessage::Response(invalid);
         assert!(matches!(
             ready(client.send_async(&cx, &invalid)),
             Err(TransportError::Codec(_))
@@ -789,12 +786,9 @@ mod tests {
     fn invalid_reserved_message_releases_slot_and_preserves_endpoint() {
         let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
         let cx = Cx::for_testing();
-        let invalid = JsonRpcMessage::Response(JsonRpcResponse {
-            jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-            result: None,
-            error: None,
-            id: Some(RequestId::Number(1)),
-        });
+        let mut invalid = JsonRpcResponse::success(RequestId::Number(1), serde_json::Value::Null);
+        invalid.result = None;
+        let invalid = JsonRpcMessage::Response(invalid);
         let permit = ready(client.reserve_send_async(&cx)).unwrap();
         assert!(matches!(
             permit.send(&invalid),
@@ -919,12 +913,10 @@ mod tests {
             let (mut client, mut server) = create_memory_transport_pair_with_capacity(1);
             let live = Cx::for_testing();
             client.send(&live, &request(81)).unwrap();
-            let invalid = JsonRpcMessage::Response(JsonRpcResponse {
-                jsonrpc: std::borrow::Cow::Borrowed(fastmcp_protocol::JSONRPC_VERSION),
-                result: None,
-                error: None,
-                id: Some(RequestId::Number(82)),
-            });
+            let mut invalid =
+                JsonRpcResponse::success(RequestId::Number(82), serde_json::Value::Null);
+            invalid.result = None;
+            let invalid = JsonRpcMessage::Response(invalid);
             assert!(matches!(
                 ready(client.send_async(&stopped, &invalid)),
                 Err(TransportError::Cancelled)
