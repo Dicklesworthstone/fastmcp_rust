@@ -1810,13 +1810,15 @@ pub trait ProxyBackend: Send {
     }
 
     /// Polls a Tasks control and drives at most one bounded ingress turn.
+    /// The returned JSON source has passed method and task-ID admission and
+    /// retains the completed result's original representation.
     #[cfg(feature = "tasks")]
     #[doc(hidden)]
     fn poll_final_stdio_task_control(
         &mut self,
         _ctx: &McpContext,
         _request: &mut StdioFinalTaskExecution,
-    ) -> McpResult<Option<serde_json::Value>> {
+    ) -> McpResult<Option<String>> {
         Err(McpError::internal_error(
             "Backend has no stdio Tasks control",
         ))
@@ -2982,9 +2984,9 @@ impl ProxyBackend for Client {
         &mut self,
         ctx: &McpContext,
         request: &mut StdioFinalTaskExecution,
-    ) -> McpResult<Option<serde_json::Value>> {
+    ) -> McpResult<Option<String>> {
         let result =
-            self.try_take_yielding_final_task_response(request, ctx.ensure_live().is_err())?;
+            self.try_take_yielding_final_task_source(request, ctx.ensure_live().is_err())?;
         relay_upstream_catalog_resource_updates(ctx, self)?;
         relay_upstream_log_notifications(ctx, self.take_final_server_notifications());
         if result.is_none() {
@@ -11484,11 +11486,11 @@ impl ProxyClient {
             return Ok(None);
         };
         loop {
-            if let Some(result) = self
+            if let Some(source) = self
                 .with_backend(|backend| backend.poll_final_stdio_task_control(ctx, &mut request))?
             {
                 ctx.ensure_live()?;
-                return serde_json::from_value(result).map(Some).map_err(|_| {
+                return serde_json::from_str(&source).map(Some).map_err(|_| {
                     McpError::internal_error(
                         "Admitted stdio Tasks result has the wrong operation type",
                     )
@@ -14393,6 +14395,120 @@ IFS= read -r end
     #[test]
     fn proxy_stdio_task_controls_mcp_deadline_planted_negative() {
         proxy_stdio_task_controls_probe(true, true);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    fn proxy_stdio_completed_task_source_probe(wrong_task_id: bool) {
+        const NESTED_RESULT: &str = r#"{"z-first":{"escaped\/key":"quoted \u0022 value","array":[null,true,false]},"content":[],"x-number":123456789012345678901234567890,"x-ratio":1.2300e+40,"taskId":"inert-result-member","a-last":[]}"#;
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap();
+        let subject = format!(
+            "stdio-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let initial = final_task_relay_result_with_ttl(&subject, None).task;
+        let mut completed_base = initial.base().clone();
+        completed_base.status = fastmcp_protocol::FinalTaskStatus::Completed;
+        if wrong_task_id {
+            completed_base.task_id =
+                fastmcp_protocol::FinalTaskId::parse(format!("{subject}-foreign")).unwrap();
+        }
+        let base = serde_json::to_string(&completed_base).unwrap();
+        let completed_source = format!(
+            r#"{{"resultType":"complete",{},"result":{NESTED_RESULT}}}"#,
+            &base[1..base.len() - 1],
+        );
+        let mut discovery: serde_json::Value =
+            serde_json::from_str(&modern_discovery_response_line(&subject, &["2026-07-28"]))
+                .unwrap();
+        discovery["result"]["capabilities"]["extensions"] =
+            serde_json::json!({fastmcp_protocol::TASKS_EXTENSION: {}});
+        let script = format!(
+            r#"
+IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+IFS= read -r control || exit 91
+case "$control" in *'"method":"tasks/get"'*'{subject}'*'"id":2'*) ;; *) exit 92 ;; esac
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{completed_source}}}'
+IFS= read -r end
+"#
+        );
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::default());
+        let mut client = runtime
+            .block_on(
+                fastmcp_client::ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", &script]),
+            )
+            .unwrap();
+        client
+            .set_request_timeout_policy(
+                RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(4)).unwrap(),
+            )
+            .unwrap();
+        let proxy = ProxyClient::from_client(client).unwrap();
+        let relay = proxy.final_tasks_relay().unwrap().unwrap();
+        let context = relay_test_context(cx.clone(), 898);
+        let handle = issue_relay_test_task(&relay, &context, initial.clone())
+            .task
+            .base()
+            .task_id
+            .clone();
+        let before = proxy.final_task_registry_snapshot_for_test().unwrap();
+        let outcome = runtime.block_on(invoke_stdio_task_control(
+            &relay,
+            &context,
+            "tasks/get",
+            handle.as_str(),
+        ));
+        if wrong_task_id {
+            assert_eq!(outcome.unwrap_err().code, McpErrorCode::InvalidRequest);
+            assert_eq!(
+                proxy.final_task_registry_snapshot_for_test().unwrap(),
+                before,
+                "a reply for another task cannot change the retained owned snapshot"
+            );
+        } else {
+            let result = outcome.unwrap();
+            assert_eq!(result["taskId"], handle.as_str());
+            assert_eq!(result["status"], "completed");
+            let retained = relay.known_task(&context, &handle).unwrap();
+            assert_eq!(retained.base().task_id, initial.base().task_id);
+            let encoded = serde_json::to_string(&retained).unwrap();
+            let members: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                members["result"].get(),
+                NESTED_RESULT,
+                "stdio task reconciliation must preserve the admitted completed payload"
+            );
+            assert_eq!(
+                proxy.final_task_registry_snapshot_for_test().unwrap()["pendingCreations"],
+                0,
+            );
+        }
+        assert!(!cx.is_cancel_requested());
+        drop(relay);
+        drop(proxy);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_completed_task_preserves_source_through_reconciliation() {
+        proxy_stdio_completed_task_source_probe(false);
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn proxy_stdio_completed_task_rejects_changed_identity_without_state_mutation() {
+        proxy_stdio_completed_task_source_probe(true);
     }
 
     /// Native HTTP plus the shipped handler; the peer supplies protocol

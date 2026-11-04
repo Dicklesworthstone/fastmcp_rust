@@ -19837,37 +19837,16 @@ impl Client {
         })
     }
 
-    /// Polls one Tasks control using its exact admitted result source.
-    /// Controls remain cancellation-first, including when a reply is ready.
+    /// Polls one Tasks control and returns its exact admitted result source.
+    ///
+    /// The response is validated against the committed method and task ID
+    /// before release. Callers must decode this source directly: converting
+    /// through `serde_json::Value` would rewrite completed-result member order,
+    /// escape spellings and numeric lexemes. Controls remain cancellation-first,
+    /// including when a reply is ready.
     #[cfg(feature = "tasks")]
     #[doc(hidden)]
-    pub fn try_take_yielding_final_task_response(
-        &mut self,
-        request: &mut StdioFinalTaskExecution,
-        cancelled: bool,
-    ) -> McpResult<Option<serde_json::Value>> {
-        self.try_take_yielding_final_task_source(request, cancelled)?
-            .map(|source| {
-                let result = match request.method {
-                    TASK_GET => serde_json::from_str::<FinalGetTaskResult>(&source)
-                        .and_then(serde_json::to_value),
-                    TASK_UPDATE => serde_json::from_str::<FinalUpdateTaskResult>(&source)
-                        .and_then(serde_json::to_value),
-                    TASK_CANCEL => serde_json::from_str::<FinalCancelTaskResult>(&source)
-                        .and_then(serde_json::to_value),
-                    _ => unreachable!("the source was validated for this Tasks method"),
-                };
-                result.map_err(|_| {
-                    self.terminate_connection(McpError::invalid_request(
-                        "Final Tasks control lost its validated result source",
-                    ))
-                })
-            })
-            .transpose()
-    }
-
-    #[cfg(feature = "tasks")]
-    fn try_take_yielding_final_task_source(
+    pub fn try_take_yielding_final_task_source(
         &mut self,
         request: &mut StdioFinalTaskExecution,
         cancelled: bool,
@@ -56314,13 +56293,14 @@ IFS= read -r end
             .unwrap();
         let result = loop {
             if let Some(result) = client
-                .try_take_yielding_final_task_response(&mut request, false)
+                .try_take_yielding_final_task_source(&mut request, false)
                 .unwrap()
             {
                 break result;
             }
             client.drive_yielding_stdio_slice().unwrap();
         };
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(result["_meta"]["request"]["id"], before);
         assert_eq!(result["_meta"]["request"]["method"], TASK_UPDATE);
         assert_eq!(
@@ -56751,14 +56731,14 @@ IFS= read -r end
                         .unwrap();
                     assert_eq!(
                         client
-                            .try_take_yielding_final_task_response(&mut request, true)
+                            .try_take_yielding_final_task_source(&mut request, true)
                             .unwrap_err()
                             .code,
                         McpErrorCode::RequestCancelled
                     );
                     assert_eq!(
                         client
-                            .try_take_yielding_final_task_response(&mut request, false)
+                            .try_take_yielding_final_task_source(&mut request, false)
                             .unwrap_err()
                             .code,
                         McpErrorCode::InvalidRequest,
@@ -56769,7 +56749,7 @@ IFS= read -r end
                     continue;
                 }
                 let observed = loop {
-                    match client.try_take_yielding_final_task_response(&mut request, false) {
+                    match client.try_take_yielding_final_task_source(&mut request, false) {
                         Ok(None) => {
                             if let Err(error) = client.drive_yielding_stdio_slice() {
                                 break Err(error);
@@ -56787,7 +56767,7 @@ IFS= read -r end
                         "an ordinary RPC error preserves the connection"
                     );
                 } else if invalid == 0 {
-                    assert_eq!(observed.unwrap().unwrap(), result);
+                    assert_eq!(observed.unwrap().unwrap(), source);
                     assert!(client.is_initialized());
                 } else {
                     let error = observed.unwrap_err();
