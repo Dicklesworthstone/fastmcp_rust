@@ -6098,7 +6098,7 @@ impl ProxyFinalTaskRelay {
         self: &Arc<Self>,
         ctx: &McpContext,
         parameters: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
+    ) -> McpResult<FinalGetTaskResult> {
         self.ensure_modern_route()?;
         let parameters = serde_json::from_value::<FinalGetTaskParams>(parameters)
             .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
@@ -6122,9 +6122,7 @@ impl ProxyFinalTaskRelay {
             )
             .await?;
         set_relayed_task_id(&mut result.task, parameters.task_id);
-        serde_json::to_value(result).map_err(|_| {
-            McpError::internal_error("Proxy final tasks/get response serialization failed")
-        })
+        Ok(result)
     }
 
     pub(crate) async fn dispatch_update(
@@ -14144,7 +14142,10 @@ mod tests {
             }
         });
         match method {
-            "tasks/get" => relay.dispatch_get(ctx, parameters).await,
+            "tasks/get" => relay
+                .dispatch_get(ctx, parameters)
+                .await
+                .map(|result| serde_json::to_value(result).unwrap()),
             "tasks/cancel" => relay.dispatch_cancel(ctx, parameters).await,
             "tasks/update" => {
                 parameters["inputResponses"] = serde_json::json!({
@@ -14461,23 +14462,70 @@ IFS= read -r end
             .task_id
             .clone();
         let before = proxy.final_task_registry_snapshot_for_test().unwrap();
-        let outcome = runtime.block_on(invoke_stdio_task_control(
-            &relay,
-            &context,
+        let server = crate::ServerBuilder::new("stdio-completed-task-source", "1.0.0")
+            .auth_provider(RelayTestAuthProvider)
+            .proxy(
+                proxy.clone(),
+                ProxyCatalog {
+                    tool_catalog_era: Some(ProtocolEra::Modern2026),
+                    ..ProxyCatalog::default()
+                },
+            )
+            .unwrap()
+            .build();
+        let request = fastmcp_protocol::JsonRpcRequest::new(
             "tasks/get",
-            handle.as_str(),
-        ));
+            Some(serde_json::json!({
+                "taskId": handle,
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {fastmcp_protocol::TASKS_EXTENSION: {}}
+                    }
+                }
+            })),
+            898_i64,
+        );
+        let inbound = crate::InboundRequestContext::new(
+            cx.clone(),
+            898,
+            crate::InboundRequestTransport::Stdio,
+        );
+        let outcome = runtime
+            .block_on(server.dispatch_stateless(&inbound, &request))
+            .expect("public Tasks request must receive a response");
+        let encoded = fastmcp_transport::Codec::new()
+            .encode_ndjson_response(&outcome)
+            .expect("public response must encode as one downstream stdio frame");
+        assert!(
+            !String::from_utf8_lossy(&encoded).contains(&subject),
+            "upstream task identity must not escape the downstream handle mapping"
+        );
         if wrong_task_id {
-            assert_eq!(outcome.unwrap_err().code, McpErrorCode::InvalidRequest);
+            assert!(outcome.result.is_none());
+            assert_eq!(
+                outcome.error.unwrap().code,
+                i32::from(McpErrorCode::InvalidRequest).into()
+            );
             assert_eq!(
                 proxy.final_task_registry_snapshot_for_test().unwrap(),
                 before,
                 "a reply for another task cannot change the retained owned snapshot"
             );
         } else {
-            let result = outcome.unwrap();
+            assert!(outcome.error.is_none(), "{outcome:?}");
+            let result = outcome.result.as_ref().unwrap();
             assert_eq!(result["taskId"], handle.as_str());
             assert_eq!(result["status"], "completed");
+            let envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_slice(&encoded).unwrap();
+            let task: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(envelope["result"].get()).unwrap();
+            assert_eq!(
+                task["result"].get(),
+                NESTED_RESULT,
+                "the public Tasks response must preserve completed payload bytes on the wire"
+            );
             let retained = relay.known_task(&context, &handle).unwrap();
             assert_eq!(retained.base().task_id, initial.base().task_id);
             let encoded = serde_json::to_string(&retained).unwrap();
@@ -14494,6 +14542,7 @@ IFS= read -r end
             );
         }
         assert!(!cx.is_cancel_requested());
+        drop(server);
         drop(relay);
         drop(proxy);
         assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
@@ -21994,6 +22043,7 @@ IFS= read -r end
             &fixture.context,
             serde_json::json!({"_meta": metadata, "taskId": fixture.handle}),
         ))
+        .map(|result| serde_json::to_value(result).unwrap())
     }
 
     #[cfg(feature = "tasks")]
@@ -23220,6 +23270,7 @@ IFS= read -r end
         ] {
             let params = serde_json::json!({"_meta": meta, "taskId": handle});
             let result = block_on(broker.dispatch_get(&owner, params.clone())).unwrap();
+            let result = serde_json::to_value(result).unwrap();
             assert_eq!(result["taskId"], handle.as_str());
             assert_eq!(
                 result["statusMessage"], name,
@@ -24807,6 +24858,7 @@ IFS= read -r end
             serde_json::json!({"_meta": meta.clone(), "taskId": task_id}),
         ))
         .expect("the retained upstream handle permits tasks/get");
+        let get = serde_json::to_value(get).unwrap();
         assert_eq!(get["taskId"], task_id.as_str());
         assert_eq!(get["resultType"], "complete");
         let update = block_on(relay.dispatch_update(
@@ -24944,7 +24996,7 @@ IFS= read -r end
             serde_json::json!({"_meta": metadata, "taskId": handle}),
         ))
         .unwrap();
-        assert_eq!(get["taskId"], handle.as_str());
+        assert_eq!(get.task.base().task_id, handle);
         assert_eq!(
             calls.lock().unwrap().as_slice(),
             ["tasks/get"],
@@ -25246,7 +25298,7 @@ IFS= read -r end
             serde_json::json!({"_meta": metadata, "taskId": handle}),
         ))
         .expect("modern stdio resolves the issued handle through its bound route");
-        assert_eq!(result["taskId"], handle.as_str());
+        assert_eq!(result.task.base().task_id, handle);
         assert_eq!(
             calls.lock().expect("calls are not poisoned").as_slice(),
             &["tasks/get"],

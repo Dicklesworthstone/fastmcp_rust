@@ -30,7 +30,7 @@ use fastmcp_protocol::extensions::{
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     ExtensionDescriptorRegistry, ExtensionDirection, ExtensionId, ExtensionRegistryReceipt,
-    ExtensionSettings, JsonRpcRequest,
+    ExtensionSettings, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -186,6 +186,23 @@ trait ErasedExtensionHandler: Send + Sync {
         self.invoke_async(context, parameters)
     }
 
+    /// Encodes the response at the typed handler boundary. Handlers whose
+    /// output is already a Value use the ordinary representation; serde
+    /// adapters override this before a source-bearing result is materialized.
+    fn invoke_response_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: RequestId,
+    ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
+        Box::pin(async move {
+            self.invoke_admitted_async(context, negotiated, parameters)
+                .await
+                .map(|value| JsonRpcResponse::success(id, value))
+        })
+    }
+
     /// Consumes authorization custody for this exact notification invocation.
     fn invoke_authorized_notification_async<'a>(
         &'a self,
@@ -240,6 +257,21 @@ where
             })
         })
     }
+
+    fn invoke_response_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        _negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: RequestId,
+    ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
+        Box::pin(async move {
+            let request = serde_json::from_value(parameters)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            let response = (self.handler)(context, request).await?;
+            encode_extension_response(id, &response)
+        })
+    }
 }
 
 /// Typed serde adapter retained behind the heterogeneous handler map.
@@ -263,6 +295,70 @@ where
             McpError::internal_error("typed extension handler response serialization failed")
         })
     }
+
+    fn invoke_response_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        _negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: RequestId,
+    ) -> BoxFuture<'a, McpResult<JsonRpcResponse>> {
+        Box::pin(async move {
+            let request = serde_json::from_value(parameters)
+                .map_err(|error| McpError::invalid_params(error.to_string()))?;
+            let response = self.handler.handle(context, request)?;
+            encode_extension_response(id, &response)
+        })
+    }
+}
+
+/// Serialize directly so RawValue-backed extension payloads retain their
+/// admitted representation. The hard protocol ceiling bounds allocations
+/// here; each transport still enforces its configured full-frame limit.
+fn encode_extension_response<Response: Serialize + ?Sized>(
+    id: RequestId,
+    response: &Response,
+) -> McpResult<JsonRpcResponse> {
+    struct ResultWriter(Vec<u8>);
+
+    impl std::io::Write for ResultWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let limit = fastmcp_core::limits::HARD_JSON_RPC_MAX_BODY_BYTES;
+            if bytes.len() > limit.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other(
+                    "extension result exceeds its byte limit",
+                ));
+            }
+            let required = self.0.len() + bytes.len();
+            if required > self.0.capacity() {
+                let capacity = required
+                    .max(self.0.capacity().saturating_mul(2))
+                    .max(256)
+                    .min(limit);
+                self.0
+                    .try_reserve_exact(capacity - self.0.len())
+                    .map_err(|_| std::io::Error::other("extension result allocation refused"))?;
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let invalid =
+        || McpError::internal_error("typed extension handler response serialization failed");
+    let mut writer = ResultWriter(Vec::new());
+    serde_json::to_writer(&mut writer, response).map_err(|_| invalid())?;
+    let source = String::from_utf8(writer.0).map_err(|_| invalid())?;
+    JsonRpcResponse::success_with_raw_result(
+        id,
+        source,
+        fastmcp_core::limits::HARD_JSON_RPC_MAX_BODY_BYTES,
+    )
+    .map_err(|_| invalid())
 }
 
 /// A stable server-side location for one extension request handler.
@@ -1053,6 +1149,46 @@ impl ExtensionHandlerRegistry {
         Ok(response)
     }
 
+    /// Uses the same current-request admission as the value API, retaining
+    /// typed source-bearing output until the transport serializes its reply.
+    pub(crate) async fn invoke_response_async(
+        &self,
+        context: &McpContext,
+        negotiated: &NegotiatedExtensionSet,
+        protocol_era: ProtocolEra,
+        extension_id: &ExtensionId,
+        request: &JsonRpcRequest,
+    ) -> Result<JsonRpcResponse, ExtensionHandlerInvocationError> {
+        let handler = self.admitted_handler(negotiated, protocol_era, extension_id, request)?;
+        let admitted = negotiated.active(extension_id).ok_or_else(|| {
+            ExtensionHandlerInvocationError::Protocol(ExtensionDispatchError::InactiveCapability(
+                extension_id.to_string(),
+            ))
+        })?;
+        let id = request.id.clone().ok_or_else(|| {
+            ExtensionHandlerInvocationError::RequestEnvelopeRequired(ExtensionHandlerKey::new(
+                extension_id.clone(),
+                &request.method,
+            ))
+        })?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        let response = handler
+            .invoke_response_async(
+                context,
+                admitted,
+                request.params.clone().unwrap_or_else(|| serde_json::json!({})),
+                id,
+            )
+            .await
+            .map_err(ExtensionHandlerInvocationError::Handler)?;
+        context
+            .ensure_live()
+            .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        Ok(response)
+    }
+
     fn admitted_handler(
         &self,
         negotiated: &NegotiatedExtensionSet,
@@ -1238,7 +1374,7 @@ mod tests {
             71_i64,
         );
         let error = runtime
-            .block_on(plain_server.dispatch_extension_fallback_async(&context, &unknown))
+            .block_on(plain_server.dispatch_extension_fallback_async(&context, &unknown, &mut None))
             .expect_err("unregistered modern methods retain method-not-found semantics");
         assert_eq!(error.code, McpErrorCode::MethodNotFound);
     }

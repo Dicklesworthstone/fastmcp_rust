@@ -16067,6 +16067,11 @@ impl Server {
         }
         self.invoke_negotiated_extension_async(request_ctx, &current, extension_id, request)
             .await
+            .and_then(|response| {
+                response.result.ok_or_else(|| {
+                    McpError::internal_error("extension handler omitted its response result")
+                })
+            })
     }
 
     fn validate_extension_request_binding(
@@ -16095,7 +16100,7 @@ impl Server {
         negotiated: &fastmcp_protocol::extensions::NegotiatedExtensionSet,
         extension_id: &ExtensionId,
         request: &JsonRpcRequest,
-    ) -> McpResult<serde_json::Value> {
+    ) -> McpResult<JsonRpcResponse> {
         let mut request = request.clone();
         remove_modern_protocol_metadata(&mut request);
         let runtime = self
@@ -16104,7 +16109,7 @@ impl Server {
             .ok_or_else(|| McpError::method_not_found(&request.method))?;
         runtime
             .handlers
-            .invoke_async(
+            .invoke_response_async(
                 request_ctx,
                 negotiated,
                 ProtocolEra::Modern2026,
@@ -16129,6 +16134,7 @@ impl Server {
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
+        retained_response: &mut Option<JsonRpcResponse>,
     ) -> McpResult<serde_json::Value> {
         require_exact_modern_extension_metadata(request)?;
         request_ctx.ensure_live()?;
@@ -16139,8 +16145,17 @@ impl Server {
         let negotiated = self
             .negotiate_extensions(&client)
             .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
-        self.invoke_negotiated_extension_async(request_ctx, &negotiated, extension_id, request)
-            .await
+        let response = self
+            .invoke_negotiated_extension_async(request_ctx, &negotiated, extension_id, request)
+            .await?;
+        let value = response.result.clone().ok_or_else(|| {
+            McpError::internal_error("extension handler omitted its response result")
+        })?;
+        // Keep the source bound to its admitted typed value. Final response
+        // middleware still owns the public value; JsonRpcResponse discards the
+        // retained representation whenever that value changes.
+        *retained_response = Some(response);
+        Ok(value)
     }
 
     fn dispatch_extension_fallback(
@@ -16508,6 +16523,7 @@ impl Server {
         remove_modern_protocol_metadata(&mut request);
 
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
+        let mut retained_extension_response = None;
         let result: McpResult<serde_json::Value> = async {
             for middleware in self.middleware.iter() {
                 Self::enforce_request_context(&request_ctx)?;
@@ -16562,8 +16578,12 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback_async(&request_ctx, &admission_request)
-                            .await
+                        self.dispatch_extension_fallback_async(
+                            &request_ctx,
+                            &admission_request,
+                            &mut retained_extension_response,
+                        )
+                        .await
                     }
                     result => result,
                 }
@@ -16656,7 +16676,14 @@ impl Server {
 
         let response_id = response_id.expect("non-notification requests have an id");
         Some(match result {
-            Ok(value) => JsonRpcResponse::success(response_id, value),
+            Ok(value) => {
+                if let Some(mut response) = retained_extension_response {
+                    response.result = Some(value);
+                    response
+                } else {
+                    JsonRpcResponse::success(response_id, value)
+                }
+            }
             Err(error) => {
                 let masked = mask_peer_error(error, self.mask_error_details);
                 JsonRpcResponse::error(
@@ -16863,6 +16890,7 @@ impl Server {
         // Bound the dispatch state and its Send proof before the progress
         // timer and transport futures wrap it. The same owner still polls
         // and drops the request; no extra task or cancellation scope is added.
+        let mut retained_extension_response = None;
         let dispatch: std::pin::Pin<
             Box<dyn Future<Output = McpResult<Option<serde_json::Value>>> + Send + '_>,
         > = Box::pin(async {
@@ -16911,8 +16939,12 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback_async(&request_ctx, &request)
-                            .await
+                        self.dispatch_extension_fallback_async(
+                            &request_ctx,
+                            &request,
+                            &mut retained_extension_response,
+                        )
+                        .await
                     }
                     result => result,
                 }
@@ -17067,7 +17099,14 @@ impl Server {
         }
         let response_id = response_id.expect("non-notification requests have an id");
         Some(match result {
-            Ok(value) => JsonRpcResponse::success(response_id, value),
+            Ok(value) => {
+                if let Some(mut response) = retained_extension_response {
+                    response.result = Some(value);
+                    response
+                } else {
+                    JsonRpcResponse::success(response_id, value)
+                }
+            }
             Err(error) => {
                 let masked = mask_peer_error(error, self.mask_error_details);
                 JsonRpcResponse::error(
@@ -28515,7 +28554,7 @@ mod lib_unit_tests {
             let request = request_binding_extension_request(1);
             let context = McpContext::new(Cx::for_testing(), 71);
             let result = if asynchronous {
-                block_on(server.dispatch_extension_fallback_async(&context, &request))
+                block_on(server.dispatch_extension_fallback_async(&context, &request, &mut None))
             } else {
                 server.dispatch_extension_fallback(&context, &request)
             };
@@ -31813,6 +31852,209 @@ mod lib_unit_tests {
             2,
             "task creation and the fenced terminal completion each emit one notification",
         );
+    }
+
+    #[cfg(feature = "tasks")]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CompletedTaskWireProbe {
+        Preserve,
+        Redact,
+        Cancel,
+        MissingCapability,
+    }
+
+    #[cfg(feature = "tasks")]
+    struct CompletedTaskResponseMiddleware {
+        probe: CompletedTaskWireProbe,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl Middleware for CompletedTaskResponseMiddleware {
+        fn on_response(
+            &self,
+            ctx: &McpContext,
+            request: &JsonRpcRequest,
+            mut response: serde_json::Value,
+        ) -> McpResult<serde_json::Value> {
+            assert_eq!(request.method, fastmcp_protocol::TASK_GET);
+            assert_eq!(response["status"], "completed");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.probe {
+                CompletedTaskWireProbe::Redact => {
+                    response["result"] = serde_json::json!({"content": [], "redacted": true});
+                }
+                CompletedTaskWireProbe::Cancel => {
+                    assert!(ctx.request_cancellation().cancel());
+                }
+                _ => panic!("only response-changing probes install middleware"),
+            }
+            Ok(response)
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn final_tasks_completed_wire_probe(probe: CompletedTaskWireProbe) {
+        const RESULT_SOURCE: &str = r#"{"z-first":{"escaped\/key":"quoted \u0022 value","ratio":1.2300e+40},"content":[{"type":"text","text":"retained-result-secret"}],"x-large":123456789012345678901234567890,"x-zero":-0,"a-last":[]}"#;
+
+        for dispatch in ["stateless", "owned", "http"] {
+            let delivered = Arc::new(Mutex::new(Vec::new()));
+            let runtime = final_tasks_test_runtime(Arc::clone(&delivered));
+            let _service = start_final_tasks_test_service(&runtime);
+            let task_id = runtime
+                .create_task_with_work(final_tasks_test_work_descriptor(), None)
+                .unwrap()
+                .task
+                .base()
+                .task_id
+                .clone();
+            runtime
+                .complete_task(
+                    &task_id,
+                    serde_json::from_str(RESULT_SOURCE).unwrap(),
+                    None,
+                )
+                .unwrap();
+            let stored_before = serde_json::to_string(&runtime.get_task(&task_id).unwrap()).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut builder = Server::new("completed-task-wire", "1.0.0")
+                .final_tasks(runtime.clone())
+                .unwrap();
+            if matches!(
+                probe,
+                CompletedTaskWireProbe::Redact | CompletedTaskWireProbe::Cancel
+            ) {
+                builder = builder.middleware(CompletedTaskResponseMiddleware {
+                    probe,
+                    calls: Arc::clone(&calls),
+                });
+            }
+            let server = Arc::new(builder.build());
+            let inbound =
+                InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory);
+            let mut params = final_tasks_get_params(&task_id, serde_json::json!({}));
+            if probe == CompletedTaskWireProbe::MissingCapability {
+                params["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+                    serde_json::json!({});
+            }
+            let request = JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(params), 71_i64);
+            let (response, encoded) = if dispatch == "http" {
+                let http = block_on(server.dispatch_http_with_protocol_policy(
+                    ProtocolPolicy::ModernOnly,
+                    &inbound,
+                    &request,
+                ));
+                let response: JsonRpcResponse = serde_json::from_slice(&http.body).unwrap();
+                (response, http.body)
+            } else {
+                let response = if dispatch == "owned" {
+                    block_on(Arc::clone(&server).dispatch_with_protocol_policy_owned(
+                        ProtocolPolicy::ModernOnly,
+                        &inbound,
+                        request,
+                        None,
+                        None,
+                        None,
+                        None,
+                        McpRequestCancellation::new(),
+                        None,
+                        Arc::new(|_| {}),
+                    ))
+                } else {
+                    block_on(server.dispatch_stateless(&inbound, &request))
+                }
+                .expect("tasks/get has a response");
+                let encoded = Codec::new().encode_ndjson_response(&response).unwrap();
+                (response, encoded)
+            };
+            assert_eq!(response.id, Some(71_i64.into()), "{dispatch}: {probe:?}");
+            if matches!(
+                probe,
+                CompletedTaskWireProbe::Cancel | CompletedTaskWireProbe::MissingCapability
+            ) {
+                let expected = if probe == CompletedTaskWireProbe::Cancel {
+                    McpErrorCode::RequestCancelled
+                } else {
+                    McpErrorCode::InvalidParams
+                };
+                assert!(response.result.is_none(), "{dispatch}: {probe:?}");
+                assert_eq!(
+                    response.error.as_ref().map(|error| error.code.clone()),
+                    Some(i32::from(expected).into()),
+                    "{dispatch}: {probe:?}",
+                );
+            } else {
+                assert!(response.error.is_none(), "{dispatch}: {response:?}");
+                assert_eq!(response.result.as_ref().unwrap()["taskId"], task_id.as_str());
+                let envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                    serde_json::from_slice(&encoded).unwrap();
+                let task: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                    serde_json::from_str(envelope["result"].get()).unwrap();
+                if probe == CompletedTaskWireProbe::Preserve {
+                    assert_eq!(
+                        task["result"].get(),
+                        RESULT_SOURCE,
+                        "{dispatch}: the final wire must retain the completed result source",
+                    );
+                } else {
+                    let redacted: serde_json::Value =
+                        serde_json::from_str(task["result"].get()).unwrap();
+                    assert_eq!(redacted, serde_json::json!({"content": [], "redacted": true}));
+                }
+            }
+            if probe != CompletedTaskWireProbe::Preserve {
+                assert!(
+                    !String::from_utf8_lossy(&encoded).contains("retained-result-secret"),
+                    "{dispatch}: stale source must not escape after redaction or rejection",
+                );
+                assert!(
+                    !format!("{response:?}").contains("retained-result-secret"),
+                    "{dispatch}: Debug must not reveal a discarded result snapshot",
+                );
+            }
+            let expected_calls = usize::from(matches!(
+                probe,
+                CompletedTaskWireProbe::Redact | CompletedTaskWireProbe::Cancel
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), expected_calls, "{dispatch}");
+            assert_eq!(
+                serde_json::to_string(&runtime.get_task(&task_id).unwrap()).unwrap(),
+                stored_before,
+                "{dispatch}: response handling must not mutate the durable completed task",
+            );
+            assert_eq!(
+                delivered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len(),
+                2,
+                "{dispatch}: only creation and completion publish task transitions",
+            );
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_tasks_completed_result_preserves_source_through_public_dispatch() {
+        final_tasks_completed_wire_probe(CompletedTaskWireProbe::Preserve);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_tasks_completed_result_middleware_redaction_discards_retained_source() {
+        final_tasks_completed_wire_probe(CompletedTaskWireProbe::Redact);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_tasks_completed_result_cancellation_does_not_release_retained_source() {
+        final_tasks_completed_wire_probe(CompletedTaskWireProbe::Cancel);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn final_tasks_completed_result_missing_negotiation_does_not_release_retained_source() {
+        final_tasks_completed_wire_probe(CompletedTaskWireProbe::MissingCapability);
     }
 
     #[cfg(feature = "tasks")]

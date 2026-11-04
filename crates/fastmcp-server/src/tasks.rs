@@ -9504,19 +9504,18 @@ pub(crate) fn dispatch_final_tasks_get(
     runtime: &FinalTaskRuntime,
     ctx: &McpContext,
     parameters: serde_json::Value,
-) -> McpResult<serde_json::Value> {
+) -> McpResult<fastmcp_protocol::CompleteTaskResult> {
     let parameters = serde_json::from_value::<FinalGetTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/get")?;
     let task = runtime
         .task_for_request(ctx, &parameters.task_id)?
         .into_task();
-    serde_json::to_value(fastmcp_protocol::CompleteTaskResult {
+    Ok(fastmcp_protocol::CompleteTaskResult {
         task,
         meta: None,
         additional: BTreeMap::new(),
     })
-    .map_err(|_| McpError::internal_error("final tasks/get response serialization failed"))
 }
 
 /// Decodes and serves a negotiated `tasks/update` request through the final runtime.
@@ -21843,6 +21842,7 @@ mod tests {
             final_task_method_parameters(&task_id),
         )
         .expect("official final tasks/get parameters are admitted");
+        let response = serde_json::to_value(response).expect("typed final task response encodes");
         // The frozen final wire is the FLAT complete envelope (resultType +
         // task fields as top-level members), not a nested `task` object —
         // see the protocol GetTaskResult round-trip fixtures.
