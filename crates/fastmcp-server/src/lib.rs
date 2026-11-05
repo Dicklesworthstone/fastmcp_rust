@@ -6955,6 +6955,49 @@ fn subscription_filter_admission_matches(
     }
 }
 
+/// Admits a Tasks acknowledgement without allowing it to widen the requested
+/// IDs or change an independently selected core notification category. Missing
+/// and empty taskIds both acknowledge no Task events; local acknowledgements
+/// use the request's first-occurrence order without retaining duplicates.
+#[cfg(all(feature = "proxy", feature = "tasks"))]
+fn admitted_task_subscription_ids(
+    expected: &SubscriptionFilter,
+    acknowledged: &SubscriptionFilter,
+) -> McpResult<Vec<fastmcp_protocol::FinalTaskId>> {
+    let requested = task_subscription_ids(expected)
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+        .ok_or_else(|| McpError::invalid_params("Tasks listener requires taskIds"))?;
+    let mut admitted = task_subscription_ids(acknowledged)
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription acknowledgement"))?
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if admitted.iter().any(|task_id| !requested.contains(task_id)) {
+        return Err(McpError::invalid_params(
+            "Tasks acknowledgement includes an unrequested task ID",
+        ));
+    }
+
+    // Preserve the existing exact comparison for core selections. Only the
+    // Tasks fragment may narrow; extension-neutral catalog callers continue
+    // using subscription_filter_admission_matches directly.
+    let mut complete_acknowledgement = acknowledged.clone();
+    complete_acknowledgement
+        .additional
+        .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+    set_task_subscription_ids(&mut complete_acknowledgement, requested.clone())
+        .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
+    if !subscription_filter_admission_matches(expected, &complete_acknowledgement)? {
+        return Err(McpError::invalid_params(
+            "Tasks acknowledgement changed the admitted core subscription filter",
+        ));
+    }
+    Ok(requested
+        .into_iter()
+        .filter(|task_id| admitted.remove(task_id))
+        .collect())
+}
+
 fn subscription_metadata(
     existing: Option<OpenMetadata>,
     subscription_id: &RequestId,
@@ -17283,16 +17326,12 @@ impl Server {
             let mut listener = relay
                 .open_listener_async(request_ctx, task_filter.clone())
                 .await?;
-            match listener
+            let admitted = match listener
                 .next_async(request_ctx.cx(), &request_cancellation)
                 .await?
             {
                 ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
-                    if !subscription_filter_admission_matches(&task_filter, &accepted)? {
-                        return Err(McpError::invalid_params(
-                            "Proxy upstream narrowed the final Tasks subscription filter",
-                        ));
-                    }
+                    admitted_task_subscription_ids(&task_filter, &accepted)?
                 }
                 ProxyFinalTaskListenerEvent::Notification(_)
                 | ProxyFinalTaskListenerEvent::Terminal => {
@@ -17300,8 +17339,19 @@ impl Server {
                         "Proxy upstream Tasks listener did not acknowledge before events",
                     ));
                 }
+            };
+            let has_task_events = !admitted.is_empty();
+            params
+                .notifications
+                .additional
+                .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+            set_task_subscription_ids(&mut params.notifications, admitted)
+                .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?;
+            if has_task_events {
+                relay_listener = Some(listener);
             }
-            relay_listener = Some(listener);
+            // Keep independent core subscriptions active after an empty Task
+            // acknowledgement without retaining an unselected upstream leg.
         }
 
         #[cfg(feature = "proxy")]
@@ -61240,6 +61290,99 @@ mod lib_unit_tests {
                 .expect("well-formed narrowed Tasks selection must compare"),
             "changing only one requested task ID must remain a rejected narrowing"
         );
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn task_subscription_acknowledgement_admits_ordered_partial_and_empty_subsets() {
+        let task_a = fastmcp_protocol::FinalTaskId::parse("task-a").unwrap();
+        let task_b = fastmcp_protocol::FinalTaskId::parse("task-b").unwrap();
+        let task_c = fastmcp_protocol::FinalTaskId::parse("task-c").unwrap();
+        let mut requested = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resource_subscriptions: Some(vec![
+                "file:///subscriptions/a".to_owned(),
+                "file:///subscriptions/b".to_owned(),
+            ]),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(
+            &mut requested,
+            vec![task_c.clone(), task_a, task_b.clone(), task_c.clone()],
+        )
+        .unwrap();
+        let mut acknowledged = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resource_subscriptions: Some(vec![
+                "file:///subscriptions/b".to_owned(),
+                "file:///subscriptions/a".to_owned(),
+            ]),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(
+            &mut acknowledged,
+            vec![task_b.clone(), task_c.clone(), task_b.clone()],
+        )
+        .unwrap();
+        assert_eq!(
+            admitted_task_subscription_ids(&requested, &acknowledged).unwrap(),
+            vec![task_c, task_b],
+            "the local subset follows first-request order and drops duplicates"
+        );
+        acknowledged
+            .additional
+            .remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+        assert!(
+            admitted_task_subscription_ids(&requested, &acknowledged)
+                .unwrap()
+                .is_empty(),
+            "an omitted Task fragment acknowledges no Task events"
+        );
+        set_task_subscription_ids(&mut acknowledged, Vec::new()).unwrap();
+        assert!(
+            admitted_task_subscription_ids(&requested, &acknowledged)
+                .unwrap()
+                .is_empty(),
+            "an explicit empty subset preserves independent core selections"
+        );
+    }
+
+    #[cfg(all(feature = "proxy", feature = "tasks"))]
+    #[test]
+    fn task_subscription_acknowledgement_rejects_widening_and_core_changes() {
+        let task = fastmcp_protocol::FinalTaskId::parse("requested-task").unwrap();
+        let mut requested = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            resource_subscriptions: Some(vec!["file:///subscriptions/retained".to_owned()]),
+            ..SubscriptionFilter::default()
+        };
+        set_task_subscription_ids(&mut requested, vec![task.clone()]).unwrap();
+        for change in ["task", "missing-core", "extra-core", "resource", "malformed"] {
+            let mut acknowledged = requested.clone();
+            match change {
+                "task" => {
+                    acknowledged.additional.remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+                    set_task_subscription_ids(
+                        &mut acknowledged,
+                        vec![task.clone(), fastmcp_protocol::FinalTaskId::parse("foreign-task").unwrap()],
+                    )
+                    .unwrap();
+                }
+                "missing-core" => acknowledged.tools_list_changed = None,
+                "extra-core" => acknowledged.prompts_list_changed = Some(true),
+                "resource" => acknowledged.resource_subscriptions = Some(Vec::new()),
+                _ => {
+                    acknowledged.additional.insert(
+                        fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY.to_owned(),
+                        serde_json::json!(["requested-task", 7]),
+                    );
+                }
+            }
+            assert!(
+                admitted_task_subscription_ids(&requested, &acknowledged).is_err(),
+                "{change} must not admit a subscription"
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! calls to another MCP server via a backend client.
 
 #[cfg(feature = "tasks")]
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -5287,11 +5287,32 @@ impl AdmittedProxyFinalTaskListener {
                 ProxyFinalTaskListenerPhase::AwaitingAcknowledgement,
                 ProxyFinalTaskListenerEvent::Acknowledged(filter),
             ) => {
-                if !crate::subscription_filter_admission_matches(&self.upstream_filter, &filter)? {
-                    return self.reject_sequence(
-                        "Proxy upstream Tasks acknowledgement does not match its admitted filter",
-                    );
-                }
+                let admitted = match crate::admitted_task_subscription_ids(
+                    &self.upstream_filter,
+                    &filter,
+                ) {
+                    Ok(admitted) => admitted.into_iter().collect::<BTreeSet<_>>(),
+                    Err(_) => {
+                        return self.reject_sequence(
+                            "Proxy upstream Tasks acknowledgement does not match its admitted filter",
+                        );
+                    }
+                };
+                self.mappings
+                    .retain(|(_, upstream_id)| admitted.contains(upstream_id));
+                let narrowed = relayed_task_filter(
+                    self.downstream_filter.clone(),
+                    self.mappings
+                        .iter()
+                        .map(|(handle, _)| handle.clone())
+                        .collect(),
+                )?;
+                let admitted_handles = crate::admitted_task_subscription_ids(
+                    &self.downstream_filter,
+                    &narrowed,
+                )?;
+                self.downstream_filter =
+                    relayed_task_filter(self.downstream_filter.clone(), admitted_handles)?;
                 self.phase = ProxyFinalTaskListenerPhase::Streaming;
                 Ok(ProxyFinalTaskListenerEvent::Acknowledged(
                     self.downstream_filter.clone(),
@@ -6201,6 +6222,7 @@ impl ProxyFinalTaskRelay {
         }
         let cancellation = ctx.request_cancellation();
         let mut listeners = Vec::with_capacity(groups.len());
+        let mut admitted_handles = BTreeSet::new();
         for (route, handles) in groups {
             let filter = relayed_task_filter(notifications.clone(), handles)?;
             let mut listener = route.open_route_listener_async(ctx, filter.clone()).await?;
@@ -6212,20 +6234,33 @@ impl ProxyFinalTaskRelay {
             .await?;
             ctx.ensure_live()?;
             match acknowledgement {
-                ProxyFinalTaskListenerEvent::Acknowledged(accepted)
-                    if crate::subscription_filter_admission_matches(&filter, &accepted)? => {}
+                ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
+                    let admitted = crate::admitted_task_subscription_ids(&filter, &accepted)?;
+                    if !admitted.is_empty() {
+                        admitted_handles.extend(admitted);
+                        listeners.push(listener);
+                    }
+                    // An empty route cannot produce Task events. Retire it now
+                    // so its completion cannot terminate other admitted routes.
+                }
                 _ => {
                     return Err(McpError::invalid_request(
-                        "Proxy upstream Tasks listener did not acknowledge its complete selection",
+                        "Proxy upstream Tasks listener did not acknowledge before events",
                     ));
                 }
             }
-            listeners.push(listener);
         }
         ctx.ensure_live()?;
+        let admitted = task_subscription_ids(&notifications)
+            .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|handle| admitted_handles.remove(handle))
+            .collect();
+        let acknowledged = relayed_task_filter(notifications, admitted)?;
         Ok(Box::new(MultiplexedProxyFinalTaskListener::new(
             listeners,
-            notifications,
+            acknowledged,
         )))
     }
 
@@ -13499,7 +13534,7 @@ mod tests {
     #[cfg(feature = "tasks")]
     use fastmcp_protocol::{
         CreateTaskResult, EmptyTaskResult, FinalGetTaskResult, FinalRequestMeta,
-        set_task_subscription_ids,
+        set_task_subscription_ids, task_subscription_ids,
     };
 
     #[cfg(all(unix, feature = "tasks"))]
@@ -23198,6 +23233,189 @@ IFS= read -r end
     }
 
     #[cfg(feature = "tasks")]
+    fn task_subset_route_fixture(
+        task_id: &str,
+        generation: u64,
+        acknowledged: SubscriptionFilter,
+        updates: Vec<fastmcp_protocol::Task>,
+    ) -> BrokerRouteFixture {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let creation = final_task_relay_result_with_ttl(task_id, None);
+        let mut events = VecDeque::from([
+            ProxyFinalTaskListenerEvent::Acknowledged(acknowledged),
+        ]);
+        events.extend(updates.into_iter().map(|task| {
+            ProxyFinalTaskListenerEvent::Notification(relay_test_notification(task))
+        }));
+        events.push_back(ProxyFinalTaskListenerEvent::Terminal);
+        let mut binding = final_task_relay_binding(ProtocolEra::Modern2026);
+        binding.configuration_generation = generation;
+        let client = ProxyClient::from_backend_with_upstream_binding(
+            FinalTaskRelayBackend {
+                calls: Arc::clone(&calls),
+                task: creation.clone(),
+                listener_events: Some(events),
+                cancel_after_task_commit: None,
+                final_progress: None,
+            },
+            binding,
+            "2026-07-28",
+        )
+        .unwrap();
+        let relay = client.final_tasks_relay().unwrap().unwrap();
+        BrokerRouteFixture {
+            client,
+            relay,
+            calls,
+            creation,
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_partial_acknowledgement_limits_alias_delivery() {
+        let accepted = final_task_relay_result_with_ttl("accepted-upstream-task", None).task;
+        let refused = final_task_relay_result_with_ttl("refused-upstream-task", None).task;
+        let route = task_subset_route_fixture(
+            "accepted-upstream-task",
+            910,
+            relay_test_filter(vec![accepted.base().task_id.clone()]),
+            vec![accepted.clone(), refused.clone()],
+        );
+        let owner = relay_test_context(Cx::for_testing(), 911);
+        let first = issue_relay_test_task(&route.relay, &owner, accepted.clone())
+            .task.base().task_id.clone();
+        let second = issue_relay_test_task(&route.relay, &owner, accepted.clone())
+            .task.base().task_id.clone();
+        let declined = issue_relay_test_task(&route.relay, &owner, refused)
+            .task.base().task_id.clone();
+        let requested = relay_test_filter(vec![
+            second.clone(), declined.clone(), first.clone(), second.clone(),
+        ]);
+        let mut listener = block_on(route.relay.open_listener_async(&owner, requested)).unwrap();
+        let cancellation = McpRequestCancellation::new();
+        let ProxyFinalTaskListenerEvent::Acknowledged(acknowledged) =
+            block_on(listener.next_async(owner.cx(), &cancellation)).unwrap()
+        else {
+            panic!("the admitted subset must be acknowledged before any event")
+        };
+        assert_eq!(
+            task_subscription_ids(&acknowledged).unwrap().unwrap(),
+            vec![second.clone(), first.clone()]
+        );
+        for handle in [&second, &first] {
+            let ProxyFinalTaskListenerEvent::Notification(notification) =
+                block_on(listener.next_async(owner.cx(), &cancellation)).unwrap()
+            else {
+                panic!("each admitted alias receives the accepted upstream event")
+            };
+            let mut expected = serde_json::to_value(relay_test_notification(accepted.clone())).unwrap();
+            expected["params"]["taskId"] = serde_json::json!(handle);
+            assert_eq!(serde_json::to_value(notification).unwrap(), expected);
+        }
+        let before = route.client.final_task_registry_snapshot_for_test().unwrap();
+        assert_eq!(
+            block_on(listener.next_async(owner.cx(), &cancellation)).unwrap_err().code,
+            McpErrorCode::InvalidRequest,
+            "request membership cannot authorize an event excluded from the acknowledgement"
+        );
+        assert_eq!(route.client.final_task_registry_snapshot_for_test().unwrap(), before);
+        assert_eq!(
+            listener.next(owner.cx(), &cancellation).unwrap_err().code,
+            McpErrorCode::InvalidRequest,
+            "an unacknowledged event permanently terminates its listener"
+        );
+        assert_eq!(route.calls.lock().unwrap().as_slice(), ["subscriptions/listen"]);
+        assert!(route.relay.known_task(&owner, &declined).is_ok());
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_empty_acknowledgement_never_authorizes_events() {
+        for explicit_empty in [false, true] {
+            for send_event in [false, true] {
+                let task = final_task_relay_result_with_ttl("empty-selection-task", None).task;
+                let acknowledged = if explicit_empty {
+                    relay_test_filter(Vec::new())
+                } else {
+                    SubscriptionFilter::default()
+                };
+                let route = task_subset_route_fixture(
+                    "empty-selection-task",
+                    912,
+                    acknowledged,
+                    if send_event { vec![task.clone()] } else { Vec::new() },
+                );
+                let owner = relay_test_context(Cx::for_testing(), 913);
+                let handle = issue_relay_test_task(&route.relay, &owner, task)
+                    .task.base().task_id.clone();
+                let mut listener = block_on(route.relay.open_listener_async(
+                    &owner, relay_test_filter(vec![handle]),
+                ))
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let before = route.client.final_task_registry_snapshot_for_test().unwrap();
+                let ProxyFinalTaskListenerEvent::Acknowledged(acknowledged) =
+                    listener.next(owner.cx(), &cancellation).unwrap()
+                else {
+                    panic!("empty admission remains a successful acknowledgement")
+                };
+                assert_eq!(task_subscription_ids(&acknowledged).unwrap(), Some(Vec::new()));
+                let event = block_on(listener.next_async(owner.cx(), &cancellation));
+                if send_event {
+                    assert_eq!(event.unwrap_err().code, McpErrorCode::InvalidRequest);
+                } else {
+                    assert!(matches!(event.unwrap(), ProxyFinalTaskListenerEvent::Terminal));
+                }
+                assert_eq!(route.client.final_task_registry_snapshot_for_test().unwrap(), before);
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_task_listener_refuses_widened_and_core_losing_acknowledgements() {
+        let task = final_task_relay_result_with_ttl("subset-boundary-task", None).task;
+        for change in ["task", "missing-core", "extra-core"] {
+            let mut acknowledged = relay_test_filter(vec![task.base().task_id.clone()]);
+            acknowledged.tools_list_changed = Some(true);
+            match change {
+                "task" => {
+                    acknowledged.additional.remove(fastmcp_protocol::TASK_SUBSCRIPTION_IDS_KEY);
+                    set_task_subscription_ids(
+                        &mut acknowledged,
+                        vec![fastmcp_protocol::FinalTaskId::parse("unrequested-task").unwrap()],
+                    )
+                    .unwrap();
+                }
+                "missing-core" => acknowledged.tools_list_changed = None,
+                _ => acknowledged.prompts_list_changed = Some(true),
+            }
+            let route = task_subset_route_fixture(
+                "subset-boundary-task", 914, acknowledged, vec![task.clone()],
+            );
+            let owner = relay_test_context(Cx::for_testing(), 915);
+            let handle = issue_relay_test_task(&route.relay, &owner, task.clone())
+                .task.base().task_id.clone();
+            let mut requested = relay_test_filter(vec![handle]);
+            requested.tools_list_changed = Some(true);
+            let before = route.client.final_task_registry_snapshot_for_test().unwrap();
+            let mut listener = block_on(route.relay.open_listener_async(&owner, requested)).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            assert_eq!(
+                block_on(listener.next_async(owner.cx(), &cancellation)).unwrap_err().code,
+                McpErrorCode::InvalidRequest,
+                "{change} must be refused before downstream acknowledgement"
+            );
+            assert_eq!(
+                listener.next(owner.cx(), &cancellation).unwrap_err().code,
+                McpErrorCode::InvalidRequest
+            );
+            assert_eq!(route.client.final_task_registry_snapshot_for_test().unwrap(), before);
+        }
+    }
+
+    #[cfg(feature = "tasks")]
     fn broker_for_routes(routes: &[&BrokerRouteFixture]) -> Arc<super::ProxyFinalTaskRelay> {
         let mut builder = crate::ServerBuilder::new("several-task-upstreams", "1.0.0")
             .auth_provider(RelayTestAuthProvider);
@@ -23243,6 +23461,98 @@ IFS= read -r end
             &serde_json::to_value(&route.creation).unwrap(),
         );
         mapped.task.base().task_id.clone()
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn proxy_final_tasks_broker_unions_partial_subsets_and_retires_empty_routes() {
+        for all_empty in [false, true] {
+            let first_task = final_task_relay_result_with_ttl("first-subset-task", None).task;
+            let second_task = final_task_relay_result_with_ttl("second-subset-task", None).task;
+            let selected = |task: &fastmcp_protocol::Task| {
+                relay_test_filter(if all_empty {
+                    Vec::new()
+                } else {
+                    vec![task.base().task_id.clone()]
+                })
+            };
+            let first = task_subset_route_fixture(
+                "first-subset-task",
+                916,
+                selected(&first_task),
+                vec![first_task.clone()],
+            );
+            let second = task_subset_route_fixture(
+                "second-subset-task",
+                917,
+                selected(&second_task),
+                vec![second_task.clone()],
+            );
+            let empty = task_subset_route_fixture(
+                "empty-route-task",
+                918,
+                SubscriptionFilter::default(),
+                Vec::new(),
+            );
+            let broker = broker_for_routes(&[&first, &second, &empty]);
+            let owner = relay_test_context(Cx::for_testing(), 919);
+            let issue = |route: &BrokerRouteFixture, task: fastmcp_protocol::Task| {
+                issue_relay_test_task(&route.relay, &owner, task)
+                    .task.base().task_id.clone()
+            };
+            let first_handle = issue(&first, first_task.clone());
+            let first_alias = issue(&first, first_task);
+            let second_handle = issue(&second, second_task.clone());
+            let second_alias = issue(&second, second_task);
+            let refused = issue(
+                &first,
+                final_task_relay_result_with_ttl("first-refused-task", None).task,
+            );
+            let empty_handle = issue(&empty, empty.creation.task.clone());
+            let requested = relay_test_filter(vec![
+                empty_handle,
+                second_alias.clone(),
+                first_handle.clone(),
+                refused,
+                second_handle.clone(),
+                first_alias.clone(),
+                second_alias.clone(),
+            ]);
+            let mut listener = block_on(broker.open_listener_async(&owner, requested)).unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let ProxyFinalTaskListenerEvent::Acknowledged(acknowledged) =
+                block_on(listener.next_async(owner.cx(), &cancellation)).unwrap()
+            else {
+                panic!("each route is admitted before the aggregate acknowledgement")
+            };
+            let expected = if all_empty {
+                Vec::new()
+            } else {
+                vec![second_alias, first_handle, second_handle, first_alias]
+            };
+            assert_eq!(
+                task_subscription_ids(&acknowledged).unwrap().unwrap(),
+                expected,
+                "route grouping cannot reorder or widen the downstream subset"
+            );
+            let mut delivered = Vec::new();
+            for _ in 0..expected.len() {
+                let ProxyFinalTaskListenerEvent::Notification(notification) =
+                    block_on(listener.next_async(owner.cx(), &cancellation)).unwrap()
+                else {
+                    panic!("an empty route cannot terminate another route's accepted events")
+                };
+                delivered.push(notification.params.task.base().task_id.clone());
+            }
+            assert_eq!(delivered, expected);
+            assert!(matches!(
+                block_on(listener.next_async(owner.cx(), &cancellation)).unwrap(),
+                ProxyFinalTaskListenerEvent::Terminal
+            ));
+            for route in [&first, &second, &empty] {
+                assert_eq!(route.calls.lock().unwrap().as_slice(), ["subscriptions/listen"]);
+            }
+        }
     }
 
     #[cfg(feature = "tasks")]
@@ -23533,6 +23843,12 @@ IFS= read -r end
 
     #[cfg(feature = "tasks")]
     #[test]
+    fn proxy_mixed_http_subscription_empty_task_acknowledgement_preserves_catalog() {
+        proxy_mixed_http_subscription_probe(MixedHttpFinish::EmptyTaskAcknowledgement);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
     fn proxy_mixed_http_subscription_cancellation_closes_both_streams() {
         proxy_mixed_http_subscription_probe(MixedHttpFinish::Cancel);
     }
@@ -23571,6 +23887,7 @@ IFS= read -r end
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum MixedHttpFinish {
         Terminal,
+        EmptyTaskAcknowledgement,
         Cancel,
         PeerCancellation,
         ForeignPeerCancellation,
@@ -23666,9 +23983,14 @@ IFS= read -r end
                     .unwrap()
             );
             open(&mut tasks_stream);
+            let accepted_tasks = if finish == MixedHttpFinish::EmptyTaskAcknowledgement {
+                serde_json::json!({"taskIds": []})
+            } else {
+                tasks["params"]["notifications"].clone()
+            };
             send(
                 &mut tasks_stream,
-                &acknowledgement(&tasks["id"], tasks["params"]["notifications"].clone()),
+                &acknowledgement(&tasks["id"], accepted_tasks),
             );
 
             let mut catalog_stream = accept();
@@ -23716,17 +24038,22 @@ IFS= read -r end
                             "notifications/tools/list_changed",
                             "catalog progress cannot wait for a quiet Task"
                         );
-                        let mut update =
-                            serde_json::to_value(relay_test_notification(peer_task)).unwrap();
-                        update["params"]["_meta"] = serde_json::json!({
-                            fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY: tasks["id"]
-                        });
-                        send(&mut tasks_stream, &update);
-                        assert_eq!(
-                            deliveries.recv_timeout(Duration::from_secs(10)).unwrap(),
-                            fastmcp_protocol::TASK_STATUS_NOTIFICATION
-                        );
-                        if finish == MixedHttpFinish::Terminal {
+                        if finish != MixedHttpFinish::EmptyTaskAcknowledgement {
+                            let mut update =
+                                serde_json::to_value(relay_test_notification(peer_task)).unwrap();
+                            update["params"]["_meta"] = serde_json::json!({
+                                fastmcp_protocol::FINAL_SUBSCRIPTION_ID_META_KEY: tasks["id"]
+                            });
+                            send(&mut tasks_stream, &update);
+                            assert_eq!(
+                                deliveries.recv_timeout(Duration::from_secs(10)).unwrap(),
+                                fastmcp_protocol::TASK_STATUS_NOTIFICATION
+                            );
+                        }
+                        if matches!(
+                            finish,
+                            MixedHttpFinish::Terminal | MixedHttpFinish::EmptyTaskAcknowledgement
+                        ) {
                             send(
                                 &mut catalog_stream,
                                 &serde_json::json!({
@@ -23931,7 +24258,9 @@ IFS= read -r end
         let (tasks_wire, _) = peer.join().expect("both native upstream sockets quiesced");
         if matches!(
             finish,
-            MixedHttpFinish::Terminal | MixedHttpFinish::PeerCancellation
+            MixedHttpFinish::Terminal
+                | MixedHttpFinish::EmptyTaskAcknowledgement
+                | MixedHttpFinish::PeerCancellation
         ) {
             let response = response.unwrap();
             assert!(
@@ -23951,6 +24280,7 @@ IFS= read -r end
         let expected = match finish {
             MixedHttpFinish::NarrowAcknowledgement => 0,
             MixedHttpFinish::DuplicateAcknowledgement | MixedHttpFinish::UnselectedEvent => 1,
+            MixedHttpFinish::EmptyTaskAcknowledgement => 2,
             _ => 3,
         };
         assert_eq!(
@@ -23965,10 +24295,25 @@ IFS= read -r end
             );
         }
         if expected > 0 {
+            let acknowledged = if finish == MixedHttpFinish::EmptyTaskAcknowledgement {
+                super::relayed_task_filter(requested, Vec::new()).unwrap()
+            } else {
+                requested
+            };
             assert_eq!(
                 notifications[0]["params"]["notifications"],
-                serde_json::to_value(requested).unwrap()
+                serde_json::to_value(acknowledged).unwrap()
             );
+        }
+        if finish == MixedHttpFinish::EmptyTaskAcknowledgement {
+            assert_eq!(
+                notifications[1]["method"],
+                "notifications/tools/list_changed",
+                "the independently admitted catalog stream remains live"
+            );
+            assert!(notifications.iter().all(|notification| {
+                notification["method"] != fastmcp_protocol::TASK_STATUS_NOTIFICATION
+            }));
         }
         if expected == 3 {
             assert_eq!(
@@ -24573,7 +24918,8 @@ IFS= read -r end
         };
         assert_eq!(
             serde_json::to_value(accepted).unwrap(),
-            serde_json::to_value(filter).unwrap()
+            serde_json::to_value(relay_test_filter(vec![first.clone(), second.clone()])).unwrap(),
+            "the local acknowledgement contains each requested alias once"
         );
         for handle in [&first, &second] {
             let ProxyFinalTaskListenerEvent::Notification(notification) =
