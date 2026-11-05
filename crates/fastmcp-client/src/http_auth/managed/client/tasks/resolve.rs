@@ -1,14 +1,18 @@
 //! Explicit, one-shot resolution of a fresh Task input snapshot.
 //!
 //! This is not a retry loop: one get, one admitted callback batch, one update.
-//! The enclosing managed operation owns the original credential and deadline.
+//! Managed and ordinary clients share the same admission and callback engine.
+//! Their transport adapters retain the original operation's lifetime and IDs.
 
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
 use std::task::Poll;
+use std::time::Instant;
 
 use asupersync::Cx;
+#[cfg(feature = "websocket-experimental")]
+use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
@@ -21,8 +25,11 @@ use serde_json::Value;
 
 use super::{
     MAX_TASK_RESPONSE_BYTES, ManagedHttpClient, ManagedHttpClientError, TaskCall, TaskResult,
-    checkpoint,
 };
+#[cfg(unix)]
+use crate::Client;
+#[cfg(feature = "websocket-experimental")]
+use crate::WebSocketClient;
 use crate::http_auth::rpc::interaction::{admit_embedded_input, normalize_embedded_input_context};
 use crate::{
     FinalTask, FinalTaskId, FinalTaskInputResponses, FinalUpdateTaskResult, HttpClient,
@@ -34,10 +41,15 @@ fn invalid(message: &'static str) -> McpError {
     McpError::invalid_params(message)
 }
 
-fn expired_input() -> HttpClientError {
-    HttpClientError::CoreResult(McpError::invalid_request(
-        "Final Task input snapshot has expired",
-    ))
+fn checkpoint(cx: &Cx, cancellation: &McpRequestCancellation) -> McpResult<()> {
+    if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+        return Err(McpError::request_cancelled());
+    }
+    Ok(())
+}
+
+fn expired_input() -> McpError {
+    McpError::invalid_request("Final Task input snapshot has expired")
 }
 
 // The retained snapshot, not a callback or a later credential renewal, fixes
@@ -50,13 +62,12 @@ struct InputRetention<'task> {
 }
 
 impl<'task> InputRetention<'task> {
-    fn new(cx: &Cx, task: &'task FinalTask) -> Result<Self, HttpClientError> {
-        let remaining = crate::task_wait::input_retention_remaining(task)
-            .map_err(HttpClientError::CoreResult)?;
+    fn new(cx: &Cx, task: &'task FinalTask) -> McpResult<Self> {
+        let remaining = crate::task_wait::input_retention_remaining(task)?;
         if remaining.is_some() && cx.timer_driver().is_none() {
-            return Err(HttpClientError::CoreResult(McpError::internal_error(
+            return Err(McpError::internal_error(
                 "Task input retention requires a caller timer driver",
-            )));
+            ));
         }
         let deadline = remaining.map(|remaining| {
             cx.now()
@@ -65,8 +76,8 @@ impl<'task> InputRetention<'task> {
         Ok(Self { task, deadline })
     }
 
-    fn check(&self, cx: &Cx) -> Result<(), HttpClientError> {
-        crate::task_wait::admit_input_retention(self.task).map_err(HttpClientError::CoreResult)?;
+    fn check(&self, cx: &Cx) -> McpResult<()> {
+        crate::task_wait::admit_input_retention(self.task)?;
         if self.deadline.is_some_and(|deadline| cx.now() >= deadline) {
             return Err(expired_input());
         }
@@ -75,10 +86,15 @@ impl<'task> InputRetention<'task> {
 }
 
 fn admit_limits(max_inputs: usize, max_payload_bytes: usize) -> Result<(), ManagedHttpClientError> {
+    admit_input_limits(max_inputs, max_payload_bytes)
+        .map_err(|_| ManagedHttpClientError::InvalidPolicy)
+}
+
+fn admit_input_limits(max_inputs: usize, max_payload_bytes: usize) -> McpResult<()> {
     if !(1..=MAX_TASK_INPUT_MAP_ENTRIES).contains(&max_inputs)
         || !(1..=MAX_TASK_RESPONSE_BYTES).contains(&max_payload_bytes)
     {
-        return Err(ManagedHttpClientError::InvalidPolicy);
+        return Err(invalid("Invalid Task input resolution limits"));
     }
     Ok(())
 }
@@ -91,7 +107,7 @@ impl PayloadBudget {
     fn charge(&mut self, value: &impl Serialize) -> McpResult<()> {
         let mut counter = Self(self.0);
         serde_json::to_writer(&mut counter, value)
-            .map_err(|_| invalid("Managed Task input payload limit exceeded"))?;
+            .map_err(|_| invalid("Task input payload limit exceeded"))?;
         self.0 = counter.0;
         Ok(())
     }
@@ -130,7 +146,7 @@ fn prepare_inputs(
     };
     crate::task_wait::admit_input_retention(task)?;
     if input_requests.is_empty() || input_requests.len() > max_inputs {
-        return Err(invalid("Managed Task input count is outside its bounds"));
+        return Err(invalid("Task input count is outside its bounds"));
     }
     let ledger = TaskInputLedger::from_requests(input_requests)
         .map_err(|_| invalid("Invalid Task input descriptors"))?;
@@ -177,7 +193,7 @@ async fn resolve_one(
     handlers: &ReverseRequestHandlers,
     key: &str,
     request: FinalEmbeddedInputRequest,
-) -> Result<(FinalEmbeddedInputResponse, MrtrCallbackOwner), HttpClientError> {
+) -> McpResult<(FinalEmbeddedInputResponse, MrtrCallbackOwner)> {
     checkpoint(cx, cancellation)?;
     retention.check(cx)?;
     let kind = request.response_kind();
@@ -210,15 +226,15 @@ async fn resolve_one(
         if let Err(error) = retention.check(cx) {
             return Poll::Ready(Err(error));
         }
-        result.map(|value| value.map_err(HttpClientError::CoreResult))
+        result
     })
     .await?;
     let response: FinalEmbeddedInputResponse = serde_json::from_value(value)
-        .map_err(|_| HttpClientError::CoreResult(invalid("Invalid Task input response")))?;
+        .map_err(|_| invalid("Invalid Task input response"))?;
     if !response.matches_kind(kind) {
-        return Err(HttpClientError::CoreResult(invalid(
+        return Err(invalid(
             "Task input response does not match its descriptor",
-        )));
+        ));
     }
     Ok((response, owner))
 }
@@ -233,11 +249,9 @@ async fn resolve_batch(
     handlers: &ReverseRequestHandlers,
     effective: TaskInputRequests,
     budget: &mut PayloadBudget,
-) -> Result<(FinalTaskInputResponses, Vec<MrtrCallbackOwner>), HttpClientError> {
+) -> McpResult<(FinalTaskInputResponses, Vec<MrtrCallbackOwner>)> {
     if effective.is_empty() || effective.len() > MAX_TASK_INPUT_MAP_ENTRIES {
-        return Err(HttpClientError::CoreResult(invalid(
-            "Managed Task input count is outside its bounds",
-        )));
+        return Err(invalid("Task input count is outside its bounds"));
     }
     let mut timer = std::pin::pin!(retention.deadline.map(Sleep::new));
     let mut pending: Vec<_> = effective
@@ -246,7 +260,7 @@ async fn resolve_batch(
             Some(Box::pin(async move {
                 let (response, owner) =
                     resolve_one(cx, cancellation, retention, handlers, &key, request).await?;
-                Ok::<_, HttpClientError>((key, response, owner))
+                Ok::<_, McpError>((key, response, owner))
             }))
         })
         .collect();
@@ -274,9 +288,7 @@ async fn resolve_batch(
             // still-pending callbacks before dispatch can submit an update.
             *slot = None;
             let (key, response, owner) = result?;
-            budget
-                .charge(&(&key, &response))
-                .map_err(HttpClientError::CoreResult)?;
+            budget.charge(&(&key, &response))?;
             responses.insert(key, response);
             owners.push(owner);
         }
@@ -294,55 +306,191 @@ async fn resolve_batch(
     .await
 }
 
-pub(super) async fn dispatch(
+// Only these adapters own wire admission. The engine below cannot create a
+// Task, reconstruct an authentication context, or repeat an uncertain update.
+trait TaskInputTransport {
+    type Error: From<McpError>;
+
+    async fn read(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> Result<FinalTask, Self::Error>;
+
+    fn input_context(&self) -> McpResult<(ReverseRequestHandlers, Value)>;
+
+    async fn update(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        responses: FinalTaskInputResponses,
+    ) -> Result<FinalUpdateTaskResult, Self::Error>;
+}
+
+struct HttpTaskInputTransport<'client> {
+    client: &'client mut HttpClient,
+    // Managed admission reserves the first ID before entering this operation.
+    // Ordinary HTTP resolves it from the same allocator at its first read.
+    request_id: Option<RequestId>,
+}
+
+impl TaskInputTransport for HttpTaskInputTransport<'_> {
+    type Error = HttpClientError;
+
+    async fn read(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> Result<FinalTask, Self::Error> {
+        checkpoint(cx, cancellation)?;
+        let request_id = match self.request_id.take() {
+            Some(request_id) => request_id,
+            None => self.client.next_request_id()?,
+        };
+        self.client
+            .connection
+            .get_task_final(cx, request_id, task_id, MAX_TASK_RESPONSE_BYTES)
+            .await
+            .map(|result| result.task)
+            .map_err(HttpClientError::Connection)
+    }
+
+    fn input_context(&self) -> McpResult<(ReverseRequestHandlers, Value)> {
+        // In the managed path these are the operation-local wrapped handlers
+        // installed by CallbackBoundary. Never recover unguarded builder copies.
+        let handlers = self
+            .client
+            .connection
+            .modern_reverse_request_handlers()
+            .cloned()
+            .ok_or_else(|| invalid("No Task input handlers are configured"))?;
+        let capabilities = serde_json::to_value(&self.client.client_capabilities)
+            .map_err(|_| invalid("Invalid client capabilities"))?;
+        Ok((handlers, capabilities))
+    }
+
+    async fn update(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        responses: FinalTaskInputResponses,
+    ) -> Result<FinalUpdateTaskResult, Self::Error> {
+        checkpoint(cx, cancellation)?;
+        let update_id = self.client.next_request_id()?;
+        self.client
+            .connection
+            .update_task_final(cx, update_id, task, responses, MAX_TASK_RESPONSE_BYTES)
+            .await
+            .map_err(HttpClientError::Connection)
+    }
+}
+
+#[cfg(unix)]
+impl TaskInputTransport for Client {
+    type Error = McpError;
+
+    async fn read(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTask> {
+        self.get_task_final_with_cx(cx, cancellation, task_id)
+            .await
+            .map(|result| result.task)
+    }
+
+    fn input_context(&self) -> McpResult<(ReverseRequestHandlers, Value)> {
+        let capabilities = serde_json::to_value(self.session.client_capabilities())
+            .map_err(|_| invalid("Invalid client capabilities"))?;
+        Ok((self.reverse_request_handlers.clone(), capabilities))
+    }
+
+    async fn update(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.update_task_final_with_cx(cx, cancellation, task, responses)
+            .await
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> TaskInputTransport for WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    type Error = McpError;
+
+    async fn read(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTask> {
+        checkpoint(cx, cancellation)?;
+        self.get_task_final(cx, task_id).await.map(|result| result.task)
+    }
+
+    fn input_context(&self) -> McpResult<(ReverseRequestHandlers, Value)> {
+        let capabilities = serde_json::to_value(self.session.client_capabilities())
+            .map_err(|_| invalid("Invalid client capabilities"))?;
+        Ok((self.reverse_request_handlers.clone(), capabilities))
+    }
+
+    async fn update(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task: &FinalTask,
+        responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        checkpoint(cx, cancellation)?;
+        self.update_task_final(cx, task, responses).await
+    }
+}
+
+async fn resolve_with_transport<T: TaskInputTransport>(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
-    client: &mut HttpClient,
-    request_id: RequestId,
+    transport: &mut T,
     task_id: FinalTaskId,
     max_inputs: usize,
     max_payload_bytes: usize,
-) -> Result<TaskResult, HttpClientError> {
+) -> Result<FinalUpdateTaskResult, T::Error> {
+    admit_input_limits(max_inputs, max_payload_bytes)?;
     // Let both managed lifetime guards check before each new network boundary,
     // including immediately ready cached discovery and ready host callbacks.
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
-    let snapshot = client
-        .connection
-        .get_task_final(cx, request_id, task_id, MAX_TASK_RESPONSE_BYTES)
-        .await
-        .map_err(HttpClientError::Connection)?;
+    let snapshot = transport.read(cx, cancellation, task_id).await?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
-    let retention = InputRetention::new(cx, &snapshot.task)?;
-    // CallbackBoundary installed these operation-local wrapped handlers. Never
-    // reach into the builder for unguarded copies or derive extra capabilities.
-    let handlers = client
-        .connection
-        .modern_reverse_request_handlers()
-        .cloned()
-        .ok_or_else(|| {
-            HttpClientError::CoreResult(invalid("No Task input handlers are configured"))
-        })?;
-    let capabilities = serde_json::to_value(&client.client_capabilities)
-        .map_err(|_| HttpClientError::CoreResult(invalid("Invalid client capabilities")))?;
+    let retention = InputRetention::new(cx, &snapshot)?;
+    let (handlers, capabilities) = transport.input_context()?;
     let PreparedInputs {
         ledger,
         effective,
         mut budget,
         omitted_contexts,
     } = prepare_inputs(
-        &snapshot.task,
+        &snapshot,
         &handlers,
         &capabilities,
         max_inputs,
         max_payload_bytes,
-    )
-    .map_err(HttpClientError::CoreResult)?;
+    )?;
     // Emit no peer-controlled keys or values. The diagnostic precedes host
     // effects, and only after the entire batch passed capability admission.
     if omitted_contexts != 0 {
-        log::debug!("Unadvertised sampling context omitted from managed Task inputs");
+        log::debug!("Unadvertised sampling context omitted from Task inputs");
     }
     let (responses, owners) = resolve_batch(
         cx,
@@ -355,28 +503,263 @@ pub(super) async fn dispatch(
     .await?;
     ledger
         .validate_responses(&responses)
-        .map_err(|_| HttpClientError::CoreResult(invalid("Invalid Task input response batch")))?;
+        .map_err(|_| invalid("Invalid Task input response batch"))?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
     retention.check(cx)?;
-    let update_id = client.next_request_id()?;
-    let acknowledged = client
-        .connection
-        .update_task_final(
-            cx,
-            update_id,
-            &snapshot.task,
-            responses,
-            MAX_TASK_RESPONSE_BYTES,
-        )
-        .await
-        .map_err(HttpClientError::Connection)?;
+    let acknowledged = transport
+        .update(cx, cancellation, &snapshot, responses)
+        .await?;
     asupersync::runtime::yield_now().await;
     checkpoint(cx, cancellation)?;
     for owner in &owners {
         owner.0.record_response_sent();
     }
-    Ok(TaskResult::Update(acknowledged))
+    Ok(acknowledged)
+}
+
+pub(super) async fn dispatch(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    client: &mut HttpClient,
+    request_id: RequestId,
+    task_id: FinalTaskId,
+    max_inputs: usize,
+    max_payload_bytes: usize,
+) -> Result<TaskResult, HttpClientError> {
+    resolve_with_transport(
+        cx,
+        cancellation,
+        &mut HttpTaskInputTransport {
+            client,
+            request_id: Some(request_id),
+        },
+        task_id,
+        max_inputs,
+        max_payload_bytes,
+    )
+    .await
+    .map(TaskResult::Update)
+}
+
+fn native_deadline(
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    policy: crate::RequestTimeoutPolicy,
+    max_inputs: usize,
+    max_payload_bytes: usize,
+) -> McpResult<Instant> {
+    admit_input_limits(max_inputs, max_payload_bytes)?;
+    checkpoint(cx, cancellation)?;
+    if cx.timer_driver().is_none() {
+        return Err(McpError::internal_error(
+            "Task input resolution requires a caller timer driver",
+        ));
+    }
+    crate::mrtr_operation_deadline(cx, policy)
+}
+
+impl HttpClient {
+    /// Reads one fresh Task, resolves its inputs with this client's installed
+    /// modern roots, sampling and elicitation handlers, and submits one update.
+    ///
+    /// This call explicitly authorizes those host effects. The entire input
+    /// batch must satisfy the capabilities actually advertised by this client
+    /// and have installed handlers before any callback starts. Callbacks run
+    /// concurrently within finite count and payload bounds, without spawning
+    /// tasks. Unadvertised sampling context is omitted from callback inputs.
+    ///
+    /// The configured request absolute timeout and caller `Cx` deadline cover
+    /// the read, callbacks and update together. A caller timer driver is
+    /// required. Finite Task retention also bounds callback execution and
+    /// admission of the update. Dropping or cancelling the operation cancels
+    /// local callback owners; it never sends `tasks/cancel`.
+    ///
+    /// No failed or uncertain update is retried, and no Task is created. An
+    /// acknowledgement does not imply completion or change an existing handle:
+    /// explicitly poll or attach the Task afterward to reconcile its state.
+    /// Calling this API again is a new disclosure decision and may repeat host
+    /// effects. It does not provide crash recovery or exactly-once execution.
+    ///
+    /// `max_inputs` is 1..=MAX_TASK_INPUT_MAP_ENTRIES; `max_payload_bytes` is
+    /// 1..=8 MiB and covers the encoded descriptors plus keyed answers.
+    /// Invalid bounds and pre-cancellation refuse before allocating an ID.
+    pub async fn resolve_task_inputs_final(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    ) -> Result<FinalUpdateTaskResult, HttpClientError> {
+        self.resolve_task_inputs_final_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            task_id,
+            max_inputs,
+            max_payload_bytes,
+        )
+        .await
+    }
+
+    /// One-shot Task input resolution with caller-owned cancellation. An
+    /// interrupted update may already have reached the server; reconcile it
+    /// explicitly instead of invoking host callbacks again automatically.
+    pub async fn resolve_task_inputs_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    ) -> Result<FinalUpdateTaskResult, HttpClientError> {
+        let deadline = native_deadline(
+            cx,
+            cancellation,
+            self.request_timeout_policy,
+            max_inputs,
+            max_payload_bytes,
+        )?;
+        crate::wait_for_mrtr_operation(
+            cx,
+            Some(cancellation),
+            deadline,
+            resolve_with_transport(
+                cx,
+                cancellation,
+                &mut HttpTaskInputTransport {
+                    client: self,
+                    request_id: None,
+                },
+                task_id,
+                max_inputs,
+                max_payload_bytes,
+            ),
+        )
+        .await
+    }
+}
+
+#[cfg(unix)]
+impl Client {
+    /// Resolves one fresh Task input batch through the yielding Unix stdio
+    /// request owner. This has the same bounded host-effect admission and
+    /// single-update semantics as [`HttpClient::resolve_task_inputs_final`].
+    /// The original timeout also covers any deferred initialization. Dropping
+    /// a request retires only its owner; deferred wire cancellation is flushed
+    /// when this client next drives ingress or closes.
+    pub async fn resolve_task_inputs_final(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.resolve_task_inputs_final_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            task_id,
+            max_inputs,
+            max_payload_bytes,
+        )
+        .await
+    }
+
+    /// Resolves one admitted batch with caller cancellation. No callback or
+    /// uncertain update is automatically replayed. Read the Task again after
+    /// acknowledgement or interruption before deciding on another disclosure.
+    pub async fn resolve_task_inputs_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        let deadline = native_deadline(
+            cx,
+            cancellation,
+            self.timeout_policy,
+            max_inputs,
+            max_payload_bytes,
+        )?;
+        crate::wait_for_mrtr_operation(
+            cx,
+            Some(cancellation),
+            deadline,
+            resolve_with_transport(
+                cx,
+                cancellation,
+                self,
+                task_id,
+                max_inputs,
+                max_payload_bytes,
+            ),
+        )
+        .await
+    }
+}
+
+#[cfg(feature = "websocket-experimental")]
+impl<IO> WebSocketClient<IO>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    /// Resolves one fresh Task input batch over this negotiated WebSocket.
+    /// Admission, concurrent callbacks and bounds match
+    /// [`HttpClient::resolve_task_inputs_final`]. The operation retains the
+    /// same connection and request-ID allocator throughout; it never reconnects
+    /// or repeats an uncertain update. A successful ACK requires an explicit
+    /// later Task read to learn the resulting state.
+    pub async fn resolve_task_inputs_final(
+        &mut self,
+        cx: &Cx,
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        self.resolve_task_inputs_final_with_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            task_id,
+            max_inputs,
+            max_payload_bytes,
+        )
+        .await
+    }
+
+    /// One-shot Task input resolution with caller cancellation. The native
+    /// request owner handles abandonment; an interrupted partial frame makes
+    /// the connection unusable instead of replaying the update.
+    pub async fn resolve_task_inputs_final_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+        max_inputs: usize,
+        max_payload_bytes: usize,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        let deadline = native_deadline(
+            cx,
+            cancellation,
+            self.request_timeout_policy,
+            max_inputs,
+            max_payload_bytes,
+        )?;
+        crate::wait_for_mrtr_operation(
+            cx,
+            Some(cancellation),
+            deadline,
+            resolve_with_transport(
+                cx,
+                cancellation,
+                self,
+                task_id,
+                max_inputs,
+                max_payload_bytes,
+            ),
+        )
+        .await
+    }
 }
 
 impl ManagedHttpClient {
@@ -459,6 +842,663 @@ impl ManagedHttpClient {
         {
             TaskResult::Update(result) => Ok(result),
             _ => Err(ManagedHttpClientError::InvalidPolicy),
+        }
+    }
+}
+
+#[cfg(all(test, any(unix, feature = "websocket-experimental")))]
+mod native_tests {
+    use super::*;
+    use crate::{ClientBuilder, ClientProtocolPlan, ProtocolPolicy, RequestTimeoutPolicy};
+    use fastmcp_core::McpErrorCode;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    const INPUT_BYTES: usize = 64 * 1024;
+
+    fn id() -> FinalTaskId {
+        FinalTaskId::parse("task-1").unwrap()
+    }
+
+    fn discovery() -> Value {
+        json!({
+            "resultType":"complete", "supportedVersions":["2026-07-28"],
+            "capabilities":{"tools":{}, "extensions":{"io.modelcontextprotocol/tasks":{}}},
+            "ttlMs":0, "cacheScope":"private",
+            "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"task-input-peer","version":"1"}}
+        })
+    }
+
+    fn inputs() -> Value {
+        json!({
+            "a-roots":{"method":"roots/list"},
+            "b-sampling":{"method":"sampling/createMessage","params":{
+                "messages":[{"role":"user","content":{"type":"text","text":"hello"}}],
+                "maxTokens":16, "includeContext":"allServers"
+            }},
+            "c-form":{"method":"elicitation/create","params":{
+                "mode":"form", "message":"approve",
+                "requestedSchema":{"type":"object",
+                    "properties":{"answer":{"type":"string"}}, "required":["answer"]}
+            }}
+        })
+    }
+
+    fn answers() -> Value {
+        json!({
+            "a-roots":{"roots":[]},
+            "b-sampling":{"role":"assistant","model":"fixture",
+                "content":{"type":"text","text":"sampled"}},
+            "c-form":{"action":"accept","content":{"answer":"approved"}}
+        })
+    }
+
+    fn snapshot(input_requests: Value) -> Value {
+        json!({
+            "resultType":"complete", "taskId":"task-1", "status":"input_required",
+            "createdAt":"2026-07-28T12:00:00Z", "lastUpdatedAt":"2026-07-28T12:00:00Z",
+            "ttlMs":null, "inputRequests":input_requests
+        })
+    }
+
+    fn completed() -> Value {
+        json!({
+            "resultType":"complete", "taskId":"task-1", "status":"completed",
+            "createdAt":"2026-07-28T12:00:00Z", "lastUpdatedAt":"2026-07-28T12:00:01Z",
+            "ttlMs":null, "result":{"content":[], "futureResult":{"kept":true}}
+        })
+    }
+
+    fn catalog() -> Value {
+        json!({"resultType":"complete", "tools":[], "ttlMs":0, "cacheScope":"private"})
+    }
+
+    fn handlers(
+        calls: &Arc<AtomicUsize>,
+        owners: &Arc<Mutex<Vec<ReverseRequestCancellation>>>,
+    ) -> ReverseRequestHandlers {
+        let roots_called = Arc::clone(calls);
+        let roots_owned = Arc::clone(owners);
+        let sampling_called = Arc::clone(calls);
+        let sampling_owned = Arc::clone(owners);
+        let form_called = Arc::clone(calls);
+        let form_owned = Arc::clone(owners);
+        ReverseRequestHandlers::new()
+            .with_modern_roots_list(move |_, local, _| {
+                roots_called.fetch_add(1, Ordering::SeqCst);
+                roots_owned.lock().unwrap().push(local);
+                Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+            })
+            .with_modern_sampling_create_message(move |_, local, parameters| {
+                assert!(parameters.include_context.is_none());
+                sampling_called.fetch_add(1, Ordering::SeqCst);
+                sampling_owned.lock().unwrap().push(local);
+                let answer: crate::FinalCreateMessageResult = serde_json::from_value(json!({
+                    "role":"assistant", "model":"fixture",
+                    "content":{"type":"text","text":"sampled"}
+                }))
+                .unwrap();
+                Box::pin(async move { Ok(answer) })
+            })
+            .with_modern_elicitation_create(move |_, local, _| {
+                form_called.fetch_add(1, Ordering::SeqCst);
+                form_owned.lock().unwrap().push(local);
+                let answer: crate::ElicitResult = serde_json::from_value(json!({
+                    "action":"accept", "content":{"answer":"approved"}
+                }))
+                .unwrap();
+                Box::pin(async move { Ok(answer) })
+            })
+    }
+
+    struct PendingRoots {
+        cancellation: ReverseRequestCancellation,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingRoots {
+        type Output = McpResult<crate::FinalEmbeddedRootsListResult>;
+
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingRoots {
+        fn drop(&mut self) {
+            assert!(self.cancellation.is_cancel_requested());
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_roots(calls: &Arc<AtomicUsize>, drops: &Arc<AtomicUsize>) -> ReverseRequestHandlers {
+        let calls = Arc::clone(calls);
+        let drops = Arc::clone(drops);
+        ReverseRequestHandlers::new().with_modern_roots_list(move |_, cancellation, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(PendingRoots {
+                cancellation,
+                drops: Arc::clone(&drops),
+            })
+        })
+    }
+
+    #[cfg(unix)]
+    mod http {
+        use super::*;
+        use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        fn run(operation: impl Future<Output = ()>) {
+            RuntimeBuilder::current_thread()
+                .with_reactor(create_reactor().unwrap())
+                .build()
+                .unwrap()
+                .block_on(operation);
+        }
+
+        fn accept(listener: &TcpListener) -> TcpStream {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                        return stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "missing expected Task request");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("Task peer accept: {error}"),
+                }
+            }
+        }
+
+        fn read(stream: &mut TcpStream) -> Value {
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let end = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its headers");
+                bytes.extend_from_slice(&buffer[..count]);
+                assert!(bytes.len() <= 128 * 1024);
+                if let Some(index) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let length = std::str::from_utf8(&bytes[..end])
+                .unwrap()
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            assert!(length <= 64 * 1024);
+            while bytes.len() < end + length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "request ended before its body");
+                bytes.extend_from_slice(&buffer[..count]);
+            }
+            serde_json::from_slice(&bytes[end..end + length]).unwrap()
+        }
+
+        fn peer(
+            replies: Vec<(&'static str, Option<Value>)>,
+        ) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+            peer_with_update_cancellation(replies, None)
+        }
+
+        fn peer_with_update_cancellation(
+            replies: Vec<(&'static str, Option<Value>)>,
+            cancellation: Option<McpRequestCancellation>,
+        ) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for (index, (method, result)) in
+                    std::iter::once(("server/discover", Some(discovery())))
+                        .chain(replies)
+                        .enumerate()
+                {
+                    let mut stream = accept(&listener);
+                    let request = read(&mut stream);
+                    assert_eq!(request["id"], index + 1);
+                    assert_eq!(request["method"], method, "no implicit retry or Task cancellation");
+                    if method.starts_with("tasks/") {
+                        assert_eq!(request["params"]["taskId"], "task-1");
+                    }
+                    if method == "tasks/update" && result.is_none()
+                        && let Some(cancellation) = &cancellation
+                    {
+                        cancellation.cancel();
+                    }
+                    if let Some(result) = result {
+                        let body = serde_json::to_vec(&json!({
+                            "jsonrpc":"2.0", "id":index + 1, "result":result
+                        }))
+                        .unwrap();
+                        write!(stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len(),
+                        ).unwrap();
+                        stream.write_all(&body).unwrap();
+                        stream.flush().unwrap();
+                    }
+                    requests.push(request);
+                    // None deliberately loses the ACK after a complete update.
+                }
+                requests
+            });
+            (target, peer)
+        }
+
+        async fn connect(cx: &Cx, target: &str, callbacks: ReverseRequestHandlers) -> HttpClient {
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::http(
+                    ProtocolPolicy::ModernOnly,
+                    Some(crate::CanonicalHttpUrl::parse(target).unwrap()),
+                    None, None, "task-input-owner".into(), "task-input-trust".into(),
+                    "native-http".into(), 0, 0, 0,
+                ).unwrap())
+                .reverse_request_handlers(callbacks)
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
+                )
+                .connect_http_client_with_cx(cx)
+                .await
+                .unwrap()
+        }
+
+        #[test]
+        fn public_http_task_inputs_resolve_all_kinds_then_reconcile_authoritatively() {
+            let (target, peer) = peer(vec![
+                ("tasks/get", Some(snapshot(inputs()))),
+                ("tasks/update", Some(json!({"resultType":"complete"}))),
+                ("tasks/get", Some(completed())),
+                ("tools/list", Some(catalog())),
+            ]);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let owners = Arc::new(Mutex::new(Vec::new()));
+            run(async {
+                let cx = Cx::current().unwrap();
+                let mut client = connect(&cx, &target, handlers(&calls, &owners)).await;
+                client.resolve_task_inputs_final(&cx, id(), 3, INPUT_BYTES).await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                assert!(matches!(handle.task(), FinalTask::Completed { .. }));
+                assert_eq!(serde_json::to_value(handle.task()).unwrap()["result"]["futureResult"], json!({"kept":true}));
+                client.list_tools(&cx, None).await.unwrap();
+                assert!(cx.checkpoint().is_ok());
+            });
+            let requests = peer.join().unwrap();
+            assert_eq!(requests[2]["params"]["inputResponses"], answers());
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
+
+        #[test]
+        fn public_http_task_inputs_admit_entire_batch_before_host_effects() {
+            for case in ["missing-handler", "sampling-tools", "count", "bytes", "expired", "terminal"] {
+                let mut initial = snapshot(inputs());
+                if case == "sampling-tools" {
+                    initial["inputRequests"]["b-sampling"]["params"]["toolChoice"] = json!({"mode":"auto"});
+                } else if case == "expired" {
+                    initial["createdAt"] = json!("1970-01-01T00:00:00Z");
+                    initial["ttlMs"] = json!(1);
+                } else if case == "terminal" {
+                    initial = completed();
+                }
+                let (target, peer) = peer(vec![
+                    ("tasks/get", Some(initial)), ("tools/list", Some(catalog())),
+                ]);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let mut callbacks = handlers(&calls, &owners);
+                    if case == "missing-handler" {
+                        callbacks.modern_elicitation_create = None;
+                    }
+                    let mut client = connect(&cx, &target, callbacks).await;
+                    let result = client.resolve_task_inputs_final(
+                        &cx, id(), if case == "count" { 2 } else { 3 },
+                        if case == "bytes" { 1 } else { INPUT_BYTES },
+                    ).await;
+                    assert!(result.is_err(), "{case}");
+                    assert_eq!(calls.load(Ordering::SeqCst), 0, "{case}");
+                    assert!(owners.lock().unwrap().is_empty());
+                    client.list_tools(&cx, None).await.unwrap();
+                });
+                assert_eq!(peer.join().unwrap().len(), 3);
+            }
+        }
+
+        #[test]
+        fn public_http_task_input_limits_and_precancellation_spend_no_request_id() {
+            let (target, peer) = peer(vec![("tools/list", Some(catalog()))]);
+            run(async {
+                let cx = Cx::current().unwrap();
+                let mut client = connect(&cx, &target, ReverseRequestHandlers::new()).await;
+                for (count, bytes) in [(0, 1), (1, 0), (MAX_TASK_INPUT_MAP_ENTRIES + 1, 1), (1, MAX_TASK_RESPONSE_BYTES + 1)] {
+                    let error = client.resolve_task_inputs_final(&cx, id(), count, bytes).await.unwrap_err();
+                    assert!(matches!(error, HttpClientError::CoreResult(error) if error.code == McpErrorCode::InvalidParams));
+                }
+                let cancellation = McpRequestCancellation::new();
+                cancellation.cancel();
+                let error = client.resolve_task_inputs_final_with_cancellation(&cx, &cancellation, id(), 1, INPUT_BYTES).await.unwrap_err();
+                assert!(matches!(error, HttpClientError::CoreResult(error) if error.code == McpErrorCode::RequestCancelled));
+                client.list_tools(&cx, None).await.unwrap();
+            });
+            assert_eq!(peer.join().unwrap().len(), 2);
+        }
+
+        #[test]
+        fn public_http_task_input_abandonment_cancels_pending_callbacks_before_drop() {
+            for finish in ["cancel", "drop", "deadline"] {
+                let (target, peer) = peer(vec![
+                    ("tasks/get", Some(snapshot(json!({"roots":{"method":"roots/list"}})))),
+                    ("tools/list", Some(catalog())),
+                ]);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let mut client = connect(&cx, &target, pending_roots(&calls, &drops)).await;
+                    if finish == "deadline" {
+                        client.request_timeout_policy = RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(200)).unwrap();
+                    }
+                    let cancellation = McpRequestCancellation::new();
+                    let mut operation = Box::pin(client.resolve_task_inputs_final_with_cancellation(&cx, &cancellation, id(), 1, INPUT_BYTES));
+                    let started_by = Instant::now() + Duration::from_secs(2);
+                    poll_fn(|task| {
+                        assert!(Instant::now() < started_by);
+                        assert!(operation.as_mut().poll(task).is_pending());
+                        if calls.load(Ordering::SeqCst) == 1 { Poll::Ready(()) } else { Poll::Pending }
+                    }).await;
+                    if finish == "cancel" {
+                        cancellation.cancel();
+                        assert!(operation.as_mut().await.is_err());
+                    } else if finish == "deadline" {
+                        assert!(operation.as_mut().await.is_err());
+                    }
+                    drop(operation);
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    assert!(cx.checkpoint().is_ok());
+                    client.list_tools(&cx, None).await.unwrap();
+                });
+                assert_eq!(peer.join().unwrap().len(), 3);
+            }
+        }
+
+        #[test]
+        fn public_http_task_input_unknown_update_is_never_replayed() {
+            for cancelled in [false, true] {
+                let cancellation = McpRequestCancellation::new();
+                let (target, peer) = peer_with_update_cancellation(vec![
+                    ("tasks/get", Some(snapshot(inputs()))),
+                    ("tasks/update", None),
+                    ("tasks/get", Some(completed())),
+                    ("tools/list", Some(catalog())),
+                ], cancelled.then(|| cancellation.clone()));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                run(async {
+                    let cx = Cx::current().unwrap();
+                    let mut client = connect(&cx, &target, handlers(&calls, &owners)).await;
+                    assert!(client.resolve_task_inputs_final_with_cancellation(&cx, &cancellation, id(), 3, INPUT_BYTES).await.is_err());
+                    assert_eq!(calls.load(Ordering::SeqCst), 3);
+                    assert!(owners.lock().unwrap().iter().all(ReverseRequestCancellation::is_cancel_requested));
+                    assert!(cx.checkpoint().is_ok());
+                    let handle = client.attach_final_task(&cx, id()).await.unwrap();
+                    assert!(matches!(handle.task(), FinalTask::Completed { .. }));
+                    assert_eq!(calls.load(Ordering::SeqCst), 3);
+                    client.list_tools(&cx, None).await.unwrap();
+                });
+                let requests = peer.join().unwrap();
+                assert_eq!(requests[2]["params"]["inputResponses"], answers());
+                assert_eq!(requests.len(), 5);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    mod stdio {
+        use super::*;
+
+        fn exchange(id: u64, method: &str, result: Value) -> String {
+            let response = json!({"jsonrpc":"2.0", "id":id, "result":result});
+            format!(r#"
+IFS= read -r request || exit 81
+case "$request" in *'"id":{id}'*) ;; *) exit 82 ;; esac
+case "$request" in *'"method":"{method}"'*) ;; *) exit 83 ;; esac
+printf '%s\n' '{response}'
+"#)
+        }
+
+        async fn connect(cx: &Cx, script: &str, callbacks: ReverseRequestHandlers) -> Client {
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(callbacks)
+                .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap())
+                .connect_stdio_with_cx(cx, "sh", &["-c", script])
+                .await
+                .unwrap()
+        }
+
+        #[test]
+        fn public_stdio_task_inputs_resolve_all_kinds_then_reconcile_authoritatively() {
+            asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                let cx = Cx::current().unwrap();
+                let mut script = exchange(1, "server/discover", discovery());
+                script.push_str(&exchange(2, "tasks/get", snapshot(inputs())));
+                script.push_str(&exchange(3, "tasks/update", json!({"resultType":"complete"})));
+                script.push_str(&format!(r#"
+case "$request" in *'"taskId":"task-1"'*) ;; *) exit 84 ;; esac
+case "$request" in *'"inputResponses":{}'*) ;; *) exit 85 ;; esac
+"#, answers()));
+                script.push_str(&exchange(4, "tasks/get", completed()));
+                script.push_str(&exchange(5, "tasks/get", completed()));
+                script.push_str("exec sleep 10\n");
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                let mut client = connect(&cx, &script, handlers(&calls, &owners)).await;
+                client.resolve_task_inputs_final(&cx, id(), 3, INPUT_BYTES).await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                let current = client.get_task_final_with_cx(&cx, &McpRequestCancellation::new(), id()).await.unwrap();
+                assert!(matches!(current.task, FinalTask::Completed { .. }));
+                assert_eq!(serde_json::to_value(current.task).unwrap()["result"]["futureResult"], json!({"kept":true}));
+                client.get_task_final_with_cx(&cx, &McpRequestCancellation::new(), id()).await.unwrap();
+                client.close_with_cx(&cx).await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(cx.checkpoint().is_ok());
+            });
+        }
+
+        #[test]
+        fn public_stdio_task_input_rejection_and_callback_cancellation_send_no_update() {
+            for cancel_callback in [false, true] {
+                asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let signal = cancellation.clone();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let counted = Arc::clone(&calls);
+                    let owners = Arc::new(Mutex::new(Vec::new()));
+                    let retained = Arc::clone(&owners);
+                    let callbacks = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        retained.lock().unwrap().push(local);
+                        signal.cancel();
+                        Box::pin(async { Ok(crate::FinalEmbeddedRootsListResult { roots: vec![] }) })
+                    });
+                    let input = if cancel_callback {
+                        json!({"roots":{"method":"roots/list"}})
+                    } else {
+                        inputs()
+                    };
+                    let script = format!("{}{}{}exec sleep 10\n",
+                        exchange(1, "server/discover", discovery()),
+                        exchange(2, "tasks/get", snapshot(input)),
+                        exchange(3, "tasks/get", completed()),
+                    );
+                    let mut client = connect(&cx, &script, callbacks).await;
+                    let error = client.resolve_task_inputs_final_with_cancellation(&cx, &cancellation, id(), 3, INPUT_BYTES).await.unwrap_err();
+                    assert_eq!(calls.load(Ordering::SeqCst), usize::from(cancel_callback));
+                    if cancel_callback {
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        assert!(owners.lock().unwrap().iter().all(ReverseRequestCancellation::is_cancel_requested));
+                    }
+                    client.get_task_final_with_cx(&cx, &McpRequestCancellation::new(), id()).await.unwrap();
+                    client.close_with_cx(&cx).await.unwrap();
+                    assert!(cx.checkpoint().is_ok());
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    mod websocket {
+        use super::*;
+        use asupersync::io::AsyncWriteExt;
+        use asupersync::net::tcp::VirtualTcpStream;
+        use asupersync::test_utils::run_test;
+        use fastmcp_protocol::JsonRpcMessage;
+        use fastmcp_transport::TransportError;
+        use fastmcp_transport::websocket::AsyncWsServerTransport;
+
+        async fn frame(peer: &mut VirtualTcpStream, id: u64, result: Value) {
+            let source = json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string();
+            let payload = source.as_bytes();
+            let mut encoded = vec![0x81];
+            if payload.len() <= 125 {
+                encoded.push(u8::try_from(payload.len()).unwrap());
+            } else {
+                encoded.push(126);
+                encoded.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+            }
+            encoded.extend_from_slice(payload);
+            peer.write_all(&encoded).await.unwrap();
+        }
+
+        async fn connect(
+            cx: &Cx,
+            initial: Value,
+            callbacks: ReverseRequestHandlers,
+        ) -> (WebSocketClient<VirtualTcpStream>, VirtualTcpStream) {
+            let (client, mut peer) = VirtualTcpStream::pair(
+                "127.0.0.1:45141".parse().unwrap(),
+                "127.0.0.1:45142".parse().unwrap(),
+            );
+            frame(&mut peer, 1, discovery()).await;
+            frame(&mut peer, 2, initial).await;
+            let client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(callbacks)
+                .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap())
+                .connect_websocket_with_cx(cx, crate::AsyncWsClientTransport::from_upgraded(client))
+                .await
+                .unwrap();
+            (client, peer)
+        }
+
+        async fn trace(cx: &Cx, peer: VirtualTcpStream, methods: &[&str]) -> Vec<Value> {
+            let mut server = AsyncWsServerTransport::from_upgraded(peer);
+            let mut requests = Vec::new();
+            for (index, method) in methods.iter().enumerate() {
+                let JsonRpcMessage::Request(request) = server.recv(cx).await.unwrap() else {
+                    panic!("expected only Task requests and the catalog sentinel");
+                };
+                assert_eq!(request.method.as_str(), *method);
+                assert_eq!(request.id, Some(RequestId::Number(i64::try_from(index + 1).unwrap())));
+                requests.push(serde_json::to_value(request).unwrap());
+            }
+            assert!(matches!(server.recv(cx).await, Err(TransportError::Closed)), "no update replay or remote Task cancellation");
+            requests
+        }
+
+        #[test]
+        fn public_websocket_task_inputs_resolve_all_kinds_then_reconcile_authoritatively() {
+            run_test(|| async {
+                let cx = Cx::current().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                let (mut client, mut peer) = connect(&cx, snapshot(inputs()), handlers(&calls, &owners)).await;
+                frame(&mut peer, 3, json!({"resultType":"complete"})).await;
+                frame(&mut peer, 4, completed()).await;
+                frame(&mut peer, 5, catalog()).await;
+                client.resolve_task_inputs_final(&cx, id(), 3, INPUT_BYTES).await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+                assert!(owners.lock().unwrap().iter().all(|owner| !owner.is_cancel_requested()));
+                let current = client.get_task_final(&cx, id()).await.unwrap();
+                assert!(matches!(current.task, FinalTask::Completed { .. }));
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                let requests = trace(&cx, peer, &["server/discover", "tasks/get", "tasks/update", "tasks/get", "tools/list"]).await;
+                assert_eq!(requests[2]["params"]["inputResponses"], answers());
+                assert_eq!(calls.load(Ordering::SeqCst), 3);
+            });
+        }
+
+        #[test]
+        fn public_websocket_task_inputs_refuse_unadvertised_later_input_before_callbacks() {
+            run_test(|| async {
+                let cx = Cx::current().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let owners = Arc::new(Mutex::new(Vec::new()));
+                let mut input = inputs();
+                input["b-sampling"]["params"]["toolChoice"] = json!({"mode":"auto"});
+                let (mut client, mut peer) = connect(&cx, snapshot(input), handlers(&calls, &owners)).await;
+                frame(&mut peer, 3, catalog()).await;
+                assert!(client.resolve_task_inputs_final(&cx, id(), 3, INPUT_BYTES).await.is_err());
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                client.list_tools(&cx, None).await.unwrap();
+                client.close(&cx).await.unwrap();
+                trace(&cx, peer, &["server/discover", "tasks/get", "tools/list"]).await;
+            });
+        }
+
+        #[test]
+        fn public_websocket_task_input_cancellation_and_drop_dispose_local_callbacks() {
+            for cancelled in [false, true] {
+                run_test(|| async move {
+                    let cx = Cx::current().unwrap();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let drops = Arc::new(AtomicUsize::new(0));
+                    let (mut client, mut peer) = connect(
+                        &cx, snapshot(json!({"roots":{"method":"roots/list"}})), pending_roots(&calls, &drops),
+                    ).await;
+                    frame(&mut peer, 3, catalog()).await;
+                    let cancellation = McpRequestCancellation::new();
+                    let mut operation = Box::pin(client.resolve_task_inputs_final_with_cancellation(&cx, &cancellation, id(), 1, INPUT_BYTES));
+                    poll_fn(|task| {
+                        assert!(operation.as_mut().poll(task).is_pending());
+                        if calls.load(Ordering::SeqCst) == 1 { Poll::Ready(()) } else { Poll::Pending }
+                    }).await;
+                    if cancelled {
+                        cancellation.cancel();
+                        let error = operation.as_mut().await.unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    }
+                    drop(operation);
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(drops.load(Ordering::SeqCst), 1);
+                    assert!(cx.checkpoint().is_ok());
+                    client.list_tools(&cx, None).await.unwrap();
+                    client.close(&cx).await.unwrap();
+                    trace(&cx, peer, &["server/discover", "tasks/get", "tools/list"]).await;
+                });
+            }
         }
     }
 }
@@ -612,7 +1652,7 @@ mod tests {
             "one",
             request,
         ));
-        let Poll::Ready(Err(HttpClientError::CoreResult(error))) = future
+        let Poll::Ready(Err(error)) = future
             .as_mut()
             .poll(&mut Context::from_waker(Waker::noop()))
         else {
@@ -791,7 +1831,7 @@ mod tests {
                 root_inputs(&["a", "b", "c", "d"]),
                 &mut budget,
             ));
-            let Poll::Ready(Err(HttpClientError::CoreResult(error))) =
+            let Poll::Ready(Err(error)) =
                 batch.as_mut().poll(&mut Context::from_waker(Waker::noop()))
             else {
                 panic!("one rejected input must terminate the whole batch");
@@ -902,7 +1942,7 @@ mod tests {
         ));
         assert!(matches!(
             batch.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Err(HttpClientError::CoreResult(error)))
+            Poll::Ready(Err(error))
                 if error.code == fastmcp_core::McpErrorCode::RequestCancelled
         ));
         drop(batch);
