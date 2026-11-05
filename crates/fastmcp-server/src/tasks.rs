@@ -2443,11 +2443,25 @@ const FINAL_TASK_CANCELLATION_RESERVE_BYTES: usize =
 /// all tasks without a principal share one bounded embedding partition.
 /// Terminal results remain charged until expiry or authorized reclamation.
 /// [`Self::with_owner_capacity`] configures these ceilings before first use.
-/// These are encoded payload bounds, not decoded heap, active application
-/// memory, framework-wide memory, or persistent-storage guarantees.
+///
+/// Execution admission is independently shared by every runtime using this
+/// store. A claim reserves one deployment and immutable-principal slot before
+/// spending an attempt. The lease holds that reservation until release or
+/// expiry; an authorized service future additionally holds it through its
+/// destruction, including asynchronous cleanup after a committed transition.
+/// Stale claim receipts alone do not prevent lease recovery. A task still
+/// owned by a live service future cannot be claimed by another runner.
+/// [`Self::with_execution_capacity`] configures these ceilings before first use.
+/// Wrappers must preserve the store-returned attested claims to preserve this
+/// execution custody; rebuilding them from raw payloads discards it.
+///
+/// Payload bounds measure encoded bytes, not decoded heap or application
+/// allocations. Execution limits bound admitted handoffs, not their memory.
+/// Neither limit establishes framework-wide memory or persistent-storage guarantees.
 pub struct InMemoryFinalTaskStore {
     max_tasks: usize,
     execution_limits: FinalTaskExecutionLimits,
+    execution_admission: Arc<InMemoryFinalTaskExecutionAdmission>,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     state: Mutex<InMemoryFinalTaskState>,
 }
@@ -2881,6 +2895,127 @@ fn prepare_in_memory_final_task_input_key_history(
     Ok(Some(next))
 }
 
+/// Shared process-local execution capacity, independent of retained task
+/// records and renewable leases. Lock order is task state, then this pool;
+/// releasing a permit only locks the pool and never re-enters the store.
+struct InMemoryFinalTaskExecutionAdmission {
+    max_active: usize,
+    max_active_per_owner: usize,
+    state: Mutex<InMemoryFinalTaskExecutionAdmissionState>,
+}
+
+#[derive(Default)]
+struct InMemoryFinalTaskExecutionAdmissionState {
+    next_permit_id: u64,
+    reservations: BTreeMap<FinalTaskId, InMemoryFinalTaskExecutionReservation>,
+    per_owner: BTreeMap<Option<[u8; 32]>, usize>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InMemoryFinalTaskExecutionReservation {
+    permit_id: u64,
+    generation: u64,
+    owner_id: String,
+    principal: Option<[u8; 32]>,
+}
+
+/// The lease and an actual service future share strong custody. Attested
+/// claims carry only a weak reference: keeping an old receipt must not turn
+/// a finite pre-dispatch lease into an unlimited execution reservation.
+struct InMemoryFinalTaskExecutionPermit {
+    admission: Arc<InMemoryFinalTaskExecutionAdmission>,
+    task_id: FinalTaskId,
+    reservation: InMemoryFinalTaskExecutionReservation,
+}
+
+impl InMemoryFinalTaskExecutionAdmission {
+    fn new(max_active: usize, max_active_per_owner: usize) -> Self {
+        Self {
+            max_active,
+            max_active_per_owner,
+            state: Mutex::new(InMemoryFinalTaskExecutionAdmissionState::default()),
+        }
+    }
+
+    fn has_capacity(
+        &self,
+        state: &InMemoryFinalTaskExecutionAdmissionState,
+        task_id: &FinalTaskId,
+        principal: Option<Sha256Digest>,
+    ) -> bool {
+        state.reservations.len() < self.max_active
+            && !state.reservations.contains_key(task_id)
+            && state
+                .per_owner
+                .get(&principal.map(Sha256Digest::into_bytes))
+                .copied()
+                .unwrap_or(0)
+                < self.max_active_per_owner
+    }
+
+    fn reserve(
+        self: &Arc<Self>,
+        task_id: &FinalTaskId,
+        generation: u64,
+        owner_id: &str,
+        principal: Option<Sha256Digest>,
+    ) -> McpResult<Option<Arc<InMemoryFinalTaskExecutionPermit>>> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !self.has_capacity(&state, task_id, principal) {
+            return Ok(None);
+        }
+        let permit_id = state
+            .next_permit_id
+            .checked_add(1)
+            .ok_or_else(|| McpError::internal_error("Task execution permit identity exhausted"))?;
+        let principal = principal.map(Sha256Digest::into_bytes);
+        let active = state.per_owner.get(&principal).copied().unwrap_or(0);
+        let reservation = InMemoryFinalTaskExecutionReservation {
+            permit_id,
+            generation,
+            owner_id: owner_id.to_owned(),
+            principal,
+        };
+        state.next_permit_id = permit_id;
+        state.reservations.insert(task_id.clone(), reservation.clone());
+        state.per_owner.insert(principal, active + 1);
+        // Never construct or drop a last permit while holding its pool lock.
+        // All fallible checks precede these mutations; only the RAII owner
+        // created below can release this exact reservation.
+        drop(state);
+        Ok(Some(Arc::new(InMemoryFinalTaskExecutionPermit {
+            admission: Arc::clone(self),
+            task_id: task_id.clone(),
+            reservation,
+        })))
+    }
+}
+
+impl Drop for InMemoryFinalTaskExecutionPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.reservations.get(&self.task_id) != Some(&self.reservation) {
+            return;
+        }
+        state.reservations.remove(&self.task_id);
+        if let Some(active) = state.per_owner.get_mut(&self.reservation.principal) {
+            debug_assert!(*active > 0);
+            if *active > 1 {
+                *active -= 1;
+            } else {
+                state.per_owner.remove(&self.reservation.principal);
+            }
+        }
+    }
+}
+
 /// A durable handoff claim in the process-local store.
 ///
 /// The payload stays in its original durable map while this lease is live, so
@@ -2895,6 +3030,7 @@ struct InMemoryFinalTaskHandoffLease {
     owner_id: String,
     dispatch_fence: Option<u64>,
     recovery_expires_at: Option<Instant>,
+    _execution_permit: Arc<InMemoryFinalTaskExecutionPermit>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2959,6 +3095,88 @@ impl InMemoryFinalTaskStore {
         state.payload_accounting.max_tasks_per_owner = max_tasks_per_owner;
         state.payload_accounting.max_bytes_per_owner = max_payload_bytes_per_owner;
         Ok(self)
+    }
+
+    /// Default maximum admitted handoffs across every runtime sharing this store.
+    pub const DEFAULT_MAX_ACTIVE_TASKS: usize = 1_024;
+    /// Maximum configurable admitted handoffs across the shared store.
+    pub const HARD_MAX_ACTIVE_TASKS: usize = 16_384;
+    /// Default maximum admitted handoffs in one immutable principal partition.
+    pub const DEFAULT_MAX_ACTIVE_TASKS_PER_OWNER: usize = 32;
+    /// Maximum configurable admitted handoffs in one principal partition.
+    pub const HARD_MAX_ACTIVE_TASKS_PER_OWNER: usize = 256;
+
+    /// Sets shared deployment and per-principal execution capacities.
+    ///
+    /// Both limits must be positive. The deployment limit cannot exceed the
+    /// retained-task capacity or 16,384; the principal limit cannot exceed the
+    /// deployment limit or 256. Defaults are at most 1,024 and 32 respectively,
+    /// reduced to fit a smaller store. All unprotected embedding tasks share
+    /// one principal partition, independently of task IDs or service owners.
+    ///
+    /// Admission precedes the attempt charge for initial and resumed work.
+    /// Saturated work stays queued without spending an attempt. Recovery skips
+    /// saturated partitions, so a lower principal limit than deployment/runner
+    /// concurrency allows other owners to make progress.
+    ///
+    /// A completed, cancelled, expired, or reclaimed task still consumes its
+    /// slot while its application future is alive. Committing a result or
+    /// dropping the application handoff cannot bypass this bound. The limit
+    /// must be configured before the store has ever admitted a task.
+    pub fn with_execution_capacity(
+        mut self,
+        max_active: usize,
+        max_active_per_owner: usize,
+    ) -> McpResult<Self> {
+        let state = self
+            .state
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.next_generation != 0 || state.retention_journal.next_sequence != 0 {
+            return Err(McpError::invalid_params(
+                "Task execution capacity requires an unused task store",
+            ));
+        }
+        if max_active == 0
+            || max_active > self.max_tasks.min(Self::HARD_MAX_ACTIVE_TASKS)
+            || max_active_per_owner == 0
+            || max_active_per_owner > max_active.min(Self::HARD_MAX_ACTIVE_TASKS_PER_OWNER)
+        {
+            return Err(McpError::invalid_params(
+                "Task execution capacities must be positive and within deployment limits",
+            ));
+        }
+        self.execution_admission = Arc::new(InMemoryFinalTaskExecutionAdmission::new(
+            max_active,
+            max_active_per_owner,
+        ));
+        Ok(self)
+    }
+
+    /// Returns the shared limit on claimed or still-running application handoffs.
+    #[must_use]
+    pub fn max_active_tasks(&self) -> usize {
+        self.execution_admission.max_active
+    }
+
+    /// Returns the shared execution limit for one immutable principal partition.
+    #[must_use]
+    pub fn max_active_tasks_per_owner(&self) -> usize {
+        self.execution_admission.max_active_per_owner
+    }
+
+    /// Returns currently reserved execution slots, including pre-dispatch
+    /// claims and application futures still performing post-transition cleanup.
+    /// Ordinary store operations reconcile expired claims; a live service
+    /// future keeps its slot until destruction even after lease expiry.
+    #[must_use]
+    pub fn active_task_count(&self) -> usize {
+        self.execution_admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reservations
+            .len()
     }
 
     /// Configures the separate bounded process-local reclamation journal.
@@ -3048,9 +3266,14 @@ impl InMemoryFinalTaskStore {
                 "In-memory final task payload capacity must be between 1 byte and 512 MiB",
             ));
         }
+        let max_active = max_tasks.min(Self::DEFAULT_MAX_ACTIVE_TASKS);
         Ok(Self {
             max_tasks,
             execution_limits,
+            execution_admission: Arc::new(InMemoryFinalTaskExecutionAdmission::new(
+                max_active,
+                max_active.min(Self::DEFAULT_MAX_ACTIVE_TASKS_PER_OWNER),
+            )),
             clock,
             state: Mutex::new(InMemoryFinalTaskState {
                 payload_accounting: InMemoryFinalTaskPayloadAccounting {
@@ -3817,21 +4040,25 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     "In-memory final task store is missing a working task descriptor",
                 )
             })?;
-        insert_in_memory_final_task_handoff_lease(
+        let Some(execution_permit) = insert_in_memory_final_task_handoff_lease(
             &mut state,
+            &self.execution_admission,
             task_id.clone(),
             expected.generation(),
             InMemoryFinalTaskHandoffKind::Resumed,
             owner_id,
             now,
-        )?;
-        Ok(Some(FinalTaskAcceptedInputClaim::new(
-            task_id.clone(),
-            expected.generation(),
-            owner_id,
+        )? else {
+            return Ok(None);
+        };
+        Ok(Some(FinalTaskAcceptedInputClaim {
+            task_id: task_id.clone(),
+            generation: expected.generation(),
+            owner_id: owner_id.to_owned(),
             work_descriptor,
             input_responses,
-        )))
+            execution_permit: Some(execution_permit),
+        }))
     }
 
     fn work_descriptor_if_current(
@@ -3876,6 +4103,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
+        let admission = self
+            .execution_admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(task_id) = next_in_memory_final_task_recovery_id(
             state.initial_work.keys(),
             after_task_id,
@@ -3884,10 +4116,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     && !state.cancellation_requests.contains(task_id)
                     && !state.handoff_leases.contains_key(task_id)
                     && in_memory_final_task_execution_exhaustion(&state, task_id, now).is_none()
+                    && self.execution_admission.has_capacity(
+                        &admission,
+                        task_id,
+                        state.authenticated_principals.get(task_id).copied(),
+                    )
             },
         ) else {
             return Ok(None);
         };
+        drop(admission);
         let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
             McpError::internal_error(
                 "In-memory final task store retained initial work for a missing task",
@@ -3959,20 +4197,24 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let Some(work_descriptor) = state.initial_work.get(task_id).cloned() else {
             return Ok(None);
         };
-        insert_in_memory_final_task_handoff_lease(
+        let Some(execution_permit) = insert_in_memory_final_task_handoff_lease(
             &mut state,
+            &self.execution_admission,
             task_id.clone(),
             expected.generation(),
             InMemoryFinalTaskHandoffKind::Initial,
             owner_id,
             now,
-        )?;
-        Ok(Some(FinalTaskInitialWorkClaim::new(
-            task_id.clone(),
-            expected.generation(),
-            owner_id,
+        )? else {
+            return Ok(None);
+        };
+        Ok(Some(FinalTaskInitialWorkClaim {
+            task_id: task_id.clone(),
+            generation: expected.generation(),
+            owner_id: owner_id.to_owned(),
             work_descriptor,
-        )))
+            execution_permit: Some(execution_permit),
+        }))
     }
 
     fn restore_initial_work_if_current(
@@ -4048,6 +4290,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         let now = (self.clock)();
         reclaim_expired_in_memory_final_tasks(&mut state, now);
 
+        let admission = self
+            .execution_admission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(task_id) = next_in_memory_final_task_recovery_id(
             state.accepted_inputs.keys(),
             after_task_id,
@@ -4056,10 +4303,16 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                     && !state.cancellation_requests.contains(task_id)
                     && !state.handoff_leases.contains_key(task_id)
                     && in_memory_final_task_execution_exhaustion(&state, task_id, now).is_none()
+                    && self.execution_admission.has_capacity(
+                        &admission,
+                        task_id,
+                        state.authenticated_principals.get(task_id).copied(),
+                    )
             },
         ) else {
             return Ok(None);
         };
+        drop(admission);
         let task = state.tasks.get(&task_id).cloned().ok_or_else(|| {
             McpError::internal_error("In-memory final task store retained input for a missing task")
         })?;
@@ -4988,12 +5241,13 @@ fn terminalize_expired_in_memory_final_task_cancellation(
 
 fn insert_in_memory_final_task_handoff_lease(
     state: &mut InMemoryFinalTaskState,
+    admission: &Arc<InMemoryFinalTaskExecutionAdmission>,
     task_id: FinalTaskId,
     generation: u64,
     kind: InMemoryFinalTaskHandoffKind,
     owner_id: &str,
     now: Instant,
-) -> McpResult<()> {
+) -> McpResult<Option<Weak<InMemoryFinalTaskExecutionPermit>>> {
     if let Some(reason) = in_memory_final_task_execution_exhaustion(state, &task_id, now) {
         return Err(McpError::invalid_params(reason));
     }
@@ -5015,8 +5269,17 @@ fn insert_in_memory_final_task_handoff_lease(
             "In-memory final task store overwrote a live handoff lease",
         ));
     }
-    // Every checked admission above precedes both the attempt charge and the
-    // claim write, so a refused claim spends neither an attempt nor authority.
+    let Some(execution_permit) = admission.reserve(
+        &task_id,
+        generation,
+        owner_id,
+        state.authenticated_principals.get(&task_id).copied(),
+    )? else {
+        return Ok(None);
+    };
+    // Capacity is reserved under the task lock before spending an attempt.
+    // A saturated owner or a still-cleaning-up task changes no task, lease,
+    // notification, deadline, or attempt state.
     let budget = state.execution_budgets.get_mut(&task_id).ok_or_else(|| {
         McpError::internal_error("In-memory final task is missing execution accounting")
     })?;
@@ -5033,6 +5296,7 @@ fn insert_in_memory_final_task_handoff_lease(
                 owner_id: owner_id.to_owned(),
                 dispatch_fence: None,
                 recovery_expires_at: Some(expires_at),
+                _execution_permit: Arc::clone(&execution_permit),
             },
         )
         .is_some()
@@ -5041,7 +5305,7 @@ fn insert_in_memory_final_task_handoff_lease(
             "In-memory final task store overwrote a live handoff lease",
         ));
     }
-    Ok(())
+    Ok(Some(Arc::downgrade(&execution_permit)))
 }
 
 const FINAL_TASK_TOTAL_DEADLINE_EXCEEDED: &str = "Task total execution deadline exceeded";
@@ -5144,16 +5408,45 @@ impl FinalTaskWorkDescriptor {
 /// runtime checks every binding again before the opaque descriptor can reach
 /// application code, so a permissive store cannot substitute another task's
 /// operation into a valid recovery candidate.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct FinalTaskInitialWorkClaim {
     task_id: FinalTaskId,
     generation: u64,
     owner_id: String,
     work_descriptor: FinalTaskWorkDescriptor,
+    execution_permit: Option<Weak<InMemoryFinalTaskExecutionPermit>>,
+}
+
+// Receipt equality/debugging describe the existing attested payload, not
+// process-local admission custody. Cloning preserves the same weak receipt
+// without extending a crashed claimant's lease.
+impl PartialEq for FinalTaskInitialWorkClaim {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.generation == other.generation
+            && self.owner_id == other.owner_id
+            && self.work_descriptor == other.work_descriptor
+    }
+}
+
+impl std::fmt::Debug for FinalTaskInitialWorkClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FinalTaskInitialWorkClaim")
+            .field("task_id", &self.task_id)
+            .field("generation", &self.generation)
+            .field("owner_id", &self.owner_id)
+            .field("work_descriptor", &self.work_descriptor)
+            .finish()
+    }
 }
 
 impl FinalTaskInitialWorkClaim {
     /// Creates one store-returned initial-work claim.
+    ///
+    /// Custom stores own their execution-admission policy. A wrapper around
+    /// the in-memory store must forward its returned claim intact rather than
+    /// reconstructing it here, which would discard private execution custody.
     #[must_use]
     pub fn new(
         task_id: FinalTaskId,
@@ -5166,6 +5459,7 @@ impl FinalTaskInitialWorkClaim {
             generation,
             owner_id: owner_id.into(),
             work_descriptor,
+            execution_permit: None,
         }
     }
 }
@@ -5175,17 +5469,44 @@ impl FinalTaskInitialWorkClaim {
 /// The descriptor and accepted inputs are returned together so no recovery
 /// path can combine a descriptor from one durable task with input retained for
 /// another task or generation.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone)]
 pub struct FinalTaskAcceptedInputClaim {
     task_id: FinalTaskId,
     generation: u64,
     owner_id: String,
     work_descriptor: FinalTaskWorkDescriptor,
     input_responses: FinalTaskInputResponses,
+    execution_permit: Option<Weak<InMemoryFinalTaskExecutionPermit>>,
+}
+
+impl PartialEq for FinalTaskAcceptedInputClaim {
+    fn eq(&self, other: &Self) -> bool {
+        self.task_id == other.task_id
+            && self.generation == other.generation
+            && self.owner_id == other.owner_id
+            && self.work_descriptor == other.work_descriptor
+            && self.input_responses == other.input_responses
+    }
+}
+
+impl std::fmt::Debug for FinalTaskAcceptedInputClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FinalTaskAcceptedInputClaim")
+            .field("task_id", &self.task_id)
+            .field("generation", &self.generation)
+            .field("owner_id", &self.owner_id)
+            .field("work_descriptor", &self.work_descriptor)
+            .field("input_responses", &self.input_responses)
+            .finish()
+    }
 }
 
 impl FinalTaskAcceptedInputClaim {
     /// Creates one store-returned accepted-input claim.
+    ///
+    /// Custom stores own their execution-admission policy. Wrappers preserve
+    /// in-memory execution custody by forwarding its attested claim intact.
     #[must_use]
     pub fn new(
         task_id: FinalTaskId,
@@ -5200,6 +5521,7 @@ impl FinalTaskAcceptedInputClaim {
             owner_id: owner_id.into(),
             work_descriptor,
             input_responses,
+            execution_permit: None,
         }
     }
 }
@@ -5315,6 +5637,7 @@ pub struct FinalTaskInitialWork {
     generation: u64,
     work_descriptor: FinalTaskWorkDescriptor,
     authority: Option<FinalTaskHandoffAuthority>,
+    execution_permit: Option<Weak<InMemoryFinalTaskExecutionPermit>>,
 }
 
 impl PartialEq for FinalTaskInitialWork {
@@ -5413,6 +5736,7 @@ pub struct FinalTaskAcceptedInput {
     work_descriptor: FinalTaskWorkDescriptor,
     input_responses: FinalTaskInputResponses,
     authority: Option<FinalTaskHandoffAuthority>,
+    execution_permit: Option<Weak<InMemoryFinalTaskExecutionPermit>>,
 }
 
 impl PartialEq for FinalTaskAcceptedInput {
@@ -7521,6 +7845,7 @@ impl FinalTaskRuntime {
             generation: claim.generation,
             work_descriptor: claim.work_descriptor,
             authority: None,
+            execution_permit: claim.execution_permit,
         })
     }
 
@@ -7553,6 +7878,7 @@ impl FinalTaskRuntime {
             work_descriptor: claim.work_descriptor,
             input_responses: claim.input_responses,
             authority: None,
+            execution_permit: claim.execution_permit,
         })
     }
 
@@ -9170,6 +9496,11 @@ struct FinalTaskExecutionGuard {
     retention_deadline: Option<FinalTaskRetentionDeadline>,
     execution_budget: Option<FinalTaskExecutionBudget>,
     restoration: Option<FinalTaskHandoffRestoration>,
+    // Held through guard/future destruction, never cleared by disarm or by a
+    // terminal transition. The supervisor future is destroyed before its
+    // borrowing heartbeat future releases this guard.
+    _execution_permit: Option<Arc<InMemoryFinalTaskExecutionPermit>>,
+    execution_admission_lost: bool,
 }
 
 impl FinalTaskExecutionGuard {
@@ -9190,6 +9521,19 @@ impl FinalTaskExecutionGuard {
                 FinalTaskHandoffRestoration::Resumed(accepted.restore_copy()),
             ),
         };
+        let receipt = match handoff {
+            FinalTaskSupervisorHandoff::Initial(initial) => initial.execution_permit.as_ref(),
+            FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.execution_permit.as_ref(),
+        };
+        // Upgrade before this guard enters even an unpolled service future.
+        // A dead required receipt is different from a custom store's None:
+        // it must never silently grant unaccounted application execution.
+        let execution_permit = receipt.and_then(Weak::upgrade).filter(|permit| {
+            permit.task_id == task_id
+                && permit.reservation.generation == generation
+                && permit.reservation.owner_id == owner_id
+        });
+        let execution_admission_lost = receipt.is_some() && execution_permit.is_none();
         Self {
             runtime: runtime.clone(),
             task_id,
@@ -9199,11 +9543,16 @@ impl FinalTaskExecutionGuard {
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
-            restoration: Some(restoration),
+            restoration: (!execution_admission_lost).then_some(restoration),
+            _execution_permit: execution_permit,
+            execution_admission_lost,
         }
     }
 
     fn elect(&mut self) -> McpResult<bool> {
+        if self.execution_admission_lost {
+            return Ok(false);
+        }
         let Some(current) = self.runtime.load_optional_task_snapshot(&self.task_id)? else {
             return Ok(false);
         };
@@ -9462,6 +9811,12 @@ impl FinalTaskExecutionGuard {
 
 impl Drop for FinalTaskExecutionGuard {
     fn drop(&mut self) {
+        // A stale weak receipt may name the same generation/owner as a new
+        // pre-dispatch claim after explicit restoration. It has no right to
+        // retire or restore that successor, even if this future was never polled.
+        if self.execution_admission_lost {
+            return;
+        }
         if self.retire_if_execution_expired().unwrap_or(false) {
             return;
         }
@@ -9803,6 +10158,855 @@ mod tests {
                 }
             }),
         )
+    }
+
+
+    mod execution_capacity_tests {
+        use super::*;
+
+        fn store(
+            max_tasks: usize,
+            max_active: usize,
+            max_per_owner: usize,
+        ) -> Arc<InMemoryFinalTaskStore> {
+            Arc::new(
+                InMemoryFinalTaskStore::new(max_tasks)
+                    .unwrap()
+                    .with_owner_capacity(max_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+                    .unwrap()
+                    .with_execution_capacity(max_active, max_per_owner)
+                    .unwrap(),
+            )
+        }
+
+        fn clock_store(
+            max_tasks: usize,
+            max_active: usize,
+            max_per_owner: usize,
+        ) -> (Arc<InMemoryFinalTaskStore>, Arc<Mutex<Instant>>) {
+            let now = Arc::new(Mutex::new(Instant::now()));
+            let clock = Arc::clone(&now);
+            let store = InMemoryFinalTaskStore::with_clock(
+                max_tasks,
+                Arc::new(move || *clock.lock().unwrap()),
+            )
+            .unwrap()
+            .with_owner_capacity(max_tasks, InMemoryFinalTaskStore::DEFAULT_MAX_PAYLOAD_BYTES)
+            .unwrap()
+            .with_execution_capacity(max_active, max_per_owner)
+            .unwrap();
+            (Arc::new(store), now)
+        }
+
+        fn insert(
+            store: &InMemoryFinalTaskStore,
+            id: &str,
+            principal: Option<Sha256Digest>,
+        ) -> FinalTaskSnapshot {
+            let task = final_working_task_without_ttl(id);
+            let notification = final_task_notification(&task);
+            if let Some(principal) = principal {
+                store
+                    .create_task_with_authenticated_work(
+                        task,
+                        notification,
+                        final_test_work_descriptor(),
+                        principal,
+                    )
+                    .unwrap()
+            } else {
+                store
+                    .create_task_with_work(task, notification, final_test_work_descriptor())
+                    .unwrap()
+            }
+        }
+
+        fn runtime(store: &Arc<InMemoryFinalTaskStore>) -> FinalTaskRuntime {
+            FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(|_| {}),
+            )
+        }
+
+        fn runner(
+            runtime: &FinalTaskRuntime,
+            supervisor: Arc<dyn ApplicationTaskSupervisor>,
+            concurrency: usize,
+        ) -> AuthorizedTaskServiceRunner {
+            runtime
+                .install_task_service(1, supervisor)
+                .unwrap()
+                .with_max_concurrent_handoffs(concurrency)
+                .unwrap()
+        }
+
+        fn initial(
+            runtime: &FinalTaskRuntime,
+            store: &InMemoryFinalTaskStore,
+            snapshot: &FinalTaskSnapshot,
+            owner: &str,
+        ) -> FinalTaskInitialWork {
+            let claim = store
+                .take_initial_work_handoff_for_owner_if_current(snapshot, owner)
+                .unwrap()
+                .unwrap();
+            runtime
+                .validate_initial_work_claim(snapshot, owner, claim)
+                .unwrap()
+        }
+
+        #[derive(Default)]
+        struct CountingPendingSupervisor {
+            entries: AtomicUsize,
+        }
+
+        impl ApplicationTaskSupervisor for CountingPendingSupervisor {
+            fn resume<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                _handoff: FinalTaskSupervisorHandoff,
+            ) -> FinalTaskSupervisorFuture<'a> {
+                self.entries.fetch_add(1, AtomicOrdering::SeqCst);
+                // The application discards its handoff before returning a
+                // future. Framework custody must still retain the permit.
+                Box::pin(std::future::pending::<McpResult<()>>())
+            }
+        }
+
+
+        struct TerminalCleanupSupervisor {
+            store: Arc<InMemoryFinalTaskStore>,
+            competing: FinalTaskSnapshot,
+            ready: AtomicBool,
+            waker: Mutex<Option<std::task::Waker>>,
+            drops: Mutex<Vec<(usize, bool)>>,
+        }
+
+        struct CleanupAdmissionDropCheck<'a>(&'a TerminalCleanupSupervisor);
+
+        impl Drop for CleanupAdmissionDropCheck<'_> {
+            fn drop(&mut self) {
+                let denied = self
+                    .0
+                    .store
+                    .take_initial_work_handoff_for_owner_if_current(
+                        &self.0.competing,
+                        "application-destructor",
+                    )
+                    .unwrap()
+                    .is_none();
+                self.0
+                    .drops
+                    .lock()
+                    .unwrap()
+                    .push((self.0.store.active_task_count(), denied));
+            }
+        }
+
+        impl ApplicationTaskSupervisor for TerminalCleanupSupervisor {
+            fn resume<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                handoff: FinalTaskSupervisorHandoff,
+            ) -> FinalTaskSupervisorFuture<'a> {
+                Box::pin(async move {
+                    let _drop_check = CleanupAdmissionDropCheck(self);
+                    let result =
+                        serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+                    match handoff {
+                        FinalTaskSupervisorHandoff::Initial(initial) => {
+                            initial.complete_task(result, None)?;
+                        }
+                        FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                            accepted.complete_task(result, None)?;
+                        }
+                    }
+                    // The handoff has been destroyed. Only the framework's
+                    // execution guard can keep cleanup charged from here.
+                    std::future::poll_fn(|context| {
+                        *self.waker.lock().unwrap() = Some(context.waker().clone());
+                        if self.ready.load(AtomicOrdering::SeqCst) {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    Ok(())
+                })
+            }
+        }
+
+        #[test]
+        fn task_02_execution_capacity_survives_terminal_cleanup_and_future_destructors() {
+            for finish_normally in [false, true] {
+                let store = store(2, 1, 1);
+                let first = insert(&store, "capacity-cleanup-a", None);
+                let competing = insert(&store, "capacity-cleanup-b", None);
+                let first_runtime = runtime(&store);
+                let second_runtime = runtime(&store);
+                let cleanup = Arc::new(TerminalCleanupSupervisor {
+                    store: Arc::clone(&store),
+                    competing: competing.clone(),
+                    ready: AtomicBool::new(false),
+                    waker: Mutex::new(None),
+                    drops: Mutex::new(Vec::new()),
+                });
+                let first_runner = runner(&first_runtime, cleanup.clone(), 1);
+                let handoff = initial(&first_runtime, &store, &first, &first_runner.dispatch_owner);
+                let second_probe = Arc::new(CountingPendingSupervisor::default());
+                let mut second_runner = runner(&second_runtime, second_probe.clone(), 2);
+                let cx = Cx::for_testing();
+                let mut first_future = first_runner
+                    .resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
+                let mut second_service = Box::pin(second_runner.run_service(&cx));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(first_future.as_mut().poll(&mut context).is_pending());
+                let terminal = store
+                    .get_task_snapshot(&first.task().base().task_id)
+                    .unwrap()
+                    .unwrap();
+                assert!(matches!(terminal.task(), FinalTask::Completed { .. }));
+                assert!(store.state.lock().unwrap().handoff_leases.is_empty());
+                assert_eq!(store.active_task_count(), 1);
+                assert!(second_service.as_mut().poll(&mut context).is_pending());
+                assert_eq!(second_probe.entries.load(AtomicOrdering::SeqCst), 0);
+
+                // Even removing the completed record cannot reclaim the live
+                // application's independently owned execution reservation.
+                if !finish_normally {
+                    assert!(matches!(
+                        store
+                            .reclaim_terminal_task_if_current(
+                                &cx,
+                                &terminal.task().base().task_id,
+                                terminal.generation(),
+                                TaskRetentionReason::OperatorRequest,
+                            )
+                            .unwrap(),
+                        TaskRetentionReclamation::Reclaimed(_)
+                    ));
+                    assert_eq!(store.task_count(), 1);
+                }
+                assert_eq!(store.active_task_count(), 1);
+                assert!(second_service.as_mut().poll(&mut context).is_pending());
+                assert_eq!(
+                    store
+                        .task_execution_budget_if_current(&competing)
+                        .unwrap()
+                        .unwrap()
+                        .attempts(),
+                    0
+                );
+                if finish_normally {
+                    cleanup.ready.store(true, AtomicOrdering::SeqCst);
+                    cleanup.waker.lock().unwrap().take().unwrap().wake();
+                    assert!(matches!(
+                        first_future.as_mut().poll(&mut context),
+                        std::task::Poll::Ready(Ok(()))
+                    ));
+                }
+                drop(first_future);
+                assert_eq!(cleanup.drops.lock().unwrap().as_slice(), &[(1, true)]);
+                assert_eq!(store.active_task_count(), 0);
+                second_runtime.signal_task_service(competing.task().base().task_id.clone());
+                assert!(second_service.as_mut().poll(&mut context).is_pending());
+                assert_eq!(second_probe.entries.load(AtomicOrdering::SeqCst), 1);
+                assert_eq!(store.active_task_count(), 1);
+                drop(second_service);
+                assert_eq!(store.active_task_count(), 0);
+            }
+        }
+
+        #[test]
+        fn task_02_execution_capacity_input_successor_waits_across_runners() {
+            let store = store(1, 1, 1);
+            let original = insert(&store, "capacity-input-cleanup", None);
+            let id = original.task().base().task_id.clone();
+            let first_runtime = runtime(&store);
+            let second_runtime = runtime(&store);
+            let probe = Arc::new(TaskTransitionCleanupProbe::default());
+            let mut first_runner = runner(&first_runtime, probe.clone(), 2);
+            let mut second_runner = runner(&second_runtime, probe.clone(), 2);
+            let cx = Cx::for_testing();
+            let mut first_service = Box::pin(first_runner.run_service(&cx));
+            let mut second_service = Box::pin(second_runner.run_service(&cx));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(first_service.as_mut().poll(&mut context).is_pending());
+            let inputs =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            second_runtime.update_task(&id, &inputs).unwrap();
+            let successor = store.get_task_snapshot(&id).unwrap().unwrap();
+            let budget = store
+                .task_execution_budget_if_current(&successor)
+                .unwrap()
+                .unwrap();
+            for _ in 0..4 {
+                second_runtime.signal_task_service(id.clone());
+                assert!(second_service.as_mut().poll(&mut context).is_pending());
+            }
+            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(store.active_task_count(), 1);
+            assert_eq!(
+                store.task_execution_budget_if_current(&successor).unwrap(),
+                Some(budget)
+            );
+            assert_eq!(store.state.lock().unwrap().accepted_inputs.get(&id), Some(&inputs));
+            assert!(store.next_accepted_input_snapshot().unwrap().is_none());
+            probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
+            drop(first_service);
+            assert_eq!(store.active_task_count(), 0);
+            second_runtime.signal_task_service(id.clone());
+            assert!(second_service.as_mut().poll(&mut context).is_pending());
+            assert_eq!(probe.resumed.load(AtomicOrdering::SeqCst), 1);
+            assert!(matches!(store.get_task(&id).unwrap(), Some(FinalTask::Completed { .. })));
+            assert_eq!(store.active_task_count(), 0);
+            drop(second_service);
+        }
+
+        #[test]
+        fn task_02_execution_capacity_initial_and_resumed_claims_share_owner_quota() {
+            let store = store(3, 2, 1);
+            let owner = Some(Sha256Digest::from_bytes([1; 32]));
+            let first = insert(&store, "capacity-mixed-a", owner);
+            let waiting = insert(&store, "capacity-mixed-b", owner);
+            let other = insert(
+                &store,
+                "capacity-mixed-c",
+                Some(Sha256Digest::from_bytes([2; 32])),
+            );
+            let runtime = runtime(&store);
+            let id = waiting.task().base().task_id.clone();
+            runtime.require_input(&id, final_roots_request(), None).unwrap();
+            let inputs =
+                serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+            runtime.update_task(&id, &inputs).unwrap();
+            let resumed = store.get_task_snapshot(&id).unwrap().unwrap();
+            let before = store.task_execution_budget_if_current(&resumed).unwrap();
+            let first_claim = store
+                .take_initial_work_handoff_for_owner_if_current(&first, "initial-worker")
+                .unwrap()
+                .unwrap();
+            assert!(
+                store
+                    .take_input_handoff_for_owner_if_current(&resumed, "resumed-worker")
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(store.next_accepted_input_snapshot().unwrap().is_none());
+            assert_eq!(store.task_execution_budget_if_current(&resumed).unwrap(), before);
+            assert_eq!(store.state.lock().unwrap().accepted_inputs.get(&id), Some(&inputs));
+            assert_eq!(
+                store.next_initial_work_snapshot().unwrap().unwrap().task().base().task_id,
+                other.task().base().task_id
+            );
+            assert!(
+                store
+                    .restore_initial_work_for_owner_if_current(
+                        &first_claim.task_id,
+                        first_claim.generation,
+                        "initial-worker",
+                        None,
+                        first_claim.work_descriptor.clone(),
+                    )
+                    .unwrap()
+            );
+            let accepted = store
+                .take_input_handoff_for_owner_if_current(&resumed, "resumed-worker")
+                .unwrap()
+                .unwrap();
+            assert_eq!(accepted.input_responses, inputs);
+            assert_eq!(store.active_task_count(), 1);
+            assert!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&first, "new-initial-worker")
+                    .unwrap()
+                    .is_none(),
+                "resumed work spends the same owner allowance as initial work"
+            );
+            assert!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&other, "other-owner-worker")
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(store.active_task_count(), 2);
+        }
+
+
+        #[test]
+        fn task_02_execution_capacity_dead_receipts_cannot_release_same_owner_successors() {
+            for expire_lease in [false, true] {
+                for poll_stale in [false, true] {
+                    let (store, clock) = clock_store(1, 1, 1);
+                    let snapshot = insert(&store, "capacity-stale-receipt", None);
+                    let runtime = runtime(&store);
+                    let probe = Arc::new(CountingPendingSupervisor::default());
+                    let runner = runner(&runtime, probe.clone(), 1);
+                    let owner = runner.dispatch_owner.as_str();
+                    let old = store
+                        .take_initial_work_handoff_for_owner_if_current(&snapshot, owner)
+                        .unwrap()
+                        .unwrap();
+                    let old_clone = old.clone();
+                    let plain = FinalTaskInitialWorkClaim::new(
+                        old.task_id.clone(),
+                        old.generation,
+                        owner,
+                        old.work_descriptor.clone(),
+                    );
+                    assert_eq!(old, plain);
+                    assert_eq!(format!("{old:?}"), format!("{plain:?}"));
+                    let stale = runtime
+                        .validate_initial_work_claim(&snapshot, owner, old)
+                        .unwrap();
+                    if expire_lease {
+                        *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+                    } else {
+                        assert!(
+                            store
+                                .restore_initial_work_for_owner_if_current(
+                                    &old_clone.task_id,
+                                    old_clone.generation,
+                                    owner,
+                                    None,
+                                    old_clone.work_descriptor.clone(),
+                                )
+                                .unwrap()
+                        );
+                    }
+                    let current = store
+                        .get_task_snapshot(&snapshot.task().base().task_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(store.active_task_count(), 0);
+                    let successor = store
+                        .take_initial_work_handoff_for_owner_if_current(&current, owner)
+                        .unwrap()
+                        .unwrap();
+                    let budget = store.task_execution_budget_if_current(&current).unwrap();
+                    let cx = Cx::for_testing();
+                    let mut stale_future =
+                        runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(stale));
+                    if poll_stale {
+                        let mut context =
+                            std::task::Context::from_waker(std::task::Waker::noop());
+                        assert!(matches!(
+                            stale_future.as_mut().poll(&mut context),
+                            std::task::Poll::Ready(Ok(()))
+                        ));
+                    }
+                    drop(stale_future);
+                    drop(old_clone);
+                    assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 0);
+                    assert_eq!(store.active_task_count(), 1);
+                    assert_eq!(store.task_execution_budget_if_current(&current).unwrap(), budget);
+                    assert!(store.next_initial_work_snapshot().unwrap().is_none());
+                    let accepted = runtime
+                        .validate_initial_work_claim(&current, owner, successor)
+                        .unwrap();
+                    let mut successor_future =
+                        runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(accepted));
+                    let mut context =
+                        std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(successor_future.as_mut().poll(&mut context).is_pending());
+                    assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 1);
+                    drop(successor_future);
+                    assert_eq!(store.active_task_count(), 0);
+                }
+            }
+        }
+
+
+        #[test]
+        fn task_02_execution_capacity_live_future_keeps_expired_lease_charged() {
+            for start_application in [false, true] {
+                let (store, clock) = clock_store(1, 1, 1);
+                let snapshot = insert(&store, "capacity-expired-live-future", None);
+                let runtime = runtime(&store);
+                let probe = Arc::new(CountingPendingSupervisor::default());
+                let runner = runner(&runtime, probe.clone(), 1);
+                let handoff = initial(&runtime, &store, &snapshot, &runner.dispatch_owner);
+                let cx = Cx::for_testing();
+                let mut future =
+                    runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
+                let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                if start_application {
+                    assert!(future.as_mut().poll(&mut context).is_pending());
+                }
+                *clock.lock().unwrap() += IN_MEMORY_FINAL_TASK_HANDOFF_LEASE;
+                let successor = store
+                    .get_task_snapshot(&snapshot.task().base().task_id)
+                    .unwrap()
+                    .unwrap();
+                let budget = store.task_execution_budget_if_current(&successor).unwrap();
+                assert!(successor.generation() > snapshot.generation());
+                assert!(store.state.lock().unwrap().handoff_leases.is_empty());
+                assert_eq!(store.active_task_count(), 1);
+                assert!(store.next_initial_work_snapshot().unwrap().is_none());
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&successor, "replacement")
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(store.task_execution_budget_if_current(&successor).unwrap(), budget);
+                drop(future);
+                assert_eq!(
+                    probe.entries.load(AtomicOrdering::SeqCst),
+                    usize::from(start_application)
+                );
+                assert_eq!(store.active_task_count(), 0);
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&successor, "replacement")
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(store.active_task_count(), 1);
+            }
+        }
+
+        #[test]
+        fn task_02_execution_capacity_cancelled_unpolled_future_releases_on_drop() {
+            let store = store(2, 1, 1);
+            let first = insert(&store, "capacity-cancel-a", None);
+            let second = insert(&store, "capacity-cancel-b", None);
+            let runtime = runtime(&store);
+            let probe = Arc::new(CountingPendingSupervisor::default());
+            let runner = runner(&runtime, probe.clone(), 1);
+            let handoff = initial(&runtime, &store, &first, &runner.dispatch_owner);
+            let cx = Cx::for_testing();
+            let future = runner.resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(handoff));
+            runtime.cancel_task(&first.task().base().task_id).unwrap();
+            assert!(matches!(
+                store.get_task(&first.task().base().task_id).unwrap(),
+                Some(FinalTask::Cancelled(_))
+            ));
+            assert_eq!(store.active_task_count(), 1);
+            assert!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&second, "other")
+                    .unwrap()
+                    .is_none()
+            );
+            drop(future);
+            assert_eq!(probe.entries.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(store.active_task_count(), 0);
+            assert!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&second, "other")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        #[test]
+        fn task_02_execution_capacity_configuration_is_bounded_and_immutable() {
+            let defaults = InMemoryFinalTaskStore::default();
+            assert_eq!(defaults.max_active_tasks(), 1_024);
+            assert_eq!(defaults.max_active_tasks_per_owner(), 32);
+            assert_eq!(defaults.active_task_count(), 0);
+            let small = InMemoryFinalTaskStore::new(2).unwrap();
+            assert_eq!(small.max_active_tasks(), 2);
+            assert_eq!(small.max_active_tasks_per_owner(), 2);
+            let configured = small.with_execution_capacity(2, 1).unwrap();
+            assert_eq!(configured.max_active_tasks(), 2);
+            assert_eq!(configured.max_active_tasks_per_owner(), 1);
+            insert(&configured, "capacity-used", None);
+            assert!(configured.with_execution_capacity(1, 1).is_err());
+
+            for (active, owner) in [
+                (0, 1),
+                (2, 0),
+                (2, 3),
+                (16_385, 1),
+                (16_384, 257),
+                (usize::MAX, 1),
+            ] {
+                assert!(
+                    InMemoryFinalTaskStore::new(16_384)
+                        .unwrap()
+                        .with_execution_capacity(active, owner)
+                        .is_err()
+                );
+            }
+            assert!(
+                InMemoryFinalTaskStore::new(2)
+                    .unwrap()
+                    .with_execution_capacity(3, 1)
+                    .is_err()
+            );
+            let largest = InMemoryFinalTaskStore::new(16_384)
+                .unwrap()
+                .with_execution_capacity(16_384, 256)
+                .unwrap();
+            assert_eq!(largest.max_active_tasks(), 16_384);
+            assert_eq!(largest.max_active_tasks_per_owner(), 256);
+        }
+
+        #[test]
+        fn task_02_execution_capacity_owner_saturation_preserves_queued_work() {
+            for principal in [None, Some(Sha256Digest::from_bytes([1; 32]))] {
+                let store = store(3, 3, 1);
+                let first = insert(&store, "capacity-a-first", principal);
+                let second = insert(&store, "capacity-a-second", principal);
+                let other = insert(
+                    &store,
+                    "capacity-z-other",
+                    Some(Sha256Digest::from_bytes([2; 32])),
+                );
+                let before = store
+                    .task_execution_budget_if_current(&second)
+                    .unwrap()
+                    .unwrap();
+                let notification = store
+                    .latest_notification(&second.task().base().task_id)
+                    .unwrap();
+                let first_claim = store
+                    .take_initial_work_handoff_for_owner_if_current(&first, "worker-one")
+                    .unwrap()
+                    .unwrap();
+                for worker in ["worker-one", "worker-two"] {
+                    assert!(
+                        store
+                            .take_initial_work_handoff_for_owner_if_current(&second, worker)
+                            .unwrap()
+                            .is_none(),
+                        "changing the service owner cannot evade the principal ceiling"
+                    );
+                }
+                assert_eq!(store.active_task_count(), 1);
+                assert_eq!(
+                    store.task_execution_budget_if_current(&second).unwrap(),
+                    Some(before)
+                );
+                let after = store
+                    .get_task_snapshot(&second.task().base().task_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.generation(), second.generation());
+                assert!(final_tasks_match_exactly(after.task(), second.task()).unwrap());
+                assert!(
+                    final_tasks_match_exactly(
+                        &store
+                            .latest_notification(&second.task().base().task_id)
+                            .unwrap()
+                            .params
+                            .task,
+                        &notification.params.task,
+                    )
+                    .unwrap()
+                );
+                let eligible = store.next_initial_work_snapshot().unwrap().unwrap();
+                assert_eq!(eligible.task().base().task_id, other.task().base().task_id);
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&eligible, "worker-two")
+                        .unwrap()
+                        .is_some()
+                );
+                assert_eq!(store.active_task_count(), 2);
+                assert!(
+                    store
+                        .restore_initial_work_for_owner_if_current(
+                            &first_claim.task_id,
+                            first_claim.generation,
+                            "worker-one",
+                            None,
+                            first_claim.work_descriptor.clone(),
+                        )
+                        .unwrap()
+                );
+                assert_eq!(store.active_task_count(), 1);
+                assert!(
+                    store
+                        .take_initial_work_handoff_for_owner_if_current(&second, "worker-three")
+                        .unwrap()
+                        .is_some(),
+                    "the same queued work becomes eligible when its owner's slot is released"
+                );
+                assert_eq!(
+                    store
+                        .task_execution_budget_if_current(&second)
+                        .unwrap()
+                        .unwrap()
+                        .attempts(),
+                    1
+                );
+            }
+        }
+
+        #[test]
+        fn task_02_execution_capacity_parallel_claims_share_atomic_limits() {
+            for same_principal in [false, true] {
+                let store = store(8, if same_principal { 4 } else { 2 }, 2);
+                let snapshots = (0_u8..8)
+                    .map(|index| {
+                        insert(
+                            &store,
+                            &format!("capacity-race-{index}"),
+                            Some(Sha256Digest::from_bytes([
+                                if same_principal { 1 } else { index + 1 };
+                                32
+                            ])),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let barrier = Arc::new(std::sync::Barrier::new(snapshots.len()));
+                let claims = std::thread::scope(|scope| {
+                    let handles = snapshots
+                        .iter()
+                        .enumerate()
+                        .map(|(index, snapshot)| {
+                            let store = Arc::clone(&store);
+                            let barrier = Arc::clone(&barrier);
+                            scope.spawn(move || {
+                                let owner = format!("worker-{index}");
+                                barrier.wait();
+                                store
+                                    .take_initial_work_handoff_for_owner_if_current(snapshot, &owner)
+                                    .unwrap()
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(claims.iter().filter(|claim| claim.is_some()).count(), 2);
+                assert_eq!(store.active_task_count(), 2);
+                for (snapshot, claim) in snapshots.iter().zip(&claims) {
+                    let budget = store
+                        .task_execution_budget_if_current(snapshot)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(budget.attempts(), u32::from(claim.is_some()));
+                    assert_eq!(budget.attempt_deadline().is_some(), claim.is_some());
+                    let current = store
+                        .get_task_snapshot(&snapshot.task().base().task_id)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(current.generation(), snapshot.generation());
+                    assert!(final_tasks_match_exactly(current.task(), snapshot.task()).unwrap());
+                }
+                for claim in claims.iter().flatten() {
+                    assert!(
+                        store
+                            .restore_initial_work_for_owner_if_current(
+                                &claim.task_id,
+                                claim.generation,
+                                &claim.owner_id,
+                                None,
+                                claim.work_descriptor.clone(),
+                            )
+                            .unwrap()
+                    );
+                }
+                assert_eq!(store.active_task_count(), 0);
+                assert!(
+                    store
+                        .execution_admission
+                        .state
+                        .lock()
+                        .unwrap()
+                        .per_owner
+                        .is_empty(),
+                    "released principals do not accumulate unbounded accounting entries"
+                );
+                drop(claims);
+                assert_eq!(store.active_task_count(), 0, "old receipt drops release nothing twice");
+            }
+        }
+
+        #[test]
+        fn task_02_execution_capacity_is_shared_by_independent_service_runners() {
+            let store = store(4, 2, 1);
+            let alice = insert(
+                &store,
+                "capacity-service-a-first",
+                Some(Sha256Digest::from_bytes([1; 32])),
+            );
+            let alice_queued = insert(
+                &store,
+                "capacity-service-a-second",
+                Some(Sha256Digest::from_bytes([1; 32])),
+            );
+            let bob = insert(
+                &store,
+                "capacity-service-b-first",
+                Some(Sha256Digest::from_bytes([2; 32])),
+            );
+            let charlie = insert(
+                &store,
+                "capacity-service-c-first",
+                Some(Sha256Digest::from_bytes([3; 32])),
+            );
+            let probe = Arc::new(ConcurrentTaskProbe::default());
+            let first_runtime = runtime(&store);
+            let second_runtime = runtime(&store);
+            let third_runtime = runtime(&store);
+            let mut first_runner = runner(&first_runtime, probe.clone(), 1);
+            let mut second_runner = runner(&second_runtime, probe.clone(), 1);
+            let mut third_runner = runner(&third_runtime, probe.clone(), 2);
+            let cx = Cx::for_testing();
+            let mut first_service = Box::pin(first_runner.run_service(&cx));
+            let mut second_service = Box::pin(second_runner.run_service(&cx));
+            let mut third_service = Box::pin(third_runner.run_service(&cx));
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(first_service.as_mut().poll(&mut context).is_pending());
+            assert!(second_service.as_mut().poll(&mut context).is_pending());
+            for _ in 0..4 {
+                assert!(
+                    third_service.as_mut().poll(&mut context).is_pending(),
+                    "saturation waits instead of failing recovery or spinning"
+                );
+            }
+            assert_eq!(
+                probe.state.lock().unwrap().started,
+                [alice.task().base().task_id.clone(), bob.task().base().task_id.clone()]
+            );
+            assert_eq!(store.active_task_count(), 2);
+            for queued in [&alice_queued, &charlie] {
+                assert_eq!(
+                    store
+                        .task_execution_budget_if_current(queued)
+                        .unwrap()
+                        .unwrap()
+                        .attempts(),
+                    0
+                );
+            }
+            probe.release(&bob.task().base().task_id, false);
+            assert!(second_service.as_mut().poll(&mut context).is_pending());
+            assert!(
+                probe
+                    .state
+                    .lock()
+                    .unwrap()
+                    .live
+                    .contains(&charlie.task().base().task_id),
+                "recovery passes Alice's saturated partition and admits Charlie"
+            );
+            assert_eq!(probe.state.lock().unwrap().peak_live, 2);
+            assert_eq!(store.active_task_count(), 2);
+            assert!(first_runtime.is_task_service_ready());
+            assert!(second_runtime.is_task_service_ready());
+            assert!(third_runtime.is_task_service_ready());
+            drop(third_service);
+            drop(second_service);
+            drop(first_service);
+            assert_eq!(store.active_task_count(), 0);
+            assert!(probe.state.lock().unwrap().live.is_empty());
+            assert!(
+                store
+                    .take_initial_work_handoff_for_owner_if_current(&alice_queued, "replacement")
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 
     #[derive(Default)]
@@ -10372,8 +11576,13 @@ mod tests {
             after_update
         );
         assert!(
-            test_next_accepted_input(&store).unwrap().is_some(),
-            "deferred successor input is restored for authoritative recovery"
+            test_next_accepted_input(&store).unwrap().is_none(),
+            "cleanup-owned successor input cannot be claimed by another runner"
+        );
+        assert_eq!(
+            store.state.lock().unwrap().accepted_inputs.get(&task_id),
+            Some(&inputs),
+            "deferring execution preserves the exact accepted input for recovery"
         );
         probe.cleanup_ready.store(true, AtomicOrdering::SeqCst);
         probe.cleanup_waker.lock().unwrap().take().unwrap().wake();
@@ -20066,6 +21275,8 @@ mod tests {
             retention_deadline: None,
             execution_budget: None,
             restoration: None,
+            _execution_permit: None,
+            execution_admission_lost: false,
         };
 
         assert!(
@@ -20094,6 +21305,8 @@ mod tests {
             retention_deadline: None,
             execution_budget: None,
             restoration: None,
+            _execution_permit: None,
+            execution_admission_lost: false,
         };
         assert!(
             !missing_guard
