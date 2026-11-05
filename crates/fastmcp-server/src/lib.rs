@@ -5312,6 +5312,11 @@ impl fastmcp_core::CatalogChangePublisher for FinalCatalogPublisher {
 struct FinalSubscriptionRegistry {
     inner: Mutex<FinalSubscriptionRegistryState>,
     terminating: AtomicBool,
+    /// The server and its live listen handles own Task observation. The
+    /// runtime keeps only a weak reference; this observer also reaches this
+    /// registry weakly so neither edge can retain a retired subscription.
+    #[cfg(feature = "tasks")]
+    task_notification_emitter: OnceLock<tasks::OwnedTaskNotificationEmitter>,
 }
 
 #[derive(Default)]
@@ -47610,12 +47615,13 @@ mod lib_unit_tests {
         let _service = start_final_tasks_test_service(&runtime);
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_by_emitter = Arc::clone(&captured);
-        runtime.add_owned_notification_emitter(Arc::new(move |notification, principal| {
-            captured_by_emitter
-                .lock()
-                .unwrap()
-                .push((notification, principal));
-        }));
+        let _observer =
+            runtime.add_owned_notification_emitter(Arc::new(move |notification, principal| {
+                captured_by_emitter
+                    .lock()
+                    .unwrap()
+                    .push((notification, principal));
+            }));
         let owner = McpContext::new(Cx::for_testing(), 1)
             .with_auth(AuthContext::with_subject("notification-owner"));
         let created = runtime

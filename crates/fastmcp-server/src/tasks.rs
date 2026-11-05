@@ -46,7 +46,7 @@ use std::sync::RwLock;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as TaskServiceOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration as StdDuration, Instant};
 
 use std::future::Future;
@@ -5108,6 +5108,9 @@ pub type FinalTaskNotificationEmitter = Arc<dyn Fn(FinalTaskStatusNotification) 
 pub(crate) type OwnedTaskNotificationEmitter =
     Arc<dyn Fn(FinalTaskStatusNotification, Option<Sha256Digest>) + Send + Sync>;
 
+type WeakTaskNotificationEmitter =
+    Weak<dyn Fn(FinalTaskStatusNotification, Option<Sha256Digest>) + Send + Sync>;
+
 /// Opaque application work bound durably to a final Task at creation.
 ///
 /// The descriptor is intentionally private to the caller-owned Task service:
@@ -6164,7 +6167,8 @@ impl std::task::Wake for FinalTaskHandoffWake {
 pub struct FinalTaskRuntime {
     store: Arc<dyn FinalTaskStore>,
     config: FinalTaskRuntimeConfig,
-    notification_emitters: Arc<Mutex<Vec<OwnedTaskNotificationEmitter>>>,
+    application_notification_emitter: OwnedTaskNotificationEmitter,
+    notification_emitters: Arc<Mutex<Vec<WeakTaskNotificationEmitter>>>,
     service_signal: Arc<Mutex<Option<FinalTaskServiceSignal>>>,
     next_task_service_id: Arc<AtomicU64>,
     retention_administration: Arc<TaskRetentionAdministration>,
@@ -6181,9 +6185,10 @@ impl FinalTaskRuntime {
         Self {
             store,
             config,
-            notification_emitters: Arc::new(Mutex::new(vec![Arc::new(
-                move |notification, _principal| notification_emitter(notification),
-            )])),
+            application_notification_emitter: Arc::new(move |notification, _principal| {
+                notification_emitter(notification)
+            }),
+            notification_emitters: Arc::new(Mutex::new(Vec::new())),
             service_signal: Arc::new(Mutex::new(None)),
             next_task_service_id: Arc::new(AtomicU64::new(0)),
             retention_administration: Arc::new(TaskRetentionAdministration::default()),
@@ -6402,19 +6407,30 @@ impl FinalTaskRuntime {
     /// Runtime clones share this registry, so a server builder can attach its
     /// subscription publisher after extension handlers have retained their
     /// runtime clone. Application-owned delivery remains installed alongside
-    /// the framework observer.
-    pub(crate) fn add_owned_notification_emitter(&self, emitter: OwnedTaskNotificationEmitter) {
-        self.notification_emitters
+    /// the framework observer. The returned handle owns that observation;
+    /// retaining the runtime alone never keeps a retired server alive.
+    #[must_use = "the notification observer must remain owned by its subscription registry"]
+    pub(crate) fn add_owned_notification_emitter(
+        &self,
+        emitter: OwnedTaskNotificationEmitter,
+    ) -> OwnedTaskNotificationEmitter {
+        let mut emitters = self
+            .notification_emitters
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(emitter);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        emitters.retain(|registered| registered.strong_count() != 0);
+        emitters.push(Arc::downgrade(&emitter));
+        emitter
     }
 
     #[cfg(test)]
-    fn add_notification_emitter(&self, emitter: FinalTaskNotificationEmitter) {
+    fn add_notification_emitter(
+        &self,
+        emitter: FinalTaskNotificationEmitter,
+    ) -> OwnedTaskNotificationEmitter {
         self.add_owned_notification_emitter(Arc::new(move |notification, _principal| {
             emitter(notification);
-        }));
+        }))
     }
 
     /// Reserves one bounded wakeup channel for a caller-owned structured Task
@@ -7831,13 +7847,23 @@ impl FinalTaskRuntime {
     /// delivery degradation; it cannot revoke the already-committed state or
     /// turn the accepted transition into an RPC error.
     fn emit(&self, notification: FinalTaskStatusNotification, principal: Option<Sha256Digest>) {
-        let emitters = self
-            .notification_emitters
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
+        let emitters = {
+            let mut registered = self
+                .notification_emitters
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registered.retain(|emitter| emitter.strong_count() != 0);
+            registered.clone()
+        };
         let mut panicked_emitter_count = 0usize;
-        for emitter in emitters {
+        // Upgrade each scoped observer only at its delivery turn. An earlier
+        // application callback may have dropped a server or subscription;
+        // taking strong references to the whole fanout would keep it alive.
+        let application = Some(Arc::clone(&self.application_notification_emitter));
+        for emitter in std::iter::once(application)
+            .chain(emitters.iter().map(Weak::upgrade))
+            .flatten()
+        {
             if catch_unwind(AssertUnwindSafe(|| {
                 emitter(notification.clone(), principal);
             }))
@@ -21249,6 +21275,176 @@ mod tests {
     }
 
     #[test]
+    fn task_03_server_notification_observers_follow_subscription_lifetimes() {
+        let application_events = Arc::new(AtomicUsize::new(0));
+        let application_observer = Arc::clone(&application_events);
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(move |_| {
+                application_observer.fetch_add(1, AtomicOrdering::SeqCst);
+            }),
+        );
+        let build = || {
+            crate::ServerBuilder::try_new_with_fixed_protocol_policy(
+                "task-observer-lifetime",
+                "1.0",
+                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            )
+            .unwrap()
+            .final_tasks(runtime.clone())
+            .unwrap()
+            .build()
+        };
+        let first = build();
+        let sibling = build();
+        let first_registry = Arc::downgrade(&first.final_subscriptions);
+        let sibling_registry = Arc::downgrade(&sibling.final_subscriptions);
+        let task = final_working_task_without_ttl("task-observer-lifetime");
+        let task_id = task.base().task_id.clone();
+        let mut filter = fastmcp_protocol::SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut filter, vec![task_id.clone()]).unwrap();
+        let first_frames = Arc::new(Mutex::new(Vec::new()));
+        let first_capture = Arc::clone(&first_frames);
+        let first_listen = first
+            .open_subscription_listen(
+                1_i64.into(),
+                filter.clone(),
+                Arc::new(move |frame| first_capture.lock().unwrap().push(frame)),
+            )
+            .unwrap();
+        let sibling_frames = Arc::new(Mutex::new(Vec::new()));
+        let sibling_capture = Arc::clone(&sibling_frames);
+        let sibling_listen = sibling
+            .open_subscription_listen(
+                2_i64.into(),
+                filter,
+                Arc::new(move |frame| sibling_capture.lock().unwrap().push(frame)),
+            )
+            .unwrap();
+
+        runtime
+            .persist_new_with_work(task, final_test_work_descriptor())
+            .unwrap();
+        for frames in [&first_frames, &sibling_frames] {
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 2, "one acknowledgement and one Task event");
+            assert_eq!(frames[1].method, fastmcp_protocol::TASK_STATUS_NOTIFICATION);
+            assert_eq!(
+                frames[1].params.as_ref().unwrap()["taskId"],
+                task_id.as_str()
+            );
+            assert_eq!(frames[1].params.as_ref().unwrap()["status"], "working");
+        }
+
+        drop(first_listen);
+        drop(first);
+        assert!(
+            first_registry.upgrade().is_none(),
+            "the shared runtime must not retain a retired server registry"
+        );
+        runtime
+            .require_input(&task_id, final_roots_request(), None)
+            .unwrap();
+        assert_eq!(first_frames.lock().unwrap().len(), 2);
+        assert_eq!(sibling_frames.lock().unwrap().len(), 3);
+        assert_eq!(
+            sibling_frames.lock().unwrap()[2].params.as_ref().unwrap()["status"],
+            "input_required"
+        );
+
+        // An explicit listen handle still owns its registration after the
+        // Server value is dropped. Preserve that public embedding contract.
+        drop(sibling);
+        assert!(sibling_registry.upgrade().is_some());
+        let responses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+        runtime.update_task(&task_id, &responses).unwrap();
+        assert_eq!(sibling_frames.lock().unwrap().len(), 4);
+        assert_eq!(
+            sibling_frames.lock().unwrap()[3].params.as_ref().unwrap()["status"],
+            "working"
+        );
+
+        drop(sibling_listen);
+        assert!(sibling_registry.upgrade().is_none());
+        let result = serde_json::from_value(serde_json::json!({"content": []})).unwrap();
+        runtime.complete_task(&task_id, result, None).unwrap();
+        assert_eq!(first_frames.lock().unwrap().len(), 2);
+        assert_eq!(sibling_frames.lock().unwrap().len(), 4);
+        assert_eq!(application_events.load(AtomicOrdering::SeqCst), 4);
+        assert!(runtime.notification_emitters.lock().unwrap().is_empty());
+        assert!(matches!(
+            runtime.get_task(&task_id).unwrap().task,
+            FinalTask::Completed { .. }
+        ));
+    }
+
+    #[test]
+    fn task_03_notification_observer_registration_prunes_dropped_servers() {
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| {}),
+        );
+        for _ in 0..64 {
+            let server = crate::ServerBuilder::try_new_with_fixed_protocol_policy(
+                "task-observer-rebuild",
+                "1.0",
+                fastmcp_protocol::protocol_policy::ProtocolPolicy::ModernOnly,
+            )
+            .unwrap()
+            .final_tasks(runtime.clone())
+            .unwrap()
+            .build();
+            let registry = Arc::downgrade(&server.final_subscriptions);
+            assert_eq!(runtime.notification_emitters.lock().unwrap().len(), 1);
+            drop(server);
+            assert!(registry.upgrade().is_none());
+        }
+        runtime.emit(
+            final_task_notification(&final_working_task_without_ttl("task-observer-rebuild")),
+            None,
+        );
+        assert!(runtime.notification_emitters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_03_notification_observer_dropped_during_fanout_is_not_called() {
+        let retiring = Arc::new(Mutex::new(None::<OwnedTaskNotificationEmitter>));
+        let retire_before_delivery = Arc::clone(&retiring);
+        let application_events = Arc::new(AtomicUsize::new(0));
+        let application_observer = Arc::clone(&application_events);
+        let runtime = FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(move |_| {
+                application_observer.fetch_add(1, AtomicOrdering::SeqCst);
+                let retired = retire_before_delivery.lock().unwrap().take();
+                drop(retired);
+            }),
+        );
+        let retired_events = Arc::new(AtomicUsize::new(0));
+        let retired_observer = Arc::clone(&retired_events);
+        *retiring.lock().unwrap() = Some(runtime.add_owned_notification_emitter(Arc::new(
+            move |_, _| {
+                retired_observer.fetch_add(1, AtomicOrdering::SeqCst);
+            },
+        )));
+        let sibling_events = Arc::new(AtomicUsize::new(0));
+        let sibling_observer = Arc::clone(&sibling_events);
+        let _sibling = runtime.add_owned_notification_emitter(Arc::new(move |_, _| {
+            sibling_observer.fetch_add(1, AtomicOrdering::SeqCst);
+        }));
+        let notification =
+            final_task_notification(&final_working_task_without_ttl("task-observer-fanout"));
+        for expected in 1..=2 {
+            runtime.emit(notification.clone(), None);
+            assert_eq!(retired_events.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(sibling_events.load(AtomicOrdering::SeqCst), expected);
+            assert_eq!(application_events.load(AtomicOrdering::SeqCst), expected);
+        }
+        assert_eq!(runtime.notification_emitters.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn task_03_final_panicking_emitter_preserves_accepted_create_and_continues() {
         let store = Arc::new(InMemoryFinalTaskStore::default());
         let continued = Arc::new(AtomicBool::new(false));
@@ -21258,7 +21454,7 @@ mod tests {
             Arc::new(|_| panic!("planted final task notification emitter panic")),
         );
         let continued_by_second_emitter = Arc::clone(&continued);
-        runtime.add_notification_emitter(Arc::new(move |_| {
+        let _observer = runtime.add_notification_emitter(Arc::new(move |_| {
             continued_by_second_emitter.store(true, AtomicOrdering::SeqCst);
         }));
         let runner = runtime
@@ -21697,7 +21893,7 @@ mod tests {
         );
         let continued = Arc::new(AtomicBool::new(false));
         let continued_by_second_emitter = Arc::clone(&continued);
-        runtime.add_notification_emitter(Arc::new(move |_| {
+        let _observer = runtime.add_notification_emitter(Arc::new(move |_| {
             continued_by_second_emitter.store(true, AtomicOrdering::SeqCst);
         }));
         let task_id = create_final_task_state_fixture(&runtime, None)
@@ -21756,7 +21952,7 @@ mod tests {
         );
         let continued = Arc::new(AtomicBool::new(false));
         let continued_by_second_emitter = Arc::clone(&continued);
-        runtime.add_notification_emitter(Arc::new(move |_| {
+        let _observer = runtime.add_notification_emitter(Arc::new(move |_| {
             continued_by_second_emitter.store(true, AtomicOrdering::SeqCst);
         }));
         let task_id = create_final_task_state_fixture(&runtime, None)
