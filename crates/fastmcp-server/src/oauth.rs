@@ -70,6 +70,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+#[cfg(feature = "builtin-auth-server")]
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use fastmcp_core::{
@@ -1230,6 +1232,27 @@ pub const HARD_MAX_OAUTH_RETAINED_ENTRIES: usize = 256 * 1_024;
 // Configuration
 // =============================================================================
 
+/// Evidence emitted by the explicitly enabled development introspection route.
+///
+/// Both profiles use the single-process, in-memory token store. Neither is a
+/// durable authorization server or a production issuer qualification.
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DevelopmentIntrospectionProfile {
+    /// Point-in-time metadata without Unix timestamps; a resource verifier
+    /// requiring expiry evidence must reject this response.
+    #[default]
+    MetadataOnly,
+    /// Retain issuance-time Unix evidence and emit conservative `iat`/`exp`
+    /// plus an opaque resource-specific subject for both users and machines.
+    ///
+    /// Monotonic token/family deadlines remain authoritative. Observed wall
+    /// clock rollback makes this profile unavailable for the lifetime of the
+    /// server instance. Restart creates a new issuer store and invalidates all
+    /// old tokens; this profile cannot restore or export its authority.
+    ResourceEvidence,
+}
+
 /// Configuration for the OAuth authorization server.
 #[derive(Debug, Clone)]
 pub struct OAuthServerConfig {
@@ -1264,6 +1287,13 @@ pub struct OAuthServerConfig {
     /// production issuer qualification, or refresh-token introspection.
     #[cfg(feature = "builtin-auth-server")]
     pub allow_development_token_introspection: bool,
+    /// Explicitly selects the evidence supplied by the development endpoint.
+    /// [`DevelopmentIntrospectionProfile::ResourceEvidence`] requires
+    /// `allow_development_token_introspection` and a whole-second access-token
+    /// lifetime. Its opaque subject preserves the issuer's registration,
+    /// user/machine and resource namespaces; it is not a display name.
+    #[cfg(feature = "builtin-auth-server")]
+    pub development_introspection_profile: DevelopmentIntrospectionProfile,
     /// Minimum PKCE code verifier length (default: 43, min: 43, max: 128).
     pub min_code_verifier_length: usize,
     /// Maximum PKCE code verifier length.
@@ -1312,6 +1342,8 @@ impl Default for OAuthServerConfig {
             allow_development_client_credentials: false,
             #[cfg(feature = "builtin-auth-server")]
             allow_development_token_introspection: false,
+            #[cfg(feature = "builtin-auth-server")]
+            development_introspection_profile: DevelopmentIntrospectionProfile::MetadataOnly,
             min_code_verifier_length: PKCE_CODE_VERIFIER_MIN_BYTES,
             max_code_verifier_length: PKCE_CODE_VERIFIER_MAX_BYTES,
             max_clients: DEFAULT_MAX_OAUTH_CLIENTS,
@@ -1337,6 +1369,17 @@ impl OAuthServerConfig {
     /// retention ceiling, or a configured lifetime is zero or excessive.
     pub fn validate(&self) -> Result<(), OAuthError> {
         validate_oauth_issuer(&self.issuer)?;
+
+        #[cfg(feature = "builtin-auth-server")]
+        if self.development_introspection_profile == DevelopmentIntrospectionProfile::ResourceEvidence
+            && (!self.allow_development_token_introspection
+                || self.access_token_lifetime.subsec_nanos() != 0)
+        {
+            return Err(OAuthError::ServerError(
+                "development resource evidence requires enabled introspection and a whole-second access lifetime"
+                    .to_string(),
+            ));
+        }
 
         if !(PKCE_CODE_VERIFIER_MIN_BYTES..=PKCE_CODE_VERIFIER_MAX_BYTES)
             .contains(&self.min_code_verifier_length)
@@ -2801,9 +2844,12 @@ impl OAuthToken {
 ///
 /// Active metadata is limited to the caller's administratively authorized
 /// resource. It never contains an access token, refresh token, client secret,
-/// grant-family identifier or registration epoch. Optional Unix `iat` and
-/// `exp` claims are deliberately absent: this development store enforces
-/// monotonic lifetimes and does not retain an authoritative wall-clock epoch.
+/// grant-family identifier or registration epoch. The metadata-only profile
+/// omits Unix `iat` and `exp`. The explicitly configured resource-evidence
+/// profile retains issuance-time epochs, rounds expiry down, and clamps it to
+/// the remaining monotonic token/family lifetime on every lookup. Its subject
+/// is an opaque registration- and resource-specific identity, including for
+/// machine clients; it never conflates a machine with an equal-looking user.
 /// Revalidate at each authorization decision; the HTTP response is `no-store`
 /// and makes no validity promise after the lookup completes.
 #[cfg(feature = "builtin-auth-server")]
@@ -2822,6 +2868,10 @@ pub struct DevelopmentAccessTokenIntrospection {
     aud: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iat: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exp: Option<u64>,
 }
 
 #[cfg(feature = "builtin-auth-server")]
@@ -2835,6 +2885,8 @@ impl DevelopmentAccessTokenIntrospection {
             sub: None,
             aud: None,
             iss: None,
+            iat: None,
+            exp: None,
         }
     }
 
@@ -2863,7 +2915,9 @@ impl DevelopmentAccessTokenIntrospection {
         self.token_type
     }
 
-    /// Approved resource owner, when the active grant has one.
+    /// Subject of the active grant. In the resource-evidence profile this is
+    /// an opaque resource-specific identity for a user or machine; otherwise
+    /// it is the approved resource owner, when the grant has one.
     #[must_use]
     pub fn subject(&self) -> Option<&str> {
         self.sub.as_deref()
@@ -2880,6 +2934,19 @@ impl DevelopmentAccessTokenIntrospection {
     pub fn issuer(&self) -> Option<&str> {
         self.iss.as_deref()
     }
+
+    /// Issuance Unix second, present only in the resource-evidence profile.
+    #[must_use]
+    pub const fn issued_at_unix_seconds(&self) -> Option<u64> {
+        self.iat
+    }
+
+    /// Conservative expiry Unix second, present only in the resource-evidence
+    /// profile. Fresh authorization must still introspect again.
+    #[must_use]
+    pub const fn expires_at_unix_seconds(&self) -> Option<u64> {
+        self.exp
+    }
 }
 
 #[cfg(feature = "builtin-auth-server")]
@@ -2891,6 +2958,7 @@ impl std::fmt::Debug for DevelopmentAccessTokenIntrospection {
             .field("client_id_present", &self.client_id.is_some())
             .field("subject_present", &self.sub.is_some())
             .field("resource_present", &self.aud.is_some())
+            .field("epoch_evidence_present", &self.exp.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -2906,6 +2974,123 @@ pub(crate) struct StoredOAuthToken {
     registration_epoch: OAuthRegistrationEpoch,
     /// Absolute, non-sliding deadline for the complete refresh-token family.
     family_expires_at: Instant,
+    /// Evidence is created only at access-token issuance under the explicit
+    /// profile. It cannot be reconstructed from an old token's remaining TTL.
+    #[cfg(feature = "builtin-auth-server")]
+    introspection_epoch: Option<DevelopmentTokenEpoch>,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+const MAX_DEVELOPMENT_NUMERIC_DATE: u64 = 9_007_199_254_740_991;
+
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DevelopmentTokenEpoch {
+    issued_at: u64,
+    expires_at: u64,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Clone, Copy)]
+struct DevelopmentIntrospectionClockSample {
+    unix: Duration,
+    monotonic: Instant,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl DevelopmentTokenEpoch {
+    fn at_issuance(
+        clock: DevelopmentIntrospectionClockSample,
+        expires_at: Instant,
+    ) -> Result<Self, OAuthError> {
+        let remaining = expires_at
+            .checked_duration_since(clock.monotonic)
+            .ok_or_else(development_introspection_clock_unavailable)?;
+        let expires_at = clock
+            .unix
+            .checked_add(remaining)
+            .map(|expires| expires.as_secs())
+            .filter(|expires| *expires <= MAX_DEVELOPMENT_NUMERIC_DATE)
+            .ok_or_else(development_introspection_clock_unavailable)?;
+        let issued_at = clock.unix.as_secs();
+        if issued_at >= expires_at {
+            return Err(development_introspection_clock_unavailable());
+        }
+        Ok(Self {
+            issued_at,
+            expires_at,
+        })
+    }
+
+    fn at_lookup(
+        self,
+        clock: DevelopmentIntrospectionClockSample,
+        expires_at: Instant,
+    ) -> Option<Self> {
+        // The wall sample precedes the monotonic sample. Adding only the
+        // remaining duration from the later sample cannot round expiry up or
+        // extend a lease past the original monotonic/family deadline.
+        let remaining = expires_at.checked_duration_since(clock.monotonic)?;
+        let expires_at = self
+            .expires_at
+            .min(clock.unix.checked_add(remaining)?.as_secs());
+        if clock.unix.as_secs() < self.issued_at
+            || self.issued_at >= expires_at
+            || clock.unix >= Duration::from_secs(expires_at)
+        {
+            return None;
+        }
+        Some(Self {
+            issued_at: self.issued_at,
+            expires_at,
+        })
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+#[derive(Default)]
+struct DevelopmentIntrospectionClock {
+    last_unix: Option<Duration>,
+    rollback_observed: bool,
+}
+
+#[cfg(feature = "builtin-auth-server")]
+impl DevelopmentIntrospectionClock {
+    fn observe(&mut self, unix: Duration) -> Result<(), OAuthError> {
+        if self.last_unix.is_some_and(|previous| unix < previous) {
+            self.rollback_observed = true;
+        }
+        if self.rollback_observed || unix.as_secs() > MAX_DEVELOPMENT_NUMERIC_DATE {
+            return Err(development_introspection_clock_unavailable());
+        }
+        self.last_unix = Some(unix);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "builtin-auth-server")]
+fn development_introspection_clock_unavailable() -> OAuthError {
+    OAuthError::TemporarilyUnavailable(
+        "development introspection clock is unavailable".to_string(),
+    )
+}
+
+struct TokenIssuanceClock {
+    monotonic: Instant,
+    #[cfg(feature = "builtin-auth-server")]
+    evidence: Option<DevelopmentIntrospectionClockSample>,
+}
+
+impl TokenIssuanceClock {
+    #[cfg(feature = "builtin-auth-server")]
+    fn introspection_epoch(
+        &self,
+        expires_at: Instant,
+    ) -> Result<Option<DevelopmentTokenEpoch>, OAuthError> {
+        self.evidence
+            .map(|clock| DevelopmentTokenEpoch::at_issuance(clock, expires_at))
+            .transpose()
+    }
 }
 
 impl std::ops::Deref for StoredOAuthToken {
@@ -3877,6 +4062,8 @@ pub struct OAuthServer {
     approval_backend: Arc<dyn AuthorizationApprovalBackend>,
     approval_generation: AuthorizationApprovalGeneration,
     pub(crate) state: RwLock<OAuthServerState>,
+    #[cfg(feature = "builtin-auth-server")]
+    introspection_clock: Mutex<DevelopmentIntrospectionClock>,
 }
 
 impl OAuthServer {
@@ -3906,6 +4093,8 @@ impl OAuthServer {
             approval_backend,
             approval_generation,
             state: RwLock::new(OAuthServerState::new()),
+            #[cfg(feature = "builtin-auth-server")]
+            introspection_clock: Mutex::new(DevelopmentIntrospectionClock::default()),
         }
     }
 
@@ -3950,6 +4139,43 @@ impl OAuthServer {
     #[must_use]
     pub fn config(&self) -> &OAuthServerConfig {
         &self.config
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn sample_development_introspection_clock(
+        &self,
+    ) -> Result<DevelopmentIntrospectionClockSample, OAuthError> {
+        // All wall observations share this short nonblocking gate so concurrent
+        // callers cannot reorder samples and falsely report clock rollback.
+        // This gate never takes the token-state lock or performs blocking I/O.
+        let mut clock = self
+            .introspection_clock
+            .try_lock()
+            .map_err(|_| development_introspection_clock_unavailable())?;
+        let unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| development_introspection_clock_unavailable())?;
+        let monotonic = Instant::now();
+        clock.observe(unix)?;
+        Ok(DevelopmentIntrospectionClockSample { unix, monotonic })
+    }
+
+    fn token_issuance_clock(&self) -> Result<TokenIssuanceClock, OAuthError> {
+        #[cfg(feature = "builtin-auth-server")]
+        if self.config.development_introspection_profile
+            == DevelopmentIntrospectionProfile::ResourceEvidence
+        {
+            let evidence = self.sample_development_introspection_clock()?;
+            return Ok(TokenIssuanceClock {
+                monotonic: evidence.monotonic,
+                evidence: Some(evidence),
+            });
+        }
+        Ok(TokenIssuanceClock {
+            monotonic: Instant::now(),
+            #[cfg(feature = "builtin-auth-server")]
+            evidence: None,
+        })
     }
 
     fn state_for_mutation(
@@ -4934,7 +5160,8 @@ impl OAuthServer {
             }
             let access_digest = digest_credential(CredentialKind::AccessToken, &access_value)?;
             let grant_id = derive_grant_id(CLIENT_CREDENTIALS_GRANT_ID_DOMAIN, &[access_digest])?;
-            let issued_at = Instant::now();
+            let clock = self.token_issuance_clock()?;
+            let issued_at = clock.monotonic;
             let expires_at = checked_deadline(
                 issued_at,
                 self.config.access_token_lifetime,
@@ -4957,6 +5184,7 @@ impl OAuthServer {
                 grant_id,
                 registration_epoch,
                 family_expires_at: expires_at,
+                introspection_epoch: clock.introspection_epoch(expires_at)?,
             };
             if let Some(assertion) = assertion {
                 let now_unix_seconds = assertion.validate_current(&state)?;
@@ -5324,7 +5552,8 @@ impl OAuthServer {
         let refresh_digest = digest_credential(CredentialKind::RefreshToken, &refresh_value)?;
         // Credential generation may block behind the platform RNG. Token and
         // family lifetimes begin only after both successful draws.
-        let issued_at = Instant::now();
+        let clock = self.token_issuance_clock()?;
+        let issued_at = clock.monotonic;
         let grant_id = match grant_id {
             Some(grant_id) => grant_id,
             None => derive_direct_grant_id(access_digest, refresh_digest)?,
@@ -5375,6 +5604,8 @@ impl OAuthServer {
                 grant_id,
                 registration_epoch,
                 family_expires_at,
+                #[cfg(feature = "builtin-auth-server")]
+                introspection_epoch: clock.introspection_epoch(access_expires_at)?,
             },
             refresh_value,
             refresh_digest,
@@ -5393,6 +5624,8 @@ impl OAuthServer {
                 grant_id,
                 registration_epoch,
                 family_expires_at,
+                #[cfg(feature = "builtin-auth-server")]
+                introspection_epoch: None,
             },
             access_lifetime_secs,
         })
@@ -5531,7 +5764,9 @@ impl OAuthServer {
     /// Authentication, resource permission, token-owner registration and all
     /// liveness checks share one nonblocking authoritative read guard. A busy
     /// or unavailable store returns an error, never a cached success. This
-    /// operation does not clean up, consume, rotate or revoke any state.
+    /// operation does not clean up, consume, rotate or revoke token state.
+    /// The resource-evidence profile additionally observes the issuer's
+    /// nonblocking wall-clock fence; rollback makes that profile unavailable.
     #[cfg(feature = "builtin-auth-server")]
     pub fn introspect_development_access_token(
         &self,
@@ -5602,14 +5837,49 @@ impl OAuthServer {
         {
             return Ok(DevelopmentAccessTokenIntrospection::inactive());
         }
+        let (subject, epoch) = match self.config.development_introspection_profile {
+            DevelopmentIntrospectionProfile::MetadataOnly => (stored.subject.clone(), None),
+            DevelopmentIntrospectionProfile::ResourceEvidence => {
+                let Some(epoch) = stored.introspection_epoch else {
+                    // Never fabricate issuance evidence for a token that was
+                    // created without the explicit resource-evidence profile.
+                    return Ok(DevelopmentAccessTokenIntrospection::inactive());
+                };
+                let clock = self.sample_development_introspection_clock()?;
+                let Some(epoch) = epoch.at_lookup(
+                    clock,
+                    stored.expires_at.min(stored.family_expires_at),
+                ) else {
+                    return Ok(DevelopmentAccessTokenIntrospection::inactive());
+                };
+                // The same framed identity as local verification preserves
+                // ownership across refresh and signing-key rotation, while
+                // separating client re-registration and user/machine grants.
+                let owner = oauth_session_owner(
+                    &self.config.issuer,
+                    &stored.client_id,
+                    stored.registration_epoch,
+                    stored.subject.as_deref(),
+                    stored.resource.as_deref(),
+                )
+                .map_err(|_| {
+                    OAuthError::ServerError(
+                        "development introspection identity is unavailable".to_string(),
+                    )
+                })?;
+                (Some(base64url_encode(owner.as_bytes())), Some(epoch))
+            }
+        };
         Ok(DevelopmentAccessTokenIntrospection {
             active: true,
             scope: (!stored.scopes.is_empty()).then(|| stored.scopes.join(" ")),
             client_id: Some(stored.client_id.clone()),
             token_type: Some(stored.token_type.as_str()),
-            sub: stored.subject.clone(),
+            sub: subject,
             aud: stored.resource.clone(),
             iss: Some(self.config.issuer.clone()),
+            iat: epoch.map(|epoch| epoch.issued_at),
+            exp: epoch.map(|epoch| epoch.expires_at),
         })
     }
 
@@ -6562,9 +6832,21 @@ mod tests {
 
     #[cfg(feature = "builtin-auth-server")]
     fn development_introspection_fixture(enabled: bool) -> (OAuthServer, TokenResponse) {
+        development_introspection_fixture_with_profile(
+            enabled,
+            DevelopmentIntrospectionProfile::MetadataOnly,
+        )
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    fn development_introspection_fixture_with_profile(
+        enabled: bool,
+        profile: DevelopmentIntrospectionProfile,
+    ) -> (OAuthServer, TokenResponse) {
         let server = OAuthServer::try_with_approval_backend(
             OAuthServerConfig {
                 allow_development_token_introspection: enabled,
+                development_introspection_profile: profile,
                 ..OAuthServerConfig::default()
             },
             Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact)),
@@ -6904,6 +7186,223 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_requires_explicit_coherent_configuration() {
+        let mut config = OAuthServerConfig {
+            development_introspection_profile: DevelopmentIntrospectionProfile::ResourceEvidence,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        config.allow_development_token_introspection = true;
+        assert!(config.validate().is_ok());
+        config.access_token_lifetime += Duration::from_millis(1);
+        assert!(config.validate().is_err());
+
+        let (server, issued) = development_introspection_fixture(true);
+        let metadata = development_introspect(&server, &issued.access_token);
+        assert!(metadata.is_active());
+        assert_eq!(metadata.subject(), Some("approved-subject"));
+        assert!(metadata.issued_at_unix_seconds().is_none());
+        assert!(metadata.expires_at_unix_seconds().is_none());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_rounds_down_and_caps_monotonic_lifetime() {
+        let monotonic = Instant::now();
+        let clock = DevelopmentIntrospectionClockSample {
+            unix: Duration::new(1_700_000_000, 900_000_000),
+            monotonic,
+        };
+        let deadline = monotonic + Duration::from_secs(60);
+        let epoch = DevelopmentTokenEpoch::at_issuance(clock, deadline).unwrap();
+        assert_eq!(epoch.issued_at, 1_700_000_000);
+        assert_eq!(epoch.expires_at, 1_700_000_060);
+
+        let later = DevelopmentIntrospectionClockSample {
+            unix: clock.unix + Duration::from_secs(10),
+            monotonic: monotonic + Duration::from_secs(10),
+        };
+        assert_eq!(epoch.at_lookup(later, deadline), Some(epoch));
+        // A tightened family deadline is authoritative even though the original
+        // retained Unix expiry is later. A fractional final second is lost.
+        let family_deadline = later.monotonic + Duration::from_millis(1250);
+        let capped = epoch.at_lookup(later, family_deadline).unwrap();
+        assert_eq!(capped.expires_at, 1_700_000_012);
+        let promised = Duration::from_secs(capped.expires_at) - later.unix;
+        assert!(promised <= family_deadline.duration_since(later.monotonic));
+        assert!(epoch.at_lookup(later, later.monotonic).is_none());
+        assert!(epoch.at_lookup(later, later.monotonic + Duration::from_millis(50)).is_none());
+
+        // Even an unobserved clock slowdown cannot extend the lease: every
+        // response is capped using the current remaining monotonic lifetime.
+        let slower_wall = DevelopmentIntrospectionClockSample {
+            unix: clock.unix + Duration::from_secs(5),
+            ..later
+        };
+        assert_eq!(epoch.at_lookup(slower_wall, deadline).unwrap().expires_at, 1_700_000_055);
+        let jumped_forward = DevelopmentIntrospectionClockSample {
+            unix: Duration::from_secs(epoch.expires_at),
+            ..later
+        };
+        assert!(epoch.at_lookup(jumped_forward, deadline).is_none());
+        let before_issuance = DevelopmentIntrospectionClockSample {
+            unix: Duration::from_secs(epoch.issued_at - 1),
+            ..later
+        };
+        assert!(epoch.at_lookup(before_issuance, deadline).is_none());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_clock_rollback_is_latched_and_nonblocking() {
+        let mut clock = DevelopmentIntrospectionClock::default();
+        let first = Duration::new(1_700_000_000, 500_000_000);
+        clock.observe(first).unwrap();
+        clock.observe(first).unwrap();
+        assert!(clock.observe(first - Duration::from_nanos(1)).is_err());
+        assert!(clock.observe(first + Duration::from_secs(60)).is_err());
+        assert_eq!(clock.last_unix, Some(first));
+
+        let (server, issued) = development_introspection_fixture_with_profile(
+            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+        );
+        let digest = access_token_digest(&issued.access_token);
+        let before = server.state.read().unwrap().access_tokens[&digest].clone();
+        let held = server.introspection_clock.lock().unwrap();
+        assert!(matches!(
+            server.introspect_development_access_token(
+                &issued.access_token, "resource-reader", Some("introspection-caller-secret"),
+                TokenEndpointAuthMethod::ClientSecretBasic,
+            ), Err(OAuthError::TemporarilyUnavailable(_))
+        ));
+        drop(held);
+        assert!(development_introspect(&server, &issued.access_token).is_active());
+        assert_retained_token_unchanged(&before, &server.state.read().unwrap().access_tokens[&digest]);
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_retains_issuance_and_private_owner_without_state_mutation() {
+        let before_wall = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+        let (server, issued) = development_introspection_fixture_with_profile(
+            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+        );
+        let canary = insert_expired_authorization_code_cleanup_canary(
+            &server, "introspection-token-client",
+        );
+        let digest = access_token_digest(&issued.access_token);
+        let before = server.state.read().unwrap().access_tokens[&digest].clone();
+        let active = development_introspect(&server, &issued.access_token);
+        let wire = serde_json::to_value(&active).unwrap();
+        assert!(active.is_active());
+        assert_eq!(active.subject().unwrap().len(), 43);
+        assert_ne!(active.subject(), Some("approved-subject"));
+        let expected_owner = oauth_session_owner(
+            &server.config.issuer, &before.client_id, before.registration_epoch,
+            before.subject.as_deref(), before.resource.as_deref(),
+        ).unwrap();
+        assert_eq!(active.subject(), Some(base64url_encode(expected_owner.as_bytes()).as_str()));
+        assert!(active.issued_at_unix_seconds().unwrap() >= before_wall);
+        let retained_epoch = before.introspection_epoch.unwrap();
+        assert_eq!(active.issued_at_unix_seconds(), Some(retained_epoch.issued_at));
+        assert!(active.expires_at_unix_seconds().unwrap() <= retained_epoch.expires_at);
+        assert!(wire["exp"].as_u64().unwrap() > wire["iat"].as_u64().unwrap());
+        assert_eq!(wire["client_id"], "introspection-token-client");
+        assert_eq!(wire["aud"], TEST_MCP_RESOURCE);
+        assert_eq!(wire["iss"], "https://fastmcp.invalid/");
+        for forbidden in ["registration_epoch", "grant_id", "access_token", "refresh_token", "grant_subject"] {
+            assert!(wire.get(forbidden).is_none());
+        }
+        assert!(!format!("{active:?}").contains(active.subject().unwrap()));
+        let after = server.state.read().unwrap();
+        assert!(after.authorization_codes.contains_key(&canary));
+        assert_retained_token_unchanged(&before, &after.access_tokens[&digest]);
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_refresh_preserves_owner_and_reuse_revokes_family() {
+        let (server, issued) = development_introspection_fixture_with_profile(
+            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+        );
+        let original = development_introspect(&server, &issued.access_token);
+        let refresh = issued.refresh_token.as_deref().unwrap();
+        let family_deadline = Instant::now() + Duration::from_secs(120);
+        server.state.write().unwrap().refresh_tokens.get_mut(&refresh_token_digest(refresh))
+            .unwrap().family_expires_at = family_deadline;
+        let refreshed = server.token(&bounded_refresh_request("introspection-token-client", refresh)).unwrap();
+        let active = development_introspect(&server, &refreshed.access_token);
+        assert_eq!(active.subject(), original.subject());
+        assert_eq!(active.scope(), original.scope());
+        assert!(active.issued_at_unix_seconds().unwrap() >= original.issued_at_unix_seconds().unwrap());
+        assert!(active.expires_at_unix_seconds().unwrap() < original.expires_at_unix_seconds().unwrap());
+        let stored = server.state.read().unwrap().access_tokens[&access_token_digest(&refreshed.access_token)].clone();
+        assert_eq!(stored.expires_at, family_deadline);
+        assert!(!development_introspect(&server, refreshed.refresh_token.as_deref().unwrap()).is_active());
+        assert!(matches!(
+            server.token(&bounded_refresh_request("introspection-token-client", refresh)),
+            Err(OAuthError::InvalidGrant(_))
+        ));
+        for access in [&issued.access_token, &refreshed.access_token] {
+            assert_eq!(serde_json::to_value(development_introspect(&server, access)).unwrap(), serde_json::json!({"active":false}));
+        }
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_missing_epochs_and_foreign_resources_are_inactive() {
+        let (server, issued) = development_introspection_fixture_with_profile(
+            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+        );
+        let digest = access_token_digest(&issued.access_token);
+        let before = server.state.read().unwrap().access_tokens[&digest].clone();
+        let foreign = server.introspect_development_access_token(
+            &issued.access_token, "other-resource-reader", Some("introspection-caller-secret"),
+            TokenEndpointAuthMethod::ClientSecretBasic,
+        ).unwrap();
+        assert_eq!(serde_json::to_value(foreign).unwrap(), serde_json::json!({"active":false}));
+        assert_retained_token_unchanged(&before, &server.state.read().unwrap().access_tokens[&digest]);
+        server.state.write().unwrap().access_tokens.get_mut(&digest).unwrap().introspection_epoch = None;
+        assert_eq!(serde_json::to_value(development_introspect(&server, &issued.access_token)).unwrap(), serde_json::json!({"active":false}));
+        let state = server.state.read().unwrap();
+        assert_eq!(state.access_tokens.len(), 1);
+        assert_eq!(state.refresh_tokens.len(), 1);
+        assert!(state.revoked_tokens.is_empty());
+    }
+
+    #[cfg(feature = "builtin-auth-server")]
+    #[test]
+    fn development_resource_evidence_clock_failure_does_not_consume_code_or_refresh() {
+        let (server, issued) = development_introspection_fixture_with_profile(
+            true, DevelopmentIntrospectionProfile::ResourceEvidence,
+        );
+        let (code, _) = server.authorize(&approved_resource_request("introspection-token-client")).unwrap();
+        let access_digest = access_token_digest(&issued.access_token);
+        let refresh = issued.refresh_token.as_deref().unwrap();
+        let refresh_digest = refresh_token_digest(refresh);
+        let before_access = server.state.read().unwrap().access_tokens[&access_digest].clone();
+        let before_refresh = server.state.read().unwrap().refresh_tokens[&refresh_digest].clone();
+        server.introspection_clock.lock().unwrap().last_unix = Some(
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap() + Duration::from_secs(60),
+        );
+        for request in [
+            resource_code_exchange_request("introspection-token-client", &code, TEST_MCP_RESOURCE),
+            bounded_refresh_request("introspection-token-client", refresh),
+        ] {
+            assert!(matches!(server.token(&request), Err(OAuthError::TemporarilyUnavailable(_))));
+        }
+        assert!(server.introspection_clock.lock().unwrap().rollback_observed);
+        let state = server.state.read().unwrap();
+        assert!(state.authorization_codes.contains_key(&authorization_code_digest(&code)));
+        assert_eq!(state.access_tokens.len(), 1);
+        assert_eq!(state.refresh_tokens.len(), 1);
+        assert!(state.revoked_tokens.is_empty());
+        assert_retained_token_unchanged(&before_access, &state.access_tokens[&access_digest]);
+        assert_retained_token_unchanged(&before_refresh, &state.refresh_tokens[&refresh_digest]);
+    }
+
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     fn development_machine_client(client_id: &str, secret: &str) -> OAuthClient {
         OAuthClient::builder(client_id)
@@ -6951,6 +7450,67 @@ mod tests {
             ))
             .unwrap();
         server
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn development_resource_evidence_separates_user_machine_and_registration_epochs() {
+        let server = OAuthServer::try_with_approval_backend(
+            OAuthServerConfig {
+                allow_development_client_credentials: true,
+                allow_development_token_introspection: true,
+                development_introspection_profile: DevelopmentIntrospectionProfile::ResourceEvidence,
+                ..Default::default()
+            },
+            Arc::new(CountingApprovalBackend::new(ApprovalTestMode::Exact)),
+        ).unwrap();
+        // The machine client ID exactly equals the approved user's display
+        // subject. Only the principal namespace differs between the grants.
+        let client = || OAuthClient::builder("approved-subject")
+            .secret("machine-secret")
+            .redirect_uri("http://127.0.0.1/callback")
+            .scope("read")
+            .development_client_credentials(
+                DevelopmentClientCredentialsGrant::new(
+                    configured_resource(TEST_MCP_RESOURCE), ["read"],
+                ).unwrap(),
+            )
+            .build().unwrap();
+        server.register_client(client()).unwrap();
+        server.register_client(development_introspection_caller("resource-reader", TEST_MCP_RESOURCE)).unwrap();
+        let machine_request = TokenRequest {
+            client_id: "approved-subject".to_string(),
+            scopes: Some(vec!["read".to_string()]),
+            ..development_machine_request()
+        };
+        let machine = server.token(&machine_request).unwrap();
+        let machine_facts = development_introspect(&server, &machine.access_token);
+        assert!(machine_facts.issued_at_unix_seconds().is_some());
+        assert!(machine_facts.expires_at_unix_seconds().is_some());
+        let next_machine = server.token(&machine_request).unwrap();
+        assert_eq!(machine_facts.subject(), development_introspect(&server, &next_machine.access_token).subject());
+
+        let (code, _) = server.authorize(&approved_resource_request("approved-subject")).unwrap();
+        let user = server.token(&TokenRequest {
+            client_secret: Some("machine-secret".to_string()),
+            client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
+            ..resource_code_exchange_request("approved-subject", &code, TEST_MCP_RESOURCE)
+        }).unwrap();
+        let user_facts = development_introspect(&server, &user.access_token);
+        assert_eq!(machine_facts.client_id(), user_facts.client_id());
+        assert_eq!(machine_facts.resource(), user_facts.resource());
+        assert_eq!(machine_facts.scope(), user_facts.scope());
+        assert_ne!(machine_facts.subject(), user_facts.subject());
+
+        server.revoke(&machine.access_token, "approved-subject", Some("machine-secret"), TokenEndpointAuthMethod::ClientSecretBasic).unwrap();
+        assert!(!development_introspect(&server, &machine.access_token).is_active());
+        assert!(development_introspect(&server, &user.access_token).is_active());
+        assert!(development_introspect(&server, &next_machine.access_token).is_active());
+        server.register_client(client()).unwrap();
+        assert!(!development_introspect(&server, &user.access_token).is_active());
+        assert!(!development_introspect(&server, &next_machine.access_token).is_active());
+        let replacement = server.token(&machine_request).unwrap();
+        assert_ne!(machine_facts.subject(), development_introspect(&server, &replacement.access_token).subject());
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -8864,6 +9424,8 @@ mod tests {
         assert_eq!(after.grant_id, before.grant_id);
         assert_eq!(after.registration_epoch, before.registration_epoch);
         assert_eq!(after.family_expires_at, before.family_expires_at);
+        #[cfg(feature = "builtin-auth-server")]
+        assert_eq!(after.introspection_epoch, before.introspection_epoch);
     }
 
     fn assert_fresh_http_resource_admission(token_resource: Option<&str>) {
@@ -14931,6 +15493,8 @@ mod tests {
                     grant_id: test_grant_id(6),
                     registration_epoch: test_registration_epoch(1),
                     family_expires_at: expired_at,
+                    #[cfg(feature = "builtin-auth-server")]
+                    introspection_epoch: None,
                 },
             );
             state.refresh_tokens.insert(
@@ -14950,6 +15514,8 @@ mod tests {
                     grant_id: test_grant_id(6),
                     registration_epoch: test_registration_epoch(1),
                     family_expires_at: expired_at,
+                    #[cfg(feature = "builtin-auth-server")]
+                    introspection_epoch: None,
                 },
             );
             state.revoked_tokens.insert(
@@ -16075,6 +16641,52 @@ mod development_private_key_jwt_tests {
         ).unwrap();
         assert_eq!(current.registration_epoch, target.registration_epoch);
         assert!(Arc::ptr_eq(&current.policy, &target.policy));
+    }
+
+    #[test]
+    fn development_resource_evidence_survives_private_key_rotation_and_observes_revocation() {
+        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+            issuer: ISSUER.to_string(),
+            allow_development_client_credentials: true,
+            allow_development_token_introspection: true,
+            development_introspection_profile: DevelopmentIntrospectionProfile::ResourceEvidence,
+            ..Default::default()
+        }).unwrap());
+        server.register_client(client_with_policy(CLIENT, rotation_policy(1, &jwks()))).unwrap();
+        server.register_client(
+            OAuthClient::builder("resource-reader")
+                .secret("reader-secret")
+                .development_token_introspection(DevelopmentTokenIntrospectionGrant::new(resource()).unwrap())
+                .build().unwrap(),
+        ).unwrap();
+        let introspect = |token: &str| server.introspect_development_access_token(
+            token, "resource-reader", Some("reader-secret"), TokenEndpointAuthMethod::ClientSecretBasic,
+        ).unwrap();
+        let first = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-before-rotation"))).unwrap();
+        let first_facts = introspect(&first.access_token);
+        assert!(first_facts.is_active());
+        let retained_epoch = server.state.read().unwrap().access_tokens[
+            &digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap()
+        ].introspection_epoch;
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        server.rotate_development_private_key_jwt(&target, rotation_policy(2, &rotated_jwks())).unwrap();
+        let after = introspect(&first.access_token);
+        assert_eq!(after.subject(), first_facts.subject());
+        assert_eq!(after.issued_at_unix_seconds(), first_facts.issued_at_unix_seconds());
+        assert_eq!(server.state.read().unwrap().access_tokens[
+            &digest_credential(CredentialKind::AccessToken, &first.access_token).unwrap()
+        ].introspection_epoch, retained_epoch);
+        let before = snapshot(&server);
+        assert!(issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-retired-key"))).is_err());
+        assert_eq!(snapshot(&server), before);
+        let second = issue(&server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "evidence-rotated-key"))).unwrap();
+        assert_eq!(introspect(&second.access_token).subject(), first_facts.subject());
+        server.revoke_with_development_private_key_jwt(
+            &sign_rotated(&claims(CLIENT, REVOCATION_ENDPOINT, "evidence-revoke")),
+            REVOCATION_ENDPOINT, &first.access_token,
+        ).unwrap();
+        assert_eq!(serde_json::to_value(introspect(&first.access_token)).unwrap(), json!({"active":false}));
+        assert!(introspect(&second.access_token).is_active());
     }
 
     #[test]
