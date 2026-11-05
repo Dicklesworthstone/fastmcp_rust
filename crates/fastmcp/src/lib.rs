@@ -447,7 +447,7 @@ pub mod server {
     #[cfg(feature = "legacy-2024-11-05")]
     pub use fastmcp_server::legacy_2024;
     pub use fastmcp_server::{
-        AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
+        AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
         BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, DuplicateBehavior,
         ExtensionHandler, ExtensionHandlerInvocationError, ExtensionHandlerKey,
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
@@ -924,7 +924,7 @@ pub use fastmcp_transport::{NativePipeReader, NativePipeWriter, create_native_pi
 // and trips none of those four rules. `providers` below re-exports its types
 // unconditionally, so the feature equation in Cargo.toml is the whole wiring.
 pub use fastmcp_server::{
-    AllowAllAuthProvider, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
+    AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, BannerStyle, BidirectionalSenders,
     BoundHttpServer, BoxFuture, CompletionHandler, ConsoleConfig, FinalElicitation,
     FinalElicitationContextExt, FinalResourceReadCacheHintProvenance, FinalRoots,
     FinalRootsContextExt, FinalSampling, FinalSamplingContextExt, FinalToolOutcome,

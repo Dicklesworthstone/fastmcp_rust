@@ -352,6 +352,20 @@ impl AuthProvider for ScopePolicyAuthProvider {
         })?;
         Ok(facts)
     }
+
+    fn authenticate_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request: AuthRequest<'a>,
+    ) -> crate::auth::AuthFuture<'a> {
+        Box::pin(async move {
+            let mut facts = self.provider.authenticate_async(ctx, request).await?;
+            self.policy.project_verified(&mut facts).map_err(|_| {
+                McpError::internal_error("authentication scope policy rejected provider facts")
+            })?;
+            Ok(facts)
+        })
+    }
 }
 
 fn validate_scope(scope: &str) -> Result<(), ScopePolicyError> {
@@ -679,5 +693,42 @@ mod tests {
         let policy = policy(&[("private-canary-admin", "private-canary-read")]);
         let required = RequiredScopes::new(scopes(&["private-canary-read"])).unwrap();
         assert!(!format!("{policy:?} {required:?}").contains("private-canary"));
+    }
+
+    #[test]
+    fn asynchronous_scope_wrapper_delegates_and_preserves_verification_expiry() {
+        struct AsyncOnly;
+        impl AuthProvider for AsyncOnly {
+            fn authenticate(&self, _: &McpContext, _: AuthRequest<'_>) -> McpResult<AuthContext> {
+                Err(McpError::internal_error("synchronous path must not run"))
+            }
+            fn authenticate_async<'a>(&'a self, _: &'a McpContext, _: AuthRequest<'a>)
+                -> crate::auth::AuthFuture<'a>
+            {
+                Box::pin(async {
+                    let mut facts = AuthContext::with_subject("async-owner")
+                        .with_verification_valid_until(std::time::Instant::now()
+                            + std::time::Duration::from_secs(30));
+                    facts.scopes = vec!["admin".to_owned()];
+                    Ok(facts)
+                })
+            }
+        }
+        let provider = ScopePolicyAuthProvider::new(AsyncOnly, policy(&[("admin", "read")]));
+        let ctx = McpContext::new(asupersync::Cx::for_testing(), 1);
+        let request = AuthRequest {
+            method: "tools/list", params: None, transport_authorization: Some("Bearer opaque"),
+            request_id: 1,
+        };
+        let mut future = provider.authenticate_async(&ctx, request);
+        let facts = match future.as_mut().poll(
+            &mut std::task::Context::from_waker(std::task::Waker::noop()),
+        ) {
+            std::task::Poll::Ready(facts) => facts.unwrap(),
+            std::task::Poll::Pending => panic!("in-memory provider unexpectedly pending"),
+        };
+        assert_eq!(facts.scopes, scopes(&["admin", "read"]));
+        assert!(facts.verification_valid_until().is_some());
+        assert!(provider.authenticate(&ctx, request).is_err());
     }
 }

@@ -52,6 +52,15 @@ pub mod jwt_resource;
 #[cfg(feature = "jwt-resource-auth")]
 pub use jwt_resource::{JwtResourceAuthError, JwtResourcePolicy, JwtResourceVerifier};
 
+/// Request-owned RFC 7662 verification against an explicitly configured HTTPS
+/// endpoint, using the shared issuer/resource audience policy and guarded I/O.
+#[cfg(feature = "jwt-resource-auth")]
+pub mod introspection;
+#[cfg(feature = "jwt-resource-auth")]
+pub use introspection::{
+    IntrospectionAdmissionPool, IntrospectionError, IntrospectionPolicy, IntrospectionVerifier,
+};
+
 /// Expiring JWT key generations with caller-driven, revocation-safe renewal.
 #[cfg(feature = "jwt-resource-auth")]
 pub mod managed_jwks;

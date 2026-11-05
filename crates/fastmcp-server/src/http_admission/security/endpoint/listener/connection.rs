@@ -738,7 +738,7 @@ async fn sse(
     subscription_drain: &SubscriptionDrain,
 ) -> Result<(), ()> {
     if let Some(lease) = lease.as_mut() {
-        lease.check(cx).map_err(|_| ())?;
+        lease.check_async(cx).await.map_err(|_| ())?;
     }
     let sender = response.sender();
     let cancellation = sender.request_cancellation();
@@ -815,7 +815,7 @@ async fn sse(
             .map_err(|_| ())??;
         let (terminal_control, terminal_response) = loop {
             if let Some(lease) = lease.as_mut() {
-                lease.check(cx).map_err(|_| ())?;
+                lease.check_async(cx).await.map_err(|_| ())?;
             }
             if terminal.is_settled() {
                 return Err(());

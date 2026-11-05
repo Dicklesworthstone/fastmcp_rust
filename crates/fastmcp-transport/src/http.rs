@@ -1800,11 +1800,24 @@ impl GuardedHttpFetcher {
         deadline: asupersync::Time,
         host: String,
     ) -> Result<Vec<IpAddr>, GuardedHttpFetchError> {
+        self.resolve_all_with_lifetime(cx, deadline, host, None).await
+    }
+
+    async fn resolve_all_with_lifetime(
+        &self,
+        cx: &Cx,
+        deadline: asupersync::Time,
+        host: String,
+        lifetime: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Vec<IpAddr>, GuardedHttpFetchError> {
         // ONE resolution path. Production and any caller-supplied resolver both
         // arrive here, and both are fenced by `guarded_select_address` after.
         let resolver = Arc::clone(&self.resolver);
-        guarded_await_phase(cx, deadline, move |phase_cx| {
-            resolver.resolve_all(phase_cx, host)
+        guarded_await_phase(cx, deadline, move |phase_cx| async move {
+            // This clone belongs to the phase child, not merely its joiner.
+            // Cancellation cannot release capacity before the child drops.
+            let _lifetime = lifetime;
+            resolver.resolve_all(phase_cx, host).await
         })
         .await
     }
@@ -2155,10 +2168,39 @@ impl GuardedHttpFetcher {
         url: &GuardedHttpsUrl,
         request: &GuardedHttpRequest,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        self.post_with_retained_lifetime(cx, url, request, None).await
+    }
+
+    /// POST while retaining a caller's admission/resource guard in every owned
+    /// resolver and TCP/TLS/HTTP phase child. The guard grants no network or TLS
+    /// authority and changes no request bytes, destination or deadline policy.
+    ///
+    /// Dropping the outer future still requests ordinary child cancellation.
+    /// Its last phase-owned guard is released only when that child's future and
+    /// resources are dropped, so an admission permit cannot be recycled while a
+    /// cancelled phase is still awaiting runtime settlement. The caller should
+    /// also retain its own Arc for post-fetch processing it must account for.
+    pub async fn post_with_lifetime(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        self.post_with_retained_lifetime(cx, url, request, Some(lifetime)).await
+    }
+
+    async fn post_with_retained_lifetime(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        request: &GuardedHttpRequest,
+        lifetime: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
         guarded_fetch_checkpoint(cx)?;
         let fetch_deadline = time::wall_now() + self.policy.deadline;
         let answers = self
-            .resolve_all(cx, fetch_deadline, url.host.clone())
+            .resolve_all_with_lifetime(cx, fetch_deadline, url.host.clone(), lifetime.clone())
             .await?;
         #[cfg(test)]
         let selected_address = guarded_select_address_with_test_loopback(
@@ -2175,6 +2217,9 @@ impl GuardedHttpFetcher {
         let native_request = guarded_compose_post_request(url, request);
         let policy = self.policy.clone();
         let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
+            // Declared before I/O resources so ordinary scope destruction
+            // disposes the request/stream before releasing this capacity.
+            let _lifetime = lifetime;
             guarded_fetch_checkpoint(&phase_cx)?;
             let tcp = NativeTcpStream::connect(selected_address)
                 .await
@@ -8107,6 +8152,14 @@ X/aCEJ5+hA==
         attempts: Vec<GuardedLoopbackPostAttempt>,
         responses: Vec<Vec<u8>>,
     ) -> GuardedLoopbackPostRun {
+        guarded_loopback_posts_retaining(attempts, responses, None)
+    }
+
+    fn guarded_loopback_posts_retaining(
+        attempts: Vec<GuardedLoopbackPostAttempt>,
+        responses: Vec<Vec<u8>>,
+        lifetime: Option<Arc<dyn Send + Sync>>,
+    ) -> GuardedLoopbackPostRun {
         fastmcp_core::block_on(async {
             let cx = Cx::current().expect("runtime installs loopback context");
             let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -8151,7 +8204,12 @@ X/aCEJ5+hA==
                 ))
                 .expect("loopback POST URL");
                 root_identities.push(fetcher.root_identity().to_owned());
-                results.push(fetcher.post(&cx, &url, &attempt.request).await);
+                results.push(match &lifetime {
+                    Some(lifetime) => fetcher.post_with_lifetime(
+                        &cx, &url, &attempt.request, Arc::clone(lifetime),
+                    ).await,
+                    None => fetcher.post(&cx, &url, &attempt.request).await,
+                });
                 urls.push(url);
             }
             let join_deadline =
@@ -8402,6 +8460,134 @@ X/aCEJ5+hA==
                 guarded_fetch_checkpoint(&cx)?;
                 Ok(answers)
             })
+        }
+    }
+
+    struct GuardedLifetimeProbe { dropped: Arc<AtomicUsize> }
+
+    impl Drop for GuardedLifetimeProbe {
+        fn drop(&mut self) { self.dropped.fetch_add(1, Ordering::AcqRel); }
+    }
+
+    struct LifetimeObservingResolver {
+        lifetime: std::sync::Weak<GuardedLifetimeProbe>,
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        alive_at_drop: Arc<AtomicUsize>,
+    }
+
+    struct LifetimeObservingResolverFuture {
+        lifetime: std::sync::Weak<GuardedLifetimeProbe>,
+        started: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+        alive_at_drop: Arc<AtomicUsize>,
+    }
+
+    impl GuardedHttpResolver for LifetimeObservingResolver {
+        fn resolve_all(&self, _: Cx, _: String)
+            -> Pin<Box<dyn Future<Output = Result<Vec<IpAddr>, GuardedHttpFetchError>> + Send + 'static>>
+        {
+            Box::pin(LifetimeObservingResolverFuture {
+                lifetime: self.lifetime.clone(),
+                started: Arc::clone(&self.started),
+                dropped: Arc::clone(&self.dropped),
+                alive_at_drop: Arc::clone(&self.alive_at_drop),
+            })
+        }
+    }
+
+    impl Future for LifetimeObservingResolverFuture {
+        type Output = Result<Vec<IpAddr>, GuardedHttpFetchError>;
+        fn poll(self: Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+            self.started.store(1, Ordering::Release);
+            Poll::Pending
+        }
+    }
+
+    impl Drop for LifetimeObservingResolverFuture {
+        fn drop(&mut self) {
+            if self.lifetime.upgrade().is_some() {
+                self.alive_at_drop.fetch_add(1, Ordering::AcqRel);
+            }
+            self.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn guarded_post_lifetime_outlives_cancelled_resolver_after_parent_drop() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let resolver_dropped = Arc::new(AtomicUsize::new(0));
+        let alive_at_drop = Arc::new(AtomicUsize::new(0));
+        let lifetime_dropped = Arc::new(AtomicUsize::new(0));
+        let lifetime = Arc::new(GuardedLifetimeProbe { dropped: Arc::clone(&lifetime_dropped) });
+        let weak = Arc::downgrade(&lifetime);
+        let fetcher = GuardedHttpFetcher::with_resolver(
+            guarded_test_policy_with_handshake(1024, Duration::from_secs(2), Duration::from_secs(1)),
+            Arc::new(LifetimeObservingResolver {
+                lifetime: weak.clone(), started: Arc::clone(&started),
+                dropped: Arc::clone(&resolver_dropped), alive_at_drop: Arc::clone(&alive_at_drop),
+            }),
+        ).unwrap();
+        let url = GuardedHttpsUrl::parse("https://public.example/introspect").unwrap();
+        let request = GuardedHttpRequest::new(
+            "application/x-www-form-urlencoded", b"token=opaque".to_vec(),
+        ).unwrap();
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut post = Box::pin(fetcher.post_with_lifetime(&cx, &url, &request, lifetime));
+            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
+                assert!(post.as_mut().poll(task).is_pending());
+                if started.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
+                task.waker().wake_by_ref();
+                Poll::Pending
+            })).await.expect("resolver starts within a bounded fixture deadline");
+            assert!(weak.upgrade().is_some());
+            drop(post);
+            // The phase may settle immediately or on a later runtime turn.
+            // Its own destructor observes the guard, independent of scheduling.
+            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
+                if resolver_dropped.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
+                task.waker().wake_by_ref();
+                Poll::Pending
+            })).await.expect("cancelled resolver settles");
+        });
+        assert_eq!(resolver_dropped.load(Ordering::Acquire), 1);
+        assert_eq!(alive_at_drop.load(Ordering::Acquire), 1, "child drops before its capacity guard");
+        assert_eq!(lifetime_dropped.load(Ordering::Acquire), 1);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn guarded_post_lifetime_preserves_real_tls_and_exact_request_bytes() {
+        for trusted in [true, false] {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let lifetime = Arc::new(GuardedLifetimeProbe { dropped: Arc::clone(&dropped) });
+            let request = GuardedHttpRequest::new(
+                "application/x-www-form-urlencoded", b"token=opaque&token_type_hint=access_token".to_vec(),
+            ).unwrap().with_authorization("Basic test-only").unwrap();
+            let roots = if trusted { guarded_loopback_member_roots() } else {
+                GuardedRootSet::new(vec![guarded_outside_root()]).unwrap()
+            };
+            let run = guarded_loopback_posts_retaining(
+                vec![GuardedLoopbackPostAttempt { roots, request: request.clone(), host: "foobar.com" }],
+                vec![b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{\"active\":false}".to_vec()],
+                Some(lifetime),
+            );
+            assert_eq!(dropped.load(Ordering::Acquire), 1);
+            assert_eq!(run.observation.accepted_connections, 1);
+            if trusted {
+                assert_eq!(run.results[0].as_ref().unwrap().status, 200);
+                assert_eq!(run.observation.requests,
+                    vec![guarded_encode_post_request(&run.urls[0], &request).unwrap()]);
+            } else {
+                match &run.results[0] {
+                    Err(GuardedHttpFetchError::Tls(message)) => assert!(
+                        !message.contains("timed out"), "fixture must reject certificate trust, not time out",
+                    ),
+                    other => panic!("untrusted root must fail TLS verification: {other:?}"),
+                }
+                assert!(run.observation.requests.is_empty(), "untrusted TLS peer gets no credential");
+            }
         }
     }
 

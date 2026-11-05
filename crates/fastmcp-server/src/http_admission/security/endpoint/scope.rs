@@ -109,7 +109,7 @@ fn check_admission(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare(
+async fn prepare(
     session: &mut ServerHttpSession,
     cx: &Cx,
     policy: &ScopeRequestPolicy,
@@ -135,7 +135,9 @@ fn prepare(
     }
     let (request, admitted, raw_params) = session.prepare_modern_http_request(request)?;
     check_admission(cx, cancellation)?;
-    let receipt = session.preauthenticate_modern_http_request(cx, &admitted, authorization)?;
+    let receipt = session
+        .preauthenticate_modern_http_request(cx, &admitted, authorization, cancellation)
+        .await?;
     check_admission(cx, cancellation)?;
     let rejection = scope_rejection(policy, &admitted, receipt.authenticated.as_ref());
     check_admission(cx, cancellation)?;
@@ -208,7 +210,7 @@ async fn dispatch_with_authorization(
         &authorization,
         cancellation.as_ref(),
         revalidation,
-    ) {
+    ).await {
         Ok(prepared) => prepared,
         Err(response) => return Ok((ServerHttpEndpointResponse::Immediate(response), None)),
     };
@@ -316,7 +318,7 @@ pub(super) async fn begin_sse(
         &authorization,
         None,
         revalidation,
-    ) {
+    ).await {
         Ok(prepared) => prepared,
         Err(response) => {
             return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(

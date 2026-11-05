@@ -281,6 +281,10 @@ impl AcceptedAudiencePolicy {
         &self.audiences
     }
 
+    pub(crate) fn identity(&self) -> Sha256Digest {
+        self.identity
+    }
+
     fn accepts(&self, audience: &str) -> bool {
         self.audiences
             .binary_search_by(|candidate| candidate.as_str().cmp(audience))

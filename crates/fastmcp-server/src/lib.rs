@@ -101,7 +101,7 @@ pub mod transform;
 mod tests;
 
 pub use auth::{
-    AllowAllAuthProvider, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
+    AllowAllAuthProvider, AuthFuture, AuthProvider, AuthRequest, StaticTokenVerifier, TokenAuthProvider,
     TokenVerifier,
 };
 pub use builder::{
@@ -10426,6 +10426,7 @@ impl AuthAdmissionReceipt {
         inbound: &InboundRequestContext,
         request: &mut JsonRpcRequest,
     ) -> Result<Sha256Digest, McpError> {
+        Server::enforce_authentication_freshness(self.authenticated.as_ref())?;
         if self.method != request.method
             || request.id != self.request_id
             || !inbound
@@ -10461,6 +10462,7 @@ impl AuthAdmissionReceipt {
         ctx: &McpContext,
         request: &JsonRpcRequest,
     ) -> Result<Sha256Digest, McpError> {
+        Server::enforce_authentication_freshness(self.authenticated.as_ref())?;
         if self.method != request.method || request.id != self.request_id {
             return Err(McpError::new(
                 McpErrorCode::ResourceForbidden,
@@ -10516,6 +10518,7 @@ impl AuthDispatchCustody {
             Self::Http(receipt) => receipt.commit(ctx, inbound, request),
             #[cfg(feature = "websocket")]
             Self::WebSocket(custody) => {
+                Server::enforce_authentication_freshness(custody.authenticated.as_ref())?;
                 if _websocket_connection_generation != Some(custody.connection_generation)
                     || custody
                         .rejected_inband_request_ids
@@ -10558,6 +10561,7 @@ impl AuthDispatchCustody {
                 (custody.authenticated.clone(), custody.fingerprint.clone())
             }
         };
+        Server::enforce_authentication_freshness(authenticated.as_ref())?;
         let committed = match authenticated {
             Some(auth) => ctx.set_auth(auth),
             None => ctx.commit_anonymous_auth(),
@@ -10757,7 +10761,8 @@ impl ServerHttpSession {
                 cx,
                 &admitted_request,
                 &transport_authorization,
-            ) {
+                modern_request_cancellation.as_ref(),
+            ).await {
                 Ok(receipt) => Some(AuthDispatchCustody::Http(receipt)),
                 Err(response) => return Ok(ServerHttpEndpointResponse::Immediate(response)),
             };
@@ -11006,14 +11011,18 @@ impl ServerHttpSession {
     /// receipt carries the sole successful provider evaluation into the fresh
     /// request context that dispatch owns; failed admission has no session,
     /// handler, middleware, or log side effects.
-    fn preauthenticate_modern_http_request(
+    async fn preauthenticate_modern_http_request(
         &self,
         cx: &Cx,
         request: &JsonRpcRequest,
         transport_authorization: &TransportAuthorization,
+        cancellation: Option<&McpRequestCancellation>,
     ) -> Result<AuthAdmissionReceipt, HttpResponse> {
         self.server
-            .preauthenticate_http_request(cx, request, transport_authorization)
+            .preauthenticate_http_request_with_cancellation_async(
+                cx, request, transport_authorization, cancellation,
+            )
+            .await
     }
 
     /// Authenticates an exact-2024 HTTP GET `/sse` or POST `/messages`
@@ -11032,7 +11041,7 @@ impl ServerHttpSession {
         let admitted = request
             .or(synthetic.as_ref())
             .expect("synthetic fills GET /sse");
-        self.preauthenticate_modern_http_request(cx, admitted, transport_authorization)
+        self.server.preauthenticate_http_request(cx, admitted, transport_authorization)
     }
 
     fn admit_modern_http_request(
@@ -11546,7 +11555,8 @@ impl ServerHttpSession {
             cx,
             &admitted_request,
             &transport_authorization,
-        ) {
+            modern_request_cancellation.as_ref(),
+        ).await {
             Ok(receipt) => AuthDispatchCustody::Http(receipt),
             Err(response) => {
                 return Ok(Err(Box::new(ServerHttpEndpointResponse::Immediate(
@@ -11955,6 +11965,12 @@ fn transport_authorization_from_http_request(
 /// detail and never reflects a credential.
 fn native_http_authentication_rejection() -> HttpResponse {
     HttpResponse::new(HttpStatus::UNAUTHORIZED).with_header("www-authenticate", "Bearer")
+}
+
+fn native_http_authentication_unavailable() -> HttpResponse {
+    HttpResponse::new(HttpStatus::SERVICE_UNAVAILABLE)
+        .with_header("retry-after", "1")
+        .with_header("cache-control", "no-store")
 }
 
 /// A fixed migration diagnostic: neither the source name nor its value is
@@ -23234,6 +23250,74 @@ impl Server {
             .map_err(|_| native_http_authentication_rejection())
     }
 
+    /// Asynchronous native admission for providers that perform guarded I/O.
+    /// The provider future is owned by this request and is dropped on timeout,
+    /// cancellation, or abandonment before any dispatch receipt can escape.
+    #[cfg(test)]
+    async fn preauthenticate_http_request_async(
+        &self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+        transport_authorization: &TransportAuthorization,
+    ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        self.preauthenticate_http_request_with_cancellation_async(
+            cx, request, transport_authorization, None,
+        ).await
+    }
+
+    async fn preauthenticate_http_request_with_cancellation_async(
+        &self,
+        cx: &Cx,
+        request: &JsonRpcRequest,
+        transport_authorization: &TransportAuthorization,
+        cancellation: Option<&McpRequestCancellation>,
+    ) -> Result<AuthAdmissionReceipt, HttpResponse> {
+        let auth_request = transport_authorization.auth_request(
+            &request.method,
+            request.params.as_ref(),
+            request_id_to_u64(request.id.as_ref()),
+        );
+        if auth_request.has_in_band_credential_source() {
+            return Err(native_http_credential_location_rejection());
+        }
+        if self.auth_provider.is_some() && auth_request.transport_authorization.is_none() {
+            return Err(native_http_authentication_rejection());
+        }
+        let budget = self.create_request_budget(cx);
+        Self::enforce_request_budget(cx, budget)
+            .map_err(|_| native_http_authentication_unavailable())?;
+        let (request_ctx, _request_lease_guard) =
+            McpContext::new(cx.clone(), request_id_to_u64(request.id.as_ref()))
+                .with_request_cancellation(cancellation.cloned().unwrap_or_default())
+                .with_budget_ceiling(budget)
+                .begin_request_scope()
+                .ok_or_else(native_http_authentication_unavailable)?;
+        let admitted = self
+            .authenticate_request_without_commit_async(&request_ctx, auth_request)
+            .await;
+        Self::enforce_request_context(&request_ctx)
+            .map_err(|_| native_http_authentication_unavailable())?;
+        match admitted {
+            Ok((fingerprint, authenticated)) => {
+                let mut sanitized = request.clone();
+                auth::strip_recognized_access_credentials(&mut sanitized.params);
+                Ok(AuthAdmissionReceipt {
+                    method: sanitized.method,
+                    request_id: sanitized.id,
+                    sanitized_params: sanitized.params,
+                    fingerprint,
+                    authenticated,
+                })
+            }
+            Err(error) if error.code == auth::AUTH_PROVIDER_UNAVAILABLE_CODE
+                || error.code == McpErrorCode::RequestCancelled =>
+            {
+                Err(native_http_authentication_unavailable())
+            }
+            Err(_) => Err(native_http_authentication_rejection()),
+        }
+    }
+
     /// Authenticates one modern ingress request before extension middleware
     /// sees it. Native authorization remains in the inbound custody object;
     /// recognized JSON credentials are removed after authentication and before
@@ -23425,6 +23509,23 @@ impl Server {
                 McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed")
             })?
         };
+        Self::admit_authentication_facts(credential_present, auth)
+    }
+
+    fn enforce_authentication_freshness(auth: Option<&AuthContext>) -> McpResult<()> {
+        if auth.and_then(AuthContext::verification_valid_until)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed"));
+        }
+        Ok(())
+    }
+
+    fn admit_authentication_facts(
+        credential_present: bool,
+        auth: AuthContext,
+    ) -> McpResult<(Sha256Digest, Option<AuthContext>)> {
+        Self::enforce_authentication_freshness(Some(&auth))?;
         if credential_present && auth.subject.as_deref().is_none_or(str::is_empty) {
             error!(
                 target: targets::SERVER,
@@ -23444,6 +23545,91 @@ impl Server {
             McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed")
         })?;
         Ok((fingerprint, Some(auth)))
+    }
+
+    /// Runs one provider future with the same isolated facts and panic boundary
+    /// as synchronous authentication. Provider waiting has its own 30-second
+    /// hard ceiling even when application request timeouts are disabled.
+    async fn authenticate_request_without_commit_async(
+        &self,
+        ctx: &McpContext,
+        request: AuthRequest<'_>,
+    ) -> McpResult<(Sha256Digest, Option<AuthContext>)> {
+        if !request.credential_sources_are_admissible() {
+            return Err(McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed"));
+        }
+        let credential_present = request.has_any_credential_source();
+        let Some(provider) = &self.auth_provider else {
+            if credential_present {
+                return Err(McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed"));
+            }
+            return auth::principal_fingerprint(None).map(|fingerprint| (fingerprint, None));
+        };
+        let staged_ctx = ctx.clone().with_isolated_auth();
+        Self::enforce_request_context(&staged_ctx)?;
+        let started = Instant::now();
+        let ceiling = staged_ctx.cx().now().saturating_add_nanos(30_000_000_000);
+        let deadline = staged_ctx.budget().deadline.map_or(ceiling, |value| value.min(ceiling));
+        let mut authentication = catch_extension_unwind(|| {
+            provider.authenticate_async(&staged_ctx, request)
+        }).map_err(|_| extension_panic_error("auth_provider"))?;
+        let cancellation = staged_ctx.request_cancellation().clone();
+        let mut cancelled = std::pin::pin!(cancellation.cancelled());
+        let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
+        let mut runtime_cancelled = std::pin::pin!(receiver.recv(staged_ctx.cx()));
+        let mut timer = std::pin::pin!(asupersync::time::Sleep::new(deadline));
+        let unavailable = || McpError::new(
+            auth::AUTH_PROVIDER_UNAVAILABLE_CODE, "Authentication provider unavailable",
+        );
+        let result = std::future::poll_fn(|task| {
+            let ceiling = auth::ambient_auth_capability_ceiling();
+            let _current = Cx::set_current(Some(staged_ctx.cx().clone()));
+            let _restriction = Cx::push_restriction(ceiling);
+            Self::enforce_request_context(&staged_ctx)?;
+            if staged_ctx.cx().now() >= deadline || started.elapsed() >= Duration::from_secs(30) {
+                return std::task::Poll::Ready(Err(unavailable()));
+            }
+            // An elected response drain can already be runtime-masked. Its
+            // caller also masks this context per poll; ordinary ingress cannot
+            // enter through that path or suppress its cancellation observation.
+            let masked_drain = staged_ctx.cx().is_cancel_requested()
+                && staged_ctx.cx().checkpoint().is_ok();
+            if !masked_drain
+                && (cancelled.as_mut().poll(task).is_ready()
+                    || runtime_cancelled.as_mut().poll(task).is_ready())
+            {
+                return std::task::Poll::Ready(Err(McpError::request_cancelled()));
+            }
+            let result = catch_extension_unwind(|| authentication.as_mut().poll(task))
+                .map_err(|_| extension_panic_error("auth_provider"))?;
+            Self::enforce_request_context(&staged_ctx)?;
+            if staged_ctx.cx().now() >= deadline || started.elapsed() >= Duration::from_secs(30) {
+                return std::task::Poll::Ready(Err(unavailable()));
+            }
+            if result.is_pending() {
+                // Sleep otherwise falls back to a process-global driver. A
+                // retained broad Cx must not restore ambient-denied time.
+                if Cx::current().and_then(|active| active.timer_driver()).is_none() {
+                    return std::task::Poll::Ready(Err(unavailable()));
+                }
+                if timer.as_mut().poll(task).is_ready() {
+                    return std::task::Poll::Ready(Err(unavailable()));
+                }
+            }
+            result
+        }).await;
+        let auth = result.map_err(|provider_error| {
+            if provider_error.code == auth::AUTH_PROVIDER_UNAVAILABLE_CODE
+                || provider_error.code == McpErrorCode::RequestCancelled
+            {
+                McpError::new(provider_error.code, "Authentication provider unavailable")
+            } else {
+                debug!(target: targets::SERVER,
+                    "Authentication provider denied request; code={:?}", provider_error.code);
+                McpError::new(McpErrorCode::ResourceForbidden, "Authentication failed")
+            }
+        })?;
+        Self::admit_authentication_facts(credential_present, auth)
     }
 
     /// Validates Upgrade authorization before the WebSocket `101` commits.

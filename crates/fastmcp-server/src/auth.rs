@@ -7,10 +7,13 @@
 //! in session state.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Write as _;
+use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
+use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 use fastmcp_core::runtime::{ProcessBoundToken, ProcessGenerationGuard};
 use fastmcp_core::{
     AccessToken, AuthContext, HmacSha256Key, MAX_ACCESS_SCHEME_BYTES, MAX_ACCESS_TOKEN_BYTES,
@@ -510,6 +513,36 @@ fn remove_headers_access_token_fields(map: &mut serde_json::Map<String, serde_js
     map.retain(|key, _| !is_header_access_token_field(key));
 }
 
+/// Request-owned authentication work, driven by the caller's runtime.
+///
+/// Dropping this future abandons the verification attempt. Implementations must
+/// not detach work, create a runtime, retain a borrowed request after completion,
+/// or publish facts from an expired/cancelled attempt.
+pub type AuthFuture<'a> =
+    Pin<Box<dyn Future<Output = McpResult<AuthContext>> + Send + 'a>>;
+
+/// Reserved local provider classification. Native asynchronous ingress maps it
+/// to a fixed HTTP 503 without exposing provider diagnostics or credential state.
+pub(crate) const AUTH_PROVIDER_UNAVAILABLE_CODE: McpErrorCode = McpErrorCode::Custom(-32098);
+
+/// Preserve an ambient effect ceiling when selecting an explicit caller's
+/// drivers. A retained broader Cx must not restore a denied effect on resumption.
+pub(crate) fn ambient_auth_capability_ceiling() -> CapMask {
+    let Some(active) = asupersync::Cx::current() else { return CapMask::all() };
+    let capabilities = active.capabilities();
+    let mut ceiling = CapMask::all();
+    for (allowed, without_effect) in [
+        (capabilities.spawn, CapSet::<false, true, true, true, true>::MASK),
+        (capabilities.time, CapSet::<true, false, true, true, true>::MASK),
+        (capabilities.entropy, CapSet::<true, true, false, true, true>::MASK),
+        (capabilities.io, CapSet::<true, true, true, false, true>::MASK),
+        (capabilities.remote, CapSet::<true, true, true, true, false>::MASK),
+    ] {
+        if !allowed { ceiling = ceiling.intersect(without_effect); }
+    }
+    ceiling
+}
+
 /// Authentication provider interface.
 ///
 /// Implementations decide whether a request is allowed and may return
@@ -525,6 +558,18 @@ pub trait AuthProvider: Send + Sync {
     /// are replaced at the framework boundary before middleware or peers see
     /// them.
     fn authenticate(&self, ctx: &McpContext, request: AuthRequest<'_>) -> McpResult<AuthContext>;
+
+    /// Authenticates on an asynchronous transport boundary without blocking its
+    /// reactor. The default preserves an existing synchronous implementation.
+    /// Network providers override this method and fail closed from
+    /// [`Self::authenticate`]; they must not block or create a private runtime.
+    fn authenticate_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request: AuthRequest<'a>,
+    ) -> AuthFuture<'a> {
+        Box::pin(async move { self.authenticate(ctx, request) })
+    }
 }
 
 /// Token verifier interface used by token-based auth providers.
@@ -536,6 +581,18 @@ pub trait TokenVerifier: Send + Sync {
         request: AuthRequest<'_>,
         token: &AccessToken,
     ) -> McpResult<AuthContext>;
+
+    /// Request-owned asynchronous verification. Existing local verifiers retain
+    /// their synchronous behavior through this default. An I/O verifier overrides
+    /// this method and refuses the synchronous entry point.
+    fn verify_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request: AuthRequest<'a>,
+        token: &'a AccessToken,
+    ) -> AuthFuture<'a> {
+        Box::pin(async move { self.verify(ctx, request, token) })
+    }
 }
 
 /// Token-based authentication provider.
@@ -637,6 +694,53 @@ impl AuthProvider for TokenAuthProvider {
             }
         };
         let auth = self.verifier.verify(ctx, request, &access)?;
+        self.finish_verification(ctx, &access, auth)
+    }
+
+    fn authenticate_async<'a>(
+        &'a self,
+        ctx: &'a McpContext,
+        request: AuthRequest<'a>,
+    ) -> AuthFuture<'a> {
+        Box::pin(async move {
+            let access = match admitted_access_token(request) {
+                Ok(Some(token)) => token,
+                Ok(None) => return Err(self.missing_token_error.clone()),
+                Err(CredentialSourceError::Multiple) => {
+                    return Err(auth_error("Multiple conflicting credential sources"));
+                }
+                Err(CredentialSourceError::Malformed) => {
+                    return Err(auth_error("Invalid access token"));
+                }
+            };
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
+            if ctx.deadline_expired() {
+                return Err(McpError::request_cancelled());
+            }
+            let auth = self.verifier.verify_async(ctx, request, &access).await?;
+            // Async work can complete concurrently with cancellation. Check even
+            // when the verifier supplied an explicit session owner.
+            ctx.checkpoint()
+                .map_err(|_| McpError::request_cancelled())?;
+            if ctx.deadline_expired() {
+                return Err(McpError::request_cancelled());
+            }
+            self.finish_verification(ctx, &access, auth)
+        })
+    }
+}
+
+impl TokenAuthProvider {
+    fn finish_verification(
+        &self,
+        ctx: &McpContext,
+        access: &AccessToken,
+        auth: AuthContext,
+    ) -> McpResult<AuthContext> {
+        if auth.verification_valid_until().is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(auth_error("Token verifier returned expired authentication facts"));
+        }
         if principal_fingerprint(Some(&auth)).is_err() {
             return Err(auth_error(
                 "Token verifier returned invalid authentication facts",
@@ -663,7 +767,7 @@ impl AuthProvider for TokenAuthProvider {
             .get_or_init(TokenOwnerNamespace::new)
             .as_ref()
             .map_err(|()| auth_error("Token owner protection unavailable"))?;
-        let owner = namespace.owner(&access, subject)?;
+        let owner = namespace.owner(access, subject)?;
         ctx.checkpoint()
             .map_err(|_| McpError::request_cancelled())?;
         if ctx.deadline_expired() {
@@ -3634,5 +3738,103 @@ mod tests {
             .replace_tokens([("retained-secret", owner)])
             .unwrap();
         assert!(authenticate_header(&provider, "Bearer retained-secret").is_err());
+    }
+}
+
+#[cfg(test)]
+mod async_auth_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Waker};
+    use std::time::Duration;
+
+    fn context() -> McpContext {
+        McpContext::new(asupersync::Cx::for_testing(), 77)
+    }
+    fn request(header: Option<&str>) -> AuthRequest<'_> {
+        AuthRequest { method: "tools/list", params: None, transport_authorization: header, request_id: 77 }
+    }
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("bounded in-memory fixture unexpectedly pending"),
+        }
+    }
+
+    struct LocalVerifier(Arc<AtomicUsize>);
+    impl TokenVerifier for LocalVerifier {
+        fn verify(&self, _: &McpContext, _: AuthRequest<'_>, _: &AccessToken) -> McpResult<AuthContext> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(AuthContext::with_subject("local-subject"))
+        }
+    }
+
+    #[test]
+    fn asynchronous_default_preserves_sync_verification_and_owner_identity() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = TokenAuthProvider::new(LocalVerifier(Arc::clone(&calls)));
+        let ctx = context();
+        let synchronous = provider.authenticate(&ctx, request(Some("Bearer local-token"))).unwrap();
+        let asynchronous = ready(provider.authenticate_async(&ctx, request(Some("Bearer local-token")))).unwrap();
+        assert_eq!(synchronous.session_owner(), asynchronous.session_owner());
+        assert_eq!(principal_fingerprint(Some(&synchronous)).unwrap(),
+            principal_fingerprint(Some(&asynchronous)).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    struct AsyncOnlyVerifier {
+        calls: Arc<AtomicUsize>,
+        cancel: bool,
+        expiry: Option<Instant>,
+    }
+    impl TokenVerifier for AsyncOnlyVerifier {
+        fn verify(&self, _: &McpContext, _: AuthRequest<'_>, _: &AccessToken) -> McpResult<AuthContext> {
+            Err(McpError::new(AUTH_PROVIDER_UNAVAILABLE_CODE, "async required"))
+        }
+        fn verify_async<'a>(&'a self, ctx: &'a McpContext, _: AuthRequest<'a>, _: &'a AccessToken)
+            -> AuthFuture<'a>
+        {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.cancel { assert!(ctx.request_cancellation().cancel()); }
+                let facts = AuthContext::with_subject("async-subject")
+                    .with_session_owner(Sha256Digest::from_bytes([33; 32]));
+                Ok(match self.expiry {
+                    Some(expiry) => facts.with_verification_valid_until(expiry),
+                    None => facts,
+                })
+            })
+        }
+    }
+
+    #[test]
+    fn token_provider_awaits_async_only_verifier_after_strict_credential_admission() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = TokenAuthProvider::new(AsyncOnlyVerifier {
+            calls: Arc::clone(&calls), cancel: false,
+            expiry: Some(Instant::now() + Duration::from_secs(30)),
+        });
+        let ctx = context();
+        assert!(provider.authenticate(&ctx, request(Some("Bearer opaque"))).is_err());
+        for header in [None, Some("Bearer "), Some("Bearer bad token"), Some("Bearer one, Bearer two")] {
+            assert!(ready(provider.authenticate_async(&ctx, request(header))).is_err());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let facts = ready(provider.authenticate_async(&ctx, request(Some("Bearer opaque")))).unwrap();
+        assert_eq!(facts.subject.as_deref(), Some("async-subject"));
+        assert_eq!(facts.session_owner(), Some(Sha256Digest::from_bytes([33; 32])));
+        assert!(facts.verification_valid_until().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn async_verifier_explicit_owner_cannot_bypass_cancellation_or_expiry() {
+        for (cancel, expiry) in [(true, None), (false, Some(Instant::now()))] {
+            let provider = TokenAuthProvider::new(AsyncOnlyVerifier {
+                calls: Arc::new(AtomicUsize::new(0)), cancel, expiry,
+            });
+            assert!(ready(provider.authenticate_async(&context(), request(Some("Bearer opaque")))).is_err());
+        }
     }
 }

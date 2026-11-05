@@ -7,6 +7,8 @@
 //! - Multi-handler registration
 //! - Error handling
 
+mod async_auth;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};

@@ -543,6 +543,7 @@ mod tests {
             scopes: vec!["read".to_string(), "write".to_string()],
             claims: Some(serde_json::json!({"aud": "api"})),
             session_owner: None,
+            verification_valid_until: None,
         }
         .with_session_owner(owner);
         let json = serde_json::to_value(&ctx).expect("serialize");
@@ -584,6 +585,7 @@ mod tests {
             scopes: vec!["read".to_string()],
             claims: None,
             session_owner: None,
+            verification_valid_until: None,
         };
 
         let debug = format!("{ctx:?}");
@@ -649,6 +651,10 @@ pub struct AuthContext {
     /// in-process consumers may incorporate it into ownership boundaries.
     #[serde(skip)]
     session_owner: Option<Sha256Digest>,
+    /// Process-local upper bound on the current provider verdict. This is
+    /// freshness custody, not a serializable grant or an identity component.
+    #[serde(skip)]
+    verification_valid_until: Option<std::time::Instant>,
 }
 
 impl fmt::Debug for AuthContext {
@@ -658,6 +664,7 @@ impl fmt::Debug for AuthContext {
             .field("scope_count", &self.scopes.len())
             .field("has_claims", &self.claims.is_some())
             .field("has_session_owner", &self.session_owner.is_some())
+            .field("has_verification_deadline", &self.verification_valid_until.is_some())
             .finish()
     }
 }
@@ -694,5 +701,26 @@ impl AuthContext {
     #[must_use]
     pub fn session_owner(&self) -> Option<Sha256Digest> {
         self.session_owner
+    }
+
+    /// Bounds how long a consumer may reuse this verified decision.
+    ///
+    /// Providers should derive this monotonic deadline conservatively from
+    /// token expiry or another authoritative freshness limit. Repeated calls
+    /// only tighten it. This does not replace continuous revocation checks.
+    /// Clones preserve the bound; serialization omits it together with the
+    /// process-local owner key and cannot recreate verification custody.
+    #[must_use]
+    pub fn with_verification_valid_until(mut self, deadline: std::time::Instant) -> Self {
+        self.verification_valid_until = Some(
+            self.verification_valid_until.map_or(deadline, |current| current.min(deadline)),
+        );
+        self
+    }
+
+    /// Returns the process-local upper bound on a cached provider decision.
+    #[must_use]
+    pub fn verification_valid_until(&self) -> Option<std::time::Instant> {
+        self.verification_valid_until
     }
 }

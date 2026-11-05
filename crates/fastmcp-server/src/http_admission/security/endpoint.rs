@@ -117,7 +117,7 @@ impl SecuredHttpSseResponse {
                     Ok(None) => return Err(SecuredHttpEndpointError::BodyClosed),
                     Err(_) => return Err(SecuredHttpEndpointError::BodyFailed),
                 }
-                if cx.timer_driver().is_none() {
+                if Cx::current().and_then(|active| active.timer_driver()).is_none() {
                     return Err(SecuredHttpEndpointError::TimerUnavailable);
                 }
                 asupersync::time::sleep(cx.now(), Duration::from_millis(10)).await;
@@ -305,7 +305,9 @@ impl ServerHttpEndpoint {
 // Poll one owned operation without restarting it. The finite timer wakes an
 // idle response, a pending representation election, or a blocked socket write.
 // Every resume checks before and after polling so a ready event cannot bypass
-// a due refusal. The surrounding response owner performs cancellation/cleanup.
+// a due refusal. A due asynchronous verification pauses this same operation;
+// neither the operation nor its provider future is restarted on each wake.
+// The surrounding response owner performs cancellation/cleanup.
 async fn guard_response<T>(
     cx: &Cx,
     authorization: &mut Option<SseAuthorizationLease>,
@@ -322,25 +324,41 @@ async fn guard_response<T>(
     }
     let mut wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
     let mut future = std::pin::pin!(future);
-    poll_fn(|task| {
-        let _current = Cx::set_current(Some(cx.clone()));
+    loop {
         lease
-            .check(cx)
+            .check_async(cx)
+            .await
             .map_err(SecuredHttpEndpointError::Revalidation)?;
-        let result = future.as_mut().poll(task);
-        lease
-            .check(cx)
-            .map_err(SecuredHttpEndpointError::Revalidation)?;
-        if let Poll::Ready(value) = result {
-            return Poll::Ready(Ok(value));
+        let result = poll_fn(|task| -> Poll<Result<Option<T>, SecuredHttpEndpointError>> {
+            let ceiling = crate::auth::ambient_auth_capability_ceiling();
+            let _current = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(ceiling);
+            if !lease.check_cached(cx).map_err(SecuredHttpEndpointError::Revalidation)? {
+                return Poll::Ready(Ok(None));
+            }
+            let result = future.as_mut().poll(task);
+            // Return custody of a ready value to the outer loop, which awaits
+            // any check that became due during this poll before delivering it.
+            if let Poll::Ready(value) = result {
+                return Poll::Ready(Ok(Some(value)));
+            }
+            if !lease.check_cached(cx).map_err(SecuredHttpEndpointError::Revalidation)? {
+                return Poll::Ready(Ok(None));
+            }
+            if Cx::current().and_then(|active| active.timer_driver()).is_none() {
+                return Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable));
+            }
+            if wake.as_mut().poll(task).is_ready() {
+                wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
+                return Poll::Ready(Ok(None));
+            }
+            Poll::Pending
+        }).await?;
+        if let Some(value) = result {
+            lease.check_async(cx).await.map_err(SecuredHttpEndpointError::Revalidation)?;
+            return Ok(value);
         }
-        if wake.as_mut().poll(task).is_ready() {
-            wake = Box::pin(Sleep::new(cx.now().saturating_add_nanos(10_000_000)));
-            let _ = wake.as_mut().poll(task);
-        }
-        Poll::Pending
-    })
-    .await
+    }
 }
 
 enum PreparedRequest {
@@ -423,9 +441,16 @@ async fn await_dispatch<T>(
     let mut future = std::pin::pin!(future);
     poll_fn(|task| {
         checkpoint(cx)?;
+        let ceiling = crate::auth::ambient_auth_capability_ceiling();
         let _current = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(ceiling);
         if cancelled.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(SecuredHttpEndpointError::Cancelled));
+        }
+        if timeout.is_some()
+            && Cx::current().and_then(|active| active.timer_driver()).is_none()
+        {
+            return Poll::Ready(Err(SecuredHttpEndpointError::TimerUnavailable));
         }
         if timeout
             .as_mut()
