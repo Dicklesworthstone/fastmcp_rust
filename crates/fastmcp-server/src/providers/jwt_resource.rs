@@ -12,12 +12,22 @@
 //! Tokens with `cnf` are refused: Bearer authentication cannot substitute for
 //! DPoP or mutual-TLS proof. These restrictions are not general JWT support.
 //!
+//! The safe default accepts only an audience exactly equal to the configured
+//! resource. An explicit [AcceptedAudiencePolicy] can map that resource to
+//! bounded, exact API identifiers issued by the same trusted issuer, including
+//! a controlled migration set. Token claims, request metadata and discovery
+//! cannot configure that policy.
+//!
 //! Only verified subject, scopes and stable issuer/resource/client identifiers
-//! reach AuthContext. Private claims, compact credentials, jti and refresh-only
-//! timestamps do not. Session ownership binds issuer/resource/client/subject;
-//! changing grants still changes the returned scopes. Individual operations
-//! still need authorization. Admission does not cancel already-admitted work,
-//! prevent normal bearer reuse, or establish aggregate profile qualification.
+//! reach AuthContext. Its sanitized audience field retains the configured
+//! resource, not the token's raw audience set. Private claims, compact
+//! credentials, jti and refresh-only timestamps do not escape. Session ownership
+//! binds issuer/resource/client/subject and, for an explicit audience policy,
+//! its complete deployment, provider, endpoint and configuration identity.
+//! Aliases in one policy share ownership; changing the policy isolates it.
+//! Individual operations still need authorization. Admission does not cancel
+//! already-admitted work, prevent normal bearer reuse, or establish aggregate
+//! profile qualification.
 //!
 //! Clones share explicit public-key rotation and local revocation. A candidate
 //! verified against a retired key generation cannot publish authentication
@@ -28,7 +38,10 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use fastmcp_core::{AccessToken, AuthContext, McpContext, McpError, McpErrorCode, McpResult};
+use fastmcp_core::{
+    AbsoluteUri, AccessToken, AuthContext, CanonicalResourceId, McpContext, McpError, McpErrorCode,
+    McpResult, Sha256Digest,
+};
 use fastmcp_protocol::jose::{
     AdmittedRsaJwks, VerifiedCompactJws, verify_compact_jws_rs256,
 };
@@ -45,6 +58,13 @@ const MAX_TOKEN_LIFETIME_SECONDS: u64 = 86_400;
 const MAX_CLOCK_SKEW_SECONDS: u64 = 300;
 const OWNER_DOMAIN: &[u8] = b"fastmcp/jwt-resource-owner/v1\0";
 const MAX_OWNER_BYTES: usize = OWNER_DOMAIN.len() + 4 * (8 + MAX_IDENTIFIER_BYTES);
+const AUDIENCE_POLICY_DOMAIN: &[u8] = b"fastmcp/jwt-accepted-audience-policy/v1\0";
+// Five framed binding strings, generation, count, and at most 16 framed IDs.
+const MAX_AUDIENCE_POLICY_BYTES: usize =
+    AUDIENCE_POLICY_DOMAIN.len() + 16 + (5 + MAX_AUDIENCES) * (8 + MAX_IDENTIFIER_BYTES);
+const MAPPED_OWNER_DOMAIN: &[u8] = b"fastmcp/jwt-resource-audience-owner/v1\0";
+const MAX_MAPPED_OWNER_BYTES: usize =
+    MAPPED_OWNER_DOMAIN.len() + 32 + 4 * (8 + MAX_IDENTIFIER_BYTES);
 
 /// Fixed diagnostics never retain a token, claim, identifier or key value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,15 +100,215 @@ impl fmt::Display for JwtResourceAuthError {
 
 impl std::error::Error for JwtResourceAuthError {}
 
-/// Immutable administrative issuer, exact audience and finite time policy.
-/// URLs are structurally admitted but retained and compared verbatim. Token
-/// normalization must not turn a different issuer or audience into a match.
+/// One exact, bounded JWT audience identifier from trusted configuration.
+///
+/// Identifiers contain 1 to 1024 UTF-8 bytes and no control characters. A value
+/// containing a colon must be an absolute RFC 3986 URI; other opaque strings
+/// are allowed. Comparison is case-sensitive and preserves every byte, including
+/// URI scheme/host case, percent escapes and trailing slashes. No normalization,
+/// discovery, network lookup or serde construction can widen this authority.
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AcceptedAudienceId {
+    value: String,
+}
+
+impl AcceptedAudienceId {
+    /// Admits one exact RFC 7519 StringOrURI under this profile's byte limit.
+    pub fn new(value: impl Into<String>) -> Result<Self, JwtResourceAuthError> {
+        let value = value.into();
+        if !valid_audience_identifier(&value) {
+            return Err(JwtResourceAuthError::InvalidPolicy);
+        }
+        Ok(Self { value })
+    }
+
+    /// The exact admitted identifier; no URL canonicalization is applied.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Debug for AcceptedAudienceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcceptedAudienceId")
+            .field("byte_len", &self.value.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable deployment authorization to map a resource to explicit audiences.
+///
+/// RFC 8707 permits an issuer to map a resource indicator to a general URI or
+/// abstract API identifier. Only trusted deployment configuration may construct
+/// this policy; never populate it from a token, challenge, request metadata or
+/// an untrusted discovery extension. Installation checks the exact issuer and
+/// canonical resource against the enclosing [JwtResourcePolicy].
+///
+/// The complete issuer, canonical resource, configured endpoint identity,
+/// provider identity, deployment identity, nonzero configuration generation and
+/// sorted audience set are bound into authenticated session ownership. Changing
+/// any binding starts a different owner partition even if a generation number
+/// was accidentally reused. Reordering the same set or switching between its
+/// migration aliases does not change ownership. This identity binding is not a
+/// distributed configuration registry or an anti-rollback service.
+#[derive(Clone)]
+pub struct AcceptedAudiencePolicy {
+    issuer: String,
+    resource: CanonicalResourceId,
+    provider_identity: String,
+    deployment_identity: String,
+    configuration_generation: u64,
+    audiences: Vec<AcceptedAudienceId>,
+    identity: Sha256Digest,
+}
+
+impl AcceptedAudiencePolicy {
+    /// Binds 1 to 16 unique audiences to one explicitly configured deployment.
+    ///
+    /// The issuer remains an exact HTTPS string without a query. The resource
+    /// must already be bound to its configured endpoint through
+    /// [CanonicalResourceId]. All binding strings are nonempty, control-free
+    /// and at most 1024 bytes. Generation zero, duplicate audiences and oversized
+    /// sets are rejected before the policy can be installed.
+    pub fn new(
+        issuer: impl Into<String>,
+        resource: CanonicalResourceId,
+        provider_identity: impl Into<String>,
+        deployment_identity: impl Into<String>,
+        configuration_generation: u64,
+        audiences: impl IntoIterator<Item = AcceptedAudienceId>,
+    ) -> Result<Self, JwtResourceAuthError> {
+        let issuer = issuer.into();
+        let provider_identity = provider_identity.into();
+        let deployment_identity = deployment_identity.into();
+        if !valid_https_identifier(&issuer, false)
+            || !valid_identifier(resource.as_str())
+            || !valid_identifier(resource.configured_endpoint_identity())
+            || !valid_identifier(&provider_identity)
+            || !valid_identifier(&deployment_identity)
+            || configuration_generation == 0
+        {
+            return Err(JwtResourceAuthError::InvalidPolicy);
+        }
+        let mut admitted = Vec::with_capacity(MAX_AUDIENCES);
+        for audience in audiences {
+            if admitted.len() == MAX_AUDIENCES {
+                return Err(JwtResourceAuthError::InvalidPolicy);
+            }
+            admitted.push(audience);
+        }
+        if admitted.is_empty() {
+            return Err(JwtResourceAuthError::InvalidPolicy);
+        }
+        admitted.sort_unstable();
+        if admitted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(JwtResourceAuthError::InvalidPolicy);
+        }
+
+        // Fixed domain and complete length framing prevent component collisions.
+        // The set is sorted before hashing so configuration order is irrelevant.
+        let mut identity_bytes = Vec::with_capacity(MAX_AUDIENCE_POLICY_BYTES);
+        identity_bytes.extend_from_slice(AUDIENCE_POLICY_DOMAIN);
+        for component in [
+            issuer.as_str(),
+            resource.as_str(),
+            resource.configured_endpoint_identity(),
+            provider_identity.as_str(),
+            deployment_identity.as_str(),
+        ] {
+            let length =
+                u64::try_from(component.len()).map_err(|_| JwtResourceAuthError::InvalidPolicy)?;
+            identity_bytes.extend_from_slice(&length.to_be_bytes());
+            identity_bytes.extend_from_slice(component.as_bytes());
+        }
+        identity_bytes.extend_from_slice(&configuration_generation.to_be_bytes());
+        let count =
+            u64::try_from(admitted.len()).map_err(|_| JwtResourceAuthError::InvalidPolicy)?;
+        identity_bytes.extend_from_slice(&count.to_be_bytes());
+        for audience in &admitted {
+            let length = u64::try_from(audience.as_str().len())
+                .map_err(|_| JwtResourceAuthError::InvalidPolicy)?;
+            identity_bytes.extend_from_slice(&length.to_be_bytes());
+            identity_bytes.extend_from_slice(audience.as_str().as_bytes());
+        }
+        let identity = fastmcp_core::sha256_bounded(&identity_bytes, MAX_AUDIENCE_POLICY_BYTES)
+            .map_err(|_| JwtResourceAuthError::InvalidPolicy)?;
+        Ok(Self {
+            issuer,
+            resource,
+            provider_identity,
+            deployment_identity,
+            configuration_generation,
+            audiences: admitted,
+            identity,
+        })
+    }
+
+    /// Exact trusted issuer; it is not URL-normalized.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Canonical resource with its configured endpoint binding.
+    #[must_use]
+    pub fn resource(&self) -> &CanonicalResourceId {
+        &self.resource
+    }
+
+    /// Exact trusted provider identity selected by this deployment.
+    #[must_use]
+    pub fn provider_identity(&self) -> &str {
+        &self.provider_identity
+    }
+
+    /// Exact deployment identity participating in ownership isolation.
+    #[must_use]
+    pub fn deployment_identity(&self) -> &str {
+        &self.deployment_identity
+    }
+
+    /// Nonzero configuration generation participating in ownership isolation.
+    #[must_use]
+    pub fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    /// Complete immutable accepted set, sorted by exact identifier bytes.
+    #[must_use]
+    pub fn audiences(&self) -> &[AcceptedAudienceId] {
+        &self.audiences
+    }
+
+    fn accepts(&self, audience: &str) -> bool {
+        self.audiences
+            .binary_search_by(|candidate| candidate.as_str().cmp(audience))
+            .is_ok()
+    }
+}
+
+impl fmt::Debug for AcceptedAudiencePolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AcceptedAudiencePolicy")
+            .field("configuration_generation", &self.configuration_generation)
+            .field("audience_count", &self.audiences.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable administrative issuer, audience and finite time policy.
+///
+/// The default accepts only the exact resource URL as an audience. An explicit
+/// [AcceptedAudiencePolicy] enables deployment-approved audience mappings.
+/// Issuers and audience identifiers are compared without normalization.
 #[derive(Clone)]
 pub struct JwtResourcePolicy {
     issuer: String,
     resource: String,
     maximum_lifetime_seconds: u64,
     clock_skew_seconds: u64,
+    accepted_audiences: Option<AcceptedAudiencePolicy>,
 }
 
 impl JwtResourcePolicy {
@@ -96,6 +316,8 @@ impl JwtResourcePolicy {
     /// five minutes, both in whole seconds. Zero skew is allowed. Issuers
     /// cannot contain queries; neither URL may contain userinfo, fragments,
     /// whitespace or controls. Each identifier is limited to 1024 UTF-8 bytes.
+    /// The resource also has to be a valid RFC 7519 StringOrURI because it is
+    /// the default audience. Invalid URI spelling is rejected, not normalized.
     pub fn new(
         issuer: impl Into<String>,
         resource: impl Into<String>,
@@ -106,6 +328,7 @@ impl JwtResourcePolicy {
         let resource = resource.into();
         if !valid_https_identifier(&issuer, false)
             || !valid_https_identifier(&resource, true)
+            || !valid_audience_identifier(&resource)
             || maximum_lifetime.is_zero()
             || maximum_lifetime.as_secs() > MAX_TOKEN_LIFETIME_SECONDS
             || maximum_lifetime.subsec_nanos() != 0
@@ -119,7 +342,38 @@ impl JwtResourcePolicy {
             resource,
             maximum_lifetime_seconds: maximum_lifetime.as_secs(),
             clock_skew_seconds: clock_skew.as_secs(),
+            accepted_audiences: None,
         })
+    }
+
+    /// Installs a trusted audience mapping before constructing the verifier.
+    ///
+    /// Both the issuer and the canonical resource serialization must match
+    /// this policy exactly. Pass the same canonical resource string to
+    /// [Self::new]; equivalent URL spellings are not an attachment authority.
+    /// The supplied set replaces the default resource audience, so include that
+    /// audience explicitly when it must remain valid during a migration.
+    ///
+    /// The installed mapping is immutable. A different generation, deployment,
+    /// provider, endpoint identity or audience set requires another verifier
+    /// and produces a different authenticated owner partition. Replacing JWKS
+    /// through [JwtResourceVerifier::replace_jwks] cannot alter the mapping.
+    pub fn with_accepted_audiences(
+        mut self,
+        audiences: AcceptedAudiencePolicy,
+    ) -> Result<Self, JwtResourceAuthError> {
+        if self.issuer != audiences.issuer || self.resource != audiences.resource.as_str() {
+            return Err(JwtResourceAuthError::InvalidPolicy);
+        }
+        self.accepted_audiences = Some(audiences);
+        Ok(self)
+    }
+
+    fn accepts_audience(&self, audience: &str) -> bool {
+        match &self.accepted_audiences {
+            Some(policy) => policy.accepts(audience),
+            None => audience == self.resource.as_str(),
+        }
     }
 }
 
@@ -128,6 +382,7 @@ impl fmt::Debug for JwtResourcePolicy {
         f.debug_struct("JwtResourcePolicy")
             .field("maximum_lifetime_seconds", &self.maximum_lifetime_seconds)
             .field("clock_skew_seconds", &self.clock_skew_seconds)
+            .field("accepted_audiences", &self.accepted_audiences)
             .finish_non_exhaustive()
     }
 }
@@ -335,14 +590,29 @@ fn checkpoint(ctx: &McpContext) -> Result<(), JwtResourceAuthError> {
     Ok(())
 }
 
+fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_IDENTIFIER_BYTES
+        && !value.chars().any(char::is_control)
+}
+
 fn identifier(value: &Value) -> Result<&str, JwtResourceAuthError> {
     value
         .as_str()
-        .filter(|text| {
-            !text.is_empty()
-                && text.len() <= MAX_IDENTIFIER_BYTES
-                && !text.chars().any(char::is_control)
-        })
+        .filter(|text| valid_identifier(text))
+        .ok_or(JwtResourceAuthError::InvalidClaims)
+}
+
+fn valid_audience_identifier(value: &str) -> bool {
+    valid_identifier(value)
+        && (!value.contains(':')
+            || AbsoluteUri::parse_with_max_bytes(value, MAX_IDENTIFIER_BYTES).is_ok())
+}
+
+fn audience_identifier(value: &Value) -> Result<&str, JwtResourceAuthError> {
+    value
+        .as_str()
+        .filter(|text| valid_audience_identifier(text))
         .ok_or(JwtResourceAuthError::InvalidClaims)
 }
 
@@ -400,13 +670,17 @@ fn numeric_date(value: &Value) -> Result<u64, JwtResourceAuthError> {
         .ok_or(JwtResourceAuthError::InvalidClaims)
 }
 
-fn admit_audience(value: &Value, expected: &str) -> Result<(), JwtResourceAuthError> {
+fn admit_audience(value: &Value, policy: &JwtResourcePolicy) -> Result<(), JwtResourceAuthError> {
     let matches = match value {
-        Value::String(_) => identifier(value)? == expected,
+        Value::String(_) => policy.accepts_audience(audience_identifier(value)?),
         Value::Array(values) if !values.is_empty() && values.len() <= MAX_AUDIENCES => {
             let mut matched = false;
             for value in values {
-                matched |= identifier(value)? == expected;
+                let audience = audience_identifier(value)?;
+                // Validate the complete array, including nonmatching members
+                // after a match. A later invalid member cannot hide behind one
+                // accepted audience. Work is bounded by 16 identifiers.
+                matched |= policy.accepts_audience(audience);
             }
             matched
         }
@@ -456,7 +730,7 @@ fn admit_claims(
     if identifier(required("iss")?)? != policy.issuer || object.contains_key("cnf") {
         return Err(JwtResourceAuthError::InvalidClaims);
     }
-    admit_audience(required("aud")?, &policy.resource)?;
+    admit_audience(required("aud")?, policy)?;
     let subject = identifier(required("sub")?)?;
     let client = identifier(required("client_id")?)?;
     identifier(required("jti")?)?;
@@ -480,9 +754,19 @@ fn admit_claims(
     }
     let scopes = admit_scopes(object.get("scope"))?;
     // Domain separation and length framing prevent concatenation collisions.
-    // Client identity prevents two clients for one subject sharing state.
-    let mut owner = Vec::with_capacity(MAX_OWNER_BYTES);
-    owner.extend_from_slice(OWNER_DOMAIN);
+    // Client identity prevents two clients for one subject sharing state. The
+    // explicit mapping binds its full configured identity, not the token's
+    // selected alias. Keep the old default owner's exact bytes unchanged.
+    let (domain, maximum_owner_bytes) = if policy.accepted_audiences.is_some() {
+        (MAPPED_OWNER_DOMAIN, MAX_MAPPED_OWNER_BYTES)
+    } else {
+        (OWNER_DOMAIN, MAX_OWNER_BYTES)
+    };
+    let mut owner = Vec::with_capacity(maximum_owner_bytes);
+    owner.extend_from_slice(domain);
+    if let Some(audiences) = &policy.accepted_audiences {
+        owner.extend_from_slice(audiences.identity.as_bytes());
+    }
     for component in [
         policy.issuer.as_str(),
         policy.resource.as_str(),
@@ -494,12 +778,15 @@ fn admit_claims(
         owner.extend_from_slice(&length.to_be_bytes());
         owner.extend_from_slice(component.as_bytes());
     }
-    let owner = fastmcp_core::sha256_bounded(&owner, MAX_OWNER_BYTES)
+    let owner = fastmcp_core::sha256_bounded(&owner, maximum_owner_bytes)
         .map_err(|_| JwtResourceAuthError::InvalidClaims)?;
     let mut context = AuthContext::with_subject(subject).with_session_owner(owner);
     context.scopes = scopes;
-    // Refresh-only timestamps and jti are not grants. Publishing them here
-    // would make unchanged authorization facts differ on every token refresh.
+    // These are sanitized resource facts, not a copy of the token's claims:
+    // the audience field retains the configured resource for existing callers.
+    // Raw audience aliases never replace resource identity. Refresh-only
+    // timestamps and jti are not grants; publishing them would make unchanged
+    // authorization facts differ on every token refresh.
     context.claims = Some(json!({
         "iss":policy.issuer, "aud":policy.resource, "client_id":client
     }));
@@ -604,6 +891,643 @@ mod tests {
         now: u64,
     ) -> Result<AuthContext, JwtResourceAuthError> {
         verifier.verify_with_clock(&ctx(), token, || Ok(now))
+    }
+
+    const API_AUDIENCE: &str = "api://enterprise-tools";
+    const MIGRATION_AUDIENCE: &str = "urn:example:enterprise-tools";
+
+    fn bound_resource(resource: &str, endpoint_identity: &str) -> CanonicalResourceId {
+        let endpoint = fastmcp_core::CanonicalHttpUrl::parse(resource).unwrap();
+        let configured = [fastmcp_core::uri::ConfiguredResourceEndpoint::new(
+            endpoint_identity,
+            &endpoint,
+            fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
+        )];
+        CanonicalResourceId::parse_for_configured_endpoints(resource, &configured).unwrap()
+    }
+
+    fn configured_audiences(
+        issuer: &str,
+        resource: CanonicalResourceId,
+        provider: &str,
+        deployment: &str,
+        generation: u64,
+        audiences: &[&str],
+    ) -> AcceptedAudiencePolicy {
+        AcceptedAudiencePolicy::new(
+            issuer,
+            resource,
+            provider,
+            deployment,
+            generation,
+            audiences
+                .iter()
+                .map(|audience| AcceptedAudienceId::new(*audience).unwrap()),
+        )
+        .unwrap()
+    }
+
+    fn audience_policy(audiences: &[&str]) -> AcceptedAudiencePolicy {
+        configured_audiences(
+            ISSUER,
+            bound_resource(RESOURCE, "endpoint-one"),
+            "provider-one",
+            "deployment-one",
+            1,
+            audiences,
+        )
+    }
+
+    fn mapped_provider(audiences: AcceptedAudiencePolicy) -> TokenAuthProvider {
+        let policy = JwtResourcePolicy::new(
+            audiences.issuer(),
+            audiences.resource().as_str(),
+            Duration::from_secs(3600),
+            Duration::ZERO,
+        )
+        .unwrap()
+        .with_accepted_audiences(audiences)
+        .unwrap();
+        TokenAuthProvider::new(JwtResourceVerifier::new(policy, &jwks("one")).unwrap())
+    }
+
+    fn live_claims() -> Value {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut source = claims(now);
+        source["exp"] = json!(now + 600);
+        source
+    }
+
+    fn authenticate_token(
+        provider: &TokenAuthProvider,
+        token: &AccessToken,
+        params: Option<&Value>,
+    ) -> McpResult<AuthContext> {
+        let authorization = format!("Bearer {}", token.token);
+        provider.authenticate(
+            &ctx(),
+            AuthRequest {
+                method: "tools/list",
+                params,
+                transport_authorization: Some(&authorization),
+                request_id: 1,
+            },
+        )
+    }
+
+    fn authenticate_claims(provider: &TokenAuthProvider, source: &Value) -> McpResult<AuthContext> {
+        authenticate_token(provider, &sign(&header(), source), None)
+    }
+
+    #[test]
+    fn accepted_audience_ids_and_policies_validate_complete_bounded_configuration() {
+        for value in [
+            API_AUDIENCE,
+            MIGRATION_AUDIENCE,
+            "enterprise tools",
+            "https://AUDIENCE.example/%74ools/",
+            "équipe",
+        ] {
+            let audience = AcceptedAudienceId::new(value).unwrap();
+            assert_eq!(audience.as_str(), value);
+            assert!(!format!("{audience:?}").contains(value));
+        }
+        for value in [
+            String::new(),
+            "line\nbreak".to_owned(),
+            "nul\0byte".to_owned(),
+            "control\u{0085}".to_owned(),
+            "no scheme:audience".to_owned(),
+            "https://audience.example/%ZZ".to_owned(),
+            "urn:has a space".to_owned(),
+            "x".repeat(MAX_IDENTIFIER_BYTES + 1),
+        ] {
+            assert_eq!(
+                AcceptedAudienceId::new(value).unwrap_err(),
+                JwtResourceAuthError::InvalidPolicy
+            );
+        }
+        let maximum = AcceptedAudienceId::new("x".repeat(MAX_IDENTIFIER_BYTES)).unwrap();
+        assert_eq!(maximum.as_str().len(), MAX_IDENTIFIER_BYTES);
+        let resource = bound_resource(RESOURCE, "endpoint-one");
+        let one = || [AcceptedAudienceId::new(API_AUDIENCE).unwrap()];
+        for (provider, deployment, generation) in [
+            ("", "deployment", 1),
+            ("provider", "", 1),
+            ("provider\n", "deployment", 1),
+            ("provider", "deployment\0", 1),
+            ("provider", "deployment", 0),
+        ] {
+            assert_eq!(
+                AcceptedAudiencePolicy::new(
+                    ISSUER,
+                    resource.clone(),
+                    provider,
+                    deployment,
+                    generation,
+                    one(),
+                )
+                .unwrap_err(),
+                JwtResourceAuthError::InvalidPolicy
+            );
+        }
+        let oversized = "x".repeat(MAX_IDENTIFIER_BYTES + 1);
+        for (provider, deployment) in [
+            (oversized.as_str(), "deployment"),
+            ("provider", oversized.as_str()),
+        ] {
+            assert!(AcceptedAudiencePolicy::new(
+                ISSUER,
+                resource.clone(),
+                provider,
+                deployment,
+                1,
+                one(),
+            )
+            .is_err());
+        }
+        for issuer in ["http://issuer.example", "https://issuer.example?tenant=one"] {
+            assert!(AcceptedAudiencePolicy::new(
+                issuer,
+                resource.clone(),
+                "provider",
+                "deployment",
+                1,
+                one(),
+            )
+            .is_err());
+        }
+        for audiences in [
+            Vec::new(),
+            vec![
+                AcceptedAudienceId::new(API_AUDIENCE).unwrap(),
+                AcceptedAudienceId::new(API_AUDIENCE).unwrap(),
+            ],
+        ] {
+            assert!(AcceptedAudiencePolicy::new(
+                ISSUER,
+                resource.clone(),
+                "provider",
+                "deployment",
+                1,
+                audiences,
+            )
+            .is_err());
+        }
+
+        // An unbounded configuration iterator is consumed only to the limit.
+        let observed = std::cell::Cell::new(0_usize);
+        let unbounded = std::iter::from_fn(|| {
+            let index = observed.get();
+            observed.set(index + 1);
+            Some(AcceptedAudienceId::new(format!("audience-{index}")).unwrap())
+        });
+        assert!(AcceptedAudiencePolicy::new(
+            ISSUER,
+            resource.clone(),
+            "provider",
+            "deployment",
+            1,
+            unbounded,
+        )
+        .is_err());
+        assert_eq!(observed.get(), MAX_AUDIENCES + 1);
+
+        // Typed resources may have a larger bound than this JWT profile.
+        // Refuse before inspecting any audience configuration.
+        let long_resource = format!("https://tools.example/{}", "p".repeat(MAX_IDENTIFIER_BYTES));
+        let too_large = bound_resource(&long_resource, "endpoint-one");
+        let not_inspected = std::cell::Cell::new(false);
+        let audiences = std::iter::from_fn(|| {
+            not_inspected.set(true);
+            Some(AcceptedAudienceId::new(API_AUDIENCE).unwrap())
+        });
+        assert!(AcceptedAudiencePolicy::new(
+            ISSUER,
+            too_large,
+            "provider",
+            "deployment",
+            1,
+            audiences,
+        )
+        .is_err());
+        assert!(!not_inspected.get());
+        assert!(AcceptedAudiencePolicy::new(
+            ISSUER,
+            bound_resource(RESOURCE, "endpoint\none"),
+            "provider",
+            "deployment",
+            1,
+            one(),
+        )
+        .is_err());
+
+        let full_set = (0..MAX_AUDIENCES).map(|index| {
+            AcceptedAudienceId::new(format!(
+                "{index:02}{}",
+                "a".repeat(MAX_IDENTIFIER_BYTES - 2)
+            ))
+            .unwrap()
+        });
+        let largest = AcceptedAudiencePolicy::new(
+            ISSUER,
+            resource,
+            "p".repeat(MAX_IDENTIFIER_BYTES),
+            "d".repeat(MAX_IDENTIFIER_BYTES),
+            u64::MAX,
+            full_set,
+        )
+        .unwrap();
+        assert_eq!(largest.audiences().len(), MAX_AUDIENCES);
+        assert_eq!(largest.configuration_generation(), u64::MAX);
+        assert_eq!(largest.provider_identity().len(), MAX_IDENTIFIER_BYTES);
+        assert_eq!(largest.deployment_identity().len(), MAX_IDENTIFIER_BYTES);
+    }
+
+    #[test]
+    fn audience_policy_attachment_requires_exact_issuer_and_canonical_resource() {
+        let audiences = audience_policy(&[API_AUDIENCE]);
+        assert!(policy().with_accepted_audiences(audiences.clone()).is_ok());
+        for (issuer, resource) in [
+            ("https://other-issuer.example", RESOURCE),
+            ("https://ISSUER.example", RESOURCE),
+            (ISSUER, "https://tools.example/other"),
+            (ISSUER, "https://TOOLS.example/mcp"),
+            (ISSUER, "https://tools.example/%6dcp"),
+        ] {
+            assert_eq!(
+                JwtResourcePolicy::new(
+                    issuer,
+                    resource,
+                    Duration::from_secs(3600),
+                    Duration::ZERO,
+                )
+                .unwrap()
+                .with_accepted_audiences(audiences.clone())
+                .unwrap_err(),
+                JwtResourceAuthError::InvalidPolicy
+            );
+        }
+        for resource in [
+            "https://tools.example/café",
+            "https://tools.example/%ZZ",
+            "https://töols.example/mcp",
+        ] {
+            assert_eq!(
+                JwtResourcePolicy::new(
+                    ISSUER,
+                    resource,
+                    Duration::from_secs(3600),
+                    Duration::ZERO,
+                )
+                .unwrap_err(),
+                JwtResourceAuthError::InvalidPolicy
+            );
+        }
+        for resource in ["https://tools.example/caf%C3%A9", "https://tools.example/%6dcp"] {
+            let verifier = JwtResourceVerifier::new(
+                JwtResourcePolicy::new(
+                    ISSUER,
+                    resource,
+                    Duration::from_secs(3600),
+                    Duration::ZERO,
+                )
+                .unwrap(),
+                &jwks("one"),
+            )
+            .unwrap();
+            let provider = TokenAuthProvider::new(verifier);
+            let mut source = live_claims();
+            source["aud"] = json!(resource);
+            assert!(authenticate_claims(&provider, &source).is_ok());
+            source["aud"] = json!(RESOURCE);
+            assert!(authenticate_claims(&provider, &source).is_err());
+        }
+    }
+
+    #[test]
+    fn signed_api_audience_authenticates_only_under_explicit_deployment_policy() {
+        let audiences = audience_policy(&[API_AUDIENCE]);
+        let debug = format!("{audiences:?}");
+        for private in [ISSUER, RESOURCE, API_AUDIENCE, "provider-one", "deployment-one"] {
+            assert!(!debug.contains(private));
+        }
+        let provider = mapped_provider(audiences);
+        let mut source = live_claims();
+        source["aud"] = json!(API_AUDIENCE);
+        source["private"] = json!({"refresh_token":"DO_NOT_EXPOSE_MAPPED_TOKEN"});
+        let token = sign(&header(), &source);
+        let admitted = authenticate_token(&provider, &token, None).unwrap();
+        assert_eq!(admitted.subject.as_deref(), Some("alice"));
+        assert_eq!(admitted.scopes, ["read", "write"]);
+        assert!(admitted.session_owner().is_some());
+        assert_eq!(admitted.claims.as_ref().unwrap()["aud"], json!(RESOURCE));
+        let facts = serde_json::to_string(&admitted).unwrap();
+        for private in [API_AUDIENCE, "DO_NOT_EXPOSE_MAPPED_TOKEN", token.token.as_str()] {
+            assert!(!facts.contains(private));
+        }
+        let default = TokenAuthProvider::new(verifier());
+        assert!(authenticate_token(&default, &token, None).is_err());
+
+        // A configured set replaces the safe default; the resource is not an
+        // additional audience unless the administrator explicitly includes it.
+        source["aud"] = json!(RESOURCE);
+        assert!(authenticate_claims(&provider, &source).is_err());
+        source["aud"] = json!(API_AUDIENCE);
+        source["iss"] = json!("https://other-issuer.example");
+        assert!(authenticate_claims(&provider, &source).is_err());
+
+        source["iss"] = json!(ISSUER);
+        source["aud"] = json!("api://unconfigured-tools");
+        source["resource"] = json!(RESOURCE);
+        source["audience_policy"] = json!({
+            "issuer":ISSUER, "resource":RESOURCE,
+            "audiences":["api://unconfigured-tools"], "generation":1
+        });
+        let params = json!({
+            "_meta":{"dev.example/accepted-audiences":["api://unconfigured-tools"]}
+        });
+        let untrusted = sign(&header(), &source);
+        let error = authenticate_token(&provider, &untrusted, Some(&params)).unwrap_err();
+        assert!(!format!("{error:?}").contains("unconfigured-tools"));
+        assert!(!format!("{error:?}").contains(&untrusted.token));
+    }
+
+    #[test]
+    fn signed_audience_arrays_require_complete_bounded_validation() {
+        let provider = mapped_provider(audience_policy(&[API_AUDIENCE]));
+        let mut source = live_claims();
+        source["aud"] = json!(API_AUDIENCE);
+        let single = authenticate_claims(&provider, &source).unwrap();
+        let mut maximum: Vec<Value> = (0..MAX_AUDIENCES)
+            .map(|index| json!(format!("other-audience-{index}")))
+            .collect();
+        maximum[MAX_AUDIENCES - 1] = json!(API_AUDIENCE);
+        for audiences in [
+            json!(["another-service", API_AUDIENCE]),
+            json!([API_AUDIENCE, "urn:example:another-service"]),
+            json!([API_AUDIENCE, API_AUDIENCE]),
+            json!(maximum),
+        ] {
+            source["aud"] = audiences;
+            let admitted = authenticate_claims(&provider, &source).unwrap();
+            assert_eq!(single.session_owner(), admitted.session_owner());
+            assert_eq!(
+                principal_fingerprint(Some(&single)).unwrap(),
+                principal_fingerprint(Some(&admitted)).unwrap()
+            );
+        }
+        for audiences in [
+            json!([]),
+            json!(null),
+            json!(true),
+            json!({}),
+            json!(""),
+            json!(["another-service"]),
+            json!([API_AUDIENCE, null]),
+            json!([API_AUDIENCE, 3]),
+            json!([API_AUDIENCE, ""]),
+            json!([API_AUDIENCE, "control\n"]),
+            json!([API_AUDIENCE, "missing scheme:invalid"]),
+            json!([API_AUDIENCE, "https://audience.example/%ZZ"]),
+            json!([API_AUDIENCE, "x".repeat(MAX_IDENTIFIER_BYTES + 1)]),
+            json!(vec![API_AUDIENCE; MAX_AUDIENCES + 1]),
+        ] {
+            source["aud"] = audiences;
+            assert!(authenticate_claims(&provider, &source).is_err());
+        }
+    }
+
+    #[test]
+    fn audience_identifier_comparison_never_normalizes_uri_or_opaque_spelling() {
+        let mut source = live_claims();
+        for (accepted, rejected) in [
+            (
+                "https://AUDIENCE.example/%74ools",
+                vec![
+                    "https://audience.example/%74ools",
+                    "https://AUDIENCE.example/tools",
+                    "https://AUDIENCE.example/%74ools/",
+                    "https://AUDIENCE.example/%74ools/child",
+                ],
+            ),
+            (
+                API_AUDIENCE,
+                vec![
+                    "API://enterprise-tools",
+                    "api://ENTERPRISE-TOOLS",
+                    "api://enterprise-tools/",
+                ],
+            ),
+            (
+                MIGRATION_AUDIENCE,
+                vec![
+                    "URN:example:enterprise-tools",
+                    "urn:example:Enterprise-tools",
+                    "urn:example:enterprise-tools-extra",
+                ],
+            ),
+            ("enterprise tools", vec!["Enterprise tools", "enterprise tools ", "enterprise"]),
+        ] {
+            let provider = mapped_provider(audience_policy(&[accepted]));
+            source["aud"] = json!(accepted);
+            assert!(authenticate_claims(&provider, &source).is_ok());
+            for audience in rejected {
+                source["aud"] = json!(audience);
+                assert!(authenticate_claims(&provider, &source).is_err());
+            }
+        }
+        // Even URL-equivalent spellings are distinct configuration IDs.
+        let explicit = audience_policy(&[
+            "https://AUDIENCE.example/%74ools",
+            "https://audience.example/tools",
+        ]);
+        assert_eq!(explicit.audiences().len(), 2);
+        let provider = mapped_provider(explicit);
+        for audience in [
+            "https://AUDIENCE.example/%74ools",
+            "https://audience.example/tools",
+        ] {
+            source["aud"] = json!(audience);
+            assert!(authenticate_claims(&provider, &source).is_ok());
+        }
+    }
+
+    #[test]
+    fn migration_aliases_preserve_owner_until_the_configured_policy_changes() {
+        let provider = mapped_provider(audience_policy(&[API_AUDIENCE, MIGRATION_AUDIENCE]));
+        let mut source = live_claims();
+        source["aud"] = json!(API_AUDIENCE);
+        let original = authenticate_claims(&provider, &source).unwrap();
+        source["aud"] = json!(MIGRATION_AUDIENCE);
+        source["jti"] = json!("migrated-token");
+        source["scope"] = json!("write read");
+        let migrated = authenticate_claims(&provider, &source).unwrap();
+        assert_eq!(original.session_owner(), migrated.session_owner());
+        assert_eq!(
+            principal_fingerprint(Some(&original)).unwrap(),
+            principal_fingerprint(Some(&migrated)).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&migrated).unwrap()
+        );
+        let reordered = mapped_provider(audience_policy(&[MIGRATION_AUDIENCE, API_AUDIENCE]));
+        assert_eq!(
+            original.session_owner(),
+            authenticate_claims(&reordered, &source).unwrap().session_owner()
+        );
+
+        let retired = mapped_provider(configured_audiences(
+            ISSUER,
+            bound_resource(RESOURCE, "endpoint-one"),
+            "provider-one",
+            "deployment-one",
+            2,
+            &[MIGRATION_AUDIENCE],
+        ));
+        let current = authenticate_claims(&retired, &source).unwrap();
+        assert_ne!(original.session_owner(), current.session_owner());
+        assert_eq!(current.claims.as_ref().unwrap()["aud"], json!(RESOURCE));
+        source["aud"] = json!(API_AUDIENCE);
+        assert!(authenticate_claims(&retired, &source).is_err());
+        assert!(authenticate_claims(&provider, &source).is_ok());
+    }
+
+    #[test]
+    fn audience_policy_bindings_isolate_provider_deployment_endpoint_and_resource() {
+        let mut source = live_claims();
+        source["aud"] = json!(API_AUDIENCE);
+        let baseline = authenticate_claims(
+            &mapped_provider(audience_policy(&[API_AUDIENCE])),
+            &source,
+        )
+        .unwrap();
+        let baseline_principal = principal_fingerprint(Some(&baseline)).unwrap();
+        for (provider_id, deployment, generation, endpoint, resource, issuer) in [
+            ("provider-two", "deployment-one", 1, "endpoint-one", RESOURCE, ISSUER),
+            ("provider-one", "deployment-two", 1, "endpoint-one", RESOURCE, ISSUER),
+            ("provider-one", "deployment-one", 2, "endpoint-one", RESOURCE, ISSUER),
+            ("provider-one", "deployment-one", 1, "endpoint-two", RESOURCE, ISSUER),
+            (
+                "provider-one",
+                "deployment-one",
+                1,
+                "endpoint-one",
+                "https://tools.example/other",
+                ISSUER,
+            ),
+            (
+                "provider-one",
+                "deployment-one",
+                1,
+                "endpoint-one",
+                RESOURCE,
+                "https://other-issuer.example",
+            ),
+        ] {
+            let provider = mapped_provider(configured_audiences(
+                issuer,
+                bound_resource(resource, endpoint),
+                provider_id,
+                deployment,
+                generation,
+                &[API_AUDIENCE],
+            ));
+            if issuer != ISSUER {
+                assert!(authenticate_claims(&provider, &source).is_err());
+            }
+            let mut bound = source.clone();
+            bound["iss"] = json!(issuer);
+            let admitted = authenticate_claims(&provider, &bound).unwrap();
+            assert_ne!(baseline.session_owner(), admitted.session_owner());
+            assert_ne!(baseline_principal, principal_fingerprint(Some(&admitted)).unwrap());
+            assert_eq!(admitted.claims.as_ref().unwrap()["aud"], json!(resource));
+            assert_eq!(admitted.claims.as_ref().unwrap()["iss"], json!(issuer));
+        }
+
+        // Reusing a generation with different policy contents cannot alias an
+        // existing ownership partition, even if both sets admit this token.
+        let changed_set = mapped_provider(audience_policy(&[API_AUDIENCE, MIGRATION_AUDIENCE]));
+        let admitted = authenticate_claims(&changed_set, &source).unwrap();
+        assert_ne!(baseline.session_owner(), admitted.session_owner());
+        assert_ne!(baseline_principal, principal_fingerprint(Some(&admitted)).unwrap());
+        let provider = mapped_provider(audience_policy(&[API_AUDIENCE]));
+        for (field, value) in [("client_id", "client-two"), ("sub", "bob")] {
+            let mut changed = source.clone();
+            changed[field] = json!(value);
+            assert_ne!(
+                baseline.session_owner(),
+                authenticate_claims(&provider, &changed).unwrap().session_owner()
+            );
+        }
+    }
+
+    #[test]
+    fn audience_policy_identity_frames_components_and_preserves_default_owners() {
+        let mut source = live_claims();
+        let default = authenticate_claims(&TokenAuthProvider::new(verifier()), &source).unwrap();
+        // Freeze the pre-mapping owner representation independently of the new
+        // policy representation. Existing sessions retain the same identity.
+        let mut legacy_owner = b"fastmcp/jwt-resource-owner/v1\0".to_vec();
+        for component in [ISSUER, RESOURCE, "client-one", "alice"] {
+            legacy_owner.extend_from_slice(&u64::try_from(component.len()).unwrap().to_be_bytes());
+            legacy_owner.extend_from_slice(component.as_bytes());
+        }
+        assert_eq!(
+            default.session_owner(),
+            Some(fastmcp_core::sha256_bounded(&legacy_owner, MAX_OWNER_BYTES).unwrap())
+        );
+        source["aud"] = json!([RESOURCE, RESOURCE]);
+        let repeated = authenticate_claims(&TokenAuthProvider::new(verifier()), &source).unwrap();
+        assert_eq!(default.session_owner(), repeated.session_owner());
+        assert_eq!(
+            principal_fingerprint(Some(&default)).unwrap(),
+            principal_fingerprint(Some(&repeated)).unwrap()
+        );
+        source["aud"] = json!(RESOURCE);
+        let explicit = authenticate_claims(
+            &mapped_provider(audience_policy(&[RESOURCE])),
+            &source,
+        )
+        .unwrap();
+        assert_ne!(default.session_owner(), explicit.session_owner());
+        assert_ne!(
+            principal_fingerprint(Some(&default)).unwrap(),
+            principal_fingerprint(Some(&explicit)).unwrap()
+        );
+
+        let left = mapped_provider(configured_audiences(
+            ISSUER,
+            bound_resource(RESOURCE, "endpoint-one"),
+            "ab",
+            "c",
+            1,
+            &[RESOURCE],
+        ));
+        let right = mapped_provider(configured_audiences(
+            ISSUER,
+            bound_resource(RESOURCE, "endpoint-one"),
+            "a",
+            "bc",
+            1,
+            &[RESOURCE],
+        ));
+        assert_ne!(
+            authenticate_claims(&left, &source).unwrap().session_owner(),
+            authenticate_claims(&right, &source).unwrap().session_owner()
+        );
+
+        source["aud"] = json!("z");
+        let left = mapped_provider(audience_policy(&["ab", "c", "z"]));
+        let right = mapped_provider(audience_policy(&["a", "bc", "z"]));
+        assert_ne!(
+            authenticate_claims(&left, &source).unwrap().session_owner(),
+            authenticate_claims(&right, &source).unwrap().session_owner()
+        );
     }
 
     #[test]
