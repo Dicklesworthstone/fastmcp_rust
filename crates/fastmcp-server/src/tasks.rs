@@ -36,6 +36,11 @@
 //! The legacy `TaskManager` (Docket/SEP-1686) in this file is compiled only for
 //! tests and is not part of the shipped API.
 
+mod authorization;
+pub use authorization::{
+    FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
+};
+
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1701,6 +1706,36 @@ pub trait FinalTaskStore: Send + Sync {
         ))
     }
 
+    /// Atomically creates request-owned work with its immutable original
+    /// operation. Preserve that binding in every returned snapshot and every
+    /// later generation. It is a process-local registration binding, not a
+    /// serializable execution grant. Backends without this contract refuse
+    /// before inserting any Task, work, notification, or quota charge.
+    fn create_task_with_operation(
+        &self,
+        _task: FinalTask,
+        _notification: FinalTaskStatusNotification,
+        _work_descriptor: FinalTaskWorkDescriptor,
+        _principal: Option<Sha256Digest>,
+        _operation: FinalTaskOperation,
+    ) -> McpResult<FinalTaskSnapshot> {
+        Err(McpError::internal_error(
+            "Final task store does not implement atomic original-operation binding",
+        ))
+    }
+
+    /// Reads only Task identity, generation, owner, and original operation.
+    /// No result, input, or application payload may be opened or cloned by
+    /// this operation. Expired and unknown IDs return `None`. This is the
+    /// first store lookup on wire management and subscription paths.
+    /// The default denies wire access; trusted application reads remain usable.
+    fn get_task_access_metadata(
+        &self,
+        _task_id: &FinalTaskId,
+    ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+        Ok(None)
+    }
+
     /// Loads one task by its opaque final identifier.
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>>;
 
@@ -2329,7 +2364,9 @@ impl FinalTaskExecutionBudget {
 pub struct FinalTaskSnapshot {
     task: FinalTask,
     generation: u64,
+    creation_generation: u64,
     authenticated_principal: Option<Sha256Digest>,
+    original_operation: Option<FinalTaskOperation>,
 }
 
 impl FinalTaskSnapshot {
@@ -2340,13 +2377,18 @@ impl FinalTaskSnapshot {
     /// accepted task-state or cancellation-intent mutation, and when it
     /// reclaims an expired handoff lease. It must compare that value atomically
     /// with the corresponding replacement or cancellation write. Callers must
-    /// treat it solely as a CAS token.
+    /// treat it solely as a CAS token. A recreated opaque ID must receive a
+    /// greater initial generation than its previous incarnation. Later
+    /// snapshots must restore that initial value with
+    /// [`Self::with_creation_generation`] while advancing the CAS generation.
     #[must_use]
     pub fn new(task: FinalTask, generation: u64) -> Self {
         Self {
             task,
             generation,
+            creation_generation: generation,
             authenticated_principal: None,
+            original_operation: None,
         }
     }
 
@@ -2362,6 +2404,33 @@ impl FinalTaskSnapshot {
     #[must_use]
     pub const fn authenticated_principal(&self) -> Option<Sha256Digest> {
         self.authenticated_principal
+    }
+
+    /// Restores the exact private operation retained at atomic creation.
+    /// Stores must preserve it even after the Task reaches a terminal state.
+    #[must_use]
+    pub fn with_original_operation(mut self, operation: Option<FinalTaskOperation>) -> Self {
+        self.original_operation = operation;
+        self
+    }
+
+    #[must_use]
+    pub fn original_operation(&self) -> Option<&FinalTaskOperation> {
+        self.original_operation.as_ref()
+    }
+
+    /// Restores the immutable initial insert generation on a later snapshot.
+    /// New records default to their current generation; every transition must
+    /// carry the original value, including across cancellation and recovery.
+    #[must_use]
+    pub const fn with_creation_generation(mut self, creation_generation: u64) -> Self {
+        self.creation_generation = creation_generation;
+        self
+    }
+
+    #[must_use]
+    pub const fn creation_generation(&self) -> u64 {
+        self.creation_generation
     }
 
     /// Returns the retained final task.
@@ -2470,7 +2539,9 @@ pub struct InMemoryFinalTaskStore {
 struct InMemoryFinalTaskState {
     tasks: BTreeMap<FinalTaskId, FinalTask>,
     authenticated_principals: BTreeMap<FinalTaskId, Sha256Digest>,
+    original_operations: BTreeMap<FinalTaskId, FinalTaskOperation>,
     generations: BTreeMap<FinalTaskId, u64>,
+    creation_generations: BTreeMap<FinalTaskId, u64>,
     next_generation: u64,
     next_dispatch_fence: u64,
     work_descriptors: BTreeMap<FinalTaskId, FinalTaskWorkDescriptor>,
@@ -2740,6 +2811,7 @@ fn prepare_in_memory_final_task_payload_charge(
     initial_work_retained: bool,
     accepted_input_bytes: usize,
     input_key_history: Option<&InMemoryFinalTaskInputKeyHistory>,
+    operation: Option<&FinalTaskOperation>,
 ) -> McpResult<InMemoryFinalTaskPayloadCharge> {
     let live = matches!(
         task,
@@ -2816,6 +2888,7 @@ fn prepare_in_memory_final_task_payload_charge(
         .checked_add(notification_bytes)
         .and_then(|bytes| bytes.checked_add(initial_work_bytes))
         .and_then(|bytes| bytes.checked_add(history_bytes))
+        .and_then(|bytes| bytes.checked_add(operation.map_or(0, FinalTaskOperation::retained_bytes)))
         .ok_or_else(|| {
             McpError::invalid_params("Final task retained payload byte count overflow")
         })?;
@@ -3373,6 +3446,7 @@ impl InMemoryFinalTaskStore {
         notification: FinalTaskStatusNotification,
         work_descriptor: FinalTaskWorkDescriptor,
         principal: Option<Sha256Digest>,
+        operation: Option<FinalTaskOperation>,
     ) -> McpResult<FinalTaskSnapshot> {
         let task_id = task.base().task_id.clone();
         validate_final_task_storage_shape(&task)?;
@@ -3407,6 +3481,7 @@ impl InMemoryFinalTaskStore {
             true,
             0,
             None,
+            operation.as_ref(),
         )?;
         let retained_payload_bytes =
             state
@@ -3421,6 +3496,7 @@ impl InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
+        state.creation_generations.insert(task_id.clone(), generation);
         state
             .execution_budgets
             .insert(task_id.clone(), execution_budget);
@@ -3432,6 +3508,9 @@ impl InMemoryFinalTaskStore {
             state
                 .authenticated_principals
                 .insert(task_id.clone(), principal);
+        }
+        if let Some(operation) = operation {
+            state.original_operations.insert(task_id.clone(), operation);
         }
         if let Some(expires_at) = expires_at {
             state.expires_at.insert(task_id.clone(), expires_at);
@@ -3713,6 +3792,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             false,
             0,
             input_key_history.as_ref(),
+            None,
         )?;
         let retained_payload_bytes =
             state
@@ -3730,6 +3810,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             .insert(task_id.clone(), notification);
         state.tasks.insert(task_id.clone(), task);
         state.generations.insert(task_id.clone(), generation);
+        state.creation_generations.insert(task_id.clone(), generation);
         state
             .execution_budgets
             .insert(task_id.clone(), execution_budget);
@@ -3745,7 +3826,7 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         notification: FinalTaskStatusNotification,
         work_descriptor: FinalTaskWorkDescriptor,
     ) -> McpResult<FinalTaskSnapshot> {
-        self.persist_task_with_work(task, notification, work_descriptor, None)
+        self.persist_task_with_work(task, notification, work_descriptor, None, None)
     }
 
     fn create_task_with_authenticated_work(
@@ -3755,7 +3836,38 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         work_descriptor: FinalTaskWorkDescriptor,
         principal: Sha256Digest,
     ) -> McpResult<FinalTaskSnapshot> {
-        self.persist_task_with_work(task, notification, work_descriptor, Some(principal))
+        self.persist_task_with_work(task, notification, work_descriptor, Some(principal), None)
+    }
+
+    fn create_task_with_operation(
+        &self,
+        task: FinalTask,
+        notification: FinalTaskStatusNotification,
+        work_descriptor: FinalTaskWorkDescriptor,
+        principal: Option<Sha256Digest>,
+        operation: FinalTaskOperation,
+    ) -> McpResult<FinalTaskSnapshot> {
+        self.persist_task_with_work(task, notification, work_descriptor, principal, Some(operation))
+    }
+
+    fn get_task_access_metadata(
+        &self,
+        task_id: &FinalTaskId,
+    ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+        let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = (self.clock)();
+        if state.expires_at.get(task_id).is_some_and(|deadline| *deadline <= now) {
+            return Ok(None);
+        }
+        Ok(state.generations.get(task_id).copied().map(|generation| {
+            FinalTaskAccessMetadata::new(
+                task_id.clone(),
+                generation,
+                state.creation_generations.get(task_id).copied().unwrap_or(0),
+                state.authenticated_principals.get(task_id).copied(),
+                state.original_operations.get(task_id).cloned(),
+            )
+        }))
     }
 
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
@@ -3783,7 +3895,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         })?;
         Ok(Some(
             FinalTaskSnapshot::new(task, generation)
-                .with_authenticated_principal(state.authenticated_principals.get(task_id).copied()),
+                .with_creation_generation(in_memory_task_creation_generation(&state, task_id)?)
+                .with_authenticated_principal(state.authenticated_principals.get(task_id).copied())
+                .with_original_operation(state.original_operations.get(task_id).cloned()),
         ))
     }
 
@@ -4137,9 +4251,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             )
         })?;
         Ok(Some(
-            FinalTaskSnapshot::new(task, generation).with_authenticated_principal(
+            FinalTaskSnapshot::new(task, generation)
+                .with_creation_generation(in_memory_task_creation_generation(&state, &task_id)?)
+                .with_authenticated_principal(
                 state.authenticated_principals.get(&task_id).copied(),
-            ),
+            ).with_original_operation(state.original_operations.get(&task_id).cloned()),
         ))
     }
 
@@ -4322,9 +4438,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
             )
         })?;
         Ok(Some(
-            FinalTaskSnapshot::new(task, generation).with_authenticated_principal(
+            FinalTaskSnapshot::new(task, generation)
+                .with_creation_generation(in_memory_task_creation_generation(&state, &task_id)?)
+                .with_authenticated_principal(
                 state.authenticated_principals.get(&task_id).copied(),
-            ),
+            ).with_original_operation(state.original_operations.get(&task_id).cloned()),
         ))
     }
 
@@ -4663,9 +4781,11 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
                 )
             })?;
             return Ok(Some(
-                FinalTaskSnapshot::new(task, generation).with_authenticated_principal(
+                FinalTaskSnapshot::new(task, generation)
+                    .with_creation_generation(in_memory_task_creation_generation(&state, task_id)?)
+                    .with_authenticated_principal(
                     state.authenticated_principals.get(task_id).copied(),
-                ),
+                ).with_original_operation(state.original_operations.get(task_id).cloned()),
             ));
         }
         replace_in_memory_final_task(
@@ -4680,7 +4800,9 @@ impl FinalTaskStore for InMemoryFinalTaskStore {
         })?;
         Ok(Some(
             FinalTaskSnapshot::new(cancelled_task, generation)
-                .with_authenticated_principal(state.authenticated_principals.get(task_id).copied()),
+                .with_creation_generation(in_memory_task_creation_generation(&state, task_id)?)
+                .with_authenticated_principal(state.authenticated_principals.get(task_id).copied())
+                .with_original_operation(state.original_operations.get(task_id).cloned()),
         ))
     }
 
@@ -4760,7 +4882,15 @@ fn committed_in_memory_final_task_snapshot(
         McpError::internal_error("In-memory final task store lost a committed task generation")
     })?;
     Ok(FinalTaskSnapshot::new(task, generation)
-        .with_authenticated_principal(state.authenticated_principals.get(task_id).copied()))
+        .with_creation_generation(in_memory_task_creation_generation(state, task_id)?)
+        .with_authenticated_principal(state.authenticated_principals.get(task_id).copied())
+        .with_original_operation(state.original_operations.get(task_id).cloned()))
+}
+
+fn in_memory_task_creation_generation(state: &InMemoryFinalTaskState, task_id: &FinalTaskId) -> McpResult<u64> {
+    state.creation_generations.get(task_id).copied().ok_or_else(|| {
+        McpError::internal_error("In-memory final task store lost its creation generation")
+    })
 }
 
 /// Compares complete durable task values without relying on handwritten
@@ -5071,6 +5201,7 @@ fn replace_in_memory_final_task(
         input_key_history
             .as_ref()
             .or_else(|| state.input_key_history.get(&task_id)),
+        state.original_operations.get(&task_id),
     )?;
     let retained_payload_bytes = state.payload_accounting.admit(
         &task_id,
@@ -5200,6 +5331,8 @@ fn remove_in_memory_final_task(state: &mut InMemoryFinalTaskState, task_id: &Fin
     state.execution_budgets.remove(task_id);
     state.tasks.remove(task_id);
     state.authenticated_principals.remove(task_id);
+    state.original_operations.remove(task_id);
+    state.creation_generations.remove(task_id);
     state.generations.remove(task_id);
     state.work_descriptors.remove(task_id);
     state.initial_work.remove(task_id);
@@ -6496,6 +6629,7 @@ pub struct FinalTaskRuntime {
     service_signal: Arc<Mutex<Option<FinalTaskServiceSignal>>>,
     next_task_service_id: Arc<AtomicU64>,
     retention_administration: Arc<TaskRetentionAdministration>,
+    access_authorizers: Arc<Mutex<Vec<Arc<dyn TaskAccessAuthorizer>>>>,
 }
 
 impl FinalTaskRuntime {
@@ -6516,6 +6650,7 @@ impl FinalTaskRuntime {
             service_signal: Arc::new(Mutex::new(None)),
             next_task_service_id: Arc::new(AtomicU64::new(0)),
             retention_administration: Arc::new(TaskRetentionAdministration::default()),
+            access_authorizers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -7136,12 +7271,13 @@ impl FinalTaskRuntime {
         work_descriptor: FinalTaskWorkDescriptor,
         status_message: Option<String>,
     ) -> McpResult<CreateTaskResult> {
-        self.create_task_with_principal(work_descriptor, status_message, None)
+        self.create_task_with_principal(work_descriptor, status_message, None, None)
     }
 
     /// Creates application work on behalf of the authenticated ingress caller.
     /// Unlike trusted embedding creation, this retains the request principal
     /// privately in the same commit as the task and its initial work.
+    #[cfg(test)]
     pub(crate) fn create_task_for_request(
         &self,
         ctx: &McpContext,
@@ -7153,6 +7289,23 @@ impl FinalTaskRuntime {
             work_descriptor,
             status_message,
             task_request_principal(ctx)?,
+            None,
+        )
+    }
+
+    pub(crate) fn create_task_for_operation(
+        &self,
+        ctx: &McpContext,
+        operation: FinalTaskOperation,
+        work_descriptor: FinalTaskWorkDescriptor,
+        status_message: Option<String>,
+    ) -> McpResult<CreateTaskResult> {
+        self.authorize_original_operation(ctx, TaskAccessAction::Create, Some(&operation))?;
+        self.create_task_with_principal(
+            work_descriptor,
+            status_message,
+            task_request_principal(ctx)?,
+            Some(operation),
         )
     }
 
@@ -7161,6 +7314,7 @@ impl FinalTaskRuntime {
         work_descriptor: FinalTaskWorkDescriptor,
         status_message: Option<String>,
         principal: Option<Sha256Digest>,
+        operation: Option<FinalTaskOperation>,
     ) -> McpResult<CreateTaskResult> {
         if self.config.ttl_ms.is_none()
             && self
@@ -7189,7 +7343,9 @@ impl FinalTaskRuntime {
                 .map(final_task_duration)
                 .transpose()?,
         });
-        self.persist_new_with_work_while_service_ready(task.clone(), work_descriptor, principal)?;
+        self.persist_new_with_work_while_service_ready(
+            task.clone(), work_descriptor, principal, operation,
+        )?;
         Ok(CreateTaskResult {
             task,
             meta: None,
@@ -7507,7 +7663,7 @@ impl FinalTaskRuntime {
         let terminal_cancellation =
             self.validate_cancellation_store_result(current, &cancelled_task, cancellation)?;
         if terminal_cancellation {
-            self.emit(cancelled_notification, current.authenticated_principal());
+            self.emit(cancelled_notification, current.authenticated_principal(), current.creation_generation());
         }
         self.signal_task_service_cancellation(task_id.clone());
         Ok(FinalCancelTaskResult::default())
@@ -7525,7 +7681,10 @@ impl FinalTaskRuntime {
         cancelled_task: &FinalTask,
         returned: FinalTaskSnapshot,
     ) -> McpResult<bool> {
-        if returned.authenticated_principal() != expected.authenticated_principal() {
+        if returned.authenticated_principal() != expected.authenticated_principal()
+            || returned.original_operation() != expected.original_operation()
+            || returned.creation_generation() != expected.creation_generation()
+        {
             return Err(McpError::internal_error(
                 "Final task store changed the task principal",
             ));
@@ -7570,7 +7729,10 @@ impl FinalTaskRuntime {
         // already-consumed intent and reject a successfully committed cancel.
         let cancellation_requested = !terminal && self.store.is_cancellation_requested(task_id)?;
         let committed = self.load_task_snapshot(task_id)?;
-        if committed.authenticated_principal() != returned.authenticated_principal() {
+        if committed.authenticated_principal() != returned.authenticated_principal()
+            || committed.creation_generation() != returned.creation_generation()
+            || committed.original_operation() != returned.original_operation()
+        {
             return Err(McpError::internal_error(
                 "Final task store changed the task principal",
             ));
@@ -7721,6 +7883,8 @@ impl FinalTaskRuntime {
         if !matches!(committed.task(), FinalTask::Failed { .. })
             || committed.generation() <= expected.generation()
             || committed.authenticated_principal() != expected.authenticated_principal()
+            || committed.original_operation() != expected.original_operation()
+            || committed.creation_generation() != expected.creation_generation()
         {
             return Err(McpError::internal_error(
                 "Final task store returned an invalid execution-expiry commit",
@@ -7758,39 +7922,21 @@ impl FinalTaskRuntime {
         &self,
         ctx: &McpContext,
         task_id: &FinalTaskId,
+        action: TaskAccessAction,
     ) -> McpResult<FinalTaskSnapshot> {
-        ctx.ensure_live()?;
-        let principal = task_request_principal(ctx)?;
+        let metadata = self.admit_task_for_request(ctx, task_id, action)?;
         let snapshot = self
             .store
             .get_task_snapshot(task_id)?
             .ok_or_else(|| McpError::invalid_params("Task not found"))?;
-        let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
-        if snapshot.authenticated_principal() != principal {
-            // A foreign task and a missing task have the same public error.
-            // Never inspect its state or input ledger before this comparison.
-            return Err(McpError::invalid_params("Task not found"));
+        if !metadata.admits_snapshot(&snapshot) {
+            return Err(authorization::task_access_denied());
         }
+        self.authorize_original_operation(ctx, action, snapshot.original_operation())?;
+        let snapshot = self.validate_loaded_task_snapshot(snapshot, Some(task_id))?;
         Ok(self
             .expire_execution_snapshot(&snapshot)?
             .unwrap_or(snapshot))
-    }
-
-    pub(crate) fn notification_matches_task_owner(
-        &self,
-        admitted: &FinalTaskSnapshot,
-        notification: &FinalTaskStatusNotification,
-    ) -> bool {
-        let task_id = &notification.params.task.base().task_id;
-        if task_id != &admitted.task().base().task_id
-            || notification.params.task.base().created_at != admitted.task().base().created_at
-        {
-            return false;
-        }
-        self.load_task_snapshot(task_id).is_ok_and(|current| {
-            current.authenticated_principal() == admitted.authenticated_principal()
-                && current.task().base().created_at == admitted.task().base().created_at
-        })
     }
 
     /// Admits task data returned by any durable-store implementation before
@@ -7800,6 +7946,11 @@ impl FinalTaskRuntime {
         snapshot: FinalTaskSnapshot,
         expected_task_id: Option<&FinalTaskId>,
     ) -> McpResult<FinalTaskSnapshot> {
+        if snapshot.creation_generation() == 0
+            || snapshot.creation_generation() > snapshot.generation()
+        {
+            return Err(McpError::internal_error("Final task store returned invalid creation authority"));
+        }
         validate_final_task_storage_shape(snapshot.task()).map_err(|error| {
             McpError::internal_error(format!(
                 "Final task store returned an invalid durable task shape: {}",
@@ -7896,7 +8047,9 @@ impl FinalTaskRuntime {
             .ok_or_else(|| McpError::invalid_params("Task not found"))?;
         let current = self.validate_loaded_task_snapshot(current, Some(task_id))?;
         if current.generation() != expected.generation()
+            || current.creation_generation() != expected.creation_generation()
             || current.authenticated_principal() != expected.authenticated_principal()
+            || current.original_operation() != expected.original_operation()
             || !final_tasks_match_exactly(current.task(), expected.task())?
         {
             return Err(McpError::internal_error(
@@ -7923,7 +8076,9 @@ impl FinalTaskRuntime {
             )
         })?;
         if committed.generation() <= expected.generation()
+            || committed.creation_generation() != expected.creation_generation()
             || committed.authenticated_principal() != expected.authenticated_principal()
+            || committed.original_operation() != expected.original_operation()
             || !final_tasks_match_exactly(committed.task(), intended)?
         {
             return Err(McpError::internal_error(
@@ -7939,6 +8094,7 @@ impl FinalTaskRuntime {
         &self,
         intended: &FinalTask,
         principal: Option<Sha256Digest>,
+        operation: Option<&FinalTaskOperation>,
         committed: FinalTaskSnapshot,
     ) -> McpResult<FinalTaskSnapshot> {
         let committed =
@@ -7948,9 +8104,12 @@ impl FinalTaskRuntime {
                 "Final task store substituted a newly created durable task",
             ));
         }
-        if committed.authenticated_principal() != principal {
+        if committed.authenticated_principal() != principal
+            || committed.creation_generation() != committed.generation()
+            || committed.original_operation() != operation
+        {
             return Err(McpError::internal_error(
-                "Final task store substituted the task principal at creation",
+                "Final task store substituted task authority at creation",
             ));
         }
         Ok(committed)
@@ -7993,7 +8152,7 @@ impl FinalTaskRuntime {
             notification.clone(),
             work_descriptor,
         )?;
-        let committed = self.validate_committed_new_task(&task, None, committed)?;
+        let committed = self.validate_committed_new_task(&task, None, None, committed)?;
         // Creation has crossed the durable create-before-reply boundary. A
         // post-commit observer failure must never erase the client handle by
         // turning this accepted operation into an RPC error.
@@ -8016,6 +8175,7 @@ impl FinalTaskRuntime {
         task: FinalTask,
         work_descriptor: FinalTaskWorkDescriptor,
         principal: Option<Sha256Digest>,
+        operation: Option<FinalTaskOperation>,
     ) -> McpResult<()> {
         let task_id = task.base().task_id.clone();
         let notification = final_task_notification(&task);
@@ -8034,7 +8194,15 @@ impl FinalTaskRuntime {
                     "Final task creation requires an installed ready task service",
                 ));
             }
-            if let Some(principal) = principal {
+            if let Some(operation) = operation.as_ref() {
+                self.store.create_task_with_operation(
+                    task.clone(),
+                    notification.clone(),
+                    work_descriptor,
+                    principal,
+                    operation.clone(),
+                )?
+            } else if let Some(principal) = principal {
                 self.store.create_task_with_authenticated_work(
                     task.clone(),
                     notification.clone(),
@@ -8049,7 +8217,7 @@ impl FinalTaskRuntime {
                 )?
             }
         };
-        let committed = self.validate_committed_new_task(&task, principal, committed)?;
+        let committed = self.validate_committed_new_task(&task, principal, operation.as_ref(), committed)?;
         // The durable commit above is the acceptance point. Observer failures
         // cannot revoke the returned task handle.
         self.emit_committed(notification, &committed);
@@ -8161,10 +8329,12 @@ impl FinalTaskRuntime {
         let current = self.load_task_snapshot(&committed.task().base().task_id);
         if current.is_ok_and(|current| {
             current.generation() == committed.generation()
+                && current.creation_generation() == committed.creation_generation()
                 && current.authenticated_principal() == committed.authenticated_principal()
+                && current.original_operation() == committed.original_operation()
                 && final_tasks_match_exactly(current.task(), committed.task()).unwrap_or(false)
         }) {
-            self.emit(notification, committed.authenticated_principal());
+            self.emit(notification, committed.authenticated_principal(), committed.creation_generation());
         }
     }
 
@@ -8172,7 +8342,7 @@ impl FinalTaskRuntime {
     /// mutation. A panic from one observer is contained and recorded as
     /// delivery degradation; it cannot revoke the already-committed state or
     /// turn the accepted transition into an RPC error.
-    fn emit(&self, notification: FinalTaskStatusNotification, principal: Option<Sha256Digest>) {
+    fn emit(&self, notification: FinalTaskStatusNotification, principal: Option<Sha256Digest>, creation_generation: u64) {
         let emitters = {
             let mut registered = self
                 .notification_emitters
@@ -8185,11 +8355,24 @@ impl FinalTaskRuntime {
         // Upgrade each scoped observer only at its delivery turn. An earlier
         // application callback may have dropped a server or subscription;
         // taking strong references to the whole fanout would keep it alive.
-        let application = Some(Arc::clone(&self.application_notification_emitter));
-        for emitter in std::iter::once(application)
-            .chain(emitters.iter().map(Weak::upgrade))
-            .flatten()
-        {
+        if catch_unwind(AssertUnwindSafe(|| {
+            (self.application_notification_emitter)(notification.clone(), principal);
+        })).is_err() {
+            panicked_emitter_count += 1;
+        }
+        for emitter in emitters.iter().filter_map(Weak::upgrade) {
+            // The application observer (or a preceding framework observer)
+            // can reclaim and recreate an opaque ID, even with identical wire
+            // timestamps and payload. Fence the committed incarnation again
+            // immediately before each framework delivery. Request observers
+            // additionally recheck current grants and the authoritative task.
+            let current = self.store.get_task_access_metadata(&notification.params.task.base().task_id);
+            if !current.is_ok_and(|current| current.is_some_and(|current| {
+                current.creation_generation() == creation_generation
+                    && current.authenticated_principal() == principal
+            })) {
+                continue;
+            }
             if catch_unwind(AssertUnwindSafe(|| {
                 emitter(notification.clone(), principal);
             }))
@@ -9890,7 +10073,7 @@ pub(crate) fn dispatch_final_tasks_get(
         .map_err(|_| McpError::invalid_params("Invalid final tasks/get parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/get")?;
     let task = runtime
-        .task_for_request(ctx, &parameters.task_id)?
+        .task_for_request(ctx, &parameters.task_id, TaskAccessAction::Get)?
         .into_task();
     Ok(fastmcp_protocol::CompleteTaskResult {
         task,
@@ -9908,7 +10091,7 @@ pub(crate) fn dispatch_final_tasks_update(
     let parameters = serde_json::from_value::<UpdateTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/update parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/update")?;
-    let current = runtime.task_for_request(ctx, &parameters.task_id)?;
+    let current = runtime.task_for_request(ctx, &parameters.task_id, TaskAccessAction::Update)?;
     serde_json::to_value(runtime.update_task_snapshot(&current, &parameters.input_responses)?)
         .map_err(|_| McpError::internal_error("final tasks/update response serialization failed"))
 }
@@ -9922,7 +10105,7 @@ pub(crate) fn dispatch_final_tasks_cancel(
     let parameters = serde_json::from_value::<FinalCancelTaskParams>(parameters)
         .map_err(|_| McpError::invalid_params("Invalid final tasks/cancel parameters"))?;
     validate_final_task_request_meta(&parameters.request, "tasks/cancel")?;
-    let current = runtime.task_for_request(ctx, &parameters.task_id)?;
+    let current = runtime.task_for_request(ctx, &parameters.task_id, TaskAccessAction::Cancel)?;
     serde_json::to_value(runtime.cancel_task_snapshot(&current)?)
         .map_err(|_| McpError::internal_error("final tasks/cancel response serialization failed"))
 }
@@ -10063,6 +10246,12 @@ mod tests {
     // silently replace finite deadlines with an unlimited fixture fallback.
     macro_rules! delegate_final_execution_policy {
         () => {
+            fn get_task_access_metadata(
+                &self,
+                task_id: &FinalTaskId,
+            ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+                self.inner.get_task_access_metadata(task_id)
+            }
             fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
                 self.inner.execution_limits()
             }
@@ -12998,7 +13187,7 @@ mod tests {
         runtime
             .require_input(&task_id, final_roots_request(), None)
             .unwrap();
-        let current = runtime.task_for_request(&owner, &task_id).unwrap();
+        let current = runtime.task_for_request(&owner, &task_id, TaskAccessAction::Update).unwrap();
         runtime
             .update_task_snapshot(
                 &current,
@@ -13013,15 +13202,17 @@ mod tests {
                 .authenticated_principal(),
             Some(principal)
         );
-        let current = runtime.task_for_request(&owner, &task_id).unwrap();
+        let current = runtime.task_for_request(&owner, &task_id, TaskAccessAction::Cancel).unwrap();
+        let admitted = runtime.admit_task_for_request(&owner, &task_id, TaskAccessAction::Listen).unwrap();
         runtime.cancel_task_snapshot(&current).unwrap();
-        assert!(runtime.notification_matches_task_owner(
-            &current,
+        assert!(runtime.notification_matches_task_access(
+            &owner,
+            &admitted,
             &store.latest_notification(&task_id).unwrap(),
-        ));
+        ).unwrap());
         assert_eq!(
             runtime
-                .task_for_request(&owner, &task_id)
+                .task_for_request(&owner, &task_id, TaskAccessAction::Get)
                 .unwrap()
                 .authenticated_principal(),
             Some(principal)
@@ -13044,14 +13235,15 @@ mod tests {
             )
             .unwrap();
         assert!(
-            runtime.task_for_request(&owner, &task_id).is_err(),
+            runtime.task_for_request(&owner, &task_id, TaskAccessAction::Get).is_err(),
             "expired ownership cannot attach to a reused unprotected ID"
         );
         assert!(
-            !runtime.notification_matches_task_owner(
-                &current,
+            runtime.notification_matches_task_access(
+                &owner,
+                &admitted,
                 &store.latest_notification(&task_id).unwrap(),
-            ),
+            ).is_err(),
             "an existing listener cannot inherit the replacement task"
         );
         assert!(
@@ -13089,7 +13281,7 @@ mod tests {
         let before_notification =
             serde_json::to_value(store.latest_notification(&task_id)).unwrap();
         for caller in [&foreign, &McpContext::new(Cx::for_testing(), 1)] {
-            let error = runtime.task_for_request(caller, &task_id).unwrap_err();
+            let error = runtime.task_for_request(caller, &task_id, TaskAccessAction::Get).unwrap_err();
             assert_eq!(error.message, "Task not found");
             assert_eq!(
                 store
@@ -13112,7 +13304,7 @@ mod tests {
                 before.authenticated_principal()
             );
         }
-        let current = runtime.task_for_request(&owner, &task_id).unwrap();
+        let current = runtime.task_for_request(&owner, &task_id, TaskAccessAction::Cancel).unwrap();
         runtime.cancel_task_snapshot(&current).unwrap();
         assert!(
             runtime.cancel_task_snapshot(&before).is_err(),
@@ -13436,6 +13628,9 @@ mod tests {
             }
             if let Some(history) = state.input_key_history.get(task_id) {
                 actual += encoded_final_task_test_bytes(&history.keys);
+            }
+            if let Some(operation) = state.original_operations.get(task_id) {
+                actual += operation.retained_bytes();
             }
             assert_eq!(state.payload_accounting.records[task_id].total, actual);
             let expected_reserve = if matches!(
@@ -13975,7 +14170,10 @@ mod tests {
                 .snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation());
+            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation())
+                .with_creation_generation(snapshot.creation_generation())
+                .with_authenticated_principal(snapshot.authenticated_principal())
+                .with_original_operation(snapshot.original_operation().cloned());
         }
 
         fn set_accepted_inputs(&self, input_responses: FinalTaskInputResponses) {
@@ -13987,6 +14185,19 @@ mod tests {
     }
 
     impl FinalTaskStore for RuntimeBoundaryProbeFinalTaskStore {
+        fn get_task_access_metadata(
+            &self,
+            task_id: &FinalTaskId,
+        ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+            let snapshot = self.snapshot.lock().unwrap();
+            Ok((&snapshot.task().base().task_id == task_id).then(|| {
+                FinalTaskAccessMetadata::new(
+                    task_id.clone(), snapshot.generation(), snapshot.creation_generation(), snapshot.authenticated_principal(),
+                    snapshot.original_operation().cloned(),
+                )
+            }))
+        }
+
         fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
             Ok(FinalTaskExecutionLimits::default())
         }
@@ -14032,7 +14243,10 @@ mod tests {
                     additional: BTreeMap::new(),
                 },
             };
-            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation() + 1);
+            *snapshot = FinalTaskSnapshot::new(task, snapshot.generation() + 1)
+                .with_creation_generation(snapshot.creation_generation())
+                .with_authenticated_principal(snapshot.authenticated_principal())
+                .with_original_operation(snapshot.original_operation().cloned());
             Ok(Some(snapshot.clone()))
         }
 
@@ -14125,7 +14339,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
                 .unwrap_or(task);
-            *snapshot = FinalTaskSnapshot::new(committed_task, next_generation);
+            *snapshot = FinalTaskSnapshot::new(committed_task, next_generation)
+                .with_creation_generation(snapshot.creation_generation())
+                .with_authenticated_principal(snapshot.authenticated_principal())
+                .with_original_operation(snapshot.original_operation().cloned());
             Ok(true)
         }
 
@@ -14154,7 +14371,10 @@ mod tests {
                 .unwrap()
                 .clone()
                 .unwrap_or(task);
-            *snapshot = FinalTaskSnapshot::new(committed_task, generation);
+            *snapshot = FinalTaskSnapshot::new(committed_task, generation)
+                .with_creation_generation(snapshot.creation_generation())
+                .with_authenticated_principal(snapshot.authenticated_principal())
+                .with_original_operation(snapshot.original_operation().cloned());
             Ok(Some(snapshot.clone()))
         }
 
@@ -14268,7 +14488,10 @@ mod tests {
                 .generation()
                 .checked_add(1)
                 .ok_or_else(|| McpError::internal_error("probe generation exhausted"))?;
-            *snapshot = FinalTaskSnapshot::new(cancelled_task, generation);
+            *snapshot = FinalTaskSnapshot::new(cancelled_task, generation)
+                .with_creation_generation(snapshot.creation_generation())
+                .with_authenticated_principal(snapshot.authenticated_principal())
+                .with_original_operation(snapshot.original_operation().cloned());
             Ok(Some(snapshot.clone()))
         }
 
@@ -15508,7 +15731,8 @@ mod tests {
             } else {
                 expected.generation() - 1
             };
-            let returned = FinalTaskSnapshot::new(cancelled.clone(), generation);
+            let returned = FinalTaskSnapshot::new(cancelled.clone(), generation)
+                .with_creation_generation(expected.creation_generation());
             *store.snapshot.lock().unwrap() = returned.clone();
             let runtime = FinalTaskRuntime::new(
                 store.clone(),
@@ -16890,7 +17114,7 @@ mod tests {
             );
             assert!(
                 runtime
-                    .task_for_request(&context("owner", true), &task_id)
+                    .task_for_request(&context("owner", true), &task_id, TaskAccessAction::Get)
                     .is_ok(),
                 "this caller really owns the task and may perform its ordinary lookup"
             );
@@ -22616,6 +22840,7 @@ mod tests {
         runtime.emit(
             final_task_notification(&final_working_task_without_ttl("task-observer-rebuild")),
             None,
+            1,
         );
         assert!(runtime.notification_emitters.lock().unwrap().is_empty());
     }
@@ -22648,8 +22873,11 @@ mod tests {
         }));
         let notification =
             final_task_notification(&final_working_task_without_ttl("task-observer-fanout"));
+        runtime.store.create_task(notification.params.task.clone(), notification.clone()).unwrap();
+        let creation_generation = runtime.store.get_task_snapshot(&notification.params.task.base().task_id)
+            .unwrap().unwrap().creation_generation();
         for expected in 1..=2 {
-            runtime.emit(notification.clone(), None);
+            runtime.emit(notification.clone(), None, creation_generation);
             assert_eq!(retired_events.load(AtomicOrdering::SeqCst), 0);
             assert_eq!(sibling_events.load(AtomicOrdering::SeqCst), expected);
             assert_eq!(application_events.load(AtomicOrdering::SeqCst), expected);

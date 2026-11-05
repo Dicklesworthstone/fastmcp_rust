@@ -306,6 +306,26 @@ impl Middleware for ScopeAdmissionMiddleware {
     }
 }
 
+#[cfg(feature = "tasks")]
+impl crate::TaskAccessAuthorizer for ScopeRequestPolicy {
+    fn authorize(
+        &self,
+        ctx: &McpContext,
+        action: crate::TaskAccessAction,
+        original: &crate::FinalTaskOperation,
+    ) -> McpResult<()> {
+        if let Some(operations) = self.operations.as_ref() {
+            return crate::TaskAccessAuthorizer::authorize(operations, ctx, action, original);
+        }
+        Server::enforce_request_context(ctx)?;
+        let facts = ctx.auth();
+        let allowed = self.authorize_verified(original.method(), facts.as_ref()).is_ok()
+            && self.authorize_verified(action.method(), facts.as_ref()).is_ok();
+        Server::enforce_request_context(ctx)?;
+        if allowed { Ok(()) } else { Err(McpError::invalid_params("Task not found")) }
+    }
+}
+
 impl Server {
     /// Installs an immutable, default-deny request gate at the front of the
     /// server's existing middleware chain, before caches and early Respond hooks.
@@ -324,8 +344,10 @@ impl Server {
     /// preflight, public resource metadata and protocol control handled before
     /// that dispatch retain their own admission. Policies created by
     /// ScopeRequestPolicy::for_operations also enforce their exact named rules.
-    /// Neither form filters catalogs. A subscription grant is checked on opening
-    /// only; its native lease and revocation contract is unchanged. JSON-RPC
+    /// With local Tasks, both forms also recheck the original operation and
+    /// management grants on get/update/cancel and every subscribed Task event.
+    /// Neither form filters catalogs or grants autonomous Task execution.
+    /// Other subscription families retain their native lease contract. JSON-RPC
     /// policy failures retain the native error mapping, not a fabricated OAuth
     /// HTTP status/challenge inferred from application error data.
     pub fn with_scope_authorization(mut self, policy: ScopeRequestPolicy) -> McpResult<Self> {
@@ -337,6 +359,10 @@ impl Server {
         middleware.try_reserve(1).map_err(|_| {
             McpError::internal_error("scope authorization installation exceeds capacity")
         })?;
+        #[cfg(feature = "tasks")]
+        if let Some(runtime) = self.final_task_runtime.as_ref() {
+            runtime.install_access_authorizer(Arc::new(policy.clone()))?;
+        }
         middleware.insert(0, Box::new(ScopeAdmissionMiddleware(policy)));
         Ok(self)
     }

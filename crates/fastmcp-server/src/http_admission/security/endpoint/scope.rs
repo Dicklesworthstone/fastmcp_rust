@@ -49,6 +49,14 @@ impl HttpSecurityPolicy {
     /// still apply, but their errors are not reclassified as OAuth. Revalidation
     /// is a separate explicit choice and retains the full named request policy.
     ///
+    /// Local Tasks also require current authorization for their original tool.
+    /// Construct one `ScopeRequestPolicy`, pass
+    /// `Arc::new(policy.clone())` to `ServerBuilder::task_access_authorizer`,
+    /// and install that same policy here. HTTP request admission does not
+    /// install or mutate the shared Task runtime's authorization policy.
+    /// The original tool's grants and the current Task-management grants
+    /// must both remain satisfied on subsequent Task requests.
+    ///
     /// Configuration is immutable after installation. A second installation
     /// fails rather than replacing or widening the previous scope policy.
     pub fn with_scope_authorization(

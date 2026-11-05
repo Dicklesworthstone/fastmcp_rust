@@ -294,6 +294,9 @@ pub struct ServerBuilder {
     /// Supervisor installed on the selected local runtime when building.
     #[cfg(feature = "tasks")]
     task_supervisor: Option<Arc<dyn ApplicationTaskSupervisor>>,
+    /// Intersecting current policies for request-owned Tasks.
+    #[cfg(feature = "tasks")]
+    task_access_authorizers: Vec<Arc<dyn crate::TaskAccessAuthorizer>>,
     /// Maximum application handoffs polled by the hosted Tasks service.
     #[cfg(feature = "tasks")]
     max_concurrent_task_handoffs: usize,
@@ -431,6 +434,8 @@ impl ServerBuilder {
             final_task_runtime: None,
             #[cfg(feature = "tasks")]
             task_supervisor: None,
+            #[cfg(feature = "tasks")]
+            task_access_authorizers: Vec::new(),
             #[cfg(feature = "tasks")]
             max_concurrent_task_handoffs: DEFAULT_CONCURRENT_TASK_HANDOFFS,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -908,6 +913,35 @@ impl ServerBuilder {
             });
         } else {
             self.task_supervisor = Some(supervisor);
+        }
+        self
+    }
+
+    /// Requires current original-operation and management authorization for
+    /// local Tasks. Calls intersect and callbacks also run before every Task
+    /// subscription event. Install at least one policy for protected
+    /// task-producing tools; ordinary authenticated owner equality is not an
+    /// original-operation permission. `OperationScopePolicy` implements this
+    /// trait and is also installed by `Server::with_operation_scope_authorization`.
+    /// A secured HTTP endpoint's admission policy is a separate boundary. To
+    /// share one definition, clone its immutable `ScopeRequestPolicy` into
+    /// `task_access_authorizer(Arc::new(policy.clone()))` and pass the same
+    /// policy to `HttpSecurityPolicy::with_scope_authorization`. HTTP admission
+    /// alone cannot reauthorize a detached Task's original tool or later events.
+    ///
+    /// This controls request access, not autonomous worker execution or
+    /// restart recovery. Trusted embedding reads and writes remain separate.
+    #[cfg(feature = "tasks")]
+    #[must_use]
+    pub fn task_access_authorizer(mut self, authorizer: Arc<dyn crate::TaskAccessAuthorizer>) -> Self {
+        if self.task_access_authorizers.len() >= 16 {
+            self.refused_registrations.push(RefusedRegistration {
+                kind: RegistrationKind::TaskService,
+                name: "task_access_authorizer".to_owned(),
+                reason: "Task access policy capacity reached".to_owned(),
+            });
+        } else {
+            self.task_access_authorizers.push(authorizer);
         }
         self
     }
@@ -3084,6 +3118,25 @@ impl ServerBuilder {
             }
             None => None,
         };
+        // No fallible builder validation follows this all-or-nothing policy
+        // batch. A refused build must not change another runtime clone's
+        // request authorization. Dropping an unstarted host also retires its
+        // service installation if policy capacity is refused here.
+        #[cfg(feature = "tasks")]
+        if !self.task_access_authorizers.is_empty() {
+            let result = self.final_task_runtime.as_ref().ok_or_else(|| {
+                McpError::invalid_request("Task access policy requires a local Tasks runtime")
+            }).and_then(|runtime| runtime.install_access_authorizers(
+                std::mem::take(&mut self.task_access_authorizers),
+            ));
+            if let Err(error) = result {
+                return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
+                    kind: RegistrationKind::TaskService,
+                    name: "task_access_authorizer".to_owned(),
+                    reason: error.to_string(),
+                }]));
+            }
+        }
         Ok(self.build_admitted(
             #[cfg(feature = "tasks")]
             task_service_host,

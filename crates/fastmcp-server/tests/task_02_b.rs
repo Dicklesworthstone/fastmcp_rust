@@ -1149,12 +1149,12 @@ fn b45_anonymous_handle_is_refused_everywhere() {
 /// bounds what the assertions are allowed to mean.
 #[derive(Default)]
 struct MinimalBackend {
-    tasks: Mutex<BTreeMap<FinalTaskId, (Task, u64)>>,
+    tasks: Mutex<BTreeMap<FinalTaskId, (Task, u64, u64)>>,
     cancellations: Mutex<BTreeSet<FinalTaskId>>,
 }
 
 impl MinimalBackend {
-    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<FinalTaskId, (Task, u64)>> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, BTreeMap<FinalTaskId, (Task, u64, u64)>> {
         self.tasks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1164,27 +1164,32 @@ impl MinimalBackend {
 impl FinalTaskStore for MinimalBackend {
     fn create_task(&self, task: Task, _notification: TaskStatusNotification) -> McpResult<()> {
         let id = task.base().task_id.clone();
-        if self.locked().insert(id, (task, 1)).is_some() {
+        let mut state = self.locked();
+        if state.contains_key(&id) {
             return Err(McpError::invalid_params("duplicate task identifier"));
         }
+        state.insert(id, (task, 1, 1));
         Ok(())
     }
 
     fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<Task>> {
-        Ok(self.locked().get(task_id).map(|(task, _)| task.clone()))
+        Ok(self.locked().get(task_id).map(|(task, _, _)| task.clone()))
     }
 
     fn get_task_snapshot(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTaskSnapshot>> {
         Ok(self
             .locked()
             .get(task_id)
-            .map(|(task, generation)| FinalTaskSnapshot::new(task.clone(), *generation)))
+            .map(|(task, generation, creation_generation)| {
+                FinalTaskSnapshot::new(task.clone(), *generation)
+                    .with_creation_generation(*creation_generation)
+            }))
     }
 
     fn replace_task(&self, task: Task, _notification: TaskStatusNotification) -> McpResult<()> {
         let id = task.base().task_id.clone();
         let mut state = self.locked();
-        let Some((slot, generation)) = state.get_mut(&id) else {
+        let Some((slot, generation, _)) = state.get_mut(&id) else {
             return Err(McpError::invalid_params("unknown task identifier"));
         };
         *slot = task;
@@ -1200,7 +1205,7 @@ impl FinalTaskStore for MinimalBackend {
     ) -> McpResult<bool> {
         let id = task.base().task_id.clone();
         let mut state = self.locked();
-        let Some((slot, generation)) = state.get_mut(&id) else {
+        let Some((slot, generation, _)) = state.get_mut(&id) else {
             return Ok(false);
         };
         if *generation != expected.generation() {
@@ -1224,7 +1229,7 @@ impl FinalTaskStore for MinimalBackend {
 
     fn request_cancellation_if_current(&self, expected: &FinalTaskSnapshot) -> McpResult<bool> {
         let id = expected.task().base().task_id.clone();
-        if self.locked().get(&id).map(|(_, g)| *g) != Some(expected.generation()) {
+        if self.locked().get(&id).map(|(_, generation, _)| *generation) != Some(expected.generation()) {
             return Ok(false);
         }
         self.request_cancellation(&id)?;

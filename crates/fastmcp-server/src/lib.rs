@@ -191,6 +191,7 @@ use session::{
 #[cfg(feature = "tasks")]
 pub use tasks::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
+    FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
     FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
     FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
@@ -17404,6 +17405,8 @@ impl Server {
         let tasks_requested =
             self.admit_final_task_subscription(&params.notifications, client_capabilities)?;
         #[cfg(feature = "tasks")]
+        let mut task_access_revalidation = None;
+        #[cfg(feature = "tasks")]
         let notification_sender =
             if tasks_requested && let Some(runtime) = self.final_task_runtime.as_ref() {
                 let mut admitted_tasks = BTreeMap::new();
@@ -17411,10 +17414,16 @@ impl Server {
                     .map_err(|_| McpError::invalid_params("invalid Tasks subscription filter"))?
                     .unwrap_or_default()
                 {
-                    let snapshot = runtime.task_for_request(request_ctx, &task_id)?;
-                    admitted_tasks.insert(task_id, snapshot);
+                    let metadata = runtime.admit_task_for_request(
+                        request_ctx, &task_id, TaskAccessAction::Listen,
+                    )?;
+                    admitted_tasks.insert(task_id, metadata);
                 }
+                let admitted_tasks = Arc::new(admitted_tasks);
+                task_access_revalidation = Some((runtime.clone(), Arc::clone(&admitted_tasks)));
                 let runtime = runtime.clone();
+                let task_context = request_ctx.clone();
+                let task_cancellation = request_cancellation.clone();
                 let guarded: NotificationSender = Arc::new(move |notification| {
                     if notification.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION {
                         let event = serde_json::to_value(&notification).ok().and_then(|wire| {
@@ -17427,8 +17436,13 @@ impl Server {
                         else {
                             return;
                         };
-                        if !runtime.notification_matches_task_owner(admitted, &event) {
-                            return;
+                        match runtime.notification_matches_task_access(&task_context, admitted, &event) {
+                            Ok(true) => {}
+                            Ok(false) => return,
+                            Err(_) => {
+                                task_cancellation.cancel();
+                                return;
+                            }
                         }
                     }
                     notification_sender(notification);
@@ -17448,6 +17462,12 @@ impl Server {
         {
             return Err(McpError::internal_error(
                 "Subscriptions require caller time capability",
+            ));
+        }
+        #[cfg(feature = "tasks")]
+        if task_access_revalidation.is_some() && request_ctx.cx().timer_driver().is_none() {
+            return Err(McpError::internal_error(
+                "Task subscriptions require the caller's timer driver",
             ));
         }
 
@@ -17568,6 +17588,17 @@ impl Server {
                 "Subscriptions require caller time capability",
             ));
         }
+        #[cfg(feature = "tasks")]
+        if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
+            if request_ctx.cx().timer_driver().is_none() {
+                return Err(McpError::internal_error(
+                    "Task subscriptions require the caller's timer driver",
+                ));
+            }
+            if !admitted.values().all(|metadata| runtime.task_access_is_current(request_ctx, metadata)) {
+                return Err(McpError::invalid_params("Task not found"));
+            }
+        }
         let lease = self.final_subscriptions.open_with_resource_bindings(
             subscription_id.clone(),
             params.notifications,
@@ -17583,7 +17614,21 @@ impl Server {
             }),
         )?;
 
+        #[cfg(feature = "tasks")]
+        let mut task_access_check_at = request_ctx.cx().now();
+
         while !self.final_subscriptions.is_terminating() {
+            #[cfg(feature = "tasks")]
+            if request_ctx.cx().now() >= task_access_check_at {
+                task_access_check_at = request_ctx.cx().now().saturating_add_nanos(1_000_000_000);
+                if let Some((runtime, admitted)) = task_access_revalidation.as_ref()
+                    && !admitted.values().all(|metadata| {
+                        runtime.task_access_is_current(request_ctx, metadata)
+                    })
+                {
+                    request_cancellation.cancel();
+                }
+            }
             if request_cancellation.is_cancel_requested() {
                 if lease.server_termination_completed(request_ctx.cx()).await {
                     return Ok(());
@@ -17620,7 +17665,15 @@ impl Server {
             }
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             if let Some(listener) = mixed_relay_listener.as_mut() {
-                match listener.next_event(request_ctx.cx(), &request_cancellation).await {
+                let operation = listener.next_event(request_ctx.cx(), &request_cancellation);
+                let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
+                    runtime.guard_task_subscription_operation(
+                        request_ctx.cx(), request_ctx, admitted, &request_cancellation, operation,
+                    ).await
+                } else {
+                    operation.await
+                };
+                match event {
                     Ok(proxy::ProxyMixedSubscriptionEvent::Catalog(notification)) => {
                         if lease.publish(notification).is_err() {
                             return lease.terminate(request_ctx.cx(), &request_cancellation).await;
@@ -17642,10 +17695,15 @@ impl Server {
             }
             #[cfg(all(feature = "proxy", feature = "tasks"))]
             if let Some(listener) = relay_listener.as_mut() {
-                match listener
-                    .next_async(request_ctx.cx(), &request_cancellation)
-                    .await
-                {
+                let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
+                let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
+                    runtime.guard_task_subscription_operation(
+                        request_ctx.cx(), request_ctx, admitted, &request_cancellation, operation,
+                    ).await
+                } else {
+                    operation.await
+                };
+                match event {
                     Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
                         if lease.publish_task(notification).is_err() {
                             return lease.terminate(request_ctx.cx(), &request_cancellation).await;
@@ -17665,10 +17723,18 @@ impl Server {
             }
             #[cfg(feature = "proxy")]
             if let Some(listener) = catalog_relay_listener.as_mut() {
-                match listener
-                    .next_async(request_ctx.cx(), &request_cancellation)
-                    .await
-                {
+                let operation = listener.next_async(request_ctx.cx(), &request_cancellation);
+                #[cfg(feature = "tasks")]
+                let event = if let Some((runtime, admitted)) = task_access_revalidation.as_ref() {
+                    runtime.guard_task_subscription_operation(
+                        request_ctx.cx(), request_ctx, admitted, &request_cancellation, operation,
+                    ).await
+                } else {
+                    operation.await
+                };
+                #[cfg(not(feature = "tasks"))]
+                let event = operation.await;
+                match event {
                     Ok(ProxyCatalogListenerEvent::Notification(notification)) => {
                         // This upstream request belongs to one downstream
                         // lease. Publishing globally duplicates overlapping
@@ -29732,6 +29798,7 @@ mod lib_unit_tests {
     struct ServerFinalTaskState {
         tasks: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, fastmcp_protocol::Task>,
         generations: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, u64>,
+        creation_generations: std::collections::BTreeMap<fastmcp_protocol::FinalTaskId, u64>,
         next_generation: u64,
         next_dispatch_fence: u64,
         work_descriptors:
@@ -29810,6 +29877,25 @@ mod lib_unit_tests {
         })?;
         state.next_generation = generation;
         Ok(generation)
+    }
+
+    #[cfg(feature = "tasks")]
+    fn server_final_task_snapshot(
+        state: &ServerFinalTaskState,
+        task: fastmcp_protocol::Task,
+        generation: u64,
+    ) -> McpResult<FinalTaskSnapshot> {
+        let creation_generation = state
+            .creation_generations
+            .get(&task.base().task_id)
+            .copied()
+            .ok_or_else(|| {
+                McpError::internal_error(
+                    "Server final task test store is missing its creation generation",
+                )
+            })?;
+        Ok(FinalTaskSnapshot::new(task, generation)
+            .with_creation_generation(creation_generation))
     }
 
     #[cfg(feature = "tasks")]
@@ -30069,6 +30155,7 @@ mod lib_unit_tests {
             state.execution_budgets.remove(&task_id);
             state.tasks.remove(&task_id);
             state.generations.remove(&task_id);
+            state.creation_generations.remove(&task_id);
             state.work_descriptors.remove(&task_id);
             state.initial_work.remove(&task_id);
             state.accepted_inputs.remove(&task_id);
@@ -30284,7 +30371,7 @@ mod lib_unit_tests {
             state.handoff_leases.remove(task_id);
             state.cancellation_requests.remove(task_id);
             state.notifications.push(notification);
-            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+            Ok(Some(server_final_task_snapshot(&state, task, generation)?))
         }
 
         fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
@@ -30299,7 +30386,7 @@ mod lib_unit_tests {
                     let generation = state.generations.get(task_id).copied().ok_or_else(|| {
                         McpError::internal_error("Server final task expiry lost its generation")
                     })?;
-                    return Ok(Some(FinalTaskSnapshot::new(task.clone(), generation)));
+                    return Ok(Some(server_final_task_snapshot(&state, task.clone(), generation)?));
                 }
             }
             Ok(None)
@@ -30328,6 +30415,7 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.creation_generations.insert(task_id.clone(), generation);
             state
                 .execution_budgets
                 .insert(task_id.clone(), execution_budget);
@@ -30367,6 +30455,7 @@ mod lib_unit_tests {
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), task);
             state.generations.insert(task_id.clone(), generation);
+            state.creation_generations.insert(task_id.clone(), generation);
             state
                 .execution_budgets
                 .insert(task_id.clone(), execution_budget);
@@ -30375,7 +30464,7 @@ mod lib_unit_tests {
                 .insert(task_id.clone(), work_descriptor.clone());
             state.initial_work.insert(task_id.clone(), work_descriptor);
             state.notifications.push(notification);
-            let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
+            let committed = server_final_task_snapshot(&state, state.tasks[&task_id].clone(), generation)?;
             if let Some(expires_at) = expires_at {
                 state.expires_at.insert(task_id, expires_at);
             }
@@ -30409,7 +30498,7 @@ mod lib_unit_tests {
             let generation = state.generations.get(task_id).copied().ok_or_else(|| {
                 McpError::internal_error("Server final task test store is missing a generation")
             })?;
-            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+            Ok(Some(server_final_task_snapshot(&state, task, generation)?))
         }
 
         fn replace_task(
@@ -30534,7 +30623,7 @@ mod lib_unit_tests {
                 .insert(task_id.clone(), execution_budget);
             state.handoff_leases.remove(&task_id);
             state.initial_work.remove(&task_id);
-            let committed = FinalTaskSnapshot::new(state.tasks[&task_id].clone(), generation);
+            let committed = server_final_task_snapshot(&state, state.tasks[&task_id].clone(), generation)?;
             if !input_responses.is_empty() {
                 state
                     .accepted_inputs
@@ -30590,10 +30679,11 @@ mod lib_unit_tests {
             if terminal {
                 state.cancellation_requests.remove(&task_id);
             }
-            Ok(Some(FinalTaskSnapshot::new(
+            Ok(Some(server_final_task_snapshot(
+                &state,
                 state.tasks[&task_id].clone(),
                 generation,
-            )))
+            )?))
         }
 
         fn replace_task_and_clear_input_for_handoff_if_current(
@@ -30661,10 +30751,11 @@ mod lib_unit_tests {
             if terminal {
                 state.cancellation_requests.remove(&task_id);
             }
-            Ok(Some(FinalTaskSnapshot::new(
+            Ok(Some(server_final_task_snapshot(
+                &state,
                 state.tasks[&task_id].clone(),
                 generation,
-            )))
+            )?))
         }
 
         fn take_input_if_current(
@@ -30771,7 +30862,7 @@ mod lib_unit_tests {
                     "Server final task test-store retained initial work without a generation",
                 )
             })?;
-            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+            Ok(Some(server_final_task_snapshot(&state, task, generation)?))
         }
 
         fn next_initial_work_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
@@ -30890,7 +30981,7 @@ mod lib_unit_tests {
                     "Server final task test-store retained input without a generation",
                 )
             })?;
-            Ok(Some(FinalTaskSnapshot::new(task, generation)))
+            Ok(Some(server_final_task_snapshot(&state, task, generation)?))
         }
 
         fn next_accepted_input_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
@@ -31140,7 +31231,7 @@ mod lib_unit_tests {
                         "Server final task test store lost an elected task generation during cancellation",
                     )
                 })?;
-                return Ok(Some(FinalTaskSnapshot::new(task, generation)));
+                return Ok(Some(server_final_task_snapshot(&state, task, generation)?));
             }
             let generation = next_server_final_task_generation(&mut state)?;
             state.tasks.insert(task_id.clone(), cancelled_task.clone());
@@ -31153,7 +31244,7 @@ mod lib_unit_tests {
             state.handoff_leases.remove(task_id);
             state.cancellation_requests.remove(task_id);
             state.notifications.push(cancelled_notification);
-            Ok(Some(FinalTaskSnapshot::new(cancelled_task, generation)))
+            Ok(Some(server_final_task_snapshot(&state, cancelled_task, generation)?))
         }
 
         fn is_cancellation_requested(
@@ -48323,6 +48414,16 @@ mod lib_unit_tests {
                 .tool(FinalTaskCreatingTool)
                 .final_tasks(task_runtime.clone())
                 .unwrap()
+                .task_access_authorizer(Arc::new({
+                    use crate::http_admission::security::scope_policy::{RequiredScopes, ScopeImplicationPolicy};
+                    use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
+                    use crate::http_admission::security::scope_policy::request::operation::{OperationScopePolicy, ScopedOperation};
+                    let methods = ScopeRequestPolicy::new(1, ScopeImplicationPolicy::new(1, vec![]).unwrap(),
+                        ["tools/call", "tasks/get", "tasks/update", "tasks/cancel", "subscriptions/listen"]
+                            .into_iter().map(|method| (method.to_owned(), RequiredScopes::new(vec![]).unwrap())).collect(),
+                    ).unwrap();
+                    OperationScopePolicy::new(1, methods, vec![(ScopedOperation::ToolCall("durable_final_task".to_owned()), RequiredScopes::new(vec![]).unwrap())]).unwrap()
+                }))
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
                 .await

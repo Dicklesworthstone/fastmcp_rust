@@ -473,6 +473,7 @@ pub mod server {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
+        FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
         FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
         FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
         FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
@@ -952,6 +953,7 @@ pub use fastmcp_server::{
 #[cfg(feature = "tasks")]
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
+    FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
     FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
     FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
@@ -2419,6 +2421,20 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
+        /// Adds current original-operation and management authorization for Tasks.
+        ///
+        /// Share the same immutable scope policy with secured HTTP admission.
+        /// Each policy intersects and runs again before Task events; no worker
+        /// execution or durable recovery authority is implied.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_access_authorizer(
+            self,
+            authorizer: std::sync::Arc<dyn crate::TaskAccessAuthorizer>,
+        ) -> Self {
+            Self { inner: self.inner.task_access_authorizer(authorizer) }
+        }
+
         /// Hosts the application's Tasks supervisor for the lifetime of each serve.
         ///
         /// Uses the default in-memory runtime or one supplied by [`Self::final_tasks`].
@@ -3209,6 +3225,7 @@ pub mod modern {
     #[cfg(feature = "tasks")]
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
+        FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
         FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
         FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
         FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
@@ -7423,6 +7440,20 @@ pub mod modern {
                 .map(|inner| Self { inner })
         }
 
+        /// Adds current original-operation and management authorization for Tasks.
+        ///
+        /// Share the same immutable scope policy with secured HTTP admission.
+        /// Each policy intersects and runs again before Task events; no worker
+        /// execution or durable recovery authority is implied.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_access_authorizer(
+            self,
+            authorizer: std::sync::Arc<dyn crate::TaskAccessAuthorizer>,
+        ) -> Self {
+            Self { inner: self.inner.task_access_authorizer(authorizer) }
+        }
+
         /// Hosts the application's Tasks supervisor for the lifetime of each serve.
         ///
         /// Uses the default in-memory runtime or one supplied by [`Self::final_tasks`].
@@ -11482,6 +11513,7 @@ pub mod prelude {
     #[cfg(feature = "tasks")]
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
+        FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
         FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskExecutionBudget,
         FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId, FinalTaskInitialWork,
         FinalTaskInputResponses, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
@@ -11563,6 +11595,16 @@ mod tests {
         RequestTimeoutSource, ResourceHandler, SubscriptionTimeoutPolicy, ToolHandler, prompt,
         resource, tool,
     };
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn facade_builders_expose_current_task_access_policy() {
+        let _: fn(super::modern::ServerBuilder, std::sync::Arc<dyn super::TaskAccessAuthorizer>)
+            -> super::modern::ServerBuilder = super::modern::ServerBuilder::task_access_authorizer;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let _: fn(super::auto::ServerBuilder, std::sync::Arc<dyn super::TaskAccessAuthorizer>)
+            -> super::auto::ServerBuilder = super::auto::ServerBuilder::task_access_authorizer;
+    }
 
     #[tool]
     async fn facade_private_core_generated_tool(

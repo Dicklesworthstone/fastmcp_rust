@@ -1058,6 +1058,8 @@ struct AdmittedToolRegistration {
     final_registration: Option<AdmittedFinalToolRegistration>,
     legacy_enabled: bool,
     execution_mode: crate::ToolExecutionMode,
+    #[cfg(feature = "tasks")]
+    task_operation_registration: Arc<()>,
 }
 
 struct AdmittedFinalToolRegistration {
@@ -1156,6 +1158,8 @@ impl AdmittedToolRegistration {
             }),
             legacy_enabled,
             execution_mode,
+            #[cfg(feature = "tasks")]
+            task_operation_registration: Arc::new(()),
         })
     }
 
@@ -1170,6 +1174,8 @@ impl AdmittedToolRegistration {
             final_registration: None,
             legacy_enabled: true,
             execution_mode,
+            #[cfg(feature = "tasks")]
+            task_operation_registration: Arc::new(()),
         }
     }
 
@@ -1182,6 +1188,8 @@ impl AdmittedToolRegistration {
             mut final_registration,
             legacy_enabled,
             execution_mode,
+            #[cfg(feature = "tasks")]
+            task_operation_registration: _,
         } = self;
         definition.name.clone_from(&mounted_name);
         if let Some(final_registration) = final_registration.as_mut() {
@@ -1196,6 +1204,8 @@ impl AdmittedToolRegistration {
             final_registration,
             legacy_enabled,
             execution_mode,
+            #[cfg(feature = "tasks")]
+            task_operation_registration: Arc::new(()),
         }
     }
 }
@@ -5218,6 +5228,10 @@ impl Router {
     ) -> McpResult<serde_json::Value> {
         #[cfg(feature = "tasks")]
         let request_metadata = params.meta.clone();
+        #[cfg(feature = "tasks")]
+        let original_registration = self.tools.get(&params.name).map(|entry| {
+            (&entry.definition.name, &entry.task_operation_registration)
+        });
         let session_state = request_ctx
             .session_state()
             .cloned()
@@ -5274,8 +5288,12 @@ impl Router {
                 // Tasks operations. Admit only the branch that can mutate the
                 // Tasks store, immediately before that mutation.
                 let runtime = self.admit_final_task_tool(&request_metadata)?;
-                encode_final_task_result(runtime.create_task_for_request(
+                let (original_name, original_registration) = original_registration.ok_or_else(|| {
+                    McpError::internal_error("Task original tool registration is missing")
+                })?;
+                encode_final_task_result(runtime.create_task_for_operation(
                     request_ctx,
+                    crate::FinalTaskOperation::for_tool(original_name, original_registration)?,
                     work_descriptor,
                     status_message,
                 )?)
@@ -22455,7 +22473,7 @@ mod router_tests {
             Poll::Pending
         ));
         let mut router = Router::new();
-        router.set_final_task_runtime(Some(runtime));
+        router.set_final_task_runtime(Some(runtime.clone()));
         router
             .add_tool(TaskCapableRouterTool {
                 final_calls: Arc::clone(&final_calls),
@@ -22478,6 +22496,18 @@ mod router_tests {
         );
         assert_eq!(final_calls.load(Ordering::SeqCst), 1);
         assert_eq!(store.task_count(), 1);
+        let task_id = fastmcp_protocol::FinalTaskId::parse(result["taskId"].as_str().unwrap()).unwrap();
+        let snapshot = runtime.task_for_request(&request_ctx, &task_id, crate::TaskAccessAction::Get).unwrap();
+        let original_name = snapshot.original_operation().unwrap().tool_name().to_owned();
+        assert!(request_ctx.disable_tool(original_name));
+        assert!(runtime.task_for_request(&request_ctx, &task_id, crate::TaskAccessAction::Get).is_err());
+        router.add_tool_with_behavior(
+            TaskCapableRouterTool { final_calls }, crate::DuplicateBehavior::Replace,
+        ).unwrap();
+        let fresh_state = SessionState::new();
+        let fresh_context = request_context(&cx, 161, Budget::INFINITE, &fresh_state);
+        assert!(runtime.task_for_request(&fresh_context, &task_id, crate::TaskAccessAction::Get).is_err(),
+            "same-name replacement cannot inherit a Task's original registration");
     }
 
     #[cfg(feature = "tasks")]

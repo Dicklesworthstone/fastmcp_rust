@@ -352,6 +352,32 @@ fn request_key(request: &JsonRpcRequest) -> Result<Option<(u8, &str)>, Operation
 
 struct OperationScopeMiddleware(OperationScopePolicy);
 
+#[cfg(feature = "tasks")]
+impl crate::TaskAccessAuthorizer for OperationScopePolicy {
+    fn authorize(
+        &self,
+        ctx: &McpContext,
+        action: crate::TaskAccessAction,
+        original: &crate::FinalTaskOperation,
+    ) -> McpResult<()> {
+        Server::enforce_request_context(ctx)?;
+        let facts = ctx.auth();
+        let authorize = || -> Result<(), OperationScopeRejection> {
+            self.inner.methods.authorize_verified(original.method(), facts.as_ref())
+                .map_err(OperationScopeRejection::Method)?;
+            self.inner.methods.authorize_verified(action.method(), facts.as_ref())
+                .map_err(OperationScopeRejection::Method)?;
+            self.authorize_key(
+                (0, original.tool_name()),
+                facts.as_ref().map_or(&[][..], |facts| facts.scopes.as_slice()),
+            )
+        };
+        let decision = authorize();
+        Server::enforce_request_context(ctx)?;
+        decision.map_err(|_| McpError::invalid_params("Task not found"))
+    }
+}
+
 impl Middleware for OperationScopeMiddleware {
     fn on_request(
         &self,
@@ -382,7 +408,11 @@ impl Server {
     /// Calling twice intersects policies. Installation after middleware sharing
     /// is refused, rather than mutating live authorization or subscription state.
     ///
-    /// This does not filter catalogs, authorize a detached Task's lifetime, add
+    /// With Tasks, this also installs current original-operation authorization
+    /// for local Task creation, get/update/cancel, and every subscribed event.
+    /// Both the original tool's complete grants and the management method's
+    /// grants are required, including after a terminal result exists.
+    /// This does not filter catalogs, authorize a detached Task's execution lifetime, add
     /// stdio credentials, or turn application JSON-RPC failures into native HTTP
     /// OAuth challenges. Existing visibility and long-lived authorization remain
     /// required. Unknown targets and insufficient grants have the same wire error.
@@ -398,6 +428,10 @@ impl Server {
         middleware.try_reserve(1).map_err(|_| {
             McpError::internal_error("operation authorization installation exceeds capacity")
         })?;
+        #[cfg(feature = "tasks")]
+        if let Some(runtime) = self.final_task_runtime.as_ref() {
+            runtime.install_access_authorizer(Arc::new(policy.clone()))?;
+        }
         middleware.insert(0, Box::new(OperationScopeMiddleware(policy)));
         Ok(self)
     }
