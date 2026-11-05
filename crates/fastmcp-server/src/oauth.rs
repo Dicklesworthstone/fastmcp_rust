@@ -1589,9 +1589,10 @@ pub struct DevelopmentPrivateKeyJwtPolicy {
 impl DevelopmentPrivateKeyJwtPolicy {
     /// Admits an issuer-bound registration and its bounded public RSA JWKS.
     ///
-    /// All strings are retained and compared exactly. A policy change requires
-    /// a new registration: unregistering the old client revokes its tokens,
-    /// and registration draws a fresh non-reusable ownership epoch.
+    /// All strings are retained and compared exactly. Public keys can rotate
+    /// through [`OAuthServer::rotate_development_private_key_jwt`] without
+    /// revoking existing tokens. Changing an issuer, endpoint, audience or
+    /// client binding requires a new registration and ownership epoch.
     pub fn new(
         issuer: impl Into<String>,
         client_id: impl Into<String>,
@@ -1696,6 +1697,43 @@ impl std::fmt::Debug for DevelopmentPrivateKeyJwtPolicy {
             .field("revocation_enabled", &self.revocation.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// Opaque administrative snapshot of one registered client's assertion keys.
+///
+/// Obtain this from [`OAuthServer::prepare_development_private_key_jwt_rotation`].
+/// It is bound to the exact registration and immutable policy allocation, so
+/// neither another rotation nor unregistering and re-registering the client
+/// can revive it. Clones represent the same snapshot and compete for the same
+/// single policy replacement. The snapshot grants no token or resource access.
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+#[derive(Clone)]
+pub struct DevelopmentPrivateKeyJwtRotationTarget {
+    registration_epoch: OAuthRegistrationEpoch,
+    policy: Arc<DevelopmentPrivateKeyJwtPolicy>,
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl DevelopmentPrivateKeyJwtRotationTarget {
+    /// Configuration generation captured by this administrative snapshot.
+    #[must_use]
+    pub fn configuration_generation(&self) -> u64 {
+        self.policy.configuration_generation
+    }
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl std::fmt::Debug for DevelopmentPrivateKeyJwtRotationTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevelopmentPrivateKeyJwtRotationTarget")
+            .field("configuration_generation", &self.configuration_generation())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+fn invalid_client_key_rotation() -> OAuthError {
+    OAuthError::InvalidRequest("client assertion key rotation is invalid or stale".to_string())
 }
 
 #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -4048,6 +4086,96 @@ impl OAuthServer {
         }
 
         state.clients.insert(client_id, client);
+        Ok(())
+    }
+
+    /// Captures a confidential machine client's current public-key policy.
+    ///
+    /// This is a trusted administrative operation, not an OAuth endpoint or a
+    /// client-authentication credential. It reads the existing registration
+    /// without cleaning up token or replay state. The returned opaque target
+    /// exposes only its current configuration generation and must still be
+    /// current when the matching rotation commits.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    pub fn prepare_development_private_key_jwt_rotation(
+        &self,
+        client_id: &str,
+    ) -> Result<DevelopmentPrivateKeyJwtRotationTarget, OAuthError> {
+        self.config.validate()?;
+        validate_client_id_admission(client_id)?;
+        let state = self.state.read().map_err(|_| {
+            OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
+        })?;
+        let client = state.clients.get(client_id).ok_or_else(invalid_client_key_rotation)?;
+        if client.metadata.client_type != ClientType::Confidential
+            || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
+            || client.metadata.development_client_credentials.is_none()
+        {
+            return Err(invalid_client_key_rotation());
+        }
+        let policy = client.development_private_key_jwt.as_ref()
+            .ok_or_else(invalid_client_key_rotation)?;
+        if policy.issuer != self.config.issuer || policy.client_id != client_id {
+            return Err(invalid_client_key_rotation());
+        }
+        Ok(DevelopmentPrivateKeyJwtRotationTarget {
+            registration_epoch: client.registration_epoch,
+            policy: Arc::clone(policy),
+        })
+    }
+
+    /// Atomically replaces only the public keys of a registered machine client.
+    ///
+    /// The replacement must preserve every issuer, client, endpoint and
+    /// audience binding and strictly increase the captured configuration
+    /// generation. Its bounded JWKS is admitted by the policy constructor
+    /// before this operation acquires the state lock. Include old and new keys
+    /// in that set for an overlap period; a later rotation can retire old keys.
+    ///
+    /// The registration epoch, grants, live tokens, owner identity and replay
+    /// guards are preserved. In-flight assertions verified with the previous
+    /// policy must be verified again against the current policy before use.
+    /// A stale target, including one from another issuer instance or an old
+    /// registration of the same client ID, fails without changing any state.
+    ///
+    /// This is a trusted administrative API. Changing authorization or other
+    /// non-key bindings still requires unregistering and registering a client.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    pub fn rotate_development_private_key_jwt(
+        &self,
+        target: &DevelopmentPrivateKeyJwtRotationTarget,
+        replacement: DevelopmentPrivateKeyJwtPolicy,
+    ) -> Result<(), OAuthError> {
+        self.config.validate()?;
+        let previous = &target.policy;
+        if replacement.issuer != self.config.issuer
+            || replacement.issuer != previous.issuer
+            || replacement.client_id != previous.client_id
+            || replacement.token_endpoint != previous.token_endpoint
+            || replacement.token_audience != previous.token_audience
+            || replacement.revocation != previous.revocation
+            || replacement.configuration_generation <= previous.configuration_generation
+        {
+            return Err(invalid_client_key_rotation());
+        }
+        let replacement = Arc::new(replacement);
+        let mut state = self.state.write().map_err(|_| {
+            OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
+        })?;
+        let client = state.clients.get_mut(&previous.client_id)
+            .ok_or_else(invalid_client_key_rotation)?;
+        if client.registration_epoch != target.registration_epoch
+            || client.metadata.client_type != ClientType::Confidential
+            || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
+            || client.metadata.development_client_credentials.is_none()
+            || client.development_private_key_jwt.as_ref().is_none_or(|current| {
+                current.configuration_generation != previous.configuration_generation
+                    || !Arc::ptr_eq(current, previous)
+            })
+        {
+            return Err(invalid_client_key_rotation());
+        }
+        client.development_private_key_jwt = Some(replacement);
         Ok(())
     }
 
@@ -15160,11 +15288,30 @@ pub(crate) mod development_private_key_jwt_test_support {
     const PRIVATE_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3wxLvB3SX9fKLLBY8rXXENHK3d78DfxpG7Uq1q9RbtvOHs2m/iU4p0xqHeD35ZG4FGXdzhQWtfp4ydwdqd098z5JHMWyR5naVmF37sykkkNSyBKA6eRYfurtlep9GVlrjpTbqEvo6777nSL9Ozq6hUzU4fPdmk8U1yZ/prSbiDbUcH8HgrgoOHfBM0vg9bM8EVtpKJtwjc1sAfG96k2TEB5tRSCaolhkpMpXdHF6zCZukHvK1DrLVpUvYlgrPfIfucb/8Ws4WxNMOg7M36actazuged0lVpNpbRNHIg+Wss+wUsRKgXhDCAlmWivcyhoLM+Jj5dnWZpeqNE4J6cXBAgMBAAECgf9ofHL3lrWk8iPHHnpGZhrgRTI1P9FMm6jFS4d/ZQSKYax3LHyke94FyhL7lFMoywIDxEc3WBuyWpx49VUyJET+Ish50pB5JSGoTcqio2xxbiiCUD8LAG6j+/kx6ldGFzP23Koszj2Z5VgXCjY9CSgicr2AMQ47NSqdOtfCdsH1Jf4A2D8U6sLFR1FDKZVie5SiZC41/91897QyySDdxEO2bbxb4ZA47EBF+dfQyEXtXDJ34oBrncVepELv9B5hWu+Z4Uf5DK78Ww8NiU1U1+bLVIL5yreK/UaHgVgEJQepTKAzTr4OMT0ZXTAZT5OfoMKmWbq6iQ5mukU8rLUg1xLECgYEA8g2q98V+XvyZQ5kFI/Skj6bxwbRw+mr0SbrWoCSP0VOV4gQ5ED7VnPwGFW8GPR3nqA4Rdx9qul7kttHQnEpbYgk4A2NTRzgqWeu0dfOS2+u+UB44SstamiZfxbNKzLHayJzPMZSZMq2fJhNs8FQtGa3ES3qRJavSOtB34meI4HECgYEAwlmY9AEthueuEaU4ZDHNeYaNwv+TO8QAixl6lj2vztTmVAAFOL7aXNWb+WCQ3SyyDkSty/Kk19e+e5s496keZLxUbyTsboP2LTu0H+45gIUkDAVp/ACXK5dOJT4Vj3jjPUuY9R3CxXvIUEDuzN2hmxTVOq7y53u71sYx5mRn4lECgYEAmNq8vp7/AKjveFqnfl89lGHOhY6XUew8vFq6soKkN4JbQlF8X5/ucaZNiTeFbw71fZD0wo8abPsD39d7r1bdgnlj3+/XZUA4rnREj7/zW+HxWtLapZDpdDMLg+OHNuCR0uIDjcHTRMeTmw3lW5csq+yp6yhJhMqOhgmjy1uqemECgYEAtNeWQYZPDLbL/FNW87R709bmVkpmgDhToRtmPCLOUpE8eXFDapf8rGF/rz6xzXxnemthpOL1jHqOHopDKgBN7cJodrtO3U8hZNmnNAcBrps0/ZKUGg+ams9BwdnRSh1cpY6Ql5THxeb2b+bbzfl1BM8P0nk0QT2bfbASgqVvHOECgYEA2D+89N+YGmI052k8Ow/QBjB/IBhO90syi3TvinbK4B2Y1wQDqt7f50lPvWzoUYFH0cq8RlroCou71gkiBxFnd7BFHVDFuyA24o7sPctQ322KMty/eSHXwQugJRRylNBXFvJXrIhfdiV+OvZ9NVXTESeVT0x5eGAI+1QTdjZCKiQ=";
     const MODULUS: &str = "t8MS7wd0l_XyiywWPK11xDRyt3e_A38aRu1KtavUW7bzh7Npv4lOKdMah3g9-WRuBRl3c4UFrX6eMncHandPfM-SRzFskeZ2lZhd-7MpJJDUsgSgOnkWH7q7ZXqfRlZa46U26hL6Ou--50i_Ts6uoVM1OHz3ZpPFNcmf6a0m4g21HB_B4K4KDh3wTNL4PWzPBFbaSibcI3NbAHxvepNkxAebUUgmqJYZKTKV3RxeswmbpB7ytQ6y1aVL2JYKz3yH7nG__FrOFsTTDoOzN-mnLWs7oHndJVaTaW0TRyIPlrLPsFLESoF4QwgJZlor3MoaCzPiY-XZ1maXqjROCenFwQ";
 
+    // A distinct public test-only key proves real overlap and retirement.
+    const ROTATED_PRIVATE_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCY2wvRBbfWvU+0NMSMlm+FPpoUnUgNPvq0bNVdGsOuQ9VUEAdwttd0Ieca2xjKpNoe/Qd7l1IRth2X6aEQWaXVvlKfjz0UWbJ0LVUJwit+rHSxq0Oxb/0fRtAJKudeLZ1n0ME8t62oFDuSIl8Vkg1sSQoIUXwhfZ7lCu+4YU8rcH83d4PxBMu9BwDPQN1tuaD7rYuxRsqXBM9zbsKseZpVCs1K3b2TbkqZTU/JrbnVZuGuni1z95g368kIzuPtvSn/bLkQnY0qQYadjb3dV7BXj+IDZtKaIVvrqwN9aU4PGKk8O7gtlbA6JkttgCgIQxy8EH+jnxFGWXJRRHL35wDvAgMBAAECggEAFQ7dpTbedCJciqetCZk9VTlMoi5mMLz5GPDYFsg10RozQi4lzZdtkz2LHci1X6WFDzkuALmAwEPl9nm54LYZAfCtvUxPI9s/mdXCSLfhT3A+xgNMLh5kMXI1/YKq9pneJ4vmMzvdcVxoNeJaVcRrPlHJpLUPyXq0ReWoei7zEzlpKyy+iJe3HKYlRVuEw73np6SLKXiEs4XoyXpqtRhhkoGv3TcBmZBFtdQKIPwC3Xpj3YxtXBmMlC6/rCI/pZh88W2I/u01GMfRySvcj1RCScjme7i/Jx72uWyaEfACgNiv9wps+EoYliZP86IrQcLECRIxEta8vtSYMZV6wTQjsQKBgQDIFDvBPWjvYG3NVb157CGkn6UftDbHaShr6j/+HLJ66/EK57tvzxwEAOm1JC1mW0A5mLkIO94jywjcj8WLlaeZmwZjRdeuu6cKNkFjGLsZvpzf2NSaKBhh/LGVN2Lrqr4H7lb8HW0BgARkOUYNF6647lSi0t/NjFlHw3OCsh58SwKBgQDDk/P55cUKE7/XL8Ul3c0en8ZVeZWEh45ZdYvgpWP/IyTE5QcnvL64+RVxQhtLjW8cTSiQjY1KX9Mk31v+gPK62aPVKiaEm0N6uxqqtjjsxhyucn/D+G4qyT6hEZ/ONTvG1X2jgc9SwhpR/Lmd6z+ZDq1hAs6Wa2JHwPBANj0fbQKBgQCgt8AYReAZCXiqTIlbeta7ipH1mam3HT2fEhg9Y4frPcPuYp8p/VAf1yvkmh7t7bb1jTx05MJYNiv0IHkq2xg6R1EmRWAvuAVCKrrzg1YoI/mXxnFhM3wCmh18I3WOoSTs8gNlma2KWu8sIuWmdrOfUbMi6Alm76p3/wS2o6XhaQKBgHneBofwAdCer8qhrKJEzFzJyGdYhK95XF0oHsoTpPTFbFL4N3YuaVWPeCoDvEhe0B59gcpZOfJfNY1jVMqIhTejCDB6vFei+/BNCHfZZi074YFePXjao6MrlUf+WGrAxwfF3iz1ZT+3TXlLFkpt3Uo9WBH8EsiuDyaQ9eO9KGcdAoGAHBD48RH14kGmEgdrn8nNJ/U+E13OGaFNCBmMSJJ5/bKn9Kd0rvMMtQZOKKoMQlave6AFKgoDLpfGr6HcjZ3JDcB7CsKTn435ZCs+aBUKSqh+uTTm1YmVDHEyGovtLWZwg8NaGTBKgLrwzJt9kG5Eaje7bManLoIXPmxDYiCfnlE=";
+    const ROTATED_MODULUS: &str = "mNsL0QW31r1PtDTEjJZvhT6aFJ1IDT76tGzVXRrDrkPVVBAHcLbXdCHnGtsYyqTaHv0He5dSEbYdl-mhEFml1b5Sn489FFmydC1VCcIrfqx0satDsW_9H0bQCSrnXi2dZ9DBPLetqBQ7kiJfFZINbEkKCFF8IX2e5QrvuGFPK3B_N3eD8QTLvQcAz0Ddbbmg-62LsUbKlwTPc27CrHmaVQrNSt29k25KmU1Pya251Wbhrp4tc_eYN-vJCM7j7b0p_2y5EJ2NKkGGnY293VewV4_iA2bSmiFb66sDfWlODxipPDu4LZWwOiZLbYAoCEMcvBB_o58RRllyUURy9-cA7w";
+
     pub(crate) fn jwks() -> Vec<u8> {
         serde_json::to_vec(&json!({"keys":[{
             "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"machine-key",
             "n":MODULUS, "e":"AQAB"
         }]})).unwrap()
+    }
+
+    pub(crate) fn rotated_jwks() -> Vec<u8> {
+        serde_json::to_vec(&json!({"keys":[{
+            "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"rotated-machine-key",
+            "n":ROTATED_MODULUS, "e":"AQAB"
+        }]})).unwrap()
+    }
+
+    pub(crate) fn sign_rotated(claims: &Value) -> String {
+        sign_raw_with_key(
+            ROTATED_PRIVATE_KEY,
+            &serde_json::to_vec(&json!({"alg":"RS256", "kid":"rotated-machine-key"})).unwrap(),
+            &serde_json::to_vec(claims).unwrap(),
+        )
     }
 
     pub(crate) fn sign(claims: &Value) -> String {
@@ -15175,7 +15322,11 @@ pub(crate) mod development_private_key_jwt_test_support {
     }
 
     pub(super) fn sign_raw(header: &[u8], claims: &[u8]) -> String {
-        let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(PRIVATE_KEY).unwrap()).unwrap();
+        sign_raw_with_key(PRIVATE_KEY, header, claims)
+    }
+
+    fn sign_raw_with_key(private_key: &str, header: &[u8], claims: &[u8]) -> String {
+        let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(private_key).unwrap()).unwrap();
         let input = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(header),
@@ -15191,7 +15342,9 @@ pub(crate) mod development_private_key_jwt_test_support {
 #[cfg(all(test, feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
 mod development_private_key_jwt_tests {
     use super::*;
-    use super::development_private_key_jwt_test_support::{jwks, sign, sign_raw};
+    use super::development_private_key_jwt_test_support::{
+        jwks, rotated_jwks, sign, sign_raw, sign_rotated,
+    };
     use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceIdPolicy};
     use serde_json::{Value, json};
 
@@ -15890,6 +16043,415 @@ mod development_private_key_jwt_tests {
         let retry = issue(&bounded, &queued).unwrap();
         assert!(bounded.validate_access_token(&retry.access_token).is_some());
         assert!(bounded.validate_access_token(&first.access_token).is_none());
+    }
+
+    fn overlapping_jwks() -> Vec<u8> {
+        let mut current: Value = serde_json::from_slice(&jwks()).unwrap();
+        let next: Value = serde_json::from_slice(&rotated_jwks()).unwrap();
+        current["keys"].as_array_mut().unwrap().extend(
+            next["keys"].as_array().unwrap().iter().cloned(),
+        );
+        serde_json::to_vec(&current).unwrap()
+    }
+
+    fn rotation_policy(generation: u64, keys: &[u8]) -> DevelopmentPrivateKeyJwtPolicy {
+        DevelopmentPrivateKeyJwtPolicy::new(
+            ISSUER, CLIENT, TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Endpoint,
+            generation, keys,
+        ).unwrap()
+            .with_revocation_endpoint(
+                REVOCATION_ENDPOINT, DevelopmentClientAssertionAudience::Endpoint,
+            ).unwrap()
+    }
+
+    fn assert_rotation_unchanged(
+        server: &OAuthServer,
+        target: &DevelopmentPrivateKeyJwtRotationTarget,
+        before: &Snapshot,
+    ) {
+        assert_eq!(&snapshot(server), before);
+        let current = server.prepare_development_private_key_jwt_rotation(
+            &target.policy.client_id,
+        ).unwrap();
+        assert_eq!(current.registration_epoch, target.registration_epoch);
+        assert!(Arc::ptr_eq(&current.policy, &target.policy));
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_overlaps_and_retires_real_keys_without_revoking_tokens() {
+        let server = endpoint_server();
+        let original_claims = claims(CLIENT, TOKEN_ENDPOINT, "before-rotation");
+        let first = issue(&server, &sign(&original_claims)).unwrap();
+        let owner = auth(&server, &first.access_token).session_owner().unwrap();
+        let mut tokens = vec![first.access_token.clone()];
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert_eq!(target.configuration_generation(), 1);
+        let before = snapshot(&server);
+        server.rotate_development_private_key_jwt(
+            &target, rotation_policy(2, &overlapping_jwks()),
+        ).unwrap();
+        assert_eq!(snapshot(&server), before);
+
+        for (jti, signer) in [
+            ("overlap-old", sign as fn(&Value) -> String),
+            ("overlap-new", sign_rotated),
+        ] {
+            let token = issue(&server, &signer(&claims(CLIENT, TOKEN_ENDPOINT, jti))).unwrap();
+            let authenticated = auth(&server, &token.access_token);
+            assert_eq!(authenticated.session_owner(), Some(owner));
+            assert_eq!(authenticated.subject.as_deref(), Some(CLIENT));
+            assert_eq!(authenticated.scopes, ["machine:read"]);
+            assert!(token.refresh_token.is_none());
+            tokens.push(token.access_token.clone());
+        }
+        // Re-signing a spent jti with the new key cannot cross the replay fence.
+        let before = snapshot(&server);
+        assert!(matches!(
+            issue(&server, &sign_rotated(&original_claims)),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert_eq!(snapshot(&server), before);
+
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert_eq!(target.configuration_generation(), 2);
+        server.rotate_development_private_key_jwt(
+            &target, rotation_policy(3, &rotated_jwks()),
+        ).unwrap();
+        assert_eq!(snapshot(&server), before);
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let before = snapshot(&server);
+        assert!(matches!(
+            issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "retired-key"))),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert!(matches!(
+            issue(&server, &sign_rotated(&original_claims)),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert_rotation_unchanged(&server, &current, &before);
+        let token = issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "after-retirement")),
+        ).unwrap();
+        tokens.push(token.access_token.clone());
+        for token in &tokens {
+            let stored = server.validate_access_token(token).unwrap();
+            assert_eq!(stored.resource.as_deref(), Some(RESOURCE));
+            assert!(stored.subject.is_none());
+            assert_eq!(auth(&server, token).session_owner(), Some(owner));
+        }
+        // The same rotated registration also authenticates explicit revocation.
+        server.revoke_with_development_private_key_jwt(
+            &sign_rotated(&claims(CLIENT, REVOCATION_ENDPOINT, "rotated-revocation")),
+            REVOCATION_ENDPOINT, &first.access_token,
+        ).unwrap();
+        assert!(server.validate_access_token(&first.access_token).is_none());
+        for token in tokens.iter().skip(1) {
+            assert_eq!(auth(&server, token).session_owner(), Some(owner));
+        }
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_rejects_binding_and_generation_changes_without_mutation() {
+        let server = endpoint_server();
+        let token = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "binding-owner"))).unwrap();
+        let stale = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        server.rotate_development_private_key_jwt(
+            &stale, rotation_policy(3, &overlapping_jwks()),
+        ).unwrap();
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let before = snapshot(&server);
+        let endpoint = DevelopmentClientAssertionAudience::Endpoint;
+        let issuer = DevelopmentClientAssertionAudience::Issuer;
+        for (issuer_url, client_id, token_url, token_audience, revocation) in [
+            ("https://other-issuer.example", CLIENT, TOKEN_ENDPOINT, endpoint, Some((REVOCATION_ENDPOINT, endpoint))),
+            (ISSUER, "other-client", TOKEN_ENDPOINT, endpoint, Some((REVOCATION_ENDPOINT, endpoint))),
+            (ISSUER, CLIENT, "https://issuer.example/oauth/other-token", endpoint, Some((REVOCATION_ENDPOINT, endpoint))),
+            (ISSUER, CLIENT, TOKEN_ENDPOINT, issuer, Some((REVOCATION_ENDPOINT, endpoint))),
+            (ISSUER, CLIENT, TOKEN_ENDPOINT, endpoint, None),
+            (ISSUER, CLIENT, TOKEN_ENDPOINT, endpoint, Some(("https://issuer.example/oauth/other-revoke", endpoint))),
+            (ISSUER, CLIENT, TOKEN_ENDPOINT, endpoint, Some((REVOCATION_ENDPOINT, issuer))),
+        ] {
+            let mut replacement = DevelopmentPrivateKeyJwtPolicy::new(
+                issuer_url, client_id, token_url, token_audience, 4, &rotated_jwks(),
+            ).unwrap();
+            if let Some((url, audience)) = revocation {
+                replacement = replacement.with_revocation_endpoint(url, audience).unwrap();
+            }
+            assert!(matches!(
+                server.rotate_development_private_key_jwt(&target, replacement),
+                Err(OAuthError::InvalidRequest(_))
+            ));
+            assert_rotation_unchanged(&server, &target, &before);
+        }
+        for generation in [1, 3] {
+            assert!(matches!(server.rotate_development_private_key_jwt(
+                &target, rotation_policy(generation, &rotated_jwks()),
+            ), Err(OAuthError::InvalidRequest(_))));
+            assert_rotation_unchanged(&server, &target, &before);
+        }
+        // A greater replacement generation cannot rescue an older snapshot.
+        assert!(matches!(server.rotate_development_private_key_jwt(
+            &stale, rotation_policy(4, &rotated_jwks()),
+        ), Err(OAuthError::InvalidRequest(_))));
+        assert_rotation_unchanged(&server, &target, &before);
+        assert!(server.validate_access_token(&token.access_token).is_some());
+        server.rotate_development_private_key_jwt(
+            &target, rotation_policy(4, &rotated_jwks()),
+        ).unwrap();
+        let token = issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "binding-retry")),
+        ).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_targets_reject_other_clients_and_issuer_instances() {
+        let server = endpoint_server();
+        server.register_client(
+            OAuthClient::builder("public-client")
+                .redirect_uri("http://127.0.0.1/callback")
+                .build().unwrap(),
+        ).unwrap();
+        server.register_client(
+            OAuthClient::builder("basic-machine").secret("basic-secret")
+                .development_client_credentials(
+                    DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap(),
+                )
+                .build().unwrap(),
+        ).unwrap();
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let before = snapshot(&server);
+        for client_id in ["missing-client", "public-client", "basic-machine"] {
+            assert!(matches!(
+                server.prepare_development_private_key_jwt_rotation(client_id),
+                Err(OAuthError::InvalidRequest(_))
+            ));
+            assert_rotation_unchanged(&server, &target, &before);
+        }
+        let same_issuer = endpoint_server();
+        let other_target = same_issuer.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let other_before = snapshot(&same_issuer);
+        assert!(matches!(same_issuer.rotate_development_private_key_jwt(
+            &target, rotation_policy(2, &rotated_jwks()),
+        ), Err(OAuthError::InvalidRequest(_))));
+        assert_rotation_unchanged(&same_issuer, &other_target, &other_before);
+        assert_rotation_unchanged(&server, &target, &before);
+        same_issuer.rotate_development_private_key_jwt(
+            &other_target, rotation_policy(2, &rotated_jwks()),
+        ).unwrap();
+        let token = issue(
+            &same_issuer, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "own-instance")),
+        ).unwrap();
+        assert!(same_issuer.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_target_cannot_cross_reregistration_with_reset_generation() {
+        let server = endpoint_server();
+        let first_claims = claims(CLIENT, TOKEN_ENDPOINT, "before-reregistration");
+        let first = issue(&server, &sign(&first_claims)).unwrap();
+        let first_owner = auth(&server, &first.access_token).session_owner().unwrap();
+        let stale = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        server.unregister_client(CLIENT).unwrap();
+        // Reuse exactly the same configured keys and generation. Only the new
+        // registration epoch and current allocation distinguish this owner.
+        server.register_client(client_with_policy(CLIENT, (*stale.policy).clone())).unwrap();
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert_eq!(current.configuration_generation(), stale.configuration_generation());
+        let token = issue(
+            &server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "new-registration")),
+        ).unwrap();
+        let current_owner = auth(&server, &token.access_token).session_owner().unwrap();
+        assert_ne!(current_owner, first_owner);
+        let before = snapshot(&server);
+        assert!(matches!(server.rotate_development_private_key_jwt(
+            &stale, rotation_policy(2, &rotated_jwks()),
+        ), Err(OAuthError::InvalidRequest(_))));
+        assert_rotation_unchanged(&server, &current, &before);
+        server.rotate_development_private_key_jwt(
+            &current, rotation_policy(2, &rotated_jwks()),
+        ).unwrap();
+        assert_eq!(snapshot(&server), before);
+        assert_eq!(auth(&server, &token.access_token).session_owner(), Some(current_owner));
+        assert!(server.validate_access_token(&first.access_token).is_none());
+        let before = snapshot(&server);
+        assert!(matches!(
+            issue(&server, &sign_rotated(&first_claims)),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert_eq!(snapshot(&server), before);
+        let fresh = issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "after-reregistration-rotation")),
+        ).unwrap();
+        assert_eq!(auth(&server, &fresh.access_token).session_owner(), Some(current_owner));
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_invalidates_unconsumed_verification_receipts() {
+        let server = endpoint_server();
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "pending-verification"));
+        let verified = server.verify_development_client_assertion(
+            &assertion, TOKEN_ENDPOINT, false,
+        ).unwrap_or_else(|_| panic!("signed registration snapshot"));
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        server.rotate_development_private_key_jwt(
+            &target, rotation_policy(2, &overlapping_jwks()),
+        ).unwrap();
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let before = snapshot(&server);
+        let request = TokenRequest {
+            grant_type: "client_credentials".to_string(),
+            client_id: CLIENT.to_string(),
+            client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
+            code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+            scopes: Some(vec!["machine:read".to_string()]),
+            resource: Some(RESOURCE.to_string()),
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        assert!(matches!(server.token_client_credentials_authenticated_with_draw(
+            &request, Some(&verified), || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                draw_security_identifier()
+            },
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_rotation_unchanged(&server, &current, &before);
+        // Its signed bytes still pass a fresh verification because the new
+        // policy explicitly retains the old key and the jti was not consumed.
+        let token = issue(&server, &assertion).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
+        assert_eq!(server.state.read().unwrap().client_assertion_replays.len(), 1);
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_competing_snapshots_commit_exactly_once() {
+        let server = endpoint_server();
+        let first = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent-rotation-owner"))).unwrap();
+        let owner = auth(&server, &first.access_token).session_owner().unwrap();
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let before = snapshot(&server);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let replacements = [
+            rotation_policy(2, &overlapping_jwks()),
+            rotation_policy(3, &rotated_jwks()),
+        ];
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = replacements.into_iter().map(|replacement| {
+                let server = Arc::clone(&server);
+                let target = target.clone();
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    let generation = replacement.configuration_generation();
+                    barrier.wait();
+                    (generation, server.rotate_development_private_key_jwt(&target, replacement))
+                })
+            }).collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+        });
+        let winners: Vec<_> = results.iter()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(generation, _)| *generation)
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(results.iter().filter(|(_, result)| {
+            matches!(result, Err(OAuthError::InvalidRequest(_)))
+        }).count(), 1);
+        assert_eq!(snapshot(&server), before);
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert_eq!(current.configuration_generation(), winners[0]);
+        assert!(matches!(server.rotate_development_private_key_jwt(
+            &target, rotation_policy(4, &rotated_jwks()),
+        ), Err(OAuthError::InvalidRequest(_))));
+        assert_rotation_unchanged(&server, &current, &before);
+        let token = issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent-rotation-current")),
+        ).unwrap();
+        assert_eq!(auth(&server, &token.access_token).session_owner(), Some(owner));
+        assert_eq!(auth(&server, &first.access_token).session_owner(), Some(owner));
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_preserves_replay_quota_and_clock_floor() {
+        let server = endpoint_server();
+        let original_claims = claims(CLIENT, TOKEN_ENDPOINT, "rotation-replay-capacity");
+        let first = issue(&server, &sign(&original_claims)).unwrap();
+        let expiry = original_claims["exp"].as_u64().unwrap();
+        {
+            let mut state = server.state.write().unwrap();
+            for index in 1_u64..u64::try_from(MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT).unwrap() {
+                let key = sha256_bounded(&index.to_be_bytes(), 8).unwrap();
+                assert!(state.client_assertion_replays.insert(key, ClientAssertionReplay {
+                    client_id: CLIENT.to_string(),
+                    expires_at_unix_seconds: expiry,
+                }).is_none());
+            }
+        }
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        let before = snapshot(&server);
+        server.rotate_development_private_key_jwt(
+            &target, rotation_policy(2, &rotated_jwks()),
+        ).unwrap();
+        assert_eq!(snapshot(&server), before);
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert!(matches!(issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "rotation-over-quota")),
+        ), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert!(matches!(
+            issue(&server, &sign_rotated(&original_claims)),
+            Err(OAuthError::InvalidClient(_))
+        ));
+        assert_rotation_unchanged(&server, &current, &before);
+
+        {
+            let mut state = server.state.write().unwrap();
+            state.advance_assertion_time(expiry + 1);
+            assert!(state.client_assertion_replays.is_empty());
+        }
+        let before = snapshot(&server);
+        server.rotate_development_private_key_jwt(
+            &current, rotation_policy(3, &rotated_jwks()),
+        ).unwrap();
+        assert_eq!(snapshot(&server), before);
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert!(matches!(issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "rotation-rolled-back-clock")),
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_rotation_unchanged(&server, &current, &before);
+        assert!(server.validate_access_token(&first.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_rotation_target_is_redacted_and_generation_never_wraps() {
+        let server = endpoint_server();
+        let target = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert_eq!(
+            format!("{target:?}"),
+            "DevelopmentPrivateKeyJwtRotationTarget { configuration_generation: 1, .. }"
+        );
+        let retained = target.clone();
+        let before = snapshot(&server);
+        server.rotate_development_private_key_jwt(
+            &target, rotation_policy(u64::MAX, &rotated_jwks()),
+        ).unwrap();
+        assert_eq!(snapshot(&server), before);
+        assert_eq!(retained.configuration_generation(), 1);
+        let current = server.prepare_development_private_key_jwt_rotation(CLIENT).unwrap();
+        assert_eq!(current.configuration_generation(), u64::MAX);
+        for generation in [u64::MAX - 1, u64::MAX] {
+            assert!(matches!(server.rotate_development_private_key_jwt(
+                &current, rotation_policy(generation, &jwks()),
+            ), Err(OAuthError::InvalidRequest(_))));
+            assert_rotation_unchanged(&server, &current, &before);
+        }
+        assert!(matches!(server.rotate_development_private_key_jwt(
+            &retained, rotation_policy(u64::MAX, &jwks()),
+        ), Err(OAuthError::InvalidRequest(_))));
+        assert_rotation_unchanged(&server, &current, &before);
+        let token = issue(
+            &server, &sign_rotated(&claims(CLIENT, TOKEN_ENDPOINT, "maximum-generation")),
+        ).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
     }
 
 }
