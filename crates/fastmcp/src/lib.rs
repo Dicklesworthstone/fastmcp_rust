@@ -474,6 +474,7 @@ pub mod server {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
+        TaskExecutionAuthorizer,
         FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
         FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
         FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
@@ -954,6 +955,7 @@ pub use fastmcp_server::{
 pub use fastmcp_server::{
     ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
+    TaskExecutionAuthorizer,
     FinalTaskAcceptedInput, FinalTaskAcceptedInputClaim, FinalTaskExecutionBudget,
     FinalTaskExecutionLimits, FinalTaskInitialWork, FinalTaskInitialWorkClaim,
     FinalTaskNotificationEmitter, FinalTaskRetentionAuthority, FinalTaskRetentionDeadline,
@@ -2435,6 +2437,25 @@ pub mod auto {
             Self { inner: self.inner.task_access_authorizer(authorizer) }
         }
 
+        /// Authorizes process-local Task work against current application grants.
+        ///
+        /// Protected Task creation requires this policy as well as
+        /// [`Self::task_access_authorizer`]. Policies receive payload-free owner
+        /// and original-operation metadata and must freshly check grants,
+        /// expiry, and revocation without retaining the ingress context.
+        /// The runtime rechecks before application work and fenced transitions.
+        /// Multiple policies intersect. This does not establish durable recovery.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_execution_authorizer(
+            self,
+            authorizer: std::sync::Arc<dyn crate::TaskExecutionAuthorizer>,
+        ) -> Self {
+            Self {
+                inner: self.inner.task_execution_authorizer(authorizer),
+            }
+        }
+
         /// Hosts the application's Tasks supervisor for the lifetime of each serve.
         ///
         /// Uses the default in-memory runtime or one supplied by [`Self::final_tasks`].
@@ -3226,6 +3247,7 @@ pub mod modern {
     pub use fastmcp_server::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
+        TaskExecutionAuthorizer,
         FinalTaskAcceptedInput, FinalTaskExecutionBudget, FinalTaskExecutionLimits,
         FinalTaskInitialWork, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
         FinalTaskRetentionDeadline, FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSnapshot,
@@ -7454,6 +7476,25 @@ pub mod modern {
             Self { inner: self.inner.task_access_authorizer(authorizer) }
         }
 
+        /// Authorizes process-local Task work against current application grants.
+        ///
+        /// Protected Task creation requires this policy as well as
+        /// [`Self::task_access_authorizer`]. Policies receive payload-free owner
+        /// and original-operation metadata and must freshly check grants,
+        /// expiry, and revocation without retaining the ingress context.
+        /// The runtime rechecks before application work and fenced transitions.
+        /// Multiple policies intersect. This does not establish durable recovery.
+        #[cfg(feature = "tasks")]
+        #[must_use]
+        pub fn task_execution_authorizer(
+            self,
+            authorizer: std::sync::Arc<dyn crate::TaskExecutionAuthorizer>,
+        ) -> Self {
+            Self {
+                inner: self.inner.task_execution_authorizer(authorizer),
+            }
+        }
+
         /// Hosts the application's Tasks supervisor for the lifetime of each serve.
         ///
         /// Uses the default in-memory runtime or one supplied by [`Self::final_tasks`].
@@ -11514,6 +11555,7 @@ pub mod prelude {
     pub use crate::{
         ApplicationTaskSupervisor, AuthorizedTaskServiceRunner, DEFAULT_IN_MEMORY_FINAL_TASKS,
         FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
+        TaskExecutionAuthorizer,
         FinalTask, FinalTaskAcceptedInput, FinalTaskCallToolResult, FinalTaskExecutionBudget,
         FinalTaskExecutionLimits, FinalTaskHandle, FinalTaskId, FinalTaskInitialWork,
         FinalTaskInputResponses, FinalTaskNotificationEmitter, FinalTaskRetentionAuthority,
@@ -11604,6 +11646,16 @@ mod tests {
         #[cfg(feature = "legacy-2024-11-05")]
         let _: fn(super::auto::ServerBuilder, std::sync::Arc<dyn super::TaskAccessAuthorizer>)
             -> super::auto::ServerBuilder = super::auto::ServerBuilder::task_access_authorizer;
+        let _: fn(
+            super::modern::ServerBuilder,
+            std::sync::Arc<dyn super::TaskExecutionAuthorizer>,
+        ) -> super::modern::ServerBuilder =
+            super::modern::ServerBuilder::task_execution_authorizer;
+        #[cfg(feature = "legacy-2024-11-05")]
+        let _: fn(
+            super::auto::ServerBuilder,
+            std::sync::Arc<dyn super::TaskExecutionAuthorizer>,
+        ) -> super::auto::ServerBuilder = super::auto::ServerBuilder::task_execution_authorizer;
     }
 
     #[tool]

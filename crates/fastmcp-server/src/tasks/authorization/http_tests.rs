@@ -14,6 +14,7 @@ use crate::{
 use fastmcp_core::AuthContext;
 use fastmcp_protocol::{Content, JsonRpcResponse, Tool, protocol_policy::ProtocolPolicy};
 use fastmcp_transport::http::{HttpMethod, HttpRequest};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Poll;
 
 const RESULT_CANARY: &str = "secured-original-tool-result-canary";
@@ -56,7 +57,34 @@ impl ToolHandler for ScopedTaskTool {
     }
 }
 
-struct InputSupervisor;
+struct ScopedTaskExecutionPolicy {
+    principal: Sha256Digest,
+    allowed: AtomicBool,
+    checks: AtomicUsize,
+}
+
+impl TaskExecutionAuthorizer for ScopedTaskExecutionPolicy {
+    fn authorize(&self, task: &FinalTaskAccessMetadata) -> McpResult<()> {
+        self.checks.fetch_add(1, Ordering::SeqCst);
+        if !self.allowed.load(Ordering::SeqCst)
+            || task.authenticated_principal() != Some(self.principal)
+            || !task.original_operation().is_some_and(|operation| {
+                operation.method() == "tools/call" && operation.tool_name() == "sensitive-tool"
+            })
+        {
+            return Err(McpError::invalid_request(
+                "Current Task execution grant is unavailable",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct InputSupervisor {
+    initial: AtomicUsize,
+    resumed: AtomicUsize,
+}
 
 impl ApplicationTaskSupervisor for InputSupervisor {
     fn resume<'a>(
@@ -64,6 +92,14 @@ impl ApplicationTaskSupervisor for InputSupervisor {
         _: &'a Cx,
         handoff: FinalTaskSupervisorHandoff,
     ) -> FinalTaskSupervisorFuture<'a> {
+        match &handoff {
+            FinalTaskSupervisorHandoff::Initial(_) => {
+                self.initial.fetch_add(1, Ordering::SeqCst);
+            }
+            FinalTaskSupervisorHandoff::Resumed(_) => {
+                self.resumed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
         Box::pin(async move {
             match handoff {
                 FinalTaskSupervisorHandoff::Initial(initial) => {
@@ -203,6 +239,18 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                         Arc::new(|_| {}),
                     );
                     let scopes = shared_policy();
+                    // The application indexes its current grants by the same
+                    // identity-only key as Task metadata. This keeps neither
+                    // an ingress context nor a credential alive for a worker.
+                    let execution = Arc::new(ScopedTaskExecutionPolicy {
+                        principal: FinalTaskAccessMetadata::principal_for_auth(&facts(&[
+                            "invoke", "manage", "sensitive",
+                        ]))
+                        .unwrap(),
+                        allowed: AtomicBool::new(true),
+                        checks: AtomicUsize::new(0),
+                    });
+                    let supervisor = Arc::new(InputSupervisor::default());
                     let verifier = StaticTokenVerifier::new([
                         ("full-grants", facts(&["invoke", "manage", "sensitive"])),
                         ("lost-original-grant", facts(&["invoke", "manage"])),
@@ -214,6 +262,7 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                         .final_tasks(runtime.clone())
                         .unwrap()
                         .task_access_authorizer(Arc::new(scopes.clone()))
+                        .task_execution_authorizer(execution.clone())
                         .auth_provider(TokenAuthProvider::new(verifier))
                         .tool(ScopedTaskTool)
                         .test_http_endpoint("https://service.example")
@@ -231,7 +280,7 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                     .with_scope_authorization(scopes)
                     .unwrap();
                     let runner = runtime
-                        .install_task_service(4, Arc::new(InputSupervisor))
+                        .install_task_service(4, supervisor.clone())
                         .unwrap();
                     assert!(!runtime.is_task_service_ready());
                     {
@@ -265,6 +314,10 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                                     asupersync::time::sleep(cx.now(), StdDuration::from_millis(1))
                                         .await;
                                 }
+                                assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
+                                assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 0);
+                                let initial_checks = execution.checks.load(Ordering::SeqCst);
+                                assert!(initial_checks > 0, "the builder installed a live policy");
                                 let get = secured_rpc(
                                     &cx,
                                     &endpoint,
@@ -357,6 +410,11 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                                         .unwrap()
                                         .contains(RESULT_CANARY)
                                 );
+                                assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 1);
+                                assert!(
+                                    execution.checks.load(Ordering::SeqCst) > initial_checks,
+                                    "input resumption rechecks the installed execution policy"
+                                );
                                 let denied = secured_rpc(
                                     &cx,
                                     &endpoint,
@@ -368,6 +426,49 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                                 .await;
                                 assert!(denied.result.is_none());
                                 assert_eq!(denied.error.unwrap().message, "Task not found");
+
+                                // Change only the current autonomous execution
+                                // grant. HTTP admission and request grants still
+                                // permit creation, but no second application
+                                // handoff may run under the withdrawn grant.
+                                execution.allowed.store(false, Ordering::SeqCst);
+                                let mut create = parameters(None);
+                                create["name"] = serde_json::json!("sensitive-tool");
+                                create["arguments"] = serde_json::json!({});
+                                let created = secured_rpc(
+                                    &cx,
+                                    &endpoint,
+                                    &security,
+                                    "full-grants",
+                                    "tools/call",
+                                    create,
+                                )
+                                .await;
+                                assert!(created.error.is_none());
+                                let created: CreateTaskResult =
+                                    serde_json::from_value(created.result.unwrap()).unwrap();
+                                let denied_id = created.task.base().task_id.clone();
+                                let rejected_task = loop {
+                                    let current = runtime.get_task(&denied_id).unwrap().task;
+                                    if matches!(
+                                        current.base().status,
+                                        FinalTaskStatus::Completed
+                                            | FinalTaskStatus::Failed
+                                            | FinalTaskStatus::Cancelled
+                                    ) {
+                                        break current;
+                                    }
+                                    asupersync::time::sleep(cx.now(), StdDuration::from_millis(1))
+                                        .await;
+                                };
+                                assert_eq!(rejected_task.base().status, FinalTaskStatus::Failed);
+                                assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
+                                assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 1);
+                                assert!(
+                                    !serde_json::to_string(&rejected_task)
+                                        .unwrap()
+                                        .contains(RESULT_CANARY)
+                                );
                             }),
                         )
                         .await

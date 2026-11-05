@@ -1,4 +1,4 @@
-//! Current request authorization for process-local Tasks.
+//! Current request and execution authorization for process-local Tasks.
 //!
 //! The original operation is an immutable, nonserializable registration
 //! binding. It is deliberately not a recoverable execution grant. A future
@@ -8,6 +8,7 @@ use super::*;
 use std::fmt;
 
 const MAX_TASK_ACCESS_AUTHORIZERS: usize = 16;
+const MAX_TASK_EXECUTION_AUTHORIZERS: usize = 16;
 const MAX_TASK_OPERATION_NAME_BYTES: usize = 2_048;
 
 /// The current request action, independent of the operation that created a Task.
@@ -72,7 +73,11 @@ impl FinalTaskOperation {
     }
 
     fn is_visible(&self, ctx: &McpContext) -> bool {
-        self.registration.strong_count() != 0 && ctx.is_tool_enabled(&self.tool_name)
+        self.is_registered() && ctx.is_tool_enabled(&self.tool_name)
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registration.strong_count() != 0
     }
 
     pub(super) fn retained_bytes(&self) -> usize {
@@ -112,6 +117,19 @@ pub struct FinalTaskAccessMetadata {
 }
 
 impl FinalTaskAccessMetadata {
+    /// Returns the Task owner lookup key for already-verified authentication.
+    ///
+    /// An execution-policy provider may use this key to index independently
+    /// maintained current grants. It is only stable identity: it verifies
+    /// neither this authentication value nor its freshness and grants no
+    /// permission by itself. The caller must obtain `auth` from its trusted
+    /// authentication boundary and authorize the original operation against
+    /// current policy. Refreshed credentials for the same provider-scoped
+    /// owner yield the same key even when their scopes change.
+    pub fn principal_for_auth(auth: &fastmcp_core::AuthContext) -> McpResult<Sha256Digest> {
+        crate::auth::principal_fingerprint(Some(auth))
+    }
+
     #[must_use]
     pub fn new(
         task_id: FinalTaskId,
@@ -194,6 +212,32 @@ pub trait TaskAccessAuthorizer: Send + Sync {
     ) -> McpResult<()>;
 }
 
+/// Current application permission to execute one process-local Task attempt.
+///
+/// Each call must freshly decide the complete current grants, visibility and
+/// revocation policy for the retained owner and exact original operation.
+/// Metadata identifies the operation to authorize; owner equality, handle
+/// possession and a previously successful request are not execution grants.
+/// The framework separately checks registration lifetime and the exact Task
+/// incarnation and generation before consulting these policies.
+///
+/// A protected router-created Task requires at least one installed execution
+/// policy. The provider obtains current authority from trusted application
+/// policy; it must not reuse the ingress context, a bearer token, or an expired
+/// request authorization receipt. This interface retains no such credential
+/// or request context and does not establish restart-safe durable authorization
+/// or renew credentials. A persistent backend needs its own protected durable
+/// authorization contract.
+///
+/// Callbacks must be synchronous, bounded, and perform no blocking I/O. They
+/// run outside runtime and store locks. Every installed policy must allow the
+/// attempt; errors and panics become the same sanitized execution denial.
+/// Framework polling, lease and mutation boundaries recheck permission; this
+/// cannot undo an external side effect already performed by application code.
+pub trait TaskExecutionAuthorizer: Send + Sync {
+    fn authorize(&self, task: &FinalTaskAccessMetadata) -> McpResult<()>;
+}
+
 impl FinalTaskRuntime {
     /// Adds an intersecting current-access policy shared by runtime clones.
     ///
@@ -214,17 +258,123 @@ impl FinalTaskRuntime {
         &self,
         authorizers: Vec<Arc<dyn TaskAccessAuthorizer>>,
     ) -> McpResult<()> {
-        let mut installed = self
+        self.install_task_authorizers(authorizers, Vec::new())
+    }
+
+    /// Adds an intersecting execution policy shared by runtime clones.
+    ///
+    /// Configure before accepting Tasks. At most sixteen policies may be
+    /// installed. Policies also apply to trusted embedding-created work;
+    /// installing one does not confer an original-operation binding on that
+    /// work or turn a principal digest into an execution grant.
+    pub fn install_execution_authorizer(
+        &self,
+        authorizer: Arc<dyn TaskExecutionAuthorizer>,
+    ) -> McpResult<()> {
+        self.install_execution_authorizers(vec![authorizer])
+    }
+
+    pub(crate) fn install_execution_authorizers(
+        &self,
+        authorizers: Vec<Arc<dyn TaskExecutionAuthorizer>>,
+    ) -> McpResult<()> {
+        self.install_task_authorizers(Vec::new(), authorizers)
+    }
+
+    /// Installs both builder policy batches atomically under a fixed lock order.
+    /// Neither policy set changes if either set would exceed its bound.
+    pub(crate) fn install_task_authorizers(
+        &self,
+        access: Vec<Arc<dyn TaskAccessAuthorizer>>,
+        execution: Vec<Arc<dyn TaskExecutionAuthorizer>>,
+    ) -> McpResult<()> {
+        let mut installed_access = self
             .access_authorizers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if authorizers.len() > MAX_TASK_ACCESS_AUTHORIZERS.saturating_sub(installed.len()) {
+        let mut installed_execution = self
+            .execution_authorizers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if access.len()
+            > MAX_TASK_ACCESS_AUTHORIZERS.saturating_sub(installed_access.len())
+        {
             return Err(McpError::invalid_params(
                 "Task access policy capacity reached",
             ));
         }
-        installed.extend(authorizers);
+        if execution.len()
+            > MAX_TASK_EXECUTION_AUTHORIZERS.saturating_sub(installed_execution.len())
+        {
+            return Err(McpError::invalid_params(
+                "Task execution policy capacity reached",
+            ));
+        }
+        installed_access.extend(access);
+        installed_execution.extend(execution);
         Ok(())
+    }
+
+    pub(super) fn ensure_execution_policy_available(
+        &self,
+        principal: Option<Sha256Digest>,
+    ) -> McpResult<()> {
+        if principal.is_some()
+            && self
+                .execution_authorizers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        {
+            return Err(task_execution_denied());
+        }
+        Ok(())
+    }
+
+    pub(super) fn authorize_task_execution(
+        &self,
+        metadata: &FinalTaskAccessMetadata,
+    ) -> McpResult<()> {
+        let authorizers = self.execution_authorizers_snapshot();
+        authorize_task_execution_with_policies(metadata, &authorizers)
+    }
+
+    /// Rechecks the exact elected record without opening application payload.
+    pub(super) fn revalidate_task_execution(
+        &self,
+        expected: &FinalTaskAccessMetadata,
+    ) -> McpResult<()> {
+        let authorizers = self.execution_authorizers_snapshot();
+        // Existing trusted embedding stores may have no request metadata API.
+        // Only their anonymous, unbound, policy-free execution retains that
+        // contract; the runner's elected store fence still owns its generation.
+        if expected.authenticated_principal().is_none()
+            && expected.original_operation().is_none()
+            && authorizers.is_empty()
+        {
+            return authorize_task_execution_with_policies(expected, &authorizers);
+        }
+        let current = self
+            .store
+            .get_task_access_metadata(expected.task_id())
+            .map_err(|_| task_execution_denied())?
+            .ok_or_else(task_execution_denied)?;
+        if current.task_id() != expected.task_id()
+            || current.generation() != expected.generation()
+            || current.creation_generation() != expected.creation_generation()
+            || current.authenticated_principal() != expected.authenticated_principal()
+            || current.original_operation() != expected.original_operation()
+        {
+            return Err(task_execution_denied());
+        }
+        authorize_task_execution_with_policies(&current, &authorizers)
+    }
+
+    fn execution_authorizers_snapshot(&self) -> Vec<Arc<dyn TaskExecutionAuthorizer>> {
+        self.execution_authorizers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(super) fn authorize_original_operation(
@@ -422,6 +572,39 @@ impl FinalTaskRuntime {
     }
 }
 
+fn authorize_task_execution_with_policies(
+    metadata: &FinalTaskAccessMetadata,
+    authorizers: &[Arc<dyn TaskExecutionAuthorizer>],
+) -> McpResult<()> {
+    if metadata.generation() == 0
+        || metadata.creation_generation() == 0
+        || metadata.creation_generation() > metadata.generation()
+        || (metadata.authenticated_principal().is_some()
+            && (metadata.original_operation().is_none() || authorizers.is_empty()))
+        || metadata
+            .original_operation()
+            .is_some_and(|operation| !operation.is_registered())
+    {
+        return Err(task_execution_denied());
+    }
+    for authorizer in authorizers {
+        let allowed = catch_unwind(AssertUnwindSafe(|| authorizer.authorize(metadata)))
+            .is_ok_and(|result| result.is_ok());
+        if !allowed
+            || metadata
+                .original_operation()
+                .is_some_and(|operation| !operation.is_registered())
+        {
+            return Err(task_execution_denied());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn task_execution_denied() -> McpError {
+    McpError::invalid_request("Task execution is no longer authorized")
+}
+
 pub(super) fn task_access_denied() -> McpError {
     McpError::invalid_params("Task not found")
 }
@@ -510,6 +693,8 @@ mod tests {
         payload_reads: AtomicUsize,
         strip_operation: AtomicBool,
         metadata_supported: AtomicBool,
+        cancel_before_execution_failure: AtomicBool,
+        injected_execution_cancellations: AtomicUsize,
     }
 
     impl ProbeStore {
@@ -520,6 +705,8 @@ mod tests {
                 payload_reads: AtomicUsize::new(0),
                 strip_operation: AtomicBool::new(false),
                 metadata_supported: AtomicBool::new(true),
+                cancel_before_execution_failure: AtomicBool::new(false),
+                injected_execution_cancellations: AtomicUsize::new(0),
             }
         }
     }
@@ -574,6 +761,33 @@ mod tests {
             self.inner
                 .replace_task_if_current(expected, task, notification)
         }
+        fn replace_task_and_clear_input_for_handoff_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            owner_id: &str,
+            dispatch_fence: u64,
+            cancellation_required: bool,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            if matches!(&task, FinalTask::Failed { .. })
+                && self
+                    .cancel_before_execution_failure
+                    .swap(false, Ordering::SeqCst)
+            {
+                assert!(self.inner.request_cancellation_if_current(expected)?);
+                self.injected_execution_cancellations
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.replace_task_and_clear_input_for_handoff_if_current(
+                expected,
+                owner_id,
+                dispatch_fence,
+                cancellation_required,
+                task,
+                notification,
+            )
+        }
         fn request_cancellation(&self, id: &FinalTaskId) -> McpResult<()> {
             self.inner.request_cancellation(id)
         }
@@ -626,6 +840,305 @@ mod tests {
             )
             .unwrap();
         (store, runtime, id, registration)
+    }
+
+    struct ExecutionPolicy {
+        principal: Option<Sha256Digest>,
+        operation: FinalTaskOperation,
+        revoked: AtomicBool,
+        calls: AtomicUsize,
+    }
+
+    impl ExecutionPolicy {
+        fn new(principal: Option<Sha256Digest>, operation: FinalTaskOperation) -> Self {
+            Self {
+                principal,
+                operation,
+                revoked: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TaskExecutionAuthorizer for ExecutionPolicy {
+        fn authorize(&self, metadata: &FinalTaskAccessMetadata) -> McpResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.revoked.load(Ordering::SeqCst)
+                && metadata.authenticated_principal() == self.principal
+                && metadata.original_operation() == Some(&self.operation)
+            {
+                Ok(())
+            } else {
+                Err(McpError::with_data(
+                    fastmcp_core::McpErrorCode::InvalidParams,
+                    "private-execution-policy-canary",
+                    serde_json::json!({"private": "execution-policy-data-canary"}),
+                ))
+            }
+        }
+    }
+
+    fn execution_policy(
+        runtime: &FinalTaskRuntime,
+        metadata: &FinalTaskAccessMetadata,
+    ) -> Arc<ExecutionPolicy> {
+        let policy = Arc::new(ExecutionPolicy::new(
+            metadata.authenticated_principal(),
+            metadata.original_operation().unwrap().clone(),
+        ));
+        runtime.install_execution_authorizer(policy.clone()).unwrap();
+        policy
+    }
+
+    fn assert_execution_denied<T>(result: McpResult<T>) {
+        let Err(error) = result else {
+            panic!("execution must require current authority")
+        };
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InvalidRequest);
+        assert_eq!(error.message, "Task execution is no longer authorized");
+        assert!(error.data.is_none());
+    }
+
+    #[test]
+    fn execution_owner_lookup_survives_credential_refresh_without_granting_permission() {
+        let authenticated = context(&["invoke", "sensitive"]).auth().unwrap();
+        let principal = FinalTaskAccessMetadata::principal_for_auth(&authenticated).unwrap();
+        let mut refreshed = authenticated.clone();
+        refreshed.scopes = vec!["manage".to_owned()];
+        refreshed = refreshed
+            .with_verification_valid_until(Instant::now() + StdDuration::from_secs(60));
+        assert_eq!(
+            FinalTaskAccessMetadata::principal_for_auth(&refreshed).unwrap(),
+            principal
+        );
+        let other_owner = refreshed.with_session_owner(Sha256Digest::from_bytes([18; 32]));
+        assert_ne!(
+            FinalTaskAccessMetadata::principal_for_auth(&other_owner).unwrap(),
+            principal
+        );
+        let (_store, runtime, id, _registration) = fixture();
+        assert_execution_denied(runtime.ensure_execution_policy_available(Some(principal)));
+        assert!(runtime
+            .admit_task_for_request(&context(&["manage"]), &id, TaskAccessAction::Get)
+            .is_err());
+    }
+
+    #[test]
+    fn execution_rechecks_current_grants_without_opening_payload_or_changing_state() {
+        let (store, runtime, id, _registration) = fixture();
+        let metadata = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+        assert_execution_denied(runtime.authorize_task_execution(&metadata));
+        let policy = execution_policy(&runtime, &metadata);
+        assert!(runtime.revalidate_task_execution(&metadata).is_ok());
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+        policy.revoked.store(true, Ordering::SeqCst);
+        assert_execution_denied(runtime.revalidate_task_execution(&metadata));
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(store.payload_reads.load(Ordering::SeqCst), 0);
+        let after = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+        assert_eq!(after.generation(), metadata.generation());
+        assert_eq!(after.creation_generation(), metadata.creation_generation());
+        assert!(!store.inner.is_cancellation_requested(&id).unwrap());
+    }
+
+    struct RemovingRegistrationPolicy(Mutex<Option<Arc<()>>>);
+
+    impl TaskExecutionAuthorizer for RemovingRegistrationPolicy {
+        fn authorize(&self, _: &FinalTaskAccessMetadata) -> McpResult<()> {
+            drop(self.0.lock().unwrap().take());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn execution_requires_original_registration_before_and_after_policy_callbacks() {
+        for remove_during_callback in [false, true] {
+            let (store, runtime, id, registration) = fixture();
+            let metadata = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+            let policy = execution_policy(&runtime, &metadata);
+            runtime.revalidate_task_execution(&metadata).unwrap();
+            if remove_during_callback {
+                runtime
+                    .install_execution_authorizer(Arc::new(RemovingRegistrationPolicy(
+                        Mutex::new(Some(registration)),
+                    )))
+                    .unwrap();
+            } else {
+                drop(registration);
+            }
+            let replacement = Arc::new(());
+            assert_ne!(
+                metadata.original_operation(),
+                Some(&FinalTaskOperation::for_tool("sensitive-tool", &replacement).unwrap())
+            );
+            assert_execution_denied(runtime.revalidate_task_execution(&metadata));
+            assert_eq!(
+                policy.calls.load(Ordering::SeqCst),
+                if remove_during_callback { 2 } else { 1 }
+            );
+            assert_eq!(store.payload_reads.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn execution_metadata_requires_exact_generation_owner_operation_and_incarnation() {
+        let (store, runtime, id, _registration) = fixture();
+        let metadata = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+        let policy = execution_policy(&runtime, &metadata);
+        runtime.revalidate_task_execution(&metadata).unwrap();
+        let replacement = Arc::new(());
+        let replacement_operation =
+            FinalTaskOperation::for_tool("sensitive-tool", &replacement).unwrap();
+        for expected in [
+            FinalTaskAccessMetadata::new(
+                id.clone(),
+                metadata.generation() + 1,
+                metadata.creation_generation(),
+                metadata.authenticated_principal(),
+                metadata.original_operation().cloned(),
+            ),
+            FinalTaskAccessMetadata::new(
+                id.clone(),
+                metadata.generation(),
+                metadata.creation_generation(),
+                Some(Sha256Digest::from_bytes([99; 32])),
+                metadata.original_operation().cloned(),
+            ),
+            FinalTaskAccessMetadata::new(
+                id.clone(),
+                metadata.generation(),
+                metadata.creation_generation(),
+                metadata.authenticated_principal(),
+                Some(replacement_operation),
+            ),
+            FinalTaskAccessMetadata::new(
+                id.clone(),
+                metadata.generation(),
+                metadata.creation_generation() + 1,
+                metadata.authenticated_principal(),
+                metadata.original_operation().cloned(),
+            ),
+        ] {
+            assert_execution_denied(runtime.revalidate_task_execution(&expected));
+        }
+        for (generation, creation_generation) in [(0, 1), (1, 0), (1, 2)] {
+            let invalid = FinalTaskAccessMetadata::new(
+                id.clone(),
+                generation,
+                creation_generation,
+                metadata.authenticated_principal(),
+                metadata.original_operation().cloned(),
+            );
+            assert_execution_denied(runtime.authorize_task_execution(&invalid));
+        }
+        let unbound_protected = FinalTaskAccessMetadata::new(
+            id.clone(),
+            metadata.generation(),
+            metadata.creation_generation(),
+            metadata.authenticated_principal(),
+            None,
+        );
+        assert_execution_denied(runtime.authorize_task_execution(&unbound_protected));
+        assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(store.payload_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn only_unbound_anonymous_execution_without_policies_can_skip_store_metadata() {
+        let store = Arc::new(ProbeStore::new());
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| {}),
+        );
+        let original = task("trusted-embedding");
+        let id = original.base().task_id.clone();
+        store
+            .inner
+            .create_task(original.clone(), final_task_notification(&original))
+            .unwrap();
+        let metadata = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+        store.metadata_supported.store(false, Ordering::SeqCst);
+        runtime.revalidate_task_execution(&metadata).unwrap();
+        assert_eq!(store.metadata_reads.load(Ordering::SeqCst), 0);
+        let registration = Arc::new(());
+        let operation = FinalTaskOperation::for_tool("sensitive-tool", &registration).unwrap();
+        let bound = FinalTaskAccessMetadata::new(
+            id,
+            metadata.generation(),
+            metadata.creation_generation(),
+            None,
+            Some(operation.clone()),
+        );
+        assert_execution_denied(runtime.revalidate_task_execution(&bound));
+        assert_eq!(store.metadata_reads.load(Ordering::SeqCst), 1);
+        runtime
+            .install_execution_authorizer(Arc::new(ExecutionPolicy::new(None, operation)))
+            .unwrap();
+        assert_execution_denied(runtime.revalidate_task_execution(&metadata));
+        assert_eq!(store.metadata_reads.load(Ordering::SeqCst), 2);
+        assert_eq!(store.payload_reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancellation_between_authorization_loss_probe_and_fenced_failure_wins() {
+        for cancellation_races in [false, true] {
+            let (store, runtime, id, _registration) = fixture();
+            let current = store.inner.get_task_snapshot(&id).unwrap().unwrap();
+            let owner = "authorization-retirement-race";
+            let _claim = store
+                .inner
+                .take_initial_work_handoff_for_owner_if_current(&current, owner)
+                .unwrap()
+                .unwrap();
+            let fence = store
+                .inner
+                .begin_handoff_dispatch_for_owner_if_current(&id, current.generation(), owner)
+                .unwrap()
+                .unwrap();
+            let metadata = store.inner.get_task_access_metadata(&id).unwrap().unwrap();
+            let policy = execution_policy(&runtime, &metadata);
+            runtime.revalidate_task_execution(&metadata).unwrap();
+            policy.revoked.store(true, Ordering::SeqCst);
+            assert_execution_denied(runtime.revalidate_task_execution(&metadata));
+            store
+                .cancel_before_execution_failure
+                .store(cancellation_races, Ordering::SeqCst);
+            assert!(runtime
+                .retire_unauthorized_handoff(&metadata, owner, fence)
+                .unwrap());
+            let retired = store.inner.get_task_snapshot(&id).unwrap().unwrap();
+            let expected_status = if cancellation_races {
+                FinalTaskStatus::Cancelled
+            } else {
+                FinalTaskStatus::Failed
+            };
+            assert_eq!(retired.task().base().status, expected_status);
+            assert_eq!(
+                store.inner.latest_notification(&id).unwrap().params.task.base().status,
+                expected_status
+            );
+            assert_eq!(
+                store.injected_execution_cancellations.load(Ordering::SeqCst),
+                usize::from(cancellation_races)
+            );
+            assert!(!runtime
+                .retire_unauthorized_handoff(&metadata, owner, fence)
+                .unwrap());
+            assert!(runtime
+                .fenced_complete_task(
+                    &id,
+                    metadata.generation(),
+                    owner,
+                    fence,
+                    completed_execution_result(),
+                    None,
+                )
+                .is_err());
+            let after = store.inner.get_task_snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.generation(), retired.generation());
+            assert!(final_tasks_match_exactly(after.task(), retired.task()).unwrap());
+        }
     }
 
     #[test]
@@ -905,6 +1418,8 @@ mod tests {
         let admitted = runtime
             .admit_task_for_request(&caller, id, TaskAccessAction::Listen)
             .unwrap();
+        execution_policy(&runtime, &admitted);
+        runtime.revalidate_task_execution(&admitted).unwrap();
         runtime.complete_task(id, serde_json::from_value(serde_json::json!({"content":[{"type":"text","text":"old-incarnation-result"}]})).unwrap(), None).unwrap();
         let stale_event = store.latest_notification(id).unwrap();
         *now.lock().unwrap() += StdDuration::from_secs(61);
@@ -926,6 +1441,8 @@ mod tests {
             current.creation_generation(),
             admitted.creation_generation()
         );
+        assert_execution_denied(runtime.revalidate_task_execution(&admitted));
+        runtime.revalidate_task_execution(&current).unwrap();
         let event = store.latest_notification(id).unwrap();
         assert!(
             runtime
@@ -1291,6 +1808,324 @@ mod tests {
         }
     }
 
+    struct ExecutionFixture {
+        store: Arc<InMemoryFinalTaskStore>,
+        runtime: FinalTaskRuntime,
+        caller: McpContext,
+        registration: Option<Arc<()>>,
+        operation: FinalTaskOperation,
+        policy: Arc<ExecutionPolicy>,
+    }
+
+    impl ExecutionFixture {
+        fn new() -> Self {
+            let store = Arc::new(InMemoryFinalTaskStore::default());
+            let runtime = FinalTaskRuntime::new(
+                store.clone(),
+                FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+                Arc::new(|_| {}),
+            );
+            let caller = context(&["invoke", "manage", "sensitive"]);
+            let registration = Arc::new(());
+            let operation = FinalTaskOperation::for_tool("sensitive-tool", &registration).unwrap();
+            let execution = Arc::new(ExecutionPolicy::new(
+                task_request_principal(&caller).unwrap(),
+                operation.clone(),
+            ));
+            runtime
+                .install_task_authorizers(vec![Arc::new(policy())], vec![execution.clone()])
+                .unwrap();
+            Self {
+                store,
+                runtime,
+                caller,
+                registration: Some(registration),
+                operation,
+                policy: execution,
+            }
+        }
+
+        fn create(&self) -> FinalTaskId {
+            self.runtime
+                .create_task_for_operation(
+                    &self.caller,
+                    self.operation.clone(),
+                    work(),
+                    None,
+                )
+                .unwrap()
+                .task
+                .base()
+                .task_id
+                .clone()
+        }
+
+        fn status(&self, id: &FinalTaskId) -> FinalTaskStatus {
+            self.store.get_task(id).unwrap().unwrap().base().status
+        }
+    }
+
+    fn poll_service(
+        cx: &Cx,
+        service: std::pin::Pin<&mut impl Future<Output = McpResult<()>>>,
+    ) -> std::task::Poll<McpResult<()>> {
+        let _current = Cx::set_current(Some(cx.clone()));
+        service.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+    }
+
+    fn completed_execution_result() -> FinalTaskCallToolResult {
+        serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": "authorized execution completed"}]
+        }))
+        .unwrap()
+    }
+
+    struct InputExecutionSupervisor {
+        initial: AtomicUsize,
+        resumed: AtomicUsize,
+    }
+
+    impl ApplicationTaskSupervisor for InputExecutionSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        self.initial.fetch_add(1, Ordering::SeqCst);
+                        initial.require_input(
+                            serde_json::from_value(serde_json::json!({
+                                "roots": {"method": "roots/list"}
+                            }))
+                            .unwrap(),
+                            None,
+                        )?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        self.resumed.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(accepted.input_responses().len(), 1);
+                        accepted.complete_task(completed_execution_result(), None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn authorized_execution_service_runs_initial_and_resumed_work() {
+        let fixture = ExecutionFixture::new();
+        let supervisor = Arc::new(InputExecutionSupervisor {
+            initial: AtomicUsize::new(0),
+            resumed: AtomicUsize::new(0),
+        });
+        let mut runner = fixture
+            .runtime
+            .install_task_service(8, supervisor.clone())
+            .unwrap();
+        let cx = Cx::for_testing();
+        let mut service = Box::pin(runner.run_service(&cx));
+        assert!(poll_service(&cx, service.as_mut()).is_pending());
+        let id = fixture.create();
+        assert!(poll_service(&cx, service.as_mut()).is_pending());
+        assert_eq!(fixture.status(&id), FinalTaskStatus::InputRequired);
+        assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 0);
+        let mut update = parameters(&id);
+        update["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+        dispatch_final_tasks_update(&fixture.runtime, &fixture.caller, update).unwrap();
+        assert!(poll_service(&cx, service.as_mut()).is_pending());
+        assert_eq!(fixture.status(&id), FinalTaskStatus::Completed);
+        assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 1);
+        assert!(fixture.policy.calls.load(Ordering::SeqCst) >= 4);
+        assert!(dispatch_final_tasks_get(
+            &fixture.runtime,
+            &fixture.caller,
+            parameters(&id)
+        )
+        .is_ok());
+        assert!(fixture.runtime.is_task_service_ready());
+    }
+
+    struct CompletingExecutionSupervisor(AtomicUsize);
+
+    impl ApplicationTaskSupervisor for CompletingExecutionSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(completed_execution_result(), None)?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(completed_execution_result(), None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn pre_dispatch_execution_revocation_never_invokes_supervisor() {
+        for remove_registration in [false, true] {
+            let mut fixture = ExecutionFixture::new();
+            let supervisor = Arc::new(CompletingExecutionSupervisor(AtomicUsize::new(0)));
+            let mut runner = fixture
+                .runtime
+                .install_task_service(8, supervisor.clone())
+                .unwrap();
+            let cx = Cx::for_testing();
+            let mut service = Box::pin(runner.run_service(&cx));
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            let id = fixture.create();
+            if remove_registration {
+                drop(fixture.registration.take());
+            } else {
+                fixture.policy.revoked.store(true, Ordering::SeqCst);
+            }
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            assert_eq!(supervisor.0.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.status(&id), FinalTaskStatus::Failed);
+            let task = fixture.store.get_task(&id).unwrap().unwrap();
+            let encoded = serde_json::to_string(&task).unwrap();
+            assert!(!encoded.contains("application-canary"));
+            assert!(!encoded.contains("private-execution-policy-canary"));
+            assert!(!encoded.contains("execution-policy-data-canary"));
+            assert!(fixture.runtime.is_task_service_ready());
+        }
+    }
+
+    struct PendingExecutionSupervisor {
+        calls: AtomicUsize,
+        polls: AtomicUsize,
+        handoff: Mutex<Option<FinalTaskSupervisorHandoff>>,
+    }
+
+    impl ApplicationTaskSupervisor for PendingExecutionSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.handoff.lock().unwrap() = Some(handoff);
+            Box::pin(std::future::poll_fn(move |_| {
+                self.polls.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Pending
+            }))
+        }
+    }
+
+    #[test]
+    fn pending_execution_revocation_stops_polling_and_invalidates_retained_handoff() {
+        for drop_without_polling in [false, true] {
+            let fixture = ExecutionFixture::new();
+            let supervisor = Arc::new(PendingExecutionSupervisor {
+                calls: AtomicUsize::new(0),
+                polls: AtomicUsize::new(0),
+                handoff: Mutex::new(None),
+            });
+            let mut runner = fixture
+                .runtime
+                .install_task_service(8, supervisor.clone())
+                .unwrap();
+            let cx = Cx::for_testing();
+            let mut service = Box::pin(runner.run_service(&cx));
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            let id = fixture.create();
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            assert_eq!(supervisor.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(supervisor.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.status(&id), FinalTaskStatus::Working);
+            fixture.policy.revoked.store(true, Ordering::SeqCst);
+            if !drop_without_polling {
+                assert!(poll_service(&cx, service.as_mut()).is_pending());
+                assert!(fixture.runtime.is_task_service_ready());
+            }
+            drop(service);
+            assert_eq!(fixture.status(&id), FinalTaskStatus::Failed);
+            assert_eq!(supervisor.polls.load(Ordering::SeqCst), 1);
+            let retired = fixture.store.get_task_snapshot(&id).unwrap().unwrap();
+            // A later grant cannot resurrect the old handed-out authority.
+            fixture.policy.revoked.store(false, Ordering::SeqCst);
+            let handoff = supervisor.handoff.lock().unwrap().take().unwrap();
+            let late = match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    initial.complete_task(completed_execution_result(), None)
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    accepted.complete_task(completed_execution_result(), None)
+                }
+            };
+            assert_execution_denied(late);
+            let after = fixture.store.get_task_snapshot(&id).unwrap().unwrap();
+            assert_eq!(after.generation(), retired.generation());
+            assert!(final_tasks_match_exactly(after.task(), retired.task()).unwrap());
+        }
+    }
+
+    struct SelectiveExecutionPolicy {
+        refused: Mutex<Option<FinalTaskId>>,
+        panic_on_refusal: bool,
+    }
+
+    impl TaskExecutionAuthorizer for SelectiveExecutionPolicy {
+        fn authorize(&self, metadata: &FinalTaskAccessMetadata) -> McpResult<()> {
+            if self.refused.lock().unwrap().as_ref() != Some(metadata.task_id()) {
+                return Ok(());
+            }
+            assert!(!self.panic_on_refusal, "private-execution-panic-canary");
+            Err(McpError::invalid_request("private-execution-error-canary"))
+        }
+    }
+
+    #[test]
+    fn per_task_execution_policy_error_and_panic_leave_sibling_service_live() {
+        for panic_on_refusal in [false, true] {
+            let fixture = ExecutionFixture::new();
+            let selective = Arc::new(SelectiveExecutionPolicy {
+                refused: Mutex::new(None),
+                panic_on_refusal,
+            });
+            fixture
+                .runtime
+                .install_execution_authorizer(selective.clone())
+                .unwrap();
+            let supervisor = Arc::new(CompletingExecutionSupervisor(AtomicUsize::new(0)));
+            let mut runner = fixture
+                .runtime
+                .install_task_service(8, supervisor.clone())
+                .unwrap();
+            let cx = Cx::for_testing();
+            let mut service = Box::pin(runner.run_service(&cx));
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            let refused = fixture.create();
+            let sibling = fixture.create();
+            *selective.refused.lock().unwrap() = Some(refused.clone());
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            assert_eq!(fixture.status(&refused), FinalTaskStatus::Failed);
+            assert_eq!(fixture.status(&sibling), FinalTaskStatus::Completed);
+            assert_eq!(supervisor.0.load(Ordering::SeqCst), 1);
+            let encoded =
+                serde_json::to_string(&fixture.store.get_task(&refused).unwrap().unwrap()).unwrap();
+            assert!(!encoded.contains("private-execution-error-canary"));
+            assert!(!encoded.contains("private-execution-panic-canary"));
+            assert!(fixture.runtime.is_task_service_ready());
+            let later = fixture.create();
+            assert!(poll_service(&cx, service.as_mut()).is_pending());
+            assert_eq!(fixture.status(&later), FinalTaskStatus::Completed);
+            assert_eq!(supervisor.0.load(Ordering::SeqCst), 2);
+        }
+    }
+
     #[test]
     fn refused_builder_policy_batch_leaves_shared_runtime_authority_and_service_unchanged() {
         let (_store, runtime, id, _registration) = fixture();
@@ -1356,6 +2191,19 @@ mod tests {
         assert_eq!(store.task_count(), 0);
         runtime
             .install_access_authorizer(Arc::new(policy()))
+            .unwrap();
+        assert_execution_denied(runtime.create_task_for_operation(
+            &caller,
+            operation.clone(),
+            work(),
+            None,
+        ));
+        assert_eq!(store.task_count(), 0);
+        runtime
+            .install_execution_authorizer(Arc::new(ExecutionPolicy::new(
+                task_request_principal(&caller).unwrap(),
+                operation.clone(),
+            )))
             .unwrap();
         let runner = runtime
             .install_task_service(1, Arc::new(IdleSupervisor))

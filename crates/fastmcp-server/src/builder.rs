@@ -297,6 +297,9 @@ pub struct ServerBuilder {
     /// Intersecting current policies for request-owned Tasks.
     #[cfg(feature = "tasks")]
     task_access_authorizers: Vec<Arc<dyn crate::TaskAccessAuthorizer>>,
+    /// Intersecting current policies for process-local Task execution.
+    #[cfg(feature = "tasks")]
+    task_execution_authorizers: Vec<Arc<dyn crate::TaskExecutionAuthorizer>>,
     /// Maximum application handoffs polled by the hosted Tasks service.
     #[cfg(feature = "tasks")]
     max_concurrent_task_handoffs: usize,
@@ -436,6 +439,8 @@ impl ServerBuilder {
             task_supervisor: None,
             #[cfg(feature = "tasks")]
             task_access_authorizers: Vec::new(),
+            #[cfg(feature = "tasks")]
+            task_execution_authorizers: Vec::new(),
             #[cfg(feature = "tasks")]
             max_concurrent_task_handoffs: DEFAULT_CONCURRENT_TASK_HANDOFFS,
             #[cfg(all(feature = "proxy", feature = "tasks"))]
@@ -929,8 +934,9 @@ impl ServerBuilder {
     /// policy to `HttpSecurityPolicy::with_scope_authorization`. HTTP admission
     /// alone cannot reauthorize a detached Task's original tool or later events.
     ///
-    /// This controls request access, not autonomous worker execution or
-    /// restart recovery. Trusted embedding reads and writes remain separate.
+    /// This controls request access. Protected Task creation also requires
+    /// [`Self::task_execution_authorizer`] for autonomous process-local work.
+    /// Restart recovery and trusted embedding reads and writes remain separate.
     #[cfg(feature = "tasks")]
     #[must_use]
     pub fn task_access_authorizer(mut self, authorizer: Arc<dyn crate::TaskAccessAuthorizer>) -> Self {
@@ -942,6 +948,42 @@ impl ServerBuilder {
             });
         } else {
             self.task_access_authorizers.push(authorizer);
+        }
+        self
+    }
+
+    /// Requires current authorization throughout process-local Task execution.
+    ///
+    /// Install at least one execution policy for protected task-producing
+    /// tools, in addition to [`Self::task_access_authorizer`]. Policies receive
+    /// payload-free, owner-bound metadata for the original tool registration
+    /// and Task incarnation. They must check current grants, expiry, and
+    /// revocation without retaining an ingress context or performing blocking
+    /// I/O. Calls intersect; an error or panic denies further application work.
+    /// The runtime checks policies before dispatch, while work is pending, and
+    /// before accepting an application transition through its Task handoff.
+    /// [`crate::FinalTaskAccessMetadata::principal_for_auth`] derives the
+    /// identity key for an application's current, already-verified owner facts.
+    ///
+    /// The selected local runtime receives the policies at build time,
+    /// regardless of the order of calls to [`Self::final_tasks`]. At most 16
+    /// execution policies may be installed. A refused policy batch leaves
+    /// both request-access and execution policies unchanged. This does not
+    /// provide durable authorization or discover external revocation by itself.
+    #[cfg(feature = "tasks")]
+    #[must_use]
+    pub fn task_execution_authorizer(
+        mut self,
+        authorizer: Arc<dyn crate::TaskExecutionAuthorizer>,
+    ) -> Self {
+        if self.task_execution_authorizers.len() >= 16 {
+            self.refused_registrations.push(RefusedRegistration {
+                kind: RegistrationKind::TaskService,
+                name: "task_execution_authorizer".to_owned(),
+                reason: "Task execution policy capacity reached".to_owned(),
+            });
+        } else {
+            self.task_execution_authorizers.push(authorizer);
         }
         self
     }
@@ -3120,19 +3162,28 @@ impl ServerBuilder {
         };
         // No fallible builder validation follows this all-or-nothing policy
         // batch. A refused build must not change another runtime clone's
-        // request authorization. Dropping an unstarted host also retires its
-        // service installation if policy capacity is refused here.
+        // request or execution authorization. Dropping an unstarted host also
+        // retires its service installation if policy capacity is refused here.
         #[cfg(feature = "tasks")]
-        if !self.task_access_authorizers.is_empty() {
-            let result = self.final_task_runtime.as_ref().ok_or_else(|| {
-                McpError::invalid_request("Task access policy requires a local Tasks runtime")
-            }).and_then(|runtime| runtime.install_access_authorizers(
-                std::mem::take(&mut self.task_access_authorizers),
-            ));
+        if !self.task_access_authorizers.is_empty() || !self.task_execution_authorizers.is_empty() {
+            let result = self
+                .final_task_runtime
+                .as_ref()
+                .ok_or_else(|| {
+                    McpError::invalid_request(
+                        "Task authorization policy requires a local Tasks runtime",
+                    )
+                })
+                .and_then(|runtime| {
+                    runtime.install_task_authorizers(
+                        std::mem::take(&mut self.task_access_authorizers),
+                        std::mem::take(&mut self.task_execution_authorizers),
+                    )
+                });
             if let Err(error) = result {
                 return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
                     kind: RegistrationKind::TaskService,
-                    name: "task_access_authorizer".to_owned(),
+                    name: "task_authorizers".to_owned(),
                     reason: error.to_string(),
                 }]));
             }
@@ -3296,6 +3347,28 @@ mod tests {
 
         struct Supervisor;
 
+        struct DenyTaskPolicy;
+
+        impl crate::TaskAccessAuthorizer for DenyTaskPolicy {
+            fn authorize(
+                &self,
+                _: &fastmcp_core::McpContext,
+                _: crate::TaskAccessAction,
+                _: &crate::FinalTaskOperation,
+            ) -> fastmcp_core::McpResult<()> {
+                Err(McpError::invalid_request("Task request policy denies access"))
+            }
+        }
+
+        impl crate::TaskExecutionAuthorizer for DenyTaskPolicy {
+            fn authorize(
+                &self,
+                _: &crate::FinalTaskAccessMetadata,
+            ) -> fastmcp_core::McpResult<()> {
+                Err(McpError::invalid_request("Task execution policy denies work"))
+            }
+        }
+
         impl ApplicationTaskSupervisor for Supervisor {
             fn resume<'a>(
                 &'a self,
@@ -3353,6 +3426,89 @@ mod tests {
             assert!(!runtime.has_installed_task_service());
             assert!(!runtime.is_task_service_ready());
             assert!(server.task_service_host.is_none());
+        }
+
+        #[test]
+        fn task_policy_capacity_refusal_preserves_both_shared_policy_sets() {
+            for execution_full in [false, true] {
+                let runtime = runtime();
+                for _ in 0..16 {
+                    if execution_full {
+                        runtime
+                            .install_execution_authorizer(Arc::new(DenyTaskPolicy))
+                            .unwrap();
+                    } else {
+                        runtime
+                            .install_access_authorizer(Arc::new(DenyTaskPolicy))
+                            .unwrap();
+                    }
+                }
+                assert_refused(
+                    builder()
+                        .final_tasks(runtime.clone())
+                        .expect("install explicit Tasks runtime")
+                        .task_supervisor(Arc::new(Supervisor))
+                        .task_access_authorizer(Arc::new(DenyTaskPolicy))
+                        .task_execution_authorizer(Arc::new(DenyTaskPolicy))
+                        .try_build(),
+                    if execution_full {
+                        "Task execution policy capacity reached"
+                    } else {
+                        "Task access policy capacity reached"
+                    },
+                );
+                assert!(!runtime.has_installed_task_service());
+                assert!(!runtime.is_task_service_ready());
+                // The opposite set still has all sixteen slots. A partial
+                // install would change a shared clone despite a refused build.
+                for _ in 0..16 {
+                    if execution_full {
+                        runtime
+                            .install_access_authorizer(Arc::new(DenyTaskPolicy))
+                            .expect("access policies were not partially installed");
+                    } else {
+                        runtime
+                            .install_execution_authorizer(Arc::new(DenyTaskPolicy))
+                            .expect("execution policies were not partially installed");
+                    }
+                }
+                assert!(
+                    runtime
+                        .install_access_authorizer(Arc::new(DenyTaskPolicy))
+                        .is_err()
+                );
+                assert!(
+                    runtime
+                        .install_execution_authorizer(Arc::new(DenyTaskPolicy))
+                        .is_err()
+                );
+            }
+        }
+
+        #[test]
+        fn task_execution_policy_builder_limit_refuses_before_shared_mutation() {
+            let runtime = runtime();
+            let mut configured = builder()
+                .final_tasks(runtime.clone())
+                .expect("install explicit Tasks runtime")
+                .task_supervisor(Arc::new(Supervisor))
+                .task_access_authorizer(Arc::new(DenyTaskPolicy));
+            for _ in 0..17 {
+                configured = configured.task_execution_authorizer(Arc::new(DenyTaskPolicy));
+            }
+            assert_refused(
+                configured.try_build(),
+                "Task execution policy capacity reached",
+            );
+            assert!(!runtime.has_installed_task_service());
+            for _ in 0..16 {
+                runtime
+                    .install_access_authorizer(Arc::new(DenyTaskPolicy))
+                    .expect("a refused builder retains no access policy");
+                runtime
+                    .install_execution_authorizer(Arc::new(DenyTaskPolicy))
+                    .expect("a refused builder retains no execution policy");
+            }
         }
 
         #[test]

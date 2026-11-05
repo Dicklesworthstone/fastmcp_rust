@@ -39,6 +39,7 @@
 mod authorization;
 pub use authorization::{
     FinalTaskAccessMetadata, FinalTaskOperation, TaskAccessAction, TaskAccessAuthorizer,
+    TaskExecutionAuthorizer,
 };
 
 #[cfg(test)]
@@ -5673,6 +5674,8 @@ struct FinalTaskHandoffAuthority {
     dispatch_fence: u64,
     transition_committed: Arc<AtomicBool>,
     execution_budget: FinalTaskExecutionBudget,
+    execution_authorization: FinalTaskAccessMetadata,
+    execution_revoked: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FinalTaskHandoffAuthority {
@@ -5689,11 +5692,34 @@ impl std::fmt::Debug for FinalTaskHandoffAuthority {
 }
 
 impl FinalTaskHandoffAuthority {
+    fn ensure_execution_authorized(&self) -> McpResult<()> {
+        if !self.execution_revoked.load(TaskServiceOrdering::Acquire)
+            && self
+            .runtime
+            .revalidate_task_execution(&self.execution_authorization)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.execution_revoked
+            .store(true, TaskServiceOrdering::Release);
+        if self.runtime.retire_unauthorized_handoff(
+            &self.execution_authorization,
+            &self.owner_id,
+            self.dispatch_fence,
+        )? {
+            self.transition_committed
+                .store(true, TaskServiceOrdering::Release);
+        }
+        Err(authorization::task_execution_denied())
+    }
+
     fn require_input(
         &self,
         input_requests: FinalTaskInputRequests,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
+        self.ensure_execution_authorized()?;
         let task = self.runtime.fenced_require_input(
             &self.task_id,
             self.generation,
@@ -5712,6 +5738,7 @@ impl FinalTaskHandoffAuthority {
         result: FinalTaskCallToolResult,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
+        self.ensure_execution_authorized()?;
         let task = self.runtime.fenced_complete_task(
             &self.task_id,
             self.generation,
@@ -5730,6 +5757,7 @@ impl FinalTaskHandoffAuthority {
         error: FinalTaskError,
         status_message: Option<String>,
     ) -> McpResult<FinalTask> {
+        self.ensure_execution_authorized()?;
         let task = self.runtime.fenced_fail_task(
             &self.task_id,
             self.generation,
@@ -5744,6 +5772,7 @@ impl FinalTaskHandoffAuthority {
     }
 
     fn honor_cancellation(&self, status_message: Option<String>) -> McpResult<FinalTask> {
+        self.ensure_execution_authorized()?;
         let task = self.runtime.fenced_honor_cancellation(
             &self.task_id,
             self.generation,
@@ -5771,6 +5800,7 @@ pub struct FinalTaskInitialWork {
     work_descriptor: FinalTaskWorkDescriptor,
     authority: Option<FinalTaskHandoffAuthority>,
     execution_permit: Option<Weak<InMemoryFinalTaskExecutionPermit>>,
+    execution_authorization: FinalTaskAccessMetadata,
 }
 
 impl PartialEq for FinalTaskInitialWork {
@@ -5870,6 +5900,7 @@ pub struct FinalTaskAcceptedInput {
     input_responses: FinalTaskInputResponses,
     authority: Option<FinalTaskHandoffAuthority>,
     execution_permit: Option<Weak<InMemoryFinalTaskExecutionPermit>>,
+    execution_authorization: FinalTaskAccessMetadata,
 }
 
 impl PartialEq for FinalTaskAcceptedInput {
@@ -6630,6 +6661,7 @@ pub struct FinalTaskRuntime {
     next_task_service_id: Arc<AtomicU64>,
     retention_administration: Arc<TaskRetentionAdministration>,
     access_authorizers: Arc<Mutex<Vec<Arc<dyn TaskAccessAuthorizer>>>>,
+    execution_authorizers: Arc<Mutex<Vec<Arc<dyn TaskExecutionAuthorizer>>>>,
 }
 
 impl FinalTaskRuntime {
@@ -6651,6 +6683,7 @@ impl FinalTaskRuntime {
             next_task_service_id: Arc::new(AtomicU64::new(0)),
             retention_administration: Arc::new(TaskRetentionAdministration::default()),
             access_authorizers: Arc::new(Mutex::new(Vec::new())),
+            execution_authorizers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -7301,10 +7334,12 @@ impl FinalTaskRuntime {
         status_message: Option<String>,
     ) -> McpResult<CreateTaskResult> {
         self.authorize_original_operation(ctx, TaskAccessAction::Create, Some(&operation))?;
+        let principal = task_request_principal(ctx)?;
+        self.ensure_execution_policy_available(principal)?;
         self.create_task_with_principal(
             work_descriptor,
             status_message,
-            task_request_principal(ctx)?,
+            principal,
             Some(operation),
         )
     }
@@ -7476,6 +7511,90 @@ impl FinalTaskRuntime {
             task.clone(),
         )?;
         Ok(task)
+    }
+
+    /// Authorization loss is a framework transition, never an application
+    /// grant. Retire only this exact elected incarnation; a concurrent
+    /// transition, reclaimed ID, or replacement owner remains untouched.
+    fn retire_unauthorized_handoff(
+        &self,
+        expected: &FinalTaskAccessMetadata,
+        owner_id: &str,
+        dispatch_fence: u64,
+    ) -> McpResult<bool> {
+        let Some(current) = self.load_optional_task_snapshot(expected.task_id())? else {
+            return Ok(false);
+        };
+        if current.generation() != expected.generation()
+            || !expected.admits_snapshot(&current)
+            || !matches!(current.task(), FinalTask::Working(_))
+        {
+            return Ok(false);
+        }
+        let result = if self.store.is_cancellation_requested(expected.task_id())? {
+            self.fenced_honor_cancellation(
+                expected.task_id(),
+                expected.generation(),
+                owner_id,
+                dispatch_fence,
+                None,
+            )
+        } else {
+            self.fenced_fail_task(
+                expected.task_id(),
+                expected.generation(),
+                owner_id,
+                dispatch_fence,
+                FinalTaskError {
+                    code: (-32000).into(),
+                    message: "Task execution is no longer authorized".to_owned(),
+                    data: None,
+                    additional: BTreeMap::new(),
+                },
+                None,
+            )
+        };
+        match result {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                // A race lost to another fenced transition is already settled.
+                // A failure on the same record remains a real backend error.
+                let current = self.load_optional_task_snapshot(expected.task_id())?;
+                if current.as_ref().is_none_or(|current| {
+                    current.generation() != expected.generation()
+                        || !expected.admits_snapshot(current)
+                }) {
+                    Ok(false)
+                } else if self.store.is_cancellation_requested(expected.task_id())? {
+                    // Cancellation intent preserves the elected generation.
+                    // It can win after our first probe but before the failed
+                    // authorization transition. Honor that winner without
+                    // aborting the service or restoring this revoked work.
+                    match self.fenced_honor_cancellation(
+                        expected.task_id(),
+                        expected.generation(),
+                        owner_id,
+                        dispatch_fence,
+                        None,
+                    ) {
+                        Ok(_) => Ok(true),
+                        Err(cancellation_error) => {
+                            let current = self.load_optional_task_snapshot(expected.task_id())?;
+                            if current.as_ref().is_none_or(|current| {
+                                current.generation() != expected.generation()
+                                    || !expected.admits_snapshot(current)
+                            }) {
+                                Ok(false)
+                            } else {
+                                Err(cancellation_error)
+                            }
+                        }
+                    }
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     fn fenced_honor_cancellation(
@@ -7997,6 +8116,13 @@ impl FinalTaskRuntime {
             work_descriptor: claim.work_descriptor,
             authority: None,
             execution_permit: claim.execution_permit,
+            execution_authorization: FinalTaskAccessMetadata::new(
+                expected.task().base().task_id.clone(),
+                expected.generation(),
+                expected.creation_generation(),
+                expected.authenticated_principal(),
+                expected.original_operation().cloned(),
+            ),
         })
     }
 
@@ -8030,6 +8156,13 @@ impl FinalTaskRuntime {
             input_responses: claim.input_responses,
             authority: None,
             execution_permit: claim.execution_permit,
+            execution_authorization: FinalTaskAccessMetadata::new(
+                expected.task().base().task_id.clone(),
+                expected.generation(),
+                expected.creation_generation(),
+                expected.authenticated_principal(),
+                expected.original_operation().cloned(),
+            ),
         })
     }
 
@@ -9131,12 +9264,18 @@ impl FinalTaskHandoffExecutor {
         if guard.retire_if_cancellation_requested()? {
             return Ok(());
         }
+        if guard.retire_if_execution_authorization_lost()? {
+            return Ok(());
+        }
         handoff.attach_authority(guard.authority()?);
         match self
             .run_supervisor_with_lease_heartbeat(cx, handoff, &mut guard, &cancellation_wake)
             .await
         {
             Ok(()) => {
+                if guard.retire_if_execution_authorization_lost()? {
+                    return Ok(());
+                }
                 if guard.retire_if_execution_expired()? {
                     return Ok(());
                 }
@@ -9169,6 +9308,9 @@ impl FinalTaskHandoffExecutor {
                 Ok(())
             }
             Err(error) => {
+                if guard.retire_if_execution_authorization_lost()? {
+                    return Ok(());
+                }
                 if guard.retire_if_execution_expired()? {
                     return Ok(());
                 }
@@ -9204,6 +9346,9 @@ impl FinalTaskHandoffExecutor {
         if guard.retire_if_execution_expired()? {
             return Ok(());
         }
+        if guard.retire_if_execution_authorization_lost()? {
+            return Ok(());
+        }
         guard.ensure_live_dispatch_for_application()?;
         let mut supervisor = self.supervisor.resume(cx, handoff);
         loop {
@@ -9222,6 +9367,9 @@ impl FinalTaskHandoffExecutor {
                 return Ok(());
             }
             if guard.retire_if_cancellation_requested()? {
+                return Ok(());
+            }
+            if guard.retire_if_execution_authorization_lost()? {
                 return Ok(());
             }
             let heartbeat_interval = guard.bounded_heartbeat_interval()?;
@@ -9253,6 +9401,11 @@ impl FinalTaskHandoffExecutor {
                 if guard.is_authoritatively_expired() {
                     return std::task::Poll::Ready(None);
                 }
+                match guard.retire_if_execution_authorization_lost() {
+                    Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
+                    Ok(false) => {}
+                    Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                }
                 if let Err(error) = guard.ensure_live_dispatch_for_application() {
                     return std::task::Poll::Ready(Some(Err(error)));
                 }
@@ -9266,6 +9419,11 @@ impl FinalTaskHandoffExecutor {
                 // `retire_if_cancellation_requested` below still records
                 // terminal cancellation when the supervisor declines.
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
+                    match guard.retire_if_execution_authorization_lost() {
+                        Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
+                        Ok(false) => {}
+                        Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                    }
                     match guard.retire_if_execution_expired() {
                         Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
                         Ok(false) => {}
@@ -9678,6 +9836,8 @@ struct FinalTaskExecutionGuard {
     transition_committed: Arc<AtomicBool>,
     retention_deadline: Option<FinalTaskRetentionDeadline>,
     execution_budget: Option<FinalTaskExecutionBudget>,
+    execution_authorization: Option<FinalTaskAccessMetadata>,
+    execution_revoked: Arc<AtomicBool>,
     restoration: Option<FinalTaskHandoffRestoration>,
     // Held through guard/future destruction, never cleared by disarm or by a
     // terminal transition. The supervisor future is destroyed before its
@@ -9726,6 +9886,15 @@ impl FinalTaskExecutionGuard {
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
+            execution_authorization: Some(match handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => {
+                    initial.execution_authorization.clone()
+                }
+                FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                    accepted.execution_authorization.clone()
+                }
+            }),
+            execution_revoked: Arc::new(AtomicBool::new(false)),
             restoration: (!execution_admission_lost).then_some(restoration),
             _execution_permit: execution_permit,
             execution_admission_lost,
@@ -9739,7 +9908,11 @@ impl FinalTaskExecutionGuard {
         let Some(current) = self.runtime.load_optional_task_snapshot(&self.task_id)? else {
             return Ok(false);
         };
-        if current.generation() != self.generation {
+        if current.generation() != self.generation
+            || self.execution_authorization.as_ref().is_none_or(|expected| {
+                !expected.admits_snapshot(&current)
+            })
+        {
             return Ok(false);
         }
         let Some(budget) = self
@@ -9848,6 +10021,7 @@ impl FinalTaskExecutionGuard {
     }
 
     fn renew(&self) -> McpResult<bool> {
+        self.ensure_execution_authorized()?;
         // A successful fenced transition consumes the dispatch lease. The
         // same future may still need to finish asynchronous cleanup before a
         // successor handoff starts. Only this private commit receipt permits
@@ -9864,6 +10038,49 @@ impl FinalTaskExecutionGuard {
             &self.owner_id,
             dispatch_fence,
         )
+    }
+
+    fn ensure_execution_authorized(&self) -> McpResult<()> {
+        let expected = self.execution_authorization.as_ref().ok_or_else(|| {
+            McpError::internal_error("Final task handoff has no execution authorization binding")
+        })?;
+        if self.execution_revoked.load(TaskServiceOrdering::Acquire) {
+            return Err(authorization::task_execution_denied());
+        }
+        // A committed transition consumes this generation. Permit only
+        // bounded cleanup under the same original operation and current
+        // policy; never use a successor's generation to authorize old work.
+        let result = if self.transition_committed.load(TaskServiceOrdering::Acquire) {
+            self.runtime.authorize_task_execution(expected)
+        } else {
+            self.runtime.revalidate_task_execution(expected)
+        };
+        if result.is_err() {
+            self.execution_revoked
+                .store(true, TaskServiceOrdering::Release);
+        }
+        result
+    }
+
+    fn retire_if_execution_authorization_lost(&mut self) -> McpResult<bool> {
+        if self.dispatch_fence.is_none() || self.ensure_execution_authorized().is_ok() {
+            return Ok(false);
+        }
+        let expected = self.execution_authorization.as_ref().ok_or_else(|| {
+            McpError::internal_error("Final task handoff has no execution authorization binding")
+        })?;
+        if self.runtime.retire_unauthorized_handoff(
+            expected,
+            &self.owner_id,
+            self.dispatch_fence.ok_or_else(|| {
+                McpError::internal_error("Final task handoff has no dispatch fence")
+            })?,
+        )? {
+            self.transition_committed
+                .store(true, TaskServiceOrdering::Release);
+        }
+        self.disarm();
+        Ok(true)
     }
 
     fn ensure_live_dispatch_for_application(&self) -> McpResult<()> {
@@ -9938,6 +10155,10 @@ impl FinalTaskExecutionGuard {
             execution_budget: self.execution_budget.ok_or_else(|| {
                 McpError::internal_error("Final task handoff has no execution budget")
             })?,
+            execution_authorization: self.execution_authorization.clone().ok_or_else(|| {
+                McpError::internal_error("Final task handoff has no execution authorization binding")
+            })?,
+            execution_revoked: Arc::clone(&self.execution_revoked),
         })
     }
 
@@ -9998,6 +10219,9 @@ impl Drop for FinalTaskExecutionGuard {
         // pre-dispatch claim after explicit restoration. It has no right to
         // retire or restore that successor, even if this future was never polled.
         if self.execution_admission_lost {
+            return;
+        }
+        if self.retire_if_execution_authorization_lost().unwrap_or(false) {
             return;
         }
         if self.retire_if_execution_expired().unwrap_or(false) {
@@ -21498,6 +21722,14 @@ mod tests {
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
+            execution_authorization: Some(FinalTaskAccessMetadata::new(
+                task_id.clone(),
+                stale_generation,
+                retained.creation_generation(),
+                retained.authenticated_principal(),
+                retained.original_operation().cloned(),
+            )),
+            execution_revoked: Arc::new(AtomicBool::new(false)),
             restoration: None,
             _execution_permit: None,
             execution_admission_lost: false,
@@ -21528,6 +21760,14 @@ mod tests {
             transition_committed: Arc::new(AtomicBool::new(false)),
             retention_deadline: None,
             execution_budget: None,
+            execution_authorization: Some(FinalTaskAccessMetadata::new(
+                missing_id.clone(),
+                retained.generation(),
+                retained.creation_generation(),
+                retained.authenticated_principal(),
+                retained.original_operation().cloned(),
+            )),
+            execution_revoked: Arc::new(AtomicBool::new(false)),
             restoration: None,
             _execution_permit: None,
             execution_admission_lost: false,

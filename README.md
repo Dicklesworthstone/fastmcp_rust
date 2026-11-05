@@ -359,13 +359,24 @@ scenarios, including every input-required one, so a measurement taken without
   Applications may instead install and drive `AuthorizedTaskServiceRunner`
   explicitly; combining that installation with the builder hook is rejected.
 - **Authenticated local Tasks retain their caller:** task creation atomically
-  stores a private principal binding. Request get/update/cancel and Tasks
-  subscriptions enforce that binding; a refreshed credential for the same
-  verified owner can continue the task. Custom stores must implement atomic
-  authenticated creation and preserve the binding in every snapshot.
+  stores a private principal binding, original tool registration, and immutable
+  creation generation. Protected task-producing tools require both
+  `ServerBuilder::task_access_authorizer` for current request grants and
+  `ServerBuilder::task_execution_authorizer` for current autonomous execution
+  grants. Execution policies are bounded application callbacks that recheck
+  owner/operation permission, expiry, and revocation before application work,
+  while it is pending, and before accepting a transition through a Task handoff.
+  `FinalTaskAccessMetadata::principal_for_auth` derives an identity lookup key
+  from verified authentication facts; that key is not itself an execution grant.
+  Policies must consult current trusted application state and must not retain
+  an ingress context or credential. A refreshed credential for the same owner
+  can access the task when its current request grants permit it. Custom stores
+  must preserve the identity and operation metadata atomically with every
+  snapshot.
   Context-free runtime and subscription APIs are trusted embedding controls.
-  Anonymous client isolation, proxy Tasks ownership, durable authorization,
-  grant revalidation, and revocation remain unqualified.
+  These controls are process-local; durable authorization, external revocation
+  discovery, anonymous client isolation, and proxy Tasks ownership remain
+  unqualified.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.
