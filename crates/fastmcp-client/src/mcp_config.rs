@@ -83,8 +83,12 @@ pub const DEFAULT_MAX_CONFIG_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// MCP configuration file containing server definitions.
 ///
 /// Accepts native `mcpServers`, TOML `mcp_servers`, and literal VS Code `servers`
-/// registries. Mixed registry dialects and unsupported VS Code execution or
-/// security controls are refused. Serialization retains the native format.
+/// registries. Entries may describe stdio commands or explicit
+/// `{"type":"http","url":"https://example.test/mcp"}` Streamable HTTP
+/// endpoints. HTTP shorthand selects immutable `ModernOnly` policy; it never
+/// guesses legacy routes or imports credentials. Mixed registry dialects and
+/// unsupported execution or security controls are refused. Serialization
+/// retains the native format with explicit HTTP endpoint bundles.
 #[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpConfig {
@@ -111,34 +115,74 @@ impl std::fmt::Debug for McpConfig {
 }
 
 /// Configuration for a single MCP server.
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 pub struct ServerConfig {
     /// Command to execute (e.g., "npx", "uvx", "python").
+    ///
+    /// HTTP-only entries have no command. Setting this field does not change
+    /// their transport; construct a new stdio configuration to select stdio.
     pub command: String,
 
     /// Arguments to pass to the command.
-    #[serde(default)]
     pub args: Vec<String>,
 
     /// Environment variables to set.
-    #[serde(default)]
     pub env: HashMap<String, String>,
 
     /// Working directory for the server process.
-    #[serde(default)]
     pub cwd: Option<String>,
 
     /// Whether the server is disabled.
-    #[serde(default)]
     pub disabled: bool,
 
     /// Optional immutable HTTP route configuration for this server.
     ///
     /// This config is separate from the stdio command surface. It never
     /// derives a route from a peer, discovery response, redirect, or origin.
-    #[serde(default)]
     http: Option<HttpEndpointConfig>,
+    // Absence of a command in an admitted HTTP entry is a transport decision,
+    // not an empty executable name or a command to infer later from public
+    // field mutation. Explicit native command + HTTP bundles retain both APIs.
+    stdio_configured: bool,
+}
+
+impl Serialize for ServerConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+
+        if self.has_conflicting_stdio_settings() {
+            return Err(serde::ser::Error::custom(
+                "HTTP-only server configuration contains stdio settings",
+            ));
+        }
+        let mut state = serializer.serialize_struct(
+            "ServerConfig",
+            if self.stdio_configured { 6 } else { 2 },
+        )?;
+        if self.stdio_configured {
+            state.serialize_field("command", &self.command)?;
+            state.serialize_field("args", &self.args)?;
+            state.serialize_field("env", &self.env)?;
+            state.serialize_field("cwd", &self.cwd)?;
+        }
+        state.serialize_field("disabled", &self.disabled)?;
+        state.serialize_field("http", &self.http)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ServerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        parse::NativeServerConfig::deserialize(deserializer)?
+            .into_config(false)
+            .map_err(D::Error::custom)
+    }
 }
 
 impl std::fmt::Debug for ServerConfig {
@@ -149,6 +193,7 @@ impl std::fmt::Debug for ServerConfig {
             .field("env_var_count", &self.env.len())
             .field("cwd_set", &self.cwd.is_some())
             .field("disabled", &self.disabled)
+            .field("stdio_configured", &self.stdio_configured)
             .field("http_configured", &self.http.is_some())
             .finish()
     }
@@ -165,7 +210,28 @@ impl ServerConfig {
             cwd: None,
             disabled: false,
             http: None,
+            stdio_configured: true,
         }
+    }
+
+    fn from_http_bundle(http: HttpEndpointConfig) -> Self {
+        Self {
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            disabled: false,
+            http: Some(http),
+            stdio_configured: false,
+        }
+    }
+
+    fn has_conflicting_stdio_settings(&self) -> bool {
+        !self.stdio_configured
+            && (!self.command.is_empty()
+                || !self.args.is_empty()
+                || !self.env.is_empty()
+                || self.cwd.is_some())
     }
 
     /// Adds arguments.
@@ -375,6 +441,48 @@ impl std::fmt::Debug for HttpEndpointConfig {
 }
 
 impl HttpEndpointConfig {
+    /// Builds the anonymous modern-only plan used by literal HTTP registry
+    /// entries. The complete configured endpoint participates in its partition
+    /// identity; another path or query at the same origin cannot share it.
+    fn from_literal_url(url: String) -> Result<Self, HttpEndpointConfigError> {
+        let invalid = || HttpEndpointConfigError::InvalidTarget {
+            route: HttpRouteKind::ModernMcpPost,
+        };
+        if url.contains("${")
+            || url.chars().any(|character| character.is_control() || character.is_whitespace())
+        {
+            return Err(invalid());
+        }
+        let canonical = parse_configured_target(Some(url), HttpRouteKind::ModernMcpPost)?
+            .ok_or_else(invalid)?;
+        if canonical.has_syntax_violation() {
+            return Err(invalid());
+        }
+        let digest = fastmcp_core::sha256_bounded(
+            canonical.as_bytes(),
+            fastmcp_core::uri::DEFAULT_CANONICAL_URL_MAX_BYTES,
+        )
+        .map_err(|_| invalid())?;
+        let mut partition = String::from("fastmcp-config-anonymous-http-v1:");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in digest.as_bytes() {
+            partition.push(char::from(HEX[usize::from(byte >> 4)]));
+            partition.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+        Self::new(
+            ProtocolPolicy::ModernOnly,
+            Some(canonical.as_str().to_owned()),
+            None,
+            None,
+            partition.clone(),
+            partition,
+            "streamable-http-2026-07-28".to_owned(),
+            1,
+            1,
+            0,
+        )
+    }
+
     /// Validates trusted endpoint configuration and freezes its bundle key.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -568,6 +676,8 @@ pub enum ConfigError {
     ServerDisabled(String),
     /// Server has no configured HTTP endpoint.
     HttpNotConfigured(String),
+    /// Server is HTTP-only and cannot be launched as a subprocess.
+    StdioNotConfigured(String),
     /// Configured HTTP routes could not form a client protocol plan.
     HttpPlanError(HttpEndpointConfigError),
     /// Configured HTTP client connection or initialization failed.
@@ -592,6 +702,9 @@ impl std::fmt::Display for ConfigError {
             ConfigError::ServerDisabled(name) => write!(f, "Server is disabled: {name}"),
             ConfigError::HttpNotConfigured(name) => {
                 write!(f, "Server has no configured HTTP endpoint: {name}")
+            }
+            ConfigError::StdioNotConfigured(name) => {
+                write!(f, "Server has no configured stdio command: {name}")
             }
             ConfigError::HttpPlanError(e) => write!(f, "Invalid configured HTTP plan: {e}"),
             ConfigError::HttpClientError(e) => write!(f, "HTTP MCP client lifecycle failed: {e}"),
@@ -676,7 +789,7 @@ impl McpConfig {
     /// Unlike [`Self::from_json`], this accepts line/block comments and a
     /// trailing comma after an object member or array element. It does not
     /// accept JSON5 strings, unquoted keys, or variable substitution. VS Code
-    /// imports support literal stdio servers only; unsupported controls are
+    /// imports support literal stdio and explicit HTTP servers; unsupported controls are
     /// refused rather than silently ignored.
     ///
     /// # Errors
@@ -792,6 +905,9 @@ impl McpConfig {
             .validate()
             .map_err(ConfigError::ClientError)?;
         let config = self.enabled_server(name)?;
+        if !config.stdio_configured {
+            return Err(ConfigError::StdioNotConfigured(name.to_owned()));
+        }
 
         spawn_client_from_config(cx, name, config, timeout_policy).await
     }
@@ -808,6 +924,11 @@ impl McpConfig {
     /// HTTP connection lifecycle fails.
     pub async fn http_client(&self, cx: &Cx, name: &str) -> Result<HttpClient, ConfigError> {
         let config = self.enabled_server(name)?;
+        if config.has_conflicting_stdio_settings() {
+            return Err(ConfigError::ParseError(
+                "HTTP-only server configuration contains stdio settings".to_owned(),
+            ));
+        }
         let http = config
             .http_endpoint_config()
             .ok_or_else(|| ConfigError::HttpNotConfigured(name.to_owned()))?;
@@ -1112,6 +1233,270 @@ mod tests {
             .build()
             .expect("caller-owned configuration test runtime");
         runtime.block_on(test);
+    }
+
+
+    fn literal_http_config(registry: &str, url: &str, disabled: bool) -> McpConfig {
+        McpConfig::from_json(
+            &serde_json::json!({
+                (registry): {
+                    "remote": {"type":"http", "url":url, "disabled":disabled}
+                }
+            })
+            .to_string(),
+        )
+        .expect("literal HTTP registry entry")
+    }
+
+    fn read_literal_http_request(
+        stream: &mut std::net::TcpStream,
+    ) -> (String, serde_json::Value) {
+        use std::io::Read as _;
+
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let end = loop {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "configured HTTP request ended before its headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(bytes.len() <= 128 * 1024);
+            if let Some(at) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = std::str::from_utf8(&bytes[..end]).unwrap().to_owned();
+        let lengths = head
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lengths.len(), 1);
+        let length = lengths[0];
+        assert!(length <= 64 * 1024);
+        while bytes.len() < end + length {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "configured HTTP request ended before its body");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(bytes.len() <= 128 * 1024);
+        }
+        assert_eq!(bytes.len(), end + length);
+        let body = serde_json::from_slice(&bytes[end..end + length]).unwrap();
+        (head, body)
+    }
+
+    fn literal_http_peer(
+        route: &str,
+    ) -> (String, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}{route}", listener.local_addr().unwrap());
+        let route = route.to_owned();
+        let peer = std::thread::spawn(move || {
+            let mut observed = Vec::new();
+            for (index, method) in ["server/discover", "tools/list"].into_iter().enumerate() {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "configured HTTP client did not send {method}"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("configured HTTP accept: {error}"),
+                    }
+                };
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(3)))
+                    .unwrap();
+                stream.set_nonblocking(false).unwrap();
+                let (head, request) = read_literal_http_request(&mut stream);
+                assert!(head.starts_with(&format!("POST {route} HTTP/1.1\r\n")));
+                let header = |name: &str| {
+                    head.lines()
+                        .filter_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case(name).then(|| value.trim().to_owned())
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(header("Mcp-Method"), [method]);
+                assert_eq!(header("MCP-Protocol-Version"), ["2026-07-28"]);
+                assert!(header("Authorization").is_empty());
+                assert_eq!(request["method"], method);
+                assert_eq!(request["id"], serde_json::json!(index + 1));
+                assert_eq!(
+                    request["params"]["_meta"]["io.modelcontextprotocol/clientInfo"]["name"],
+                    "fastmcp-client:remote"
+                );
+                let result = if index == 0 {
+                    let capabilities = fastmcp_protocol::ServerDiscoverCapabilities::from_registry(
+                        &fastmcp_protocol::ServerBehaviorRegistry::from_behaviors([
+                            fastmcp_protocol::ServerBehavior::ToolsList,
+                        ]),
+                        std::collections::BTreeMap::new(),
+                    )
+                    .unwrap();
+                    serde_json::to_value(fastmcp_protocol::ServerDiscoverResult::new(
+                        capabilities,
+                        fastmcp_protocol::ServerInfo {
+                            name: "configured-http-peer".to_owned(),
+                            version: "1.0.0".to_owned(),
+                        },
+                        None,
+                        fastmcp_protocol::DiscoveryCacheHints::private_ttl_ms(0),
+                    ))
+                    .unwrap()
+                } else {
+                    serde_json::json!({
+                        "resultType": "complete",
+                        "tools": [{
+                            "name": "configured-tool",
+                            "description": "Configured remote HTTP tool",
+                            "inputSchema": {"type": "object"}
+                        }],
+                        "ttlMs": 0,
+                        "cacheScope": "private"
+                    })
+                };
+                let response = serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc":"2.0", "id":request["id"], "result":result
+                }))
+                .unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(&response).unwrap();
+                stream.flush().unwrap();
+                observed.push(request);
+            }
+            observed
+        });
+        (url, peer)
+    }
+
+    #[test]
+    fn literal_http_registry_connects_discovers_and_lists_through_caller_runtime() {
+        let route = "/mcp/tenant%2Fblue?tenant=one&mode=%2f+two&empty=";
+        for registry in ["mcpServers", "servers"] {
+            let (url, peer) = literal_http_peer(route);
+            let config = literal_http_config(registry, &url, false);
+            let before = config.to_json();
+            run_config_client_test(async {
+                let cx = Cx::current().unwrap();
+                let mut client = config.http_client(&cx, "remote").await.unwrap();
+                assert_eq!(
+                    client.selected_protocol_era(),
+                    fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026
+                );
+                assert_eq!(
+                    client.protocol_plan(),
+                    &config
+                        .get_server("remote")
+                        .unwrap()
+                        .http_endpoint_config()
+                        .unwrap()
+                        .protocol_plan()
+                        .unwrap()
+                );
+                assert_eq!(client.client_info().name, "fastmcp-client:remote");
+                assert_eq!(client.server_info().unwrap().name, "configured-http-peer");
+                let listed = client.list_tools(&cx, None).await.unwrap();
+                let fastmcp_protocol::CoreResult::Final(
+                    fastmcp_protocol::FinalCoreResult::ToolsList { result, .. },
+                ) = listed
+                else {
+                    panic!("configured HTTP list returned another result family");
+                };
+                let result = serde_json::to_value(result).unwrap();
+                assert_eq!(result["tools"].as_array().unwrap().len(), 1);
+                assert_eq!(result["tools"][0]["name"], "configured-tool");
+                assert_eq!(config.to_json(), before);
+            });
+            let observed = peer.join().unwrap();
+            assert_eq!(observed.len(), 2, "one discovery and one application request");
+        }
+    }
+
+    #[test]
+    fn literal_http_registry_disabled_cancelled_and_wrong_transport_make_no_contact() {
+        for registry in ["mcpServers", "servers"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/mcp?tenant=private", listener.local_addr().unwrap());
+            let active = literal_http_config(registry, &url, false);
+            let disabled = literal_http_config(registry, &url, true);
+            let before = active.to_json();
+            run_config_client_test(async {
+                let cx = Cx::current().unwrap();
+                assert!(matches!(
+                    disabled.http_client(&cx, "remote").await,
+                    Err(ConfigError::ServerDisabled(_))
+                ));
+                assert!(matches!(
+                    disabled.client(&cx, "remote").await,
+                    Err(ConfigError::ServerDisabled(_))
+                ));
+                assert!(matches!(
+                    active.client(&cx, "remote").await,
+                    Err(ConfigError::StdioNotConfigured(_))
+                ));
+
+                let cancelled = Cx::for_testing();
+                cancelled.set_cancel_requested(true);
+                assert!(matches!(
+                    active.http_client(&cancelled, "remote").await,
+                    Err(ConfigError::HttpClientError(_))
+                ));
+
+                // Changing an old public stdio field cannot change the
+                // admitted transport or silently add ignored controls.
+                let mut conflicting = active.clone();
+                conflicting.mcp_servers.get_mut("remote").unwrap().command =
+                    "definitely-not-a-command".to_owned();
+                assert!(matches!(
+                    conflicting.client(&cx, "remote").await,
+                    Err(ConfigError::StdioNotConfigured(_))
+                ));
+                assert!(matches!(
+                    conflicting.http_client(&cx, "remote").await,
+                    Err(ConfigError::ParseError(_))
+                ));
+                assert!(serde_json::to_value(&conflicting).is_err());
+            });
+            assert_eq!(active.to_json(), before);
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+
+            for (field, value) in [
+                ("command", serde_json::json!("server")),
+                ("headers", serde_json::json!({"Authorization":"Bearer rejected-secret"})),
+            ] {
+                let mut entry = serde_json::json!({"type":"http", "url":url});
+                entry[field] = value;
+                let source = serde_json::json!({(registry): {"remote": entry}}).to_string();
+                assert!(McpConfig::from_json(&source).is_err());
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+            }
+        }
     }
 
     #[test]

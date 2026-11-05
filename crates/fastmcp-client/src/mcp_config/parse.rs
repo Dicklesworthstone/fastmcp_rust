@@ -80,91 +80,114 @@ struct ConfigWire {
     #[serde(default, alias = "mcp_servers", deserialize_with = "present")]
     mcp_servers: Option<HashMap<String, NativeServerConfig>>,
     #[serde(default, deserialize_with = "present")]
-    servers: Option<HashMap<String, VscodeStdioServer>>,
+    servers: Option<HashMap<String, NativeServerConfig>>,
     #[serde(flatten, deserialize_with = "extra_fields")]
     extra: HashMap<String, serde_json::Value>,
 }
 
-// Native entries are executable policy, not an extension bag. Silently
-// discarding an unknown field can turn a remote/sandboxed declaration into a
-// less-constrained local stdio launch. Keep the supported native surface exact;
-// the nested `http` object is the explicit remote-route configuration.
+// Preserve field presence independently of the field's decoded value. In
+// particular, a present nullable cwd/http cannot hide an earlier occurrence
+// or disappear when checking an HTTP entry for conflicting stdio controls.
+fn present_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+// Entries are executable policy, not an extension bag. The exact same closed
+// field inventory is used for native registries, VS Code imports and direct
+// ServerConfig decoding; dialect-specific admission happens before conversion.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct NativeServerConfig {
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    #[serde(default)]
-    cwd: Option<String>,
+pub(super) struct NativeServerConfig {
+    #[serde(rename = "type", default, deserialize_with = "present_field")]
+    kind: Option<String>,
+    #[serde(default, deserialize_with = "present_field")]
+    command: Option<String>,
+    #[serde(default, deserialize_with = "present_field")]
+    url: Option<String>,
+    #[serde(default, deserialize_with = "present_field")]
+    args: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present_field")]
+    env: Option<HashMap<String, String>>,
+    #[serde(default, deserialize_with = "present_field")]
+    cwd: Option<Option<String>>,
     #[serde(default)]
     disabled: bool,
-    #[serde(default)]
-    http: Option<HttpEndpointConfig>,
+    #[serde(default, deserialize_with = "present_field")]
+    http: Option<Option<HttpEndpointConfig>>,
 }
 
 impl NativeServerConfig {
-    fn into_config(self) -> ServerConfig {
-        let mut config = ServerConfig::new(self.command);
-        config.args = self.args;
-        config.env = self.env;
-        config.cwd = self.cwd;
+    pub(super) fn into_config(self, vscode: bool) -> Result<ServerConfig, &'static str> {
+        if vscode && self.http.is_some() {
+            return Err("VS Code entries cannot contain native HTTP endpoint bundles");
+        }
+        if self.kind.as_deref() == Some("http") {
+            if self.command.is_some()
+                || self.args.is_some()
+                || self.env.is_some()
+                || self.cwd.is_some()
+                || self.http.is_some()
+            {
+                return Err("HTTP shorthand cannot contain stdio settings or another HTTP bundle");
+            }
+            let url = self.url.ok_or("HTTP shorthand requires a literal URL")?;
+            let http = HttpEndpointConfig::from_literal_url(url)
+                .map_err(|_| "HTTP shorthand requires a valid credential-free literal endpoint")?;
+            let mut config = ServerConfig::from_http_bundle(http);
+            config.disabled = self.disabled;
+            return Ok(config);
+        }
+        if self.url.is_some() {
+            return Err("a URL requires explicit HTTP transport without a stdio command");
+        }
+        if self.kind.as_deref().is_some_and(|kind| kind != "stdio") {
+            return Err("unsupported configured server transport");
+        }
+
+        let http = self.http.flatten();
+        let Some(command) = self.command else {
+            // HTTP shorthand serializes to a native, fully explicit bundle.
+            // No executable command is invented during that round trip.
+            if self.kind.is_some()
+                || self.args.is_some()
+                || self.env.is_some()
+                || self.cwd.is_some()
+            {
+                return Err("HTTP-only endpoint bundles cannot contain stdio settings");
+            }
+            let mut config = ServerConfig::from_http_bundle(
+                http.ok_or("stdio server configuration requires a command")?,
+            );
+            config.disabled = self.disabled;
+            return Ok(config);
+        };
+        let args = self.args.unwrap_or_default();
+        let env = self.env.unwrap_or_default();
+        let cwd = self.cwd.flatten();
+        if vscode {
+            if command.trim().is_empty() {
+                return Err("VS Code stdio server command must be nonempty");
+            }
+            // Unresolved VS Code substitutions cannot become executable text.
+            let mut strings = std::iter::once(command.as_str())
+                .chain(args.iter().map(String::as_str))
+                .chain(env.keys().map(String::as_str))
+                .chain(env.values().map(String::as_str))
+                .chain(cwd.as_deref());
+            if strings.any(|value| value.contains("${") || value.contains('\0')) {
+                return Err("VS Code variable substitution and NUL bytes are not supported");
+            }
+        }
+        let mut config = ServerConfig::new(command);
+        config.args = args;
+        config.env = env;
+        config.cwd = cwd;
         config.disabled = self.disabled;
-        if let Some(http) = self.http {
-            config = config.with_http_endpoint_config(http);
-        }
-        config
-    }
-}
-
-// Do not silently discard VS Code controls that this client cannot enforce.
-// In particular, envFile, sandbox, remote URLs, and development settings must
-// never turn into a less-constrained stdio launch.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VscodeStdioServer {
-    #[serde(rename = "type", default = "stdio_kind")]
-    kind: String,
-    command: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    env: HashMap<String, String>,
-    #[serde(default)]
-    cwd: Option<String>,
-    #[serde(default)]
-    disabled: bool,
-}
-
-fn stdio_kind() -> String {
-    "stdio".to_owned()
-}
-
-impl VscodeStdioServer {
-    fn into_config(self) -> Result<ServerConfig, &'static str> {
-        if self.kind != "stdio" {
-            return Err("VS Code imports support literal stdio servers only");
-        }
-        if self.command.trim().is_empty() {
-            return Err("VS Code stdio server command must be nonempty");
-        }
-        // There is no VS Code variable resolver in this library. Passing an
-        // unresolved value to an executable would not implement its meaning.
-        let mut strings = std::iter::once(self.command.as_str())
-            .chain(self.args.iter().map(String::as_str))
-            .chain(self.env.keys().map(String::as_str))
-            .chain(self.env.values().map(String::as_str))
-            .chain(self.cwd.as_deref());
-        if strings.any(|value| value.contains("${") || value.contains('\0')) {
-            return Err("VS Code variable substitution and NUL bytes are not supported");
-        }
-        let mut config = ServerConfig::new(self.command);
-        config.args = self.args;
-        config.env = self.env;
-        config.cwd = self.cwd;
-        config.disabled = self.disabled;
+        config.http = http;
         Ok(config)
     }
 }
@@ -179,8 +202,13 @@ impl<'de> Deserialize<'de> for McpConfig {
             (Some(mcp_servers), None) => Ok(Self {
                 mcp_servers: mcp_servers
                     .into_iter()
-                    .map(|(name, server)| (name, server.into_config()))
-                    .collect(),
+                    .map(|(name, server)| {
+                        server
+                            .into_config(false)
+                            .map(|config| (name, config))
+                            .map_err(D::Error::custom)
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()?,
             }),
             (Some(_), Some(_)) => Err(D::Error::custom(
                 "configuration contains more than one server registry dialect",
@@ -201,7 +229,7 @@ impl<'de> Deserialize<'de> for McpConfig {
                     .into_iter()
                     .map(|(name, server)| {
                         server
-                            .into_config()
+                            .into_config(true)
                             .map(|config| (name, config))
                             .map_err(D::Error::custom)
                     })
@@ -490,6 +518,185 @@ mod tests {
         assert_eq!(local.env.get("EXAMPLE").map(String::as_str), Some("value"));
         assert_eq!(local.cwd.as_deref(), Some("/workspace"));
         assert!(local.disabled);
+    }
+
+
+    #[test]
+    fn literal_http_registry_entries_round_trip_without_a_stdio_command() {
+        let url = "https://example.test/mcp/v1%2Fitems?tenant=one&selection=%2f+two&empty=";
+        for registry in ["mcpServers", "mcp_servers", "servers"] {
+            for disabled in [false, true] {
+                let source = serde_json::json!({
+                    (registry): {
+                        "remote": {"type": "http", "url": url, "disabled": disabled}
+                    }
+                })
+                .to_string();
+                for config in [
+                    McpConfig::from_json(&source).unwrap(),
+                    McpConfig::from_jsonc(&source).unwrap(),
+                ] {
+                    let server = config.get_server("remote").unwrap();
+                    assert!(!server.stdio_configured);
+                    assert!(server.command.is_empty());
+                    assert_eq!(server.disabled, disabled);
+                    let http = server.http_endpoint_config().unwrap();
+                    assert_eq!(http.policy(), super::super::ProtocolPolicy::ModernOnly);
+                    assert_eq!(http.modern_post.as_ref().unwrap().as_str(), url);
+                    assert!(http.legacy_sse.is_none());
+                    assert!(http.legacy_message_post.is_none());
+                    assert_eq!(config.enabled_servers().is_empty(), disabled);
+                    let key = http.endpoint_bundle().key();
+
+                    let encoded: serde_json::Value =
+                        serde_json::from_str(&config.to_json()).unwrap();
+                    assert!(encoded["mcpServers"]["remote"].get("command").is_none());
+                    assert!(encoded["mcpServers"]["remote"].get("args").is_none());
+                    assert!(encoded["mcpServers"]["remote"].get("env").is_none());
+                    for restored in [
+                        McpConfig::from_json(&config.to_json()).unwrap(),
+                        McpConfig::from_toml(&config.to_toml()).unwrap(),
+                    ] {
+                        let remote = restored.get_server("remote").unwrap();
+                        assert!(!remote.stdio_configured);
+                        assert_eq!(remote.disabled, disabled);
+                        assert_eq!(
+                            remote.http_endpoint_config().unwrap().endpoint_bundle().key(),
+                            key
+                        );
+                    }
+                    let direct: ServerConfig =
+                        serde_json::from_value(encoded["mcpServers"]["remote"].clone()).unwrap();
+                    assert!(!direct.stdio_configured);
+                    assert_eq!(
+                        direct.http_endpoint_config().unwrap().endpoint_bundle().key(),
+                        key
+                    );
+                }
+            }
+        }
+        let toml = "[mcp_servers.remote]\ntype = \"http\"\nurl = \"https://example.test/mcp?tenant=one\"\n";
+        let config = McpConfig::from_toml(toml).unwrap();
+        assert!(!config.get_server("remote").unwrap().stdio_configured);
+    }
+
+    #[test]
+    fn literal_http_registry_partitions_include_the_complete_endpoint() {
+        let endpoint = |url: &str| HttpEndpointConfig::from_literal_url(url.to_owned()).unwrap();
+        let first = endpoint("https://example.test/mcp?tenant=one");
+        let equivalent = endpoint("https://EXAMPLE.test:443/mcp?tenant=one");
+        assert_eq!(first.endpoint_bundle().key(), equivalent.endpoint_bundle().key());
+        for changed in [
+            "https://example.test/other?tenant=one",
+            "https://example.test/mcp?tenant=two",
+            "https://example.test/mcp?",
+            "https://example.test/mcp",
+        ] {
+            let changed = endpoint(changed);
+            assert_ne!(first.endpoint_bundle().key(), changed.endpoint_bundle().key());
+            assert_ne!(first.security_partition, changed.security_partition);
+            assert_ne!(first.credential_partition, changed.credential_partition);
+        }
+        assert_ne!(
+            endpoint("https://example.test/mcp?").endpoint_bundle().key(),
+            endpoint("https://example.test/mcp").endpoint_bundle().key()
+        );
+        assert!(!first.security_partition.contains("tenant"));
+        assert!(!format!("{first:?}").contains("tenant"));
+    }
+
+    #[test]
+    fn literal_http_registry_rejects_conflicting_or_unimplemented_controls() {
+        for registry in ["mcpServers", "mcp_servers", "servers"] {
+            for (field, value) in [
+                ("command", serde_json::json!("server")),
+                ("command", serde_json::json!("")),
+                ("command", serde_json::Value::Null),
+                ("args", serde_json::json!([])),
+                ("env", serde_json::json!({})),
+                ("cwd", serde_json::Value::Null),
+                ("http", serde_json::Value::Null),
+                ("headers", serde_json::json!({})),
+                ("headers", serde_json::json!({"Authorization": "Bearer secret-control"})),
+                ("auth", serde_json::json!({"token": "secret-control"})),
+                ("envFile", serde_json::json!("/run/secrets/mcp.env")),
+                ("sandbox", serde_json::json!({"enabled": true})),
+                ("dev", serde_json::json!({"watch": "**/*.rs"})),
+            ] {
+                let mut server =
+                    serde_json::json!({"type":"http", "url":"https://example.test/mcp"});
+                server[field] = value;
+                let source = serde_json::json!({(registry): {"remote": server}}).to_string();
+                for error in [
+                    McpConfig::from_json(&source).unwrap_err(),
+                    McpConfig::from_jsonc(&source).unwrap_err(),
+                ] {
+                    assert!(matches!(error, ConfigError::ParseError(_)), "{registry}: {field}");
+                    assert!(!format!("{error:?}").contains("secret-control"));
+                }
+            }
+            for server in [
+                serde_json::json!({"url":"https://example.test/mcp"}),
+                serde_json::json!({"type":"stdio", "url":"https://example.test/mcp"}),
+                serde_json::json!({"type":"sse", "url":"https://example.test/mcp"}),
+                serde_json::json!({"type":"http"}),
+                serde_json::json!({"type":"http", "url":null}),
+            ] {
+                let source = serde_json::json!({(registry): {"remote": server}}).to_string();
+                assert!(McpConfig::from_json(&source).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn literal_http_registry_rejects_credential_syntax_fragments_and_variables() {
+        for url in [
+            "https://user:secret-url@example.test/mcp",
+            "https://@example.test/mcp",
+            "https://example.test/mcp#fragment",
+            "https://example.test/mcp#",
+            concat!("https://", "$", "{input:host}/mcp"),
+            concat!("https://example.test/mcp?token=", "$", "{env:TOKEN}"),
+            " https://example.test/mcp",
+            "https://example.test/mcp\n",
+            "https://example.test/mcp\0",
+            "https://example.test/has space",
+            "https:\\example.test\\mcp",
+            "https:example.test/mcp",
+            "https://example.test/mcp?bad=%zz",
+            "wss://example.test/mcp",
+            "/relative/mcp",
+        ] {
+            for registry in ["mcpServers", "servers"] {
+                let source = serde_json::json!({
+                    (registry): {"remote": {"type":"http", "url":url}}
+                })
+                .to_string();
+                let error = McpConfig::from_json(&source).unwrap_err();
+                assert!(matches!(error, ConfigError::ParseError(_)), "{url}");
+                assert!(!format!("{error:?}").contains("secret-url"));
+            }
+        }
+    }
+
+    #[test]
+    fn literal_http_registry_duplicate_fields_cannot_replace_transport_policy() {
+        for fields in [
+            r#""type":"http","type":"http","url":"https://example.test/mcp""#,
+            r#""type":null,"type":"http","url":"https://example.test/mcp""#,
+            r#""type":"http","url":"https://example.test/first","url":"https://example.test/second""#,
+            r#""type":"http","url":null,"url":"https://example.test/mcp""#,
+            r#""type":"http","url":"https://example.test/first","u\u0072l":"https://example.test/second""#,
+            r#""type":"http","url":"https://example.test/mcp","disabled":true,"disabled":false"#,
+            r#""command":"server","cwd":null,"cwd":"/other""#,
+            r#""command":"server","http":null,"http":null"#,
+        ] {
+            for registry in ["mcpServers", "mcp_servers", "servers"] {
+                let source = format!(r#"{{"{registry}":{{"remote":{{{fields}}}}}}}"#);
+                assert!(McpConfig::from_json(&source).is_err(), "{registry}: {fields}");
+                assert!(McpConfig::from_jsonc(&source).is_err());
+            }
+        }
     }
 
     #[test]
