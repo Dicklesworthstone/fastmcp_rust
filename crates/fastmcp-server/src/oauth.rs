@@ -76,6 +76,10 @@ use fastmcp_core::{
     AccessToken, AuthContext, CanonicalResourceId, McpContext, McpError, McpErrorCode, McpResult,
     SecurityIdentifier, Sha256Digest, draw_security_identifier, sha256_bounded,
 };
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+use fastmcp_protocol::jose::{AdmittedRsaJwks, verify_compact_jws_rs256};
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+use fastmcp_protocol::security_admission::{CompactJwsProfile, admit_compact_jws};
 use url::{Host, Url};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -94,6 +98,8 @@ const AUTHORIZATION_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:authorization-grant
 const DIRECT_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:direct-grant-id:v1\0";
 #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
 const CLIENT_CREDENTIALS_GRANT_ID_DOMAIN: &[u8] = b"fastmcp:oauth:machine-grant-id:v1\0";
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+const CLIENT_ASSERTION_REPLAY_DOMAIN: &[u8] = b"fastmcp:oauth:client-assertion-replay:v1\0";
 const OAUTH_SESSION_OWNER_DOMAIN: &[u8] = b"fastmcp:oauth:session-owner:v1\0";
 const OAUTH_REGISTRATION_EPOCH_BYTES: usize = 32;
 const CLIENT_SECRET_SALT_BYTES: usize = 32;
@@ -157,6 +163,20 @@ pub const MAX_OAUTH_PARAMETER_PAIRS: usize = 64;
 pub const MAX_OAUTH_PARAMETER_NAME_BYTES: usize = 256;
 /// Maximum decoded bytes in one OAuth parameter value.
 pub const MAX_OAUTH_PARAMETER_VALUE_BYTES: usize = MAX_OAUTH_STATE_BYTES;
+
+/// The exact RFC 7523 form value used by private-key client authentication.
+pub const JWT_BEARER_CLIENT_ASSERTION_TYPE: &str =
+    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+/// Maximum assertion size accepted by the bounded development issuer.
+pub const MAX_DEVELOPMENT_CLIENT_ASSERTION_BYTES: usize = MAX_OAUTH_PARAMETER_VALUE_BYTES;
+/// Maximum admitted lifetime, in seconds, of a development client assertion.
+pub const MAX_DEVELOPMENT_CLIENT_ASSERTION_LIFETIME_SECONDS: u64 = 60;
+/// Hard deployment-wide count of unexpired development assertion replay IDs.
+pub const MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS: usize = 1_024;
+/// Hard per-client count of unexpired development assertion replay IDs.
+pub const MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT: usize = 64;
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+const MAX_CLIENT_ASSERTION_JTI_BYTES: usize = 256;
 
 const OAUTH_ISSUER_ERROR: &str = "OAuth issuer URL is invalid or outside retained-value bounds";
 const OAUTH_CLIENT_ID_RETENTION_ERROR: &str = "OAuth client_id is outside retained-value bounds";
@@ -253,12 +273,23 @@ impl OAuthParameterEndpoint {
                 "resource" => Some(OAuthParameterName::Resource),
                 "client_id" => Some(OAuthParameterName::ClientId),
                 "client_secret" => Some(OAuthParameterName::ClientSecret),
+                "client_assertion" => Some(OAuthParameterName::ClientAssertion),
+                "client_assertion_type" => Some(OAuthParameterName::ClientAssertionType),
                 "code_verifier" => Some(OAuthParameterName::CodeVerifier),
                 "refresh_token" => Some(OAuthParameterName::RefreshToken),
                 "scope" => Some(OAuthParameterName::Scope),
                 _ => None,
             },
-            Self::RevocationForm | Self::IntrospectionForm => match name {
+            Self::RevocationForm => match name {
+                "token" => Some(OAuthParameterName::Token),
+                "token_type_hint" => Some(OAuthParameterName::TokenTypeHint),
+                "client_id" => Some(OAuthParameterName::ClientId),
+                "client_secret" => Some(OAuthParameterName::ClientSecret),
+                "client_assertion" => Some(OAuthParameterName::ClientAssertion),
+                "client_assertion_type" => Some(OAuthParameterName::ClientAssertionType),
+                _ => None,
+            },
+            Self::IntrospectionForm => match name {
                 "token" => Some(OAuthParameterName::Token),
                 "token_type_hint" => Some(OAuthParameterName::TokenTypeHint),
                 "client_id" => Some(OAuthParameterName::ClientId),
@@ -307,6 +338,10 @@ pub enum OAuthParameterName {
     Code,
     /// `client_secret`
     ClientSecret,
+    /// RFC 7523 `client_assertion`; accepted only by its explicitly enabled flow.
+    ClientAssertion,
+    /// RFC 7523 `client_assertion_type`.
+    ClientAssertionType,
     /// `code_verifier`
     CodeVerifier,
     /// `refresh_token`
@@ -449,6 +484,10 @@ pub struct OAuthAuthorizationServerMetadata {
     pub grant_types_supported: Vec<&'static str>,
     pub token_endpoint_auth_methods_supported: Vec<&'static str>,
     pub revocation_endpoint_auth_methods_supported: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_signing_alg_values_supported: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint_auth_signing_alg_values_supported: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub introspection_endpoint_auth_methods_supported: Option<Vec<&'static str>>,
     pub code_challenge_methods_supported: [&'static str; 1],
@@ -631,6 +670,12 @@ impl OAuthHttpRoutes {
         if self.server.config().allow_public_clients {
             methods.push("none");
         }
+        let assertion_algorithms = if self.server.development_client_credentials_enabled() {
+            methods.push("private_key_jwt");
+            Some(vec!["RS256"])
+        } else {
+            None
+        };
         Ok(OAuthAuthorizationServerMetadata {
             issuer: self.server.config().issuer.clone(),
             authorization_endpoint: format!("{base}/authorize"),
@@ -649,6 +694,8 @@ impl OAuthHttpRoutes {
             grant_types_supported: self.server.supported_grant_types(),
             token_endpoint_auth_methods_supported: methods.clone(),
             revocation_endpoint_auth_methods_supported: methods,
+            token_endpoint_auth_signing_alg_values_supported: assertion_algorithms.clone(),
+            revocation_endpoint_auth_signing_alg_values_supported: assertion_algorithms,
             introspection_endpoint_auth_methods_supported: self
                 .introspection_path
                 .as_ref()
@@ -1174,7 +1221,8 @@ pub const HARD_MAX_REVOCATION_TOMBSTONES_PER_CLIENT: usize =
 /// Hard aggregate ceiling across every globally retained OAuth state map.
 ///
 /// This covers registered clients, pending authorization codes, live access
-/// and refresh tokens, and revocation tombstones. Per-client limits partition
+/// and refresh tokens, revocation tombstones, and the fixed assertion replay
+/// allowance when development machine issuance is enabled. Per-client limits partition
 /// those same global entries and therefore are not added a second time.
 pub const HARD_MAX_OAUTH_RETAINED_ENTRIES: usize = 256 * 1_024;
 
@@ -1199,9 +1247,10 @@ pub struct OAuthServerConfig {
     /// issuer. Each confidential client must also have its own explicit
     /// [`DevelopmentClientCredentialsGrant`]; browser scopes confer no rights.
     ///
-    /// This opt-in uses the existing in-memory opaque-token store and secret
-    /// verifier. It does not activate a production issuer, private-key JWT
-    /// authentication, or an official-draft MCP extension advertisement.
+    /// This opt-in uses the existing in-memory opaque-token store. A client
+    /// authenticates using its registered HTTP Basic secret or an explicitly
+    /// installed [`DevelopmentPrivateKeyJwtPolicy`]. It does not activate a
+    /// production issuer or an official-draft MCP extension advertisement.
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     pub allow_development_client_credentials: bool,
     /// Enables RFC 7662 access-token introspection for the single-process
@@ -1433,12 +1482,20 @@ impl OAuthServerConfig {
     }
 
     fn checked_global_retention_limit(&self) -> Result<usize, OAuthError> {
+        let assertion_replays = 0;
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        let assertion_replays = if self.allow_development_client_credentials {
+            MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS
+        } else {
+            assertion_replays
+        };
         [
             self.max_clients,
             self.max_authorization_codes,
             self.max_access_tokens,
             self.max_refresh_tokens,
             self.max_revocation_tombstones,
+            assertion_replays,
         ]
         .into_iter()
         .try_fold(0_usize, |total, limit| {
@@ -1458,7 +1515,7 @@ impl OAuthServerConfig {
 /// OAuth client types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientType {
-    /// Confidential client (has a secret).
+    /// Confidential client (has a secret or an explicitly registered public key).
     Confidential,
     /// Public client (no secret, e.g., native apps, SPAs).
     Public,
@@ -1475,6 +1532,9 @@ pub enum TokenEndpointAuthMethod {
     ClientSecretBasic,
     /// Client credentials in the form body and no Authorization header.
     ClientSecretPost,
+    /// Preregistered RS256 assertions for the development machine issuer.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    PrivateKeyJwt,
     /// Public-client identification without a client secret.
     None,
 }
@@ -1486,9 +1546,168 @@ impl TokenEndpointAuthMethod {
         match self {
             Self::ClientSecretBasic => "client_secret_basic",
             Self::ClientSecretPost => "client_secret_post",
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            Self::PrivateKeyJwt => "private_key_jwt",
             Self::None => "none",
         }
     }
+}
+
+/// An exact, administratively selected audience for one assertion endpoint.
+///
+/// Token and revocation endpoints make independent selections. Neither a
+/// request nor a JWT may choose between these alternatives.
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevelopmentClientAssertionAudience {
+    /// The preserved HTTPS issuer identifier, including its exact trailing slash.
+    Issuer,
+    /// The preserved HTTPS URL of the endpoint receiving this assertion.
+    Endpoint,
+}
+
+/// Immutable preregistered public keys for one development machine client.
+///
+/// This is trusted deployment configuration, never a DCR document or a key
+/// reference from an assertion. It permits only RS256, an absent JOSE typ,
+/// scalar exact audiences, and assertions lasting at most 60 seconds with
+/// required integer iat/exp and a bounded one-use jti. The issuer retains
+/// replay IDs in process memory; this is not a durable production issuer.
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+#[derive(Clone)]
+pub struct DevelopmentPrivateKeyJwtPolicy {
+    issuer: String,
+    client_id: String,
+    token_endpoint: String,
+    token_audience: DevelopmentClientAssertionAudience,
+    revocation: Option<(String, DevelopmentClientAssertionAudience)>,
+    configuration_generation: u64,
+    keys: AdmittedRsaJwks,
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl DevelopmentPrivateKeyJwtPolicy {
+    /// Admits an issuer-bound registration and its bounded public RSA JWKS.
+    ///
+    /// All strings are retained and compared exactly. A policy change requires
+    /// a new registration: unregistering the old client revokes its tokens,
+    /// and registration draws a fresh non-reusable ownership epoch.
+    pub fn new(
+        issuer: impl Into<String>,
+        client_id: impl Into<String>,
+        token_endpoint: impl Into<String>,
+        token_audience: DevelopmentClientAssertionAudience,
+        configuration_generation: u64,
+        jwks_json: &[u8],
+    ) -> Result<Self, OAuthError> {
+        let issuer = issuer.into();
+        let client_id = client_id.into();
+        let token_endpoint = token_endpoint.into();
+        validate_oauth_issuer(&issuer)?;
+        validate_client_id_admission(&client_id)?;
+        validate_client_assertion_endpoint(&token_endpoint)?;
+        if configuration_generation == 0
+            || client_id == issuer
+            || client_id == token_endpoint
+        {
+            return Err(OAuthError::InvalidRequest(
+                "invalid development client assertion registration".to_string(),
+            ));
+        }
+        let keys = AdmittedRsaJwks::from_json(jwks_json).map_err(|_| {
+            OAuthError::InvalidRequest("invalid registered client assertion keys".to_string())
+        })?;
+        Ok(Self {
+            issuer,
+            client_id,
+            token_endpoint,
+            token_audience,
+            revocation: None,
+            configuration_generation,
+            keys,
+        })
+    }
+
+    /// Registers a separate exact revocation endpoint and audience policy.
+    /// Without this explicit agreement, assertions cannot revoke tokens.
+    pub fn with_revocation_endpoint(
+        mut self,
+        endpoint: impl Into<String>,
+        audience: DevelopmentClientAssertionAudience,
+    ) -> Result<Self, OAuthError> {
+        let endpoint = endpoint.into();
+        validate_client_assertion_endpoint(&endpoint)?;
+        if endpoint == self.token_endpoint || endpoint == self.client_id {
+            return Err(OAuthError::InvalidRequest(
+                "invalid development assertion revocation endpoint".to_string(),
+            ));
+        }
+        self.revocation = Some((endpoint, audience));
+        Ok(self)
+    }
+
+    /// Exact issuer to which the registration belongs.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Client identifier whose public key authenticates this registration.
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// Exact endpoint that may receive token-grant assertions.
+    #[must_use]
+    pub fn token_endpoint(&self) -> &str {
+        &self.token_endpoint
+    }
+
+    /// Immutable deployment configuration generation.
+    #[must_use]
+    pub const fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    fn audience(&self, endpoint: &str, revocation: bool) -> Option<&str> {
+        let (expected, audience) = if revocation {
+            let (expected, audience) = self.revocation.as_ref()?;
+            (expected.as_str(), *audience)
+        } else {
+            (self.token_endpoint.as_str(), self.token_audience)
+        };
+        if endpoint != expected {
+            return None;
+        }
+        Some(match audience {
+            DevelopmentClientAssertionAudience::Issuer => &self.issuer,
+            DevelopmentClientAssertionAudience::Endpoint => expected,
+        })
+    }
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl std::fmt::Debug for DevelopmentPrivateKeyJwtPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DevelopmentPrivateKeyJwtPolicy")
+            .field("configuration_generation", &self.configuration_generation)
+            .field("registered_key_count", &self.keys.len())
+            .field("revocation_enabled", &self.revocation.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+fn validate_client_assertion_endpoint(endpoint: &str) -> Result<(), OAuthError> {
+    if !parse_secure_endpoint(endpoint, MAX_OAUTH_ISSUER_BYTES, EndpointSpelling::Exact)
+        .is_some_and(|url| url.scheme() == "https" && url.query().is_none())
+    {
+        return Err(OAuthError::InvalidRequest(
+            "invalid development client assertion endpoint".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Administrative permission to inspect access tokens for one exact resource.
@@ -1531,7 +1750,7 @@ impl std::fmt::Debug for DevelopmentTokenIntrospectionGrant {
 /// Administrative authorization for one machine client at one exact resource.
 ///
 /// This is deliberately separate from browser redirect and consent scopes.
-/// Only an explicit confidential, HTTP Basic registration may carry it. It
+/// Only an explicit confidential Basic or private-key registration may carry it. It
 /// belongs to the single-process development issuer, whose opaque tokens and
 /// in-memory revocation state are not the production AUTH-06 issuer profile.
 #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
@@ -1688,6 +1907,8 @@ pub struct OAuthClient {
     pub allowed_scopes: HashSet<String>,
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    development_private_key_jwt: Option<Arc<DevelopmentPrivateKeyJwtPolicy>>,
     #[cfg(feature = "builtin-auth-server")]
     development_token_introspection: Option<DevelopmentTokenIntrospectionGrant>,
     /// Client name (for display).
@@ -1702,6 +1923,8 @@ struct RegisteredOAuthClient {
     metadata: OAuthClientMetadata,
     secret_verifier: Option<ClientSecretVerifier>,
     registration_epoch: OAuthRegistrationEpoch,
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    development_private_key_jwt: Option<Arc<DevelopmentPrivateKeyJwtPolicy>>,
 }
 
 impl RegisteredOAuthClient {
@@ -1720,6 +1943,8 @@ impl RegisteredOAuthClient {
             metadata,
             secret_verifier,
             registration_epoch,
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            development_private_key_jwt: client.development_private_key_jwt,
         })
     }
 
@@ -1911,16 +2136,20 @@ impl OAuthClient {
             ));
         }
 
+        #[cfg(not(all(feature = "builtin-auth-server", feature = "oauth-client-credentials")))]
+        let private_key_client = false;
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        let private_key_client = self.development_private_key_jwt.is_some();
         let credential_class_is_consistent = matches!(
             (self.client_type, self.client_secret.is_some()),
             (ClientType::Public, false) | (ClientType::Confidential, true)
-        );
+        ) || (private_key_client && self.client_type == ClientType::Confidential);
         if !credential_class_is_consistent {
             return Err(OAuthError::InvalidRequest(
                 OAUTH_CLIENT_CREDENTIAL_CLASS_ERROR.to_string(),
             ));
         }
-        if !matches!(
+        let method_matches_class = matches!(
             (self.client_type, self.token_endpoint_auth_method),
             (ClientType::Public, TokenEndpointAuthMethod::None)
                 | (
@@ -1928,10 +2157,30 @@ impl OAuthClient {
                     TokenEndpointAuthMethod::ClientSecretBasic
                         | TokenEndpointAuthMethod::ClientSecretPost
                 )
-        ) {
+        );
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        let method_matches_class = method_matches_class
+            || (private_key_client
+                && self.client_type == ClientType::Confidential
+                && self.token_endpoint_auth_method == TokenEndpointAuthMethod::PrivateKeyJwt);
+        if !method_matches_class {
             return Err(OAuthError::InvalidRequest(
                 "client authentication method does not match credential class".to_string(),
             ));
+        }
+
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        if let Some(policy) = &self.development_private_key_jwt {
+            if self.client_secret.is_some()
+                || self.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
+                || self.client_type != ClientType::Confidential
+                || self.development_client_credentials.is_none()
+                || policy.client_id != self.client_id
+            {
+                return Err(OAuthError::InvalidRequest(
+                    "inconsistent development private-key client registration".to_string(),
+                ));
+            }
         }
 
         let requires_redirect = true;
@@ -1942,10 +2191,14 @@ impl OAuthClient {
         #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
         if self.development_client_credentials.is_some()
             && (self.client_type != ClientType::Confidential
-                || self.token_endpoint_auth_method != TokenEndpointAuthMethod::ClientSecretBasic)
+                || !matches!(
+                    self.token_endpoint_auth_method,
+                    TokenEndpointAuthMethod::ClientSecretBasic
+                        | TokenEndpointAuthMethod::PrivateKeyJwt
+                ))
         {
             return Err(OAuthError::InvalidRequest(
-                "development machine clients require confidential HTTP Basic registration"
+                "development machine clients require confidential Basic or private-key registration"
                     .to_string(),
             ));
         }
@@ -2054,6 +2307,8 @@ pub struct OAuthClientBuilder {
     allowed_scopes: HashSet<String>,
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     development_client_credentials: Option<DevelopmentClientCredentialsGrant>,
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    development_private_key_jwt: Option<Arc<DevelopmentPrivateKeyJwtPolicy>>,
     #[cfg(feature = "builtin-auth-server")]
     development_token_introspection: Option<DevelopmentTokenIntrospectionGrant>,
     name: Option<String>,
@@ -2091,6 +2346,8 @@ impl OAuthClientBuilder {
             allowed_scopes: HashSet::new(),
             #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
             development_client_credentials: None,
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            development_private_key_jwt: None,
             #[cfg(feature = "builtin-auth-server")]
             development_token_introspection: None,
             name: None,
@@ -2128,6 +2385,19 @@ impl OAuthClientBuilder {
         grant: DevelopmentClientCredentialsGrant,
     ) -> Self {
         self.development_client_credentials = Some(grant);
+        self
+    }
+
+    /// Binds a machine-only confidential client to preregistered RS256 keys.
+    ///
+    /// The registration must also contain an explicit machine resource/scope
+    /// grant. Combining this policy with a secret, another authentication
+    /// method, another client ID, or introspection permission fails at build.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[must_use]
+    pub fn development_private_key_jwt(mut self, policy: DevelopmentPrivateKeyJwtPolicy) -> Self {
+        self.token_endpoint_auth_method = Some(TokenEndpointAuthMethod::PrivateKeyJwt);
+        self.development_private_key_jwt = Some(Arc::new(policy));
         self
     }
 
@@ -2205,7 +2475,11 @@ impl OAuthClientBuilder {
     /// Returns an error if the client metadata is empty, inconsistent, or
     /// exceeds a retained-value or retained-count bound.
     pub fn build(self) -> Result<OAuthClient, OAuthError> {
-        let client_type = if self.client_credential.is_some() {
+        #[cfg(not(all(feature = "builtin-auth-server", feature = "oauth-client-credentials")))]
+        let private_key_client = false;
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        let private_key_client = self.development_private_key_jwt.is_some();
+        let client_type = if self.client_credential.is_some() || private_key_client {
             ClientType::Confidential
         } else {
             ClientType::Public
@@ -2226,6 +2500,8 @@ impl OAuthClientBuilder {
             allowed_scopes: self.allowed_scopes,
             #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
             development_client_credentials: self.development_client_credentials,
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            development_private_key_jwt: self.development_private_key_jwt,
             #[cfg(feature = "builtin-auth-server")]
             development_token_introspection: self.development_token_introspection,
             name: self.name,
@@ -3095,6 +3371,105 @@ pub(crate) struct RevocationTombstone {
     pub(crate) expires_at: Instant,
 }
 
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+struct ClientAssertionReplay {
+    client_id: String,
+    expires_at_unix_seconds: u64,
+}
+
+/// Verification snapshots the immutable registration outside the mutation
+/// gate. The exact epoch and policy allocation must still be current when
+/// replay admission and the authorized operation commit under one write lock.
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+struct VerifiedDevelopmentClientAssertion {
+    client_id: String,
+    registration_epoch: OAuthRegistrationEpoch,
+    policy: Arc<DevelopmentPrivateKeyJwtPolicy>,
+    replay_key: Sha256Digest,
+    issued_at_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+    not_before_unix_seconds: Option<u64>,
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+impl VerifiedDevelopmentClientAssertion {
+    fn validate_current(&self, state: &OAuthServerState) -> Result<u64, OAuthError> {
+        let client = state
+            .clients
+            .get(&self.client_id)
+            .ok_or_else(invalid_client_assertion)?;
+        if client.registration_epoch != self.registration_epoch
+            || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
+            || client.development_private_key_jwt.as_ref().is_none_or(|policy| {
+                policy.configuration_generation != self.policy.configuration_generation
+                    || !Arc::ptr_eq(policy, &self.policy)
+            })
+        {
+            return Err(invalid_client_assertion());
+        }
+        let now = client_assertion_unix_seconds()?;
+        if now < state.client_assertion_time_floor
+            || self.issued_at_unix_seconds > now
+            || self.expires_at_unix_seconds <= now
+            || self.not_before_unix_seconds.is_some_and(|not_before| not_before > now)
+            || state
+                .client_assertion_replays
+                .get(&self.replay_key)
+                .is_some_and(|entry| entry.expires_at_unix_seconds > now)
+        {
+            return Err(invalid_client_assertion());
+        }
+        let active = state
+            .client_assertion_replays
+            .values()
+            .filter(|entry| entry.expires_at_unix_seconds > now);
+        let mut total = 0;
+        let mut owned = 0;
+        for entry in active {
+            total += 1;
+            owned += usize::from(entry.client_id == self.client_id);
+        }
+        if total >= MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS
+            || owned >= MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT
+        {
+            return Err(capacity_error("client assertion replay guards"));
+        }
+        Ok(now)
+    }
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+fn invalid_client_assertion() -> OAuthError {
+    OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+fn client_assertion_unix_seconds() -> Result<u64, OAuthError> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| invalid_client_assertion())
+}
+
+fn admit_revocation_token_value(
+    token: &str,
+) -> Result<Option<(CredentialDigest, CredentialDigest)>, OAuthError> {
+    if token.len() > OAUTH_OPAQUE_CREDENTIAL_BYTES || token.chars().any(char::is_control) {
+        return Err(OAuthError::InvalidRequest(
+            "revocation token is outside admitted bounds".to_string(),
+        ));
+    }
+    validate_opaque_credential(token, "revocation token is invalid")
+        .is_ok()
+        .then(|| {
+            Ok((
+                digest_credential(CredentialKind::AccessToken, token)?,
+                digest_credential(CredentialKind::RefreshToken, token)?,
+            ))
+        })
+        .transpose()
+}
+
 /// Internal state for the OAuth server.
 pub(crate) struct OAuthServerState {
     /// Registered clients by client_id.
@@ -3108,6 +3483,14 @@ pub(crate) struct OAuthServerState {
     /// Revoked tokens retained to their own expiry; refresh replay guards are
     /// retained to the fixed absolute deadline of their grant family.
     pub(crate) revoked_tokens: HashMap<CredentialDigest, RevocationTombstone>,
+    /// Keys bind client ID and jti, deliberately excluding registration epoch
+    /// and endpoint so rotation and revoke/token crossings cannot erase replay.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    client_assertion_replays: HashMap<Sha256Digest, ClientAssertionReplay>,
+    /// Monotonic high-water Unix timestamp. Once expiry cleanup observed a
+    /// timestamp, a wall-clock rollback cannot make a discarded assertion live.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    client_assertion_time_floor: u64,
 }
 
 impl OAuthServerState {
@@ -3118,6 +3501,10 @@ impl OAuthServerState {
             access_tokens: HashMap::new(),
             refresh_tokens: HashMap::new(),
             revoked_tokens: HashMap::new(),
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            client_assertion_replays: HashMap::new(),
+            #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+            client_assertion_time_floor: 0,
         }
     }
 
@@ -3129,6 +3516,78 @@ impl OAuthServerState {
             .retain(|_, token| token.expires_at > now);
         self.revoked_tokens
             .retain(|_, tombstone| tombstone.expires_at > now);
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        if let Ok(now_unix_seconds) = client_assertion_unix_seconds() {
+            self.advance_assertion_time(now_unix_seconds);
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn advance_assertion_time(&mut self, now_unix_seconds: u64) {
+        self.client_assertion_time_floor = self.client_assertion_time_floor.max(now_unix_seconds);
+        let floor = self.client_assertion_time_floor;
+        self.client_assertion_replays
+            .retain(|_, entry| entry.expires_at_unix_seconds > floor);
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn commit_client_assertion(
+        &mut self,
+        assertion: &VerifiedDevelopmentClientAssertion,
+        now_unix_seconds: u64,
+    ) {
+        self.advance_assertion_time(now_unix_seconds);
+        self.client_assertion_replays.insert(
+            assertion.replay_key,
+            ClientAssertionReplay {
+                client_id: assertion.client_id.clone(),
+                expires_at_unix_seconds: assertion.expires_at_unix_seconds,
+            },
+        );
+    }
+
+    fn revoke_presented_token(
+        &mut self,
+        admitted_token: Option<(CredentialDigest, CredentialDigest)>,
+        client_id: &str,
+        config: &OAuthServerConfig,
+        now: Instant,
+    ) {
+        let Some((access_digest, refresh_digest)) = admitted_token else {
+            return;
+        };
+        let access = self.access_tokens.get(&access_digest).cloned();
+        let refresh = self.refresh_tokens.get(&refresh_digest).cloned();
+        let refresh_tombstone = self.revoked_tokens.get(&refresh_digest).cloned();
+        if access.as_ref().is_some_and(|entry| entry.client_id != client_id)
+            || refresh.as_ref().is_some_and(|entry| entry.client_id != client_id)
+            || refresh_tombstone.as_ref().is_some_and(|entry| entry.client_id != client_id)
+        {
+            // RFC 7009 makes unknown tokens and other clients' tokens
+            // indistinguishable. The ownership decision and removal share
+            // the authoritative write lock for both authentication methods.
+            return;
+        }
+        if let Some(access) = self.access_tokens.remove(&access_digest) {
+            self.insert_tombstone_bounded(
+                access_digest,
+                RevocationTombstone {
+                    client_id: client_id.to_string(),
+                    grant_id: access.grant_id,
+                    replay_guard: false,
+                    expires_at: access.expires_at,
+                },
+                config,
+                now,
+            );
+        }
+        let refresh_grant_id = refresh
+            .as_ref()
+            .map(|entry| entry.grant_id)
+            .or_else(|| refresh_tombstone.map(|entry| entry.grant_id));
+        if let Some(grant_id) = refresh_grant_id {
+            self.revoke_grant_family(grant_id, client_id, config, now);
+        }
     }
 
     fn authorization_code_count_for_client(&self, client_id: &str) -> usize {
@@ -3555,6 +4014,17 @@ impl OAuthServer {
         // object immediately before it can enter persistent server state.
         client.validate_for_retention()?;
 
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        if client
+            .development_private_key_jwt
+            .as_ref()
+            .is_some_and(|policy| policy.issuer != self.config.issuer)
+        {
+            return Err(OAuthError::InvalidRequest(
+                "client assertion registration belongs to another issuer".to_string(),
+            ));
+        }
+
         if client.client_type == ClientType::Public && !self.config.allow_public_clients {
             return Err(OAuthError::InvalidClient(
                 "public clients are not allowed".to_string(),
@@ -3605,8 +4075,10 @@ impl OAuthServer {
             .refresh_tokens
             .retain(|_, token| token.client_id != client_id);
         // No descendant remains after unregistration. Purging the old
-        // registration's tombstones prevents a later registration with the
-        // same public client ID from inheriting replay-guard capacity or state.
+        // registration's refresh tombstones prevents a later registration
+        // from inheriting refresh-family state. Client-assertion replay IDs
+        // deliberately survive until expiry, preventing unregister/register
+        // from replaying the same still-valid signed authentication.
         state
             .revoked_tokens
             .retain(|_, tombstone| tombstone.client_id != client_id);
@@ -4028,10 +4500,184 @@ impl OAuthServer {
         }
     }
 
+    /// Exchanges one RS256 client assertion for a development machine token.
+    ///
+    /// The token_endpoint argument is the trusted public URL of the receiving
+    /// endpoint, supplied by transport configuration. It must equal the
+    /// immutable registration even when the JWT audience is the issuer URL.
+    /// Verified iss/sub identifies the client; there is no independent
+    /// client-ID or secret override. Native HTTP additionally enforces the
+    /// exact assertion type, grant and credential-location rules.
+    ///
+    /// The opaque access token retains the existing resource/scope and
+    /// registration ownership boundaries. No refresh token or user identity is
+    /// issued. Replay IDs and tokens commit atomically in this process only.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    pub fn token_with_development_private_key_jwt(
+        &self,
+        assertion: &str,
+        token_endpoint: &str,
+        resource: &str,
+        scopes: &[String],
+    ) -> Result<TokenResponse, OAuthError> {
+        validate_optional_authorization_resource(Some(resource))?;
+        let scopes = canonicalize_request_scopes(scopes)?;
+        let verified = self.verify_development_client_assertion(assertion, token_endpoint, false)?;
+        let request = TokenRequest {
+            grant_type: "client_credentials".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: verified.client_id.clone(),
+            client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
+            code_verifier: None,
+            refresh_token: None,
+            scopes: Some(scopes),
+            resource: Some(resource.to_string()),
+        };
+        self.token_client_credentials_authenticated_with_draw(
+            &request,
+            Some(&verified),
+            draw_security_identifier,
+        )
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn verify_development_client_assertion(
+        &self,
+        assertion: &str,
+        endpoint: &str,
+        revocation: bool,
+    ) -> Result<VerifiedDevelopmentClientAssertion, OAuthError> {
+        self.config.validate()?;
+        if !self.config.allow_development_client_credentials {
+            return Err(OAuthError::UnsupportedGrantType(
+                OAUTH_GRANT_TYPE_UNSUPPORTED_ERROR.to_string(),
+            ));
+        }
+        if assertion.is_empty() || assertion.len() > MAX_DEVELOPMENT_CLIENT_ASSERTION_BYTES {
+            return Err(invalid_client_assertion());
+        }
+        let admitted = admit_compact_jws(CompactJwsProfile::Rfc7523ClientAssertion, assertion)
+            .map_err(|_| invalid_client_assertion())?;
+        if admitted.header().algorithm() != "RS256"
+            || admitted.header().media_type().is_some()
+            || admitted.header().key_id().is_none()
+        {
+            return Err(invalid_client_assertion());
+        }
+        let claims = admitted.claims();
+        let client_id = claims
+            .get("sub")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_client_assertion)?;
+        validate_client_id_admission(client_id).map_err(|_| invalid_client_assertion())?;
+        if claims.get("iss").and_then(serde_json::Value::as_str) != Some(client_id) {
+            return Err(invalid_client_assertion());
+        }
+        let audience = claims
+            .get("aud")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(invalid_client_assertion)?;
+        let (policy, registration_epoch) = {
+            let state = self.state.read().map_err(|_| {
+                OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
+            })?;
+            let client = state.clients.get(client_id).ok_or_else(invalid_client_assertion)?;
+            if client.metadata.client_type != ClientType::Confidential
+                || client.metadata.token_endpoint_auth_method != TokenEndpointAuthMethod::PrivateKeyJwt
+                || client.metadata.development_client_credentials.is_none()
+            {
+                return Err(invalid_client_assertion());
+            }
+            (
+                Arc::clone(client.development_private_key_jwt.as_ref().ok_or_else(invalid_client_assertion)?),
+                client.registration_epoch,
+            )
+        };
+        if policy.issuer != self.config.issuer
+            || policy.client_id != client_id
+            || policy.audience(endpoint, revocation) != Some(audience)
+        {
+            return Err(invalid_client_assertion());
+        }
+        // RSA runs without the registry/state lock. The snapshot's epoch and
+        // exact immutable policy are rechecked at the later mutation gate.
+        verify_compact_jws_rs256(assertion, &policy.keys)
+            .map_err(|_| invalid_client_assertion())?;
+        let issued_at_unix_seconds = claims
+            .get("iat")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(invalid_client_assertion)?;
+        let expires_at_unix_seconds = claims
+            .get("exp")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(invalid_client_assertion)?;
+        let not_before_unix_seconds = claims
+            .get("nbf")
+            .map(|value| value.as_u64().ok_or_else(invalid_client_assertion))
+            .transpose()?;
+        let lifetime = expires_at_unix_seconds.checked_sub(issued_at_unix_seconds)
+            .ok_or_else(invalid_client_assertion)?;
+        let now = client_assertion_unix_seconds()?;
+        if !(1..=MAX_DEVELOPMENT_CLIENT_ASSERTION_LIFETIME_SECONDS).contains(&lifetime)
+            || issued_at_unix_seconds > now
+            || expires_at_unix_seconds <= now
+            || not_before_unix_seconds.is_some_and(|not_before| {
+                not_before > now || not_before >= expires_at_unix_seconds
+            })
+        {
+            return Err(invalid_client_assertion());
+        }
+        let jti = claims
+            .get("jti")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= MAX_CLIENT_ASSERTION_JTI_BYTES
+                    && !value.chars().any(char::is_control)
+            })
+            .ok_or_else(invalid_client_assertion)?;
+        const MAX_REPLAY_INPUT: usize = CLIENT_ASSERTION_REPLAY_DOMAIN.len()
+            + 16 + MAX_OAUTH_CLIENT_ID_BYTES + MAX_CLIENT_ASSERTION_JTI_BYTES;
+        let mut replay_input = Zeroizing::new(Vec::with_capacity(MAX_REPLAY_INPUT));
+        replay_input.extend_from_slice(CLIENT_ASSERTION_REPLAY_DOMAIN);
+        for value in [client_id, jti] {
+            let length = u64::try_from(value.len()).map_err(|_| invalid_client_assertion())?;
+            replay_input.extend_from_slice(&length.to_be_bytes());
+            replay_input.extend_from_slice(value.as_bytes());
+        }
+        let replay_key = sha256_bounded(&replay_input, MAX_REPLAY_INPUT)
+            .map_err(|_| invalid_client_assertion())?;
+        Ok(VerifiedDevelopmentClientAssertion {
+            client_id: client_id.to_string(),
+            registration_epoch,
+            policy,
+            replay_key,
+            issued_at_unix_seconds,
+            expires_at_unix_seconds,
+            not_before_unix_seconds,
+        })
+    }
+
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     fn token_client_credentials_with_draw<F, E>(
         &self,
         request: &TokenRequest,
+        draw: F,
+    ) -> Result<TokenResponse, OAuthError>
+    where
+        F: FnMut() -> Result<SecurityIdentifier, E>,
+        E: std::fmt::Display,
+    {
+        self.token_client_credentials_authenticated_with_draw(request, None, draw)
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    fn token_client_credentials_authenticated_with_draw<F, E>(
+        &self,
+        request: &TokenRequest,
+        assertion: Option<&VerifiedDevelopmentClientAssertion>,
         mut draw: F,
     ) -> Result<TokenResponse, OAuthError>
     where
@@ -4083,12 +4729,23 @@ impl OAuthServer {
             .state
             .write()
             .map_err(|_| OAuthError::ServerError("failed to acquire write lock".to_string()))?;
-        let registration_epoch = authenticate_client_or_dummy(
-            &state,
-            &request.client_id,
-            request.client_secret.as_deref(),
-            request.client_authentication_method,
-        )?;
+        let registration_epoch = if let Some(assertion) = assertion {
+            if request.client_id != assertion.client_id
+                || request.client_secret.is_some()
+                || request.client_authentication_method != TokenEndpointAuthMethod::PrivateKeyJwt
+            {
+                return Err(invalid_client_assertion());
+            }
+            assertion.validate_current(&state)?;
+            assertion.registration_epoch
+        } else {
+            authenticate_client_or_dummy(
+                &state,
+                &request.client_id,
+                request.client_secret.as_deref(),
+                request.client_authentication_method,
+            )?
+        };
         let client = state.clients.get(&request.client_id).ok_or_else(|| {
             OAuthError::InvalidClient(OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string())
         })?;
@@ -4102,7 +4759,9 @@ impl OAuthServer {
                 )
             })?;
         if client.metadata.client_type != ClientType::Confidential
-            || request.client_authentication_method != TokenEndpointAuthMethod::ClientSecretBasic
+            || !(request.client_authentication_method == TokenEndpointAuthMethod::ClientSecretBasic
+                || (request.client_authentication_method == TokenEndpointAuthMethod::PrivateKeyJwt
+                    && assertion.is_some()))
         {
             return Err(OAuthError::InvalidClient(
                 OAUTH_CLIENT_AUTHENTICATION_ERROR.to_string(),
@@ -4171,6 +4830,10 @@ impl OAuthServer {
                 registration_epoch,
                 family_expires_at: expires_at,
             };
+            if let Some(assertion) = assertion {
+                let now_unix_seconds = assertion.validate_current(&state)?;
+                state.commit_client_assertion(assertion, now_unix_seconds);
+            }
             state.cleanup_expired_at(issued_at);
             state.access_tokens.insert(access_digest, metadata);
             return Ok(TokenResponse {
@@ -4678,66 +5341,37 @@ impl OAuthServer {
         method: TokenEndpointAuthMethod,
     ) -> Result<(), OAuthError> {
         validate_client_authentication_admission(client_id, client_secret)?;
-        if token.len() > OAUTH_OPAQUE_CREDENTIAL_BYTES || token.chars().any(char::is_control) {
-            return Err(OAuthError::InvalidRequest(
-                "revocation token is outside admitted bounds".to_string(),
-            ));
-        }
-        let admitted_token = validate_opaque_credential(token, "revocation token is invalid")
-            .is_ok()
-            .then(|| {
-                Ok::<_, OAuthError>((
-                    digest_credential(CredentialKind::AccessToken, token)?,
-                    digest_credential(CredentialKind::RefreshToken, token)?,
-                ))
-            })
-            .transpose()?;
+        let admitted_token = admit_revocation_token_value(token)?;
         let (mut state, now, _) =
             self.state_for_authenticated_mutation(client_id, client_secret, method)?;
 
-        // Perform the ownership check and deletion under the same write lock.
-        // In particular, never remove first and discover afterward that the
-        // token belongs to another client.
-        let Some((access_digest, refresh_digest)) = admitted_token else {
-            return Ok(());
-        };
+        state.revoke_presented_token(admitted_token, client_id, &self.config, now);
+        Ok(())
+    }
 
-        let access = state.access_tokens.get(&access_digest).cloned();
-        let refresh = state.refresh_tokens.get(&refresh_digest).cloned();
-        let refresh_tombstone = state.revoked_tokens.get(&refresh_digest).cloned();
-        let access_owner = access.as_ref().map(|entry| &entry.client_id);
-        let refresh_owner = refresh.as_ref().map(|entry| &entry.client_id);
-        let refresh_tombstone_owner = refresh_tombstone.as_ref().map(|entry| &entry.client_id);
-        if access_owner.is_some_and(|owner| owner != client_id)
-            || refresh_owner.is_some_and(|owner| owner != client_id)
-            || refresh_tombstone_owner.is_some_and(|owner| owner != client_id)
-        {
-            // RFC 7009 requires an indistinguishable success response for an
-            // unknown token. Treat a token owned by another client the same way.
-            return Ok(());
-        }
-
-        if let Some(access) = state.access_tokens.remove(&access_digest) {
-            state.insert_tombstone_bounded(
-                access_digest,
-                RevocationTombstone {
-                    client_id: client_id.to_string(),
-                    grant_id: access.grant_id,
-                    replay_guard: false,
-                    expires_at: access.expires_at,
-                },
-                &self.config,
-                now,
-            );
-        }
-        let refresh_grant_id = refresh
-            .as_ref()
-            .map(|entry| entry.grant_id)
-            .or_else(|| refresh_tombstone.map(|entry| entry.grant_id));
-        if let Some(grant_id) = refresh_grant_id {
-            state.revoke_grant_family(grant_id, client_id, &self.config, now);
-        }
-
+    /// Revokes a machine token using a separately configured RS256 assertion.
+    ///
+    /// The revocation_endpoint argument comes from trusted transport routing.
+    /// The token-grant audience never supplies implicit revocation authority.
+    /// Unknown and foreign-client token values produce the same success, while
+    /// invalid or replayed assertions cannot mutate token or replay state.
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    pub fn revoke_with_development_private_key_jwt(
+        &self,
+        assertion: &str,
+        revocation_endpoint: &str,
+        token: &str,
+    ) -> Result<(), OAuthError> {
+        let admitted_token = admit_revocation_token_value(token)?;
+        let verified = self.verify_development_client_assertion(assertion, revocation_endpoint, true)?;
+        let mut state = self.state.write().map_err(|_| {
+            OAuthError::TemporarilyUnavailable("client registration is unavailable".to_string())
+        })?;
+        let now_unix_seconds = verified.validate_current(&state)?;
+        let now = Instant::now();
+        state.commit_client_assertion(&verified, now_unix_seconds);
+        state.cleanup_expired_at(now);
+        state.revoke_presented_token(admitted_token, &verified.client_id, &self.config, now);
         Ok(())
     }
 
@@ -14511,4 +15145,751 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(all(test, feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+pub(crate) mod development_private_key_jwt_test_support {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use ring::rand::SystemRandom;
+    use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
+    use serde_json::{Value, json};
+
+    // Public test-only key, shared with the resource-verifier fixtures.
+    // Production client authentication accepts public keys only.
+    const PRIVATE_KEY: &str = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3wxLvB3SX9fKLLBY8rXXENHK3d78DfxpG7Uq1q9RbtvOHs2m/iU4p0xqHeD35ZG4FGXdzhQWtfp4ydwdqd098z5JHMWyR5naVmF37sykkkNSyBKA6eRYfurtlep9GVlrjpTbqEvo6777nSL9Ozq6hUzU4fPdmk8U1yZ/prSbiDbUcH8HgrgoOHfBM0vg9bM8EVtpKJtwjc1sAfG96k2TEB5tRSCaolhkpMpXdHF6zCZukHvK1DrLVpUvYlgrPfIfucb/8Ws4WxNMOg7M36actazuged0lVpNpbRNHIg+Wss+wUsRKgXhDCAlmWivcyhoLM+Jj5dnWZpeqNE4J6cXBAgMBAAECgf9ofHL3lrWk8iPHHnpGZhrgRTI1P9FMm6jFS4d/ZQSKYax3LHyke94FyhL7lFMoywIDxEc3WBuyWpx49VUyJET+Ish50pB5JSGoTcqio2xxbiiCUD8LAG6j+/kx6ldGFzP23Koszj2Z5VgXCjY9CSgicr2AMQ47NSqdOtfCdsH1Jf4A2D8U6sLFR1FDKZVie5SiZC41/91897QyySDdxEO2bbxb4ZA47EBF+dfQyEXtXDJ34oBrncVepELv9B5hWu+Z4Uf5DK78Ww8NiU1U1+bLVIL5yreK/UaHgVgEJQepTKAzTr4OMT0ZXTAZT5OfoMKmWbq6iQ5mukU8rLUg1xLECgYEA8g2q98V+XvyZQ5kFI/Skj6bxwbRw+mr0SbrWoCSP0VOV4gQ5ED7VnPwGFW8GPR3nqA4Rdx9qul7kttHQnEpbYgk4A2NTRzgqWeu0dfOS2+u+UB44SstamiZfxbNKzLHayJzPMZSZMq2fJhNs8FQtGa3ES3qRJavSOtB34meI4HECgYEAwlmY9AEthueuEaU4ZDHNeYaNwv+TO8QAixl6lj2vztTmVAAFOL7aXNWb+WCQ3SyyDkSty/Kk19e+e5s496keZLxUbyTsboP2LTu0H+45gIUkDAVp/ACXK5dOJT4Vj3jjPUuY9R3CxXvIUEDuzN2hmxTVOq7y53u71sYx5mRn4lECgYEAmNq8vp7/AKjveFqnfl89lGHOhY6XUew8vFq6soKkN4JbQlF8X5/ucaZNiTeFbw71fZD0wo8abPsD39d7r1bdgnlj3+/XZUA4rnREj7/zW+HxWtLapZDpdDMLg+OHNuCR0uIDjcHTRMeTmw3lW5csq+yp6yhJhMqOhgmjy1uqemECgYEAtNeWQYZPDLbL/FNW87R709bmVkpmgDhToRtmPCLOUpE8eXFDapf8rGF/rz6xzXxnemthpOL1jHqOHopDKgBN7cJodrtO3U8hZNmnNAcBrps0/ZKUGg+ams9BwdnRSh1cpY6Ql5THxeb2b+bbzfl1BM8P0nk0QT2bfbASgqVvHOECgYEA2D+89N+YGmI052k8Ow/QBjB/IBhO90syi3TvinbK4B2Y1wQDqt7f50lPvWzoUYFH0cq8RlroCou71gkiBxFnd7BFHVDFuyA24o7sPctQ322KMty/eSHXwQugJRRylNBXFvJXrIhfdiV+OvZ9NVXTESeVT0x5eGAI+1QTdjZCKiQ=";
+    const MODULUS: &str = "t8MS7wd0l_XyiywWPK11xDRyt3e_A38aRu1KtavUW7bzh7Npv4lOKdMah3g9-WRuBRl3c4UFrX6eMncHandPfM-SRzFskeZ2lZhd-7MpJJDUsgSgOnkWH7q7ZXqfRlZa46U26hL6Ou--50i_Ts6uoVM1OHz3ZpPFNcmf6a0m4g21HB_B4K4KDh3wTNL4PWzPBFbaSibcI3NbAHxvepNkxAebUUgmqJYZKTKV3RxeswmbpB7ytQ6y1aVL2JYKz3yH7nG__FrOFsTTDoOzN-mnLWs7oHndJVaTaW0TRyIPlrLPsFLESoF4QwgJZlor3MoaCzPiY-XZ1maXqjROCenFwQ";
+
+    pub(crate) fn jwks() -> Vec<u8> {
+        serde_json::to_vec(&json!({"keys":[{
+            "kty":"RSA", "alg":"RS256", "use":"sig", "kid":"machine-key",
+            "n":MODULUS, "e":"AQAB"
+        }]})).unwrap()
+    }
+
+    pub(crate) fn sign(claims: &Value) -> String {
+        sign_raw(
+            &serde_json::to_vec(&json!({"alg":"RS256", "kid":"machine-key"})).unwrap(),
+            &serde_json::to_vec(claims).unwrap(),
+        )
+    }
+
+    pub(super) fn sign_raw(header: &[u8], claims: &[u8]) -> String {
+        let key = RsaKeyPair::from_pkcs8(&STANDARD.decode(PRIVATE_KEY).unwrap()).unwrap();
+        let input = format!(
+            "{}.{}",
+            URL_SAFE_NO_PAD.encode(header),
+            URL_SAFE_NO_PAD.encode(claims)
+        );
+        let mut signature = vec![0_u8; 256];
+        key.sign(&RSA_PKCS1_SHA256, &SystemRandom::new(), input.as_bytes(), &mut signature)
+            .unwrap();
+        format!("{input}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+}
+
+#[cfg(all(test, feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+mod development_private_key_jwt_tests {
+    use super::*;
+    use super::development_private_key_jwt_test_support::{jwks, sign, sign_raw};
+    use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceIdPolicy};
+    use serde_json::{Value, json};
+
+    const ISSUER: &str = "https://issuer.example";
+    const TOKEN_ENDPOINT: &str = "https://issuer.example/oauth/token";
+    const REVOCATION_ENDPOINT: &str = "https://issuer.example/oauth/revoke";
+    const RESOURCE: &str = "https://resource.example/mcp";
+    const CLIENT: &str = "private-machine";
+
+    fn resource() -> CanonicalResourceId {
+        let endpoint = CanonicalHttpUrl::parse(RESOURCE).unwrap();
+        CanonicalResourceId::parse_for_endpoint(
+            RESOURCE, &endpoint, CanonicalResourceIdPolicy::DEFAULT,
+        ).unwrap()
+    }
+
+    fn policy(
+        client_id: &str,
+        token_audience: DevelopmentClientAssertionAudience,
+        revocation_audience: DevelopmentClientAssertionAudience,
+        generation: u64,
+    ) -> DevelopmentPrivateKeyJwtPolicy {
+        DevelopmentPrivateKeyJwtPolicy::new(
+            ISSUER, client_id, TOKEN_ENDPOINT, token_audience, generation, &jwks(),
+        ).unwrap()
+            .with_revocation_endpoint(REVOCATION_ENDPOINT, revocation_audience).unwrap()
+    }
+
+    fn client_with_policy(client_id: &str, policy: DevelopmentPrivateKeyJwtPolicy) -> OAuthClient {
+        OAuthClient::builder(client_id)
+            .development_private_key_jwt(policy)
+            .development_client_credentials(
+                DevelopmentClientCredentialsGrant::new(resource(), ["machine:read", "machine:write"]).unwrap(),
+            )
+            .build().unwrap()
+    }
+
+    fn server(
+        token_audience: DevelopmentClientAssertionAudience,
+        revocation_audience: DevelopmentClientAssertionAudience,
+    ) -> Arc<OAuthServer> {
+        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+            issuer: ISSUER.to_string(),
+            allow_development_client_credentials: true,
+            ..Default::default()
+        }).unwrap());
+        server.register_client(client_with_policy(
+            CLIENT, policy(CLIENT, token_audience, revocation_audience, 1),
+        )).unwrap();
+        server
+    }
+
+    fn endpoint_server() -> Arc<OAuthServer> {
+        server(
+            DevelopmentClientAssertionAudience::Endpoint,
+            DevelopmentClientAssertionAudience::Endpoint,
+        )
+    }
+
+    fn claims(client_id: &str, audience: &str, jti: &str) -> Value {
+        let now = client_assertion_unix_seconds().unwrap();
+        json!({
+            "iss":client_id, "sub":client_id, "aud":audience,
+            "iat":now, "exp":now + 60, "jti":jti
+        })
+    }
+
+    fn issue(server: &OAuthServer, assertion: &str) -> Result<TokenResponse, OAuthError> {
+        server.token_with_development_private_key_jwt(
+            assertion, TOKEN_ENDPOINT, RESOURCE, &["machine:read".to_string()],
+        )
+    }
+
+    fn auth(server: &Arc<OAuthServer>, token: &str) -> AuthContext {
+        server.token_verifier(resource()).verify(
+            &McpContext::new(asupersync::Cx::for_testing(), 1),
+            AuthRequest {
+                method: "tools/call", params: None, transport_authorization: None, request_id: 1,
+            },
+            &AccessToken { scheme: "Bearer".to_string(), token: token.to_string() },
+        ).unwrap()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Snapshot {
+        clients: Vec<(String, [u8; 32])>,
+        codes: Vec<[u8; 32]>,
+        access: Vec<[u8; 32]>,
+        refresh: Vec<[u8; 32]>,
+        revoked: Vec<[u8; 32]>,
+        replay: Vec<([u8; 32], String, u64)>,
+        time_floor: u64,
+    }
+
+    fn snapshot(server: &OAuthServer) -> Snapshot {
+        let state = server.state.read().unwrap();
+        let mut clients: Vec<_> = state.clients.iter()
+            .map(|(id, entry)| (id.clone(), *entry.registration_epoch.as_bytes())).collect();
+        clients.sort();
+        let mut codes: Vec<_> = state.authorization_codes.keys().map(|key| key.0.into_bytes()).collect();
+        let mut access: Vec<_> = state.access_tokens.keys().map(|key| key.0.into_bytes()).collect();
+        let mut refresh: Vec<_> = state.refresh_tokens.keys().map(|key| key.0.into_bytes()).collect();
+        let mut revoked: Vec<_> = state.revoked_tokens.keys().map(|key| key.0.into_bytes()).collect();
+        let mut replay: Vec<_> = state.client_assertion_replays.iter()
+            .map(|(key, entry)| (key.into_bytes(), entry.client_id.clone(), entry.expires_at_unix_seconds))
+            .collect();
+        codes.sort();
+        access.sort();
+        refresh.sort();
+        revoked.sort();
+        replay.sort();
+        Snapshot { clients, codes, access, refresh, revoked, replay, time_floor: state.client_assertion_time_floor }
+    }
+
+    #[test]
+    fn development_private_key_jwt_registration_requires_exact_trusted_bindings() {
+        let valid = policy(
+            CLIENT, DevelopmentClientAssertionAudience::Endpoint,
+            DevelopmentClientAssertionAudience::Endpoint, 7,
+        );
+        assert_eq!(valid.issuer(), ISSUER);
+        assert_eq!(valid.client_id(), CLIENT);
+        assert_eq!(valid.token_endpoint(), TOKEN_ENDPOINT);
+        assert_eq!(valid.configuration_generation(), 7);
+        let client = client_with_policy(CLIENT, valid.clone());
+        assert_eq!(client.client_type, ClientType::Confidential);
+        assert_eq!(client.token_endpoint_auth_method, TokenEndpointAuthMethod::PrivateKeyJwt);
+        assert!(!client.has_client_secret());
+        assert!(!client.authenticate(None));
+        assert!(client.redirect_uris.is_empty());
+
+        for (issuer, endpoint, generation) in [
+            ("http://issuer.example", TOKEN_ENDPOINT, 7),
+            (ISSUER, "http://127.0.0.1/oauth/token", 7),
+            (ISSUER, "https://issuer.example/oauth/token#fragment", 7),
+            (ISSUER, "https://issuer.example/oauth/token?next=peer", 7),
+            (ISSUER, TOKEN_ENDPOINT, 0),
+        ] {
+            assert!(DevelopmentPrivateKeyJwtPolicy::new(
+                issuer, CLIENT, endpoint, DevelopmentClientAssertionAudience::Endpoint,
+                generation, &jwks(),
+            ).is_err());
+        }
+        assert!(valid.clone().with_revocation_endpoint(
+            TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Issuer,
+        ).is_err());
+        assert!(OAuthClient::builder("another-client")
+            .development_private_key_jwt(valid.clone())
+            .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap())
+            .build().is_err());
+        assert!(OAuthClient::builder(CLIENT)
+            .secret("must-not-be-combined")
+            .development_private_key_jwt(valid.clone())
+            .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap())
+            .build().is_err());
+        assert!(OAuthClient::builder(CLIENT)
+            .development_private_key_jwt(valid.clone())
+            .development_client_credentials(DevelopmentClientCredentialsGrant::new(resource(), ["machine:read"]).unwrap())
+            .token_endpoint_auth_method(TokenEndpointAuthMethod::ClientSecretBasic)
+            .build().is_err());
+        assert!(OAuthClient::builder(CLIENT)
+            .development_private_key_jwt(valid.clone())
+            .redirect_uri("http://127.0.0.1/callback")
+            .build().is_err());
+        let foreign = OAuthServer::try_new(OAuthServerConfig {
+            issuer: "https://another-issuer.example".to_string(),
+            allow_development_client_credentials: true,
+            ..Default::default()
+        }).unwrap();
+        let before = snapshot(&foreign);
+        assert!(foreign.register_client(client_with_policy(CLIENT, valid)).is_err());
+        assert_eq!(snapshot(&foreign), before);
+    }
+
+    #[test]
+    fn development_private_key_jwt_issues_and_revokes_with_independent_audiences() {
+        for token_audience in [
+            DevelopmentClientAssertionAudience::Issuer,
+            DevelopmentClientAssertionAudience::Endpoint,
+        ] {
+            for revocation_audience in [
+                DevelopmentClientAssertionAudience::Issuer,
+                DevelopmentClientAssertionAudience::Endpoint,
+            ] {
+                let server = server(token_audience, revocation_audience);
+                let token_aud = match token_audience {
+                    DevelopmentClientAssertionAudience::Issuer => ISSUER,
+                    DevelopmentClientAssertionAudience::Endpoint => TOKEN_ENDPOINT,
+                };
+                let revoke_aud = match revocation_audience {
+                    DevelopmentClientAssertionAudience::Issuer => ISSUER,
+                    DevelopmentClientAssertionAudience::Endpoint => REVOCATION_ENDPOINT,
+                };
+                let assertion = sign(&claims(CLIENT, token_aud, "issue"));
+                let token = issue(&server, &assertion).unwrap();
+                assert_eq!(token.scope.as_deref(), Some("machine:read"));
+                assert!(token.refresh_token.is_none());
+                let stored = server.validate_access_token(&token.access_token).unwrap();
+                assert_eq!(stored.client_id, CLIENT);
+                assert_eq!(stored.resource.as_deref(), Some(RESOURCE));
+                assert!(stored.subject.is_none());
+                let verified = auth(&server, &token.access_token);
+                assert_eq!(verified.subject.as_deref(), Some(CLIENT));
+                assert_eq!(verified.scopes, ["machine:read"]);
+                assert!(verified.claims.as_ref().unwrap()["grant_subject"].is_null());
+                assert!(verified.session_owner().is_some());
+                let revocation = sign(&claims(CLIENT, revoke_aud, "revoke"));
+                server.revoke_with_development_private_key_jwt(
+                    &revocation, REVOCATION_ENDPOINT, &token.access_token,
+                ).unwrap();
+                assert!(server.validate_access_token(&token.access_token).is_none());
+                assert_eq!(server.stats().refresh_tokens, 0);
+                assert_eq!(server.stats().authorization_codes, 0);
+                assert_eq!(server.state.read().unwrap().client_assertion_replays.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn development_private_key_jwt_signed_claim_and_header_negatives_preserve_state() {
+        let server = endpoint_server();
+        let original = claims(CLIENT, TOKEN_ENDPOINT, "admission");
+        let now = original["iat"].as_u64().unwrap();
+        let changes = [
+            ("iss", json!("another-client")),
+            ("sub", json!("another-client")),
+            ("aud", json!(ISSUER)),
+            ("aud", json!([TOKEN_ENDPOINT])),
+            ("aud", json!(format!("{TOKEN_ENDPOINT}/"))),
+            ("iat", json!(now + 60)),
+            ("iat", json!(now - 1)),
+            ("iat", json!(now.to_string())),
+            ("exp", json!(now)),
+            ("exp", json!(now + 61)),
+            ("exp", json!(u64::MAX)),
+            ("exp", json!(-1)),
+            ("nbf", json!(now + 120)),
+            ("nbf", json!("invalid")),
+            ("jti", json!("")),
+            ("jti", json!("x".repeat(MAX_CLIENT_ASSERTION_JTI_BYTES + 1))),
+            ("jti", json!("contains\ncontrol")),
+            ("scope", json!("machine:write")),
+            ("nonce", json!("wrong-profile")),
+        ];
+        for (name, value) in changes {
+            let mut changed = original.clone();
+            changed[name] = value;
+            let before = snapshot(&server);
+            assert!(matches!(issue(&server, &sign(&changed)), Err(OAuthError::InvalidClient(_))), "{name}");
+            assert_eq!(snapshot(&server), before, "{name}");
+        }
+        for absent in ["iss", "sub", "aud", "iat", "exp", "jti"] {
+            let mut changed = original.clone();
+            changed.as_object_mut().unwrap().remove(absent);
+            let before = snapshot(&server);
+            assert!(matches!(issue(&server, &sign(&changed)), Err(OAuthError::InvalidClient(_))), "{absent}");
+            assert_eq!(snapshot(&server), before);
+        }
+        for header in [
+            json!({"alg":"RS256", "kid":"machine-key", "typ":"JWT"}),
+            json!({"alg":"RS256", "kid":"machine-key", "typ":"at+jwt"}),
+            json!({"alg":"RS256", "kid":"unknown"}),
+            json!({"alg":"HS256", "kid":"machine-key"}),
+            json!({"alg":"none", "kid":"machine-key"}),
+            json!({"alg":"RS256", "kid":"machine-key", "jku":"https://keys.example/jwks"}),
+        ] {
+            let assertion = sign_raw(&serde_json::to_vec(&header).unwrap(), &serde_json::to_vec(&original).unwrap());
+            let before = snapshot(&server);
+            assert!(matches!(issue(&server, &assertion), Err(OAuthError::InvalidClient(_))));
+            assert_eq!(snapshot(&server), before);
+        }
+        let duplicate_claims = format!(
+            "{{\"iss\":\"{CLIENT}\",\"sub\":\"{CLIENT}\",\"aud\":\"{TOKEN_ENDPOINT}\",\"iat\":{now},\"exp\":{},\"jti\":\"a\",\"jti\":\"b\"}}",
+            now + 60,
+        );
+        let duplicate = sign_raw(
+            br#"{"alg":"RS256","kid":"machine-key"}"#,
+            duplicate_claims.as_bytes(),
+        );
+        let before = snapshot(&server);
+        assert!(matches!(issue(&server, &duplicate), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        let token = issue(&server, &sign(&original)).unwrap();
+        assert_eq!(auth(&server, &token.access_token).scopes, ["machine:read"]);
+    }
+
+    #[test]
+    fn development_private_key_jwt_endpoint_resource_and_scope_denials_do_not_consume_assertions() {
+        let server = endpoint_server();
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "unchanged"));
+        let before = snapshot(&server);
+        for endpoint in [REVOCATION_ENDPOINT, "https://other.example/oauth/token"] {
+            assert!(server.token_with_development_private_key_jwt(
+                &assertion, endpoint, RESOURCE, &["machine:read".to_string()],
+            ).is_err());
+            assert_eq!(snapshot(&server), before);
+        }
+        assert!(server.token_with_development_private_key_jwt(
+            &assertion, TOKEN_ENDPOINT, "https://resource.example/other", &["machine:read".to_string()],
+        ).is_err());
+        assert_eq!(snapshot(&server), before);
+        for scopes in [Vec::new(), vec!["machine:admin".to_string()], vec!["openid".to_string()]] {
+            assert!(server.token_with_development_private_key_jwt(
+                &assertion, TOKEN_ENDPOINT, RESOURCE, &scopes,
+            ).is_err());
+            assert_eq!(snapshot(&server), before);
+        }
+        let token = issue(&server, &assertion).unwrap();
+        let wrong_resource = CanonicalHttpUrl::parse("https://resource.example/other").unwrap();
+        let wrong_verifier = server.token_verifier(CanonicalResourceId::parse_for_endpoint(
+            wrong_resource.as_str(), &wrong_resource, CanonicalResourceIdPolicy::DEFAULT,
+        ).unwrap());
+        assert!(wrong_verifier.verify(
+            &McpContext::new(asupersync::Cx::for_testing(), 1),
+            AuthRequest { method: "tools/call", params: None, transport_authorization: None, request_id: 1 },
+            &AccessToken { scheme: "Bearer".to_string(), token: token.access_token.clone() },
+        ).is_err());
+        assert_eq!(auth(&server, &token.access_token).subject.as_deref(), Some(CLIENT));
+    }
+
+    #[test]
+    fn development_private_key_jwt_concurrent_duplicate_assertions_issue_exactly_once() {
+        let server = endpoint_server();
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "concurrent"));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let results = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8).map(|_| {
+                let server = Arc::clone(&server);
+                let barrier = Arc::clone(&barrier);
+                let assertion = &assertion;
+                scope.spawn(move || {
+                    barrier.wait();
+                    issue(&server, assertion)
+                })
+            }).collect();
+            workers.into_iter().map(|worker| worker.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| matches!(result, Err(OAuthError::InvalidClient(_)))).count(), 7);
+        assert_eq!(server.stats().access_tokens, 1);
+        assert_eq!(server.state.read().unwrap().client_assertion_replays.len(), 1);
+        let success = results.into_iter().find_map(Result::ok).unwrap();
+        assert_eq!(auth(&server, &success.access_token).subject.as_deref(), Some(CLIENT));
+    }
+
+    #[test]
+    fn development_private_key_jwt_replay_is_shared_across_endpoints_and_reregistration() {
+        let server = server(
+            DevelopmentClientAssertionAudience::Issuer,
+            DevelopmentClientAssertionAudience::Issuer,
+        );
+        let assertion = sign(&claims(CLIENT, ISSUER, "shared"));
+        let first = issue(&server, &assertion).unwrap();
+        let first_owner = auth(&server, &first.access_token).session_owner().unwrap();
+        let before = snapshot(&server);
+        assert!(matches!(server.revoke_with_development_private_key_jwt(
+            &assertion, REVOCATION_ENDPOINT, &first.access_token,
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        assert!(server.validate_access_token(&first.access_token).is_some());
+
+        server.unregister_client(CLIENT).unwrap();
+        server.register_client(client_with_policy(CLIENT, policy(
+            CLIENT, DevelopmentClientAssertionAudience::Issuer,
+            DevelopmentClientAssertionAudience::Issuer, 2,
+        ))).unwrap();
+        assert!(server.validate_access_token(&first.access_token).is_none());
+        let before = snapshot(&server);
+        assert!(matches!(issue(&server, &assertion), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        let fresh = issue(&server, &sign(&claims(CLIENT, ISSUER, "fresh-registration"))).unwrap();
+        assert_ne!(auth(&server, &fresh.access_token).session_owner(), Some(first_owner));
+
+        let revocation = sign(&claims(CLIENT, ISSUER, "fresh-revoke"));
+        server.revoke_with_development_private_key_jwt(
+            &revocation, REVOCATION_ENDPOINT, &fresh.access_token,
+        ).unwrap();
+        let before = snapshot(&server);
+        assert!(matches!(issue(&server, &revocation), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        assert!(server.validate_access_token(&fresh.access_token).is_none());
+    }
+
+    #[test]
+    fn development_private_key_jwt_verified_snapshot_cannot_cross_registry_generation() {
+        let server = endpoint_server();
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "in-flight"));
+        let verified = server.verify_development_client_assertion(
+            &assertion, TOKEN_ENDPOINT, false,
+        ).unwrap_or_else(|_| panic!("signed registration snapshot"));
+        server.unregister_client(CLIENT).unwrap();
+        server.register_client(client_with_policy(CLIENT, policy(
+            CLIENT, DevelopmentClientAssertionAudience::Endpoint,
+            DevelopmentClientAssertionAudience::Endpoint, 2,
+        ))).unwrap();
+        let request = TokenRequest {
+            grant_type: "client_credentials".to_string(),
+            client_id: CLIENT.to_string(),
+            client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
+            code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+            scopes: Some(vec!["machine:read".to_string()]),
+            resource: Some(RESOURCE.to_string()),
+        };
+        let before = snapshot(&server);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = server.token_client_credentials_authenticated_with_draw(
+            &request, Some(&verified), || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                draw_security_identifier()
+            },
+        );
+        assert!(matches!(result, Err(OAuthError::InvalidClient(_))));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(snapshot(&server), before);
+        // A public TokenRequest naming the method cannot fabricate a verified receipt.
+        assert!(matches!(server.token(&request), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        let fresh = issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "after-rotation"))).unwrap();
+        assert!(server.validate_access_token(&fresh.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_replay_limits_do_not_evict_live_ids_or_block_other_owners() {
+        let server = endpoint_server();
+        let first_assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "owner-0"));
+        let first = issue(&server, &first_assertion).unwrap();
+        for index in 1..MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT {
+            issue(&server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, &format!("owner-{index}")))).unwrap();
+        }
+        let before = snapshot(&server);
+        assert!(matches!(issue(
+            &server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "owner-overflow")),
+        ), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert_eq!(snapshot(&server), before);
+        assert!(matches!(issue(&server, &first_assertion), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        assert!(server.validate_access_token(&first.access_token).is_some());
+
+        server.register_client(client_with_policy("other-machine", policy(
+            "other-machine", DevelopmentClientAssertionAudience::Endpoint,
+            DevelopmentClientAssertionAudience::Endpoint, 1,
+        ))).unwrap();
+        let other = issue(&server, &sign(&claims("other-machine", TOKEN_ENDPOINT, "owner-0"))).unwrap();
+        assert_eq!(auth(&server, &other.access_token).subject.as_deref(), Some("other-machine"));
+        assert_eq!(server.state.read().unwrap().client_assertion_replays.len(),
+            MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS_PER_CLIENT + 1);
+    }
+
+    #[test]
+    fn development_private_key_jwt_global_replay_capacity_recovers_only_after_expiry() {
+        let server = endpoint_server();
+        let now = client_assertion_unix_seconds().unwrap();
+        let mut first_key = None;
+        {
+            // Retained IDs may belong to unregistered clients. Seed those
+            // bounded records to isolate deployment saturation from RSA cost.
+            let mut state = server.state.write().unwrap();
+            for index in 0_u64..u64::try_from(MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS).unwrap() {
+                let key = sha256_bounded(&index.to_be_bytes(), 8).unwrap();
+                first_key.get_or_insert(key);
+                state.client_assertion_replays.insert(key, ClientAssertionReplay {
+                    client_id: format!("retired-client-{}", index / 64),
+                    expires_at_unix_seconds: now + 60,
+                });
+            }
+        }
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "global-capacity"));
+        let before = snapshot(&server);
+        assert!(matches!(issue(&server, &assertion), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert_eq!(snapshot(&server), before);
+        {
+            let mut state = server.state.write().unwrap();
+            state.client_assertion_replays.get_mut(&first_key.unwrap()).unwrap()
+                .expires_at_unix_seconds = now.saturating_sub(1);
+        }
+        let token = issue(&server, &assertion).unwrap();
+        let state = server.state.read().unwrap();
+        assert_eq!(state.client_assertion_replays.len(), MAX_DEVELOPMENT_CLIENT_ASSERTION_REPLAYS);
+        assert!(!state.client_assertion_replays.contains_key(&first_key.unwrap()));
+        drop(state);
+        assert!(server.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_wall_clock_rollback_cannot_reactivate_pruned_replay_ids() {
+        let server = endpoint_server();
+        let claim = claims(CLIENT, TOKEN_ENDPOINT, "clock-rollback");
+        let expiry = claim["exp"].as_u64().unwrap();
+        let assertion = sign(&claim);
+        let token = issue(&server, &assertion).unwrap();
+        {
+            let mut state = server.state.write().unwrap();
+            // Model cleanup after observing expiry, followed by wall time
+            // moving back into the signed assertion's original live window.
+            state.advance_assertion_time(expiry + 1);
+            assert!(state.client_assertion_replays.is_empty());
+        }
+        let before = snapshot(&server);
+        assert!(matches!(issue(&server, &assertion), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        // Even a new jti cannot use the rolled-back clock to evade the floor.
+        assert!(matches!(issue(
+            &server, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "after-rollback")),
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        assert!(server.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_bad_signatures_and_same_kid_wrong_keys_fail_closed() {
+        let server = endpoint_server();
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "signature"));
+        let mut corrupt = assertion.as_bytes().to_vec();
+        let signature_start = assertion.rfind('.').unwrap() + 1;
+        corrupt[signature_start] = if corrupt[signature_start] == b'A' { b'B' } else { b'A' };
+        let before = snapshot(&server);
+        assert!(matches!(issue(
+            &server, std::str::from_utf8(&corrupt).unwrap(),
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+
+        // A separately admitted RSA key with the same kid cannot authenticate
+        // a signature from the original registration.
+        let mut other_jwks: Value = serde_json::from_slice(&jwks()).unwrap();
+        other_jwks["keys"][0]["n"] = json!("nglMZYxKVQoNbg1eyTOptTNw5GbItWLTcvYNFx1fIffaj5yjvmwBg1hZ3WXWnrPiHGQLmWJA8DhSF4ivZsNGR8DT_EZMhCV6oJiiwr-B_I4jiSdVwPkMCNKaI9WNFaZKh5-no6suh4V4-rVVjIecT8N60qlKkpCxlYkgtQ28AUM6RiDrd33DTZdRTjLHxWA5dyz2mlPwdMQvu0vlnZckAPgZauymb8KL5tXl2nv0Am9z08HtNkj259Y4d1KvsjZKczPbuKFiA9zAVOl1hNDQ7dI1ZxvHDJikifFUlx7gMioUOr0Im0MJuDMy6LIAHDpiqTtX5BXssw8IqOHEBV8_sQ");
+        let other_policy = DevelopmentPrivateKeyJwtPolicy::new(
+            ISSUER, CLIENT, TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Endpoint,
+            2, &serde_json::to_vec(&other_jwks).unwrap(),
+        ).unwrap();
+        let other_server = OAuthServer::try_new(OAuthServerConfig {
+            issuer: ISSUER.to_string(),
+            allow_development_client_credentials: true,
+            ..Default::default()
+        }).unwrap();
+        other_server.register_client(client_with_policy(CLIENT, other_policy)).unwrap();
+        let other_before = snapshot(&other_server);
+        assert!(matches!(issue(&other_server, &assertion), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&other_server), other_before);
+        let token = issue(&server, &assertion).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_revocation_requires_separate_agreement_and_preserves_foreign_tokens() {
+        let no_revocation = DevelopmentPrivateKeyJwtPolicy::new(
+            ISSUER, CLIENT, TOKEN_ENDPOINT, DevelopmentClientAssertionAudience::Issuer, 1, &jwks(),
+        ).unwrap();
+        let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+            issuer: ISSUER.to_string(),
+            allow_development_client_credentials: true,
+            ..Default::default()
+        }).unwrap());
+        server.register_client(client_with_policy(CLIENT, no_revocation)).unwrap();
+        let token = issue(&server, &sign(&claims(CLIENT, ISSUER, "no-revoke-issued"))).unwrap();
+        let before = snapshot(&server);
+        assert!(matches!(server.revoke_with_development_private_key_jwt(
+            &sign(&claims(CLIENT, ISSUER, "no-revoke-permission")),
+            REVOCATION_ENDPOINT, &token.access_token,
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        assert!(server.validate_access_token(&token.access_token).is_some());
+
+        server.register_client(client_with_policy("other-client", policy(
+            "other-client", DevelopmentClientAssertionAudience::Issuer,
+            DevelopmentClientAssertionAudience::Issuer, 1,
+        ))).unwrap();
+        let revoke = sign(&claims("other-client", ISSUER, "foreign-token"));
+        let before = snapshot(&server);
+        assert!(matches!(server.revoke_with_development_private_key_jwt(
+            &revoke, TOKEN_ENDPOINT, &token.access_token,
+        ), Err(OAuthError::InvalidClient(_))));
+        assert_eq!(snapshot(&server), before);
+        // RFC 7009 unknown/foreign-token success consumes this authentication
+        // once, but grants no authority over the first client's live token.
+        server.revoke_with_development_private_key_jwt(
+            &revoke, REVOCATION_ENDPOINT, &token.access_token,
+        ).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
+        let unknown = sign(&claims("other-client", ISSUER, "unknown-token"));
+        server.revoke_with_development_private_key_jwt(
+            &unknown, REVOCATION_ENDPOINT, "unknown-token",
+        ).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
+    }
+
+    #[test]
+    fn development_private_key_jwt_disabled_profile_and_metadata_preserve_basic_behavior() {
+        for enabled in [false, true] {
+            let server = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+                issuer: ISSUER.to_string(),
+                allow_development_client_credentials: enabled,
+                ..Default::default()
+            }).unwrap());
+            server.register_client(client_with_policy(CLIENT, policy(
+                CLIENT, DevelopmentClientAssertionAudience::Endpoint,
+                DevelopmentClientAssertionAudience::Endpoint, 1,
+            ))).unwrap();
+            let routes = OAuthHttpRoutes::new(Arc::clone(&server), "https://issuer.example/oauth").unwrap();
+            let metadata = serde_json::to_value(routes.authorization_server_metadata().unwrap()).unwrap();
+            for field in ["token_endpoint_auth_methods_supported", "revocation_endpoint_auth_methods_supported"] {
+                let methods = metadata[field].as_array().unwrap();
+                assert_eq!(methods.contains(&json!("private_key_jwt")), enabled);
+                assert!(methods.contains(&json!("client_secret_basic")));
+            }
+            for field in [
+                "token_endpoint_auth_signing_alg_values_supported",
+                "revocation_endpoint_auth_signing_alg_values_supported",
+            ] {
+                if enabled {
+                    assert_eq!(metadata[field], json!(["RS256"]));
+                } else {
+                    assert!(metadata.get(field).is_none());
+                }
+            }
+            let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "enabled"));
+            if enabled {
+                let token = issue(&server, &assertion).unwrap();
+                let private_owner = auth(&server, &token.access_token).session_owner().unwrap();
+                server.register_client(
+                    OAuthClient::builder("basic-machine").secret("basic-secret")
+                        .development_client_credentials(DevelopmentClientCredentialsGrant::new(
+                            resource(), ["machine:read"],
+                        ).unwrap())
+                        .build().unwrap(),
+                ).unwrap();
+                let basic = server.token(&TokenRequest {
+                    grant_type: "client_credentials".to_string(),
+                    client_id: "basic-machine".to_string(),
+                    client_secret: Some("basic-secret".to_string()),
+                    client_authentication_method: TokenEndpointAuthMethod::ClientSecretBasic,
+                    code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+                    scopes: Some(vec!["machine:read".to_string()]),
+                    resource: Some(RESOURCE.to_string()),
+                }).unwrap();
+                assert_ne!(auth(&server, &basic.access_token).session_owner(), Some(private_owner));
+                server.revoke(
+                    &basic.access_token, "basic-machine", Some("basic-secret"),
+                    TokenEndpointAuthMethod::ClientSecretBasic,
+                ).unwrap();
+                assert!(server.validate_access_token(&basic.access_token).is_none());
+                assert!(server.validate_access_token(&token.access_token).is_some());
+            } else {
+                let before = snapshot(&server);
+                assert!(matches!(issue(&server, &assertion), Err(OAuthError::UnsupportedGrantType(_))));
+                assert_eq!(snapshot(&server), before);
+            }
+        }
+    }
+
+    #[test]
+    fn development_private_key_jwt_failed_token_preparation_does_not_consume_assertion() {
+        let server = endpoint_server();
+        let assertion = sign(&claims(CLIENT, TOKEN_ENDPOINT, "entropy-retry"));
+        let verified = server.verify_development_client_assertion(
+            &assertion, TOKEN_ENDPOINT, false,
+        ).unwrap_or_else(|_| panic!("signed registration snapshot"));
+        let request = TokenRequest {
+            grant_type: "client_credentials".to_string(),
+            client_id: CLIENT.to_string(),
+            client_secret: None,
+            client_authentication_method: TokenEndpointAuthMethod::PrivateKeyJwt,
+            code: None, redirect_uri: None, code_verifier: None, refresh_token: None,
+            scopes: Some(vec!["machine:read".to_string()]),
+            resource: Some(RESOURCE.to_string()),
+        };
+        let before = snapshot(&server);
+        let result = server.token_client_credentials_authenticated_with_draw(
+            &request, Some(&verified), || Err::<SecurityIdentifier, _>("injected entropy failure"),
+        );
+        assert!(matches!(result, Err(OAuthError::ServerError(_))));
+        assert_eq!(snapshot(&server), before);
+        let token = issue(&server, &assertion).unwrap();
+        assert!(server.validate_access_token(&token.access_token).is_some());
+
+        let bounded = Arc::new(OAuthServer::try_new(OAuthServerConfig {
+            issuer: ISSUER.to_string(),
+            allow_development_client_credentials: true,
+            max_access_tokens: 1,
+            max_access_tokens_per_client: 1,
+            ..Default::default()
+        }).unwrap());
+        bounded.register_client(client_with_policy(CLIENT, policy(
+            CLIENT, DevelopmentClientAssertionAudience::Endpoint,
+            DevelopmentClientAssertionAudience::Endpoint, 1,
+        ))).unwrap();
+        let first = issue(&bounded, &sign(&claims(CLIENT, TOKEN_ENDPOINT, "capacity-first"))).unwrap();
+        let queued = sign(&claims(CLIENT, TOKEN_ENDPOINT, "capacity-retry"));
+        let before = snapshot(&bounded);
+        assert!(matches!(issue(&bounded, &queued), Err(OAuthError::TemporarilyUnavailable(_))));
+        assert_eq!(snapshot(&bounded), before);
+        bounded.revoke_with_development_private_key_jwt(
+            &sign(&claims(CLIENT, REVOCATION_ENDPOINT, "capacity-revoke")),
+            REVOCATION_ENDPOINT, &first.access_token,
+        ).unwrap();
+        let retry = issue(&bounded, &queued).unwrap();
+        assert!(bounded.validate_access_token(&retry.access_token).is_some());
+        assert!(bounded.validate_access_token(&first.access_token).is_none());
+    }
+
 }

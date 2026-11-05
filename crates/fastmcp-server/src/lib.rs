@@ -12029,6 +12029,12 @@ fn oauth_http_client_credentials(
     admission: &mut OAuthParameterAdmission,
     authorization: Option<&str>,
 ) -> Result<(String, Option<String>, oauth::TokenEndpointAuthMethod), HttpResponse> {
+    // Assertion authentication has its own exact-purpose entrypoint. Never
+    // ignore a second credential just because this endpoint or build does not
+    // support it, including an explicitly empty assertion parameter.
+    if oauth_http_has_client_assertion(admission) {
+        return Err(oauth_http_invalid_request());
+    }
     let Some(authorization) = authorization else {
         let client_id = oauth_required_parameter(admission, OAuthParameterName::ClientId)
             .map_err(oauth_http_error)?;
@@ -12112,6 +12118,102 @@ fn oauth_http_client_credentials(
         Some(client_secret.to_string()),
         oauth::TokenEndpointAuthMethod::ClientSecretBasic,
     ))
+}
+
+fn oauth_http_has_client_assertion(admission: &OAuthParameterAdmission) -> bool {
+    admission.parameters().iter().any(|parameter| {
+        matches!(parameter.name(), "client_assertion" | "client_assertion_type")
+    })
+}
+
+/// Selects the machine profile's sole assertion credential before parsing the
+/// grant or touching issuer state. The signed subject supplies the client ID;
+/// even empty body credentials or an Authorization field are competing methods.
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+fn oauth_http_private_key_jwt(
+    admission: &mut OAuthParameterAdmission,
+    authorization: Option<&str>,
+) -> Result<zeroize::Zeroizing<String>, HttpResponse> {
+    if authorization.is_some()
+        || admission.parameters().iter().any(|parameter| {
+            matches!(parameter.name(), "client_id" | "client_secret")
+        })
+    {
+        return Err(oauth_http_invalid_request());
+    }
+    let assertion_type =
+        oauth_required_parameter(admission, OAuthParameterName::ClientAssertionType)
+            .map_err(oauth_http_error)?;
+    if assertion_type != oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE {
+        return Err(oauth_http_invalid_request());
+    }
+    oauth_required_parameter(admission, OAuthParameterName::ClientAssertion)
+        .map(zeroize::Zeroizing::new)
+        .map_err(oauth_http_error)
+}
+
+#[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+fn oauth_http_private_key_jwt_token(
+    routes: &OAuthHttpRoutes,
+    admission: &mut OAuthParameterAdmission,
+    assertion: &str,
+) -> HttpResponse {
+    let grant_type = match oauth_required_parameter(admission, OAuthParameterName::GrantType) {
+        Ok(grant_type) => grant_type,
+        Err(error) => return oauth_http_error(error),
+    };
+    if grant_type != "client_credentials" {
+        return oauth_http_error(OAuthError::UnsupportedGrantType(
+            "assertion authentication requires the machine grant".to_string(),
+        ));
+    }
+    if admission.parameters().iter().any(|parameter| {
+        matches!(parameter.name(), "code" | "redirect_uri" | "code_verifier" | "refresh_token")
+    }) {
+        return oauth_http_invalid_request();
+    }
+    let resource = match oauth_required_parameter(admission, OAuthParameterName::Resource) {
+        Ok(resource) => resource,
+        Err(error) => return oauth_http_error(error),
+    };
+    let scope_present = admission
+        .parameters()
+        .iter()
+        .any(|parameter| parameter.name() == "scope");
+    let scopes = match admission.take_defined_value(OAuthParameterName::Scope) {
+        Some(value) => {
+            let value = value.into_string();
+            if value.split(' ').any(|scope| {
+                scope.is_empty()
+                    || !scope.bytes().all(|byte| {
+                        matches!(byte, 0x21 | 0x23..=0x5B | 0x5D..=0x7E)
+                    })
+            }) {
+                return oauth_http_error(OAuthError::InvalidScope(
+                    "invalid machine scope syntax".to_string(),
+                ));
+            }
+            value.split(' ').map(str::to_owned).collect::<Vec<_>>()
+        }
+        None if scope_present => {
+            return oauth_http_error(OAuthError::InvalidScope(
+                "invalid machine scope syntax".to_string(),
+            ));
+        }
+        None => Vec::new(),
+    };
+    // This is the same trusted spelling used in authorization-server metadata.
+    // Host, forwarded headers and body fields never select an assertion target.
+    let endpoint = format!("{}/token", routes.public_endpoint_base().trim_end_matches('/'));
+    match routes.server().token_with_development_private_key_jwt(
+        assertion,
+        &endpoint,
+        &resource,
+        &scopes,
+    ) {
+        Ok(response) => oauth_http_no_store(HttpResponse::ok().with_json(&response)),
+        Err(error) => oauth_http_error(error),
+    }
 }
 
 fn h1_oauth_singleton_header<'a>(
@@ -12536,6 +12638,14 @@ fn dispatch_oauth_h1_request(
             Ok(admission) => admission,
             Err(_) => return oauth_http_invalid_request(),
         };
+        #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+        if oauth_http_has_client_assertion(&admission) {
+            let assertion = match oauth_http_private_key_jwt(&mut admission, authorization_header) {
+                Ok(assertion) => assertion,
+                Err(response) => return response,
+            };
+            return oauth_http_private_key_jwt_token(routes, &mut admission, &assertion);
+        }
         let (client_id, client_secret, client_authentication_method) =
             match oauth_http_client_credentials(&mut admission, authorization_header) {
                 Ok(credentials) => credentials,
@@ -12575,6 +12685,25 @@ fn dispatch_oauth_h1_request(
         Ok(token) => token,
         Err(error) => return oauth_http_error(error),
     };
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    if oauth_http_has_client_assertion(&admission) {
+        let assertion = match oauth_http_private_key_jwt(&mut admission, authorization_header) {
+            Ok(assertion) => assertion,
+            Err(response) => return response,
+        };
+        let endpoint = format!(
+            "{}/revoke",
+            routes.public_endpoint_base().trim_end_matches('/'),
+        );
+        return match routes.server().revoke_with_development_private_key_jwt(
+            &assertion,
+            &endpoint,
+            &token,
+        ) {
+            Ok(()) => oauth_http_no_store(HttpResponse::ok()),
+            Err(error) => oauth_http_error(error),
+        };
+    }
     let (client_id, client_secret, client_authentication_method) =
         match oauth_http_client_credentials(&mut admission, authorization_header) {
             Ok(credentials) => credentials,
@@ -45304,6 +45433,517 @@ mod lib_unit_tests {
     }
 
     #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    mod native_private_key_jwt_tests {
+        use super::*;
+        use crate::oauth::development_private_key_jwt_test_support::{jwks, sign};
+
+        const CLIENT_ID: &str = "native-signed-machine";
+        const BASE: &str = "https://fastmcp.invalid/oauth";
+        const TOKEN_ENDPOINT: &str = "https://fastmcp.invalid/oauth/token";
+        const REVOCATION_ENDPOINT: &str = "https://fastmcp.invalid/oauth/revoke";
+        const RESOURCE: &str = "https://resource.example/api";
+
+        fn resource() -> fastmcp_core::CanonicalResourceId {
+            let endpoint = fastmcp_core::CanonicalHttpUrl::parse(RESOURCE).unwrap();
+            fastmcp_core::CanonicalResourceId::parse_for_endpoint(
+                RESOURCE,
+                &endpoint,
+                fastmcp_core::CanonicalResourceIdPolicy::DEFAULT,
+            )
+            .unwrap()
+        }
+
+        fn fixture() -> OAuthHttpRoutes {
+            let oauth = Arc::new(
+                oauth::OAuthServer::try_new(oauth::OAuthServerConfig {
+                    allow_development_client_credentials: true,
+                    ..oauth::OAuthServerConfig::default()
+                })
+                .unwrap(),
+            );
+            let policy = oauth::DevelopmentPrivateKeyJwtPolicy::new(
+                oauth.config().issuer.clone(),
+                CLIENT_ID,
+                TOKEN_ENDPOINT,
+                oauth::DevelopmentClientAssertionAudience::Endpoint,
+                1,
+                &jwks(),
+            )
+            .unwrap()
+            .with_revocation_endpoint(
+                REVOCATION_ENDPOINT,
+                oauth::DevelopmentClientAssertionAudience::Endpoint,
+            )
+            .unwrap();
+            oauth
+                .register_client(
+                    oauth::OAuthClient::builder(CLIENT_ID)
+                        .development_client_credentials(
+                            oauth::DevelopmentClientCredentialsGrant::new(
+                                resource(),
+                                ["machine:read"],
+                            )
+                            .unwrap(),
+                        )
+                        .development_private_key_jwt(policy)
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            OAuthHttpRoutes::new(oauth, BASE).unwrap()
+        }
+
+        fn assertion(audience: &str, jti: &str) -> String {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            sign(&serde_json::json!({
+                "iss": CLIENT_ID,
+                "sub": CLIENT_ID,
+                "aud": audience,
+                "iat": now,
+                "exp": now + 55,
+                "jti": jti,
+            }))
+        }
+
+        fn form(parameters: &[(&str, &str)]) -> String {
+            let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+            for (name, value) in parameters {
+                encoded.append_pair(name, value);
+            }
+            encoded.finish()
+        }
+
+        fn token_form(assertion: &str, scope: &str) -> String {
+            form(&[
+                ("grant_type", "client_credentials"),
+                ("resource", RESOURCE),
+                ("scope", scope),
+                ("client_assertion_type", oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE),
+                ("client_assertion", assertion),
+            ])
+        }
+
+        fn revocation_form(assertion: &str, token: &str) -> String {
+            form(&[
+                ("token", token),
+                ("client_assertion_type", oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE),
+                ("client_assertion", assertion),
+            ])
+        }
+
+        fn dispatch(routes: &OAuthHttpRoutes, path: &str, form: &str) -> HttpResponse {
+            let request = native_oauth_form_request(path, form, None);
+            dispatch_oauth_h1_request(routes, &request, path, "")
+        }
+
+        #[test]
+        fn native_signed_machine_issues_resource_token_revokes_and_advertises_authentication() {
+            let routes = fixture();
+            let signed = assertion(TOKEN_ENDPOINT, "native-issue");
+            let body = token_form(&signed, "machine:read");
+            assert!(!body.contains("client_id="));
+            let response = dispatch(&routes, routes.token_path(), &body);
+            assert_eq!(response.status, HttpStatus::OK);
+            assert_eq!(
+                response.headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+            assert_eq!(
+                response.headers.get("pragma").map(String::as_str),
+                Some("no-cache")
+            );
+            let issued: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(issued["scope"], "machine:read");
+            assert!(issued.get("refresh_token").is_none());
+            assert!(issued.get("id_token").is_none());
+            let token = issued["access_token"].as_str().unwrap();
+            let retained = routes.server().validate_access_token(token).unwrap();
+            assert_eq!(retained.client_id, CLIENT_ID);
+            assert_eq!(retained.resource.as_deref(), Some(RESOURCE));
+            assert!(retained.subject.is_none());
+
+            let provider = TokenAuthProvider::new(routes.server().token_verifier(resource()));
+            let bearer = format!("Bearer {token}");
+            let ctx = McpContext::new(Cx::for_testing(), 971);
+            let authentication = || {
+                provider.authenticate(
+                    &ctx,
+                    AuthRequest {
+                        method: "tools/list",
+                        params: None,
+                        transport_authorization: Some(&bearer),
+                        request_id: 971,
+                    },
+                )
+            };
+            assert!(authentication().is_ok());
+            assert_native_oauth_error(
+                &dispatch(&routes, routes.token_path(), &body),
+                HttpStatus::BAD_REQUEST,
+                "invalid_client",
+                None,
+            );
+            assert_eq!(routes.server().stats().access_tokens, 1);
+
+            let mut metadata_request =
+                native_oauth_form_request(routes.metadata_path(), "", None);
+            metadata_request.method = Http1Method::Get;
+            metadata_request.headers.clear();
+            let response = dispatch_oauth_h1_request(
+                &routes, &metadata_request, routes.metadata_path(), "",
+            );
+            assert_eq!(response.status, HttpStatus::OK);
+            let metadata: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            for field in [
+                "token_endpoint_auth_methods_supported",
+                "revocation_endpoint_auth_methods_supported",
+            ] {
+                assert!(metadata[field].as_array().unwrap().iter()
+                    .any(|method| method == "private_key_jwt"));
+            }
+            for field in [
+                "token_endpoint_auth_signing_alg_values_supported",
+                "revocation_endpoint_auth_signing_alg_values_supported",
+            ] {
+                assert_eq!(metadata[field], serde_json::json!(["RS256"]));
+            }
+
+            // A token-endpoint audience cannot authorize the separate revoke route.
+            let wrong_target = assertion(TOKEN_ENDPOINT, "native-wrong-revoke-target");
+            assert_native_oauth_error(
+                &dispatch(
+                    &routes,
+                    routes.revocation_path(),
+                    &revocation_form(&wrong_target, token),
+                ),
+                HttpStatus::BAD_REQUEST,
+                "invalid_client",
+                None,
+            );
+            assert!(authentication().is_ok());
+            let revoke = revocation_form(
+                &assertion(REVOCATION_ENDPOINT, "native-revoke"),
+                token,
+            );
+            let response = dispatch(&routes, routes.revocation_path(), &revoke);
+            assert_eq!(response.status, HttpStatus::OK);
+            assert_eq!(
+                response.headers.get("cache-control").map(String::as_str),
+                Some("no-store")
+            );
+            assert!(authentication().is_err());
+            assert!(routes.server().validate_access_token(token).is_none());
+            assert_native_oauth_error(
+                &dispatch(&routes, routes.revocation_path(), &revoke),
+                HttpStatus::BAD_REQUEST,
+                "invalid_client",
+                None,
+            );
+            assert_eq!(routes.server().stats().refresh_tokens, 0);
+
+            // Public OIDC discovery describes the same token/revocation handlers.
+            // Pending ID-token signing remains a separate capability.
+            let oidc = native_pending_oidc_provider(
+                routes.server(), "https://fastmcp.invalid/oidc/jwks",
+            );
+            let routes = routes.with_oidc(oidc).unwrap();
+            let path = routes.oidc_routes().unwrap().discovery_path();
+            let mut request = native_oauth_form_request(path, "", None);
+            request.method = Http1Method::Get;
+            request.headers.clear();
+            let response = dispatch_oauth_h1_request(&routes, &request, path, "");
+            assert_eq!(response.status, HttpStatus::OK);
+            let discovery: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            for field in [
+                "token_endpoint_auth_signing_alg_values_supported",
+                "revocation_endpoint_auth_signing_alg_values_supported",
+            ] {
+                assert_eq!(discovery[field], metadata[field]);
+            }
+            for field in [
+                "token_endpoint_auth_methods_supported",
+                "revocation_endpoint_auth_methods_supported",
+            ] {
+                assert!(discovery[field].as_array().unwrap().iter()
+                    .any(|method| method == "private_key_jwt"));
+            }
+            assert_eq!(discovery["id_token_signing_alg_values_supported"], serde_json::json!([]));
+            assert_eq!(discovery["grant_types_supported"], metadata["grant_types_supported"]);
+        }
+
+        #[test]
+        fn native_signed_machine_refusals_preserve_the_unconsumed_assertion() {
+            let routes = fixture();
+            let signed = assertion(TOKEN_ENDPOINT, "native-refused-then-accepted");
+            let valid = token_form(&signed, "machine:read");
+            let basic = native_oauth_basic_header("native-signed-machine:unused");
+            let mut rejected = Vec::new();
+            for authorization in [basic, String::new(), "Bearer competing-token".to_owned()] {
+                rejected.push((valid.clone(), Some(authorization), "invalid_request"));
+            }
+            for extra in [
+                "client_id=native-signed-machine", "client_id=",
+                "client_secret=unused", "client_secret=", "client%5Fsecret=",
+                "code=", "redirect_uri=", "code_verifier=", "refresh_token=",
+                "client_assertion=", "client%5Fassertion=duplicate",
+                "client_assertion_type=",
+            ] {
+                rejected.push((format!("{valid}&{extra}"), None, "invalid_request"));
+            }
+            for scope in ["", " machine:read", "machine:read ", "machine:read  machine:read"] {
+                rejected.push((token_form(&signed, scope), None, "invalid_scope"));
+            }
+            rejected.push((
+                token_form(&signed, "machine:read\tmachine:read"), None, "invalid_request",
+            ));
+            rejected.push((
+                token_form(&signed, "browser:admin"), None, "invalid_scope",
+            ));
+            rejected.push((
+                valid.replace("grant_type=client_credentials", "grant_type=authorization_code"),
+                None,
+                "unsupported_grant_type",
+            ));
+            rejected.push((
+                valid.replace("resource.example%2Fapi", "resource.example%2Fother"),
+                None,
+                "invalid_request",
+            ));
+            for parameters in [
+                vec![
+                    ("grant_type", "client_credentials"), ("resource", RESOURCE),
+                    ("scope", "machine:read"), ("client_assertion_type", "wrong"),
+                    ("client_assertion", signed.as_str()),
+                ],
+                vec![
+                    ("grant_type", "client_credentials"), ("resource", RESOURCE),
+                    ("scope", "machine:read"), ("client_assertion", signed.as_str()),
+                ],
+                vec![
+                    ("grant_type", "client_credentials"), ("resource", RESOURCE),
+                    ("scope", "machine:read"),
+                    ("client_assertion_type", oauth::JWT_BEARER_CLIENT_ASSERTION_TYPE),
+                    ("client_assertion", ""),
+                ],
+            ] {
+                rejected.push((form(&parameters), None, "invalid_request"));
+            }
+            for (body, authorization, error) in rejected {
+                let request =
+                    native_oauth_form_request(routes.token_path(), &body, authorization.as_deref());
+                let response =
+                    dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "");
+                assert_native_oauth_error(&response, HttpStatus::BAD_REQUEST, error, None);
+                assert_eq!(routes.server().stats().access_tokens, 0);
+                assert_eq!(routes.server().stats().refresh_tokens, 0);
+                assert_eq!(routes.server().stats().revoked_tokens, 0);
+            }
+            assert_eq!(
+                dispatch(&routes, routes.token_path(), &valid).status,
+                HttpStatus::OK,
+                "refused input cannot spend the valid assertion's replay slot"
+            );
+            assert_eq!(routes.server().stats().access_tokens, 1);
+        }
+
+        #[test]
+        fn native_signed_machine_audience_uses_the_trusted_public_route() {
+            let routes = fixture();
+            let alternate = OAuthHttpRoutes::new(
+                Arc::clone(routes.server()), "https://different.example/oauth",
+            )
+            .unwrap();
+            let body = token_form(
+                &assertion(TOKEN_ENDPOINT, "native-trusted-public-route"), "machine:read",
+            );
+            let mut request = native_oauth_form_request(alternate.token_path(), &body, None);
+            request.headers.extend([
+                ("Host".to_owned(), "fastmcp.invalid".to_owned()),
+                ("X-Forwarded-Host".to_owned(), "fastmcp.invalid".to_owned()),
+                ("X-Forwarded-Proto".to_owned(), "https".to_owned()),
+            ]);
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&alternate, &request, alternate.token_path(), ""),
+                HttpStatus::BAD_REQUEST,
+                "invalid_client",
+                None,
+            );
+            assert_eq!(routes.server().stats().access_tokens, 0);
+            request.headers.push((
+                "Forwarded".to_owned(), "host=untrusted.example;proto=http".to_owned(),
+            ));
+            assert_eq!(
+                dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "").status,
+                HttpStatus::OK,
+                "only the administratively configured receiving endpoint selects the target"
+            );
+        }
+
+        #[test]
+        fn live_http_signed_machine_token_authorizes_mcp_until_signed_revocation() {
+            run_live_http_test(|cx| async move {
+                let routes = fixture();
+                let oauth = Arc::clone(routes.server());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed_calls = Arc::clone(&calls);
+                let bound = Server::new("live-private-key-jwt", "1.0.0")
+                    .protocol_policy(ProtocolPolicy::ModernOnly)
+                    .map_err(|error| format!("modern OAuth test policy failed: {error}"))?
+                    .auth_provider(TokenAuthProvider::new(oauth.token_verifier(resource())))
+                    .oauth_http_routes(routes)
+                    .tool(ModernHttpAuthCounterTool { calls })
+                    .build()
+                    .bind_http(&cx, "127.0.0.1:0")
+                    .await
+                    .map_err(|error| format!("signed OAuth listener failed: {error}"))?;
+                let address = bound.local_addr()
+                    .map_err(|error| format!("signed OAuth address failed: {error}"))?;
+                let caller_cx = cx.clone();
+                let mut client = cx
+                    .spawn(move |_client_cx| async move {
+                        let result = async {
+                            let request = |path: &str, body: &str| {
+                                format!(
+                                    "POST {path} HTTP/1.1\r\nHost: loopback\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len(),
+                                )
+                                .into_bytes()
+                            };
+                            let body = token_form(
+                                &assertion(TOKEN_ENDPOINT, "live-native-issue"), "machine:read",
+                            );
+                            let issued = live_http_exchange(
+                                address, request("/oauth/token", &body),
+                            )
+                            .await?;
+                            if !issued.starts_with(b"HTTP/1.1 200")
+                                || live_http_response_header(&issued, "cache-control")? != "no-store"
+                            {
+                                return Err("signed machine issuance did not succeed".to_owned());
+                            }
+                            let issued: serde_json::Value =
+                                serde_json::from_slice(live_http_response_body(&issued)?)
+                                    .map_err(|_| "signed token response was not JSON".to_owned())?;
+                            let token = issued["access_token"].as_str()
+                                .ok_or_else(|| "signed token response omitted access token".to_owned())?
+                                .to_owned();
+                            if issued.get("refresh_token").is_some()
+                                || issued.get("id_token").is_some()
+                                || oauth.validate_access_token(&token).is_none()
+                            {
+                                return Err("machine issuance crossed token-family boundaries".to_owned());
+                            }
+                            let replay = live_http_exchange(
+                                address, request("/oauth/token", &body),
+                            )
+                            .await?;
+                            let replay_body: serde_json::Value =
+                                serde_json::from_slice(live_http_response_body(&replay)?)
+                                    .map_err(|_| "assertion replay response was not JSON".to_owned())?;
+                            if !replay.starts_with(b"HTTP/1.1 400")
+                                || replay_body != serde_json::json!({"error": "invalid_client"})
+                                || oauth.stats().access_tokens != 1
+                            {
+                                return Err("wire assertion replay issued another token".to_owned());
+                            }
+
+                            let bearer = format!("Bearer {token}");
+                            let tool_request = modern_http_json_tool_request(
+                                "modern_http_auth_counter", 972,
+                            );
+                            let tool_wire = || live_http_post(
+                                "/mcp",
+                                &tool_request.body,
+                                &[
+                                    ("Accept", "application/json"),
+                                    ("Authorization", bearer.as_str()),
+                                    ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                                    ("Mcp-Method", "tools/call"),
+                                    ("Mcp-Name", "modern_http_auth_counter"),
+                                ],
+                            );
+                            let accepted = live_http_exchange(address, tool_wire()).await?;
+                            if !accepted.starts_with(b"HTTP/1.1 200")
+                                || observed_calls.load(Ordering::Acquire) != 1
+                            {
+                                return Err("issued machine token did not authorize MCP dispatch".to_owned());
+                            }
+                            let response: JsonRpcResponse =
+                                serde_json::from_slice(live_http_response_body(&accepted)?)
+                                    .map_err(|_| "machine MCP response was not JSON-RPC".to_owned())?;
+                            if response.error.is_some() || response.result.is_none() {
+                                return Err("authenticated machine MCP call did not succeed".to_owned());
+                            }
+
+                            let revoke = revocation_form(
+                                &assertion(REVOCATION_ENDPOINT, "live-native-revoke"),
+                                &token,
+                            );
+                            let revoked = live_http_exchange(
+                                address, request("/oauth/revoke", &revoke),
+                            )
+                            .await?;
+                            if !revoked.starts_with(b"HTTP/1.1 200")
+                                || oauth.validate_access_token(&token).is_some()
+                            {
+                                return Err("signed revocation did not invalidate its token".to_owned());
+                            }
+                            let refused = live_http_exchange(address, tool_wire()).await?;
+                            if !refused.starts_with(b"HTTP/1.1 401")
+                                || observed_calls.load(Ordering::Acquire) != 1
+                            {
+                                return Err("revoked token reached the MCP tool handler".to_owned());
+                            }
+                            Ok(())
+                        }
+                        .await;
+                        caller_cx.cancel_with(CancelKind::User, Some("signed OAuth lifecycle complete"));
+                        result
+                    })
+                    .map_err(|error| format!("signed OAuth client spawn failed: {error}"))?;
+                let serve = bound.serve(&cx).await;
+                client.join(&cx).await
+                    .map_err(|error| format!("signed OAuth client failed: {error:?}"))??;
+                require_quiescent_http_shutdown(
+                    serve.map_err(|error| format!("signed OAuth listener failed: {error}"))?,
+                    "signed OAuth lifecycle",
+                )
+                .await?;
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn native_basic_rejects_assertion_parameters_before_spending_authorization_code() {
+        let (routes, form, basic) = native_oauth_basic_fixture();
+        for extra in [
+            "client_assertion=", "client_assertion=ignored",
+            "client_assertion_type=", "client_assertion_type=ignored",
+            "client%5Fassertion=",
+        ] {
+            let request = native_oauth_form_request(
+                routes.token_path(), &format!("{form}&{extra}"), Some(&basic),
+            );
+            assert_native_oauth_error(
+                &dispatch_oauth_h1_request(&routes, &request, routes.token_path(), ""),
+                HttpStatus::BAD_REQUEST,
+                "invalid_request",
+                None,
+            );
+            assert_eq!(routes.server().stats().access_tokens, 0);
+        }
+        let request = native_oauth_form_request(routes.token_path(), &form, Some(&basic));
+        assert_eq!(
+            dispatch_oauth_h1_request(&routes, &request, routes.token_path(), "").status,
+            HttpStatus::OK,
+        );
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
     fn native_development_machine_fixture(enabled: bool) -> (OAuthHttpRoutes, String) {
         let oauth = Arc::new(
             oauth::OAuthServer::try_new(oauth::OAuthServerConfig {
@@ -45531,7 +46171,6 @@ mod lib_unit_tests {
         for form in [
             base.to_string(),
             format!("{base}&code="),
-            format!("{base}&client_assertion=ignored"),
             base.replace("machine%3Aread", "machine%3Aread++machine%3Awrite"),
         ] {
             let request = native_oauth_form_request(routes.token_path(), &form, Some(&basic));
@@ -45545,6 +46184,20 @@ mod lib_unit_tests {
             assert_eq!(routes.server().stats().access_tokens, 0);
             assert_eq!(routes.server().stats().refresh_tokens, 0);
         }
+        // Competing credentials are malformed independently of grant enablement.
+        let request = native_oauth_form_request(
+            routes.token_path(),
+            &format!("{base}&client_assertion=ignored"),
+            Some(&basic),
+        );
+        assert_native_oauth_error(
+            &dispatch_oauth_h1_request(&routes, &request, routes.token_path(), ""),
+            HttpStatus::BAD_REQUEST,
+            "invalid_request",
+            None,
+        );
+        assert_eq!(routes.server().stats().access_tokens, 0);
+        assert_eq!(routes.server().stats().refresh_tokens, 0);
     }
 
     fn assert_native_oauth_error(

@@ -521,6 +521,9 @@ pub struct DiscoveryDocument {
     /// The public-client `none` method is present only when the attached
     /// OAuth server admits public clients.
     pub revocation_endpoint_auth_methods_supported: Vec<String>,
+    /// Supported signing algorithms for revocation client assertions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revocation_endpoint_auth_signing_alg_values_supported: Option<Vec<String>>,
     /// Whether every authorization response carries RFC 9207 `iss`.
     pub authorization_response_iss_parameter_supported: bool,
     /// Supported scopes.
@@ -538,6 +541,9 @@ pub struct DiscoveryDocument {
     pub id_token_signing_alg_values_supported: Vec<String>,
     /// Supported token endpoint auth methods.
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// Supported signing algorithms for token endpoint client assertions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_signing_alg_values_supported: Option<Vec<String>>,
     /// Supported claims.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claims_supported: Option<Vec<String>>,
@@ -570,6 +576,7 @@ impl DiscoveryDocument {
                 "client_secret_post".to_string(),
                 "client_secret_basic".to_string(),
             ],
+            revocation_endpoint_auth_signing_alg_values_supported: None,
             authorization_response_iss_parameter_supported: true,
             scopes_supported: vec![
                 "openid".to_string(),
@@ -589,6 +596,7 @@ impl DiscoveryDocument {
                 "client_secret_post".to_string(),
                 "client_secret_basic".to_string(),
             ],
+            token_endpoint_auth_signing_alg_values_supported: None,
             claims_supported: Some(vec![
                 "sub".to_string(),
                 "iss".to_string(),
@@ -1929,6 +1937,16 @@ impl OidcProvider {
             doc.revocation_endpoint_auth_methods_supported
                 .retain(|method| method != "none");
         }
+        if self.oauth.development_client_credentials_enabled() {
+            doc.token_endpoint_auth_methods_supported
+                .push("private_key_jwt".to_string());
+            doc.revocation_endpoint_auth_methods_supported
+                .push("private_key_jwt".to_string());
+            doc.token_endpoint_auth_signing_alg_values_supported =
+                Some(vec!["RS256".to_string()]);
+            doc.revocation_endpoint_auth_signing_alg_values_supported =
+                Some(vec!["RS256".to_string()]);
+        }
         #[cfg(feature = "builtin-auth-server")]
         if let Ok(slot) = self.signing_activation.read() {
             if let (Some(_), Some(published)) = (slot.active(), slot.published()) {
@@ -2636,6 +2654,86 @@ mod non_signing_tests {
             );
             assert!(discovery.id_token_signing_alg_values_supported.is_empty());
             assert!(discovery.jwks_uri.is_none());
+        }
+    }
+
+    #[cfg(all(feature = "builtin-auth-server", feature = "oauth-client-credentials"))]
+    #[test]
+    fn discovery_client_assertion_metadata_tracks_issuer_and_public_client_policy() {
+        for enabled in [false, true] {
+            for allow_public_clients in [false, true] {
+                let oauth = Arc::new(
+                    OAuthServer::try_new(OAuthServerConfig {
+                        issuer: "https://issuer.example".to_string(),
+                        allow_public_clients,
+                        allow_development_client_credentials: enabled,
+                        ..OAuthServerConfig::default()
+                    })
+                    .unwrap(),
+                );
+                let doc = OidcProvider::with_defaults(oauth)
+                    .unwrap()
+                    .discovery_document("https://issuer.example/oauth");
+                let mut methods = Vec::new();
+                if allow_public_clients {
+                    methods.push("none".to_string());
+                }
+                methods.extend([
+                    "client_secret_post".to_string(),
+                    "client_secret_basic".to_string(),
+                ]);
+                if enabled {
+                    methods.push("private_key_jwt".to_string());
+                }
+                let algorithms = enabled.then(|| vec!["RS256".to_string()]);
+                assert_eq!(doc.token_endpoint_auth_methods_supported, methods);
+                assert_eq!(doc.revocation_endpoint_auth_methods_supported, methods);
+                assert_eq!(
+                    doc.token_endpoint_auth_signing_alg_values_supported,
+                    algorithms
+                );
+                assert_eq!(
+                    doc.revocation_endpoint_auth_signing_alg_values_supported,
+                    algorithms
+                );
+                assert_eq!(doc.registration_endpoint.is_some(), allow_public_clients);
+
+                // Authenticating client assertions does not activate this
+                // provider's independent ID-token signer or JWKS publication.
+                assert!(doc.id_token_signing_alg_values_supported.is_empty());
+                assert!(doc.jwks_uri.is_none());
+                let wire = serde_json::to_value(&doc).unwrap();
+                for key in [
+                    "token_endpoint_auth_methods_supported",
+                    "revocation_endpoint_auth_methods_supported",
+                ] {
+                    assert_eq!(wire[key], serde_json::json!(methods));
+                }
+                for key in [
+                    "token_endpoint_auth_signing_alg_values_supported",
+                    "revocation_endpoint_auth_signing_alg_values_supported",
+                ] {
+                    if enabled {
+                        assert_eq!(wire[key], serde_json::json!(["RS256"]));
+                    } else {
+                        assert!(wire.get(key).is_none());
+                    }
+                }
+                assert_eq!(
+                    wire["id_token_signing_alg_values_supported"],
+                    serde_json::json!([])
+                );
+                assert!(wire.get("jwks_uri").is_none());
+                let restored: DiscoveryDocument = serde_json::from_value(wire).unwrap();
+                assert_eq!(
+                    restored.token_endpoint_auth_signing_alg_values_supported,
+                    algorithms
+                );
+                assert_eq!(
+                    restored.revocation_endpoint_auth_signing_alg_values_supported,
+                    algorithms
+                );
+            }
         }
     }
 
