@@ -358,6 +358,15 @@ scenarios, including every input-required one, so a measurement taken without
   creation with `Final task creation requires an installed ready task service`.
   Applications may instead install and drive `AuthorizedTaskServiceRunner`
   explicitly; combining that installation with the builder hook is rejected.
+  Each elected attempt receives a separate child region in the caller's runtime.
+  Its deadline is capped by the caller and the remaining attempt, total-lifetime,
+  and retention limits; lease renewal cannot extend it. Cancelling a Task leaves
+  the service and sibling Tasks independent. The built-in store keeps execution
+  capacity reserved until the attempt and its descendants settle. Custom stores
+  must provide equivalent admission across lease expiry and changes of owner.
+  Descendants must cooperate with cancellation; dropping the service requests
+  cleanup owned by the caller's runtime, and abrupt runtime destruction does not
+  prove cleanup completed.
 - **Authenticated local Tasks retain their caller:** task creation atomically
   stores a private principal binding, original tool registration, and immutable
   creation generation. Protected task-producing tools require both

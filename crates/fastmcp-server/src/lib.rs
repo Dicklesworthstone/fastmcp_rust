@@ -31292,6 +31292,7 @@ mod lib_unit_tests {
     #[cfg(feature = "tasks")]
     #[test]
     fn server_final_task_store_execution_budget_survives_renewal_and_reclaim() {
+        with_final_tasks_test_runtime(async {
         let start = Instant::now();
         let clock_now = Arc::new(Mutex::new(start));
         let clock = {
@@ -31316,8 +31317,11 @@ mod lib_unit_tests {
         let healthy = runtime
             .create_task_with_work(final_tasks_test_work_descriptor(), None)
             .expect("public admission accepts a bounded backend");
-        let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(Future::poll(service.as_mut(), &mut poll_cx).is_pending());
+        drive_final_tasks_test_service_until(service.as_mut(), || {
+            runtime.get_task(&healthy.task.base().task_id).is_ok_and(|result| {
+                matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+            })
+        }).await;
         assert!(matches!(
             runtime
                 .get_task(&healthy.task.base().task_id)
@@ -31464,6 +31468,8 @@ mod lib_unit_tests {
             panic!("claim exhaustion must retain a failed task");
         };
         assert_eq!(error.message, "Task execution attempt limit exceeded");
+        drop(service);
+        });
     }
 
     #[cfg(feature = "tasks")]
@@ -31691,7 +31697,9 @@ mod lib_unit_tests {
         let runner = runtime
             .install_task_service(1, Arc::new(FinalTasksTestSupervisor))
             .expect("test final Tasks service must install");
-        let service_cx = Cx::for_testing();
+        // Readiness-only fixtures may stay detached. Tests that execute work
+        // enter with_final_tasks_test_runtime before calling this helper.
+        let service_cx = Cx::current().unwrap_or_else(Cx::for_testing);
         let mut service = Box::pin(async move { runner.run(&service_cx).await });
         let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
         assert!(
@@ -31699,6 +31707,38 @@ mod lib_unit_tests {
             "test final Tasks service must publish readiness and remain owned",
         );
         service
+    }
+
+    #[cfg(feature = "tasks")]
+    fn with_final_tasks_test_runtime(scenario: impl Future<Output = ()>) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(scenario);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(feature = "tasks")]
+    async fn drive_final_tasks_test_service_until<F: Future<Output = McpResult<()>> + ?Sized>(
+        mut service: std::pin::Pin<&mut F>,
+        condition: impl Fn() -> bool,
+    ) {
+        let cx = Cx::current().expect("application execution uses the caller test runtime");
+        let mut observation = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(1)));
+        asupersync::time::timeout(cx.now(), Duration::from_secs(5), std::future::poll_fn(|context| {
+            if let std::task::Poll::Ready(result) = service.as_mut().poll(context) {
+                panic!("Task service exited before caller shutdown: {result:?}");
+            }
+            if condition() {
+                return std::task::Poll::Ready(());
+            }
+            if observation.as_mut().poll(context).is_ready() {
+                observation = Box::pin(asupersync::time::sleep(cx.now(), Duration::from_millis(1)));
+                context.waker().wake_by_ref();
+            }
+            std::task::Poll::Pending
+        })).await.expect("Task application reaches its expected state within the caller runtime");
     }
 
     #[cfg(feature = "tasks")]
@@ -31718,7 +31758,7 @@ mod lib_unit_tests {
     impl ApplicationTaskSupervisor for RecordingServerFinalTaskSupervisor {
         fn resume<'a>(
             &'a self,
-            cx: &'a Cx,
+            _cx: &'a Cx,
             handoff: FinalTaskSupervisorHandoff,
         ) -> FinalTaskSupervisorFuture<'a> {
             let started = Arc::clone(&self.started);
@@ -31735,7 +31775,6 @@ mod lib_unit_tests {
                 let result = serde_json::from_value(serde_json::json!({"content": []}))
                     .expect("typed terminal task result");
                 initial.complete_task(result, None)?;
-                cx.cancel_with(asupersync::CancelKind::User, None);
                 Ok(())
             })
         }
@@ -31765,6 +31804,7 @@ mod lib_unit_tests {
     #[cfg(feature = "tasks")]
     #[test]
     fn server_final_task_store_service_consumes_durable_initial_work() {
+        with_final_tasks_test_runtime(async {
         let store = Arc::new(ServerFinalTaskStore::default());
         let runtime = server_final_task_store_runtime(Arc::clone(&store));
         let started = Arc::new(Mutex::new(Vec::new()));
@@ -31776,7 +31816,7 @@ mod lib_unit_tests {
                 }),
             )
             .expect("test task service installs");
-        let service_cx = Cx::for_testing();
+        let service_cx = Cx::current().unwrap();
         let mut service = Box::pin(runner.run(&service_cx));
 
         assert!(matches!(
@@ -31788,10 +31828,11 @@ mod lib_unit_tests {
             .expect("ready service admits durable initial work");
         let task_id = created.task.base().task_id.clone();
 
-        assert!(matches!(
-            poll_final_task_service_once(service.as_mut()),
-            std::task::Poll::Ready(Ok(()))
-        ));
+        drive_final_tasks_test_service_until(service.as_mut(), || {
+            runtime.get_task(&task_id).is_ok_and(|result| {
+                matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+            })
+        }).await;
         assert_eq!(
             started
                 .lock()
@@ -31806,6 +31847,10 @@ mod lib_unit_tests {
                 .is_none(),
             "successful owner-fenced dispatch consumes the initial handoff"
         );
+        service_cx.cancel_with(asupersync::CancelKind::User, None);
+        asupersync::time::timeout(service_cx.now(), Duration::from_secs(5), service.as_mut())
+            .await.unwrap().unwrap();
+        });
     }
 
     #[cfg(feature = "tasks")]
@@ -32280,6 +32325,7 @@ mod lib_unit_tests {
     #[cfg(feature = "tasks")]
     #[test]
     fn final_tasks_test_server_drives_retained_service_after_task_creation() {
+        with_final_tasks_test_runtime(async {
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let (server, mut service) = final_tasks_test_server(Arc::clone(&delivered));
         let runtime = server
@@ -32293,11 +32339,11 @@ mod lib_unit_tests {
             .task_id
             .clone();
 
-        let mut poll_cx = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(
-            Future::poll(service.as_mut(), &mut poll_cx).is_pending(),
-            "the retained service continues waiting after committing its task transition",
-        );
+        drive_final_tasks_test_service_until(service.as_mut(), || {
+            runtime.get_task(&task_id).is_ok_and(|result| {
+                matches!(result.task, fastmcp_protocol::Task::Completed { .. })
+            })
+        }).await;
 
         assert!(matches!(
             runtime
@@ -32314,6 +32360,8 @@ mod lib_unit_tests {
             2,
             "task creation and the fenced terminal completion each emit one notification",
         );
+        drop(service);
+        });
     }
 
     #[cfg(feature = "tasks")]
@@ -48271,6 +48319,27 @@ mod lib_unit_tests {
     struct AuthTaskSupervisor;
 
     #[cfg(feature = "tasks")]
+    struct AuthTaskExecutionPolicy {
+        owner: Sha256Digest,
+    }
+
+    #[cfg(feature = "tasks")]
+    impl TaskExecutionAuthorizer for AuthTaskExecutionPolicy {
+        fn authorize(&self, task: &FinalTaskAccessMetadata) -> McpResult<()> {
+            if task.authenticated_principal() == Some(self.owner)
+                && task.original_operation().is_some_and(|operation| {
+                    operation.method() == "tools/call"
+                        && operation.tool_name() == "durable_final_task"
+                })
+            {
+                Ok(())
+            } else {
+                Err(McpError::invalid_request("Unexpected Task execution owner or operation"))
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
     impl ApplicationTaskSupervisor for AuthTaskSupervisor {
         fn resume<'a>(
             &'a self,
@@ -48369,6 +48438,12 @@ mod lib_unit_tests {
                 sha256_bounded(subject.as_bytes(), 256).expect("bounded test owner subject")
             };
             let owner = verified_owner(&subject);
+            // This trusted fixture grants one owner execution of this exact
+            // tool. The worker retains only the identity lookup key; refreshed
+            // ingress credentials and request contexts are not its authority.
+            let execution_owner = FinalTaskAccessMetadata::principal_for_auth(
+                &AuthContext::with_subject(subject.clone()).with_session_owner(owner),
+            ).map_err(|error| error.to_string())?;
             let mut refreshed =
                 AuthContext::with_subject(subject.clone()).with_session_owner(owner);
             refreshed.scopes = vec!["tasks".to_owned()];
@@ -48424,6 +48499,9 @@ mod lib_unit_tests {
                             .into_iter().map(|method| (method.to_owned(), RequiredScopes::new(vec![]).unwrap())).collect(),
                     ).unwrap();
                     OperationScopePolicy::new(1, methods, vec![(ScopedOperation::ToolCall("durable_final_task".to_owned()), RequiredScopes::new(vec![]).unwrap())]).unwrap()
+                }))
+                .task_execution_authorizer(Arc::new(AuthTaskExecutionPolicy {
+                    owner: execution_owner,
                 }))
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
