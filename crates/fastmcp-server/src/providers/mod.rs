@@ -21,6 +21,8 @@
 //!   authentication through the existing `TokenAuthProvider` server hook.
 //!   `ManagedJwtResourceVerifier` adds expiring keys and caller-driven,
 //!   single-flight JWKS refresh with revocation and stale-result fencing.
+//!   `GuardedJwtResourceVerifier` supplies bounded HTTPS renewal directly on
+//!   the authenticating request's runtime, without custom fetching code.
 //!
 //! # Example
 //!
@@ -66,6 +68,7 @@ pub use introspection::{
 pub mod managed_jwks;
 #[cfg(feature = "jwt-resource-auth")]
 pub use managed_jwks::{
+    GuardedJwksSource, GuardedJwtResourceVerifier, JwksFetchAdmissionPool,
     JwksRefreshError, JwksRefreshOutcome, JwksRefreshPolicy, ManagedJwtResourceVerifier,
 };
 

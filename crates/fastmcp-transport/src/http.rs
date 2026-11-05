@@ -1705,10 +1705,33 @@ impl GuardedHttpFetcher {
         cx: &Cx,
         url: &GuardedHttpsUrl,
     ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        self.fetch_with_retained_lifetime(cx, url, None).await
+    }
+
+    /// Fetch while retaining the caller's capacity guard in every resolver
+    /// and TCP/TLS/HTTP child, including after the joining future is dropped.
+    /// The guard grants no authority and does not change the request, roots,
+    /// address fence or deadlines. Retain another Arc while processing the
+    /// returned document when that work must remain charged to the same limit.
+    pub async fn fetch_with_lifetime(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        lifetime: Arc<dyn Send + Sync>,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
+        self.fetch_with_retained_lifetime(cx, url, Some(lifetime)).await
+    }
+
+    async fn fetch_with_retained_lifetime(
+        &self,
+        cx: &Cx,
+        url: &GuardedHttpsUrl,
+        lifetime: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<GuardedHttpFetchResponse, GuardedHttpFetchError> {
         guarded_fetch_checkpoint(cx)?;
         let fetch_deadline = time::wall_now() + self.policy.deadline;
         let answers = self
-            .resolve_all(cx, fetch_deadline, url.host.clone())
+            .resolve_all_with_lifetime(cx, fetch_deadline, url.host.clone(), lifetime.clone())
             .await?;
         #[cfg(test)]
         let selected_address = guarded_select_address_with_test_loopback(
@@ -1730,8 +1753,9 @@ impl GuardedHttpFetcher {
                 selected_address,
             };
             let body_limit = self.policy.response_body_bytes;
-            let wire = guarded_await_phase(cx, fetch_deadline, move |phase_cx| {
-                exchange.exchange(phase_cx, request)
+            let wire = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
+                let _lifetime = lifetime;
+                exchange.exchange(phase_cx, request).await
             })
             .await?;
             return guarded_admit_native_response(
@@ -1749,6 +1773,8 @@ impl GuardedHttpFetcher {
         let target = url.target.clone();
         let policy = self.policy.clone();
         let response = guarded_await_phase(cx, fetch_deadline, move |phase_cx| async move {
+            // Keep capacity until this child and all of its I/O resources drop.
+            let _lifetime = lifetime;
             guarded_fetch_checkpoint(&phase_cx)?;
             let tcp = NativeTcpStream::connect(selected_address)
                 .await
@@ -1792,15 +1818,6 @@ impl GuardedHttpFetcher {
     #[must_use]
     pub fn policy(&self) -> &GuardedHttpFetchPolicy {
         &self.policy
-    }
-
-    async fn resolve_all(
-        &self,
-        cx: &Cx,
-        deadline: asupersync::Time,
-        host: String,
-    ) -> Result<Vec<IpAddr>, GuardedHttpFetchError> {
-        self.resolve_all_with_lifetime(cx, deadline, host, None).await
     }
 
     async fn resolve_all_with_lifetime(
@@ -8553,6 +8570,45 @@ X/aCEJ5+hA==
         });
         assert_eq!(resolver_dropped.load(Ordering::Acquire), 1);
         assert_eq!(alive_at_drop.load(Ordering::Acquire), 1, "child drops before its capacity guard");
+        assert_eq!(lifetime_dropped.load(Ordering::Acquire), 1);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn guarded_get_lifetime_outlives_cancelled_resolver_after_parent_drop() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let resolver_dropped = Arc::new(AtomicUsize::new(0));
+        let alive_at_drop = Arc::new(AtomicUsize::new(0));
+        let lifetime_dropped = Arc::new(AtomicUsize::new(0));
+        let lifetime = Arc::new(GuardedLifetimeProbe { dropped: Arc::clone(&lifetime_dropped) });
+        let weak = Arc::downgrade(&lifetime);
+        let fetcher = GuardedHttpFetcher::with_resolver(
+            guarded_test_policy_with_handshake(1024, Duration::from_secs(2), Duration::from_secs(1)),
+            Arc::new(LifetimeObservingResolver {
+                lifetime: weak.clone(), started: Arc::clone(&started),
+                dropped: Arc::clone(&resolver_dropped), alive_at_drop: Arc::clone(&alive_at_drop),
+            }),
+        ).unwrap();
+        let url = GuardedHttpsUrl::parse("https://public.example/keys").unwrap();
+        fastmcp_core::block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut get = Box::pin(fetcher.fetch_with_lifetime(&cx, &url, lifetime));
+            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
+                assert!(get.as_mut().poll(task).is_pending());
+                if started.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
+                task.waker().wake_by_ref();
+                Poll::Pending
+            })).await.expect("resolver starts within a bounded fixture deadline");
+            assert!(weak.upgrade().is_some());
+            drop(get);
+            time::timeout_at(time::wall_now() + Duration::from_secs(1), std::future::poll_fn(|task| {
+                if resolver_dropped.load(Ordering::Acquire) != 0 { return Poll::Ready(()); }
+                task.waker().wake_by_ref();
+                Poll::Pending
+            })).await.expect("cancelled resolver settles");
+        });
+        assert_eq!(resolver_dropped.load(Ordering::Acquire), 1);
+        assert_eq!(alive_at_drop.load(Ordering::Acquire), 1);
         assert_eq!(lifetime_dropped.load(Ordering::Acquire), 1);
         assert!(weak.upgrade().is_none());
     }

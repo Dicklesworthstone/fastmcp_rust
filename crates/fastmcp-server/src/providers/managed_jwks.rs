@@ -25,6 +25,10 @@ use fastmcp_core::{AccessToken, AuthContext, McpContext, McpError, McpErrorCode,
 use super::jwt_resource::{JwtResourceAuthError, JwtResourcePolicy, JwtResourceVerifier};
 use crate::auth::{AuthRequest, TokenVerifier};
 
+/// Bounded HTTPS key acquisition on the authenticating request's runtime.
+pub mod guarded;
+pub use guarded::{GuardedJwksSource, GuardedJwtResourceVerifier, JwksFetchAdmissionPool};
+
 /// Maximum admitted key document, independently of the fetcher's allocation bound.
 pub const MAX_REFRESH_JWKS_BYTES: usize = 64 * 1024;
 
@@ -276,7 +280,7 @@ impl ManagedJwtResourceVerifier {
             return Err(JwtResourceAuthError::KeysChanged);
         }
         auth_checkpoint(ctx)?;
-        Ok(authenticated)
+        Ok(authenticated.with_verification_valid_until(active.expires_at))
     }
 
     /// Performs at most one due refresh. `fetch` is not called when cancelled,
@@ -492,6 +496,19 @@ mod tests {
             BeginRefresh::Run(lease) => lease,
             BeginRefresh::Skip(_) => panic!("expected a due refresh"),
         }
+    }
+
+    #[test]
+    fn managed_jwt_receipt_cannot_outlive_keys_or_a_shorter_token_lease() {
+        let (verifier, _) = fixture();
+        verifier.install_jwks(&jwks()).unwrap();
+        let generation = verifier.fresh_generation().unwrap();
+        let short = generation.expires_at - Duration::from_secs(5);
+        let facts = AuthContext::with_subject("subject").with_verification_valid_until(short);
+        let authenticated = verifier.finish_authentication(&ctx(), &generation, facts).unwrap();
+        assert_eq!(authenticated.verification_valid_until(), Some(short));
+        let authenticated = verifier.finish_authentication(&ctx(), &generation, AuthContext::with_subject("subject")).unwrap();
+        assert_eq!(authenticated.verification_valid_until(), Some(generation.expires_at));
     }
 
     #[test]

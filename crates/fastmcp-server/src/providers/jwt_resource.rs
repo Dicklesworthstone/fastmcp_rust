@@ -35,7 +35,7 @@
 
 use std::fmt;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use fastmcp_core::{
@@ -476,14 +476,15 @@ impl JwtResourceVerifier {
         ctx: &McpContext,
         token: &AccessToken,
     ) -> Result<AuthContext, JwtResourceAuthError> {
-        self.verify_with_clock(ctx, token, || {
+        let candidate = self.prepare_verification(ctx, token)?;
+        self.admit_verified_precise(ctx, candidate, || {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_secs())
                 .map_err(|_| JwtResourceAuthError::ClockUnavailable)
         })
     }
 
+    #[cfg(test)]
     fn verify_with_clock(
         &self,
         ctx: &McpContext,
@@ -520,11 +521,21 @@ impl JwtResourceVerifier {
         Ok(VerifiedJwt { keys, verified })
     }
 
+    #[cfg(test)]
     fn admit_verified(
         &self,
         ctx: &McpContext,
         candidate: VerifiedJwt,
         clock: impl FnOnce() -> Result<u64, JwtResourceAuthError>,
+    ) -> Result<AuthContext, JwtResourceAuthError> {
+        self.admit_verified_precise(ctx, candidate, || clock().map(Duration::from_secs))
+    }
+
+    fn admit_verified_precise(
+        &self,
+        ctx: &McpContext,
+        candidate: VerifiedJwt,
+        clock: impl FnOnce() -> Result<Duration, JwtResourceAuthError>,
     ) -> Result<AuthContext, JwtResourceAuthError> {
         let active = self
             .keys
@@ -541,10 +552,30 @@ impl JwtResourceVerifier {
         // callback. Sample after lock acquisition so contention cannot preserve
         // a stale pre-lock expiry reading. Hold the generation through this
         // bounded decision; revocation after it cannot recall returned facts.
-        let context = admit_claims(&self.policy, candidate.verified.claims(), clock()?)?;
+        // Sample monotonic time first. Time spent taking the wall sample and
+        // admitting claims can only shorten the resulting lease, never extend
+        // it. Keeping the wall sample's fractional second avoids granting an
+        // extra almost-second at an integer NumericDate expiry boundary.
+        let sampled = Instant::now();
+        let now = clock()?;
+        let claims = candidate.verified.claims();
+        let context = admit_claims(&self.policy, claims, now.as_secs())?;
+        let expires = numeric_date(&claims["exp"])?
+            .checked_add(self.policy.clock_skew_seconds)
+            .ok_or(JwtResourceAuthError::InvalidClaims)?;
+        let remaining = Duration::from_secs(expires)
+            .checked_sub(now)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(JwtResourceAuthError::InvalidClaims)?;
+        let valid_until = sampled
+            .checked_add(remaining)
+            .ok_or(JwtResourceAuthError::ClockUnavailable)?;
         checkpoint(ctx)?;
+        if Instant::now() >= valid_until {
+            return Err(JwtResourceAuthError::InvalidClaims);
+        }
         drop(active);
-        Ok(context)
+        Ok(context.with_verification_valid_until(valid_until))
     }
 }
 
@@ -799,7 +830,7 @@ fn admit_claims(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::providers) mod tests {
     use super::*;
     use crate::auth::{AuthProvider, TokenAuthProvider};
     use base64::engine::general_purpose::STANDARD;
@@ -821,12 +852,12 @@ mod tests {
         McpContext::new(asupersync::Cx::for_testing(), 1)
     }
 
-    fn policy() -> JwtResourcePolicy {
+    pub(in crate::providers) fn policy() -> JwtResourcePolicy {
         JwtResourcePolicy::new(ISSUER, RESOURCE, Duration::from_secs(3600), Duration::ZERO)
             .unwrap()
     }
 
-    fn jwks(kid: &str) -> Vec<u8> {
+    pub(in crate::providers) fn jwks(kid: &str) -> Vec<u8> {
         serde_json::to_vec(&json!({"keys":[{
             "kty":"RSA", "alg":"RS256", "use":"sig", "kid":kid, "n":MODULUS, "e":"AQAB"
         }]}))
@@ -852,12 +883,12 @@ mod tests {
         JwtResourceVerifier::new(policy(), &jwks("one")).unwrap()
     }
 
-    fn claims(now: u64) -> Value {
+    pub(in crate::providers) fn claims(now: u64) -> Value {
         json!({"iss":ISSUER, "aud":RESOURCE, "sub":"alice", "client_id":"client-one",
             "iat":now - 10, "exp":now + 60, "jti":"test-token-one", "scope":"read write"})
     }
 
-    fn header() -> Value {
+    pub(in crate::providers) fn header() -> Value {
         json!({"alg":"RS256", "kid":"one", "typ":"at+jwt"})
     }
 
@@ -882,11 +913,36 @@ mod tests {
         }
     }
 
-    fn sign(header: &Value, claims: &Value) -> AccessToken {
+    pub(in crate::providers) fn sign(header: &Value, claims: &Value) -> AccessToken {
         sign_raw(
             &serde_json::to_vec(header).unwrap(),
             &serde_json::to_vec(claims).unwrap(),
         )
+    }
+
+    #[test]
+    fn verified_jwt_receipt_has_precise_nonserializable_expiry_without_changing_owner() {
+        let verifier = verifier();
+        let mut source = claims(NOW);
+        source["exp"] = json!(NOW + 2);
+        let token = sign(&header(), &source);
+        let candidate = verifier.prepare_verification(&ctx(), &token).unwrap();
+        let before = Instant::now();
+        let facts = verifier.admit_verified_precise(&ctx(), candidate, || {
+            Ok(Duration::from_secs(NOW) + Duration::from_millis(875))
+        }).unwrap();
+        let after = Instant::now();
+        let expiry = facts.verification_valid_until().unwrap();
+        assert!(expiry >= before + Duration::from_millis(1125));
+        assert!(expiry <= after + Duration::from_millis(1125));
+        let other = verifier.verify_with_clock(&ctx(), &token, || Ok(NOW)).unwrap();
+        assert_eq!(facts.session_owner(), other.session_owner());
+        assert_eq!(principal_fingerprint(Some(&facts)).unwrap(), principal_fingerprint(Some(&other)).unwrap());
+        assert!(!serde_json::to_string(&facts).unwrap().contains("verification_valid_until"));
+        let expired = verifier.prepare_verification(&ctx(), &token).unwrap();
+        assert!(matches!(verifier.admit_verified_precise(&ctx(), expired, || {
+            Ok(Duration::from_secs(NOW + 2))
+        }), Err(JwtResourceAuthError::InvalidClaims)));
     }
 
     fn verify_at(
