@@ -52315,6 +52315,7 @@ mod lib_unit_tests {
     ) -> Result<(), String> {
         let bound = Server::new("operator-secret-canary", "1.0.0")
             .protocol_policy(ProtocolPolicy::ModernOnly)
+            .expect("modern-only policy is available")
             .http_config(HttpServerConfig::new().max_connections(1))
             .build()
             .bind_http(cx, "127.0.0.1:0")

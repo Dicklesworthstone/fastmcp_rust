@@ -12836,6 +12836,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fmt::Write as _;
     use std::future::Future as _;
+    use std::future::poll_fn;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
