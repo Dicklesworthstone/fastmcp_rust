@@ -1421,7 +1421,7 @@ mod tests {
                 else {
                     panic!("configured HTTP list returned another result family");
                 };
-                let result = serde_json::to_value(result).unwrap();
+                let result = serde_json::to_value(result.payload).unwrap();
                 assert_eq!(result["tools"].as_array().unwrap().len(), 1);
                 assert_eq!(result["tools"][0]["name"], "configured-tool");
                 assert_eq!(config.to_json(), before);

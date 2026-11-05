@@ -6196,7 +6196,7 @@ impl CoreOperation<'_> {
                         "resources/read does not accept tool or prompt arguments",
                     ));
                 }
-                fastmcp_protocol::AbsoluteUri::parse(uri).map_err(|_| {
+                fastmcp_protocol::common_types::AbsoluteUri::parse(uri).map_err(|_| {
                     fastmcp_core::McpError::invalid_params(
                         "read requires a structurally valid absolute resource URI",
                     )

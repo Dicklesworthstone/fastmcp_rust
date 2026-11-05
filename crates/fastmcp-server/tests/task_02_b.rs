@@ -1256,7 +1256,7 @@ impl FinalTaskStore for MinimalBackend {
         Ok(self
             .locked()
             .get(task_id)
-            .filter(|(_, current)| *current == generation)
+            .filter(|(_, current, _)| *current == generation)
             .map(|_| FinalTaskRetentionDeadline::Unlimited))
     }
 }
