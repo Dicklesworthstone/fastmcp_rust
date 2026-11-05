@@ -377,6 +377,15 @@ scenarios, including every input-required one, so a measurement taken without
   These controls are process-local; durable authorization, external revocation
   discovery, anonymous client isolation, and proxy Tasks ownership remain
   unqualified.
+- **Proxied Tasks keep their original tool authorization.** Install
+  `ServerBuilder::task_access_authorizer`, `with_scope_authorization`, or
+  `with_operation_scope_authorization` on the gateway before protected Task
+  creation. The gateway binds each issued handle to the exact originating
+  tool registration and rechecks current original-operation and management
+  grants before upstream controls, reconciliation reads, and subscription
+  events, including queued aliases. An unauthorized selection opens no upstream
+  listener. These policies govern the current gateway process; they do not
+  authorize an upstream worker's execution lifetime or provide restart recovery.
 - **OAuth/OIDC are unpromoted source surfaces:** their public building blocks
   remain available for development, but production security/profile
   conformance is unverified and no production-support claim is made for them.

@@ -923,7 +923,7 @@ impl ServerBuilder {
     }
 
     /// Requires current original-operation and management authorization for
-    /// local Tasks. Calls intersect and callbacks also run before every Task
+    /// local and proxied Tasks. Calls intersect and callbacks run before every Task
     /// subscription event. Install at least one policy for protected
     /// task-producing tools; ordinary authenticated owner equality is not an
     /// original-operation permission. `OperationScopePolicy` implements this
@@ -934,8 +934,10 @@ impl ServerBuilder {
     /// policy to `HttpSecurityPolicy::with_scope_authorization`. HTTP admission
     /// alone cannot reauthorize a detached Task's original tool or later events.
     ///
-    /// This controls request access. Protected Task creation also requires
+    /// This controls request access. Protected local Task creation also requires
     /// [`Self::task_execution_authorizer`] for autonomous process-local work.
+    /// Proxy policies run before upstream dispatch and do not authorize an
+    /// upstream worker's execution lifetime or survive gateway restart.
     /// Restart recovery and trusted embedding reads and writes remain separate.
     #[cfg(feature = "tasks")]
     #[must_use]
@@ -3166,20 +3168,30 @@ impl ServerBuilder {
         // retires its service installation if policy capacity is refused here.
         #[cfg(feature = "tasks")]
         if !self.task_access_authorizers.is_empty() || !self.task_execution_authorizers.is_empty() {
-            let result = self
-                .final_task_runtime
-                .as_ref()
-                .ok_or_else(|| {
-                    McpError::invalid_request(
-                        "Task authorization policy requires a local Tasks runtime",
-                    )
-                })
-                .and_then(|runtime| {
-                    runtime.install_task_authorizers(
+            let result = if let Some(runtime) = self.final_task_runtime.as_ref() {
+                runtime.install_task_authorizers(
+                    std::mem::take(&mut self.task_access_authorizers),
+                    std::mem::take(&mut self.task_execution_authorizers),
+                )
+            } else if !self.task_execution_authorizers.is_empty() {
+                // Reject the complete configuration before mutating any relay.
+                Err(McpError::invalid_request(
+                    "Task execution policy requires a local Tasks runtime",
+                ))
+            } else {
+                #[cfg(feature = "proxy")]
+                {
+                    self.final_task_relay.as_ref().ok_or_else(|| {
+                        McpError::invalid_request("Task access policy requires a Tasks service")
+                    }).and_then(|relay| relay.install_access_authorizers(
                         std::mem::take(&mut self.task_access_authorizers),
-                        std::mem::take(&mut self.task_execution_authorizers),
-                    )
-                });
+                    ))
+                }
+                #[cfg(not(feature = "proxy"))]
+                {
+                    Err(McpError::invalid_request("Task access policy requires a Tasks service"))
+                }
+            };
             if let Err(error) = result {
                 return Err(ServerBuildError::InvalidConfiguration(vec![RefusedRegistration {
                     kind: RegistrationKind::TaskService,
@@ -6485,6 +6497,21 @@ mod tests {
         }
 
         #[cfg(feature = "tasks")]
+        struct OrdinaryProxyTaskAccessPolicy;
+
+        #[cfg(feature = "tasks")]
+        impl crate::TaskAccessAuthorizer for OrdinaryProxyTaskAccessPolicy {
+            fn authorize(
+                &self,
+                _ctx: &McpContext,
+                _action: crate::TaskAccessAction,
+                _original: &crate::FinalTaskOperation,
+            ) -> McpResult<()> {
+                Ok(())
+            }
+        }
+
+        #[cfg(feature = "tasks")]
         fn ordinary_proxy_tasks_client(
             calls: Arc<Mutex<Vec<String>>>,
             updates: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -6519,7 +6546,7 @@ mod tests {
                 "inputRequests": {},
             }))
             .expect("the ordinary proxy Task fixture is exact");
-            bound_proxy_client(
+            let client = bound_proxy_client(
                 OrdinaryProxyTasksBackend {
                     calls,
                     updates,
@@ -6530,7 +6557,13 @@ mod tests {
                     narrow_task_acknowledgement,
                 },
                 ProtocolEra::Modern2026,
-            )
+            );
+            if relay_tasks {
+                client.final_tasks_relay().unwrap().unwrap()
+                    .install_access_authorizers(vec![Arc::new(OrdinaryProxyTaskAccessPolicy)])
+                    .unwrap();
+            }
+            client
         }
 
         fn discovered_duplicate_policy_proxy() -> (ProxyClient, ProxyCatalog) {

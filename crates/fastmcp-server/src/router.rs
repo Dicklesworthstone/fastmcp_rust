@@ -5269,6 +5269,11 @@ impl Router {
                 work_descriptor,
                 status_message,
             } => {
+                let (original_name, original_registration) = original_registration.ok_or_else(|| {
+                    McpError::internal_error("Task original tool registration is missing")
+                })?;
+                let original =
+                    crate::FinalTaskOperation::for_tool(original_name, original_registration)?;
                 #[cfg(all(feature = "proxy", feature = "tasks"))]
                 if let Some(relay) = self.final_task_relay.as_ref() {
                     // A relayed task is already durable upstream. Decode its
@@ -5276,7 +5281,11 @@ impl Router {
                     // gate, retain the route-bound snapshot for controls, and
                     // emit its owner-bound downstream handle without local creation.
                     require_final_tasks_capability(&request_metadata)?;
-                    if let Some(result) = relay.admit_carried_task(request_ctx, &work_descriptor)? {
+                    if let Some(result) = relay.admit_carried_task_for_operation(
+                        request_ctx,
+                        &work_descriptor,
+                        original,
+                    )? {
                         return encode_final_task_result(result);
                     }
                     return Err(McpError::internal_error(
@@ -5288,12 +5297,9 @@ impl Router {
                 // Tasks operations. Admit only the branch that can mutate the
                 // Tasks store, immediately before that mutation.
                 let runtime = self.admit_final_task_tool(&request_metadata)?;
-                let (original_name, original_registration) = original_registration.ok_or_else(|| {
-                    McpError::internal_error("Task original tool registration is missing")
-                })?;
                 encode_final_task_result(runtime.create_task_for_operation(
                     request_ctx,
-                    crate::FinalTaskOperation::for_tool(original_name, original_registration)?,
+                    original,
                     work_descriptor,
                     status_message,
                 )?)
@@ -6007,6 +6013,20 @@ impl Router {
             dispatch_started_at,
         );
         let ctx = ctx.with_operation_deadline(effective_budget.deadline);
+        #[cfg(all(feature = "proxy", feature = "tasks"))]
+        if declares_final_tasks && ctx.client_supports_tasks() && ctx.auth().is_some()
+            && let Some(client) = handler.proxy_catalog_client()
+        {
+            // A remote Task can already exist when its result arrives. Check
+            // the exact originating operation before any upstream side effect.
+            client.authorize_final_task_creation(
+                &ctx,
+                &crate::FinalTaskOperation::for_tool(
+                    &entry.definition.name,
+                    &entry.task_operation_registration,
+                )?,
+            )?;
+        }
         let outcome = run_handler_in_request(
             &ctx,
             request_cx,

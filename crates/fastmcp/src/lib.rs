@@ -2423,7 +2423,7 @@ pub mod auto {
                 .map(|inner| Self { inner })
         }
 
-        /// Adds current original-operation and management authorization for Tasks.
+        /// Adds current original-operation and management authorization for local and proxied Tasks.
         ///
         /// Share the same immutable scope policy with secured HTTP admission.
         /// Each policy intersects and runs again before Task events; no worker
@@ -2439,7 +2439,7 @@ pub mod auto {
 
         /// Authorizes process-local Task work against current application grants.
         ///
-        /// Protected Task creation requires this policy as well as
+        /// Protected local Task creation requires this policy as well as
         /// [`Self::task_access_authorizer`]. Policies receive payload-free owner
         /// and original-operation metadata and must freshly check grants,
         /// expiry, and revocation without retaining the ingress context.
@@ -7462,7 +7462,7 @@ pub mod modern {
                 .map(|inner| Self { inner })
         }
 
-        /// Adds current original-operation and management authorization for Tasks.
+        /// Adds current original-operation and management authorization for local and proxied Tasks.
         ///
         /// Share the same immutable scope policy with secured HTTP admission.
         /// Each policy intersects and runs again before Task events; no worker
@@ -7478,7 +7478,7 @@ pub mod modern {
 
         /// Authorizes process-local Task work against current application grants.
         ///
-        /// Protected Task creation requires this policy as well as
+        /// Protected local Task creation requires this policy as well as
         /// [`Self::task_access_authorizer`]. Policies receive payload-free owner
         /// and original-operation metadata and must freshly check grants,
         /// expiry, and revocation without retaining the ingress context.

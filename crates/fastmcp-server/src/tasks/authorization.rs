@@ -80,6 +80,43 @@ impl FinalTaskOperation {
         self.registration.strong_count() != 0
     }
 
+    /// Shares the same process-local admission boundary with proxied Tasks.
+    /// The caller snapshots its policies before entering application callbacks.
+    pub(crate) fn authorize_access(
+        &self,
+        ctx: &McpContext,
+        action: TaskAccessAction,
+        authorizers: &[Arc<dyn TaskAccessAuthorizer>],
+    ) -> McpResult<()> {
+        ensure_current_task_authentication(ctx)?;
+        if action == TaskAccessAction::Create && ctx.auth().is_some() && authorizers.is_empty() {
+            return Err(McpError::invalid_request(
+                "Protected Task creation requires a current original-operation access policy",
+            ));
+        }
+        if !self.is_visible(ctx) || (ctx.auth().is_some() && authorizers.is_empty()) {
+            return Err(task_access_denied());
+        }
+        for authorizer in authorizers {
+            let allowed = catch_unwind(AssertUnwindSafe(|| {
+                authorizer.authorize(ctx, action, self)
+            }))
+            .is_ok_and(|result| result.is_ok());
+            ensure_current_task_authentication(ctx)?;
+            if !allowed || !self.is_visible(ctx) {
+                return Err(task_access_denied());
+            }
+        }
+        ensure_current_task_authentication(ctx)
+    }
+
+    pub(crate) fn admit_access_policy_batch(installed: usize, additional: usize) -> McpResult<()> {
+        if additional > MAX_TASK_ACCESS_AUTHORIZERS.saturating_sub(installed) {
+            return Err(McpError::invalid_params("Task access policy capacity reached"));
+        }
+        Ok(())
+    }
+
     pub(super) fn retained_bytes(&self) -> usize {
         self.tool_name.len() + std::mem::size_of::<Self>()
     }
@@ -296,13 +333,7 @@ impl FinalTaskRuntime {
             .execution_authorizers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if access.len()
-            > MAX_TASK_ACCESS_AUTHORIZERS.saturating_sub(installed_access.len())
-        {
-            return Err(McpError::invalid_params(
-                "Task access policy capacity reached",
-            ));
-        }
+        FinalTaskOperation::admit_access_policy_batch(installed_access.len(), access.len())?;
         if execution.len()
             > MAX_TASK_EXECUTION_AUTHORIZERS.saturating_sub(installed_execution.len())
         {
@@ -396,25 +427,7 @@ impl FinalTaskRuntime {
                 Err(task_access_denied())
             };
         };
-        if action == TaskAccessAction::Create && ctx.auth().is_some() && authorizers.is_empty() {
-            return Err(McpError::invalid_request(
-                "Protected Task creation requires a current original-operation access policy",
-            ));
-        }
-        if !original.is_visible(ctx) || (ctx.auth().is_some() && authorizers.is_empty()) {
-            return Err(task_access_denied());
-        }
-        for authorizer in authorizers {
-            let allowed = catch_unwind(AssertUnwindSafe(|| {
-                authorizer.authorize(ctx, action, original)
-            }))
-            .is_ok_and(|result| result.is_ok());
-            ensure_current_task_authentication(ctx)?;
-            if !allowed || !original.is_visible(ctx) {
-                return Err(task_access_denied());
-            }
-        }
-        ensure_current_task_authentication(ctx)
+        original.authorize_access(ctx, action, &authorizers)
     }
 
     pub(crate) fn admit_task_for_request(
@@ -1865,12 +1878,63 @@ mod tests {
         }
     }
 
-    fn poll_service(
+    fn with_execution_runtime(scenario: impl Future<Output = ()>) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(scenario);
+        assert!(runtime.shutdown_timeout(StdDuration::from_secs(2)));
+    }
+
+    async fn wait_for_execution(cx: &Cx, description: &str, condition: impl Fn() -> bool) {
+        asupersync::time::timeout(cx.now(), StdDuration::from_secs(5), async {
+            while !condition() {
+                asupersync::time::sleep(cx.now(), StdDuration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect(description);
+    }
+
+    async fn start_execution_service(
         cx: &Cx,
-        service: std::pin::Pin<&mut impl Future<Output = McpResult<()>>>,
-    ) -> std::task::Poll<McpResult<()>> {
-        let _current = Cx::set_current(Some(cx.clone()));
-        service.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        runtime: &FinalTaskRuntime,
+        supervisor: Arc<dyn ApplicationTaskSupervisor>,
+    ) -> asupersync::runtime::TaskHandle<McpResult<()>> {
+        let mut runner = runtime.install_task_service(8, supervisor).unwrap();
+        let service = cx
+            .spawn(move |service_cx| async move { runner.run_service(&service_cx).await })
+            .unwrap();
+        wait_for_execution(cx, "caller-owned Task service becomes ready", || {
+            runtime.is_task_service_ready()
+        })
+        .await;
+        service
+    }
+
+    async fn stop_execution_service(
+        cx: &Cx,
+        fixture: &ExecutionFixture,
+        mut service: asupersync::runtime::TaskHandle<McpResult<()>>,
+    ) {
+        service.abort_with_reason(asupersync::CancelReason::user("Task execution test cleanup"));
+        let outcome = asupersync::time::timeout(
+            cx.now(),
+            StdDuration::from_secs(5),
+            service.join(cx),
+        )
+        .await
+        .expect("Task service cancellation settles within the caller runtime");
+        assert!(
+            matches!(
+                outcome,
+                Ok(Ok(())) | Err(asupersync::runtime::JoinError::Cancelled(_))
+            ),
+            "unexpected Task service shutdown: {outcome:?}"
+        );
+        assert!(!fixture.runtime.is_task_service_ready());
+        assert_eq!(fixture.store.active_task_count(), 0);
     }
 
     fn completed_execution_result() -> FinalTaskCallToolResult {
@@ -1916,38 +1980,41 @@ mod tests {
 
     #[test]
     fn authorized_execution_service_runs_initial_and_resumed_work() {
-        let fixture = ExecutionFixture::new();
-        let supervisor = Arc::new(InputExecutionSupervisor {
-            initial: AtomicUsize::new(0),
-            resumed: AtomicUsize::new(0),
+        with_execution_runtime(async {
+            let cx = Cx::current().unwrap();
+            let fixture = ExecutionFixture::new();
+            let supervisor = Arc::new(InputExecutionSupervisor {
+                initial: AtomicUsize::new(0),
+                resumed: AtomicUsize::new(0),
+            });
+            let service =
+                start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+            let id = fixture.create();
+            wait_for_execution(&cx, "authorized initial work requests input", || {
+                fixture.status(&id) == FinalTaskStatus::InputRequired
+            })
+            .await;
+            assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
+            assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 0);
+            let mut update = parameters(&id);
+            update["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
+            dispatch_final_tasks_update(&fixture.runtime, &fixture.caller, update).unwrap();
+            wait_for_execution(&cx, "authorized resumed work completes", || {
+                fixture.status(&id) == FinalTaskStatus::Completed
+            })
+            .await;
+            assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
+            assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 1);
+            assert!(fixture.policy.calls.load(Ordering::SeqCst) >= 4);
+            assert!(dispatch_final_tasks_get(
+                &fixture.runtime,
+                &fixture.caller,
+                parameters(&id)
+            )
+            .is_ok());
+            assert!(fixture.runtime.is_task_service_ready());
+            stop_execution_service(&cx, &fixture, service).await;
         });
-        let mut runner = fixture
-            .runtime
-            .install_task_service(8, supervisor.clone())
-            .unwrap();
-        let cx = Cx::for_testing();
-        let mut service = Box::pin(runner.run_service(&cx));
-        assert!(poll_service(&cx, service.as_mut()).is_pending());
-        let id = fixture.create();
-        assert!(poll_service(&cx, service.as_mut()).is_pending());
-        assert_eq!(fixture.status(&id), FinalTaskStatus::InputRequired);
-        assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
-        assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 0);
-        let mut update = parameters(&id);
-        update["inputResponses"] = serde_json::json!({"roots": {"roots": []}});
-        dispatch_final_tasks_update(&fixture.runtime, &fixture.caller, update).unwrap();
-        assert!(poll_service(&cx, service.as_mut()).is_pending());
-        assert_eq!(fixture.status(&id), FinalTaskStatus::Completed);
-        assert_eq!(supervisor.initial.load(Ordering::SeqCst), 1);
-        assert_eq!(supervisor.resumed.load(Ordering::SeqCst), 1);
-        assert!(fixture.policy.calls.load(Ordering::SeqCst) >= 4);
-        assert!(dispatch_final_tasks_get(
-            &fixture.runtime,
-            &fixture.caller,
-            parameters(&id)
-        )
-        .is_ok());
-        assert!(fixture.runtime.is_task_service_ready());
     }
 
     struct CompletingExecutionSupervisor(AtomicUsize);
@@ -1976,30 +2043,33 @@ mod tests {
     #[test]
     fn pre_dispatch_execution_revocation_never_invokes_supervisor() {
         for remove_registration in [false, true] {
-            let mut fixture = ExecutionFixture::new();
-            let supervisor = Arc::new(CompletingExecutionSupervisor(AtomicUsize::new(0)));
-            let mut runner = fixture
-                .runtime
-                .install_task_service(8, supervisor.clone())
-                .unwrap();
-            let cx = Cx::for_testing();
-            let mut service = Box::pin(runner.run_service(&cx));
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            let id = fixture.create();
-            if remove_registration {
-                drop(fixture.registration.take());
-            } else {
-                fixture.policy.revoked.store(true, Ordering::SeqCst);
-            }
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            assert_eq!(supervisor.0.load(Ordering::SeqCst), 0);
-            assert_eq!(fixture.status(&id), FinalTaskStatus::Failed);
-            let task = fixture.store.get_task(&id).unwrap().unwrap();
-            let encoded = serde_json::to_string(&task).unwrap();
-            assert!(!encoded.contains("application-canary"));
-            assert!(!encoded.contains("private-execution-policy-canary"));
-            assert!(!encoded.contains("execution-policy-data-canary"));
-            assert!(fixture.runtime.is_task_service_ready());
+            with_execution_runtime(async {
+                let cx = Cx::current().unwrap();
+                let mut fixture = ExecutionFixture::new();
+                let supervisor = Arc::new(CompletingExecutionSupervisor(AtomicUsize::new(0)));
+                let service =
+                    start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+                let id = fixture.create();
+                // No await separates creation from revocation, so the caller's
+                // single-thread scheduler cannot enter the worker between them.
+                if remove_registration {
+                    drop(fixture.registration.take());
+                } else {
+                    fixture.policy.revoked.store(true, Ordering::SeqCst);
+                }
+                wait_for_execution(&cx, "revoked initial work retires before dispatch", || {
+                    fixture.status(&id) == FinalTaskStatus::Failed
+                })
+                .await;
+                assert_eq!(supervisor.0.load(Ordering::SeqCst), 0);
+                let task = fixture.store.get_task(&id).unwrap().unwrap();
+                let encoded = serde_json::to_string(&task).unwrap();
+                assert!(!encoded.contains("application-canary"));
+                assert!(!encoded.contains("private-execution-policy-canary"));
+                assert!(!encoded.contains("execution-policy-data-canary"));
+                assert!(fixture.runtime.is_task_service_ready());
+                stop_execution_service(&cx, &fixture, service).await;
+            });
         }
     }
 
@@ -2026,49 +2096,56 @@ mod tests {
 
     #[test]
     fn pending_execution_revocation_stops_polling_and_invalidates_retained_handoff() {
-        for drop_without_polling in [false, true] {
-            let fixture = ExecutionFixture::new();
-            let supervisor = Arc::new(PendingExecutionSupervisor {
-                calls: AtomicUsize::new(0),
-                polls: AtomicUsize::new(0),
-                handoff: Mutex::new(None),
+        for cancel_before_heartbeat in [false, true] {
+            with_execution_runtime(async {
+                let cx = Cx::current().unwrap();
+                let fixture = ExecutionFixture::new();
+                let supervisor = Arc::new(PendingExecutionSupervisor {
+                    calls: AtomicUsize::new(0),
+                    polls: AtomicUsize::new(0),
+                    handoff: Mutex::new(None),
+                });
+                let service =
+                    start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+                let id = fixture.create();
+                wait_for_execution(&cx, "pending application receives its first poll", || {
+                    supervisor.polls.load(Ordering::SeqCst) != 0
+                })
+                .await;
+                assert_eq!(supervisor.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(fixture.status(&id), FinalTaskStatus::Working);
+                let polls_before_revocation = supervisor.polls.load(Ordering::SeqCst);
+                fixture.policy.revoked.store(true, Ordering::SeqCst);
+                if !cancel_before_heartbeat {
+                    wait_for_execution(&cx, "heartbeat retires revoked pending work", || {
+                        fixture.status(&id) == FinalTaskStatus::Failed
+                    })
+                    .await;
+                    assert!(fixture.runtime.is_task_service_ready());
+                }
+                stop_execution_service(&cx, &fixture, service).await;
+                assert_eq!(fixture.status(&id), FinalTaskStatus::Failed);
+                assert_eq!(
+                    supervisor.polls.load(Ordering::SeqCst),
+                    polls_before_revocation
+                );
+                let retired = fixture.store.get_task_snapshot(&id).unwrap().unwrap();
+                // A later grant cannot resurrect the old handed-out authority.
+                fixture.policy.revoked.store(false, Ordering::SeqCst);
+                let handoff = supervisor.handoff.lock().unwrap().take().unwrap();
+                let late = match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(completed_execution_result(), None)
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(completed_execution_result(), None)
+                    }
+                };
+                assert_execution_denied(late);
+                let after = fixture.store.get_task_snapshot(&id).unwrap().unwrap();
+                assert_eq!(after.generation(), retired.generation());
+                assert!(final_tasks_match_exactly(after.task(), retired.task()).unwrap());
             });
-            let mut runner = fixture
-                .runtime
-                .install_task_service(8, supervisor.clone())
-                .unwrap();
-            let cx = Cx::for_testing();
-            let mut service = Box::pin(runner.run_service(&cx));
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            let id = fixture.create();
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            assert_eq!(supervisor.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(supervisor.polls.load(Ordering::SeqCst), 1);
-            assert_eq!(fixture.status(&id), FinalTaskStatus::Working);
-            fixture.policy.revoked.store(true, Ordering::SeqCst);
-            if !drop_without_polling {
-                assert!(poll_service(&cx, service.as_mut()).is_pending());
-                assert!(fixture.runtime.is_task_service_ready());
-            }
-            drop(service);
-            assert_eq!(fixture.status(&id), FinalTaskStatus::Failed);
-            assert_eq!(supervisor.polls.load(Ordering::SeqCst), 1);
-            let retired = fixture.store.get_task_snapshot(&id).unwrap().unwrap();
-            // A later grant cannot resurrect the old handed-out authority.
-            fixture.policy.revoked.store(false, Ordering::SeqCst);
-            let handoff = supervisor.handoff.lock().unwrap().take().unwrap();
-            let late = match handoff {
-                FinalTaskSupervisorHandoff::Initial(initial) => {
-                    initial.complete_task(completed_execution_result(), None)
-                }
-                FinalTaskSupervisorHandoff::Resumed(accepted) => {
-                    accepted.complete_task(completed_execution_result(), None)
-                }
-            };
-            assert_execution_denied(late);
-            let after = fixture.store.get_task_snapshot(&id).unwrap().unwrap();
-            assert_eq!(after.generation(), retired.generation());
-            assert!(final_tasks_match_exactly(after.task(), retired.task()).unwrap());
         }
     }
 
@@ -2090,40 +2167,169 @@ mod tests {
     #[test]
     fn per_task_execution_policy_error_and_panic_leave_sibling_service_live() {
         for panic_on_refusal in [false, true] {
+            with_execution_runtime(async {
+                let cx = Cx::current().unwrap();
+                let fixture = ExecutionFixture::new();
+                let selective = Arc::new(SelectiveExecutionPolicy {
+                    refused: Mutex::new(None),
+                    panic_on_refusal,
+                });
+                fixture
+                    .runtime
+                    .install_execution_authorizer(selective.clone())
+                    .unwrap();
+                let supervisor = Arc::new(CompletingExecutionSupervisor(AtomicUsize::new(0)));
+                let service =
+                    start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+                let refused = fixture.create();
+                let sibling = fixture.create();
+                *selective.refused.lock().unwrap() = Some(refused.clone());
+                wait_for_execution(&cx, "policy denial preserves sibling execution", || {
+                    fixture.status(&refused) == FinalTaskStatus::Failed
+                        && fixture.status(&sibling) == FinalTaskStatus::Completed
+                })
+                .await;
+                assert_eq!(supervisor.0.load(Ordering::SeqCst), 1);
+                let encoded =
+                    serde_json::to_string(&fixture.store.get_task(&refused).unwrap().unwrap())
+                        .unwrap();
+                assert!(!encoded.contains("private-execution-error-canary"));
+                assert!(!encoded.contains("private-execution-panic-canary"));
+                assert!(fixture.runtime.is_task_service_ready());
+                let later = fixture.create();
+                wait_for_execution(&cx, "service admits later authorized work", || {
+                    fixture.status(&later) == FinalTaskStatus::Completed
+                })
+                .await;
+                assert_eq!(supervisor.0.load(Ordering::SeqCst), 2);
+                stop_execution_service(&cx, &fixture, service).await;
+            });
+        }
+    }
+
+    struct HeartbeatExecutionSupervisor {
+        pending: Mutex<Option<FinalTaskId>>,
+        pending_polls: AtomicUsize,
+        pending_dropped: AtomicBool,
+        completed: AtomicUsize,
+    }
+
+    struct HeartbeatPendingFuture<'a> {
+        polls: &'a AtomicUsize,
+        dropped: &'a AtomicBool,
+        _handoff: FinalTaskSupervisorHandoff,
+    }
+
+    impl Future for HeartbeatPendingFuture<'_> {
+        type Output = McpResult<()>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            // Deliberately retain no waker and register no application timer.
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for HeartbeatPendingFuture<'_> {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl ApplicationTaskSupervisor for HeartbeatExecutionSupervisor {
+        fn resume<'a>(
+            &'a self,
+            _: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            let task_id = match &handoff {
+                FinalTaskSupervisorHandoff::Initial(initial) => initial.task_id(),
+                FinalTaskSupervisorHandoff::Resumed(accepted) => accepted.task_id(),
+            };
+            if self.pending.lock().unwrap().as_ref() == Some(task_id) {
+                return Box::pin(HeartbeatPendingFuture {
+                    polls: &self.pending_polls,
+                    dropped: &self.pending_dropped,
+                    _handoff: handoff,
+                });
+            }
+            Box::pin(async move {
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        initial.complete_task(completed_execution_result(), None)?;
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        accepted.complete_task(completed_execution_result(), None)?;
+                    }
+                }
+                self.completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn execution_heartbeat_retires_unwoken_revoked_work_and_preserves_sibling_service() {
+        with_execution_runtime(async {
+            let cx = Cx::current().unwrap();
+            assert!(cx.timer_driver().is_some());
             let fixture = ExecutionFixture::new();
             let selective = Arc::new(SelectiveExecutionPolicy {
                 refused: Mutex::new(None),
-                panic_on_refusal,
+                panic_on_refusal: false,
             });
             fixture
                 .runtime
                 .install_execution_authorizer(selective.clone())
                 .unwrap();
-            let supervisor = Arc::new(CompletingExecutionSupervisor(AtomicUsize::new(0)));
-            let mut runner = fixture
-                .runtime
-                .install_task_service(8, supervisor.clone())
-                .unwrap();
-            let cx = Cx::for_testing();
-            let mut service = Box::pin(runner.run_service(&cx));
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            let refused = fixture.create();
-            let sibling = fixture.create();
-            *selective.refused.lock().unwrap() = Some(refused.clone());
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            assert_eq!(fixture.status(&refused), FinalTaskStatus::Failed);
-            assert_eq!(fixture.status(&sibling), FinalTaskStatus::Completed);
-            assert_eq!(supervisor.0.load(Ordering::SeqCst), 1);
-            let encoded =
-                serde_json::to_string(&fixture.store.get_task(&refused).unwrap().unwrap()).unwrap();
-            assert!(!encoded.contains("private-execution-error-canary"));
-            assert!(!encoded.contains("private-execution-panic-canary"));
+            let supervisor = Arc::new(HeartbeatExecutionSupervisor {
+                pending: Mutex::new(None),
+                pending_polls: AtomicUsize::new(0),
+                pending_dropped: AtomicBool::new(false),
+                completed: AtomicUsize::new(0),
+            });
+            let service =
+                start_execution_service(&cx, &fixture.runtime, supervisor.clone()).await;
+            let revoked = fixture.create();
+            *supervisor.pending.lock().unwrap() = Some(revoked.clone());
+            wait_for_execution(&cx, "application parks without arranging another wake", || {
+                supervisor.pending_polls.load(Ordering::SeqCst) != 0
+            })
+            .await;
+            // Let admission and first-poll notifications drain before changing
+            // policy. The observation timer belongs to this separate test task;
+            // it cannot wake or manually poll the spawned service task.
+            asupersync::time::sleep(cx.now(), StdDuration::from_millis(20)).await;
+            let polls_before_revocation = supervisor.pending_polls.load(Ordering::SeqCst);
+            let checks_before_revocation = fixture.policy.calls.load(Ordering::SeqCst);
+            *selective.refused.lock().unwrap() = Some(revoked.clone());
+            wait_for_execution(&cx, "service heartbeat retires and settles revoked work", || {
+                fixture.status(&revoked) == FinalTaskStatus::Failed
+                    && supervisor.pending_dropped.load(Ordering::SeqCst)
+                    && fixture.store.active_task_count() == 0
+            })
+            .await;
+            assert_eq!(
+                supervisor.pending_polls.load(Ordering::SeqCst),
+                polls_before_revocation,
+                "authorization loss permits no further application poll"
+            );
+            assert!(fixture.policy.calls.load(Ordering::SeqCst) > checks_before_revocation);
             assert!(fixture.runtime.is_task_service_ready());
-            let later = fixture.create();
-            assert!(poll_service(&cx, service.as_mut()).is_pending());
-            assert_eq!(fixture.status(&later), FinalTaskStatus::Completed);
-            assert_eq!(supervisor.0.load(Ordering::SeqCst), 2);
-        }
+            assert!(!cx.is_cancel_requested());
+
+            let sibling = fixture.create();
+            wait_for_execution(&cx, "the same service completes an authorized sibling", || {
+                fixture.status(&sibling) == FinalTaskStatus::Completed
+            })
+            .await;
+            assert_eq!(supervisor.completed.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.status(&revoked), FinalTaskStatus::Failed);
+            stop_execution_service(&cx, &fixture, service).await;
+        });
     }
 
     #[test]

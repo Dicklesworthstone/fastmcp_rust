@@ -409,7 +409,7 @@ impl Server {
     /// is refused, rather than mutating live authorization or subscription state.
     ///
     /// With Tasks, this also installs current original-operation authorization
-    /// for local Task creation, get/update/cancel, and every subscribed event.
+    /// for local and proxied Task creation, get/update/cancel, and every subscribed event.
     /// Both the original tool's complete grants and the management method's
     /// grants are required, including after a terminal result exists.
     /// This does not filter catalogs, authorize a detached Task's execution lifetime, add
@@ -431,6 +431,10 @@ impl Server {
         #[cfg(feature = "tasks")]
         if let Some(runtime) = self.final_task_runtime.as_ref() {
             runtime.install_access_authorizer(Arc::new(policy.clone()))?;
+        }
+        #[cfg(all(feature = "tasks", feature = "proxy"))]
+        if self.final_task_runtime.is_none() && let Some(relay) = self.final_task_relay.as_ref() {
+            relay.install_access_authorizers(vec![Arc::new(policy.clone())])?;
         }
         middleware.insert(0, Box::new(OperationScopeMiddleware(policy)));
         Ok(self)

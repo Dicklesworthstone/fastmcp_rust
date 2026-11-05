@@ -5122,13 +5122,27 @@ pub(crate) struct ProxyFinalTaskRelay {
 }
 
 #[cfg(feature = "tasks")]
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct ProxyFinalTaskRegistry {
     tasks: HashMap<FinalTaskId, ProxyRelayedFinalTask>,
     pending_creations: HashSet<FinalTaskId>,
     /// Local observation order only; upstream wall-clock timestamps are not
     /// revisions and can repeat or move backwards.
     next_snapshot_revision: u64,
+    /// Intersecting current policies shared by every relay for this client.
+    access_authorizers: Vec<Arc<dyn crate::TaskAccessAuthorizer>>,
+}
+
+#[cfg(feature = "tasks")]
+impl std::fmt::Debug for ProxyFinalTaskRegistry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProxyFinalTaskRegistry")
+            .field("tasks", &self.tasks.len())
+            .field("pending_creations", &self.pending_creations.len())
+            .field("access_authorizers", &self.access_authorizers.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// An issued handle's exact upstream result, stable owner, and retention clock.
@@ -5151,6 +5165,9 @@ struct ProxyRelayedFinalTask {
     creation: CreateTaskResult,
     binding: ProxyUpstreamBinding,
     owner: fastmcp_core::Sha256Digest,
+    /// Bound once by the router before a handle is exposed downstream.
+    /// This registration is process-local and is never a durable grant.
+    original_operation: Option<crate::FinalTaskOperation>,
     expires_at: Option<Instant>,
     recovery_until: Option<Instant>,
     retained_at: Instant,
@@ -5193,7 +5210,7 @@ enum ProxyFinalTaskListenerPhase {
 
 #[cfg(feature = "tasks")]
 struct AdmittedProxyFinalTaskListener {
-    inner: Box<dyn ProxyFinalTaskListener>,
+    inner: Option<Box<dyn ProxyFinalTaskListener>>,
     relay: Arc<ProxyFinalTaskRelay>,
     owner: fastmcp_core::Sha256Digest,
     context: McpContext,
@@ -5217,7 +5234,7 @@ impl AdmittedProxyFinalTaskListener {
         downstream_filter: SubscriptionFilter,
     ) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             relay,
             owner,
             context,
@@ -5231,8 +5248,28 @@ impl AdmittedProxyFinalTaskListener {
     }
 
     fn reject_sequence(&mut self, message: &'static str) -> McpResult<ProxyFinalTaskListenerEvent> {
-        self.phase = ProxyFinalTaskListenerPhase::Terminated;
+        self.terminate();
         Err(McpError::invalid_request(message))
+    }
+
+    fn terminate(&mut self) {
+        self.phase = ProxyFinalTaskListenerPhase::Terminated;
+        self.inner = None;
+        self.pending = None;
+        self.pending_handles.clear();
+    }
+
+    fn authorize_selection(&self, ctx: &McpContext) -> McpResult<()> {
+        if proxy_task_owner(ctx)? != self.owner {
+            return Err(unknown_proxy_task());
+        }
+        for (handle, _) in &self.mappings {
+            self.relay.authorize_handle(
+                ctx, crate::TaskAccessAction::Listen, self.owner, handle,
+                ProxyFinalTaskLookup::RecoveryLocator,
+            )?;
+        }
+        Ok(())
     }
 
     async fn take_pending_notification(
@@ -5257,14 +5294,19 @@ impl AdmittedProxyFinalTaskListener {
         };
         notification.params.task = match self
             .relay
-            .reconcile_task(ctx, self.owner, &handle, notification.params.task, None)
+            .reconcile_task(
+                ctx,
+                self.owner,
+                &handle,
+                notification.params.task,
+                None,
+                crate::TaskAccessAction::Listen,
+            )
             .await
         {
             Ok(task) => task,
             Err(error) => {
-                self.phase = ProxyFinalTaskListenerPhase::Terminated;
-                self.pending = None;
-                self.pending_handles.clear();
+                self.terminate();
                 return Err(error);
             }
         };
@@ -5347,7 +5389,7 @@ impl AdmittedProxyFinalTaskListener {
                 })
             }
             (ProxyFinalTaskListenerPhase::Streaming, ProxyFinalTaskListenerEvent::Terminal) => {
-                self.phase = ProxyFinalTaskListenerPhase::Terminated;
+                self.terminate();
                 Ok(ProxyFinalTaskListenerEvent::Terminal)
             }
             (ProxyFinalTaskListenerPhase::Terminated, _) => {
@@ -5372,20 +5414,32 @@ impl AdmittedProxyFinalTaskListener {
             .with_request_cx(cx.clone())
             .with_request_cancellation(request_cancellation.clone());
         if let Err(error) = ctx.ensure_live() {
-            self.phase = ProxyFinalTaskListenerPhase::Terminated;
-            self.pending = None;
-            self.pending_handles.clear();
+            self.terminate();
             return Err(error.into());
+        }
+        if let Err(error) = self.authorize_selection(&ctx) {
+            self.terminate();
+            return Err(error);
         }
         if let Some(notification) = self.take_pending_notification(&ctx).await? {
             return Ok(notification);
         }
-        let event = self.inner.next_async(cx, request_cancellation).await?;
+        let result = self.inner.as_mut().expect("live listener owns its backend")
+            .next_async(cx, request_cancellation).await;
+        let event = match result {
+            Ok(event) => event,
+            Err(error) => {
+                self.terminate();
+                return Err(error);
+            }
+        };
         if let Err(error) = ctx.ensure_live() {
-            self.phase = ProxyFinalTaskListenerPhase::Terminated;
-            self.pending = None;
-            self.pending_handles.clear();
+            self.terminate();
             return Err(error.into());
+        }
+        if let Err(error) = self.authorize_selection(&ctx) {
+            self.terminate();
+            return Err(error);
         }
         self.admit_event(&ctx, event).await
     }
@@ -5430,6 +5484,8 @@ struct MultiplexedProxyFinalTaskListener {
     listeners: Vec<Option<Box<dyn ProxyFinalTaskListener>>>,
     turns: Vec<Option<ProxyFinalTaskListenTurn>>,
     acknowledgement: Option<SubscriptionFilter>,
+    context: McpContext,
+    selections: Vec<(Arc<ProxyFinalTaskRelay>, Vec<FinalTaskId>)>,
     next_route: usize,
     terminated: bool,
 }
@@ -5439,11 +5495,15 @@ impl MultiplexedProxyFinalTaskListener {
     fn new(
         listeners: Vec<Box<dyn ProxyFinalTaskListener>>,
         acknowledgement: SubscriptionFilter,
+        context: McpContext,
+        selections: Vec<(Arc<ProxyFinalTaskRelay>, Vec<FinalTaskId>)>,
     ) -> Self {
         Self {
             turns: (0..listeners.len()).map(|_| None).collect(),
             listeners: listeners.into_iter().map(Some).collect(),
             acknowledgement: Some(acknowledgement),
+            context,
+            selections,
             next_route: 0,
             terminated: false,
         }
@@ -5454,6 +5514,20 @@ impl MultiplexedProxyFinalTaskListener {
         self.acknowledgement = None;
         self.turns.clear();
         self.listeners.clear();
+        self.selections.clear();
+    }
+
+    fn authorize_selection(&self, ctx: &McpContext) -> McpResult<()> {
+        let owner = proxy_task_owner(ctx)?;
+        for (route, handles) in &self.selections {
+            for handle in handles {
+                route.authorize_handle(
+                    ctx, crate::TaskAccessAction::Listen, owner, handle,
+                    ProxyFinalTaskLookup::RecoveryLocator,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     async fn next_event(
@@ -5470,6 +5544,13 @@ impl MultiplexedProxyFinalTaskListener {
             self.terminate();
             return Err(McpError::request_cancelled());
         }
+        let ctx = self.context.clone()
+            .with_request_cx(cx.clone())
+            .with_request_cancellation(cancellation.clone());
+        if let Err(error) = self.authorize_selection(&ctx) {
+            self.terminate();
+            return Err(error);
+        }
         if let Some(filter) = self.acknowledgement.take() {
             return Ok(ProxyFinalTaskListenerEvent::Acknowledged(filter));
         }
@@ -5481,6 +5562,9 @@ impl MultiplexedProxyFinalTaskListener {
             cx,
             cancellation,
             Box::pin(std::future::poll_fn(|task_cx| {
+                if let Err(error) = self.authorize_selection(&ctx) {
+                    return Poll::Ready(Err(error));
+                }
                 let route_count = self.listeners.len();
                 for offset in 0..route_count {
                     let index = (self.next_route + offset) % route_count;
@@ -5509,6 +5593,10 @@ impl MultiplexedProxyFinalTaskListener {
             })),
         )
         .await;
+        if let Err(error) = self.authorize_selection(&ctx) {
+            self.terminate();
+            return Err(error);
+        }
         match event {
             Ok(ProxyFinalTaskListenerEvent::Notification(notification)) => {
                 Ok(ProxyFinalTaskListenerEvent::Notification(notification))
@@ -5570,6 +5658,107 @@ impl ProxyFinalTaskRelay {
             binding,
             attached_routes: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Installs one complete server policy batch on every admitted route.
+    /// Fixed registry order prevents deadlocks between brokers sharing clients;
+    /// capacity and allocation checks precede every semantic mutation.
+    pub(crate) fn install_access_authorizers(
+        &self,
+        authorizers: Vec<Arc<dyn crate::TaskAccessAuthorizer>>,
+    ) -> McpResult<()> {
+        let routes = self
+            .attached_routes
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy final Tasks route registry lock poisoned"))?
+            .clone();
+        let mut registries: Vec<_> = std::iter::once(Arc::clone(&self.tasks))
+            .chain(routes.iter().map(|route| Arc::clone(&route.tasks)))
+            .collect();
+        registries.sort_by_key(|registry| Arc::as_ptr(registry) as usize);
+        registries.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let mut installed = registries
+            .iter()
+            .map(|registry| {
+                registry.lock().map_err(|_| {
+                    McpError::internal_error("Proxy final Tasks registry lock poisoned")
+                })
+            })
+            .collect::<McpResult<Vec<_>>>()?;
+        for registry in &installed {
+            crate::FinalTaskOperation::admit_access_policy_batch(
+                registry.access_authorizers.len(),
+                authorizers.len(),
+            )?;
+        }
+        for registry in &mut installed {
+            registry.access_authorizers.try_reserve(authorizers.len()).map_err(|_| {
+                McpError::internal_error("Proxy Task access policy allocation failed")
+            })?;
+        }
+        for registry in &mut installed {
+            registry.access_authorizers.extend(authorizers.iter().cloned());
+        }
+        Ok(())
+    }
+
+    fn access_authorizers(&self) -> McpResult<Vec<Arc<dyn crate::TaskAccessAuthorizer>>> {
+        self.tasks
+            .lock()
+            .map(|registry| registry.access_authorizers.clone())
+            .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))
+    }
+
+    /// Checks retained authority without cloning a result, creation response,
+    /// or input map. Repeated listener checks must preserve the one-payload
+    /// alias fanout bound even when a completed Task contains a large result.
+    fn authorize_handle(
+        &self,
+        ctx: &McpContext,
+        action: crate::TaskAccessAction,
+        owner: fastmcp_core::Sha256Digest,
+        handle: &FinalTaskId,
+        lookup: ProxyFinalTaskLookup,
+    ) -> McpResult<()> {
+        if proxy_task_owner(ctx)? != owner {
+            return Err(unknown_proxy_task());
+        }
+        let (original, authorizers) = {
+            let registry = self.tasks.lock().map_err(|_| {
+                McpError::internal_error("Proxy final Tasks registry lock poisoned")
+            })?;
+            let retained = registry.tasks.get(handle).ok_or_else(unknown_proxy_task)?;
+            let now = Instant::now();
+            if retained.owner != owner
+                || retained.binding != self.binding
+                || retained.recovery_until.is_some_and(|deadline| deadline <= now)
+                || (matches!(lookup, ProxyFinalTaskLookup::CurrentSnapshot)
+                    && retained.expires_at.is_some_and(|deadline| deadline <= now))
+            {
+                return Err(unknown_proxy_task());
+            }
+            (
+                retained.original_operation.clone().ok_or_else(unknown_proxy_task)?,
+                registry.access_authorizers.clone(),
+            )
+        };
+        original.authorize_access(ctx, action, &authorizers)
+            .map_err(|_| unknown_proxy_task())
+    }
+
+    fn authorize_mapping(
+        &self,
+        ctx: &McpContext,
+        action: crate::TaskAccessAction,
+        retained: &ProxyRelayedFinalTask,
+    ) -> McpResult<()> {
+        if proxy_task_owner(ctx)? != retained.owner || retained.binding != self.binding {
+            return Err(unknown_proxy_task());
+        }
+        let original = retained.original_operation.as_ref().ok_or_else(unknown_proxy_task)?;
+        original
+            .authorize_access(ctx, action, &self.access_authorizers()?)
+            .map_err(|_| unknown_proxy_task())
     }
 
     /// Adds one route to the server's existing Tasks service. The builder
@@ -5676,7 +5865,7 @@ impl ProxyFinalTaskRelay {
     /// Resolves an issued carrier under the current request owner. The carrier
     /// holds no upstream data: the typed result survives without a JSON Value
     /// round trip, including nested result sibling order and number lexemes.
-    pub(crate) fn admit_carried_task(
+    fn admit_carried_task(
         self: &Arc<Self>,
         ctx: &McpContext,
         descriptor: &crate::FinalTaskWorkDescriptor,
@@ -5705,6 +5894,49 @@ impl ProxyFinalTaskRelay {
         Ok(Some(result))
     }
 
+    /// Binds the exact router registration before an issued handle can be
+    /// returned to a caller. A carrier cannot rebind an existing operation.
+    pub(crate) fn admit_carried_task_for_operation(
+        self: &Arc<Self>,
+        ctx: &McpContext,
+        descriptor: &crate::FinalTaskWorkDescriptor,
+        original: crate::FinalTaskOperation,
+    ) -> McpResult<Option<CreateTaskResult>> {
+        let Some(value) = descriptor
+            .as_value()
+            .as_object()
+            .and_then(|object| object.get(RELAYED_TASK_RESULT_MEMBER))
+        else {
+            return Ok(None);
+        };
+        let handle = serde_json::from_value::<FinalTaskId>(value.clone())
+            .map_err(|_| unknown_proxy_task())?;
+        let owner = proxy_task_owner(ctx)?;
+        let (route, retained) =
+            self.resolve_task(owner, &handle, ProxyFinalTaskLookup::CurrentSnapshot)?;
+        original
+            .authorize_access(ctx, crate::TaskAccessAction::Create, &route.access_authorizers()?)
+            .map_err(|_| unknown_proxy_task())?;
+        if retained.original_operation.as_ref().is_some_and(|known| known != &original) {
+            return Err(unknown_proxy_task());
+        }
+        {
+            let mut registry = route.tasks.lock().map_err(|_| {
+                McpError::internal_error("Proxy final Tasks registry lock poisoned")
+            })?;
+            Self::reclaim_expired_tasks(&mut registry, Instant::now());
+            let current = registry.tasks.get_mut(&handle).ok_or_else(unknown_proxy_task)?;
+            if current.owner != owner
+                || current.binding != route.binding
+                || current.original_operation != retained.original_operation
+            {
+                return Err(unknown_proxy_task());
+            }
+            current.original_operation = Some(original);
+        }
+        self.admit_carried_task(ctx, descriptor)
+    }
+
     fn reserve_task_creation(
         self: &Arc<Self>,
         ctx: &McpContext,
@@ -5715,6 +5947,11 @@ impl ProxyFinalTaskRelay {
             .tasks
             .lock()
             .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?;
+        if registry.access_authorizers.is_empty() {
+            return Err(McpError::invalid_request(
+                "Proxy Task creation requires a current original-operation access policy",
+            ));
+        }
         Self::reclaim_expired_tasks(&mut registry, Instant::now());
         if registry.tasks.len() + registry.pending_creations.len() >= MAX_RELAYED_FINAL_TASKS {
             return Err(McpError::invalid_params(
@@ -5785,6 +6022,7 @@ impl ProxyFinalTaskRelay {
             creation: result,
             binding: self.binding,
             owner: reservation.owner,
+            original_operation: None,
             retained_at,
             wall_origin,
             snapshot_revision: 0,
@@ -5972,6 +6210,7 @@ impl ProxyFinalTaskRelay {
         handle: &FinalTaskId,
         mut task: FinalTask,
         mut expected_revision: Option<u64>,
+        action: crate::TaskAccessAction,
     ) -> McpResult<FinalTask> {
         // A conflicting event gets at most two fresh reads. Further races
         // remain explicit instead of spinning or overwriting a newer state.
@@ -5980,6 +6219,9 @@ impl ProxyFinalTaskRelay {
             if proxy_task_owner(ctx)? != owner {
                 return Err(unknown_proxy_task());
             }
+            self.authorize_handle(
+                ctx, action, owner, handle, ProxyFinalTaskLookup::RecoveryLocator,
+            )?;
             if let Some(admitted) = self.record_task(owner, handle, &task, expected_revision)? {
                 return Ok(admitted);
             }
@@ -5987,6 +6229,7 @@ impl ProxyFinalTaskRelay {
                 break;
             }
             let current = self.known_locator(owner, handle)?;
+            self.authorize_mapping(ctx, action, &current)?;
             expected_revision = Some(current.snapshot_revision);
             task = self
                 .client
@@ -6129,6 +6372,7 @@ impl ProxyFinalTaskRelay {
             &parameters.task_id,
             ProxyFinalTaskLookup::RecoveryLocator,
         )?;
+        route.authorize_mapping(ctx, crate::TaskAccessAction::Get, &retained)?;
         let mut result = route
             .client
             .get_final_task(ctx, retained.task.base().task_id.clone())
@@ -6140,6 +6384,7 @@ impl ProxyFinalTaskRelay {
                 &parameters.task_id,
                 result.task,
                 Some(retained.snapshot_revision),
+                crate::TaskAccessAction::Get,
             )
             .await?;
         set_relayed_task_id(&mut result.task, parameters.task_id);
@@ -6159,10 +6404,15 @@ impl ProxyFinalTaskRelay {
             &parameters.task_id,
             ProxyFinalTaskLookup::CurrentSnapshot,
         )?;
+        route.authorize_mapping(ctx, crate::TaskAccessAction::Update, &retained)?;
         let result = route
             .client
             .update_final_task(ctx, &retained.task, parameters.input_responses)
             .await?;
+        route.authorize_handle(
+            ctx, crate::TaskAccessAction::Update, retained.owner, &parameters.task_id,
+            ProxyFinalTaskLookup::CurrentSnapshot,
+        )?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/update response serialization failed")
         })
@@ -6181,10 +6431,15 @@ impl ProxyFinalTaskRelay {
             &parameters.task_id,
             ProxyFinalTaskLookup::CurrentSnapshot,
         )?;
+        route.authorize_mapping(ctx, crate::TaskAccessAction::Cancel, &retained)?;
         let result = route
             .client
             .cancel_final_task(ctx, retained.task.base().task_id.clone())
             .await?;
+        route.authorize_handle(
+            ctx, crate::TaskAccessAction::Cancel, retained.owner, &parameters.task_id,
+            ProxyFinalTaskLookup::CurrentSnapshot,
+        )?;
         serde_json::to_value(result).map_err(|_| {
             McpError::internal_error("Proxy final tasks/cancel response serialization failed")
         })
@@ -6203,8 +6458,9 @@ impl ProxyFinalTaskRelay {
         let mut groups: Vec<(Arc<Self>, Vec<FinalTaskId>)> = Vec::new();
         // Resolve the entire selection before opening any upstream stream.
         for handle in task_ids {
-            let (route, _) =
+            let (route, retained) =
                 self.resolve_task(owner, &handle, ProxyFinalTaskLookup::CurrentSnapshot)?;
+            route.authorize_mapping(ctx, crate::TaskAccessAction::Listen, &retained)?;
             match groups
                 .iter_mut()
                 .find(|(known, _)| Arc::ptr_eq(known, &route))
@@ -6214,7 +6470,11 @@ impl ProxyFinalTaskRelay {
             }
         }
         if groups.is_empty() {
-            return self.open_route_listener_async(ctx, notifications).await;
+            // An empty selection conveys no Task authority and needs no
+            // upstream request or retained stream.
+            return Ok(Box::new(MultiplexedProxyFinalTaskListener::new(
+                Vec::new(), notifications, ctx.clone(), Vec::new(),
+            )));
         }
         if groups.len() == 1 {
             let (route, _) = groups.pop().expect("one admitted route");
@@ -6222,6 +6482,7 @@ impl ProxyFinalTaskRelay {
         }
         let cancellation = ctx.request_cancellation();
         let mut listeners = Vec::with_capacity(groups.len());
+        let mut selections = Vec::with_capacity(groups.len());
         let mut admitted_handles = BTreeSet::new();
         for (route, handles) in groups {
             let filter = relayed_task_filter(notifications.clone(), handles)?;
@@ -6237,7 +6498,8 @@ impl ProxyFinalTaskRelay {
                 ProxyFinalTaskListenerEvent::Acknowledged(accepted) => {
                     let admitted = crate::admitted_task_subscription_ids(&filter, &accepted)?;
                     if !admitted.is_empty() {
-                        admitted_handles.extend(admitted);
+                        admitted_handles.extend(admitted.iter().cloned());
+                        selections.push((route, admitted));
                         listeners.push(listener);
                     }
                     // An empty route cannot produce Task events. Retire it now
@@ -6261,6 +6523,8 @@ impl ProxyFinalTaskRelay {
         Ok(Box::new(MultiplexedProxyFinalTaskListener::new(
             listeners,
             acknowledged,
+            ctx.clone(),
+            selections,
         )))
     }
 
@@ -6277,8 +6541,9 @@ impl ProxyFinalTaskRelay {
         let mut mappings = Vec::new();
         let mut upstream_ids = Vec::new();
         for task_id in task_ids {
-            let task = self.known_mapping(owner, &task_id)?.task;
-            let upstream_id = task.base().task_id.clone();
+            let retained = self.known_mapping(owner, &task_id)?;
+            self.authorize_mapping(ctx, crate::TaskAccessAction::Listen, &retained)?;
+            let upstream_id = retained.task.base().task_id.clone();
             if !upstream_ids.contains(&upstream_id) {
                 upstream_ids.push(upstream_id.clone());
             }
@@ -10200,6 +10465,24 @@ impl ProxyClient {
         ))))
     }
 
+    /// Router preflight runs before a Task-capable upstream tool can perform
+    /// work. The registry is shared with the route that will retain its handle.
+    #[cfg(feature = "tasks")]
+    pub(crate) fn authorize_final_task_creation(
+        &self,
+        ctx: &McpContext,
+        original: &crate::FinalTaskOperation,
+    ) -> McpResult<()> {
+        proxy_task_owner(ctx)?;
+        let authorizers = self
+            .final_task_registry
+            .lock()
+            .map_err(|_| McpError::internal_error("Proxy final Tasks registry lock poisoned"))?
+            .access_authorizers
+            .clone();
+        original.authorize_access(ctx, crate::TaskAccessAction::Create, &authorizers)
+    }
+
     /// Returns the route-local relayed Tasks state for a unit-test
     /// unchanged-state assertion. This deliberately exposes only a stable
     /// serialized snapshot, never the mutable registry or its retention
@@ -13498,6 +13781,9 @@ fn resource_from_template(template: &ResourceTemplate) -> Resource {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "tasks")]
+    mod task_authorization;
+
     use fastmcp_core::runtime::poll_on_cx;
     #[cfg(feature = "tasks")]
     use std::collections::VecDeque;
@@ -13833,11 +14119,43 @@ mod tests {
     }
 
     #[cfg(feature = "tasks")]
+    struct RelayTestAccessAuthorizer;
+
+    #[cfg(feature = "tasks")]
+    impl crate::TaskAccessAuthorizer for RelayTestAccessAuthorizer {
+        fn authorize(
+            &self,
+            _ctx: &McpContext,
+            _action: crate::TaskAccessAction,
+            _original: &crate::FinalTaskOperation,
+        ) -> fastmcp_core::McpResult<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn prepare_relay_test_access(relay: &super::ProxyFinalTaskRelay) {
+        if relay.access_authorizers().unwrap().is_empty() {
+            relay.install_access_authorizers(vec![Arc::new(RelayTestAccessAuthorizer)]).unwrap();
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn relay_test_operation() -> crate::FinalTaskOperation {
+        static REGISTRATION: std::sync::OnceLock<Arc<()>> = std::sync::OnceLock::new();
+        crate::FinalTaskOperation::for_tool(
+            "relay-test-tool",
+            REGISTRATION.get_or_init(|| Arc::new(())),
+        ).unwrap()
+    }
+
+    #[cfg(feature = "tasks")]
     fn issue_relay_test_task(
         relay: &Arc<super::ProxyFinalTaskRelay>,
         ctx: &McpContext,
         task: fastmcp_protocol::Task,
     ) -> CreateTaskResult {
+        prepare_relay_test_access(relay);
         let reservation = relay
             .reserve_task_creation(ctx)
             .expect("reserve an issued handle");
@@ -13852,7 +14170,7 @@ mod tests {
             )
             .expect("retain the task behind its reserved handle");
         relay
-            .admit_carried_task(ctx, &carrier)
+            .admit_carried_task_for_operation(ctx, &carrier, relay_test_operation())
             .expect("admit the owned carrier")
             .expect("carrier belongs to the relay")
     }
@@ -14738,6 +15056,7 @@ IFS= read -r end
                         .final_tasks_relay()
                         .unwrap()
                         .expect("discovered Tasks relay");
+                    prepare_relay_test_access(&relay);
                     let before = proxy.final_task_registry_snapshot_for_test().unwrap();
                     let mut tool = final_catalog_tool();
                     tool.name.clone_from(&subject);
@@ -14833,7 +15152,11 @@ IFS= read -r end
                                 assert!(task_result);
                                 serde_json::to_value(
                                     relay
-                                        .admit_carried_task(&ctx, &work_descriptor)
+                                        .admit_carried_task_for_operation(
+                                            &relay_test_context(cx.clone(), 8831),
+                                            &work_descriptor,
+                                            relay_test_operation(),
+                                        )
                                         .unwrap()
                                         .unwrap(),
                                 )
@@ -16708,7 +17031,12 @@ IFS= read -r end
                         tool.name.clone_from(&subject);
                         let handler = ProxyToolHandler::from_final(tool, proxy.clone()).unwrap();
                         #[cfg(feature = "tasks")]
-                        let handler = if allow_tasks { let mut handler = handler; handler.task_relay = proxy.final_tasks_relay().unwrap(); handler } else { handler };
+                        let handler = if allow_tasks {
+                            let mut handler = handler;
+                            handler.task_relay = proxy.final_tasks_relay().unwrap();
+                            prepare_relay_test_access(handler.task_relay.as_ref().unwrap());
+                            handler
+                        } else { handler };
                         let capabilities = fastmcp_core::ClientCapabilityInfo::new().with_roots(false);
                         #[cfg(feature = "tasks")]
                         let capabilities = if allow_tasks { capabilities.with_tasks() } else { capabilities };
@@ -16790,7 +17118,11 @@ IFS= read -r end
                                     FinalToolOutcome::CreateTask { work_descriptor, .. } => {
                                         assert!(allow_tasks);
                                         assert_eq!(round, 1);
-                                        let retained = handler.task_relay.as_ref().unwrap().admit_carried_task(&round_ctx, &work_descriptor).unwrap().unwrap();
+                                        let retained = handler.task_relay.as_ref().unwrap().admit_carried_task_for_operation(
+                                            &relay_test_context(cx.clone(), 8911),
+                                            &work_descriptor,
+                                            relay_test_operation(),
+                                        ).unwrap().unwrap();
                                         assert_relay_task_mapping(&serde_json::to_value(retained).unwrap(), &upstream);
                                     }
                                 }
@@ -17898,7 +18230,11 @@ IFS= read -r end
                 .unwrap();
                 #[cfg(feature = "tasks")]
                 let relay = if ctx.client_supports_tasks() {
-                    proxy.final_tasks_relay().unwrap()
+                    let relay = proxy.final_tasks_relay().unwrap();
+                    if let Some(relay) = relay.as_ref() {
+                        prepare_relay_test_access(relay);
+                    }
+                    relay
                 } else {
                     None
                 };
@@ -17935,7 +18271,11 @@ IFS= read -r end
                     }) => {
                         let result = relay
                             .expect("Tasks must be explicitly negotiated")
-                            .admit_carried_task(ctx, &work_descriptor)
+                            .admit_carried_task_for_operation(
+                                &relay_test_context(ctx.cx().clone(), 8912),
+                                &work_descriptor,
+                                relay_test_operation(),
+                            )
                             .unwrap()
                             .unwrap();
                         return Ok(serde_json::to_value(result).unwrap());
@@ -23224,6 +23564,7 @@ IFS= read -r end
         )
         .unwrap();
         let relay = client.final_tasks_relay().unwrap().unwrap();
+        prepare_relay_test_access(&relay);
         BrokerRouteFixture {
             client,
             relay,
@@ -23263,6 +23604,7 @@ IFS= read -r end
         )
         .unwrap();
         let relay = client.final_tasks_relay().unwrap().unwrap();
+        prepare_relay_test_access(&relay);
         BrokerRouteFixture {
             client,
             relay,
@@ -23455,7 +23797,9 @@ IFS= read -r end
             .relay
             .encode_task_carrier(reservation, created)
             .unwrap();
-        let mapped = broker.admit_carried_task(ctx, &carrier).unwrap().unwrap();
+        let mapped = broker.admit_carried_task_for_operation(
+            ctx, &carrier, relay_test_operation(),
+        ).unwrap().unwrap();
         assert_relay_task_mapping(
             &serde_json::to_value(&mapped).unwrap(),
             &serde_json::to_value(&route.creation).unwrap(),
@@ -24683,6 +25027,8 @@ IFS= read -r end
                 }),
             ],
             SubscriptionFilter::default(),
+            relay_test_context(Cx::for_testing(), 901),
+            Vec::new(),
         );
         let cx = Cx::for_testing();
         let cancellation = McpRequestCancellation::new();
@@ -24760,6 +25106,8 @@ IFS= read -r end
                     }),
                 ],
                 SubscriptionFilter::default(),
+                relay_test_context(Cx::for_testing(), 902),
+                Vec::new(),
             );
             let cx = Cx::for_testing();
             let cancellation = McpRequestCancellation::new();
@@ -25099,7 +25447,7 @@ IFS= read -r end
                     assert_relay_task_mapping(
                         &serde_json::to_value(
                             relay
-                                .admit_carried_task(&owner_ctx, &work_descriptor)
+                                .admit_carried_task_for_operation(&owner_ctx, &work_descriptor, relay_test_operation())
                                 .unwrap()
                                 .unwrap(),
                         )
@@ -25172,6 +25520,7 @@ IFS= read -r end
             .expect("the modern HTTP route installs the relay");
 
         let owner_ctx = relay_test_context(Cx::for_testing(), 733);
+        prepare_relay_test_access(&relay);
         let reservation = relay
             .reserve_task_creation(&owner_ctx)
             .expect("reserve a handle before upstream task creation");
@@ -25188,7 +25537,7 @@ IFS= read -r end
             .encode_task_carrier(reservation, created)
             .expect("the private router carrier retains the Task result");
         let admitted = relay
-            .admit_carried_task(&owner_ctx, &carrier)
+            .admit_carried_task_for_operation(&owner_ctx, &carrier, relay_test_operation())
             .expect("the exact carrier is admitted")
             .expect("the carrier belongs to this relay");
         let task_id = admitted.task.base().task_id.clone();
@@ -25367,6 +25716,7 @@ IFS= read -r end
                 _request: crate::auth::AuthRequest<'_>,
             ) -> fastmcp_core::McpResult<fastmcp_core::AuthContext> {
                 let mut auth = relay_test_auth();
+                auth.scopes.push("tool:invoke".to_owned());
                 if !self.0.load(Ordering::Acquire) {
                     auth.scopes.push("task:cancel".to_owned());
                 }
@@ -25402,10 +25752,16 @@ IFS= read -r end
             let policy = ScopeRequestPolicy::new(
                 1,
                 ScopeImplicationPolicy::new(1, Vec::new()).unwrap(),
-                vec![(
-                    "tasks/cancel".to_owned(),
-                    RequiredScopes::new(vec!["task:cancel".to_owned()]).unwrap(),
-                )],
+                vec![
+                    (
+                        "tasks/cancel".to_owned(),
+                        RequiredScopes::new(vec!["task:cancel".to_owned()]).unwrap(),
+                    ),
+                    (
+                        "tools/call".to_owned(),
+                        RequiredScopes::new(vec!["tool:invoke".to_owned()]).unwrap(),
+                    ),
+                ],
             )
             .unwrap();
             let server = Arc::new(
@@ -25847,6 +26203,7 @@ IFS= read -r end
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
+        prepare_relay_test_access(&relay);
         let reservation = relay
             .reserve_task_creation(&context)
             .expect("the route reserves a task slot before the upstream side effect");
@@ -25862,7 +26219,7 @@ IFS= read -r end
         assert!(context.request_cancellation().is_cancel_requested());
         let control_context = relay_test_context(Cx::for_testing(), 746);
         let admitted = relay
-            .admit_carried_task(&control_context, &carrier)
+            .admit_carried_task_for_operation(&control_context, &carrier, relay_test_operation())
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -25999,6 +26356,7 @@ IFS= read -r end
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
+        prepare_relay_test_access(&relay);
         let handler =
             ProxyToolHandler::from_final_with_task_relay(final_catalog_tool(), proxy, relay)
                 .expect("exact final task handler is constructed");
@@ -26055,6 +26413,7 @@ IFS= read -r end
             .final_tasks_relay()
             .expect("relay discovery is available")
             .expect("the selected modern route installs a relay");
+        prepare_relay_test_access(&relay);
         let handler =
             ProxyToolHandler::from_final_with_task_relay(final_catalog_tool(), proxy, relay)
                 .expect("exact final task handler is constructed");

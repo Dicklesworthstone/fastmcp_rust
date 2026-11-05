@@ -344,7 +344,7 @@ impl Server {
     /// preflight, public resource metadata and protocol control handled before
     /// that dispatch retain their own admission. Policies created by
     /// ScopeRequestPolicy::for_operations also enforce their exact named rules.
-    /// With local Tasks, both forms also recheck the original operation and
+    /// With local or proxied Tasks, both forms also recheck the original operation and
     /// management grants on get/update/cancel and every subscribed Task event.
     /// Neither form filters catalogs or grants autonomous Task execution.
     /// Other subscription families retain their native lease contract. JSON-RPC
@@ -362,6 +362,10 @@ impl Server {
         #[cfg(feature = "tasks")]
         if let Some(runtime) = self.final_task_runtime.as_ref() {
             runtime.install_access_authorizer(Arc::new(policy.clone()))?;
+        }
+        #[cfg(all(feature = "tasks", feature = "proxy"))]
+        if self.final_task_runtime.is_none() && let Some(relay) = self.final_task_relay.as_ref() {
+            relay.install_access_authorizers(vec![Arc::new(policy.clone())])?;
         }
         middleware.insert(0, Box::new(ScopeAdmissionMiddleware(policy)));
         Ok(self)
