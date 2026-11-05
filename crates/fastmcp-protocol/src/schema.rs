@@ -3334,10 +3334,27 @@ fn resolve_local_reference_fragment_with_charge<'a>(
                 .ok_or("invalid local schema reference")?;
             target = match target {
                 Value::Object(object) => object.get(&segment),
-                Value::Array(array) => segment
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|index| array.get(index)),
+                Value::Array(array) => {
+                    // RFC 6901 array-index is "0" or a nonzero digit followed
+                    // by digits. Integer parsing alone also accepts a leading
+                    // plus or zeroes, which could select an unintended schema.
+                    // Object member names above remain exact, unrestricted keys.
+                    let canonical = segment == "0"
+                        || (segment
+                            .bytes()
+                            .next()
+                            .is_some_and(|byte| matches!(byte, b'1'..=b'9'))
+                            && segment.bytes().all(|byte| byte.is_ascii_digit()));
+                    // The explicit "-" marker names a nonexistent member,
+                    // retaining its existing unresolved-reference diagnostic.
+                    if !canonical && segment != "-" {
+                        return Err("invalid local schema reference");
+                    }
+                    segment
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|index| array.get(index))
+                }
                 _ => None,
             }
             .ok_or("unresolved local schema reference")?;
@@ -8372,6 +8389,119 @@ mod tests {
             accepted["$ref"],
             json!("https://schemas.example.test/catalog/../child.json")
         );
+    }
+
+    #[test]
+    fn final_references_require_canonical_array_index_tokens() {
+        let choices: Vec<_> = (0..12).map(|value| json!({"const": value})).collect();
+        for keyword in ["$ref", "$dynamicRef"] {
+            for (token, expected) in [("0", 0), ("1", 1), ("10", 10), ("%30", 0), ("%31%30", 10)] {
+                let source = json!({
+                    "$defs": {"choices": {"anyOf": choices}},
+                    keyword: format!("#/$defs/choices/anyOf/{token}")
+                });
+                let admitted = admit_final_schema(source.clone()).unwrap();
+                assert!(
+                    admitted.validate(&json!(expected)).is_ok(),
+                    "{keyword}: {token}"
+                );
+                assert!(
+                    admitted.validate(&json!(expected + 1)).is_err(),
+                    "{keyword}: {token}"
+                );
+                assert_eq!(admitted.schema(), &source);
+            }
+            for token in [
+                "00", "01", "+0", "-0", "", "1.0", "1e0", "%30%30", "%2B0", "%2D0", "%20%31",
+                "%31%20", "%D9%A1",
+            ] {
+                let source = json!({
+                    "$defs": {"choices": {"anyOf": choices}},
+                    keyword: format!("#/$defs/choices/anyOf/{token}")
+                });
+                let error = admit_final_schema(source).unwrap_err();
+                assert_eq!(error.path(), format!("$.{keyword}"), "{token}");
+                assert_eq!(error.reason(), "invalid local schema reference", "{token}");
+            }
+            // These tokens name nonexistent array members: "-" is the RFC 6901
+            // append position, while decimal indices may exceed length or usize.
+            for token in ["-".to_owned(), "12".to_owned(), "9".repeat(100)] {
+                let source = json!({
+                    "$defs": {"choices": {"anyOf": choices}},
+                    keyword: format!("#/$defs/choices/anyOf/{token}")
+                });
+                let error = admit_final_schema(source).unwrap_err();
+                assert_eq!(error.reason(), "unresolved local schema reference");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_references_require_canonical_array_index_tokens() {
+        let choices: Vec<_> = (0..12).map(|value| json!({"const": value})).collect();
+        for (token, expected) in [("0", 0), ("1", 1), ("10", 10)] {
+            let source = json!({
+                "$defs": {"choices": {"anyOf": choices}},
+                "$ref": format!("#/$defs/choices/anyOf/{token}")
+            });
+            assert!(validate(&source, &json!(expected)).is_ok(), "{token}");
+            assert!(validate(&source, &json!(expected + 1)).is_err(), "{token}");
+        }
+        for token in ["00", "01", "+0", "-0", "", "1.0", "1e0", " 1", "1 "] {
+            let source = json!({
+                "$defs": {"choices": {"anyOf": choices}},
+                "$ref": format!("#/$defs/choices/anyOf/{token}")
+            });
+            let errors = validate(&source, &json!(0)).unwrap_err();
+            assert_eq!(errors[0].message, "invalid local schema reference", "{token}");
+        }
+        for token in ["-".to_owned(), "12".to_owned(), "9".repeat(100)] {
+            let source = json!({
+                "$defs": {"choices": {"anyOf": choices}},
+                "$ref": format!("#/$defs/choices/anyOf/{token}")
+            });
+            let errors = validate(&source, &json!(0)).unwrap_err();
+            assert_eq!(
+                errors[0].message,
+                "unresolved local schema reference",
+                "{token}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_numeric_object_members_remain_literal() {
+        for keyword in ["$ref", "$dynamicRef"] {
+            for key in ["0", "00", "01", "+0", "-0", "-", ""] {
+                let source = json!({
+                    "$defs": {key: {"const": key}},
+                    keyword: format!("#/$defs/{key}")
+                });
+                let admitted = admit_final_schema(source.clone()).unwrap();
+                let accepted = json!(key);
+                let rejected = json!(format!("other-{key}"));
+                assert!(admitted.validate(&accepted).is_ok(), "{keyword}: {key:?}");
+                assert!(admitted.validate(&rejected).is_err(), "{keyword}: {key:?}");
+                if keyword == "$ref" {
+                    assert!(validate(&source, &accepted).is_ok(), "{key:?}");
+                    assert!(validate(&source, &rejected).is_err(), "{key:?}");
+                }
+                assert_eq!(admitted.schema(), &source);
+            }
+        }
+        let source = json!({
+            "$defs": {
+                "00": {"const": "decoded"},
+                "%30%30": {"const": "literal"}
+            },
+            "$ref": "#/$defs/%30%30"
+        });
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!("decoded")).is_ok());
+        assert!(admitted.validate(&json!("literal")).is_err());
+        // Raw validation deliberately retains its historical no-decoding rule.
+        assert!(validate(&source, &json!("literal")).is_ok());
+        assert!(validate(&source, &json!("decoded")).is_err());
     }
 
     #[test]
