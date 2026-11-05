@@ -14,7 +14,8 @@
 //!   resolution, composition, and conditional applicators
 //! - Declared Draft 2020-12 vocabularies and bounded content annotations
 //! - Bounded patterns with ECMAScript digit, word, and whitespace character
-//!   classes; constructs outside the linear regex engine remain unsupported
+//!   classes, default ASCII word boundaries, and line-terminator-aware wildcards;
+//!   constructs outside the linear regex engine remain unsupported
 //!
 //! External references are never resolved through network or filesystem I/O.
 
@@ -114,7 +115,7 @@ pub const MAX_PATTERN_PROPERTY_BYTES: usize = 4 * 1024;
 pub const MAX_PATTERN_BYTES: usize = 4 * 1024;
 
 // Preserve regex's existing source nesting limit. Normalization introduces
-// at most a bracket class and a union below an existing shorthand leaf.
+// at most a bracket class and a union, or a scoped flag group, below a leaf.
 const SCHEMA_PATTERN_SOURCE_NEST_LIMIT: u32 = 250;
 const SCHEMA_PATTERN_NORMALIZED_NEST_LIMIT: u32 = SCHEMA_PATTERN_SOURCE_NEST_LIMIT + 2;
 
@@ -2443,15 +2444,22 @@ fn validate_pattern_keyword(
 }
 
 /// Compiles the bounded pattern subset without inheriting Rust regex's
-/// Unicode definitions of `\d`, `\w`, and `\s`.
+/// Unicode classes and default word boundaries, or its narrower
+/// definition of the line terminators excluded by `.`.
 ///
 /// ECMA-262's CharacterClassEscape productions define digits and word
 /// characters as ASCII, and whitespace as WhiteSpace plus LineTerminator.
 /// Explicit nested classes preserve those semantics inside bracket classes,
 /// including negated escapes, while retaining the linear-time matcher.
-/// Escapes are consumed in pairs so a literal `\\d` is never rewritten.
+/// Class/escape context keeps a literal `.`, bracket, or `\\b` unchanged and
+/// interprets `\b` inside a class as backspace. Scoped dotAll modifiers retain
+/// their meaning. Escapes are consumed in pairs so a literal `\\d` is never
+/// rewritten.
 /// Other syntax still goes through the existing regex parser and its limits;
 /// this is not a complete ECMAScript regular-expression implementation.
+/// Named engine boundary extensions and inline case-insensitive modes retain
+/// their existing boundary semantics; normalization does not claim full
+/// ECMAScript modifier parity.
 /// Rust-only modes that disable Unicode are outside this schema pattern subset.
 fn compile_schema_pattern(source: &str) -> Result<Regex, regex::Error> {
     if source.len() > MAX_PATTERN_BYTES {
@@ -2463,16 +2471,126 @@ fn compile_schema_pattern(source: &str) -> Result<Regex, regex::Error> {
     // The source bound applies before expansion. Each escape expands by a
     // fixed factor, so both normalization and regex compilation stay bounded.
     let mut normalized = String::with_capacity(source.len());
+    // The syntax pass must see a literal backspace for class \b, which the
+    // Rust parser otherwise rejects as an assertion. It retains shorthand
+    // escapes so invalid ranges such as [\d-a] cannot become valid unions.
+    let mut syntax_source = String::with_capacity(source.len());
+    let mut classes = Vec::new();
+    let mut groups = Vec::new();
+    let mut flags = SchemaPatternFlags::default();
     let mut characters = source.chars();
     while let Some(character) = characters.next() {
-        if character != '\\' {
+        if flags.extended && character == '#' {
+            syntax_source.push(character);
+            normalized.push(character);
+            for comment_character in characters.by_ref() {
+                syntax_source.push(comment_character);
+                normalized.push(comment_character);
+                if comment_character == '\n' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if flags.extended && character.is_whitespace() {
+            syntax_source.push(character);
             normalized.push(character);
             continue;
         }
+        if character != '\\' {
+            syntax_source.push(character);
+            match character {
+                '[' => {
+                    if let Some(start) = classes.last_mut() {
+                        *start = SchemaPatternClassStart::Populated;
+                    }
+                    classes.push(SchemaPatternClassStart::Open);
+                    normalized.push(character);
+                }
+                '^' if matches!(classes.last(), Some(SchemaPatternClassStart::Open)) => {
+                    if let Some(start) = classes.last_mut() {
+                        *start = SchemaPatternClassStart::Negated;
+                    }
+                    normalized.push(character);
+                }
+                ']' if matches!(classes.last(), Some(SchemaPatternClassStart::Populated)) => {
+                    let _ = classes.pop();
+                    normalized.push(character);
+                }
+                '(' if classes.is_empty() => {
+                    normalized.push(character);
+                    // Extended mode also ignores spacing/comments immediately
+                    // after the opening parenthesis, before its group prefix.
+                    if flags.extended {
+                        let ignored = schema_pattern_ignored_prefix(characters.as_str());
+                        syntax_source.push_str(ignored);
+                        normalized.push_str(ignored);
+                        characters = characters.as_str()[ignored.len()..].chars();
+                    }
+                    if let Some(prefix) = schema_pattern_capture_prefix(characters.as_str()) {
+                        // Engine capture names can contain dots and brackets.
+                        // They are names, not pattern atoms or character classes.
+                        syntax_source.push_str(prefix);
+                        normalized.push_str(prefix);
+                        characters = characters.as_str()[prefix.len()..].chars();
+                        groups.push(flags);
+                    } else if let Some((prefix, scoped, next_flags)) =
+                        schema_pattern_group_flags(characters.as_str(), flags)
+                    {
+                        syntax_source.push_str(prefix);
+                        normalized.push_str(prefix);
+                        characters = characters.as_str()[prefix.len()..].chars();
+                        if scoped {
+                            groups.push(flags);
+                        }
+                        flags = next_flags;
+                    } else {
+                        groups.push(flags);
+                    }
+                }
+                ')' if classes.is_empty() => {
+                    if let Some(parent) = groups.pop() {
+                        flags = parent;
+                    }
+                    normalized.push(character);
+                }
+                '.' if classes.is_empty() && !flags.dot_all => {
+                    normalized.push_str(r"[^\r\n\u{2028}\u{2029}]");
+                }
+                _ => {
+                    if let Some(start) = classes.last_mut() {
+                        *start = SchemaPatternClassStart::Populated;
+                    }
+                    normalized.push(character);
+                }
+            }
+            continue;
+        }
         let Some(escape) = characters.next() else {
+            syntax_source.push('\\');
             normalized.push('\\');
             break;
         };
+        if let Some(start) = classes.last_mut() {
+            *start = SchemaPatternClassStart::Populated;
+        }
+        if escape == 'b' && !classes.is_empty() {
+            syntax_source.push_str(r"\x08");
+            normalized.push_str(r"\x08");
+            continue;
+        }
+        syntax_source.push('\\');
+        syntax_source.push(escape);
+        if let Some(prefix) =
+            schema_pattern_escape_prefix(escape, characters.as_str(), flags)
+        {
+            syntax_source.push_str(prefix);
+            normalized.push('\\');
+            normalized.push(escape);
+            normalized.push_str(prefix);
+            characters = characters.as_str()[prefix.len()..].chars();
+            continue;
+        }
         match escape {
             'd' => normalized.push_str("[0-9]"),
             'D' => normalized.push_str("[^0-9]"),
@@ -2480,26 +2598,148 @@ fn compile_schema_pattern(source: &str) -> Result<Regex, regex::Error> {
             'W' => normalized.push_str("[^A-Za-z0-9_]"),
             's' => normalized.push_str(r"[\t\n\x0B\x0C\r\p{Zs}\u{2028}\u{2029}\u{FEFF}]"),
             'S' => normalized.push_str(r"[^\t\n\x0B\x0C\r\p{Zs}\u{2028}\u{2029}\u{FEFF}]"),
+            'b' if classes.is_empty() && !flags.ignore_case => {
+                normalized.push_str(r"(?-u:\b)");
+            }
+            'B' if classes.is_empty() && !flags.ignore_case => {
+                normalized.push_str(r"(?-u:\B)");
+            }
             _ => {
                 normalized.push('\\');
                 normalized.push(escape);
             }
         }
     }
-    // Check the original syntax before replacing a class escape with a
-    // nested bracket class: otherwise invalid ranges such as `[\d-a]` could
+    // Check the original structure before replacing a class escape with a
+    // nested bracket class: otherwise invalid ranges such as [\d-a] could
     // become valid unions. Release that bounded compilation before compiling
     // the normalized form, which needs only its generated AST depth allowance.
-    let original = regex::RegexBuilder::new(source)
+    let original = regex::RegexBuilder::new(&syntax_source)
         .nest_limit(SCHEMA_PATTERN_SOURCE_NEST_LIMIT)
         .build()?;
-    if normalized == source {
+    if normalized == syntax_source {
         return Ok(original);
     }
     drop(original);
     regex::RegexBuilder::new(&normalized)
         .nest_limit(SCHEMA_PATTERN_NORMALIZED_NEST_LIMIT)
         .build()
+}
+
+#[derive(Clone, Copy, Default)]
+struct SchemaPatternFlags {
+    dot_all: bool,
+    extended: bool,
+    ignore_case: bool,
+}
+
+// Retain the regex parser's nested class syntax, including its leading literal
+// closing bracket after an optional negation. Extended whitespace/comments
+// do not consume that initial position.
+enum SchemaPatternClassStart {
+    Open,
+    Negated,
+    Populated,
+}
+
+/// Returns the whitespace/comments ignored by the engine's extended mode.
+fn schema_pattern_ignored_prefix(source: &str) -> &str {
+    let mut in_comment = false;
+    let mut end = 0;
+    for (index, character) in source.char_indices() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+        } else if character == '#' {
+            in_comment = true;
+        } else if !character.is_whitespace() {
+            break;
+        }
+        end = index + character.len_utf8();
+    }
+    &source[..end]
+}
+
+/// Copies capture-name punctuation without treating it as pattern syntax.
+/// The original regex parser remains responsible for validating the name.
+fn schema_pattern_capture_prefix(suffix: &str) -> Option<&str> {
+    let name = suffix
+        .strip_prefix("?P<")
+        .or_else(|| suffix.strip_prefix("?<"))?;
+    let name_end = name.find('>')?;
+    let prefix_len = suffix.len() - name.len() + name_end + 1;
+    Some(&suffix[..prefix_len])
+}
+
+/// Preserves braced engine escapes and named boundary assertions verbatim.
+/// The syntax pass validates payloads; only their source extent matters here.
+fn schema_pattern_escape_prefix(
+    escape: char,
+    suffix: &str,
+    flags: SchemaPatternFlags,
+) -> Option<&str> {
+    let ignored = match escape {
+        'p' | 'P' | 'x' | 'u' | 'U' if flags.extended => {
+            schema_pattern_ignored_prefix(suffix).len()
+        }
+        'p' | 'P' | 'x' | 'u' | 'U' | 'b' => 0,
+        _ => return None,
+    };
+    let body = suffix[ignored..].strip_prefix('{')?;
+    if escape == 'b' {
+        // Only named engine assertions are opaque. Numeric repetitions such
+        // as \b{1} still need their ordinary boundary normalized.
+        let name = if flags.extended {
+            &body[schema_pattern_ignored_prefix(body).len()..]
+        } else {
+            body
+        };
+        if !name
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, 'a'..='z' | 'A'..='Z' | '-'))
+        {
+            return None;
+        }
+    }
+    let mut in_comment = false;
+    for (index, character) in body.char_indices() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if flags.extended && character == '#' {
+            in_comment = true;
+        } else if character == '}' {
+            return Some(&suffix[..ignored + index + 2]);
+        }
+    }
+    None
+}
+
+/// Reads only flag-group prefixes; the regex parser still validates their
+/// complete syntax. Ordinary and named capture groups inherit their parent.
+fn schema_pattern_group_flags(
+    suffix: &str,
+    mut flags: SchemaPatternFlags,
+) -> Option<(&str, bool, SchemaPatternFlags)> {
+    let modifiers = suffix.strip_prefix('?')?;
+    let mut enabled = true;
+    for (index, character) in modifiers.char_indices() {
+        match character {
+            '-' => enabled = false,
+            's' => flags.dot_all = enabled,
+            'x' => flags.extended = enabled,
+            'i' => flags.ignore_case = enabled,
+            'm' | 'R' | 'U' | 'u' => {}
+            ':' | ')' => return Some((&suffix[..index + 2], character == ':', flags)),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn validate_format_keyword(
@@ -10196,6 +10436,282 @@ mod tests {
         assert!(validate(&schema, &json!("hello")).is_ok());
         assert!(validate(&schema, &json!("Hello")).is_err());
         assert!(validate(&schema, &json!("hello123")).is_err());
+    }
+
+    #[test]
+    fn ecmascript_word_boundaries_follow_ascii_word_characters() {
+        // Only the neighboring character changes; dot accepts both members.
+        let cases: [(&str, &[&str], &[&str]); 6] = [
+            (r"^a\b.$", &["aπ", "aé", "a!"], &["ab", "a_", "a1"]),
+            (r"^a\B.$", &["ab", "a_", "a1"], &["aπ", "aé", "a!"]),
+            (r"^.\ba$", &["πa", "éa", "!a"], &["ba", "_a", "1a"]),
+            (r"^.\Ba$", &["ba", "_a", "1a"], &["πa", "éa", "!a"]),
+            (r"^\b.+\b$", &["a", "42", "a_1"], &["π", "é", "!"]),
+            (r"^\B.+\B$", &["π", "é", "!"], &["a", "42", "a_1"]),
+        ];
+        for (pattern, accepted, rejected) in cases {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            for (values, expected) in [(accepted, true), (rejected, false)] {
+                for value in values {
+                    let value = json!(value);
+                    assert_eq!(
+                        admitted.validate(&value).is_ok(),
+                        expected,
+                        "{pattern}: {value:?}"
+                    );
+                    assert_eq!(
+                        validate(&source, &value).is_ok(),
+                        expected,
+                        "{pattern}: {value:?}"
+                    );
+                }
+            }
+            assert_eq!(admitted.schema(), &source);
+        }
+        for (pattern, accepts_empty) in [(r"^\B$", true), (r"^\b$", false)] {
+            let admitted = admit_final_schema(json!({"pattern": pattern})).unwrap();
+            assert_eq!(admitted.validate(&json!("")).is_ok(), accepts_empty);
+        }
+    }
+
+    #[test]
+    fn ecmascript_dot_excludes_each_line_terminator() {
+        // CompileAtom excludes exactly the four LineTerminator code points.
+        let accepted = ['a', 'é', '🦀', '\0', '\t', '\u{b}', '\u{c}', '\u{85}'];
+        let rejected = ['\n', '\r', '\u{2028}', '\u{2029}'];
+        for (pattern, prefix, suffix) in [(r"^.$", "", ""), (r"^a.b$", "a", "b")] {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            for (characters, expected) in [(accepted.as_slice(), true), (rejected.as_slice(), false)] {
+                for character in characters {
+                    let value = json!(format!("{prefix}{character}{suffix}"));
+                    assert_eq!(
+                        admitted.validate(&value).is_ok(),
+                        expected,
+                        "{pattern}: {character:?}"
+                    );
+                    assert_eq!(
+                        validate(&source, &value).is_ok(),
+                        expected,
+                        "{pattern}: {character:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ecmascript_dot_preserves_flag_scopes_and_extended_comments() {
+        for pattern in [
+            r"(?s)^.$",
+            r"^(?s:.)$",
+            r"(?x)( ?s:^.$)",
+            r"(?x)( ?s)^.$",
+            "(?x)( # ignored [ ( . \\b\n ?s:^.$)",
+        ] {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            for value in ["\n", "\r", "\u{2028}", "\u{2029}"] {
+                assert!(admitted.validate(&json!(value)).is_ok(), "{pattern}");
+                assert!(validate(&source, &json!(value)).is_ok(), "{pattern}");
+            }
+            assert!(admitted.validate(&json!("")).is_err());
+            assert!(admitted.validate(&json!("aa")).is_err());
+        }
+        for (pattern, accepted, rejected) in [
+            (r"^(?s:.)(?-s:.)$", "\ra", "\r\r"),
+            (r"^(?s:.).$", "\ra", "\r\r"),
+            (r"^((?s).).$", "\ra", "\r\r"),
+            (r"^(?s:.(?-s:.).).$", "\na\rb", "\na\r\r"),
+            (r"(?s)^.(?-s:.)..$", "\na\r\u{2028}", "\n\r\r\u{2028}"),
+            // Retained engine capture names can contain punctuation that must
+            // not be interpreted as part of their pattern bodies.
+            (r"^(?P<a.1>.)$", "a", "\r"),
+            (r"^(?<a.1>.)$", "a", "\r"),
+            (r"^(?P<a[>.)$", "a", "\r"),
+            (r"^(?<a]>.)$", "a", "\r"),
+            (r"^(?P<a[1]>.)$", "a", "\r"),
+            (r"^(?s:(?P<a.1>.))(?<b[>.)$", "\ra", "\r\r"),
+            (r"^(?P<a.1>(?s).).$", "\ra", "\r\r"),
+            (r"^(?P<a[>a)\b.$", "aπ", "ab"),
+            (r"(?x)^( ?P<a.1>.)$", "a", "\r"),
+            (r"(?x)^(?P<a.1>( ?s).).$", "\ra", "\r\r"),
+            (
+                "(?x)^( # capture prefix [ . \\b\n ?<a[>.)$",
+                "a",
+                "\r",
+            ),
+            // Existing case-insensitive engine extensions keep their word
+            // boundaries, but their flags must not escape a scoped group.
+            (r"(?i:^\bπ\b$)", "π", "!"),
+            (r"(?x)( ?i:^\bπ\b$)", "π", "!"),
+            (r"^(?i:a)\b.$", "aπ", "ab"),
+            // A comment's brackets/parentheses and an escaped class bracket
+            // must not alter the context of the following wildcard.
+            (
+                "(?x) ^ [\\].] # ignored [ ( . \\b\n \\b a . $",
+                ".ab",
+                ".a\r",
+            ),
+            // Extended whitespace before negation still leaves the first
+            // closing bracket literal in the retained engine class syntax.
+            (r"(?x) ^ [ ^ ].] . $", "ab", "a\r"),
+        ] {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!(accepted)).is_ok(), "{pattern}");
+            assert!(admitted.validate(&json!(rejected)).is_err(), "{pattern}");
+            assert!(validate(&source, &json!(accepted)).is_ok(), "{pattern}");
+            assert!(validate(&source, &json!(rejected)).is_err(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn ecmascript_pattern_class_backspace_and_literal_escapes() {
+        for (pattern, accepted, rejected) in [
+            (r"^[\b]$", "\u{8}", "b"),
+            (r"^[^\b]$", "b", "\u{8}"),
+            (r"^[\b-\r]$", "\t", "\u{7}"),
+            (r"^[\b-\r]$", "\r", "\u{e}"),
+            (r"^[\\b]+$", r"\b", "\u{8}"),
+            (r"^\\b$", r"\b", "\u{8}"),
+            (r"^[.]$", ".", "a"),
+            (r"^\.$", ".", "a"),
+            (r"^\\.$", r"\a", "\\\r"),
+            (r"^\\\.$", r"\.", r"\a"),
+            (r"^[\].]+$", "].", "a"),
+            (r"^\[.\]$", "[a]", "[\r]"),
+            // Escape payloads retain engine punctuation and extended-mode
+            // comments, including braces that occur only inside comments.
+            (r"^\p{Age:1.1}.$", "ab", "a\r"),
+            (r"^\P{Age:1.1}.$", "🦀a", "🦀\r"),
+            (r"^[\p{Age:1.1}].$", "ab", "a\r"),
+            (
+                "(?x)^\\p # prefix } . [ \\b\n {Age:1.1 # body } [ . \\b\n }.$",
+                "ab",
+                "a\r",
+            ),
+            (r"^\x{2E}.$", ".a", ".\r"),
+            (r"^\u{5B}.$", "[a", "[\r"),
+            (r"^\U{5D}.$", "]a", "]\r"),
+            (
+                "(?x)^\\u # prefix } . [\n {4 # body } . [\n 1}.$",
+                "Aa",
+                "A\r",
+            ),
+            // Named engine boundaries retain their Unicode behavior. Plain
+            // boundaries followed by numeric repetitions use ASCII semantics.
+            (r"^\b{start}π.$", "πa", "π\r"),
+            (r"^π\b{end}.$", "π!", "πa"),
+            (r"^\b{start-half}π.$", "πa", "π\r"),
+            (r"^π\b{end-half}.$", "π!", "πa"),
+            (
+                "(?x)^\\b{ s # name } . [\n t a r t }π.$",
+                "πa",
+                "π\r",
+            ),
+            (r"^a\b{1}.$", "aπ", "ab"),
+            (
+                "(?x)^a\\b{ # count } start\n 1 }.$",
+                "aπ",
+                "ab",
+            ),
+        ] {
+            let source = json!({"pattern": pattern});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!(accepted)).is_ok(), "{pattern}");
+            assert!(admitted.validate(&json!(rejected)).is_err(), "{pattern}");
+            assert!(validate(&source, &json!(accepted)).is_ok(), "{pattern}");
+            assert!(validate(&source, &json!(rejected)).is_err(), "{pattern}");
+            assert_eq!(admitted.schema(), &source);
+        }
+        for pattern in [
+            r"[\B]",
+            r"[\b-\d]",
+            r"[\d-\b]",
+            r"[\b",
+            r"\b(",
+            r".(",
+            r"(?x)(? s : .)",
+            r"(?x)(?s - s:.)",
+        ] {
+            let source = json!({"pattern": pattern});
+            assert!(admit_final_schema(source.clone()).is_err(), "{pattern}");
+            assert!(validate(&source, &json!("a")).is_err(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn ecmascript_assertions_and_dot_control_property_annotations() {
+        for (pattern, accepted, rejected) in [
+            (r"^a\b.$", "aπ", "ab"),
+            (r"^a\B.$", "ab", "aπ"),
+            (r"^.$", "a", "\r"),
+            (r"^.$", "é", "\u{2028}"),
+            (r"^.$", "é", "\u{2029}"),
+            (r"^[\b]$", "\u{8}", "b"),
+            (r"^[.]$", ".", "a"),
+            (r"^\\b$", r"\b", "\u{8}"),
+        ] {
+            let source = json!({
+                "patternProperties": {pattern: {"type": "integer"}},
+                "additionalProperties": false
+            });
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!({accepted: 1})).is_ok(), "{pattern}");
+            assert!(admitted.validate(&json!({rejected: 1})).is_err(), "{pattern}");
+            assert!(
+                admitted.validate(&json!({accepted: "1"})).is_err(),
+                "{pattern}"
+            );
+            assert!(validate(&source, &json!({accepted: 1})).is_ok(), "{pattern}");
+            assert!(validate(&source, &json!({rejected: 1})).is_err(), "{pattern}");
+
+            let evaluated = admit_final_schema(json!({
+                "allOf": [{"patternProperties": {pattern: {"type": "integer"}}}],
+                "unevaluatedProperties": false
+            }))
+            .unwrap();
+            assert!(evaluated.validate(&json!({accepted: 1})).is_ok(), "{pattern}");
+            assert!(evaluated.validate(&json!({rejected: 1})).is_err(), "{pattern}");
+            assert!(
+                evaluated.validate(&json!({accepted: "1"})).is_err(),
+                "{pattern}"
+            );
+
+            let names =
+                admit_final_schema(json!({"propertyNames": {"pattern": pattern}})).unwrap();
+            assert!(names.validate(&json!({accepted: 1})).is_ok(), "{pattern}");
+            assert!(names.validate(&json!({rejected: 1})).is_err(), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn ecmascript_assertion_and_dot_normalization_preserves_bounds() {
+        let prefix = "a".repeat(MAX_PATTERN_BYTES - 1);
+        let source = json!({"pattern": format!("{prefix}.")});
+        let admitted = admit_final_schema(source.clone()).unwrap();
+        assert!(admitted.validate(&json!(format!("{prefix}b"))).is_ok());
+        assert!(admitted.validate(&json!(format!("{prefix}\r"))).is_err());
+        let oversized = json!({"pattern": format!("a{prefix}.")});
+        assert_eq!(
+            admit_final_schema(oversized.clone()).unwrap_err().reason(),
+            "pattern exceeds byte limit"
+        );
+        assert!(validate(&oversized, &json!(format!("a{prefix}b"))).is_err());
+
+        let depth = usize::try_from(SCHEMA_PATTERN_SOURCE_NEST_LIMIT).unwrap();
+        for (atom, accepted, rejected) in [(r"\b", "a", "π"), (".", "a", "\r")] {
+            let bounded = format!("{}{atom}{}", "(".repeat(depth), ")".repeat(depth));
+            let source = json!({"pattern": bounded});
+            let admitted = admit_final_schema(source.clone()).unwrap();
+            assert!(admitted.validate(&json!(accepted)).is_ok(), "{atom}");
+            assert!(admitted.validate(&json!(rejected)).is_err(), "{atom}");
+            let excessive = json!({"pattern": format!("({bounded})")});
+            assert!(admit_final_schema(excessive.clone()).is_err(), "{atom}");
+            assert!(validate(&excessive, &json!(accepted)).is_err(), "{atom}");
+        }
     }
 
     #[test]
