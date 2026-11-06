@@ -132,12 +132,6 @@ async fn await_io<T>(
 ) -> Result<T, TransportError> {
     stdio_checkpoint(cx)?;
     let deadline = cx.budget().deadline;
-    if deadline.is_some() && cx.timer_driver().is_none() {
-        return Err(TransportError::Io(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "async stdio deadlines require the caller's timer driver",
-        )));
-    }
     let mut timeout = deadline.map(|deadline| Box::pin(Sleep::new(deadline)));
     // Keep the sender alive: this channel observes only the receiver's public
     // Cx cancellation registration and never carries an application value.
@@ -169,19 +163,9 @@ async fn await_io<T>(
                 .err()
                 .unwrap_or(TransportError::Cancelled)));
         }
-        if timeout
-            .as_mut()
-            .is_some_and(|timeout| timeout.as_mut().poll(task).is_ready())
-        {
-            if let Err(error) = stdio_checkpoint(cx) {
-                return Poll::Ready(Err(error));
-            }
-            // An active mask defers deadline cancellation too. The context
-            // observer remains registered and will observe it after unmasking.
-            timeout = None;
-        }
         // Success is the I/O commitment. Do not turn accepted bytes into a
-        // cancellation error by adding a post-poll checkpoint.
+        // cancellation error by adding a post-poll checkpoint. An immediately
+        // ready adapter also needs no timer registration or time capability.
         match operation(task) {
             Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {
                 if let Err(error) = stdio_checkpoint(cx) {
@@ -205,14 +189,44 @@ async fn await_io<T>(
                 // later turn, with another checkpoint, instead of losing a
                 // retained prefix or spinning inside this executor poll.
                 task.waker().wake_by_ref();
-                Poll::Pending
             }
-            result => {
-                // Pending is not progress, even if the source self-woke. Only
-                // completing this wait starts a fresh budget for the next I/O.
-                result.map(|result| result.map_err(|error| native_io_error(cx, error)))
+            Poll::Ready(result) => {
+                return Poll::Ready(result.map_err(|error| native_io_error(cx, error)));
+            }
+            // Pending is not progress, even if the source self-woke. Only
+            // completing this wait starts a fresh budget for the next I/O.
+            Poll::Pending => {}
+        }
+        if let Some(timer) = timeout.as_mut() {
+            // A retained driver is not authority to use time under a narrower
+            // host scope. Check after applying that scope on every pending
+            // poll, before Sleep can fall back to ambient OS timing when the
+            // effective context hides the driver's capability.
+            if !ceiling.contains(CapSet::<false, true, false, false, false>::MASK)
+                || !cx.capabilities().time
+            {
+                return Poll::Ready(Err(TransportError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "pending async stdio deadline requires the time capability",
+                ))));
+            }
+            if cx.timer_driver().is_none() {
+                return Poll::Ready(Err(TransportError::Io(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "pending async stdio deadline requires the caller's timer driver",
+                ))));
+            }
+            if timer.as_mut().poll(task).is_ready() {
+                if let Err(error) = stdio_checkpoint(cx) {
+                    return Poll::Ready(Err(error));
+                }
+                // An active mask defers deadline cancellation too. The context
+                // observer remains registered and observes it after unmasking.
+                // Do not poll this completed timer again while masked.
+                timeout = None;
             }
         }
+        Poll::Pending
     })
     .await
 }
@@ -1545,6 +1559,323 @@ mod tests {
                 source
             );
         });
+    }
+
+    mod timer_authority {
+        use super::*;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use asupersync::{Budget, Time};
+        use std::time::Duration;
+
+        #[derive(Clone, Copy, Debug)]
+        enum Stage {
+            Read,
+            Write,
+            Flush,
+            Shutdown,
+        }
+
+        const STAGES: [Stage; 4] = [Stage::Read, Stage::Write, Stage::Flush, Stage::Shutdown];
+
+        fn with_deadline(test: impl FnOnce(&Cx, &Arc<VirtualClock>, &TimerDriverHandle)) {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+            test(&cx, &clock, &timer);
+            assert_eq!(timer.pending_count(), 0);
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        fn scoped<T>(cx: &Cx, mask: CapMask, operation: impl FnOnce() -> T) -> T {
+            let _caller = Cx::set_current(Some(cx.clone()));
+            let _restriction = Cx::push_restriction(mask);
+            operation()
+        }
+
+        fn no_time() -> CapMask {
+            CapSet::<true, false, true, true, true>::MASK
+        }
+
+        fn denied(result: Result<(), TransportError>) {
+            assert!(matches!(
+                result,
+                Err(TransportError::Io(error)) if error.kind() == io::ErrorKind::PermissionDenied
+            ));
+        }
+
+        async fn perform(
+            transport: &mut AsyncStdioTransport<FeedReader, TestWriter>,
+            cx: &Cx,
+            stage: Stage,
+            message: &JsonRpcMessage,
+        ) -> Result<(), TransportError> {
+            match stage {
+                Stage::Read => {
+                    let received = transport.recv_async(cx).await?;
+                    assert_eq!(
+                        serde_json::to_value(received).unwrap(),
+                        serde_json::to_value(message).unwrap()
+                    );
+                    Ok(())
+                }
+                Stage::Write | Stage::Flush => transport.send_async(cx, message).await,
+                Stage::Shutdown => transport.close_async(cx).await,
+            }
+        }
+
+        fn blocked_output(stage: Stage, allowance: usize) -> Arc<Output> {
+            let output = Output::new(if matches!(stage, Stage::Write) {
+                allowance
+            } else {
+                usize::MAX
+            });
+            if matches!(stage, Stage::Flush | Stage::Shutdown) {
+                output.flush_ready.store(false, Ordering::SeqCst);
+            }
+            output
+        }
+
+        #[test]
+        fn pending_stdio_stages_require_caller_and_host_time_authority() {
+            // The same I/O remains pending; only the effective time authority
+            // differs between the positive and the two refusal cases.
+            for (held_denial, host_denial) in [(false, false), (true, false), (false, true)] {
+                for stage in STAGES {
+                    with_deadline(|cx, _clock, timer| {
+                        let caller = if held_denial {
+                            scoped(cx, no_time(), || Cx::current().unwrap())
+                        } else {
+                            cx.clone()
+                        };
+                        let mask = if host_denial {
+                            no_time()
+                        } else {
+                            CapMask::all()
+                        };
+                        let feed = Arc::new(Feed::default());
+                        let output = blocked_output(stage, 0);
+                        let mut transport = AsyncStdioTransport::from_io(
+                            FeedReader(Arc::clone(&feed)),
+                            TestWriter(Arc::clone(&output)),
+                        );
+                        let message = request(97);
+                        let wire = Codec::new()
+                            .encode_request(match &message {
+                                JsonRpcMessage::Request(request) => request,
+                                JsonRpcMessage::Response(_) => unreachable!(),
+                            })
+                            .unwrap();
+                        let refused = held_denial || host_denial;
+                        {
+                            let mut operation =
+                                pin!(perform(&mut transport, &caller, stage, &message));
+                            let first =
+                                scoped(cx, mask, || poll(operation.as_mut(), Waker::noop()));
+                            if refused {
+                                let Poll::Ready(result) = first else {
+                                    panic!(
+                                        "{stage:?} must refuse instead of starting an ambient timer"
+                                    );
+                                };
+                                denied(result);
+                            } else {
+                                assert!(first.is_pending(), "{stage:?} must actually wait");
+                                assert!(timer.pending_count() > 0);
+                                match stage {
+                                    Stage::Read => feed.push(&wire),
+                                    Stage::Write => {
+                                        output.allowance.store(usize::MAX, Ordering::SeqCst);
+                                    }
+                                    Stage::Flush | Stage::Shutdown => {
+                                        output.flush_ready.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                                assert!(matches!(
+                                    scoped(cx, mask, || poll(operation.as_mut(), Waker::noop())),
+                                    Poll::Ready(Ok(()))
+                                ));
+                            }
+                            assert_eq!(timer.pending_count(), 0, "completion retires the timer");
+                        }
+                        let expected = if matches!(stage, Stage::Flush)
+                            || (!refused && matches!(stage, Stage::Write))
+                        {
+                            wire.as_slice()
+                        } else {
+                            &[]
+                        };
+                        assert_eq!(output.bytes.lock().unwrap().as_slice(), expected);
+                        assert_eq!(
+                            transport.is_closed(),
+                            refused || matches!(stage, Stage::Shutdown)
+                        );
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn ready_stdio_needs_neither_unused_time_authority_nor_a_timer_driver() {
+            with_deadline(|cx, _clock, timer| {
+                let restricted = scoped(cx, no_time(), || Cx::current().unwrap());
+                let driverless = Cx::for_testing_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_nanos(u64::MAX)),
+                );
+                for caller in [cx, &restricted, &driverless] {
+                    let source = br#"{"jsonrpc":"2.0","method":"test/ready","id":98}"#;
+                    let wire = [source.as_slice(), b"\n"].concat();
+                    let output = Output::new(usize::MAX);
+                    let mut transport = AsyncStdioTransport::from_io(
+                        wire.as_slice(),
+                        TestWriter(Arc::clone(&output)),
+                    );
+                    scoped(cx, no_time(), || {
+                        assert_eq!(
+                            ready(transport.recv_with_source_async(caller))
+                                .unwrap()
+                                .source(),
+                            source
+                        );
+                        ready(transport.send_async(caller, &request(99))).unwrap();
+                        ready(transport.close_async(caller)).unwrap();
+                        assert!(!Cx::current().unwrap().capabilities().time);
+                    });
+                    assert_eq!(newline_count(&output.bytes.lock().unwrap()), 1);
+                    assert!(output.dropped.load(Ordering::SeqCst));
+                    assert_eq!(timer.pending_count(), 0);
+                }
+                let mut blocked = AsyncStdioTransport::from_io(
+                    FeedReader(Arc::new(Feed::default())),
+                    Vec::<u8>::new(),
+                );
+                scoped(cx, CapMask::all(), || {
+                    assert!(matches!(
+                        ready(blocked.recv_async(&driverless)),
+                        Err(TransportError::Io(error))
+                            if error.kind() == io::ErrorKind::Unsupported
+                    ));
+                });
+                assert!(blocked.is_closed());
+                assert_eq!(timer.pending_count(), 0);
+            });
+        }
+
+        #[test]
+        fn resumed_stdio_time_denial_retires_observers_and_fences_partial_writes() {
+            for stage in STAGES {
+                with_deadline(|cx, clock, timer| {
+                    let feed = Arc::new(Feed::default());
+                    let output = blocked_output(stage, 5);
+                    let mut transport = AsyncStdioTransport::from_io(
+                        FeedReader(feed),
+                        TestWriter(Arc::clone(&output)),
+                    );
+                    let message = request(100);
+                    let wakes = Arc::new(WakeCount::default());
+                    let waker = Waker::from(Arc::clone(&wakes));
+                    {
+                        let mut operation = pin!(perform(&mut transport, cx, stage, &message));
+                        // A short write first yields after its accepted prefix;
+                        // proceed to its pending wait before narrowing authority.
+                        for _ in 0..4 {
+                            assert!(
+                                scoped(cx, CapMask::all(), || poll(operation.as_mut(), &waker))
+                                    .is_pending()
+                            );
+                            if timer.pending_count() > 0 {
+                                break;
+                            }
+                        }
+                        assert!(
+                            timer.pending_count() > 0,
+                            "{stage:?} registered its real timer"
+                        );
+                        let Poll::Ready(result) =
+                            scoped(cx, no_time(), || poll(operation.as_mut(), &waker))
+                        else {
+                            panic!("a retained timer cannot bypass the narrower {stage:?} scope");
+                        };
+                        denied(result);
+                        assert_eq!(timer.pending_count(), 0);
+                        let before = wakes.0.load(Ordering::SeqCst);
+                        clock.advance(10_000_000);
+                        assert_eq!(timer.process_timers(), 0);
+                        cx.set_cancel_requested(true);
+                        assert_eq!(
+                            wakes.0.load(Ordering::SeqCst),
+                            before,
+                            "completed I/O retains no cancellation observer"
+                        );
+                    }
+                    assert!(transport.is_closed());
+                    if matches!(stage, Stage::Write) {
+                        assert_eq!(output.bytes.lock().unwrap().len(), 5);
+                        output.allowance.store(usize::MAX, Ordering::SeqCst);
+                        assert!(matches!(
+                            ready(transport.send_async(&Cx::for_testing(), &request(101))),
+                            Err(TransportError::Closed)
+                        ));
+                        assert_eq!(
+                            output.bytes.lock().unwrap().len(),
+                            5,
+                            "no frame may follow an abandoned prefix"
+                        );
+                    }
+                });
+            }
+        }
+
+        #[test]
+        fn masked_stdio_deadline_retires_timer_then_unmask_preserves_input_prefix() {
+            with_deadline(|cx, clock, timer| {
+                let feed = Arc::new(Feed::default());
+                let source = br#"{"jsonrpc":"2.0","method":"test/masked-deadline","id":102}"#;
+                feed.push(&source[..20]);
+                let mut transport =
+                    AsyncStdioTransport::from_io(FeedReader(Arc::clone(&feed)), Vec::<u8>::new());
+                {
+                    let mut receiving = pin!(transport.recv_async(cx));
+                    scoped(cx, CapMask::all(), || {
+                        cx.masked(|| {
+                            assert!(poll(receiving.as_mut(), Waker::noop()).is_pending());
+                        });
+                        assert!(timer.pending_count() > 0);
+                        clock.advance(10_000_000);
+                        assert_eq!(timer.process_timers(), 1);
+                        for _ in 0..2 {
+                            cx.masked(|| {
+                                assert!(poll(receiving.as_mut(), Waker::noop()).is_pending());
+                            });
+                            assert_eq!(
+                                timer.pending_count(),
+                                0,
+                                "masked expiry never rearms a completed timer"
+                            );
+                        }
+                        assert!(matches!(
+                            poll(receiving.as_mut(), Waker::noop()),
+                            Poll::Ready(Err(TransportError::Timeout))
+                        ));
+                    });
+                }
+                assert!(!transport.is_closed());
+                feed.push(&[&source[20..], b"\n"].concat());
+                assert_eq!(
+                    ready(transport.recv_with_source_async(&Cx::for_testing()))
+                        .unwrap()
+                        .source(),
+                    source
+                );
+            });
+        }
     }
 
     /// Reports a cooperative stop for a bounded or unbounded number of polls.
