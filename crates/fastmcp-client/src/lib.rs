@@ -506,11 +506,17 @@ impl ReverseRequestHandlers {
         cx: &Cx,
         capabilities: &serde_json::Value,
         input_required: &InputRequiredResult,
+        checkpoint: impl Fn() -> McpResult<()>,
     ) -> McpResult<MrtrInputResponses> {
+        checkpoint()?;
         let requests = self.prepare_input_required(capabilities, input_required)?;
+        checkpoint()?;
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
-            let value = self.invoke_embedded_input_request(cx, input_key, request)?;
+            checkpoint()?;
+            let value =
+                self.invoke_embedded_input_request(cx, input_key, request, &checkpoint)?;
+            checkpoint()?;
             responses.insert(input_key.to_owned(), value);
         }
         Ok(responses)
@@ -626,6 +632,7 @@ impl ReverseRequestHandlers {
         cx: &Cx,
         input_key: &str,
         request: FinalEmbeddedInputRequest,
+        checkpoint: &impl Fn() -> McpResult<()>,
     ) -> McpResult<serde_json::Value> {
         match request {
             FinalEmbeddedInputRequest::Sampling(params) => {
@@ -639,6 +646,7 @@ impl ReverseRequestHandlers {
                     handler,
                     ReverseRequestCancellation::new(),
                     final_create_message_params_from_embedded(params),
+                    checkpoint,
                 )?;
                 serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
@@ -657,6 +665,7 @@ impl ReverseRequestHandlers {
                     handler,
                     ReverseRequestCancellation::new(),
                     params,
+                    checkpoint,
                 )?;
                 serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
@@ -675,6 +684,7 @@ impl ReverseRequestHandlers {
                     handler,
                     ReverseRequestCancellation::new(),
                     elicit_request_params_from_embedded(input_key, params),
+                    checkpoint,
                 )?;
                 serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
@@ -3487,27 +3497,6 @@ where
         .map_err(|_| McpError::invalid_params("Invalid reverse request parameters"))
 }
 
-fn invoke_reverse_request_handler<P, R>(
-    cx: &Cx,
-    handler: &(
-         dyn for<'callback> Fn(
-        &'callback Cx,
-        ReverseRequestCancellation,
-        P,
-    ) -> ReverseRequestFuture<'callback, R>
-             + Send
-             + Sync
-     ),
-    cancellation: ReverseRequestCancellation,
-    params: P,
-) -> McpResult<R> {
-    cancellation.checkpoint()?;
-    // Poll under the caller's own Cx: a sync caller running inside a runtime
-    // task must not build or enter a second runtime (FND-04 [7]).
-    catch_client_callback_unwind(|| poll_on_cx(cx, handler(cx, cancellation, params)))
-        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?
-}
-
 fn invoke_shared_reverse_request_handler<P, R>(
     cx: &Cx,
     handler: &Arc<
@@ -3521,17 +3510,51 @@ fn invoke_shared_reverse_request_handler<P, R>(
     >,
     cancellation: ReverseRequestCancellation,
     params: P,
+    checkpoint: &impl Fn() -> McpResult<()>,
 ) -> McpResult<R> {
-    invoke_reverse_request_handler(cx, handler.as_ref(), cancellation, params)
+    cancellation.checkpoint()?;
+    checkpoint()?;
+    let mut callback = None;
+    // The token must become cancelled before the callback future is dropped
+    // on timeout, caller cancellation, callback error, or panic.
+    let owner = MrtrCallbackOwner(cancellation);
+    let check = || owner.0.checkpoint().and_then(|()| checkpoint());
+    let result = catch_client_callback_unwind(|| {
+        callback = Some(handler(cx, owner.0.clone(), params));
+        // The existing synchronous bridge polls pending futures without
+        // requiring a wake. Guard each poll with the original MRTR budget;
+        // neither a parked callback nor its completing poll may outlive it.
+        poll_on_cx(
+            cx,
+            std::future::poll_fn(|task_cx| {
+                if let Err(error) = check() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                let polled = callback
+                    .as_mut()
+                    .expect("the callback is constructed before its first poll")
+                    .as_mut()
+                    .poll(task_cx);
+                if let Err(error) = check() {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                polled
+            }),
+        )
+    })
+    .map_err(|_| McpError::internal_error("Client reverse request handler failed"))??;
+    check()?;
+    owner.0.record_response_sent();
+    Ok(result)
 }
 
-/// Async counterpart of [`invoke_reverse_request_handler`] for callers already
-/// on an asupersync runtime, such as the exact-2024 inline SSE request loop.
+/// Invokes a reverse handler directly for callers already on an asupersync
+/// runtime, such as the exact-2024 inline SSE request loop.
 /// Driving the handler with a nested `block_on` there re-enters the runtime,
 /// which `fastmcp_core::runtime::block_on` rejects with a panic (bd-84om4).
 ///
 /// The handler call and every poll of its future stay behind the redacting
-/// panic boundary, and the error mapping is the synchronous helper's.
+/// panic boundary with the same error mapping as the synchronous MRTR path.
 #[cfg(feature = "legacy-2024-11-05")]
 async fn invoke_reverse_request_handler_async<P, R>(
     cx: &Cx,
@@ -24058,7 +24081,7 @@ impl Client {
         mut respond: F,
     ) -> McpResult<CoreResult>
     where
-        F: FnMut(&InputRequiredResult, &serde_json::Value) -> McpResult<MrtrInputResponses>,
+        F: FnMut(&InputRequiredResult, &serde_json::Value, Instant) -> McpResult<MrtrInputResponses>,
     {
         self.ensure_initialized()?;
         let cx = self.cx.clone();
@@ -24102,7 +24125,7 @@ impl Client {
             } else {
                 admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
             }
-            let input_responses = respond(input_required, &capabilities)?;
+            let input_responses = respond(input_required, &capabilities, driver.deadline())?;
             let retry_parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
@@ -24147,8 +24170,10 @@ impl Client {
                 "tools/call",
                 original_parameters,
                 MrtrResponderKind::Installed,
-                |input_required, capabilities| {
-                    handlers.respond_to_input_required(&cx, capabilities, input_required)
+                |input_required, capabilities, deadline| {
+                    handlers.respond_to_input_required(&cx, capabilities, input_required, || {
+                        check_mrtr_operation(&cx, None, deadline)
+                    })
                 },
             );
         }
@@ -24214,7 +24239,7 @@ impl Client {
             "tools/call",
             original_parameters,
             MrtrResponderKind::CallerProvided,
-            |input_required, _| respond(input_required),
+            |input_required, _, _| respond(input_required),
         )
     }
 
@@ -25271,8 +25296,10 @@ impl Client {
                 "resources/read",
                 serde_json::json!({"uri": uri}),
                 MrtrResponderKind::Installed,
-                |input_required, capabilities| {
-                    handlers.respond_to_input_required(&cx, capabilities, input_required)
+                |input_required, capabilities, deadline| {
+                    handlers.respond_to_input_required(&cx, capabilities, input_required, || {
+                        check_mrtr_operation(&cx, None, deadline)
+                    })
                 },
             );
         }
@@ -25324,7 +25351,7 @@ impl Client {
             "resources/read",
             original_parameters,
             MrtrResponderKind::CallerProvided,
-            |input_required, _| respond(input_required),
+            |input_required, _, _| respond(input_required),
         )
     }
 
@@ -25576,8 +25603,10 @@ impl Client {
                 "prompts/get",
                 original_parameters,
                 MrtrResponderKind::Installed,
-                |input_required, capabilities| {
-                    handlers.respond_to_input_required(&cx, capabilities, input_required)
+                |input_required, capabilities, deadline| {
+                    handlers.respond_to_input_required(&cx, capabilities, input_required, || {
+                        check_mrtr_operation(&cx, None, deadline)
+                    })
                 },
             );
         }
@@ -25639,7 +25668,7 @@ impl Client {
             "prompts/get",
             retry_parameters,
             MrtrResponderKind::CallerProvided,
-            |input_required, _| respond(input_required),
+            |input_required, _, _| respond(input_required),
         )
     }
 
@@ -27747,7 +27776,9 @@ mod tests {
                 assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
                 result
             } else {
-                handlers.respond_to_input_required(&Cx::for_testing(), capabilities, input)
+                handlers.respond_to_input_required(&Cx::for_testing(), capabilities, input, || {
+                    Ok(())
+                })
             }
         }
 
@@ -27870,6 +27901,237 @@ mod tests {
         #[test]
         fn async_peer_refusals_keep_precedence_over_missing_handlers() {
             assert_prior_refusals(true);
+        }
+
+        #[test]
+        fn sync_cancelled_batch_has_no_callbacks_or_diagnostics() {
+            let cx = Cx::for_testing();
+            cx.set_cancel_requested(true);
+            let input = peer_result(requests([0, 1, 2]));
+            let calls = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+            let handlers = handlers(None, &calls);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let (result, diagnostics) = observe_diagnostics(|| {
+                handlers.respond_to_input_required(&cx, &capabilities(), &input, || {
+                    check_mrtr_operation(&cx, None, deadline)
+                })
+            });
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            for count in calls.iter() {
+                assert_eq!(count.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(diagnostics, 0);
+        }
+    }
+
+    // bd-mrtr-01-b-otqd: synchronous installed resolvers retain the same
+    // caller lifetime while pending and while producing their final value.
+    mod sync_mrtr_lifetime {
+        use super::*;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use fastmcp_protocol::{ExactJsonValue, ResultMeta, parse_exact_json};
+        use std::task::{Context, Poll};
+
+        #[derive(Default)]
+        struct Observed {
+            calls: AtomicUsize,
+            polls: AtomicUsize,
+            cancelled_at_drop: Mutex<Vec<bool>>,
+            tokens: Mutex<Vec<ReverseRequestCancellation>>,
+        }
+
+        #[derive(Clone)]
+        enum CallbackMode {
+            Ready,
+            CancelOnReady,
+            PendingOnce {
+                clock: Arc<VirtualClock>,
+                advance: u64,
+            },
+        }
+
+        struct RootsFuture {
+            cx: Cx,
+            cancellation: ReverseRequestCancellation,
+            observed: Arc<Observed>,
+            mode: CallbackMode,
+            polled: bool,
+        }
+
+        impl Future for RootsFuture {
+            type Output = McpResult<FinalEmbeddedRootsListResult>;
+
+            fn poll(self: Pin<&mut Self>, _task_cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                this.observed.polls.fetch_add(1, Ordering::SeqCst);
+                let already_polled = std::mem::replace(&mut this.polled, true);
+                match &this.mode {
+                    CallbackMode::PendingOnce { clock, advance } if !already_polled => {
+                        clock.advance(*advance);
+                        // Deliberately arrange no wake. The sync bridge's
+                        // next poll must first reconcile the caller lifetime.
+                        return Poll::Pending;
+                    }
+                    CallbackMode::CancelOnReady => {
+                        this.cx.set_cancel_requested(true);
+                    }
+                    CallbackMode::Ready | CallbackMode::PendingOnce { .. } => {}
+                }
+                Poll::Ready(Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }))
+            }
+        }
+
+        impl Drop for RootsFuture {
+            fn drop(&mut self) {
+                self.observed
+                    .cancelled_at_drop
+                    .lock()
+                    .unwrap()
+                    .push(self.cancellation.is_cancel_requested());
+            }
+        }
+
+        fn roots_handler(observed: &Arc<Observed>, mode: CallbackMode) -> ReverseRequestHandlers {
+            let observed = Arc::clone(observed);
+            ReverseRequestHandlers::new().with_modern_roots_list(
+                move |cx, cancellation, _params| {
+                    observed.calls.fetch_add(1, Ordering::SeqCst);
+                    observed.tokens.lock().unwrap().push(cancellation.clone());
+                    Box::pin(RootsFuture {
+                        cx: cx.clone(),
+                        cancellation,
+                        observed: Arc::clone(&observed),
+                        mode: mode.clone(),
+                        polled: false,
+                    })
+                },
+            )
+        }
+
+        fn inputs(two_requests: bool) -> InputRequiredResult {
+            let source = if two_requests {
+                r#"{"first":{"method":"roots/list"},"second":{"method":"roots/list"}}"#
+            } else {
+                r#"{"first":{"method":"roots/list"}}"#
+            };
+            let ExactJsonValue::Object(requests) = parse_exact_json(source).unwrap() else {
+                panic!("the fixture must be an input-request map");
+            };
+            InputRequiredResult::new(
+                Some(requests),
+                Some("retained-sync-state".to_owned()),
+                ResultMeta::empty(),
+            )
+            .unwrap()
+        }
+
+        fn ready_callback_probe(cancel: bool) {
+            let cx = Cx::for_testing();
+            let observed = Arc::new(Observed::default());
+            let mode = if cancel {
+                CallbackMode::CancelOnReady
+            } else {
+                CallbackMode::Ready
+            };
+            let handlers = roots_handler(&observed, mode);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let result = handlers.respond_to_input_required(
+                &cx,
+                &serde_json::json!({"roots": {}}),
+                &inputs(true),
+                || check_mrtr_operation(&cx, None, deadline),
+            );
+            if cancel {
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
+                assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
+                assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    BTreeMap::from([
+                        ("first".to_owned(), serde_json::json!({"roots": []})),
+                        ("second".to_owned(), serde_json::json!({"roots": []})),
+                    ])
+                );
+                assert_eq!(observed.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(observed.polls.load(Ordering::SeqCst), 2);
+                assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [false, false]);
+                assert!(
+                    observed
+                        .tokens
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|token| !token.is_cancel_requested())
+                );
+                cx.checkpoint().unwrap();
+            }
+        }
+
+        fn pending_callback_probe(expire: bool) {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer)
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(
+                asupersync::Budget::INFINITE
+                    .with_deadline(asupersync::Time::from_nanos(10_000_000)),
+            );
+            let observed = Arc::new(Observed::default());
+            let handlers = roots_handler(
+                &observed,
+                CallbackMode::PendingOnce {
+                    clock,
+                    advance: if expire { 10_000_000 } else { 9_999_999 },
+                },
+            );
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let result = handlers.respond_to_input_required(
+                &cx,
+                &serde_json::json!({"roots": {}}),
+                &inputs(false),
+                || check_mrtr_operation(&cx, None, deadline),
+            );
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+            if expire {
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
+                assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
+                assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            } else {
+                assert_eq!(result.unwrap()["first"], serde_json::json!({"roots": []}));
+                assert_eq!(observed.polls.load(Ordering::SeqCst), 2);
+                assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [false]);
+                assert!(!observed.tokens.lock().unwrap()[0].is_cancel_requested());
+                cx.checkpoint().unwrap();
+            }
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn ready_callbacks_complete_once_without_cancellation() {
+            ready_callback_probe(false);
+        }
+
+        #[test]
+        fn cancellation_in_first_ready_callback_prevents_later_callbacks() {
+            ready_callback_probe(true);
+        }
+
+        #[test]
+        fn pending_callback_completes_before_caller_deadline() {
+            pending_callback_probe(false);
+        }
+
+        #[test]
+        fn pending_callback_observes_caller_deadline_before_drop() {
+            pending_callback_probe(true);
         }
     }
 
@@ -48965,6 +49227,7 @@ IFS= read -r end
                 &worker_handler,
                 worker_cancellation,
                 (),
+                &|| Ok(()),
             )
         });
 
@@ -58716,6 +58979,99 @@ exec sleep 5
         assert_eq!(error.code, McpErrorCode::InternalError);
         assert_eq!(error.message, "Client reverse request handler failed");
         assert_eq!(label.as_deref(), Some("fnd04-sync-reverse-caller"));
+    }
+
+    #[cfg(unix)]
+    fn sync_mrtr_public_callback_lifetime_probe(cancel: bool) {
+        let roots_calls = Arc::new(AtomicUsize::new(0));
+        let sampling_calls = Arc::new(AtomicUsize::new(0));
+        let roots_token = Arc::new(Mutex::new(None));
+        let handler_roots_calls = Arc::clone(&roots_calls);
+        let handler_sampling_calls = Arc::clone(&sampling_calls);
+        let handler_roots_token = Arc::clone(&roots_token);
+        let handlers = ReverseRequestHandlers::new()
+            .with_modern_roots_list(move |cx, cancellation, _params| {
+                handler_roots_calls.fetch_add(1, Ordering::SeqCst);
+                *handler_roots_token.lock().unwrap() = Some(cancellation);
+                let cx = cx.clone();
+                Box::pin(async move {
+                    if cancel {
+                        cx.set_cancel_requested(true);
+                    }
+                    Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                })
+            })
+            .with_modern_sampling_create_message(move |_cx, _cancellation, _params| {
+                handler_sampling_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(serde_json::from_value(serde_json::json!({
+                        "role": "assistant",
+                        "model": "mrtr-test-model",
+                        "content": {"type": "text", "text": "complete"},
+                    }))
+                    .unwrap())
+                })
+            });
+        let script = modern_mrtr_two_input_client_script(!cancel);
+        let connection_cx = Cx::for_request();
+        let mut client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&connection_cx, "sh", &["-c", &script]),
+        )
+        .unwrap();
+
+        let result = client.call_tool_typed("retry-tool", serde_json::json!({}));
+        let next_id = client.next_id.load(Ordering::SeqCst);
+        // Cleanup has a separate live caller even when the request's Cx was
+        // cancelled. The negative peer accepts EOF only, never a partial retry.
+        let cleanup_cx = Cx::for_request();
+        http_test_runtime_block_on(client.close_with_cx(&cleanup_cx)).unwrap();
+        assert!(client.child.is_none());
+        assert_eq!(roots_calls.load(Ordering::SeqCst), 1);
+        if cancel {
+            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(sampling_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(next_id, 3, "no continuation ID may be allocated");
+            assert!(connection_cx.checkpoint().is_err());
+            assert!(
+                roots_token
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_cancel_requested()
+            );
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+            ));
+            assert_eq!(sampling_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(next_id, 4, "the complete batch produces one continuation");
+            connection_cx.checkpoint().unwrap();
+            assert!(
+                !roots_token
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .is_cancel_requested()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_mrtr_public_complete_batch_retries_once() {
+        sync_mrtr_public_callback_lifetime_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_mrtr_public_ready_cancellation_stops_later_handler_and_retry() {
+        sync_mrtr_public_callback_lifetime_probe(true);
     }
 
     #[cfg(unix)]
