@@ -3384,7 +3384,7 @@ fn validate_internal<'a>(
             validate_object(schema_obj, value, obj, path, errors, context);
         }
         Value::Array(arr) => {
-            validate_array(schema_obj, arr, path, errors, context);
+            validate_array(schema_obj, value, arr, path, errors, context);
         }
         Value::String(s) => {
             validate_string(schema_obj, s, path, errors, context);
@@ -4827,6 +4827,7 @@ fn validate_dependencies<'a>(
 /// Validates array-specific constraints.
 fn validate_array<'a>(
     schema: &'a serde_json::Map<String, Value>,
+    value: &Value,
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
@@ -4974,14 +4975,18 @@ fn validate_array<'a>(
     }
 
     if context.enforce_unevaluated_properties {
-        validate_unevaluated_items(schema, arr, path, errors, context);
+        validate_unevaluated_items(schema, value, arr, path, errors, context);
     }
 }
 
 /// Applies Draft 2020-12 `unevaluatedItems` after sibling applicators have
 /// contributed their successful item annotations.
+/// Keep the original instance borrowed through every probe: rebuilding an
+/// array value here would recursively copy large payloads for each branch and
+/// retain those copies across nested annotation traversal.
 fn validate_unevaluated_items<'a>(
     schema: &'a serde_json::Map<String, Value>,
+    value: &Value,
     arr: &[Value],
     path: &str,
     errors: &mut Vec<ValidationError>,
@@ -4991,7 +4996,16 @@ fn validate_unevaluated_items<'a>(
         return;
     };
     let mut evaluated = HashSet::with_capacity(arr.len());
-    mark_evaluated_array_items(schema, arr, path, false, &mut evaluated, errors, context);
+    mark_evaluated_array_items(
+        schema,
+        value,
+        arr,
+        path,
+        false,
+        &mut evaluated,
+        errors,
+        context,
+    );
 
     for (index, item) in arr.iter().enumerate() {
         if !consume_validation_work(context, path, errors) {
@@ -5011,6 +5025,7 @@ fn validate_unevaluated_items<'a>(
 
 fn mark_evaluated_array_items<'a>(
     schema: &'a serde_json::Map<String, Value>,
+    value: &Value,
     arr: &[Value],
     path: &str,
     include_unevaluated_items: bool,
@@ -5021,6 +5036,7 @@ fn mark_evaluated_array_items<'a>(
     context.push_dynamic_scope(schema);
     mark_evaluated_array_items_inner(
         schema,
+        value,
         arr,
         path,
         include_unevaluated_items,
@@ -5033,6 +5049,7 @@ fn mark_evaluated_array_items<'a>(
 
 fn mark_evaluated_array_items_inner<'a>(
     schema: &'a serde_json::Map<String, Value>,
+    value: &Value,
     arr: &[Value],
     path: &str,
     include_unevaluated_items: bool,
@@ -5110,44 +5127,51 @@ fn mark_evaluated_array_items_inner<'a>(
 
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         mark_reference_evaluated_array_items(
-            schema, reference, arr, path, evaluated, errors, context,
+            schema, reference, value, arr, path, evaluated, errors, context,
         );
     }
     if let Some(reference) = schema.get("$dynamicRef").and_then(Value::as_str) {
         mark_dynamic_reference_evaluated_array_items(
-            schema, reference, arr, path, evaluated, errors, context,
+            schema, reference, value, arr, path, evaluated, errors, context,
         );
     }
 
-    mark_composition_evaluated_array_items(schema, "allOf", arr, path, evaluated, errors, context);
-    mark_composition_evaluated_array_items(schema, "anyOf", arr, path, evaluated, errors, context);
+    mark_composition_evaluated_array_items(
+        schema, "allOf", value, arr, path, evaluated, errors, context,
+    );
+    mark_composition_evaluated_array_items(
+        schema, "anyOf", value, arr, path, evaluated, errors, context,
+    );
 
     if let Some(subschemas) = bounded_subschemas(schema, "oneOf", path, errors) {
         let matching: Vec<_> = subschemas
             .iter()
-            .filter(|subschema| {
-                branch_is_valid(subschema, &Value::Array(arr.to_vec()), path, context)
-            })
+            .filter(|subschema| branch_is_valid(subschema, value, path, context))
             .collect();
         if matching.len() == 1
             && let Some(subschema) = matching[0].as_object()
         {
-            mark_evaluated_array_items(subschema, arr, path, true, evaluated, errors, context);
+            mark_evaluated_array_items(
+                subschema, value, arr, path, true, evaluated, errors, context,
+            );
         }
     }
 
     if let Some(condition) = schema.get("if") {
-        let value = Value::Array(arr.to_vec());
-        let condition_matched = branch_is_valid(condition, &value, path, context);
+        let condition_matched = branch_is_valid(condition, value, path, context);
         if condition_matched && let Some(condition) = condition.as_object() {
-            mark_evaluated_array_items(condition, arr, path, true, evaluated, errors, context);
+            mark_evaluated_array_items(
+                condition, value, arr, path, true, evaluated, errors, context,
+            );
         }
         let branch = if condition_matched { "then" } else { "else" };
         if let Some(subschema) = schema.get(branch)
-            && branch_is_valid(subschema, &value, path, context)
+            && branch_is_valid(subschema, value, path, context)
             && let Some(subschema) = subschema.as_object()
         {
-            mark_evaluated_array_items(subschema, arr, path, true, evaluated, errors, context);
+            mark_evaluated_array_items(
+                subschema, value, arr, path, true, evaluated, errors, context,
+            );
         }
     }
 }
@@ -5155,6 +5179,7 @@ fn mark_evaluated_array_items_inner<'a>(
 fn mark_reference_evaluated_array_items<'a>(
     schema: &'a serde_json::Map<String, Value>,
     reference: &str,
+    value: &Value,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
@@ -5168,10 +5193,10 @@ fn mark_reference_evaluated_array_items<'a>(
     let root_schema = context.root_schema;
     let target = resolve_local_reference_with_work(root_schema, schema, reference, context).ok();
     if let Some(target) = target
-        && branch_is_valid(target, &Value::Array(arr.to_vec()), path, context)
+        && branch_is_valid(target, value, path, context)
         && let Some(target) = target.as_object()
     {
-        mark_evaluated_array_items(target, arr, path, true, evaluated, errors, context);
+        mark_evaluated_array_items(target, value, arr, path, true, evaluated, errors, context);
     }
     context.leave_reference();
 }
@@ -5179,6 +5204,7 @@ fn mark_reference_evaluated_array_items<'a>(
 fn mark_dynamic_reference_evaluated_array_items<'a>(
     schema: &'a serde_json::Map<String, Value>,
     reference: &str,
+    value: &Value,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
@@ -5191,9 +5217,9 @@ fn mark_dynamic_reference_evaluated_array_items<'a>(
     }
     let root_schema = context.root_schema;
     match resolve_dynamic_reference_with_work(root_schema, schema, reference, context) {
-        Ok(target) if branch_is_valid(target, &Value::Array(arr.to_vec()), path, context) => {
+        Ok(target) if branch_is_valid(target, value, path, context) => {
             if let Some(target) = target.as_object() {
-                mark_evaluated_array_items(target, arr, path, true, evaluated, errors, context);
+                mark_evaluated_array_items(target, value, arr, path, true, evaluated, errors, context);
             }
         }
         Ok(_) => {}
@@ -5205,6 +5231,7 @@ fn mark_dynamic_reference_evaluated_array_items<'a>(
 fn mark_composition_evaluated_array_items<'a>(
     schema: &'a serde_json::Map<String, Value>,
     keyword: &str,
+    value: &Value,
     arr: &[Value],
     path: &str,
     evaluated: &mut HashSet<usize>,
@@ -5214,12 +5241,13 @@ fn mark_composition_evaluated_array_items<'a>(
     let Some(subschemas) = bounded_subschemas(schema, keyword, path, errors) else {
         return;
     };
-    let value = Value::Array(arr.to_vec());
     for subschema in subschemas {
-        if branch_is_valid(subschema, &value, path, context)
+        if branch_is_valid(subschema, value, path, context)
             && let Some(subschema) = subschema.as_object()
         {
-            mark_evaluated_array_items(subschema, arr, path, true, evaluated, errors, context);
+            mark_evaluated_array_items(
+                subschema, value, arr, path, true, evaluated, errors, context,
+            );
         }
     }
 }
@@ -6791,6 +6819,141 @@ mod tests {
             .expect_err("adding only an unevaluated item must reject");
         assert!(errors.iter().any(|error| error.path == "root[2]"));
         assert_eq!(accepted, json!(["heading", 2]));
+    }
+
+    fn large_annotation_array() -> Value {
+        json!(["x".repeat(3 * 1024 * 1024), 42])
+    }
+
+    fn assert_large_array_annotations(source: Value) {
+        let schema =
+            admit_final_schema(source.clone()).expect("the bounded array annotation schema admits");
+        let accepted = large_annotation_array();
+        schema
+            .validate(&accepted)
+            .expect("successful applicators annotate the multi-MiB array");
+
+        let mut planted = accepted.clone();
+        planted
+            .as_array_mut()
+            .expect("the fixture is an array")
+            .push(Value::Bool(true));
+        let errors = schema
+            .validate(&planted)
+            .expect_err("one additional unevaluated item must reject");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root[2]");
+        assert_eq!(errors[0].message, "schema rejects all values");
+        assert_eq!(schema.schema(), &source);
+        assert_eq!(accepted, large_annotation_array());
+    }
+
+    #[test]
+    fn admitted_large_array_composition_annotations_preserve_unevaluated_items() {
+        let shape = json!({"prefixItems": [{"type": "string"}, {"type": "integer"}]});
+
+        // Nested allOf used to retain one complete instance copy at every
+        // annotation level. The same schema and instance remain within the
+        // existing depth, node, byte, and validation-work limits.
+        let mut nested = shape.clone();
+        for _ in 0..24 {
+            nested = json!({"allOf": [nested]});
+        }
+        nested["unevaluatedItems"] = Value::Bool(false);
+        assert_large_array_annotations(nested);
+
+        // Both successful branches contribute annotations, even though
+        // ordinary anyOf validation can stop after the first match. A failed
+        // branch must not annotate the otherwise unevaluated third element.
+        assert_large_array_annotations(json!({
+            "anyOf": [
+                {"prefixItems": [{"type": "string"}]},
+                shape,
+                {"prefixItems": [true, {"type": "string"}, true]}
+            ],
+            "unevaluatedItems": false
+        }));
+
+        // oneOf previously cloned the whole array for every branch, including
+        // immediately false branches that do not examine the payload at all.
+        let mut alternatives = vec![Value::Bool(false); MAX_COMPOSITION_BRANCHES - 1];
+        alternatives.push(shape);
+        assert_large_array_annotations(json!({
+            "oneOf": alternatives,
+            "unevaluatedItems": false
+        }));
+    }
+
+    #[test]
+    fn admitted_large_array_reference_annotations_preserve_unevaluated_items() {
+        for (keyword, reference) in [("$ref", "#/$defs/shape"), ("$dynamicRef", "#shape")] {
+            assert_large_array_annotations(json!({
+                "$defs": {
+                    "shape": {
+                        "$dynamicAnchor": "shape",
+                        "$ref": "#/$defs/constraints"
+                    },
+                    "constraints": {
+                        "prefixItems": [{"type": "string"}, {"type": "integer"}]
+                    }
+                },
+                keyword: reference,
+                "unevaluatedItems": false
+            }));
+        }
+    }
+
+    #[test]
+    fn admitted_large_array_conditional_annotations_preserve_unevaluated_items() {
+        let shape = json!({"prefixItems": [{"type": "string"}, {"type": "integer"}]});
+        assert_large_array_annotations(json!({
+            "if": shape,
+            "unevaluatedItems": false
+        }));
+        assert_large_array_annotations(json!({
+            "if": {"prefixItems": [{"type": "string"}]},
+            "then": shape,
+            "else": {"prefixItems": [true, true, true]},
+            "unevaluatedItems": false
+        }));
+        assert_large_array_annotations(json!({
+            "if": {"prefixItems": [{"type": "integer"}, true, true]},
+            "then": {"prefixItems": [true, true, true]},
+            "else": shape,
+            "unevaluatedItems": false
+        }));
+    }
+
+    #[test]
+    fn admitted_large_array_annotations_use_the_nested_instance() {
+        let source = json!({
+            "prefixItems": [{
+                "allOf": [{
+                    "prefixItems": [{"type": "string"}, {"type": "integer"}]
+                }],
+                "unevaluatedItems": false
+            }],
+            "items": false
+        });
+        let schema = admit_final_schema(source.clone()).expect("the nested schema admits");
+        let accepted = Value::Array(vec![large_annotation_array()]);
+        schema
+            .validate(&accepted)
+            .expect("annotation probes borrow the child array rather than its parent");
+
+        let mut planted = accepted.clone();
+        planted[0]
+            .as_array_mut()
+            .expect("the child fixture is an array")
+            .push(Value::Bool(true));
+        let errors = schema
+            .validate(&planted)
+            .expect_err("one unevaluated child item must reject");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root[0][2]");
+        assert_eq!(errors[0].message, "schema rejects all values");
+        assert_eq!(schema.schema(), &source);
+        assert_eq!(accepted, Value::Array(vec![large_annotation_array()]));
     }
 
     #[test]
