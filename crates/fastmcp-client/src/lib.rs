@@ -3519,7 +3519,7 @@ fn invoke_shared_reverse_request_handler<P, R>(
     // on timeout, caller cancellation, callback error, or panic.
     let owner = MrtrCallbackOwner(cancellation);
     let check = || owner.0.checkpoint().and_then(|()| checkpoint());
-    let result = catch_client_callback_unwind(|| {
+    let outcome = catch_client_callback_unwind(|| {
         callback = Some(handler(cx, owner.0.clone(), params));
         // The existing synchronous bridge polls pending futures without
         // requiring a wake. Guard each poll with the original MRTR budget;
@@ -3542,7 +3542,29 @@ fn invoke_shared_reverse_request_handler<P, R>(
             }),
         )
     })
-    .map_err(|_| McpError::internal_error("Client reverse request handler failed"))??;
+    .unwrap_or_else(|_| {
+        Err(McpError::internal_error("Client reverse request handler failed"))
+    })
+    .and_then(|result| {
+        check()?;
+        Ok(result)
+    });
+    if outcome.is_err() {
+        owner.0.cancel();
+    }
+    // Separate polling and destruction panic boundaries so a failed poll
+    // cannot run a panicking destructor while already unwinding. Empty the
+    // retained slot first, and preserve the caller's Cx and effect ceiling
+    // while the actual handler future is destroyed.
+    let completed_callback = callback.take();
+    let cleanup = catch_client_callback_unwind(|| {
+        poll_on_cx(cx, async move { drop(completed_callback) });
+    });
+    if cleanup.is_err() {
+        owner.0.cancel();
+        return Err(McpError::internal_error("Client reverse request handler failed"));
+    }
+    let result = outcome?;
     check()?;
     owner.0.record_response_sent();
     Ok(result)
@@ -27932,11 +27954,16 @@ mod tests {
         use fastmcp_protocol::{ExactJsonValue, ResultMeta, parse_exact_json};
         use std::task::{Context, Poll};
 
+        const CALLBACK_CONTEXT: &str = "sync-mrtr-callback-owner";
+
         #[derive(Default)]
         struct Observed {
             calls: AtomicUsize,
             polls: AtomicUsize,
             cancelled_at_drop: Mutex<Vec<bool>>,
+            redacted_at_drop: Mutex<Vec<bool>>,
+            context_at_drop: Mutex<Vec<Option<String>>>,
+            poll_panic_redacted: AtomicBool,
             tokens: Mutex<Vec<ReverseRequestCancellation>>,
         }
 
@@ -27944,6 +27971,10 @@ mod tests {
         enum CallbackMode {
             Ready,
             CancelOnReady,
+            CancelOnDrop,
+            PanicOnDrop,
+            CancelOnReadyAndDropPanic,
+            PanicOnPollAndDrop,
             PendingOnce {
                 clock: Arc<VirtualClock>,
                 advance: u64,
@@ -27972,10 +28003,20 @@ mod tests {
                         // next poll must first reconcile the caller lifetime.
                         return Poll::Pending;
                     }
-                    CallbackMode::CancelOnReady => {
+                    CallbackMode::CancelOnReady | CallbackMode::CancelOnReadyAndDropPanic => {
                         this.cx.set_cancel_requested(true);
                     }
-                    CallbackMode::Ready | CallbackMode::PendingOnce { .. } => {}
+                    CallbackMode::PanicOnPollAndDrop => {
+                        this.observed.poll_panic_redacted.store(
+                            REDACT_CLIENT_CALLBACK_PANIC.with(|redacted| redacted.get()),
+                            Ordering::SeqCst,
+                        );
+                        panic!("private sync callback poll payload");
+                    }
+                    CallbackMode::Ready
+                    | CallbackMode::CancelOnDrop
+                    | CallbackMode::PanicOnDrop
+                    | CallbackMode::PendingOnce { .. } => {}
                 }
                 Poll::Ready(Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }))
             }
@@ -27983,11 +28024,32 @@ mod tests {
 
         impl Drop for RootsFuture {
             fn drop(&mut self) {
+                if matches!(&self.mode, CallbackMode::CancelOnDrop) {
+                    self.cx.set_cancel_requested(true);
+                }
                 self.observed
                     .cancelled_at_drop
                     .lock()
                     .unwrap()
                     .push(self.cancellation.is_cancel_requested());
+                self.observed
+                    .redacted_at_drop
+                    .lock()
+                    .unwrap()
+                    .push(REDACT_CLIENT_CALLBACK_PANIC.with(|redacted| redacted.get()));
+                self.observed
+                    .context_at_drop
+                    .lock()
+                    .unwrap()
+                    .push(Cx::current().and_then(|cx| cx.task_type()));
+                if matches!(
+                    &self.mode,
+                    CallbackMode::PanicOnDrop
+                        | CallbackMode::CancelOnReadyAndDropPanic
+                        | CallbackMode::PanicOnPollAndDrop
+                ) {
+                    panic!("private sync callback destructor payload");
+                }
             }
         }
 
@@ -28027,6 +28089,7 @@ mod tests {
 
         fn ready_callback_probe(cancel: bool) {
             let cx = Cx::for_testing();
+            cx.set_task_type(CALLBACK_CONTEXT);
             let observed = Arc::new(Observed::default());
             let mode = if cancel {
                 CallbackMode::CancelOnReady
@@ -28068,6 +28131,54 @@ mod tests {
                 );
                 cx.checkpoint().unwrap();
             }
+            let completed = if cancel { 1 } else { 2 };
+            assert_eq!(*observed.redacted_at_drop.lock().unwrap(), vec![true; completed]);
+            assert_eq!(
+                *observed.context_at_drop.lock().unwrap(),
+                vec![Some(CALLBACK_CONTEXT.to_owned()); completed],
+            );
+        }
+
+        fn cleanup_failure_probe(mode: CallbackMode, cancelled_before_drop: bool) {
+            let cancelled_by_drop = matches!(&mode, CallbackMode::CancelOnDrop);
+            let caller_cancelled = cancelled_by_drop
+                || matches!(&mode, CallbackMode::CancelOnReadyAndDropPanic);
+            let poll_panics = matches!(&mode, CallbackMode::PanicOnPollAndDrop);
+            let cx = Cx::for_testing();
+            cx.set_task_type(CALLBACK_CONTEXT);
+            let observed = Arc::new(Observed::default());
+            let handlers = roots_handler(&observed, mode);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let error = handlers
+                .respond_to_input_required(
+                    &cx,
+                    &serde_json::json!({"roots": {}}),
+                    &inputs(true),
+                    || check_mrtr_operation(&cx, None, deadline),
+                )
+                .expect_err("callback cleanup must finish before accepting its result");
+            let expected = if cancelled_by_drop {
+                McpError::request_cancelled()
+            } else {
+                McpError::internal_error("Client reverse request handler failed")
+            };
+            assert_eq!(error.code, expected.code);
+            assert_eq!(error.message, expected.message);
+            assert!(error.data.is_none());
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                *observed.cancelled_at_drop.lock().unwrap(),
+                [cancelled_before_drop],
+            );
+            assert_eq!(*observed.redacted_at_drop.lock().unwrap(), [true]);
+            assert_eq!(
+                *observed.context_at_drop.lock().unwrap(),
+                [Some(CALLBACK_CONTEXT.to_owned())],
+            );
+            assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            assert_eq!(cx.checkpoint().is_err(), caller_cancelled);
+            assert_eq!(observed.poll_panic_redacted.load(Ordering::SeqCst), poll_panics);
         }
 
         fn pending_callback_probe(expire: bool) {
@@ -28132,6 +28243,26 @@ mod tests {
         #[test]
         fn pending_callback_observes_caller_deadline_before_drop() {
             pending_callback_probe(true);
+        }
+
+        #[test]
+        fn ready_callback_drop_panic_is_redacted_before_any_sibling() {
+            cleanup_failure_probe(CallbackMode::PanicOnDrop, false);
+        }
+
+        #[test]
+        fn cancelled_callback_drop_panic_is_redacted_without_acceptance() {
+            cleanup_failure_probe(CallbackMode::CancelOnReadyAndDropPanic, true);
+        }
+
+        #[test]
+        fn callback_poll_and_drop_panics_are_caught_separately() {
+            cleanup_failure_probe(CallbackMode::PanicOnPollAndDrop, true);
+        }
+
+        #[test]
+        fn cancellation_during_callback_drop_stops_later_callbacks() {
+            cleanup_failure_probe(CallbackMode::CancelOnDrop, false);
         }
     }
 
