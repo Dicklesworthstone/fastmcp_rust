@@ -186,6 +186,18 @@ path = "tests/e2e_workflow.rs"
 # the Auto facade it exercises over both exact protocol eras.
 required-features = ["testing-lab", "tasks", "legacy-2024-11-05"]
 
+[[test]]
+name = "extension_authoring"
+path = "tests/extension_authoring.rs"
+# This target carries a file-scope `#![cfg(feature = "extension-authoring")]`.
+# WITHOUT this stanza cargo auto-discovers it, compiles it to an EMPTY binary
+# whenever the feature is off, and prints a vacuous `ok. 0 passed` that is
+# indistinguishable from real coverage -- the defect class bd-ufj6r fixed for
+# 23 other targets and that this file reintroduced on 2026-11-02 (992a2e83).
+# Declaring the feature makes cargo SKIP the target when it is unsatisfied and
+# REFUSE when it is named explicitly, so a zero-run can no longer read green.
+required-features = ["extension-authoring"]
+
 [[bin]]
 name = "echo_server"
 path = "examples/echo_server.rs"
