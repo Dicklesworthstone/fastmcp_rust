@@ -499,14 +499,15 @@ impl ReverseRequestHandlers {
     /// elicitation inside `inputRequests`, and the client supplies
     /// `inputResponses` on the next `tools/call` without sending reverse
     /// JSON-RPC. The complete input batch is admitted against the original
-    /// request's transmitted capabilities before any handler is invoked.
+    /// request's transmitted capabilities and the installed handlers before
+    /// any handler or diagnostic callback is invoked.
     pub(crate) fn respond_to_input_required(
         &self,
         cx: &Cx,
         capabilities: &serde_json::Value,
         input_required: &InputRequiredResult,
     ) -> McpResult<MrtrInputResponses> {
-        let requests = Self::prepare_input_required(capabilities, input_required)?;
+        let requests = self.prepare_input_required(capabilities, input_required)?;
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
             let value = self.invoke_embedded_input_request(cx, input_key, request)?;
@@ -525,7 +526,7 @@ impl ReverseRequestHandlers {
         checkpoint: impl Fn() -> McpResult<()>,
     ) -> McpResult<MrtrInputResponses> {
         checkpoint()?;
-        let requests = Self::prepare_input_required(capabilities, input_required)?;
+        let requests = self.prepare_input_required(capabilities, input_required)?;
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
             checkpoint()?;
@@ -575,10 +576,35 @@ impl ReverseRequestHandlers {
     }
 
     fn prepare_input_required<'input>(
+        &self,
         capabilities: &serde_json::Value,
         input_required: &'input InputRequiredResult,
     ) -> McpResult<Vec<(&'input str, FinalEmbeddedInputRequest)>> {
         let mut requests = admit_mrtr_input_required(capabilities, input_required)?;
+        // Explicit capabilities also support caller-provided resolvers, so
+        // advertising a method does not imply an installed automatic handler.
+        // Reject an unfulfillable automatic batch before any earlier sibling
+        // can sample, prompt the user, or emit a normalization diagnostic.
+        for (input_key, request) in &requests {
+            let (method, installed) = match request {
+                FinalEmbeddedInputRequest::Sampling(_) => (
+                    "sampling/createMessage",
+                    self.modern_sampling_create_message.is_some(),
+                ),
+                FinalEmbeddedInputRequest::Roots(_) => {
+                    ("roots/list", self.modern_roots_list.is_some())
+                }
+                FinalEmbeddedInputRequest::Elicitation(_) => (
+                    "elicitation/create",
+                    self.modern_elicitation_create.is_some(),
+                ),
+            };
+            if !installed {
+                return Err(McpError::invalid_params(format!(
+                    "MRTR input request {input_key} requires an installed {method} reverse handler"
+                )));
+            }
+        }
         let mut context_ignored = false;
         for (_, request) in &mut requests {
             context_ignored |= crate::http_auth::rpc::interaction::normalize_embedded_input_context(
@@ -27540,6 +27566,308 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_core::block_on;
+
+    // bd-mrtr-01-b-otqd: automatic resolver coverage is an all-input barrier.
+    mod mrtr_handler_preflight {
+        use super::*;
+        use fastmcp_protocol::{
+            CoreResultDiscriminatorPolicy, DecodedResult, ResultPeerEra, decode_peer_result,
+        };
+        use std::cell::Cell;
+
+        const METHODS: [&str; 3] = ["roots/list", "sampling/createMessage", "elicitation/create"];
+        const STATE: &str = "opaque/\u{00e9}/e\u{0301}/雪\n\"\\state";
+        const CONTEXT_DIAGNOSTIC: &str =
+            "Ignoring unadvertised sampling context hint in MRTR input";
+
+        std::thread_local! {
+            static DIAGNOSTICS: Cell<Option<usize>> = const { Cell::new(None) };
+        }
+
+        struct DiagnosticLogger;
+
+        impl log::Log for DiagnosticLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() == log::Level::Warn
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if record.level() == log::Level::Warn
+                    && record.args().as_str() == Some(CONTEXT_DIAGNOSTIC)
+                {
+                    DIAGNOSTICS.with(|count| {
+                        if let Some(value) = count.get() {
+                            count.set(Some(value + 1));
+                        }
+                    });
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        fn observe_diagnostics<T>(operation: impl FnOnce() -> T) -> (T, usize) {
+            static LOGGER: DiagnosticLogger = DiagnosticLogger;
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| {
+                log::set_logger(&LOGGER).expect("install MRTR diagnostic observer");
+                log::set_max_level(log::LevelFilter::Warn);
+            });
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    DIAGNOSTICS.with(|count| count.set(None));
+                }
+            }
+            DIAGNOSTICS.with(|count| assert_eq!(count.replace(Some(0)), None));
+            let _reset = Reset;
+            let result = operation();
+            (result, DIAGNOSTICS.with(|count| count.get().unwrap()))
+        }
+
+        fn capabilities() -> serde_json::Value {
+            serde_json::json!({"roots": {}, "sampling": {}, "elicitation": {"form": {}}})
+        }
+
+        fn requests(order: [usize; 3]) -> serde_json::Value {
+            let descriptors = [
+                serde_json::json!({"method": "roots/list"}),
+                serde_json::json!({
+                    "method": "sampling/createMessage",
+                    "params": {
+                        "messages": [{"role": "user", "content": {"type": "text", "text": "sample"}}],
+                        "maxTokens": 8,
+                        "includeContext": "allServers",
+                    },
+                }),
+                serde_json::json!({
+                    "method": "elicitation/create",
+                    "params": {
+                        "message": "Review form",
+                        "requestedSchema": {"type": "object", "properties": {}},
+                    },
+                }),
+            ];
+            serde_json::Value::Object(
+                order
+                    .into_iter()
+                    .enumerate()
+                    .map(|(position, kind)| {
+                        (format!("input-{position}"), descriptors[kind].clone())
+                    })
+                    .collect(),
+            )
+        }
+
+        fn peer_result(requests: serde_json::Value) -> InputRequiredResult {
+            let source = serde_json::json!({
+                "resultType": "input_required",
+                "inputRequests": requests,
+                "requestState": STATE,
+            })
+            .to_string();
+            let (result, diagnostic) = decode_peer_result(
+                &source,
+                ResultPeerEra::Modern,
+                &CoreResultDiscriminatorPolicy,
+            )
+            .unwrap();
+            assert!(diagnostic.is_none());
+            let DecodedResult::InputRequired(result) = result else {
+                panic!("the peer must supply an input-required result");
+            };
+            result
+        }
+
+        fn sampling_response() -> serde_json::Value {
+            serde_json::json!({
+                "role": "assistant",
+                "model": "preflight-model",
+                "content": {"type": "text", "text": "sampled"},
+            })
+        }
+
+        fn handlers(
+            missing: Option<usize>,
+            calls: &Arc<[AtomicUsize; 3]>,
+        ) -> ReverseRequestHandlers {
+            let mut handlers = ReverseRequestHandlers::new();
+            if missing != Some(0) {
+                let calls = Arc::clone(calls);
+                handlers = handlers.with_modern_roots_list(move |_cx, _cancellation, _params| {
+                    calls[0].fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
+                });
+            }
+            if missing != Some(1) {
+                let calls = Arc::clone(calls);
+                handlers = handlers.with_modern_sampling_create_message(
+                    move |_cx, _cancellation, params| {
+                        calls[1].fetch_add(1, Ordering::SeqCst);
+                        assert!(params.include_context.is_none());
+                        Box::pin(async { Ok(serde_json::from_value(sampling_response()).unwrap()) })
+                    },
+                );
+            }
+            if missing != Some(2) {
+                let calls = Arc::clone(calls);
+                handlers = handlers.with_modern_elicitation_create(
+                    move |_cx, _cancellation, _params| {
+                        calls[2].fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async { Ok(ElicitResult::decline()) })
+                    },
+                );
+            }
+            handlers
+        }
+
+        fn dispatch(
+            asynchronous: bool,
+            handlers: &ReverseRequestHandlers,
+            capabilities: &serde_json::Value,
+            input: &InputRequiredResult,
+        ) -> McpResult<MrtrInputResponses> {
+            if asynchronous {
+                let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .build()
+                    .unwrap();
+                let result = runtime.block_on(async {
+                    let cx = Cx::current().unwrap();
+                    handlers
+                        .respond_to_input_required_async(&cx, capabilities, input, || {
+                            cx.checkpoint().map_err(|_| McpError::request_cancelled())
+                        })
+                        .await
+                });
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+                result
+            } else {
+                handlers.respond_to_input_required(&Cx::for_testing(), capabilities, input)
+            }
+        }
+
+        fn assert_missing_handlers(asynchronous: bool) {
+            for (missing, method) in METHODS.iter().enumerate() {
+                for position in 0..METHODS.len() {
+                    let mut order = [0, 1, 2];
+                    order.swap(missing, position);
+                    let input = peer_result(requests(order));
+                    let retained_inputs = input.input_requests().cloned();
+                    let calls = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+                    let handlers = handlers(Some(missing), &calls);
+                    let (result, diagnostics) = observe_diagnostics(|| {
+                        dispatch(asynchronous, &handlers, &capabilities(), &input)
+                    });
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::InvalidParams);
+                    assert_eq!(
+                        error.message,
+                        format!(
+                            "MRTR input request input-{position} requires an installed {method} reverse handler"
+                        ),
+                    );
+                    for count in calls.iter() {
+                        assert_eq!(count.load(Ordering::SeqCst), 0);
+                    }
+                    assert_eq!(diagnostics, 0, "an unfulfillable batch has no host effects");
+                    assert_eq!(input.input_requests(), retained_inputs.as_ref());
+                    assert_eq!(input.request_state(), Some(STATE));
+                }
+            }
+        }
+
+        fn assert_complete_batch(asynchronous: bool) {
+            let input = peer_result(requests([0, 1, 2]));
+            let retained_inputs = input.input_requests().cloned();
+            let calls = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+            let handlers = handlers(None, &calls);
+            let (responses, diagnostics) = observe_diagnostics(|| {
+                dispatch(asynchronous, &handlers, &capabilities(), &input)
+            });
+            let responses = responses.unwrap();
+            for count in calls.iter() {
+                assert_eq!(count.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(diagnostics, 1, "the admitted context hint is diagnosed once");
+            let expected_responses = serde_json::json!({
+                "input-0": {"roots": []},
+                "input-1": sampling_response(),
+                "input-2": {"action": "decline"},
+            });
+            assert_eq!(serde_json::to_value(&responses).unwrap(), expected_responses);
+            let original = serde_json::json!({
+                "name": "preflight-tool",
+                "arguments": {"untouched": ["semantic argument", 7]},
+                "_meta": {"io.modelcontextprotocol/clientCapabilities": capabilities()},
+            });
+            let retry = mrtr_retry_parameters(original.clone(), &input, responses).unwrap();
+            let mut expected = original;
+            expected["inputResponses"] = expected_responses;
+            expected["requestState"] = serde_json::json!(STATE);
+            assert_eq!(retry, expected);
+            assert_eq!(input.input_requests(), retained_inputs.as_ref());
+            assert_eq!(input.request_state(), Some(STATE));
+        }
+
+        fn assert_prior_refusals(asynchronous: bool) {
+            for malformed in [false, true] {
+                let mut inputs = requests([0, 1, 2]);
+                let mut advertised = capabilities();
+                let expected_message = if malformed {
+                    inputs["input-1"]["params"]["messages"] = serde_json::json!("invalid");
+                    "MRTR input-required result contains an invalid embedded input request"
+                } else {
+                    advertised.as_object_mut().unwrap().remove("sampling");
+                    "MRTR input-required result requests an unadvertised client capability"
+                };
+                let input = peer_result(inputs);
+                let calls = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+                // A missing first handler must not hide a later peer violation.
+                let handlers = handlers(Some(0), &calls);
+                let (result, diagnostics) = observe_diagnostics(|| {
+                    dispatch(asynchronous, &handlers, &advertised, &input)
+                });
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidRequest);
+                assert_eq!(error.message, expected_message);
+                for count in calls.iter() {
+                    assert_eq!(count.load(Ordering::SeqCst), 0);
+                }
+                assert_eq!(diagnostics, 0);
+            }
+        }
+
+        #[test]
+        fn sync_missing_handlers_do_not_invoke_callbacks_or_diagnostics() {
+            assert_missing_handlers(false);
+        }
+
+        #[test]
+        fn async_missing_handlers_do_not_invoke_callbacks_or_diagnostics() {
+            assert_missing_handlers(true);
+        }
+
+        #[test]
+        fn sync_complete_batch_preserves_responses_and_continuation_state() {
+            assert_complete_batch(false);
+        }
+
+        #[test]
+        fn async_complete_batch_preserves_responses_and_continuation_state() {
+            assert_complete_batch(true);
+        }
+
+        #[test]
+        fn sync_peer_refusals_keep_precedence_over_missing_handlers() {
+            assert_prior_refusals(false);
+        }
+
+        #[test]
+        fn async_peer_refusals_keep_precedence_over_missing_handlers() {
+            assert_prior_refusals(true);
+        }
+    }
 
     #[test]
     fn resource_subscription_relations_are_bounded_and_byte_exact() {
