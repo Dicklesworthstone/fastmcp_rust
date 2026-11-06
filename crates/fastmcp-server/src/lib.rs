@@ -14482,7 +14482,29 @@ async fn serve_modern_json_http_connection(
             return;
         }
     };
-    let response = match dispatch.join(cx).await {
+    // Notifications have no request ID and are not in active_requests, so
+    // cancelling the listener's registered requests cannot reach them. Each
+    // accepted connection must forward shutdown to its own dispatch token.
+    // Retain one join future across interval waits. Dropping an interval
+    // only drops its borrow, while dropping the whole connection still
+    // cancels dispatch through the join future's existing drop contract.
+    let dispatched = {
+        let mut joined = std::pin::pin!(dispatch.join(cx));
+        loop {
+            if listener_shutdown.is_requested() || cx.checkpoint().is_err() {
+                request_cancellation.cancel();
+                // Once forwarded, retain the connection until dispatch settles.
+                // Do not keep polling a timer on an already-cancelled context.
+                break joined.as_mut().await;
+            }
+            if let Ok(result) =
+                asupersync::time::timeout(cx.now(), HTTP_ACCEPT_CANCEL_POLL, joined.as_mut()).await
+            {
+                break result;
+            }
+        }
+    };
+    let response = match dispatched {
         Ok(response) => response,
         Err(_) => HttpResponse::internal_error(),
     };

@@ -608,3 +608,53 @@ fn typed_notification_http_cancellation_prevents_late_effects() {
     assert_eq!(observations.total.load(Ordering::SeqCst), 0);
     assert_eq!(observations.abandoned.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn typed_notification_http_shutdown_settles_pending_work_after_sibling_completion() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let observations = with_notification_http(|cx, server_cx, address, observations| async move {
+        let mut pending = Box::pin(notification_http_exchange(
+            address,
+            notification(7, true),
+            true,
+        ));
+        while observations.started.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::future::poll_fn(|task| Poll::Ready(pending.as_mut().poll(task)))
+                    .await
+                    .is_pending(),
+                "pending notification must retain its response"
+            );
+            asupersync::runtime::yield_now().await;
+        }
+
+        let completed = notification_http_exchange(address, notification(11, false), true)
+            .await
+            .expect("independent notification completes while its sibling is pending");
+        assert!(completed.starts_with(b"HTTP/1.1 202"));
+        assert_eq!(observations.started.load(Ordering::SeqCst), 2);
+        assert_eq!(observations.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(observations.total.load(Ordering::SeqCst), 33);
+
+        server_cx.cancel_with(
+            asupersync::types::CancelKind::Shutdown,
+            Some("stop listener with one pending and one completed notification"),
+        );
+        if let Ok(response) = asupersync::time::timeout(cx.now(), Duration::from_secs(2), pending)
+            .await
+            .expect("listener shutdown closes pending notification without its 60-second deadline")
+        {
+            assert!(
+                !response.starts_with(b"HTTP/1.1 202"),
+                "incomplete notification cannot publish a success acknowledgement"
+            );
+        }
+        assert!(cx.checkpoint().is_ok(), "the application caller stays live");
+    });
+    assert_eq!(observations.started.load(Ordering::SeqCst), 2);
+    assert_eq!(observations.completed.load(Ordering::SeqCst), 1);
+    assert_eq!(observations.total.load(Ordering::SeqCst), 33);
+    assert_eq!(observations.abandoned.load(Ordering::SeqCst), 1);
+}
