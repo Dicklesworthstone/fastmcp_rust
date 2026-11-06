@@ -10926,10 +10926,11 @@ impl ServerHttpSession {
                 transport_authorization,
             );
             let result = Arc::clone(&self.server)
-                .dispatch_http_extension_notification(
+                .dispatch_extension_notification_owned(
                     &inbound,
                     notification,
                     auth_receipt,
+                    None,
                     modern_request_cancellation.unwrap_or_default(),
                 )
                 .await;
@@ -15929,16 +15930,42 @@ impl Server {
         self.router.prompts()
     }
 
-    /// Completes one descriptor-owned notification inside the HTTP request.
+    /// Finds a frozen client-to-server notification with its own activation proof.
     ///
-    /// This profile never acknowledges a detached future. Every message owns
+    /// Registration alone never activates a callback. The execution path below
+    /// authenticates the current frame and validates that frame's settings proof.
+    fn registered_extension_notification_id(&self, method: &str) -> Option<&ExtensionId> {
+        self.extension_runtime
+            .as_deref()?
+            .handlers
+            .descriptor_registry()
+            .descriptors()
+            .find(|descriptor| {
+                descriptor
+                    .notification
+                    .as_ref()
+                    .is_some_and(|notification| {
+                        notification.name == method
+                            && notification.direction
+                                == fastmcp_protocol::ExtensionDirection::ClientToServer
+                            && notification.activation_proof.is_some()
+                    })
+            })
+            .map(|descriptor| &descriptor.id)
+    }
+
+    /// Completes one descriptor-owned notification in its transport-owned scope.
+    ///
+    /// This path never detaches a callback. Every message owns
     /// fresh authentication, explicit operation authorization, settings proof,
-    /// cancellation and a finite deadline; 202 follows completed work only.
-    async fn dispatch_http_extension_notification(
+    /// cancellation and a finite deadline. HTTP acknowledges only completed
+    /// work; stream transports emit no JSON-RPC response, including on failure.
+    async fn dispatch_extension_notification_owned(
         self: Arc<Self>,
         inbound: &InboundRequestContext,
         mut notification: JsonRpcRequest,
         auth_receipt: Option<AuthDispatchCustody>,
+        websocket_connection_generation: Option<u64>,
         cancellation: McpRequestCancellation,
     ) -> McpResult<()> {
         if notification.id.is_some() || notification.validate().is_err() {
@@ -15969,7 +15996,7 @@ impl Server {
             inbound,
             &mut notification,
             auth_receipt.as_ref(),
-            None,
+            websocket_connection_generation,
         )?;
         let deadline = context.budget().deadline.unwrap_or(maximum).min(maximum);
         let result = if let Some(region) = router::open_modern_request_region(&context).await? {
@@ -15979,7 +16006,7 @@ impl Server {
             let task = region.cx().spawn(move |child_cx| async move {
                 let context = dispatch_context.with_request_cx(child_cx);
                 server
-                    .dispatch_http_extension_notification_in_region(
+                    .dispatch_extension_notification_in_region(
                         &context,
                         notification,
                         dispatch_cancellation,
@@ -16016,7 +16043,7 @@ impl Server {
                                 && timer.as_mut().poll(task_cx).is_ready()))
                     {
                         let _ = region.cancel(asupersync::CancelReason::user(
-                            "HTTP extension notification cancelled",
+                            "Extension notification cancelled",
                         ));
                         cancel_forwarded = true;
                     }
@@ -16026,7 +16053,7 @@ impl Server {
             };
             // Callback completion alone does not settle work spawned through
             // its Cx. Close cancels and drains all remaining descendants on
-            // success, error, panic and expiry before a finite HTTP result.
+            // success, error, panic and expiry before transport completion.
             // Dropping this outer future also drops the region owner, so the
             // runtime retains and cancels that subtree instead of detaching it.
             region.close().await.map_err(|_| {
@@ -16043,7 +16070,7 @@ impl Server {
             // A detached testing context has no runtime gateway and therefore
             // cannot spawn descendants. Immediate callbacks still work there;
             // the inner watchdog rejects pending work without a timer driver.
-            self.dispatch_http_extension_notification_in_region(
+            self.dispatch_extension_notification_in_region(
                 &context,
                 notification,
                 cancellation.clone(),
@@ -16059,7 +16086,7 @@ impl Server {
         Ok(())
     }
 
-    async fn dispatch_http_extension_notification_in_region(
+    async fn dispatch_extension_notification_in_region(
         &self,
         context: &McpContext,
         notification: JsonRpcRequest,
@@ -16072,18 +16099,9 @@ impl Server {
             .as_deref()
             .ok_or_else(|| McpError::invalid_request("Extension notification is not admitted"))?;
         let descriptors = runtime.handlers.descriptor_registry();
-        let descriptor = descriptors
-            .descriptors()
-            .find(|descriptor| {
-                descriptor.notification.as_ref().is_some_and(|candidate| {
-                    candidate.name == notification.method
-                        && candidate.direction
-                            == fastmcp_protocol::ExtensionDirection::ClientToServer
-                        && candidate.activation_proof.is_some()
-                })
-            })
+        let id = self
+            .registered_extension_notification_id(&notification.method)
             .ok_or_else(|| McpError::invalid_request("Extension notification is not admitted"))?;
-        let id = &descriptor.id;
         let server_settings = runtime
             .server_discovery
             .extensions
@@ -17123,6 +17141,43 @@ impl Server {
             return response_for_error(McpError::invalid_request(
                 "Inbound request identity does not match the JSON-RPC request id",
             ));
+        }
+        if is_notification
+            && self
+                .registered_extension_notification_id(&request.method)
+                .is_some()
+        {
+            // The owning pump already selected the modern era. Notification
+            // metadata cannot select an era or reuse a previous request's
+            // capabilities: the registered proof is authenticated and resolved
+            // afresh by the same bounded path used for an HTTP notification.
+            let result = Arc::clone(&self)
+                .dispatch_extension_notification_owned(
+                    inbound,
+                    request,
+                    auth_receipt,
+                    websocket_connection_generation,
+                    request_cancellation,
+                )
+                .await;
+            if let Some(stats) = &self.stats {
+                if result.as_ref().is_err_and(McpError::is_cancelled) {
+                    stats.record_cancelled(&method, started_at.elapsed());
+                } else {
+                    stats.record_request(&method, started_at.elapsed(), result.is_ok());
+                }
+            }
+            if let Err(error) = result {
+                error!(
+                    target: targets::HANDLER,
+                    "Extension notification failed; method_key={:016x}; code={:?}",
+                    stable_hash_request_id(&method),
+                    error.code
+                );
+            }
+            // JSON-RPC notifications never produce a response, even when
+            // authentication, activation, schema admission or execution fails.
+            return None;
         }
         let request_ctx = self.attach_request_scoped_component_access(
             self.with_final_catalog_publisher(

@@ -1275,12 +1275,28 @@ the typed request, so `deny_unknown_fields` applies to the application payload.
 
 `ExtensionContext` provides typed settings, immutable descriptor information,
 cancellation and deadline observations, and `checkpoint()`. It exposes no raw
-`McpContext`, `Cx`, credentials, or registry access. The initial authoring scope is
-modern client-to-server requests with bilateral activation; notifications and
-legacy extension methods are outside this surface. One registration can contain
+`McpContext`, `Cx`, credentials, or registry access. One registration can contain
 multiple typed methods. Installation does not merge an existing extension
 registry. These construction and admission APIs do not imply complete extension
 qualification.
+
+Use `ExtensionBuilder::typed_notification` (or `typed_notification_sync`) for a
+modern client-to-server notification. Registration requires an explicit operation
+authorization callback and a metadata key for a self-contained settings proof.
+Every message must supply compatible settings in that exact `params._meta` field;
+an earlier request's capabilities cannot activate a later notification. The
+framework authenticates each message, validates its typed payload, applies the
+operation policy, and resolves its settings before invoking the handler with an
+`ExtensionNotificationContext`. This context offers the same bounded cancellation
+and deadline observations without exposing transport or task-spawning authority.
+
+Typed notifications run on caller-owned HTTP, stdio, memory, and WebSocket serving
+paths after the transport selects the modern era. HTTP returns an empty 202 only
+after the callback and its scope settle. Stream transports emit no JSON-RPC
+response for successful or rejected notifications. Pending notification work is
+cancelled and drained on connection shutdown, and each notification has a finite
+deadline even when ordinary request timeouts are disabled. Legacy extension
+notifications are outside this surface.
 
 ---
 

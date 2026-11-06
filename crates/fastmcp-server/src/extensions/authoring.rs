@@ -6,8 +6,10 @@
 //! access to the registry, raw protocol data, credentials, or an executor.
 //!
 //! Requests use bilateral settings. A notification supplies its own bounded
-//! settings proof in an explicitly registered metadata field on every HTTP
-//! POST. Neither path installs legacy fallbacks or grants transport authority.
+//! settings proof in an explicitly registered metadata field on every message.
+//! HTTP and modern stream transports run that message inside the owning
+//! transport's scope. Neither path installs legacy fallbacks or grants
+//! transport authority.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -428,9 +430,10 @@ impl<Settings> ExtensionNotificationContext<'_, Settings> {
 
 /// An asynchronous notification callback polled on the caller-owned runtime.
 ///
-/// Completion produces no JSON-RPC result. The HTTP acknowledgement is emitted
-/// by the existing transport only after this callback and its request lifetime
-/// have settled; the callback receives no write or detached-task capability.
+/// Completion produces no JSON-RPC result. HTTP acknowledges only after this
+/// callback and its request lifetime have settled. Modern stream transports
+/// send no JSON-RPC response, including when the callback fails. The callback
+/// receives no write or detached-task capability.
 pub trait ExtensionNotificationHandler<Notification, Settings>: Send + Sync {
     /// Executes one admitted notification using the sealed borrowed context.
     fn handle<'a>(
@@ -1030,7 +1033,7 @@ where
         Ok(self)
     }
 
-    /// Registers one typed asynchronous client-to-server HTTP notification.
+    /// Registers one typed asynchronous client-to-server notification.
     ///
     /// Every message supplies this extension's typed client settings in the
     /// exact `params._meta[activation_metadata_key]` field. The framework admits
@@ -1040,9 +1043,11 @@ where
     /// endpoint identity/scope rules remain part of transport authorization.
     /// There is no implicit public allow policy and no prior-request activation.
     ///
-    /// The handler receives a sealed notification context and returns `()`;
-    /// normal HTTP dispatch emits an empty 202 only after scoped completion.
-    /// This registration does not enable legacy or unsolicited stdio ingress.
+    /// The handler receives a sealed notification context and returns `()`.
+    /// HTTP emits an empty 202 only after scoped completion; modern stdio,
+    /// memory, and WebSocket transports complete within the owning scope
+    /// without emitting a JSON-RPC response. Each message must supply its own
+    /// activation proof. This registration does not enable legacy ingress.
     pub fn typed_notification<Notification, Handler, Authorize>(
         mut self,
         method: impl Into<String>,
@@ -1089,7 +1094,7 @@ where
 
     /// Registers a synchronous notification with the same admission and policy.
     ///
-    /// The callback still runs inside the ordinary asynchronous HTTP request
+    /// The callback still runs inside the transport-owned asynchronous
     /// lifetime. No response value, runtime bridge, or detached worker is added.
     pub fn typed_notification_sync<Notification, Handler, Authorize>(
         mut self,

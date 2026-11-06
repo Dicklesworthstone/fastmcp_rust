@@ -710,3 +710,412 @@ fn typed_notification_http_shutdown_settles_pending_work_after_sibling_completio
     assert_eq!(observations.total.load(Ordering::SeqCst), 33);
     assert_eq!(observations.abandoned.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn typed_notification_stdio_authenticates_and_drains_without_notification_responses() {
+    exercise_notification_stdio(false);
+}
+
+#[cfg(feature = "legacy-2024-11-05")]
+#[test]
+fn typed_notification_stdio_auto_selects_modern_before_current_message_activation() {
+    exercise_notification_stdio(true);
+}
+
+fn exercise_notification_stdio(auto: bool) {
+    use asupersync::net::{TcpListener, TcpStream};
+    use fastmcp_rust::AsyncStdioTransport;
+
+    const TOKEN: &str = "stdio-notification-owner";
+    const FOREIGN_TOKEN: &str = "stdio-notification-foreign";
+
+    let observations = Arc::new(NotificationObservations::default());
+    let observed = Arc::clone(&observations);
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().expect("caller reactor"))
+        .blocking_threads(0, 0)
+        .build()
+        .expect("caller-owned native stdio runtime");
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("caller context");
+        assert!(cx.blocking_pool_handle().is_none());
+        asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+            let verifier = fastmcp_rust::StaticTokenVerifier::new([
+                (TOKEN, fastmcp_rust::AuthContext::with_subject("owner")),
+                (
+                    FOREIGN_TOKEN,
+                    fastmcp_rust::AuthContext::with_subject("foreign"),
+                ),
+            ])
+            .expect("bounded test credentials");
+            let registration = notification_registration(Arc::clone(&observations));
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("native NDJSON listener");
+            let address = listener.local_addr().unwrap();
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    let (socket, _) = listener.accept().await.expect("native peer accepts");
+                    let (input, output) = socket.into_split();
+                    #[cfg(feature = "legacy-2024-11-05")]
+                    if auto {
+                        let server =
+                            fastmcp_rust::auto::ServerBuilder::new("stdio-notifications", "1.0")
+                                .extension(registration)
+                                .expect("public Auto facade extension installation")
+                                .auth_provider(fastmcp_rust::TokenAuthProvider::new(verifier))
+                                .try_build()
+                                .expect("frozen Auto server");
+                        return server.serve_stdio_io(&server_cx, input, output).await;
+                    }
+                    #[cfg(not(feature = "legacy-2024-11-05"))]
+                    assert!(!auto, "Auto requires the exact legacy adapter feature");
+                    let server = modern::ServerBuilder::new("stdio-notifications", "1.0")
+                        .extension(registration)
+                        .expect("public modern facade extension installation")
+                        .auth_provider(fastmcp_rust::TokenAuthProvider::new(verifier))
+                        .try_build()
+                        .expect("frozen modern server");
+                    server.serve_stdio_io(&server_cx, input, output).await
+                })
+                .expect("owned stdio server task");
+            let socket = TcpStream::connect(address)
+                .await
+                .expect("native peer connects");
+            let (input, output) = socket.split();
+            let mut peer = AsyncStdioTransport::from_io(input, output);
+            let frame = |mut value: fastmcp_rust::JsonValue, token: Option<&str>| {
+                if let Some(token) = token {
+                    value["params"]["_meta"]["token"] = json!(token);
+                }
+                fastmcp_rust::serde_json::from_value::<JsonRpcMessage>(value)
+                    .expect("valid JSON-RPC fixture")
+            };
+            let discovery = |id| {
+                frame(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "server/discover",
+                        "params": {"_meta": {
+                            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                            "io.modelcontextprotocol/clientCapabilities": {}
+                        }}
+                    }),
+                    Some(TOKEN),
+                )
+            };
+            peer.send_async(&cx, &discovery(81_i64)).await.unwrap();
+            let JsonRpcMessage::Response(response) = peer.recv_async(&cx).await.unwrap() else {
+                panic!("discovery returns its ordinary request response");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(81)));
+            assert!(response.error.is_none(), "{response:?}");
+
+            let valid = notification(7, false);
+            for token in [None, Some(FOREIGN_TOKEN)] {
+                peer.send_async(&cx, &frame(valid.clone(), token))
+                    .await
+                    .unwrap();
+            }
+            peer.send_async(&cx, &frame(valid.clone(), Some(TOKEN)))
+                .await
+                .unwrap();
+            while observations.completed.load(Ordering::SeqCst) == 0 {
+                asupersync::runtime::yield_now().await;
+            }
+            assert_eq!(
+                observations.authorized.load(Ordering::SeqCst),
+                1,
+                "missing credentials and a different connection principal fail before policy"
+            );
+            assert_eq!(observations.started.load(Ordering::SeqCst), 1);
+            assert_eq!(observations.total.load(Ordering::SeqCst), 21);
+
+            let mut missing = valid.clone();
+            missing["params"]["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove(ACTIVATION);
+            let mut incompatible = valid.clone();
+            incompatible["params"]["_meta"][ACTIVATION]["version"] = json!(2);
+            let mut malformed = valid.clone();
+            malformed["params"]["value"] = json!("wrong-type");
+            let mut unexpected = valid.clone();
+            unexpected["params"]["unexpected"] = json!(true);
+            let mut unknown = valid;
+            unknown["method"] = json!("com.example/unregistered");
+            for rejected in [
+                missing,
+                incompatible,
+                malformed,
+                unexpected,
+                unknown,
+                notification(13, false),
+            ] {
+                peer.send_async(&cx, &frame(rejected, Some(TOKEN)))
+                    .await
+                    .unwrap();
+            }
+            let mut fresh = notification(11, false);
+            fresh["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+                json!("2025-11-25");
+            fresh["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+                json!({"extensions": {(EXTENSION): {"version": 2}}});
+            peer.send_async(&cx, &frame(fresh, Some(TOKEN)))
+                .await
+                .unwrap();
+            peer.send_async(&cx, &discovery(82_i64)).await.unwrap();
+
+            // Half-close the actual socket, preserving the peer's reader.
+            // Closing the transport itself would latch its terminal locally
+            // and could hide an illegal notification response still on wire.
+            socket
+                .shutdown(std::net::Shutdown::Write)
+                .expect("peer input EOF starts the server's accepted-work drain");
+            let JsonRpcMessage::Response(response) = peer.recv_async(&cx).await.unwrap() else {
+                panic!("only the explicit discovery request produces a response");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(82)));
+            assert!(response.error.is_none(), "{response:?}");
+            assert!(
+                matches!(peer.recv_async(&cx).await, Err(TransportError::Closed)),
+                "successful and rejected notifications remain silent through actual wire EOF"
+            );
+            serving
+                .join(&cx)
+                .await
+                .expect("owned stdio server joins")
+                .expect("EOF drains every accepted notification");
+            assert!(cx.checkpoint().is_ok(), "the application caller stays live");
+        })
+        .await
+        .expect("bounded native NDJSON exchange and complete notification drain");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    assert_eq!(observed.authorized.load(Ordering::SeqCst), 5);
+    assert_eq!(observed.started.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.total.load(Ordering::SeqCst), 54);
+    assert_eq!(observed.abandoned.load(Ordering::SeqCst), 0);
+}
+
+fn memory_notification_frame(
+    mut value: fastmcp_rust::JsonValue,
+    token: Option<&str>,
+) -> JsonRpcMessage {
+    if let Some(token) = token {
+        value["params"]["_meta"]["token"] = json!(token);
+    }
+    fastmcp_rust::serde_json::from_value(value).expect("valid JSON-RPC fixture")
+}
+
+fn notification_discovery(id: i64) -> JsonRpcMessage {
+    memory_notification_frame(
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "server/discover",
+            "params": {"_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }}
+        }),
+        Some("memory-notification-owner"),
+    )
+}
+
+fn memory_notification_server(observations: Arc<NotificationObservations>) -> modern::Server {
+    let verifier = fastmcp_rust::StaticTokenVerifier::new([
+        (
+            "memory-notification-owner",
+            fastmcp_rust::AuthContext::with_subject("owner"),
+        ),
+        (
+            "memory-notification-foreign",
+            fastmcp_rust::AuthContext::with_subject("foreign"),
+        ),
+    ])
+    .unwrap();
+    modern::ServerBuilder::new("memory-notifications", "1.0")
+        .extension(notification_registration(observations))
+        .unwrap()
+        .auth_provider(fastmcp_rust::TokenAuthProvider::new(verifier))
+        .try_build()
+        .unwrap()
+}
+
+#[test]
+fn typed_notification_memory_authenticates_each_frame_and_revalidates_activation() {
+    let observations = Arc::new(NotificationObservations::default());
+    let observed = Arc::clone(&observations);
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().unwrap();
+        asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+            let server = memory_notification_server(Arc::clone(&observations));
+            let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+            let mut serving = cx
+                .spawn(move |cx| async move { server.serve_memory(&cx, transport).await })
+                .unwrap();
+            peer.send_async(&cx, &notification_discovery(1))
+                .await
+                .unwrap();
+            assert!(response(&cx, &mut peer, 1).await.error.is_none());
+
+            let valid = notification(7, false);
+            for token in [None, Some("memory-notification-foreign")] {
+                peer.send_async(&cx, &memory_notification_frame(valid.clone(), token))
+                    .await
+                    .unwrap();
+            }
+            peer.send_async(
+                &cx,
+                &memory_notification_frame(valid.clone(), Some("memory-notification-owner")),
+            )
+            .await
+            .unwrap();
+
+            let mut missing = valid.clone();
+            missing["params"]["_meta"]
+                .as_object_mut()
+                .unwrap()
+                .remove(ACTIVATION);
+            let mut incompatible = valid.clone();
+            incompatible["params"]["_meta"][ACTIVATION]["version"] = json!(2);
+            let mut malformed = valid.clone();
+            malformed["params"]["value"] = json!("wrong-type");
+            let mut extra_parameter = valid.clone();
+            extra_parameter["params"]["unexpected"] = json!(true);
+            let mut unknown = valid;
+            unknown["method"] = json!("com.example/unregistered");
+            for rejected in [
+                missing,
+                incompatible,
+                malformed,
+                extra_parameter,
+                unknown,
+                notification(13, false),
+            ] {
+                peer.send_async(
+                    &cx,
+                    &memory_notification_frame(rejected, Some("memory-notification-owner")),
+                )
+                .await
+                .unwrap();
+            }
+            let mut fresh = notification(11, false);
+            fresh["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"] =
+                json!("2025-11-25");
+            fresh["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"] =
+                json!({"extensions": {(EXTENSION): {"version": 2}}});
+            peer.send_async(
+                &cx,
+                &memory_notification_frame(fresh, Some("memory-notification-owner")),
+            )
+            .await
+            .unwrap();
+            peer.send_async(&cx, &notification_discovery(2))
+                .await
+                .unwrap();
+            let (mut input, output) = peer.into_split();
+            drop(output);
+            let JsonRpcMessage::Response(response) = input.recv_async(&cx).await.unwrap() else {
+                panic!("only the explicit discovery request produces a response");
+            };
+            assert_eq!(response.id, Some(RequestId::Number(2)));
+            assert!(response.error.is_none(), "{response:?}");
+            assert!(matches!(
+                input.recv_async(&cx).await,
+                Err(TransportError::Closed)
+            ));
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(cx.checkpoint().is_ok());
+        })
+        .await
+        .expect("bounded native memory exchange and full notification drain");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    assert_eq!(observed.authorized.load(Ordering::SeqCst), 5);
+    assert_eq!(observed.started.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.total.load(Ordering::SeqCst), 54);
+    assert_eq!(observed.abandoned.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn typed_notification_memory_shutdown_cancels_pending_work_without_blocking_siblings() {
+    let observations = Arc::new(NotificationObservations::default());
+    let observed = Arc::clone(&observations);
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().unwrap();
+        asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+            let server = memory_notification_server(Arc::clone(&observations));
+            let (mut peer, transport) = create_memory_transport_pair_with_capacity(1);
+            let (sender, mut receiver) = asupersync::channel::oneshot::channel();
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    sender.send(&server_cx, server_cx.clone()).unwrap();
+                    server.serve_memory(&server_cx, transport).await
+                })
+                .unwrap();
+            let server_cx = receiver.recv(&cx).await.unwrap();
+            peer.send_async(
+                &cx,
+                &memory_notification_frame(
+                    notification(7, true),
+                    Some("memory-notification-owner"),
+                ),
+            )
+            .await
+            .unwrap();
+            while observations.started.load(Ordering::SeqCst) == 0 {
+                asupersync::runtime::yield_now().await;
+            }
+            peer.send_async(&cx, &notification_discovery(1))
+                .await
+                .unwrap();
+            assert!(response(&cx, &mut peer, 1).await.error.is_none());
+            peer.send_async(
+                &cx,
+                &memory_notification_frame(
+                    notification(11, false),
+                    Some("memory-notification-owner"),
+                ),
+            )
+            .await
+            .unwrap();
+            while observations.completed.load(Ordering::SeqCst) == 0 {
+                asupersync::runtime::yield_now().await;
+            }
+            assert_eq!(observations.started.load(Ordering::SeqCst), 2);
+            assert_eq!(observations.total.load(Ordering::SeqCst), 33);
+            server_cx.cancel_with(
+                asupersync::types::CancelKind::Shutdown,
+                Some("stop pending native extension notification"),
+            );
+            assert!(matches!(
+                asupersync::time::timeout(cx.now(), Duration::from_secs(2), peer.recv_async(&cx))
+                    .await
+                    .expect("shutdown does not wait for the notification deadline"),
+                Err(TransportError::Closed)
+            ));
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(cx.checkpoint().is_ok(), "caller authority stays live");
+        })
+        .await
+        .expect("bounded native notification cancellation and cleanup");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    assert_eq!(observed.started.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.completed.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.total.load(Ordering::SeqCst), 33);
+    assert_eq!(observed.abandoned.load(Ordering::SeqCst), 1);
+}
