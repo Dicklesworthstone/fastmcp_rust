@@ -323,7 +323,7 @@ audit it; unsupported policy fields must not be added as decorative YAML.
 # Check for compiler errors and warnings (workspace-wide)
 cargo check --workspace --all-targets
 
-# Check for clippy lints (pedantic + nursery are enabled)
+# Check for clippy lints (pedantic is enabled; nursery is NOT)
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
