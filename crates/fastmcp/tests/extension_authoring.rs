@@ -130,12 +130,10 @@ fn request(
     settings: Option<fastmcp_rust::JsonValue>,
     value: fastmcp_rust::JsonValue,
 ) -> JsonRpcMessage {
-    // Tasks is ALWAYS advertised, including when this request omits the typed
-    // extension's own settings. The facade's default feature set includes
-    // `tasks`, so ServerBuilder auto-installs the official Tasks extension,
-    // whose descriptor is RejectOneSided. A client that advertises any
-    // extensions object without Tasks is therefore refused for THAT reason,
-    // which would make every negative below pass on an unintended dimension.
+    // Advertise Tasks in the shared baseline so each negative below isolates
+    // the typed extension's settings or schema. The composition test explicitly
+    // removes Tasks to exercise its per-request inactivity, and corrupts its
+    // settings separately to verify the frozen bilateral validator still runs.
     let mut capabilities = json!({
         "extensions": {"io.modelcontextprotocol/tasks": {}}
     });
@@ -264,6 +262,57 @@ fn attribute_extension_yields_on_caller_runtime_and_returns_typed_result() {
     assert!(responses[0].error.is_none(), "{:?}", responses[0]);
     assert_eq!(responses[0].result.as_ref().unwrap()["value"], 27);
     assert!(responses[1].error.is_some());
+}
+
+#[test]
+#[cfg(feature = "tasks")]
+fn typed_extension_requests_compose_with_optional_default_tasks() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut requests = vec![
+        request(1, Some(json!({"version": 1})), json!(7)),
+        request(2, Some(json!({"version": 1})), json!(11)),
+        request(3, Some(json!({"version": 1})), json!(13)),
+        request(4, None, json!(13)),
+        request(5, Some(json!({"version": 1})), json!(17)),
+    ];
+    for (index, settings) in [
+        (0, None),
+        (1, Some(json!({}))),
+        (2, Some(json!({"unexpected": true}))),
+        (3, Some(json!({}))),
+        (4, None),
+    ] {
+        let JsonRpcMessage::Request(request) = &mut requests[index] else {
+            panic!("fixture is an extension request");
+        };
+        let extensions =
+            request.params.as_mut().unwrap()["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                ["extensions"]
+                .as_object_mut()
+                .unwrap();
+        match settings {
+            Some(settings) => {
+                extensions.insert("io.modelcontextprotocol/tasks".to_owned(), settings);
+            }
+            None => {
+                extensions.remove("io.modelcontextprotocol/tasks");
+            }
+        }
+    }
+    let responses = run_exchange(registration(Arc::clone(&calls)), requests);
+    for (index, expected) in [(0, 21), (1, 33), (4, 51)] {
+        assert!(responses[index].error.is_none(), "{:?}", responses[index]);
+        assert_eq!(responses[index].result.as_ref().unwrap()["value"], expected);
+    }
+    for response in &responses[2..4] {
+        assert!(response.error.is_some(), "{response:?}");
+        assert!(response.result.is_none());
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "absent Tasks is optional; malformed Tasks and absent typed settings cannot reach the handler",
+    );
 }
 
 #[test]

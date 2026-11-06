@@ -1356,11 +1356,36 @@ impl ServerExtensionRuntime {
             .resolver
             .lock()
             .map_err(|_| ServerExtensionNegotiationError::ResolverPoisoned)?;
+        // TASK-01 keeps ordinary requests/results available when this client
+        // does not support Tasks. The builder installs the built-in runtime
+        // by default, but its discovery advertisement cannot make Tasks a
+        // prerequisite for an unrelated extension request. Select inactivity
+        // for this exchange only; present Tasks settings still pass through
+        // the frozen descriptor's exact bilateral validation below.
+        #[cfg(feature = "tasks")]
+        let request_enablement = {
+            let tasks_id = fastmcp_protocol::extensions::official_tasks_extension_id();
+            if self.local_enablement.is_enabled(&tasks_id)
+                && !client.extensions.contains_key(&tasks_id)
+            {
+                let mut enablement = self.local_enablement.clone();
+                enablement.set_runtime(tasks_id, false);
+                Some(enablement)
+            } else {
+                None
+            }
+        };
+        #[cfg(feature = "tasks")]
+        let local_enablement = request_enablement
+            .as_ref()
+            .unwrap_or(&self.local_enablement);
+        #[cfg(not(feature = "tasks"))]
+        let local_enablement = &self.local_enablement;
         self.handlers
             .descriptor_registry()
             .negotiate(
                 ProtocolEra::Modern2026,
-                &self.local_enablement,
+                local_enablement,
                 client,
                 &self.server_discovery,
                 &mut *resolver,
@@ -29063,6 +29088,106 @@ mod lib_unit_tests {
     }
 
     #[cfg(feature = "tasks")]
+    #[test]
+    fn extension_request_binding_keeps_unadvertised_builtin_tasks_inactive() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = request_binding_extension_server(
+            Arc::clone(&calls),
+            Arc::new(AtomicUsize::new(0)),
+            false,
+        );
+        let request = request_binding_extension_request(1);
+        let client = final_client_extension_discovery(&request).unwrap();
+        let custom_id = ExtensionId::parse("com.example/request-binding").unwrap();
+        let tasks_id = fastmcp_protocol::extensions::official_tasks_extension_id();
+        let runtime = server.extension_runtime.as_deref().unwrap();
+        let discovery = runtime.discovery_capabilities();
+        assert_eq!(
+            discovery.get(tasks_id.as_str()),
+            Some(&serde_json::json!({}))
+        );
+        assert!(runtime.local_enablement.is_enabled(&tasks_id));
+        assert_eq!(
+            runtime
+                .handlers
+                .descriptor_registry()
+                .descriptor(&tasks_id)
+                .unwrap()
+                .resolver
+                .fallback,
+            fastmcp_protocol::ExtensionFallbackPolicy::RejectOneSided,
+        );
+
+        // The generic frozen-registry contract is unchanged. Only the server
+        // selects the optional built-in runtime for each current request.
+        let direct = runtime.handlers.descriptor_registry().negotiate(
+            ProtocolEra::Modern2026,
+            &runtime.local_enablement,
+            &client,
+            &runtime.server_discovery,
+            &mut *runtime.resolver.lock().unwrap(),
+        );
+        assert!(matches!(
+            direct,
+            Err(ExtensionNegotiationError::OneSidedSupport {
+                id,
+                missing: fastmcp_protocol::extensions::ExtensionPeer::Client,
+            }) if id == tasks_id.as_str()
+        ));
+
+        let ordinary = server.negotiate_extensions(&client).unwrap();
+        assert!(ordinary.active(&custom_id).is_some());
+        assert!(ordinary.active(&tasks_id).is_none());
+        assert_eq!(
+            server
+                .dispatch_negotiated_extension(
+                    &McpContext::new(Cx::for_testing(), 71),
+                    &ordinary,
+                    &request,
+                )
+                .unwrap(),
+            serde_json::json!({"value": 41}),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut both = client.clone();
+        both.extensions
+            .insert(tasks_id.clone(), official_tasks_empty_settings());
+        let tasks = server.negotiate_extensions(&both).unwrap();
+        assert!(tasks.active(&custom_id).is_some());
+        assert!(tasks.active(&tasks_id).is_some());
+
+        let mut malformed = both.clone();
+        malformed.extensions.insert(
+            tasks_id.clone(),
+            ExtensionSettings::new(serde_json::json!({"unexpected": true})).unwrap(),
+        );
+        assert!(matches!(
+            server.negotiate_extensions(&malformed),
+            Err(ServerExtensionNegotiationError::Protocol(
+                ExtensionNegotiationError::SettingsCompatibilityRejected(id)
+            )) if id == tasks_id.as_str()
+        ));
+
+        let mut missing_custom = both.clone();
+        missing_custom.extensions.remove(&custom_id);
+        assert!(matches!(
+            server.negotiate_extensions(&missing_custom),
+            Err(ServerExtensionNegotiationError::Protocol(
+                ExtensionNegotiationError::OneSidedSupport {
+                    id,
+                    missing: fastmcp_protocol::extensions::ExtensionPeer::Client,
+                }
+            )) if id == custom_id.as_str()
+        ));
+        assert_eq!(server.negotiate_extensions(&client).unwrap(), ordinary);
+        assert_eq!(server.negotiate_extensions(&both).unwrap(), tasks);
+        assert_eq!(runtime.discovery_capabilities(), discovery);
+        assert!(runtime.local_enablement.is_enabled(&tasks_id));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "tasks")]
     fn extension_registry_test_server(calls: Arc<AtomicUsize>) -> Server {
         let mut descriptors = ExtensionDescriptorRegistry::new();
         let tasks_id = register_official_tasks_extension(&mut descriptors)
@@ -34112,10 +34237,61 @@ mod lib_unit_tests {
             .insert("com.example/echo".to_owned(), serde_json::json!({}));
         let response = block_on(server.dispatch_stateless(
             &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
-            &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(get_params), 71_i64),
+            &JsonRpcRequest::new(fastmcp_protocol::TASK_GET, Some(get_params.clone()), 71_i64),
         ))
         .expect("merged final Tasks handler must route requests");
         assert!(response.error.is_none());
+        assert_eq!(
+            response.result.as_ref().map(|result| &result["taskId"]),
+            Some(&serde_json::json!(task_id.as_str())),
+        );
+        let task_before = serde_json::to_vec(&runtime.get_task(&task_id).unwrap()).unwrap();
+        let notifications_before = {
+            let notifications = delivered.lock().unwrap();
+            serde_json::to_vec(&*notifications).unwrap()
+        };
+        for missing in ["io.modelcontextprotocol/tasks", "com.example/echo"] {
+            let mut denied_params = get_params.clone();
+            denied_params
+                .pointer_mut("/_meta/io.modelcontextprotocol~1clientCapabilities/extensions")
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .remove(missing);
+            let denied = block_on(server.dispatch_stateless(
+                &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
+                &JsonRpcRequest::new(fastmcp_protocol::TASK_CANCEL, Some(denied_params), 71_i64),
+            ))
+            .expect("an undeclared capability returns a response");
+            assert_eq!(
+                denied.error.expect("missing capability must reject").code,
+                i32::from(McpErrorCode::InvalidParams).into(),
+            );
+            assert!(denied.result.is_none());
+            assert_eq!(
+                serde_json::to_vec(&runtime.get_task(&task_id).unwrap()).unwrap(),
+                task_before,
+                "rejected cancellation cannot mutate the retained Task",
+            );
+            let notifications_after = {
+                let notifications = delivered.lock().unwrap();
+                serde_json::to_vec(&*notifications).unwrap()
+            };
+            assert_eq!(notifications_after, notifications_before);
+        }
+        let cancelled = block_on(server.dispatch_stateless(
+            &InboundRequestContext::new(Cx::for_testing(), 71, InboundRequestTransport::Memory),
+            &JsonRpcRequest::new(fastmcp_protocol::TASK_CANCEL, Some(get_params), 71_i64),
+        ))
+        .expect("restoring both declarations admits the same cancellation");
+        assert!(cancelled.error.is_none());
+        assert_eq!(
+            cancelled.result,
+            Some(serde_json::json!({"resultType": "complete"})),
+        );
+        assert!(matches!(
+            runtime.get_task(&task_id).unwrap().task,
+            fastmcp_protocol::Task::Cancelled(_)
+        ));
     }
 
     #[cfg(feature = "tasks")]
