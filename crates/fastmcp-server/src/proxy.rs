@@ -1199,6 +1199,19 @@ pub trait ProxyBackend: Send {
         None
     }
 
+    /// Whether the selected upstream advertises the catalog containing `method`.
+    ///
+    /// Native backends read their admitted discover/initialize snapshot. This
+    /// method runs under the route mutex and must perform only bounded local
+    /// reads: no initialization, I/O, or future polling. An unavailable or
+    /// invalid snapshot is an error, not evidence that a catalog is absent.
+    /// Custom asynchronous backends provide all four catalogs by default and
+    /// may explicitly narrow that set. Advertised catalog failures stay errors.
+    fn supports_catalog_method(&self, method: &str) -> McpResult<bool> {
+        catalog_capability(method)?;
+        Ok(true)
+    }
+
     /// Reserves an independently owned asynchronous core request.
     ///
     /// This method runs under the route mutex, so it may only perform bounded
@@ -2935,6 +2948,24 @@ fn collect_proxy_catalog_pages<T: Serialize>(
 }
 
 impl ProxyBackend for Client {
+    fn supports_catalog_method(&self, method: &str) -> McpResult<bool> {
+        let capability = catalog_capability(method)?;
+        match self.selected_protocol_era() {
+            Some(ProtocolEra::Modern2026) => {
+                let discovery = self.server_discovery().ok_or_else(|| {
+                    McpError::invalid_request("Proxy client has no admitted discovery snapshot")
+                })?;
+                discovery_supports_final_capability(discovery, capability)
+            }
+            Some(ProtocolEra::Legacy2024) => {
+                legacy_supports_catalog(self.server_capabilities(), method)
+            }
+            None => Err(McpError::invalid_request(
+                "Proxy client has no initialized catalog capabilities",
+            )),
+        }
+    }
+
     #[cfg(feature = "tasks")]
     fn start_final_stdio_task_control(
         &mut self,
@@ -6817,8 +6848,8 @@ pub struct ProxyHttpClient {
     next_request_id: i64,
     #[cfg(feature = "legacy-2024-11-05")]
     legacy_initialized: bool,
-    /// Upstream initialize advertised `capabilities.completions`.
-    legacy_completion_supported: bool,
+    /// Exact capabilities retained only after a valid upstream initialize.
+    legacy_server_capabilities: Option<fastmcp_protocol::ServerCapabilities>,
     instructions: Option<String>,
     implementation: Option<Implementation>,
     inbound_legacy_reverse: Arc<Mutex<Option<McpContext>>>,
@@ -6912,7 +6943,7 @@ impl ProxyHttpClient {
             next_request_id,
             #[cfg(feature = "legacy-2024-11-05")]
             legacy_initialized: false,
-            legacy_completion_supported: false,
+            legacy_server_capabilities: None,
             instructions,
             implementation,
             inbound_legacy_reverse: Arc::new(Mutex::new(None)),
@@ -7181,7 +7212,7 @@ impl ProxyHttpClient {
             ));
         }
         self.instructions = initialized.instructions.filter(|value| !value.is_empty());
-        self.legacy_completion_supported = initialized.capabilities.completions.is_some();
+        self.legacy_server_capabilities = Some(initialized.capabilities);
         Ok(())
     }
 
@@ -7226,6 +7257,10 @@ impl ProxyHttpClient {
         method: &str,
         mut decode: impl FnMut(CoreResult) -> McpResult<(Vec<T>, Option<String>)>,
     ) -> McpResult<Vec<T>> {
+        self.ensure_legacy_initialized_async().await?;
+        if !self.supports_catalog_method(method)? {
+            return Ok(Vec::new());
+        }
         let mut entries = Vec::new();
         let mut cursor = None;
         let mut admission = ProxyCatalogAdmission::default();
@@ -7623,6 +7658,26 @@ impl ProxyHttpClient {
 }
 
 impl ProxyBackend for ProxyHttpClient {
+    fn supports_catalog_method(&self, method: &str) -> McpResult<bool> {
+        let capability = catalog_capability(method)?;
+        match self.binding.era() {
+            ProtocolEra::Modern2026 => {
+                let discovery = self.connection.server_discovery().ok_or_else(|| {
+                    McpError::invalid_request("Proxy HTTP client has no admitted discovery snapshot")
+                })?;
+                discovery_supports_final_capability(&discovery, capability)
+            }
+            ProtocolEra::Legacy2024 => {
+                let capabilities = self.legacy_server_capabilities.as_ref().ok_or_else(|| {
+                    McpError::invalid_request(
+                        "Proxy HTTP client has no initialized catalog capabilities",
+                    )
+                })?;
+                legacy_supports_catalog(capabilities, method)
+            }
+        }
+    }
+
     fn upstream_instructions(&self) -> McpResult<Option<String>> {
         Ok(self.instructions.clone())
     }
@@ -7761,6 +7816,17 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_tool_catalog(&mut self) -> McpResult<ProxyToolCatalog> {
+        if self.binding.era() == ProtocolEra::Legacy2024 {
+            self.ensure_legacy_initialized()?;
+        }
+        if !self.supports_catalog_method(fastmcp_protocol::methods::TOOLS_LIST)? {
+            return Ok(match self.binding.era() {
+                ProtocolEra::Legacy2024 => ProxyToolCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => {
+                    ProxyToolCatalog::Final(ProxyFinalCatalog::new(Vec::new()))
+                }
+            });
+        }
         match self.binding.era() {
             ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
                 "legacy",
@@ -7825,6 +7891,17 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_resource_catalog(&mut self) -> McpResult<ProxyResourceCatalog> {
+        if self.binding.era() == ProtocolEra::Legacy2024 {
+            self.ensure_legacy_initialized()?;
+        }
+        if !self.supports_catalog_method(fastmcp_protocol::methods::RESOURCES_LIST)? {
+            return Ok(match self.binding.era() {
+                ProtocolEra::Legacy2024 => ProxyResourceCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => {
+                    ProxyResourceCatalog::Final(ProxyFinalCatalog::new(Vec::new()))
+                }
+            });
+        }
         match self.binding.era() {
             ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
                 "legacy",
@@ -7876,6 +7953,17 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_resource_template_catalog(&mut self) -> McpResult<ProxyResourceTemplateCatalog> {
+        if self.binding.era() == ProtocolEra::Legacy2024 {
+            self.ensure_legacy_initialized()?;
+        }
+        if !self.supports_catalog_method(fastmcp_protocol::methods::RESOURCES_TEMPLATES_LIST)? {
+            return Ok(match self.binding.era() {
+                ProtocolEra::Legacy2024 => ProxyResourceTemplateCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => {
+                    ProxyResourceTemplateCatalog::Final(ProxyFinalCatalog::new(Vec::new()))
+                }
+            });
+        }
         match self.binding.era() {
             ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
                 "legacy",
@@ -7929,6 +8017,17 @@ impl ProxyBackend for ProxyHttpClient {
     }
 
     fn list_prompt_catalog(&mut self) -> McpResult<ProxyPromptCatalog> {
+        if self.binding.era() == ProtocolEra::Legacy2024 {
+            self.ensure_legacy_initialized()?;
+        }
+        if !self.supports_catalog_method(fastmcp_protocol::methods::PROMPTS_LIST)? {
+            return Ok(match self.binding.era() {
+                ProtocolEra::Legacy2024 => ProxyPromptCatalog::Legacy(Vec::new()),
+                ProtocolEra::Modern2026 => {
+                    ProxyPromptCatalog::Final(ProxyFinalCatalog::new(Vec::new()))
+                }
+            });
+        }
         match self.binding.era() {
             ProtocolEra::Legacy2024 => collect_proxy_catalog_pages(
                 "legacy",
@@ -7974,7 +8073,10 @@ impl ProxyBackend for ProxyHttpClient {
         match self.binding.era() {
             ProtocolEra::Legacy2024 => {
                 self.ensure_legacy_initialized()?;
-                Ok(self.legacy_completion_supported)
+                Ok(self
+                    .legacy_server_capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.completions.is_some()))
             }
             ProtocolEra::Modern2026 => Ok(self
                 .connection
@@ -8993,6 +9095,27 @@ fn discovery_supports_final_capability(
         ))
     })?;
     Ok(capabilities.get(capability).is_some())
+}
+
+fn catalog_capability(method: &str) -> McpResult<&'static str> {
+    match method {
+        "tools/list" => Ok("tools"),
+        "resources/list" | "resources/templates/list" => Ok("resources"),
+        "prompts/list" => Ok("prompts"),
+        _ => Err(McpError::invalid_params("Not a proxy catalog method")),
+    }
+}
+
+fn legacy_supports_catalog(
+    capabilities: &fastmcp_protocol::ServerCapabilities,
+    method: &str,
+) -> McpResult<bool> {
+    match method {
+        "tools/list" => Ok(capabilities.tools.is_some()),
+        "resources/list" | "resources/templates/list" => Ok(capabilities.resources.is_some()),
+        "prompts/list" => Ok(capabilities.prompts.is_some()),
+        _ => Err(McpError::invalid_params("Not a proxy catalog method")),
+    }
 }
 
 fn discovery_supports_final_completion(discovery: &ServerDiscoverResult) -> McpResult<bool> {
@@ -10695,6 +10818,9 @@ impl ProxyClient {
             -> McpResult<(Vec<T>, Option<String>, Option<ProxyCatalogCacheHint>)>,
     ) -> McpResult<ProxyFinalCatalog<T>> {
         let mut catalog = ProxyFinalCatalog::new(Vec::new());
+        if !self.with_backend(|backend| backend.supports_catalog_method(method))? {
+            return Ok(catalog);
+        }
         let mut cursor = None;
         let mut admission = ProxyCatalogAdmission::default();
         let era = if self.upstream_binding.map(|binding| binding.era())
@@ -19478,9 +19604,9 @@ IFS= read -r end
                     continue;
                 }
                 let result = if legacy {
-                    serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{}, "serverInfo":{"name":"registry-peer","version":"1"}})
+                    serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{"tools":{},"resources":{},"prompts":{}}, "serverInfo":{"name":"registry-peer","version":"1"}})
                 } else {
-                    serde_json::json!({"supportedVersions":["2026-07-28"], "capabilities":{"tools":{}}, "ttlMs":0,"cacheScope":"private"})
+                    serde_json::json!({"supportedVersions":["2026-07-28"], "capabilities":{"tools":{},"resources":{},"prompts":{}}, "ttlMs":0,"cacheScope":"private"})
                 };
                 let response =
                     serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result});
@@ -20051,14 +20177,10 @@ IFS= read -r end
         ));
         std::fs::create_dir(&control).unwrap();
         let subject = control.file_name().unwrap().to_str().unwrap().to_owned();
-        let opening = if legacy {
-            scripted_response_line(
-                1,
-                serde_json::json!({"protocolVersion":"2024-11-05", "capabilities":{}, "serverInfo":{"name":subject,"version":"1"}}),
-            )
-        } else {
-            modern_discovery_response_line(&subject, &["2026-07-28"])
-        };
+        let opening = scripted_response_line(
+            1,
+            catalog_capability_opening(legacy, 7, CatalogCapabilityFault::None),
+        );
         // Capture actual requests. Notifications consume no response ID and
         // may include the cancellation of an abandoned catalog page.
         let mut script = format!(
@@ -29003,6 +29125,536 @@ exec sleep 2
             .expect("flush native HTTP discovery response");
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CatalogCapabilityFault {
+        None,
+        MethodError,
+        MalformedPage,
+        MalformedCapabilities,
+    }
+
+    fn advertised_catalog_methods(mask: u8) -> Vec<&'static str> {
+        [
+            (1, "tools/list"),
+            (2, "resources/list"),
+            (2, "resources/templates/list"),
+            (4, "prompts/list"),
+        ]
+        .into_iter()
+        .filter_map(|(bit, method)| (mask & bit != 0).then_some(method))
+        .collect()
+    }
+
+    fn catalog_capability_opening(
+        legacy: bool,
+        mask: u8,
+        fault: CatalogCapabilityFault,
+    ) -> serde_json::Value {
+        let mut capabilities = serde_json::json!({});
+        for (bit, name) in [(1, "tools"), (2, "resources"), (4, "prompts")] {
+            if mask & bit != 0 {
+                capabilities[name] = serde_json::json!({});
+            }
+        }
+        if fault == CatalogCapabilityFault::MalformedCapabilities {
+            capabilities["tools"] = serde_json::json!(false);
+        }
+        if legacy {
+            serde_json::json!({
+                "protocolVersion":"2024-11-05", "capabilities":capabilities,
+                "serverInfo":{"name":"selective-catalog-peer","version":"1"}
+            })
+        } else {
+            serde_json::json!({
+                "supportedVersions":["2026-07-28"], "capabilities":capabilities,
+                "ttlMs":0, "cacheScope":"private"
+            })
+        }
+    }
+
+    fn catalog_capability_reply(
+        legacy: bool,
+        method: &str,
+        fault: CatalogCapabilityFault,
+        id: serde_json::Value,
+    ) -> serde_json::Value {
+        if fault == CatalogCapabilityFault::MethodError {
+            return serde_json::json!({
+                "jsonrpc":"2.0", "id":id,
+                "error":{"code":-32601,"message":"advertised catalog unavailable"}
+            });
+        }
+        let (member, entry) = match method {
+            "tools/list" => (
+                "tools",
+                serde_json::json!({"name":"selective-tool","inputSchema":{"type":"object"}}),
+            ),
+            "resources/list" => (
+                "resources",
+                serde_json::json!({"name":"selective-resource","uri":"file:///selective/resource"}),
+            ),
+            "resources/templates/list" => (
+                "resourceTemplates",
+                serde_json::json!({"name":"selective-template","uriTemplate":"file:///selective/{id}"}),
+            ),
+            "prompts/list" => ("prompts", serde_json::json!({"name":"selective-prompt"})),
+            _ => panic!("unexpected catalog method {method}"),
+        };
+        let mut result = serde_json::json!({});
+        result[member] = if fault == CatalogCapabilityFault::MalformedPage {
+            serde_json::json!({"not":"an array"})
+        } else {
+            serde_json::json!([entry])
+        };
+        if !legacy {
+            result["resultType"] = serde_json::json!("complete");
+            result["ttlMs"] = serde_json::json!(0);
+            result["cacheScope"] = serde_json::json!("private");
+        }
+        serde_json::json!({"jsonrpc":"2.0", "id":id, "result":result})
+    }
+
+    fn assert_selective_catalog(
+        result: fastmcp_core::McpResult<super::ProxyTypedCatalog>,
+        observed: &[String],
+        legacy: bool,
+        mask: u8,
+        fault: CatalogCapabilityFault,
+    ) {
+        let mut expected: Vec<String> = advertised_catalog_methods(mask)
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        match fault {
+            CatalogCapabilityFault::None => {
+                let catalog = ProxyCatalog::from_typed_catalog(
+                    result.expect("advertised catalogs remain usable"),
+                )
+                .unwrap();
+                let actual = if legacy {
+                    assert_eq!(catalog.era().unwrap(), ProtocolEra::Legacy2024);
+                    [
+                        catalog.tools.len(),
+                        catalog.resources.len(),
+                        catalog.resource_templates.len(),
+                        catalog.prompts.len(),
+                    ]
+                } else {
+                    assert_eq!(catalog.era().unwrap(), ProtocolEra::Modern2026);
+                    [
+                        catalog.final_tools.len(),
+                        catalog.final_resources.len(),
+                        catalog.final_resource_templates.len(),
+                        catalog.final_prompts.len(),
+                    ]
+                };
+                assert_eq!(
+                    actual,
+                    [
+                        usize::from(mask & 1 != 0),
+                        usize::from(mask & 2 != 0),
+                        usize::from(mask & 2 != 0),
+                        usize::from(mask & 4 != 0),
+                    ]
+                );
+            }
+            CatalogCapabilityFault::MethodError => {
+                let error =
+                    result.expect_err("an advertised method failure cannot become an empty catalog");
+                assert_eq!(error.code, McpErrorCode::MethodNotFound);
+                assert!(error.message.contains("advertised catalog unavailable"));
+                expected.truncate(1);
+            }
+            CatalogCapabilityFault::MalformedPage => {
+                assert!(
+                    result.is_err(),
+                    "malformed advertised page must fail atomically"
+                );
+                expected.truncate(1);
+            }
+            CatalogCapabilityFault::MalformedCapabilities => {
+                assert!(
+                    result.is_err(),
+                    "malformed capabilities cannot masquerade as absent"
+                );
+                expected.clear();
+            }
+        }
+        assert_eq!(
+            observed,
+            expected.as_slice(),
+            "no request is sent for an unadvertised catalog"
+        );
+    }
+
+    #[cfg(unix)]
+    fn proxy_stdio_catalog_capabilities_probe(
+        legacy: bool,
+        asynchronous: bool,
+        mask: u8,
+        fault: CatalogCapabilityFault,
+    ) {
+        let control = std::env::temp_dir().join(format!(
+            "fastmcp-selective-catalog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&control).unwrap();
+        let requests = control.join("requests");
+        std::fs::write(&requests, b"").unwrap();
+        let opening = scripted_response_line(1, catalog_capability_opening(legacy, mask, fault));
+        let method = if legacy { "initialize" } else { "server/discover" };
+        let mut script = format!(
+            "expect_method() {{\nIFS= read -r request || exit 91\nprintf '%s\\n' \"$request\" >> \"$1/requests\"\ncase \"$request\" in *\"\\\"method\\\":\\\"$2\\\"\"*) ;; *) exit 92;; esac\n}}\nexpect_method \"$1\" {method}\nprintf '%s\\n' '{opening}'\n"
+        );
+        if legacy {
+            script.push_str("expect_method \"$1\" notifications/initialized\n");
+        }
+        if fault != CatalogCapabilityFault::MalformedCapabilities {
+            for (index, method) in advertised_catalog_methods(mask).into_iter().enumerate() {
+                let response =
+                    catalog_capability_reply(legacy, method, fault, serde_json::json!(index + 2));
+                script.push_str(&format!(
+                    "expect_method \"$1\" {method}\nprintf '%s\\n' '{response}'\n"
+                ));
+                if fault != CatalogCapabilityFault::None {
+                    break;
+                }
+            }
+        }
+        // An unexpected extra RPC closes the pipe promptly, rather than
+        // allowing a regressed client to hang on an unadvertised method.
+        script.push_str("while IFS= read -r request; do\nprintf '%s\\n' \"$request\" >> \"$1/requests\"\ncase \"$request\" in *'\"id\":'*) exit 93;; esac\ndone\n");
+        let cx = caller_runtime_cx();
+        let policy = if legacy {
+            ProtocolPolicy::LegacyOnly
+        } else {
+            ProtocolPolicy::ModernOnly
+        };
+        let connected = poll_on_cx(
+            &cx,
+            fastmcp_client::ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(policy))
+                .request_timeout_policy(scripted_peer_timeout_policy())
+                .connect_stdio_with_cx(
+                    &cx,
+                    "sh",
+                    &[
+                        "-c",
+                        &script,
+                        "selective-catalog-peer",
+                        control.to_str().unwrap(),
+                    ],
+                ),
+        );
+        let result = connected.and_then(|mut client| {
+            if asynchronous {
+                let proxy = ProxyClient::from_client(client)?;
+                let result = poll_on_cx(&cx, proxy.catalog_typed_with_cx(&cx));
+                drop(proxy);
+                result
+            } else {
+                let result = super::ProxyTypedCatalog::from_backend(&mut client);
+                client.close().expect("selective stdio peer cleanup settles");
+                result
+            }
+        });
+        let observed: Vec<String> = std::fs::read_to_string(requests)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter_map(|request| {
+                request["method"]
+                    .as_str()
+                    .filter(|method| method.ends_with("/list"))
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_selective_catalog(result, &observed, legacy, mask, fault);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_catalog_capabilities_positive() {
+        for asynchronous in [false, true] {
+            for mask in [0, 1, 2, 4, 7] {
+                proxy_stdio_catalog_capabilities_probe(
+                    false,
+                    asynchronous,
+                    mask,
+                    CatalogCapabilityFault::None,
+                );
+                #[cfg(feature = "legacy-2024-11-05")]
+                proxy_stdio_catalog_capabilities_probe(
+                    true,
+                    asynchronous,
+                    mask,
+                    CatalogCapabilityFault::None,
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_catalog_capabilities_planted_negative() {
+        for asynchronous in [false, true] {
+            for fault in [
+                CatalogCapabilityFault::MethodError,
+                CatalogCapabilityFault::MalformedPage,
+                CatalogCapabilityFault::MalformedCapabilities,
+            ] {
+                proxy_stdio_catalog_capabilities_probe(false, asynchronous, 1, fault);
+                #[cfg(feature = "legacy-2024-11-05")]
+                proxy_stdio_catalog_capabilities_probe(true, asynchronous, 1, fault);
+            }
+        }
+    }
+
+    fn proxy_http_catalog_capabilities_probe(
+        legacy: bool,
+        asynchronous: bool,
+        mask: u8,
+        fault: CatalogCapabilityFault,
+        direct_legacy_constructor: bool,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StopPeer(Arc<AtomicBool>);
+        impl Drop for StopPeer {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let sse_target = format!("http://{address}/sse");
+        let message_target = format!("http://{address}/message");
+        let plan = if legacy {
+            legacy_only_http_proxy_plan(&sse_target, &message_target)
+        } else {
+            ClientProtocolPlan::http(
+                ProtocolPolicy::ModernOnly,
+                Some(CanonicalHttpUrl::parse(&format!("http://{address}/mcp")).unwrap()),
+                None,
+                None,
+                "selective".into(),
+                "selective".into(),
+                "selective".into(),
+                1,
+                1,
+                0,
+            )
+            .unwrap()
+        };
+        let stop = StopPeer(Arc::new(AtomicBool::new(false)));
+        let stopped = Arc::clone(&stop.0);
+        let peer = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let mut sse = None;
+            let mut observed = Vec::new();
+            while !stopped.load(Ordering::Acquire) {
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "selective HTTP peer is bounded");
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("selective HTTP accept failed: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let captured = read_http_request(&mut stream);
+                if captured.head.starts_with("GET ") {
+                    assert!(legacy && sse.is_none());
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+                        .unwrap();
+                    write_chunked_sse_event(
+                        &mut stream,
+                        format!("event: endpoint\ndata: {message_target}\n\n").as_bytes(),
+                    );
+                    stream.flush().unwrap();
+                    sse = Some(stream);
+                    continue;
+                }
+                let request: serde_json::Value = serde_json::from_slice(&captured.body).unwrap();
+                let method = request["method"].as_str().unwrap();
+                if method == "notifications/initialized" {
+                    assert!(legacy);
+                    write_http_response(&mut stream, 202, "application/json", b"");
+                    continue;
+                }
+                let response = if method == "initialize" || method == "server/discover" {
+                    assert_eq!(method, if legacy { "initialize" } else { "server/discover" });
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":catalog_capability_opening(legacy, mask, fault)})
+                } else {
+                    observed.push(method.to_owned());
+                    let advertised = advertised_catalog_methods(mask).contains(&method);
+                    catalog_capability_reply(
+                        legacy,
+                        method,
+                        if advertised {
+                            fault
+                        } else {
+                            CatalogCapabilityFault::MethodError
+                        },
+                        request["id"].clone(),
+                    )
+                };
+                if legacy {
+                    write_http_response(&mut stream, 202, "application/json", b"");
+                    let sse = sse.as_mut().expect("legacy SSE exists before any POST");
+                    write_chunked_sse_event(
+                        sse,
+                        format!("event: message\ndata: {response}\n\n").as_bytes(),
+                    );
+                    sse.flush().unwrap();
+                } else {
+                    write_http_response(
+                        &mut stream,
+                        200,
+                        "application/json",
+                        &serde_json::to_vec(&response).unwrap(),
+                    );
+                }
+            }
+            observed
+        });
+        let cx = caller_runtime_cx();
+        let result = if direct_legacy_constructor {
+            #[cfg(feature = "legacy-2024-11-05")]
+            {
+                let opened = poll_on_cx(
+                    &cx,
+                    ProxyClient::connect_legacy_http_with_protocol_plan_and_catalog(
+                        cx.clone(),
+                        1,
+                        plan,
+                        proxy_http_client_info(),
+                        ClientCapabilities::default(),
+                    ),
+                );
+                opened.map(|(proxy, catalog)| {
+                    drop(proxy);
+                    catalog
+                })
+            }
+            #[cfg(not(feature = "legacy-2024-11-05"))]
+            unreachable!("exact-2024 test is gated by its feature")
+        } else if asynchronous {
+            poll_on_cx(&cx, async {
+                let mut registry = ProxyClient::upstream_binding_registry();
+                let proxy = registry
+                    .connect_http_with_protocol_plan(
+                        &cx,
+                        "selective",
+                        "selective",
+                        1,
+                        plan,
+                        proxy_http_client_info(),
+                        ClientCapabilities::default(),
+                    )
+                    .await?;
+                proxy.catalog_typed_with_cx(&cx).await
+            })
+        } else {
+            let connected = poll_on_cx(
+                &cx,
+                ClientHttpConnection::connect(
+                    &cx,
+                    plan.clone(),
+                    proxy_http_client_info(),
+                    ClientCapabilities::default(),
+                ),
+            );
+            connected
+                .map_err(super::proxy_http_connection_error)
+                .and_then(|connection| {
+                    let binding =
+                        super::binding_from_live_http_connection(&connection, plan.policy(), 1)?;
+                    let mut backend = ProxyHttpClient::new(
+                        binding,
+                        connection,
+                        cx.clone(),
+                        proxy_http_client_info(),
+                        ClientCapabilities::default(),
+                    );
+                    if legacy {
+                        let before = backend.next_request_id;
+                        assert!(backend.supports_catalog_method("tools/list").is_err());
+                        assert_eq!(
+                            backend.next_request_id, before,
+                            "capability query cannot initialize or reserve an ID"
+                        );
+                    }
+                    super::ProxyTypedCatalog::from_backend(&mut backend)
+                })
+        };
+        drop(stop);
+        let observed = peer.join().unwrap();
+        assert_selective_catalog(result, &observed, legacy, mask, fault);
+    }
+
+    #[test]
+    fn proxy_http_catalog_capabilities_positive() {
+        for asynchronous in [false, true] {
+            for mask in [0, 1, 2, 4, 7] {
+                proxy_http_catalog_capabilities_probe(
+                    false,
+                    asynchronous,
+                    mask,
+                    CatalogCapabilityFault::None,
+                    false,
+                );
+                #[cfg(feature = "legacy-2024-11-05")]
+                proxy_http_catalog_capabilities_probe(
+                    true,
+                    asynchronous,
+                    mask,
+                    CatalogCapabilityFault::None,
+                    false,
+                );
+            }
+        }
+        #[cfg(feature = "legacy-2024-11-05")]
+        for mask in [0, 1, 2, 4, 7] {
+            proxy_http_catalog_capabilities_probe(
+                true,
+                true,
+                mask,
+                CatalogCapabilityFault::None,
+                true,
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_http_catalog_capabilities_planted_negative() {
+        for fault in [
+            CatalogCapabilityFault::MethodError,
+            CatalogCapabilityFault::MalformedPage,
+            CatalogCapabilityFault::MalformedCapabilities,
+        ] {
+            for asynchronous in [false, true] {
+                proxy_http_catalog_capabilities_probe(false, asynchronous, 1, fault, false);
+                #[cfg(feature = "legacy-2024-11-05")]
+                proxy_http_catalog_capabilities_probe(true, asynchronous, 1, fault, false);
+            }
+            #[cfg(feature = "legacy-2024-11-05")]
+            proxy_http_catalog_capabilities_probe(true, true, 1, fault, true);
+        }
+    }
+
     fn http_proxy_plan(
         modern_target: &str,
         legacy_sse_target: &str,
@@ -29687,7 +30339,7 @@ expect_request notifications/initialized '' absent
             let probe_request = read_http_request(&mut probe);
             write_http_discovery_response(
                 &mut probe,
-                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"prompts":{}},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
             let responses = [
@@ -29919,7 +30571,7 @@ expect_request notifications/initialized '' absent
                 (
                     "initialize",
                     Some(
-                        serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"legacy-proxy-peer","version":"1.0.0"}}),
+                        serde_json::json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{},"resources":{},"prompts":{}},"serverInfo":{"name":"legacy-proxy-peer","version":"1.0.0"}}),
                     ),
                 ),
                 ("notifications/initialized", None),
@@ -30902,7 +31554,7 @@ expect_request notifications/initialized '' absent
             let probe_request = read_http_request(&mut probe);
             write_http_discovery_response(
                 &mut probe,
-                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"private"}}"#,
             );
 
             let (mut request, _) = listener
@@ -31135,7 +31787,7 @@ expect_request notifications/initialized '' absent
                 let probe_request = read_http_request(&mut probe);
                 write_http_discovery_response(
                     &mut probe,
-                    br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
+                    br#"{"jsonrpc":"2.0","id":1,"result":{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"prompts":{}},"ttlMs":0,"cacheScope":"private"}}"#,
                 );
 
                 let mut requests = Vec::new();
@@ -31224,7 +31876,12 @@ expect_request notifications/initialized '' absent
             let expected_message_target = legacy_message_target.clone();
             let initialize_result = serde_json::to_value(fastmcp_protocol::InitializeResult {
                 protocol_version: fastmcp_protocol::PROTOCOL_VERSION.to_owned(),
-                capabilities: fastmcp_protocol::ServerCapabilities::default(),
+                capabilities: fastmcp_protocol::ServerCapabilities {
+                    tools: Some(Default::default()),
+                    resources: Some(Default::default()),
+                    prompts: Some(Default::default()),
+                    ..Default::default()
+                },
                 server_info: fastmcp_protocol::ServerInfo {
                     name: "legacy-id-mismatch-peer".to_owned(),
                     version: "1.0.0".to_owned(),
