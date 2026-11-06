@@ -310,12 +310,13 @@ pub mod client {
         FinalCacheTtlDiagnostic, FinalResultCache, HttpClient, HttpClientError,
         HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
         MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
-        MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryRequestEvent,
-        MemoryRequestExecution, OpaquePagination, PaginationBounds, PendingRequestRecord,
-        ProgressCallback, Request, RequestExecution, RequestExecutor, RequestTimeoutPolicy,
-        RequestTimeoutSource, ReverseRequest, ReverseRequestCancellation, StdioRequestExecution,
-        StdioRequestExecutor, StdioSubscriptionEvent, SubscriptionFilter,
-        SubscriptionListenCollector, SubscriptionTimeoutPolicy,
+        MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
+        MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, OpaquePagination,
+        PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
+        RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
+        ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
+        StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
+        SubscriptionTimeoutPolicy,
     };
     /// Tasks client APIs are available only with the official Tasks extension.
     #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
@@ -752,6 +753,7 @@ pub use fastmcp_protocol::extensions::{
     MAX_EXTENSION_SETTINGS_ENTRIES, MAX_EXTENSION_SETTINGS_KEY_BYTES,
     MAX_EXTENSION_SETTINGS_NESTING, MAX_EXTENSION_SETTINGS_VALUE_BYTES,
     MAX_STDIO_CORRELATION_METHODS, NegotiatedExtension, NegotiatedExtensionSet,
+    NotificationActivationProofDescriptor, NotificationActivationProofLocation,
     ServerExtensionDiscovery, StdioCorrelationDescriptor,
 };
 
@@ -1091,9 +1093,10 @@ pub use fastmcp_client::{
     FinalCacheTtlDiagnostic, FinalResultCache, HttpClient, HttpClientError,
     HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY, MAX_FINAL_CACHE_MAX_BYTES,
     MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
-    MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryRequestEvent, MemoryRequestExecution,
-    OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback, Request,
-    RequestExecution, RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
+    MAX_HTTP_RETAINED_EXECUTION_BYTES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
+    MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, OpaquePagination,
+    PaginationBounds, PendingRequestRecord, ProgressCallback, Request, RequestExecution,
+    RequestExecutor, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequest,
     ReverseRequestCancellation, StdioRequestExecution, StdioRequestExecutor,
     StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
     SubscriptionTimeoutPolicy,
@@ -1744,6 +1747,24 @@ pub mod auto {
         {
             self.inner
                 .request_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+        /// Publishes one configured extension notification with fresh settings proof.
+        /// Auto sessions selected to exact 2024 reject before writing a frame.
+        /// This does not allocate a request ID or wait for a response.
+        pub async fn notify_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .notify_final_extension(cx, extension_id, method, parameters)
                 .await
         }
 
@@ -3018,11 +3039,11 @@ pub mod modern {
         HttpClientError, HttpSubscriptionListener, ListPageLimits, MAX_FINAL_CACHE_CAPACITY,
         MAX_FINAL_CACHE_MAX_BYTES, MAX_HTTP_EXECUTION_REQUEST_BYTES, MAX_HTTP_IN_FLIGHT_EXECUTIONS,
         MAX_HTTP_RETAINED_EXECUTION_BYTES, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
-        MAX_MRTR_TOTAL_INPUT_RESPONSES, MemoryClient, MemoryRequestEvent, MemoryRequestExecution,
-        MrtrInputResponses, OpaquePagination, PaginationBounds, PendingRequestRecord,
-        ProgressCallback, RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequestHandlers,
-        StdioSubscriptionEvent, SubscriptionFilter, SubscriptionListenCollector,
-        SubscriptionTimeoutPolicy,
+        MAX_MRTR_TOTAL_INPUT_RESPONSES, MemoryClient, MemoryClientBuilder, MemoryExtensionEvent,
+        MemoryExtensionExecution, MemoryRequestEvent, MemoryRequestExecution, MrtrInputResponses,
+        OpaquePagination, PaginationBounds, PendingRequestRecord, ProgressCallback,
+        RequestTimeoutPolicy, RequestTimeoutSource, ReverseRequestHandlers, StdioSubscriptionEvent,
+        SubscriptionFilter, SubscriptionListenCollector, SubscriptionTimeoutPolicy,
     };
     pub use fastmcp_core::{
         CanonicalHttpUrl, ClientCapabilityInfo, ClientImplementationInfo, ClientRoot, Cx,
@@ -3060,6 +3081,7 @@ pub mod modern {
         MAX_EXTENSION_SETTINGS_ENTRIES, MAX_EXTENSION_SETTINGS_KEY_BYTES,
         MAX_EXTENSION_SETTINGS_NESTING, MAX_EXTENSION_SETTINGS_VALUE_BYTES,
         MAX_STDIO_CORRELATION_METHODS, NegotiatedExtension, NegotiatedExtensionSet,
+        NotificationActivationProofDescriptor, NotificationActivationProofLocation,
         ServerExtensionDiscovery, StdioCorrelationDescriptor,
     };
     pub use fastmcp_protocol::methods::Final2026Peer;
@@ -3150,6 +3172,7 @@ pub mod modern {
             MAX_EXTENSION_SETTINGS_ENTRIES, MAX_EXTENSION_SETTINGS_KEY_BYTES,
             MAX_EXTENSION_SETTINGS_NESTING, MAX_EXTENSION_SETTINGS_VALUE_BYTES,
             MAX_STDIO_CORRELATION_METHODS, NegotiatedExtension, NegotiatedExtensionSet,
+            NotificationActivationProofDescriptor, NotificationActivationProofLocation,
             ServerExtensionDiscovery, StdioCorrelationDescriptor,
         };
 
@@ -4613,6 +4636,24 @@ pub mod modern {
                 .await
         }
 
+        /// Publishes one configured extension notification with fresh settings proof.
+        /// This uses the caller's runtime and does not allocate a request ID or
+        /// wait for a response. An interrupted frame is never replayed.
+        pub async fn notify_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<()>
+        where
+            IO: Send + 'static,
+        {
+            self.inner
+                .notify_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
         /// Reads a resource through the pinned modern WebSocket session,
         /// following bounded MRTR continuations to its typed terminal result.
         pub async fn read_resource_with_mrtr_retry<F>(
@@ -4765,6 +4806,21 @@ pub mod modern {
     impl Client {
         fn from_inner(inner: fastmcp_client::Client) -> Self {
             Self { inner }
+        }
+
+        /// Publishes one configured extension notification through modern stdio.
+        /// Deferred discovery runs on the caller's runtime. Every notification
+        /// carries fresh settings proof and consumes no request ID or waiter.
+        pub async fn notify_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<()> {
+            self.inner
+                .notify_final_extension(cx, extension_id, method, parameters)
+                .await
         }
 
         /// Attaches one Task through a caller-owned modern stdio request.
@@ -5795,6 +5851,21 @@ pub mod modern {
         ) -> Result<JsonValue, HttpClientError> {
             self.inner
                 .request_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+        /// Publishes one configured extension notification with fresh settings proof.
+        /// The HTTP exchange must acknowledge notification acceptance without
+        /// a JSON-RPC response. No request ID or response waiter is allocated.
+        pub async fn notify_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> Result<(), HttpClientError> {
+            self.inner
+                .notify_final_extension(cx, extension_id, method, parameters)
                 .await
         }
 
@@ -11475,6 +11546,9 @@ pub mod prelude {
         McpOutcome,
         McpResult,
         MemoryClient,
+        MemoryClientBuilder,
+        MemoryExtensionEvent,
+        MemoryExtensionExecution,
         MemoryRecvHalf,
         MemoryRequestEvent,
         MemoryRequestExecution,

@@ -1730,6 +1730,140 @@ where
         )
     }
 
+    /// Commits an extension request with its result authority already attached.
+    /// A deferred control retains publication priority without consuming an ID
+    /// generation or allowing a request to escape its admitted result owner.
+    pub(crate) fn execute_external_extension(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: Request,
+        timeout_policy: RequestTimeoutPolicy,
+        admission: ClientExtensionResultAdmission,
+        commit: impl FnOnce(&JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<Option<RequestExecution<T>>> {
+        timeout_policy.validate()?;
+        admission.validate_request(self.protocol_era(), &request.method)?;
+        if !self.state.borrow().external_writes {
+            return Err(McpError::invalid_request(
+                "Executor does not own external writes",
+            ));
+        }
+        self.execute_with_commit(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Request(timeout_policy),
+            Some(cancellation.clone()),
+            Some(admission),
+            |_, _, message| commit(message),
+        )
+    }
+
+    /// Publishes one already-admitted modern notification without allocating a
+    /// request ID, result waiter, execution generation, or correlation charge.
+    /// Ordinary owner maintenance and deferred controls precede application I/O.
+    pub(crate) fn send_notification(&self, cx: &Cx, notification: JsonRpcRequest) -> McpResult<()> {
+        self.send_notification_with_commit(
+            cx,
+            None,
+            notification,
+            false,
+            |transport, cx, message| transport.send(cx, message),
+        )?
+        .then_some(())
+        .ok_or_else(|| {
+            McpError::internal_error("Synchronous notification publication was deferred")
+        })
+    }
+
+    /// Publishes through an owned asynchronous channel's reserved send permit.
+    /// `false` means a newly retired owner's control must be flushed first;
+    /// the callback has not run and the caller can release the unused permit.
+    pub(crate) fn send_external_notification(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        notification: JsonRpcRequest,
+        commit: impl FnOnce(&JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<bool> {
+        self.send_notification_with_commit(
+            cx,
+            Some(cancellation),
+            notification,
+            true,
+            |_, _, message| commit(message),
+        )
+    }
+
+    fn send_notification_with_commit(
+        &self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        notification: JsonRpcRequest,
+        external_writes: bool,
+        commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<bool> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        let checkpoint = || {
+            if cx.checkpoint().is_err()
+                || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+                || (cancellation.is_some()
+                    && cx
+                        .budget()
+                        .deadline
+                        .is_some_and(|deadline| cx.now() >= deadline))
+            {
+                Err(McpError::request_cancelled())
+            } else {
+                Ok(())
+            }
+        };
+        checkpoint()?;
+        if notification.id.is_some() || notification.validate().is_err() {
+            return Err(McpError::invalid_params(
+                "Notification publication requires a valid id-less JSON-RPC notification",
+            ));
+        }
+        // Reject malformed or oversized local messages before servicing any
+        // unrelated owner or entering a transport's potentially pending write.
+        fastmcp_transport::Codec::new()
+            .encode_request(&notification)
+            .map_err(|error| transport_error_to_mcp(TransportError::Codec(error)))?;
+        let mut state = self.state.borrow_mut();
+        if state.external_writes != external_writes {
+            return Err(McpError::invalid_request(
+                "Notification publication does not own this executor's write path",
+            ));
+        }
+        if state.result_peer_era != ResultPeerEra::Modern {
+            return Err(McpError::invalid_params(
+                "Final extension notifications require the modern protocol era",
+            ));
+        }
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        if state.shutdown {
+            return Err(McpError::internal_error(
+                "Client request executor is shut down",
+            ));
+        }
+        self.drain_abandoned_locked(cx, &mut state)?;
+        self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
+        checkpoint()?;
+        if external_writes && state.deferred_control_count() != 0 {
+            return Ok(false);
+        }
+        commit(
+            &mut state.transport,
+            cx,
+            &JsonRpcMessage::Request(notification),
+        )
+        .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
+        Ok(true)
+    }
+
     /// Services original caller lifetimes without attempting transport I/O.
     pub(crate) fn has_external_controls(&self, cx: &Cx) -> McpResult<bool> {
         self.poll_timeouts_at(cx, Instant::now())?;
@@ -5245,6 +5379,214 @@ mod tests {
             .received_frames
             .pop_front()
             .unwrap_or(Err(TransportError::Closed))
+    }
+
+    mod notification_publication {
+        use super::*;
+
+        fn notification() -> JsonRpcRequest {
+            JsonRpcRequest::notification("example/changed", Some(serde_json::json!({"value": 7})))
+        }
+
+        #[test]
+        fn notification_uses_no_request_slot_or_correlation_even_at_capacity() {
+            let cx = Cx::for_testing();
+            let mut executor = RequestExecutor::with_protocol_era(
+                ScriptedTransport::new([]),
+                ProtocolEra::Modern2026,
+            );
+            executor.max_in_flight = 1;
+            executor.max_correlations = 1;
+            let owner = executor.execute(&cx, request(1)).unwrap();
+            let before = OperatorSnapshot::capture(&executor).unwrap();
+            let generation = executor.state.borrow().next_generation;
+            assert!(before.requests().is_saturated());
+            assert!(before.correlations().is_saturated());
+
+            executor.send_notification(&cx, notification()).unwrap();
+            let after = OperatorSnapshot::capture(&executor).unwrap();
+            assert_eq!(after.contributor(), before.contributor());
+            let state = executor.state.borrow();
+            assert_eq!(state.next_generation, generation);
+            assert_eq!(state.transport.io_calls, [2, 0, 0]);
+            let JsonRpcMessage::Request(sent) = &state.transport.sent[1] else {
+                panic!("notification must retain its JSON-RPC envelope");
+            };
+            assert!(sent.id.is_none());
+            assert_eq!(sent.method, "example/changed");
+            drop(state);
+            drop(owner);
+        }
+
+        #[test]
+        fn notification_services_retired_owners_before_application_publication() {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::with_protocol_era(
+                ScriptedTransport::new([]),
+                ProtocolEra::Modern2026,
+            );
+            let owner = executor.execute(&cx, request(1)).unwrap();
+            drop(owner);
+            assert_eq!(executor.state.borrow().deferred_control_count(), 1);
+            executor.send_notification(&cx, notification()).unwrap();
+            let state = executor.state.borrow();
+            assert!(state.pending.is_empty());
+            assert_eq!(state.next_generation, 1);
+            assert_eq!(state.transport.sent.len(), 3);
+            let methods = state
+                .transport
+                .sent
+                .iter()
+                .map(|message| match message {
+                    JsonRpcMessage::Request(request) => request.method.as_str(),
+                    _ => panic!("only application requests and controls are sent"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                [TOOLS_CALL, "notifications/cancelled", "example/changed"]
+            );
+        }
+
+        #[test]
+        fn refused_notification_performs_no_transport_activity() {
+            for refusal in [
+                "legacy",
+                "cancelled",
+                "request-id",
+                "wrong-writer",
+                "closed",
+            ] {
+                let cx = Cx::for_testing();
+                let executor = if refusal == "wrong-writer" {
+                    RequestExecutor::with_external_driver(
+                        ScriptedTransport::new([]),
+                        ProtocolEra::Modern2026,
+                    )
+                } else {
+                    RequestExecutor::with_protocol_era(
+                        ScriptedTransport::new([]),
+                        if refusal == "legacy" {
+                            ProtocolEra::Legacy2024
+                        } else {
+                            ProtocolEra::Modern2026
+                        },
+                    )
+                };
+                let mut value = notification();
+                match refusal {
+                    "cancelled" => cx.set_cancel_requested(true),
+                    "request-id" => value.id = Some(RequestId::Number(7)),
+                    "closed" => executor.stop_connection(McpError::internal_error("owner stopped")),
+                    _ => {}
+                }
+                assert!(executor.send_notification(&cx, value).is_err(), "{refusal}");
+                let state = executor.state.borrow();
+                assert_eq!(state.transport.io_calls, [0, 0, 0], "{refusal}");
+                assert_eq!(state.next_generation, 0);
+                assert!(state.pending.is_empty());
+                assert!(state.completed.is_empty());
+                assert!(state.tombstones.is_empty());
+            }
+        }
+
+        #[test]
+        fn uncertain_notification_send_retires_waiters_but_unsent_backpressure_does_not() {
+            for kind in [
+                std::io::ErrorKind::WouldBlock,
+                std::io::ErrorKind::BrokenPipe,
+            ] {
+                let cx = Cx::for_testing();
+                let executor = RequestExecutor::with_protocol_era(
+                    ScriptedTransport::new([]),
+                    ProtocolEra::Modern2026,
+                );
+                let mut owner = executor.execute(&cx, request(1)).unwrap();
+                executor.state.borrow_mut().transport.send_error = Some(kind);
+                assert!(executor.send_notification(&cx, notification()).is_err());
+                assert_eq!(executor.state.borrow().next_generation, 1);
+                assert_eq!(executor.state.borrow().transport.io_calls, [2, 0, 0]);
+                if kind == std::io::ErrorKind::WouldBlock {
+                    assert!(executor.terminal_error().is_none());
+                    assert!(executor.try_take_response(&mut owner).unwrap().is_none());
+                    executor.state.borrow_mut().transport.send_error = None;
+                    executor.send_notification(&cx, notification()).unwrap();
+                    assert_eq!(executor.pending_records().len(), 1);
+                } else {
+                    assert!(executor.terminal_error().is_some());
+                    assert!(executor.try_take_response(&mut owner).is_err());
+                    assert!(executor.pending_records().is_empty());
+                    assert!(executor.send_notification(&cx, notification()).is_err());
+                    assert_eq!(executor.state.borrow().transport.io_calls, [2, 0, 0]);
+                }
+            }
+        }
+
+        #[test]
+        fn external_notification_defers_to_controls_and_checks_current_cancellation() {
+            let cx = Cx::for_testing();
+            let cancellation = McpRequestCancellation::new();
+            let executor = RequestExecutor::with_external_driver(
+                ScriptedTransport::new([]),
+                ProtocolEra::Modern2026,
+            );
+            let owner = executor
+                .execute_external(
+                    &cx,
+                    &cancellation,
+                    request(1),
+                    RequestTimeoutPolicy::default(),
+                    |_| Ok(()),
+                )
+                .unwrap()
+                .unwrap();
+            drop(owner);
+            let published = Cell::new(false);
+            assert!(
+                !executor
+                    .send_external_notification(&cx, &cancellation, notification(), |_| {
+                        published.set(true);
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert!(!published.get());
+            assert!(
+                executor
+                    .commit_external_control(|message| {
+                        let JsonRpcMessage::Request(control) = message else {
+                            panic!("cancellation control must precede application data");
+                        };
+                        assert_eq!(control.method, "notifications/cancelled");
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert!(
+                executor
+                    .send_external_notification(&cx, &cancellation, notification(), |_| {
+                        published.set(true);
+                        Ok(())
+                    })
+                    .unwrap()
+            );
+            assert!(published.get());
+            assert_eq!(executor.state.borrow().next_generation, 1);
+            assert_eq!(executor.state.borrow().transport.io_calls, [0, 0, 0]);
+
+            let stopped = McpRequestCancellation::new();
+            assert!(stopped.cancel());
+            published.set(false);
+            assert!(
+                executor
+                    .send_external_notification(&cx, &stopped, notification(), |_| {
+                        published.set(true);
+                        Ok(())
+                    })
+                    .is_err()
+            );
+            assert!(!published.get());
+        }
     }
 
     mod operator_observations {

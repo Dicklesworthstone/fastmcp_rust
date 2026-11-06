@@ -1298,6 +1298,44 @@ cancelled and drained on connection shutdown, and each notification has a finite
 deadline even when ordinary request timeouts are disabled. Legacy extension
 notifications are outside this surface.
 
+### Calling extensions from clients
+
+Configure `ClientBuilder::extension_registry` with the client's descriptor
+registry, local settings, and a compatibility-resolver factory before connecting.
+The connected HTTP, stdio, and WebSocket clients expose
+`notify_final_extension(cx, extension_id, method, parameters)`, including the
+recommended modern facade. A retained `StdioRequestExecutor` can also publish a
+notification while other request handles remain live. The client attaches fresh
+settings proof in the exact location named by `NotificationActivationProofDescriptor`;
+applications do not have to construct that proof manually. Conflicting caller
+proof, unconfigured methods, wrong directions, and legacy sessions fail before
+publication. Notifications consume no request ID or response waiter. HTTP waits
+for the empty 202 acknowledgement; stdio, memory, and WebSocket publication does
+not imply that the server callback has completed.
+
+The in-process client now accepts the same frozen extension configuration through
+`MemoryClient::builder(client_info).extension_registry(...)`. Connect it to an
+owned bounded memory endpoint with `connect(cx, transport)`. Existing
+`MemoryClient::connect` calls continue to work for ordinary core methods; a raw
+extension capability advertisement alone does not authorize extension calls.
+
+Use `execute_final_extension(cx, cancellation, extension_id, method, parameters)`
+to obtain a `MemoryExtensionExecution`, then drive it with
+`next_extension_event(cx, cancellation, execution)`. Each handle retains its own
+progress, admitted result, cancellation, and exact result JSON source. Core and
+extension handles may share the connection, and driving one routes its siblings'
+responses without consuming them. `request_final_extension` is the convenience
+form that waits for the result. Memory notifications take the explicit
+cancellation token as well.
+
+Memory publication waits for channel capacity while continuing to route incoming
+responses, including when both bounded directions are full. Dropping or cancelling
+an unsent wait allocates no ID or waiter. Dropping a published execution schedules
+its cancellation before later application messages, and late results remain
+owned by that execution rather than a sibling. These clients run on the supplied
+runtime and do not create a background pump. A caller timer driver is required
+for response deadlines and the finite send-admission timeout.
+
 ---
 
 ## Client executor observations

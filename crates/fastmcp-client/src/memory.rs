@@ -14,11 +14,14 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{McpError, McpErrorCode, McpRequestCancellation, McpResult};
+use fastmcp_protocol::extensions::{
+    ClientExtensionDiscovery, ExtensionDescriptorRegistry, ExtensionSettingsCompatibilityResolver,
+};
 use fastmcp_protocol::protocol_policy::{MODERN_PROTOCOL_VERSION, ProtocolEra};
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, CoreRequest, CoreResult, FinalCoreResult, FinalRequestMeta,
-    JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, ServerCapabilities,
-    ServerDiscoverResult,
+    ClientCapabilities, ClientInfo, CoreRequest, CoreResult, ExtensionId, FinalCoreResult,
+    FinalRequestMeta, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
+    ServerCapabilities, ServerDiscoverResult,
 };
 use fastmcp_transport::memory::asynchronous::MemorySendPermit;
 use fastmcp_transport::memory::{MemoryRecvHalf, MemorySendHalf, MemoryTransport};
@@ -31,7 +34,7 @@ use crate::execution::{
     CancellationRequested, FinalCacheTtlDiagnostic, RequestExecution, RequestExecutor,
     decode_core_result_with_cache_ttl_from_source,
 };
-use crate::session::ClientSession;
+use crate::session::{ClientExtensionRuntime, ClientSession};
 use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(20);
@@ -95,11 +98,141 @@ pub enum MemoryRequestEvent {
     Result(Box<CoreResult>),
 }
 
+/// One admitted extension request on a [`MemoryClient`].
+///
+/// The handle retains the exact extension owner and result authority installed
+/// before publication. Dropping an unfinished handle cancels only that request;
+/// its deferred control follows the same bounded path as ordinary core work.
+#[derive(Debug)]
+pub struct MemoryExtensionExecution {
+    owner: Arc<()>,
+    inner: RequestExecution<ExternalMemoryTransport>,
+    notifications: VecDeque<JsonRpcRequest>,
+    raw_result_source: Option<String>,
+    finished: bool,
+}
+
+impl MemoryExtensionExecution {
+    /// The exact ID actually published to the peer.
+    #[must_use]
+    pub fn request_id(&self) -> &RequestId {
+        self.inner.request_id()
+    }
+
+    /// The exact admitted result JSON after its successful result event.
+    ///
+    /// This source preserves number spellings and member order independently
+    /// of the parsed result value. Errors and unfinished executions have none.
+    #[must_use]
+    pub fn raw_result_source(&self) -> Option<&str> {
+        self.raw_result_source.as_deref()
+    }
+}
+
+/// A request-owned progress notification or one admitted extension result.
+#[derive(Debug)]
+pub enum MemoryExtensionEvent {
+    /// Progress carrying this execution's exact advertised token.
+    Notification(JsonRpcRequest),
+    /// A result admitted by the immutable extension authority for this request.
+    Result(Value),
+}
+
+/// Configures one modern client for an already owned bounded memory endpoint.
+///
+/// The builder freezes extension descriptors and local settings before any
+/// discovery request is published. Connection setup uses only the supplied
+/// runtime context and consumes no background worker or independent runtime.
+#[derive(Debug)]
+pub struct MemoryClientBuilder {
+    client_info: ClientInfo,
+    capabilities: ClientCapabilities,
+    extension_runtime: Option<Arc<ClientExtensionRuntime>>,
+    timeout_policy: RequestTimeoutPolicy,
+}
+
+impl MemoryClientBuilder {
+    /// Uses the supplied identity and default capabilities and response bounds.
+    #[must_use]
+    pub fn new(client_info: ClientInfo) -> Self {
+        Self {
+            client_info,
+            capabilities: ClientCapabilities::default(),
+            extension_runtime: None,
+            timeout_policy: RequestTimeoutPolicy::default(),
+        }
+    }
+
+    /// Sets ordinary client capabilities.
+    ///
+    /// Nonempty extension settings must exactly match the settings installed
+    /// by [`Self::extension_registry`]; raw capability advertisements never
+    /// grant extension execution authority.
+    #[must_use]
+    pub fn capabilities(mut self, capabilities: ClientCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Sets finite idle and absolute response bounds, including discovery.
+    pub fn timeout_policy(mut self, policy: RequestTimeoutPolicy) -> McpResult<Self> {
+        RequestTimeoutPolicy::new(policy.idle_timeout(), policy.absolute_timeout())?;
+        self.timeout_policy = policy;
+        Ok(self)
+    }
+
+    /// Installs one frozen registry and its locally configured extension settings.
+    ///
+    /// Every local settings owner must have a descriptor. The factory must
+    /// produce an independent compatibility resolver for each negotiation;
+    /// notification activation also obtains fresh current-message authority.
+    /// Only methods admitted by the peer's successful discovery are executable.
+    pub fn extension_registry<F, R>(
+        mut self,
+        descriptors: ExtensionDescriptorRegistry,
+        client_discovery: ClientExtensionDiscovery,
+        resolver_factory: F,
+    ) -> McpResult<Self>
+    where
+        F: Fn() -> R + Send + Sync + 'static,
+        R: ExtensionSettingsCompatibilityResolver + Send + 'static,
+    {
+        if self.extension_runtime.is_some() {
+            return Err(McpError::invalid_params(
+                "Memory client extension registry is already configured",
+            ));
+        }
+        self.extension_runtime = Some(Arc::new(ClientExtensionRuntime::new(
+            descriptors,
+            client_discovery,
+            resolver_factory,
+        )?));
+        Ok(self)
+    }
+
+    /// Connects to an exact modern peer over the supplied endpoint.
+    pub async fn connect(self, cx: &Cx, transport: MemoryTransport) -> McpResult<MemoryClient> {
+        self.connect_with_cancellation(cx, &McpRequestCancellation::new(), transport)
+            .await
+    }
+
+    /// Connects with explicit cancellation; failed discovery releases both halves.
+    pub async fn connect_with_cancellation(
+        self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        transport: MemoryTransport,
+    ) -> McpResult<MemoryClient> {
+        MemoryClient::connect_configured(cx, cancellation, transport, self).await
+    }
+}
+
 /// A modern-only asynchronous client for an existing bounded memory endpoint.
 ///
 /// Ordinary core methods share the same typed protocol admission and request
-/// executor as other clients. Long-lived subscriptions and extension methods
-/// require their distinct owning APIs and are not opened by this adapter.
+/// executor as other clients. Configured extensions use their own admitted
+/// execution and notification APIs. Long-lived subscriptions are not opened
+/// by this adapter.
 /// Client metadata is frozen at connect and stamped on every request.
 ///
 /// A caller timer driver is required when an operation must wait: response
@@ -139,6 +272,12 @@ impl fastmcp_core::OperatorSnapshotSource<fastmcp_core::OperatorExecutorCapacity
 }
 
 impl MemoryClient {
+    /// Starts configuration for an owned bounded memory endpoint.
+    #[must_use]
+    pub fn builder(client_info: ClientInfo) -> MemoryClientBuilder {
+        MemoryClientBuilder::new(client_info)
+    }
+
     /// Discovers the exact modern peer using only the supplied runtime context.
     pub async fn connect(
         cx: &Cx,
@@ -165,14 +304,44 @@ impl MemoryClient {
         client_info: ClientInfo,
         capabilities: ClientCapabilities,
     ) -> McpResult<Self> {
+        Self::builder(client_info)
+            .capabilities(capabilities)
+            .connect_with_cancellation(cx, cancellation, transport)
+            .await
+    }
+
+    async fn connect_configured(
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        transport: MemoryTransport,
+        builder: MemoryClientBuilder,
+    ) -> McpResult<Self> {
         checkpoint(cx, cancellation)?;
-        if capabilities
+        let MemoryClientBuilder {
+            client_info,
+            mut capabilities,
+            extension_runtime,
+            timeout_policy,
+        } = builder;
+        if let Some(runtime) = &extension_runtime {
+            let configured = runtime.client_wire_extensions();
+            if capabilities
+                .extensions
+                .as_ref()
+                .is_some_and(|advertised| !advertised.is_empty() && advertised != &configured)
+            {
+                return Err(McpError::invalid_params(
+                    "Memory client extension capabilities differ from its configured registry",
+                ));
+            }
+            capabilities.extensions = Some(configured);
+        } else if capabilities
             .extensions
             .as_ref()
             .is_some_and(|extensions| !extensions.is_empty())
         {
             return Err(McpError::invalid_params(
-                "Memory core client does not negotiate extension execution",
+                "Memory client extension capabilities require a configured registry",
             ));
         }
         let session = ClientSession::try_new(
@@ -182,7 +351,8 @@ impl MemoryClient {
             ServerCapabilities::default(),
             MODERN_PROTOCOL_VERSION.to_owned(),
         )
-        .map_err(|_| McpError::internal_error("Modern memory protocol version is unavailable"))?;
+        .map_err(|_| McpError::internal_error("Modern memory protocol version is unavailable"))?
+        .with_client_extension_runtime(extension_runtime.clone());
         let (receiver, sender) = transport.into_split();
         let mut client = Self {
             receiver,
@@ -194,7 +364,7 @@ impl MemoryClient {
             owner: Arc::new(()),
             session,
             next_id: 1,
-            timeout_policy: RequestTimeoutPolicy::default(),
+            timeout_policy,
             cache_diagnostics: VecDeque::new(),
             closed: false,
         };
@@ -227,7 +397,11 @@ impl MemoryClient {
             MODERN_PROTOCOL_VERSION.to_owned(),
         )
         .map_err(|_| McpError::internal_error("Modern memory session could not be established"))?
+        .with_client_extension_runtime(extension_runtime)
         .with_server_discovery(discovery);
+        client
+            .session
+            .negotiate_client_extensions_after_discovery()?;
         Ok(client)
     }
 
@@ -334,6 +508,151 @@ impl MemoryClient {
         }
     }
 
+    /// Publishes one negotiated client-to-server extension request.
+    ///
+    /// The method, direction and exact extension owner must be active before
+    /// waiting for channel capacity. Local protocol metadata always replaces
+    /// conflicting caller metadata. The returned handle owns the same bounded
+    /// correlation, progress and cancellation machinery as ordinary requests.
+    pub async fn execute_final_extension(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &ExtensionId,
+        method: &str,
+        parameters: Value,
+    ) -> McpResult<MemoryExtensionExecution> {
+        self.execute_final_extension_with_timeout_policy(
+            cx,
+            cancellation,
+            extension_id,
+            method,
+            parameters,
+            self.timeout_policy,
+        )
+        .await
+    }
+
+    /// Uses stricter response deadlines for one admitted extension request.
+    ///
+    /// Both deadlines begin at actual publication. Dropping or cancelling a
+    /// capacity wait publishes nothing and consumes no request ID or waiter.
+    pub async fn execute_final_extension_with_timeout_policy(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &ExtensionId,
+        method: &str,
+        parameters: Value,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<MemoryExtensionExecution> {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        RequestTimeoutPolicy::new(
+            timeout_policy.idle_timeout(),
+            timeout_policy.absolute_timeout(),
+        )?;
+        if timeout_policy.idle_timeout() > self.timeout_policy.idle_timeout()
+            || timeout_policy.absolute_timeout() > self.timeout_policy.absolute_timeout()
+        {
+            return Err(McpError::invalid_params(
+                "Memory execution timeout exceeds the client policy",
+            ));
+        }
+        let admission = self
+            .session
+            .admit_final_extension_method(extension_id, method)?;
+        let parameters = self.parameters(parameters)?;
+        let next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| McpError::internal_error("Memory request IDs exhausted"))?;
+        let wire = JsonRpcRequest::new(method, Some(parameters), self.next_id);
+        fastmcp_transport::Codec::new()
+            .encode_request(&wire)
+            .map_err(transport_error_from_codec)?;
+        let deadline = Instant::now() + SEND_ADMISSION_TIMEOUT;
+        loop {
+            self.flush_controls(cx, cancellation, deadline).await?;
+            let permit = reserve_capacity(
+                &mut self.sender,
+                &mut self.receiver,
+                &self.executor,
+                cx,
+                cancellation,
+                deadline,
+            )
+            .await?;
+            if let Some(inner) = self.executor.execute_external_extension(
+                cx,
+                cancellation,
+                wire.clone(),
+                timeout_policy,
+                admission.clone(),
+                |message| permit.send(message),
+            )? {
+                self.next_id = next_id;
+                return Ok(MemoryExtensionExecution {
+                    owner: Arc::clone(&self.owner),
+                    inner,
+                    notifications: VecDeque::new(),
+                    raw_result_source: None,
+                    finished: false,
+                });
+            }
+        }
+    }
+
+    /// Publishes one extension notification with fresh local activation proof.
+    ///
+    /// Notification metadata remains distinct from request metadata. The
+    /// configured descriptor chooses the proof field; conflicting supplied
+    /// proof or malformed metadata is refused before waiting for capacity.
+    /// Request-shaped open metadata remains inert and grants no authority.
+    /// Successful publication allocates no request ID, response waiter or
+    /// correlation slot and does not wait for a response. Pending controls
+    /// retain priority, while incoming responses continue to be routed during
+    /// capacity waits. Cancelling or dropping an unsent wait has no wire effect.
+    pub async fn notify_final_extension(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &ExtensionId,
+        method: &str,
+        parameters: Value,
+    ) -> McpResult<()> {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
+        let parameters =
+            self.session
+                .prepare_final_extension_notification(extension_id, method, parameters)?;
+        let wire = JsonRpcRequest::notification(method, Some(parameters));
+        fastmcp_transport::Codec::new()
+            .encode_request(&wire)
+            .map_err(transport_error_from_codec)?;
+        let deadline = Instant::now() + SEND_ADMISSION_TIMEOUT;
+        loop {
+            self.flush_controls(cx, cancellation, deadline).await?;
+            let permit = reserve_capacity(
+                &mut self.sender,
+                &mut self.receiver,
+                &self.executor,
+                cx,
+                cancellation,
+                deadline,
+            )
+            .await?;
+            if self.executor.send_external_notification(
+                cx,
+                cancellation,
+                wire.clone(),
+                |message| permit.send(message),
+            )? {
+                return Ok(());
+            }
+        }
+    }
+
     /// Drives this connection until one event for the selected handle is ready.
     /// Other handles retain their correlated outcomes. Dropping this *wait*
     /// preserves the execution; dropping the execution itself cancels it.
@@ -410,6 +729,109 @@ impl MemoryClient {
         }
     }
 
+    /// Drives the shared connection until this extension handle has one event.
+    ///
+    /// Results are admitted against the authority frozen before this request's
+    /// publication, including ownership of non-core result discriminators.
+    /// A result or terminal error is consumed once; subsequent calls return
+    /// `None`. Dropping this wait preserves the execution and sibling results.
+    pub async fn next_extension_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        execution: &mut MemoryExtensionExecution,
+    ) -> McpResult<Option<MemoryExtensionEvent>> {
+        self.ensure_extension_owner(execution)?;
+        if execution.finished {
+            return Ok(None);
+        }
+        loop {
+            let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
+            if let Some(error) = execution.inner.terminal_error() {
+                execution.notifications.clear();
+                execution.finished = true;
+                let _ = self.executor.try_take_response(&mut execution.inner);
+                return Err(error);
+            }
+            if let Some(notification) = execution.notifications.pop_front() {
+                return Ok(Some(MemoryExtensionEvent::Notification(notification)));
+            }
+            execution
+                .notifications
+                .extend(execution.inner.take_stream_notifications()?);
+            if let Some(notification) = execution.notifications.pop_front() {
+                return Ok(Some(MemoryExtensionEvent::Notification(notification)));
+            }
+            if let Some((response, source)) = self
+                .executor
+                .try_take_response_with_raw_result(&mut execution.inner)?
+            {
+                execution.finished = true;
+                let result = response_result(response)?;
+                let source = source.ok_or_else(|| {
+                    McpError::invalid_request(
+                        "Memory extension response omitted exact result source",
+                    )
+                })?;
+                execution.raw_result_source = Some(source);
+                return Ok(Some(MemoryExtensionEvent::Result(result)));
+            }
+            maintenance?;
+            if checkpoint(cx, cancellation).is_err() {
+                let cancelled = self.executor.cancel(cx, &mut execution.inner);
+                if execution.inner.terminal_error().is_none() {
+                    cancelled?;
+                }
+                continue;
+            }
+            self.ensure_open()?;
+            if let Err(error) = self.drive_once(cx, cancellation).await {
+                if execution.inner.terminal_error().is_some() {
+                    continue;
+                }
+                if error.code == McpErrorCode::RequestCancelled {
+                    let cancelled = self.executor.cancel(cx, &mut execution.inner);
+                    if execution.inner.terminal_error().is_none() {
+                        cancelled?;
+                    }
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// Completes one admitted extension call without consuming sibling results.
+    ///
+    /// Use execute/next_extension_event to observe progress or retain the exact
+    /// result source through [`MemoryExtensionExecution::raw_result_source`].
+    pub async fn request_final_extension(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &ExtensionId,
+        method: &str,
+        parameters: Value,
+    ) -> McpResult<Value> {
+        let mut execution = self
+            .execute_final_extension(cx, cancellation, extension_id, method, parameters)
+            .await?;
+        loop {
+            match self
+                .next_extension_event(cx, cancellation, &mut execution)
+                .await?
+            {
+                Some(MemoryExtensionEvent::Result(result)) => return Ok(result),
+                Some(MemoryExtensionEvent::Notification(_)) => {}
+                None => {
+                    return Err(McpError::internal_error(
+                        "Memory extension execution ended without its result",
+                    ));
+                }
+            }
+        }
+    }
+
     /// Completes one core call, retaining valid progress in its owned handle
     /// until consumed. Use execute/next_event to observe progress incrementally.
     pub async fn request_core(
@@ -477,6 +899,19 @@ impl MemoryClient {
         Ok(())
     }
 
+    /// Elects cancellation for one extension request without waiting for capacity.
+    pub fn cancel_extension(
+        &mut self,
+        cx: &Cx,
+        execution: &mut MemoryExtensionExecution,
+    ) -> McpResult<()> {
+        self.ensure_extension_owner(execution)?;
+        if !execution.finished {
+            self.executor.cancel(cx, &mut execution.inner)?;
+        }
+        Ok(())
+    }
+
     /// Returns connection-level notifications without guessing a request owner.
     /// In particular, identifier-free logs and unmatched progress do not become
     /// another request's callback or extend any response deadline.
@@ -524,10 +959,19 @@ impl MemoryClient {
         Ok(())
     }
 
+    fn ensure_extension_owner(&self, execution: &MemoryExtensionExecution) -> McpResult<()> {
+        if !Arc::ptr_eq(&self.owner, &execution.owner) {
+            return Err(McpError::invalid_params(
+                "Memory extension execution belongs to another client",
+            ));
+        }
+        Ok(())
+    }
+
     fn parameters(&self, mut parameters: Value) -> McpResult<Value> {
-        let object = parameters
-            .as_object_mut()
-            .ok_or_else(|| McpError::invalid_params("Memory core parameters must be an object"))?;
+        let object = parameters.as_object_mut().ok_or_else(|| {
+            McpError::invalid_params("Memory request parameters must be an object")
+        })?;
         let mut metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
             client_capabilities: self.session.client_capabilities().clone(),
@@ -761,6 +1205,11 @@ fn decode_response(
     response: JsonRpcResponse,
     source: Option<&str>,
 ) -> McpResult<(CoreResult, Option<FinalCacheTtlDiagnostic>)> {
+    let result = response_result(response)?;
+    decode_core_result_with_cache_ttl_from_source(request, &result, source)
+}
+
+fn response_result(response: JsonRpcResponse) -> McpResult<Value> {
     if let Some(error) = response.error {
         let code = error
             .code
@@ -772,11 +1221,13 @@ fn decode_response(
             None => McpError::new(code, error.message),
         });
     }
-    let result = response
+    response
         .result
-        .ok_or_else(|| McpError::invalid_request("Memory response omitted its result"))?;
-    decode_core_result_with_cache_ttl_from_source(request, &result, source)
+        .ok_or_else(|| McpError::invalid_request("Memory response omitted its result"))
 }
+
+#[cfg(test)]
+mod extension_tests;
 
 #[cfg(test)]
 mod tests {

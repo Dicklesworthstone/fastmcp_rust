@@ -809,6 +809,32 @@ impl ClientSession {
         runtime.admit_request(negotiated, extension_id, method)
     }
 
+    /// Prepares fresh current-message activation without borrowing the
+    /// connection's request negotiation as notification authority.
+    pub(crate) fn prepare_final_extension_notification(
+        &self,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        if self.selected_era != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_params(
+                "Final client extensions are unavailable in exact MCP 2024-11-05",
+            ));
+        }
+        let runtime = self.client_extension_runtime.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "No builder-owned final client extension registry is configured",
+            )
+        })?;
+        let discovery = self.server_discovery.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "Final extension notification requires retained server/discover state",
+            )
+        })?;
+        runtime.prepare_notification(discovery, extension_id, method, parameters)
+    }
+
     pub(crate) fn set_mcp_apps_activation_receipt(
         &mut self,
         receipt: Option<McpAppsActivationReceipt>,

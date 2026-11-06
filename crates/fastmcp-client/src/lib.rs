@@ -130,7 +130,10 @@ pub use fastmcp_protocol::common_types::LoggingLevel;
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_transport::websocket::AsyncWsClientTransport;
-pub use memory::{MemoryClient, MemoryRequestEvent, MemoryRequestExecution};
+pub use memory::{
+    MemoryClient, MemoryClientBuilder, MemoryExtensionEvent, MemoryExtensionExecution,
+    MemoryRequestEvent, MemoryRequestExecution,
+};
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is
 // absent. Keep the private name available in feature-off builds.
@@ -5651,17 +5654,18 @@ impl<F> Drop for WebSocketOwnedClose<F> {
 /// unusable. Explicit close still retires its owned transport because it uses
 /// the separate `close_settled` election.
 #[cfg(feature = "websocket-experimental")]
-struct WebSocketCancellationSendGuard<'a, IO>
+struct WebSocketNotificationSendGuard<'a, IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
     closed: &'a mut bool,
     callbacks: &'a WebSocketReverseCallbackPool<IO>,
+    failure_message: &'static str,
     committed: bool,
 }
 
 #[cfg(feature = "websocket-experimental")]
-impl<IO> Drop for WebSocketCancellationSendGuard<'_, IO>
+impl<IO> Drop for WebSocketNotificationSendGuard<'_, IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
@@ -5670,9 +5674,7 @@ where
             *self.closed = true;
             self.callbacks
                 .state
-                .fail_connection(McpError::internal_error(
-                    "WebSocket cancellation control did not commit",
-                ));
+                .fail_connection(McpError::internal_error(self.failure_message));
             self.callbacks.cancel_all();
         }
     }
@@ -7695,9 +7697,10 @@ where
             uncertain_writer: Arc::clone(&self.reverse_callback_pool.uncertain_writer),
             send_failure_message: "WebSocket cancellation control did not commit",
         });
-        let mut commitment = WebSocketCancellationSendGuard {
+        let mut commitment = WebSocketNotificationSendGuard {
             closed: &mut self.closed,
             callbacks: &self.reverse_callback_pool,
+            failure_message: "WebSocket cancellation control did not commit",
             committed: false,
         };
         // Cancellation notification delivery is the short commit-critical
@@ -9198,6 +9201,81 @@ where
         received.response.result.ok_or_else(|| {
             McpError::invalid_request("WebSocket final extension response has no result")
         })
+    }
+
+    /// Sends one configured extension notification with fresh per-message proof.
+    ///
+    /// The frozen descriptor, local settings, and retained modern discovery
+    /// must admit the exact owner, method, and direction before any frame is
+    /// written. Caller proof cannot replace those settings. This allocates no
+    /// request ID or response owner and never reads for an acknowledgement.
+    /// The client's absolute request bound caps publication; interruption of
+    /// an admitted write makes the connection terminal and is never retried.
+    pub async fn notify_final_extension(
+        &mut self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<()>
+    where
+        IO: Send + 'static,
+    {
+        let deadline = WebSocketConnectDeadline::new(cx, self.request_timeout_policy)?;
+        deadline.check(cx, None)?;
+        if self.closed {
+            return Err(McpError::internal_error("WebSocket client is closed"));
+        }
+        let parameters =
+            self.session
+                .prepare_final_extension_notification(extension_id, method, parameters)?;
+        let notification = JsonRpcRequest::notification(method, Some(parameters));
+        fastmcp_transport::Codec::new()
+            .encode_request(&notification)
+            .map_err(|error| transport_error_to_mcp(TransportError::Codec(error)))?;
+
+        self.settle_abandoned_websocket_request().await?;
+        self.expire_live_websocket_subscriptions().await?;
+        deadline.check(cx, None)?;
+        if let Err(error) = self.drain_completed_reverse_callbacks() {
+            return Err(self.terminal_callback_error(cx, error).await);
+        }
+        let sender = Arc::clone(&self.sender);
+        let send_state = Arc::new(WebSocketTransientRequestState {
+            phase: AtomicU8::new(WebSocketTransientRequestState::SENDING),
+            callbacks: Arc::clone(&self.reverse_callback_pool.state),
+            uncertain_writer: Arc::clone(&self.reverse_callback_pool.uncertain_writer),
+            send_failure_message: "WebSocket extension notification did not commit",
+        });
+        let mut commitment = WebSocketNotificationSendGuard {
+            closed: &mut self.closed,
+            callbacks: &self.reverse_callback_pool,
+            failure_message: "WebSocket extension notification did not commit",
+            committed: false,
+        };
+        let message = JsonRpcMessage::Request(notification);
+        let result = deadline
+            .wait(
+                cx,
+                None,
+                WebSocketOwnedSend::new(
+                    send_websocket_callback_message(
+                        &sender,
+                        &self.reverse_callback_pool.state,
+                        cx,
+                        &message,
+                    ),
+                    send_state,
+                ),
+            )
+            .await;
+        commitment.committed = matches!(result, Ok(Ok(())));
+        drop(commitment);
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(self.terminal_transport_error(cx, error).await),
+            Err(error) => Err(self.terminal_callback_error(cx, error).await),
+        }
     }
 
     /// Calls a modern tool and follows bounded input-required MRTR rounds.
@@ -17293,6 +17371,7 @@ pub struct StdioRequestExecutor {
     modern_request_meta: Option<Arc<FinalRequestMeta>>,
     client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     negotiated_extensions: Option<Arc<fastmcp_protocol::extensions::NegotiatedExtensionSet>>,
+    extension_notification_discovery: Option<Arc<ServerDiscoverResult>>,
 }
 
 impl std::fmt::Debug for StdioRequestExecutor {
@@ -17438,9 +17517,14 @@ impl StdioRequestExecutor {
         peer_era: ProtocolEra,
         timeout_policy: RequestTimeoutPolicy,
         modern_request_meta: Option<FinalRequestMeta>,
-        client_extension_runtime: Option<Arc<ClientExtensionRuntime>>,
-        negotiated_extensions: Option<fastmcp_protocol::extensions::NegotiatedExtensionSet>,
+        session: &ClientSession,
     ) -> Self {
+        let client_extension_runtime = session.client_extension_runtime().cloned();
+        let extension_notification_discovery = client_extension_runtime
+            .as_ref()
+            .and_then(|_| session.server_discovery())
+            .cloned()
+            .map(Arc::new);
         Self {
             executor: RequestExecutor::with_protocol_era(transport, peer_era),
             next_id,
@@ -17448,7 +17532,8 @@ impl StdioRequestExecutor {
             peer_era,
             modern_request_meta: modern_request_meta.map(Arc::new),
             client_extension_runtime,
-            negotiated_extensions: negotiated_extensions.map(Arc::new),
+            negotiated_extensions: session.negotiated_extensions().cloned().map(Arc::new),
+            extension_notification_discovery,
         }
     }
 
@@ -17591,6 +17676,51 @@ impl StdioRequestExecutor {
             execution,
             require_result_source: true,
         })
+    }
+
+    /// Commits one configured extension notification without allocating a
+    /// request ID, response waiter, or cancellation tombstone.
+    ///
+    /// Each message receives its own self-contained activation proof from the
+    /// frozen local settings and retained peer discovery. Conflicting caller
+    /// proof, unsupported directions, inactive extensions, and exact-2024
+    /// connections are refused before writing. No core request metadata is
+    /// added, no response is awaited, and an uncertain write is never retried.
+    pub fn notify_final_extension(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<()> {
+        if let Some(error) = self.executor.terminal_error() {
+            return Err(error);
+        }
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        if self.peer_era != ProtocolEra::Modern2026 {
+            return Err(McpError::invalid_params(
+                "Final client extensions are unavailable in exact MCP 2024-11-05",
+            ));
+        }
+        let runtime = self.client_extension_runtime.as_ref().ok_or_else(|| {
+            McpError::invalid_params(
+                "No builder-owned final client extension registry is configured",
+            )
+        })?;
+        let discovery = self
+            .extension_notification_discovery
+            .as_ref()
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Final extension notification requires retained server/discover state",
+                )
+            })?;
+        let parameters =
+            runtime.prepare_notification(discovery, extension_id, method, parameters)?;
+        self.executor
+            .send_notification(cx, JsonRpcRequest::notification(method, Some(parameters)))
     }
 
     fn execute_request(
@@ -19708,8 +19838,7 @@ impl Client {
             peer_era,
             self.timeout_policy,
             modern_request_meta,
-            self.session.client_extension_runtime().cloned(),
-            self.session.negotiated_extensions().cloned(),
+            &self.session,
         ));
     }
 
@@ -20822,6 +20951,33 @@ impl Client {
             .decode_result(source)
             .map_err(|error| self.terminate_connection(error))?;
         Ok(received.result)
+    }
+
+    /// Sends one configured modern extension notification through the selected
+    /// stdio writer, using the caller's context for admission and publication.
+    ///
+    /// Deferred discovery runs on the caller's runtime before notification
+    /// admission. Every notification carries fresh self-contained settings
+    /// proof; it consumes no request ID and never waits for a peer response.
+    /// Dropped or failed writes are not retried.
+    pub async fn notify_final_extension(
+        &mut self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<()> {
+        if cx.checkpoint().is_err() {
+            return Err(McpError::request_cancelled());
+        }
+        self.ensure_initialized_with_cx(cx).await?;
+        let executor = self.multiplexed_stdio_executor()?;
+        match executor.notify_final_extension(cx, extension_id, method, parameters) {
+            Err(error) if executor.executor.terminal_error().is_some() => {
+                Err(self.terminate_connection(error))
+            }
+            result => result,
+        }
     }
 
     /// Sends one already-admitted final Tasks request and decodes its exact
@@ -37848,6 +38004,181 @@ exec sleep 2
                 1,
                 "generic extension admission rejection settles the shared split writer exactly once"
             );
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
+    fn clt_ext_notification_websocket_interrupted_publication_never_replays() {
+        use fastmcp_protocol::extensions::NotificationActivationProofLocation;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for outcome in ["complete", "drop", "deadline"] {
+                let (client_io, mut peer_io, probe) = probed_async_websocket_pair();
+                write_server_text_frame(
+                    &mut peer_io,
+                    &modern_raw_extension_discovery_response(
+                        "notification-websocket-peer",
+                        Some(serde_json::json!({"mode": "raw"})),
+                    ),
+                )
+                .await;
+                let (id, builder, resolutions) =
+                    notification_extension_builder(NotificationActivationProofLocation::Metadata);
+                let mut client = builder
+                    .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                    .connect_websocket_with_cx(
+                        &healthy,
+                        AsyncWsClientTransport::from_upgraded(client_io),
+                    )
+                    .await
+                    .unwrap();
+                let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+                let JsonRpcMessage::Request(discovery) = peer.recv(&healthy).await.unwrap() else {
+                    panic!("the first client frame must be discovery");
+                };
+                assert_eq!(discovery.method, SERVER_DISCOVER_METHOD);
+                assert_eq!(discovery.id, Some(RequestId::Number(1)));
+                let next_id = client.next_id;
+                // The paired cases use the same real native frame. Only the
+                // ability to commit beyond its first three bytes changes.
+                probe.arm(0x01, 3, outcome == "complete");
+                match outcome {
+                    "complete" => {
+                        client
+                            .notify_final_extension(
+                                &healthy,
+                                &id,
+                                "example/events",
+                                serde_json::json!({"value": 1}),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    "drop" => {
+                        let mut sending = Box::pin(client.notify_final_extension(
+                            &healthy,
+                            &id,
+                            "example/events",
+                            serde_json::json!({"value": 1}),
+                        ));
+                        assert!(
+                            std::future::poll_fn(|task_cx| {
+                                Poll::Ready(sending.as_mut().poll(task_cx))
+                            })
+                            .await
+                            .is_pending()
+                        );
+                        assert!(probe.started.load(Ordering::Acquire));
+                        assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                        drop(sending);
+                    }
+                    _ => {
+                        let limited = runtime.request_cx_with_budget(
+                            asupersync::Budget::INFINITE
+                                .with_deadline(healthy.now() + Duration::from_millis(100)),
+                        );
+                        let result = asupersync::time::timeout(
+                            healthy.now(),
+                            Duration::from_secs(2),
+                            client.notify_final_extension(
+                                &limited,
+                                &id,
+                                "example/events",
+                                serde_json::json!({"value": 1}),
+                            ),
+                        )
+                        .await
+                        .expect("caller deadline must wake a backpressured notification send");
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                        assert!(healthy.checkpoint().is_ok());
+                    }
+                }
+                assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+                assert_eq!(client.next_id, next_id);
+                assert!(client.transient_request.is_none());
+                assert!(client.retired_requests.is_empty());
+                if outcome == "complete" {
+                    let JsonRpcMessage::Request(notification) = peer.recv(&healthy).await.unwrap()
+                    else {
+                        panic!("the committed notification must be an id-less request envelope");
+                    };
+                    assert_eq!(notification.id, None);
+                    assert_eq!(notification.method, "example/events");
+                    assert_eq!(
+                        notification.params,
+                        Some(serde_json::json!({
+                            "value": 1, "_meta": {"com.example/proof": {"mode": "raw"}}
+                        }))
+                    );
+                    peer.send(
+                        &healthy,
+                        &JsonRpcMessage::Response(JsonRpcResponse::success(
+                            RequestId::Number(2),
+                            async_modern_tools_list_result(),
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                    client.list_tools(&healthy, None).await.unwrap();
+                    let JsonRpcMessage::Request(request) = peer.recv(&healthy).await.unwrap()
+                    else {
+                        panic!("ordinary requests remain usable after a notification");
+                    };
+                    assert_eq!(request.method, "tools/list");
+                    assert_eq!(request.id, Some(RequestId::Number(2)));
+                    client.close(&healthy).await.unwrap();
+                    assert!(matches!(
+                        peer.recv(&healthy).await,
+                        Err(TransportError::Closed)
+                    ));
+                } else {
+                    assert!(client.closed);
+                    assert!(
+                        client
+                            .reverse_callback_pool
+                            .uncertain_writer
+                            .load(Ordering::Acquire)
+                    );
+                    probe.release();
+                    assert_eq!(
+                        client.close(&healthy).await.unwrap_err().message,
+                        "WebSocket extension notification did not commit"
+                    );
+                    assert!(client.close_settled);
+                    assert!(probe.dropped.load(Ordering::Acquire));
+                    assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                    assert!(
+                        client
+                            .notify_final_extension(
+                                &healthy,
+                                &id,
+                                "example/events",
+                                serde_json::json!({"value": 2}),
+                            )
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(client.next_id, next_id);
+                    assert_eq!(resolutions.load(Ordering::SeqCst), 2);
+                    assert_eq!(probe.accepted.lock().unwrap().len(), 3);
+                    assert!(
+                        asupersync::time::timeout(
+                            healthy.now(),
+                            Duration::from_secs(2),
+                            peer.recv(&healthy),
+                        )
+                        .await
+                        .unwrap()
+                        .is_err()
+                    );
+                }
+            }
         });
     }
 
@@ -56425,6 +56756,84 @@ while IFS= read -r unexpected; do exit 31; done
     }
 
     #[cfg(unix)]
+    fn notification_extension_builder(
+        location: fastmcp_protocol::extensions::NotificationActivationProofLocation,
+    ) -> (
+        fastmcp_protocol::ExtensionId,
+        ClientBuilder,
+        Arc<AtomicUsize>,
+    ) {
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+            ExtensionFallbackPolicy, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+            ExtensionSettings, ExtensionSettingsSchema, NotificationActivationProofDescriptor,
+        };
+
+        let id = fastmcp_protocol::ExtensionId::parse("com.example/raw").unwrap();
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(ExtensionDescriptor {
+                id: id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: "notification-client-v1".to_owned(),
+                    codec_id: "notification-client-v1".to_owned(),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: "notification-server-v1".to_owned(),
+                    codec_id: "notification-server-v1".to_owned(),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: "notification-settings-v1".to_owned(),
+                    version: 1,
+                    fallback: ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: None,
+                notification: Some(ExtensionNotificationDescriptor {
+                    name: "example/events".to_owned(),
+                    direction: ExtensionDirection::ClientToServer,
+                    activation_proof: Some(NotificationActivationProofDescriptor::SelfContained {
+                        location,
+                        key: "com.example/proof".to_owned(),
+                    }),
+                }),
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .unwrap();
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_count = Arc::clone(&resolutions);
+        let builder = ClientBuilder::new()
+            .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+            .extension_registry(
+                registry,
+                ClientExtensionDiscovery {
+                    extensions: BTreeMap::from([(
+                        id.clone(),
+                        ExtensionSettings::new(serde_json::json!({"mode": "raw"})).unwrap(),
+                    )]),
+                },
+                move || {
+                    let resolutions = Arc::clone(&resolver_count);
+                    move |descriptor: &ExtensionDescriptor,
+                          client: &ExtensionSettings,
+                          server: &ExtensionSettings| {
+                        resolutions.fetch_add(1, Ordering::SeqCst);
+                        if client == server {
+                            Ok(client.clone())
+                        } else {
+                            Err(fastmcp_protocol::extensions::ExtensionNegotiationError::SettingsCompatibilityRejected(
+                                descriptor.id.to_string(),
+                            ))
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        (id, builder, resolutions)
+    }
+
+    #[cfg(unix)]
     fn extension_result_configuration(
         direction: ExtensionDirection,
         fallback: fastmcp_protocol::extensions::ExtensionFallbackPolicy,
@@ -57381,6 +57790,142 @@ while IFS= read -r unexpected; do exit 31; done
             .expect("the negotiated client-to-server raw extension request succeeds");
         assert_eq!(result["echoed"]["input"], "ok");
         client.close().expect("raw extension stdio client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_notification_stdio_clones_preserve_request_ownership() {
+        use fastmcp_protocol::extensions::NotificationActivationProofLocation;
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            for location in [
+                NotificationActivationProofLocation::Params,
+                NotificationActivationProofLocation::Metadata,
+            ] {
+                let (id, builder, resolutions) = notification_extension_builder(location);
+                let discovery = modern_raw_extension_discovery_response(
+                    "notification-stdio-peer",
+                    Some(serde_json::json!({"mode": "raw"})),
+                );
+                let script = format!(
+                    r#"IFS= read -r discovery || exit 90
+printf '%s\n' '{discovery}'
+IFS= read -r request || exit 91
+IFS= read -r first || exit 92
+IFS= read -r second || exit 93
+IFS= read -r followup || exit 94
+printf '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","observed":[%s,%s],"calls":[%s,%s]}}}}\n' "$first" "$second" "$request" "$followup"
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}'
+while IFS= read -r ignored; do :; done
+"#
+                );
+                let mut client = builder
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", &script])
+                    .await
+                    .unwrap();
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let notification_sender = executor.clone();
+                let mut first = executor
+                    .execute(&cx, "tools/list", Some(serde_json::json!({})))
+                    .unwrap();
+                let next_id = client.peek_next_request_id();
+                let mut conflicting = serde_json::json!({"value": 1});
+                match location {
+                    NotificationActivationProofLocation::Params => {
+                        conflicting["com.example/proof"] = serde_json::json!({"mode": "other"});
+                    }
+                    NotificationActivationProofLocation::Metadata => {
+                        conflicting["_meta"] =
+                            serde_json::json!({"com.example/proof": {"mode": "other"}});
+                    }
+                }
+                assert_eq!(
+                    notification_sender
+                        .notify_final_extension(&cx, &id, "example/events", conflicting)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                notification_sender
+                    .notify_final_extension(
+                        &cx,
+                        &id,
+                        "example/events",
+                        serde_json::json!({"value": 1}),
+                    )
+                    .unwrap();
+                client
+                    .notify_final_extension(
+                        &cx,
+                        &id,
+                        "example/events",
+                        serde_json::json!({"value": 2}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(client.peek_next_request_id(), next_id);
+                assert_eq!(resolutions.load(Ordering::SeqCst), 3);
+                assert_eq!(
+                    fastmcp_core::OperatorSnapshot::capture(&executor)
+                        .unwrap()
+                        .requests()
+                        .pending,
+                    1
+                );
+                let mut followup = executor
+                    .execute(&cx, "tools/list", Some(serde_json::json!({})))
+                    .unwrap();
+                assert_eq!(first.request_id(), &RequestId::Number(2));
+                assert_eq!(followup.request_id(), &RequestId::Number(3));
+                client.drive_multiplexed_stdio(&cx).unwrap();
+                client.drive_multiplexed_stdio(&cx).unwrap();
+                let result = executor
+                    .try_take_response(&mut first)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .unwrap();
+                for (index, notification) in result["observed"].as_array().unwrap().iter().enumerate()
+                {
+                    let mut parameters = serde_json::json!({"value": index + 1});
+                    match location {
+                        NotificationActivationProofLocation::Params => {
+                            parameters["com.example/proof"] = serde_json::json!({"mode": "raw"});
+                        }
+                        NotificationActivationProofLocation::Metadata => {
+                            parameters["_meta"] =
+                                serde_json::json!({"com.example/proof": {"mode": "raw"}});
+                        }
+                    }
+                    assert_eq!(
+                        notification,
+                        &serde_json::json!({
+                            "jsonrpc": "2.0", "method": "example/events", "params": parameters
+                        })
+                    );
+                }
+                assert_eq!(result["observed"].as_array().unwrap().len(), 2);
+                assert_eq!(result["calls"][0]["id"], 2);
+                assert_eq!(result["calls"][1]["id"], 3);
+                assert!(executor.try_take_response(&mut followup).unwrap().is_some());
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(
+                    notification_sender
+                        .notify_final_extension(
+                            &cx,
+                            &id,
+                            "example/events",
+                            serde_json::json!({"value": 3}),
+                        )
+                        .is_err()
+                );
+            }
+        });
     }
 
     #[cfg(unix)]

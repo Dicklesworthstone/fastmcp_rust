@@ -1,4 +1,4 @@
-//! A real typed extension producer and the shipped generic HTTP consumer.
+//! Real typed extension producers and the shipped HTTP and memory clients.
 
 use std::collections::BTreeMap;
 
@@ -7,10 +7,21 @@ use fastmcp_rust::{
     CanonicalHttpUrl, ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
     ExtensionDirection, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
     ExtensionMethodDescriptor, ExtensionNegotiationError, ExtensionNegotiationResolver,
-    ExtensionSettings, ExtensionSettingsSchema,
+    ExtensionNotificationDescriptor, ExtensionSettings, ExtensionSettingsSchema,
+    NotificationActivationProofDescriptor, NotificationActivationProofLocation,
 };
 
 fn client_configuration() -> (
+    ExtensionId,
+    ExtensionDescriptorRegistry,
+    ClientExtensionDiscovery,
+) {
+    client_configuration_with_notifications(false)
+}
+
+fn client_configuration_with_notifications(
+    notifications: bool,
+) -> (
     ExtensionId,
     ExtensionDescriptorRegistry,
     ClientExtensionDiscovery,
@@ -39,7 +50,14 @@ fn client_configuration() -> (
                 http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
                 legacy_fallback: false,
             }),
-            notification: None,
+            notification: notifications.then(|| ExtensionNotificationDescriptor {
+                name: NOTIFICATION.to_owned(),
+                direction: ExtensionDirection::ClientToServer,
+                activation_proof: Some(NotificationActivationProofDescriptor::SelfContained {
+                    location: NotificationActivationProofLocation::Metadata,
+                    key: ACTIVATION.to_owned(),
+                }),
+            }),
             result_discriminator: None,
             routing_headers: Vec::new(),
             stdio_correlation: None,
@@ -146,4 +164,297 @@ fn typed_extension_http_client_preserves_payload_only_result() {
         2,
         "the two valid calls execute; the forbidden core-method near-match does not"
     );
+}
+
+fn duplex_registration(
+    calls: Arc<AtomicUsize>,
+    observations: Arc<NotificationObservations>,
+) -> ExtensionRegistration {
+    let authorization = Arc::clone(&observations);
+    builder()
+        .typed_request_sync(
+            METHOD,
+            "scale-params-v1",
+            "scale-result-v1",
+            move |context: ExtensionContext<'_, Settings>, request: ScaleRequest| {
+                context.checkpoint()?;
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ScaleResponse {
+                    value: request.value * context.settings().multiplier,
+                })
+            },
+        )
+        .unwrap()
+        .typed_notification(
+            NOTIFICATION,
+            "scaled-notification-v1",
+            ACTIVATION,
+            move |notification: &ScaleNotification| {
+                authorization.authorized.fetch_add(1, Ordering::SeqCst);
+                if notification.value == 13 {
+                    return Err(McpError::new(
+                        fastmcp_rust::McpErrorCode::ResourceForbidden,
+                        "notification operation denied",
+                    ));
+                }
+                Ok(())
+            },
+            ScaleNotificationHandler(observations),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn typed_extension_memory_client_multiplexes_requests_and_notifications() {
+    use fastmcp_rust::{
+        ClientInfo, CoreResult, FinalCoreResult, McpRequestCancellation, MemoryExtensionEvent,
+        MemoryRequestEvent,
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let observations = Arc::new(NotificationObservations::default());
+    let observed = Arc::clone(&observations);
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().unwrap();
+        assert!(cx.blocking_pool_handle().is_none());
+        asupersync::time::timeout(cx.now(), Duration::from_secs(10), async {
+            let server = modern::ServerBuilder::new("typed-memory-client", "1.0")
+                .extension(duplex_registration(calls, Arc::clone(&observations)))
+                .unwrap()
+                .try_build()
+                .unwrap();
+            let (transport, peer) = create_memory_transport_pair_with_capacity(1);
+            let mut serving = cx
+                .spawn(move |server_cx| async move { server.serve_memory(&server_cx, peer).await })
+                .unwrap();
+            let (id, descriptors, discovery) = client_configuration_with_notifications(true);
+            let mut client = modern::MemoryClient::builder(ClientInfo {
+                name: "typed-memory-consumer".to_owned(),
+                version: "1.0".to_owned(),
+            })
+            .extension_registry(descriptors, discovery, || accept_settings)
+            .unwrap()
+            .connect(&cx, transport)
+            .await
+            .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            client
+                .notify_final_extension(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    NOTIFICATION,
+                    json!({"value": 7, "hold": false}),
+                )
+                .await
+                .unwrap();
+            let mut extension = client
+                .execute_final_extension(&cx, &cancellation, &id, METHOD, json!({"value": 7}))
+                .await
+                .unwrap();
+            assert_eq!(extension.request_id(), &RequestId::Number(2));
+            let mut core = client
+                .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                .await
+                .unwrap();
+            assert_eq!(core.request_id(), &RequestId::Number(3));
+
+            // These stale request fields cannot replace the fresh notification
+            // proof emitted from this client's immutable local configuration.
+            client
+                .notify_final_extension(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    NOTIFICATION,
+                    json!({"value": 11, "hold": false, "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": {(EXTENSION): {"version": 2}}
+                        }
+                    }}),
+                )
+                .await
+                .unwrap();
+            client
+                .notify_final_extension(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    NOTIFICATION,
+                    json!({"value": 17, "hold": false, "_meta": {(ACTIVATION): {"version": 2}}}),
+                )
+                .await
+                .expect_err("a caller cannot override the configured notification proof");
+            for value in [json!("wrong-type"), json!(13)] {
+                client
+                    .notify_final_extension(
+                        &cx,
+                        &cancellation,
+                        &id,
+                        NOTIFICATION,
+                        json!({"value": value, "hold": false}),
+                    )
+                    .await
+                    .expect("publication succeeds; stream notifications have no response");
+            }
+            let Some(MemoryRequestEvent::Result(result)) = client
+                .next_event(&cx, &cancellation, &mut core)
+                .await
+                .unwrap()
+            else {
+                panic!("the core sibling retains its own terminal result");
+            };
+            assert!(matches!(
+                *result,
+                CoreResult::Final(FinalCoreResult::ToolsList { .. })
+            ));
+            let Some(MemoryExtensionEvent::Result(result)) = client
+                .next_extension_event(&cx, &cancellation, &mut extension)
+                .await
+                .unwrap()
+            else {
+                panic!("the extension retains its own terminal result");
+            };
+            assert_eq!(result, json!({"value": 21}));
+            assert_eq!(
+                serde_json::from_str::<fastmcp_rust::JsonValue>(
+                    extension.raw_result_source().unwrap()
+                )
+                .unwrap(),
+                result,
+            );
+            assert!(
+                client
+                    .next_extension_event(&cx, &cancellation, &mut extension)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            client
+                .request_final_extension(&cx, &cancellation, &id, METHOD, json!({"value": "bad"}))
+                .await
+                .expect_err("the typed producer rejects invalid payloads without executing them");
+            assert_eq!(
+                client
+                    .request_final_extension(&cx, &cancellation, &id, METHOD, json!({"value": 5}))
+                    .await
+                    .unwrap(),
+                json!({"value": 15}),
+                "a rejected sibling does not poison the connection",
+            );
+            while observations.completed.load(Ordering::SeqCst) < 2
+                || observations.authorized.load(Ordering::SeqCst) < 3
+            {
+                asupersync::runtime::yield_now().await;
+            }
+            assert!(client.take_server_notifications().is_empty());
+            client.close(&cx).unwrap();
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(cx.checkpoint().is_ok());
+        })
+        .await
+        .expect("capacity-one memory client and server complete on their caller runtime");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.authorized.load(Ordering::SeqCst), 3);
+    assert_eq!(observed.started.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.total.load(Ordering::SeqCst), 54);
+    assert_eq!(observed.abandoned.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn typed_notification_modern_http_facade_acknowledges_completed_callbacks() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let observations = Arc::new(NotificationObservations::default());
+    let observed = Arc::clone(&observations);
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().unwrap();
+        asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+            let server = modern::ServerBuilder::new("typed-http-notify-client", "1.0")
+                .extension(duplex_registration(calls, Arc::clone(&observations)))
+                .unwrap()
+                .try_build()
+                .unwrap();
+            let bound = server.bind_http(&cx, "127.0.0.1:0").await.unwrap();
+            let endpoint =
+                CanonicalHttpUrl::parse(&format!("http://{}/mcp", bound.local_addr().unwrap(),))
+                    .unwrap();
+            let (ready, mut receiver) = asupersync::channel::oneshot::channel();
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    ready.send(&server_cx, server_cx.clone()).unwrap();
+                    bound.serve(&server_cx).await
+                })
+                .unwrap();
+            let server_cx = receiver.recv(&cx).await.unwrap();
+            let (id, descriptors, discovery) = client_configuration_with_notifications(true);
+            let mut client = modern::ClientBuilder::new()
+                .extension_registry(descriptors, discovery, || accept_settings)
+                .unwrap()
+                .connect_http_with_cx(&cx, endpoint)
+                .await
+                .unwrap();
+            for value in [7, 11] {
+                client
+                    .notify_final_extension(
+                        &cx,
+                        &id,
+                        NOTIFICATION,
+                        json!({"value": value, "hold": false}),
+                    )
+                    .await
+                    .expect("the public facade accepts the server's empty HTTP 202");
+            }
+            assert_eq!(observations.completed.load(Ordering::SeqCst), 2);
+            for parameters in [
+                json!({"value": 13, "hold": false}),
+                json!({"value": "bad", "hold": false}),
+                json!({"value": 17, "hold": false, "_meta": {(ACTIVATION): {"version": 2}}}),
+            ] {
+                client
+                    .notify_final_extension(&cx, &id, NOTIFICATION, parameters)
+                    .await
+                    .expect_err("schema, policy and local proof refusals remain observable");
+            }
+            assert_eq!(
+                client
+                    .request_final_extension(&cx, &id, METHOD, json!({"value": 5}))
+                    .await
+                    .unwrap(),
+                json!({"value": 15}),
+            );
+            drop(client);
+            server_cx.cancel_with(
+                asupersync::types::CancelKind::Shutdown,
+                Some("public notification client exchange complete"),
+            );
+            assert!(matches!(
+                serving.join(&cx).await.unwrap().unwrap(),
+                fastmcp_rust::HttpServerShutdown::Quiescent,
+            ));
+        })
+        .await
+        .expect("bounded public HTTP notification and request exchange");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    assert_eq!(observed_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observed.authorized.load(Ordering::SeqCst), 3);
+    assert_eq!(observed.completed.load(Ordering::SeqCst), 2);
+    assert_eq!(observed.total.load(Ordering::SeqCst), 54);
+    assert_eq!(observed.abandoned.load(Ordering::SeqCst), 0);
 }
