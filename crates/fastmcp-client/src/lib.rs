@@ -9171,7 +9171,8 @@ where
     where
         IO: Send + 'static,
     {
-        self.session
+        let admission = self
+            .session
             .admit_final_extension_method(extension_id, method)?;
         if cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
@@ -9193,8 +9194,9 @@ where
                 "WebSocket final extension response has no admitted result source",
             )
         })?;
-        serde_json::from_str(&source).map_err(|_| {
-            McpError::invalid_request("WebSocket final extension response result is not valid JSON")
+        admission.decode_result(&source)?;
+        received.response.result.ok_or_else(|| {
+            McpError::invalid_request("WebSocket final extension response has no result")
         })
     }
 
@@ -16531,7 +16533,7 @@ impl HttpClient {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         let request_id = self.next_request_id()?;
-        let (mut response, result_source, _, _, _) = {
+        let (mut response, _, _, _, _) = {
             let mut observer = Self::final_http_notification_observer(
                 &mut self.final_result_cache,
                 &mut self.final_server_notifications,
@@ -16553,14 +16555,9 @@ impl HttpClient {
         if let Some(error) = response.error.take() {
             return Err(HttpClientError::CoreResult(json_rpc_error_to_mcp(error)));
         }
-        let result_source = result_source.ok_or_else(|| {
+        response.result.ok_or_else(|| {
             HttpClientError::CoreResult(McpError::invalid_request(
-                "HTTP final extension response has no admitted result source",
-            ))
-        })?;
-        serde_json::from_str(&result_source).map_err(|_| {
-            HttpClientError::CoreResult(McpError::invalid_request(
-                "HTTP final extension response result is not valid JSON",
+                "HTTP final extension response has no result",
             ))
         })
     }
@@ -17526,7 +17523,7 @@ impl StdioRequestExecutor {
                 "Final client extension settings were not negotiated by server/discover",
             )
         })?;
-        runtime.admit_method(negotiated, extension_id, method)?;
+        let admission = runtime.admit_request(negotiated, extension_id, method)?;
 
         let configured_metadata = self.modern_request_meta.as_ref().ok_or_else(|| {
             McpError::internal_error("Negotiated stdio client metadata is unavailable")
@@ -17567,10 +17564,19 @@ impl StdioRequestExecutor {
 
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
-        let mut execution =
-            self.execute_request(cx, JsonRpcRequest::new(method, Some(parameters), id))?;
-        execution.require_result_source = true;
-        Ok(execution)
+        let timeout_policy = *self.timeout_policy.lock().map_err(|_| {
+            McpError::internal_error("Negotiated stdio timeout policy is unavailable")
+        })?;
+        let execution = self.executor.execute_final_extension_with_timeout_policy(
+            cx,
+            JsonRpcRequest::new(method, Some(parameters), id),
+            timeout_policy,
+            admission,
+        )?;
+        Ok(StdioRequestExecution {
+            execution,
+            require_result_source: true,
+        })
     }
 
     fn execute_request(
@@ -20784,7 +20790,8 @@ impl Client {
         parameters: serde_json::Value,
     ) -> McpResult<serde_json::Value> {
         self.ensure_initialized()?;
-        self.session
+        let admission = self
+            .session
             .admit_final_extension_method(extension_id, method)?;
         let parameters = self.prepare_request_parameters(parameters)?;
         let received = self.send_prepared_request(method, parameters)?;
@@ -20793,11 +20800,10 @@ impl Client {
                 "Peer final extension response lost its admitted result source",
             ))
         })?;
-        serde_json::from_str(source).map_err(|_| {
-            self.terminate_connection(McpError::invalid_request(
-                "Peer response result is not valid JSON for the admitted final extension request",
-            ))
-        })
+        admission
+            .decode_result(source)
+            .map_err(|error| self.terminate_connection(error))?;
+        Ok(received.result)
     }
 
     /// Sends one already-admitted final Tasks request and decodes its exact
@@ -37930,6 +37936,82 @@ exec sleep 2
 
     #[cfg(all(feature = "websocket-experimental", unix))]
     #[test]
+    fn clt_ext_registered_result_websocket_keeps_request_ownership() {
+        run_test(|| async {
+            let cx = Cx::current().expect("caller runtime");
+            let (client_io, server_io) = async_websocket_pair();
+            let mut peer = cx
+                .spawn(move |peer_cx| async move {
+                    let mut server = AsyncWsServerTransport::from_upgraded(server_io);
+                    let JsonRpcMessage::Request(discover) = server.recv(&peer_cx).await.unwrap()
+                    else {
+                        panic!("first request must be discovery");
+                    };
+                    let discovery: serde_json::Value =
+                        serde_json::from_str(&extension_result_pair_discovery_response()).unwrap();
+                    server
+                        .send(
+                            &peer_cx,
+                            &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                discover.id.unwrap(),
+                                discovery["result"].clone(),
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    for (index, marker) in [
+                        "com.example/raw-result",
+                        "com.example/other-result",
+                        "com.example/raw-result",
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let JsonRpcMessage::Request(request) = server.recv(&peer_cx).await.unwrap()
+                        else {
+                            panic!("extension request expected");
+                        };
+                        assert_eq!(request.method, "example/echo");
+                        assert_eq!(request.id, Some(RequestId::Number(index as i64 + 2)));
+                        server
+                            .send(
+                                &peer_cx,
+                                &JsonRpcMessage::Response(JsonRpcResponse::success(
+                                    request.id.unwrap(),
+                                    serde_json::json!({"resultType": marker, "value": 21}),
+                                )),
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    assert!(matches!(server.recv(&peer_cx).await, Err(TransportError::Closed)));
+                })
+                .unwrap();
+            let (id, registry, discovery) = extension_result_pair_configuration();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
+                .await
+                .unwrap();
+            for accepted in [true, false, true] {
+                let result = client
+                    .request_final_extension(&cx, &id, "example/echo", serde_json::json!({}))
+                    .await;
+                if accepted {
+                    assert_eq!(result.unwrap()["value"], 21);
+                } else {
+                    assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+                }
+            }
+            client.close(&cx).await.unwrap();
+            peer.join(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(all(feature = "websocket-experimental", unix))]
+    #[test]
     fn rh5_websocket_extension_wrong_direction_rejects_before_contact_or_id_allocation() {
         run_test(|| async {
             let cx = Cx::current().expect("test runtime installs caller context");
@@ -40992,6 +41074,96 @@ exec sleep 2
         .expect("public HTTP raw extension request uses the admitted source path");
         assert_eq!(result["echoed"]["input"], "ok");
         server.join().expect("raw extension HTTP peer joins");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_registered_result_http_round_trip() {
+        // The same public request path must enforce its receipt for both
+        // finite JSON responses and the terminal frame of an SSE response.
+        for use_sse in [false, true] {
+            let cases = [
+                (r#"{"resultType":"com.example/raw-result","value":7.30e-2}"#, true),
+                (r#"{"resultType":"com.example/other-result","value":7.30e-2}"#, false),
+                (r#"{"resultType":"com.example/unknown-result","value":7.30e-2}"#, false),
+                (r#"{"resultType":"task","value":7.30e-2}"#, false),
+                (r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#, false),
+                (r#"{"resultType":"complete","value":21}"#, true),
+                (r#"{"value":21}"#, true),
+                (r#"{"resultType":"com.example/raw-result","value":1.20e+4}"#, true),
+            ];
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let modern_target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut probe, _) = listener.accept().unwrap();
+                let request = read_http_cache_test_request(&mut probe);
+                assert_eq!(request["method"], SERVER_DISCOVER_METHOD);
+                assert_eq!(request["id"], 1);
+                write_http_cache_test_response(
+                    &mut probe,
+                    "application/json",
+                    extension_result_pair_discovery_response().as_bytes(),
+                );
+                for (index, (source, _)) in cases.iter().enumerate() {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let request = read_http_cache_test_request(&mut stream);
+                    assert_eq!(request["method"], "example/echo");
+                    assert_eq!(request["id"], index + 2);
+                    assert_eq!(
+                        request["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]
+                            ["extensions"]["com.example/raw"],
+                        serde_json::json!({"mode": "raw"})
+                    );
+                    let response = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{source}}}"#,
+                        index + 2,
+                    );
+                    if use_sse {
+                        let event = format!("event: message\ndata: {response}\n\n");
+                        write_http_cache_test_response(&mut stream, "text/event-stream", event.as_bytes());
+                    } else {
+                        write_http_cache_test_response(&mut stream, "application/json", response.as_bytes());
+                    }
+                }
+            });
+            let (extension_id, registry, discovery) = extension_result_pair_configuration();
+            let cx = Cx::for_request();
+            let mut client = http_test_runtime_block_on(
+                ClientBuilder::new()
+                    .protocol_plan(http_cache_test_plan(&modern_target))
+                    .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                    .unwrap()
+                    .connect_http_client_with_cx(&cx),
+            )
+            .unwrap();
+            for (source, accepted) in cases {
+                let result = http_test_runtime_block_on(client.request_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/echo",
+                    serde_json::json!({}),
+                ));
+                if accepted {
+                    assert_eq!(
+                        result.unwrap(),
+                        serde_json::from_str::<serde_json::Value>(source).unwrap(),
+                        "successful validation must preserve payload and number lexemes"
+                    );
+                } else {
+                    assert!(
+                        matches!(
+                            result,
+                            Err(HttpClientError::Connection(
+                                http_executor::ClientHttpConnectionError::FinalExtensionAdmission(error)
+                            )) if error.code == McpErrorCode::InvalidRequest
+                        ),
+                        "the exact response must fail result admission: {source}"
+                    );
+                }
+            }
+            assert_eq!(client.next_id.load(Ordering::SeqCst), cases.len() as u64 + 2);
+            server.join().unwrap();
+        }
     }
 
     #[cfg(unix)]
@@ -56119,6 +56291,19 @@ while IFS= read -r unexpected; do exit 31; done
         fastmcp_protocol::extensions::ExtensionDescriptorRegistry,
         fastmcp_protocol::extensions::ClientExtensionDiscovery,
     ) {
+        extension_result_configuration(direction, fallback, None)
+    }
+
+    #[cfg(unix)]
+    fn extension_result_configuration(
+        direction: ExtensionDirection,
+        fallback: fastmcp_protocol::extensions::ExtensionFallbackPolicy,
+        result_discriminator: Option<&str>,
+    ) -> (
+        fastmcp_protocol::ExtensionId,
+        fastmcp_protocol::extensions::ExtensionDescriptorRegistry,
+        fastmcp_protocol::extensions::ClientExtensionDiscovery,
+    ) {
         use fastmcp_protocol::extensions::{
             ClientExtensionDiscovery, ExtensionDescriptor, ExtensionMethodDescriptor,
             ExtensionNegotiationResolver, ExtensionSettings, ExtensionSettingsSchema,
@@ -56153,7 +56338,7 @@ while IFS= read -r unexpected; do exit 31; done
                     legacy_fallback: false,
                 }),
                 notification: None,
-                result_discriminator: None,
+                result_discriminator: result_discriminator.map(str::to_owned),
                 routing_headers: Vec::new(),
                 stdio_correlation: None,
             })
@@ -56164,6 +56349,123 @@ while IFS= read -r unexpected; do exit 31; done
             extensions: BTreeMap::from([(extension_id.clone(), settings)]),
         };
         (extension_id, registry, discovery)
+    }
+
+    #[cfg(unix)]
+    fn extension_result_pair_configuration() -> (
+        fastmcp_protocol::ExtensionId,
+        fastmcp_protocol::extensions::ExtensionDescriptorRegistry,
+        fastmcp_protocol::extensions::ClientExtensionDiscovery,
+    ) {
+        let (id, mut registry, mut discovery) = extension_result_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+            Some("com.example/raw-result"),
+        );
+        let mut other = registry.descriptor(&id).unwrap().clone();
+        other.id = fastmcp_protocol::ExtensionId::parse("com.example/other").unwrap();
+        other.method.as_mut().unwrap().name = "example/other".to_owned();
+        other.result_discriminator = Some("com.example/other-result".to_owned());
+        discovery
+            .extensions
+            .insert(other.id.clone(), discovery.extensions[&id].clone());
+        registry.register(other).unwrap();
+        (id, registry, discovery)
+    }
+
+    #[cfg(unix)]
+    fn extension_result_pair_discovery_response() -> String {
+        let source = modern_raw_extension_discovery_response(
+            "registered-result-peer",
+            Some(serde_json::json!({"mode": "raw"})),
+        );
+        let mut response: serde_json::Value = serde_json::from_str(&source).unwrap();
+        response["result"]["capabilities"]["extensions"]["com.example/other"] =
+            serde_json::json!({"mode": "raw"});
+        serde_json::to_string(&response).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_result_receipt_enforces_owner_shape_and_metadata() {
+        let (id, registry, discovery) = extension_result_pair_configuration();
+        let runtime = Arc::new(
+            ClientExtensionRuntime::new(registry, discovery, || accept_raw_extension_settings)
+                .unwrap(),
+        );
+        let response: serde_json::Value =
+            serde_json::from_str(&extension_result_pair_discovery_response()).unwrap();
+        let discovery = serde_json::from_value(response["result"].clone()).unwrap();
+        let negotiated = runtime.negotiate(&discovery).unwrap();
+        let admission = runtime
+            .admit_request(&negotiated, &id, "example/echo")
+            .unwrap();
+
+        for source in [
+            r#"{"resultType":"com.example/raw-result","value":7.30e-2}"#,
+            r#"{"resultType":"com.example/raw-result","_meta":{"com.example/note":true}}"#,
+            r#"{"resultType":"complete","value":21}"#,
+            r#"{"value":21}"#,
+        ] {
+            admission.decode_result(source).expect("admitted result");
+        }
+        for source in [
+            r#"{"resultType":"com.example/other-result","value":7.30e-2}"#,
+            r#"{"resultType":"com.example/unknown-result","value":7.30e-2}"#,
+            r#"{"resultType":"task","value":7.30e-2}"#,
+            r#"{"resultType":null,"value":7.30e-2}"#,
+            r#"{"resultType":17,"value":7.30e-2}"#,
+            r#"{"resultType":"com.example/raw-result","_meta":null}"#,
+            r#"{"resultType":"com.example/raw-result","_meta":17}"#,
+            r#"{"resultType":"com.example/raw-result","_meta":"bad"}"#,
+            r#"{"resultType":"com.example/raw-result","_meta":[]}"#,
+            r#"{"resultType":"com.example/raw-result","_meta":{"io.modelcontextprotocol/subscriptionId":1}}"#,
+            r#"{"resultType":"input_required","requestState":17}"#,
+            r#"{"resultType":"com.example/raw-result","resultType":"complete"}"#,
+            r#"["payload"]"#,
+            r#""payload""#,
+        ] {
+            let error = admission
+                .decode_result(source)
+                .expect_err("only this request's structurally valid result is admitted");
+            assert_eq!(error.code, McpErrorCode::InvalidRequest, "{source}");
+        }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn clt_ext_result_tasks_marker_requires_typed_tool_call() {
+        let mut registry = fastmcp_protocol::extensions::ExtensionDescriptorRegistry::new();
+        let id = register_official_tasks_extension(&mut registry).unwrap();
+        let runtime = Arc::new(
+            ClientExtensionRuntime::new(
+                registry,
+                fastmcp_protocol::extensions::ClientExtensionDiscovery {
+                    extensions: BTreeMap::from([(id.clone(), official_tasks_empty_settings())]),
+                },
+                || accept_raw_extension_settings,
+            )
+            .unwrap(),
+        );
+        let discovery: ServerDiscoverResult = serde_json::from_value(serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": [MODERN_PROTOCOL_VERSION],
+            "capabilities": {"extensions": {"io.modelcontextprotocol/tasks": {}}},
+            "ttlMs": 0,
+            "cacheScope": "private"
+        }))
+        .unwrap();
+        let negotiated = runtime.negotiate(&discovery).unwrap();
+        let admission = runtime.admit_request(&negotiated, &id, "tasks/get").unwrap();
+        admission.decode_result(r#"{"resultType":"complete"}"#).unwrap();
+        let error = admission
+            .decode_result(r#"{"resultType":"task"}"#)
+            .expect_err("even the official Tasks owner cannot return a task from tasks/get");
+        assert_eq!(error.code, McpErrorCode::InvalidRequest);
+        assert_eq!(
+            error.message,
+            "Tasks result requires its typed tools/call execution surface"
+        );
     }
 
     /// Resolver canary that succeeds exactly once per resolver instance.
@@ -56949,6 +57251,248 @@ while IFS= read -r unexpected; do exit 31; done
             .expect("the negotiated client-to-server raw extension request succeeds");
         assert_eq!(result["echoed"]["input"], "ok");
         client.close().expect("raw extension stdio client cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_registered_result_stdio_round_trip() {
+        let (extension_id, registry, client_discovery) = extension_result_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+            Some("com.example/raw-result"),
+        );
+        let discovery = modern_raw_extension_discovery_response(
+            "registered-result-stdio",
+            Some(serde_json::json!({"mode": "raw"})),
+        );
+        let first_source =
+            r#"{"resultType":"com.example/raw-result","owner":"first","exact":7.30e-2}"#;
+        let second_source =
+            r#"{"resultType":"com.example/raw-result","owner":"second","exact":1.20e+4}"#;
+        let script = format!(
+            "IFS= read -r discovery || exit 1; \\
+             printf '%s\\n' '{discovery}'; \\
+             IFS= read -r first || exit 1; IFS= read -r second || exit 1; \\
+             case \"$first\" in *'\"method\":\"example/echo\"'*'\"id\":2'*) ;; *) exit 1 ;; esac; \\
+             case \"$second\" in *'\"method\":\"example/echo\"'*'\"id\":3'*) ;; *) exit 1 ;; esac; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{second_source}}}'; \\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{first_source}}}'; \\
+             exec sleep 2"
+        );
+        let cx = Cx::for_request();
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, client_discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+        )
+        .unwrap();
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let mut first = executor
+            .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+            .unwrap();
+        let mut second = executor
+            .clone()
+            .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+            .unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        let (second_response, second_raw) = executor
+            .try_take_response_with_raw_result(&mut second)
+            .unwrap()
+            .expect("registered extension result reaches its reordered owner");
+        let (first_response, first_raw) = executor
+            .try_take_response_with_raw_result(&mut first)
+            .unwrap()
+            .expect("the first request retains its own negotiated result receipt");
+        assert_eq!(first_response.result.unwrap()["owner"], "first");
+        assert_eq!(second_response.result.unwrap()["owner"], "second");
+        assert_eq!(first_raw.as_deref(), Some(first_source));
+        assert_eq!(second_raw.as_deref(), Some(second_source));
+        assert!(executor.executor.pending_records().is_empty());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_result_owner_mismatch_is_request_local() {
+        for rejected_discriminator in ["com.example/other-result", "com.example/unknown-result"] {
+            let (extension_id, registry, client_discovery) = extension_result_pair_configuration();
+            let other_id = fastmcp_protocol::ExtensionId::parse("com.example/other").unwrap();
+            let discovery = extension_result_pair_discovery_response();
+            let rejected_source = format!(
+                r#"{{"resultType":"{rejected_discriminator}","owner":"first"}}"#
+            );
+            let accepted_source =
+                r#"{"resultType":"com.example/other-result","owner":"second","exact":1.20e+4}"#;
+            let script = format!(
+                "IFS= read -r discovery || exit 1; \\
+                 printf '%s\\n' '{discovery}'; \\
+                 IFS= read -r first || exit 1; IFS= read -r second || exit 1; \\
+                 case \"$first\" in *'\"method\":\"example/echo\"'*'\"id\":2'*) ;; *) exit 1 ;; esac; \\
+                 case \"$second\" in *'\"method\":\"example/other\"'*'\"id\":3'*) ;; *) exit 1 ;; esac; \\
+                 printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{accepted_source}}}'; \\
+                 printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{rejected_source}}}'; \\
+                 exec sleep 2"
+            );
+            let cx = Cx::for_request();
+            let mut client = block_on(
+                ClientBuilder::new()
+                    .extension_registry(registry, client_discovery, || accept_raw_extension_settings)
+                    .unwrap()
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+            )
+            .unwrap();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let mut first = executor
+                .execute_final_extension(&cx, &extension_id, "example/echo", serde_json::json!({}))
+                .unwrap();
+            let mut second = executor
+                .execute_final_extension(&cx, &other_id, "example/other", serde_json::json!({}))
+                .unwrap();
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            let error = executor.try_take_response(&mut first).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidRequest);
+            let (response, source) = executor
+                .try_take_response_with_raw_result(&mut second)
+                .unwrap()
+                .expect("another extension's valid result remains deliverable");
+            assert_eq!(response.result.unwrap()["owner"], "second");
+            assert_eq!(source.as_deref(), Some(accepted_source));
+            assert!(executor.executor.pending_records().is_empty());
+            assert!(executor.executor.terminal_error().is_none());
+            client.close().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_result_core_method_cannot_borrow_receipt() {
+        let (extension_id, registry, discovery) = extension_result_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+            Some("com.example/raw-result"),
+        );
+        let script = modern_raw_extension_client_script(
+            r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"com.example/raw-result","value":21}}"#,
+        );
+        let cx = Cx::for_request();
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+        )
+        .unwrap();
+        let admission = client
+            .session
+            .admit_final_extension_method(&extension_id, "example/echo")
+            .unwrap();
+        assert!(
+            admission
+                .validate_request(ProtocolEra::Legacy2024, "example/echo")
+                .is_err()
+        );
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let error = match executor.executor.execute_final_extension_with_timeout_policy(
+            &cx,
+            JsonRpcRequest::new("tools/list", Some(serde_json::json!({})), 500),
+            RequestTimeoutPolicy::default(),
+            admission,
+        ) {
+            Ok(_) => panic!("a valid extension receipt cannot authorize a core request"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert!(executor.executor.pending_records().is_empty());
+        assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+
+        let mut execution = executor
+            .execute_final_extension(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({"input": "ok"}),
+            )
+            .unwrap();
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        let response = executor.try_take_response(&mut execution).unwrap().unwrap();
+        assert_eq!(response.result.unwrap()["value"], 21);
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_result_one_sided_admission_does_not_contact() {
+        let (extension_id, registry, discovery) = extension_result_configuration(
+            ExtensionDirection::ClientToServer,
+            fastmcp_protocol::extensions::ExtensionFallbackPolicy::ClientInactiveFallback,
+            Some("com.example/raw-result"),
+        );
+        let script = modern_raw_extension_no_contact_client_script(None);
+        let cx = Cx::for_request();
+        let mut client = block_on(
+            ClientBuilder::new()
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+        )
+        .unwrap();
+        let next_id = client.next_id.load(Ordering::SeqCst);
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        let rejected = executor.execute_final_extension(
+            &cx,
+            &extension_id,
+            "example/echo",
+            serde_json::json!({}),
+        );
+        assert!(matches!(rejected, Err(error) if error.code == McpErrorCode::InvalidParams));
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+        assert!(executor.executor.pending_records().is_empty());
+        let error = client
+            .request_final_extension(&extension_id, "example/echo", serde_json::json!({}))
+            .unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_sequential_result_preserves_payload_and_rejects_unknown_marker() {
+        for (source, accepted) in [
+            (r#"{"resultType":"com.example/raw-result","value":21}"#, true),
+            (r#"{"value":21}"#, true),
+            (r#"{"resultType":"com.example/unknown-result","value":21}"#, false),
+            (r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#, false),
+        ] {
+            let (extension_id, registry, discovery) = extension_result_configuration(
+                ExtensionDirection::ClientToServer,
+                fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+                Some("com.example/raw-result"),
+            );
+            let response = format!(r#"{{"jsonrpc":"2.0","id":2,"result":{source}}}"#);
+            let script = modern_raw_extension_client_script(&response);
+            let mut client = block_on(
+                ClientBuilder::new()
+                    .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                    .unwrap()
+                    .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script.as_str()]),
+            )
+            .unwrap();
+            let result = client.request_final_extension(
+                &extension_id,
+                "example/echo",
+                serde_json::json!({"input": "ok"}),
+            );
+            if accepted {
+                assert_eq!(result.unwrap(), serde_json::from_str::<serde_json::Value>(source).unwrap());
+            } else {
+                assert_eq!(result.unwrap_err().code, McpErrorCode::InvalidRequest);
+            }
+            client.close().unwrap();
+        }
     }
 
     #[cfg(unix)]

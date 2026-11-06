@@ -77,7 +77,9 @@ use crate::FinalToolCallOutcome;
 use crate::execution::{
     CancellationRequested, ExecutionTerminalReason, MrtrDriver, MrtrDriverLimits,
 };
-use crate::session::{ClientExtensionRuntime, mcp_apps_activation_receipt};
+use crate::session::{
+    ClientExtensionResultAdmission, ClientExtensionRuntime, mcp_apps_activation_receipt,
+};
 use crate::sse::{BoundedSseParser, SseEndOfStream, SseLimits, SseParseError, SsePushError};
 use crate::{
     ClientHttpNegotiation, ClientHttpNegotiationDecision, ClientHttpNegotiationError,
@@ -5668,7 +5670,7 @@ impl ClientHttpConnection {
         &self,
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
-    ) -> McpResult<()> {
+    ) -> McpResult<ClientExtensionResultAdmission> {
         match self {
             Self::Modern(client) => client.admit_final_extension_method(extension_id, method),
             #[cfg(feature = "legacy-2024-11-05")]
@@ -6259,19 +6261,32 @@ impl ClientHttpConnection {
         ),
         ClientHttpConnectionError,
     > {
-        self.admit_final_extension_method(extension_id, method)
+        let admission = self
+            .admit_final_extension_method(extension_id, method)
             .map_err(ClientHttpConnectionError::FinalExtensionAdmission)?;
-        self.request_json_with_result_source_at_inner(
-            cx,
-            None,
-            ModernRequestAdmission::FinalExtension(method),
-            parameters,
-            request_id,
-            maximum_response_bytes,
-            None,
-            observer,
-        )
-        .await
+        let received = self
+            .request_json_with_result_source_at_inner(
+                cx,
+                None,
+                ModernRequestAdmission::FinalExtension(method),
+                parameters,
+                request_id,
+                maximum_response_bytes,
+                None,
+                observer,
+            )
+            .await?;
+        if received.0.result.is_some() {
+            let source = received.1.as_deref().ok_or_else(|| {
+                ClientHttpConnectionError::FinalExtensionAdmission(McpError::invalid_request(
+                    "HTTP final extension response has no admitted result source",
+                ))
+            })?;
+            admission
+                .decode_result(source)
+                .map_err(ClientHttpConnectionError::FinalExtensionAdmission)?;
+        }
+        Ok(received)
     }
 
     /// Request-local variant of [`Self::request_json_with_result_source_at`].
@@ -7915,7 +7930,7 @@ impl ModernHttpClient {
         &self,
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
-    ) -> McpResult<()> {
+    ) -> McpResult<ClientExtensionResultAdmission> {
         let runtime = self.client_extension_runtime.as_ref().ok_or_else(|| {
             McpError::invalid_params(
                 "No builder-owned final client extension registry is configured",
@@ -7930,7 +7945,7 @@ impl ModernHttpClient {
                     "Final client extension settings were not negotiated by server/discover",
                 )
             })?;
-        runtime.admit_method(&negotiated, extension_id, method)
+        runtime.admit_request(&negotiated, extension_id, method)
     }
 
     /// Sends one proof-bound extension notification as one finite HTTP POST.

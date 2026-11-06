@@ -47,6 +47,7 @@ use fastmcp_protocol::{
 use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
 use serde_json::Value;
 
+use crate::session::ClientExtensionResultAdmission;
 use crate::{
     RequestTimeoutPolicy, RequestTimeoutSource, SubscriptionTimeoutPolicy, request_timeout_error,
     transport_error_to_mcp,
@@ -916,6 +917,7 @@ struct PendingExecution {
     advertised_progress_key: Option<CorrelationKey>,
     last_progress: Option<ExactNonNegativeJsonNumber>,
     method: String,
+    extension_result: Option<ClientExtensionResultAdmission>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1077,6 +1079,9 @@ struct DecodedFinalResponse {
 enum AdmittedFinalResult {
     Core(Box<DecodedResult>, Option<ResultPeerDiagnostic>),
     Task,
+    /// An exact registered discriminator admitted for this request owner.
+    /// Its source is available only through the extension/raw result surface.
+    Extension,
     /// `subscriptions/listen` completion is method-shaped, not a generic
     /// complete-result payload. Keep the admitted source for the typed
     /// listener instead of forcing it through [`CoreResultDiscriminatorPolicy`].
@@ -1090,6 +1095,7 @@ impl DecodedFinalResponse {
         peer_era: ResultPeerEra,
         accepts_task_result: bool,
         retain_subscription_listen: bool,
+        extension_result: Option<&ClientExtensionResultAdmission>,
     ) -> McpResult<Self> {
         if raw_result.is_some() && response.result.is_none() {
             return Err(McpError::invalid_request(
@@ -1110,6 +1116,18 @@ impl DecodedFinalResponse {
             .result
             .as_ref()
             .map(|result| {
+                if let Some(admission) = extension_result {
+                    let source = raw_result.as_deref().ok_or_else(|| {
+                        McpError::invalid_request(
+                            "Peer final extension response lost its admitted result source",
+                        )
+                    })?;
+                    let (decoded, diagnostic) = admission.decode_result(source)?;
+                    return Ok(match decoded {
+                        DecodedResult::Deferred(_) => AdmittedFinalResult::Extension,
+                        decoded => AdmittedFinalResult::Core(Box::new(decoded), diagnostic),
+                    });
+                }
                 if retain_subscription_listen {
                     return Ok(AdmittedFinalResult::SubscriptionListen);
                 }
@@ -1149,6 +1167,9 @@ impl DecodedFinalResponse {
             Some(AdmittedFinalResult::Core(decoded, diagnostic)) => Ok((*decoded, diagnostic)),
             Some(AdmittedFinalResult::Task) => Err(McpError::invalid_request(
                 "Tasks result requires its typed Tasks execution surface",
+            )),
+            Some(AdmittedFinalResult::Extension) => Err(McpError::invalid_request(
+                "Extension result requires its admitted extension execution surface",
             )),
             Some(AdmittedFinalResult::SubscriptionListen) => Err(McpError::invalid_request(
                 "Listen result requires its typed subscription surface",
@@ -1593,6 +1614,7 @@ where
             request,
             ExecutionTimeoutPolicy::Request(timeout_policy),
             Some(cancellation.clone()),
+            None,
             |_, _, message| commit(message),
         )
     }
@@ -1774,6 +1796,27 @@ where
             cx,
             request,
             ExecutionTimeoutPolicy::Request(timeout_policy),
+            None,
+        )
+    }
+
+    /// Starts an extension execution with its frozen result authority already
+    /// attached. Ordinary callers cannot install this receipt after a send or
+    /// borrow it for a core method or another protocol era.
+    pub(crate) fn execute_final_extension_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        request: Request,
+        timeout_policy: RequestTimeoutPolicy,
+        admission: ClientExtensionResultAdmission,
+    ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        admission.validate_request(self.protocol_era(), &request.method)?;
+        self.execute_with_deadline_policy(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Request(timeout_policy),
+            Some(admission),
         )
     }
 
@@ -1804,6 +1847,7 @@ where
             cx,
             request,
             ExecutionTimeoutPolicy::Subscription(timeout_policy),
+            None,
         )
     }
 
@@ -1812,6 +1856,7 @@ where
         cx: &Cx,
         request: Request,
         timeout_policy: ExecutionTimeoutPolicy,
+        extension_result: Option<ClientExtensionResultAdmission>,
     ) -> McpResult<RequestExecution<T>> {
         if self.state.borrow().external_writes {
             return Err(McpError::invalid_request(
@@ -1823,6 +1868,7 @@ where
             request,
             timeout_policy,
             None,
+            extension_result,
             |transport, cx, message| transport.send(cx, message),
         )?
         .ok_or_else(|| McpError::internal_error("Synchronous executor deferred its own send"))
@@ -1834,6 +1880,7 @@ where
         request: Request,
         timeout_policy: ExecutionTimeoutPolicy,
         request_cancellation: Option<McpRequestCancellation>,
+        extension_result: Option<ClientExtensionResultAdmission>,
         commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportError>,
     ) -> McpResult<Option<RequestExecution<T>>> {
         let turn = ExecutionTurn::new(cx);
@@ -1991,6 +2038,7 @@ where
                 advertised_progress_key,
                 last_progress: None,
                 method: request.method.clone(),
+                extension_result,
             },
         );
 
@@ -3266,6 +3314,7 @@ where
             state.result_peer_era,
             accepts_task_result,
             retain_subscription_listen,
+            pending.extension_result.as_ref(),
         ) {
             Ok(decoded) => decoded,
             Err(error) => {

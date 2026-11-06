@@ -19,8 +19,9 @@ use fastmcp_protocol::protocol_policy::{
     ProtocolVersionError,
 };
 use fastmcp_protocol::{
-    ClientCapabilities, ClientInfo, ServerCapabilities, ServerDiscoverResult, ServerInfo,
-    ServerInstructions,
+    ClientCapabilities, ClientInfo, DecodedResult, DeferringResultDiscriminatorPolicy,
+    ResultPeerDiagnostic, ResultPeerEra, ServerCapabilities, ServerDiscoverResult, ServerInfo,
+    ServerInstructions, decode_peer_result,
 };
 
 #[cfg(feature = "legacy-2024-11-05")]
@@ -99,6 +100,85 @@ pub(crate) struct ClientExtensionRuntime {
     local_enablement: ExtensionLocalEnablement,
     client_discovery: ClientExtensionDiscovery,
     resolver_factory: Arc<dyn ClientExtensionSettingsResolverFactory>,
+}
+
+/// Immutable result authority retained by one admitted extension request.
+///
+/// The receipt cannot be constructed from peer result metadata. Its method,
+/// owner and bilateral settings are fixed before the request is committed,
+/// so another request or a later discovery cannot widen result admission.
+#[derive(Clone, Debug)]
+pub(crate) struct ClientExtensionResultAdmission {
+    runtime: Arc<ClientExtensionRuntime>,
+    negotiated: NegotiatedExtensionSet,
+    extension_id: fastmcp_protocol::ExtensionId,
+    method: String,
+}
+
+impl ClientExtensionResultAdmission {
+    pub(crate) fn validate_request(&self, era: ProtocolEra, method: &str) -> McpResult<()> {
+        if era != ProtocolEra::Modern2026 || method != self.method {
+            return Err(McpError::invalid_params(
+                "Final extension result admission does not match this request",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates the original result source without rewriting its payload.
+    ///
+    /// In particular, a schema-checked extension object that omits
+    /// `resultType` keeps that omission through the existing peer compatibility
+    /// rule. A non-core marker remains inert until its exact request owner is
+    /// admitted by the retained negotiated registry.
+    pub(crate) fn decode_result(
+        &self,
+        source: &str,
+    ) -> McpResult<(DecodedResult, Option<ResultPeerDiagnostic>)> {
+        let decoded = decode_peer_result(
+            source,
+            ResultPeerEra::Modern,
+            &DeferringResultDiscriminatorPolicy,
+        )
+        .map_err(|_| {
+            McpError::invalid_request("Peer final extension result failed protocol decoding")
+        })?;
+        if let DecodedResult::Deferred(result) = &decoded.0 {
+            // The deferring policy is an inert carrier: it validates entries
+            // of object metadata but deliberately defers non-object metadata.
+            // A terminal extension consumer must finish that shape check.
+            if result.members().iter().any(|member| {
+                member.name == "_meta"
+                    && !matches!(&member.value, fastmcp_protocol::ExactJsonValue::Object(_))
+            }) {
+                return Err(McpError::invalid_request(
+                    "Peer final extension result metadata must be an object",
+                ));
+            }
+            // A task is an eligible tools/call outcome, never the result of
+            // a generic extension method, including tasks/get/update/cancel.
+            // Keep its dedicated typed admission and persistence path intact.
+            // Keep this wire exclusion active when the Tasks feature is absent.
+            if result.discriminator() == "task" {
+                return Err(McpError::invalid_request(
+                    "Tasks result requires its typed tools/call execution surface",
+                ));
+            }
+            self.negotiated
+                .admit_result_discriminator(
+                    &self.runtime.descriptors,
+                    ProtocolEra::Modern2026,
+                    &self.extension_id,
+                    result.discriminator(),
+                )
+                .map_err(|_| {
+                    McpError::invalid_request(
+                        "Peer final extension result is not owned by this negotiated request",
+                    )
+                })?;
+        }
+        Ok(decoded)
+    }
 }
 
 impl std::fmt::Debug for ClientExtensionRuntime {
@@ -232,6 +312,21 @@ impl ClientExtensionRuntime {
                     "Final extension request is not admitted by the negotiated client capability: {error}"
                 ))
             })
+    }
+
+    pub(crate) fn admit_request(
+        self: &Arc<Self>,
+        negotiated: &NegotiatedExtensionSet,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+    ) -> McpResult<ClientExtensionResultAdmission> {
+        self.admit_method(negotiated, extension_id, method)?;
+        Ok(ClientExtensionResultAdmission {
+            runtime: Arc::clone(self),
+            negotiated: negotiated.clone(),
+            extension_id: extension_id.clone(),
+            method: method.to_owned(),
+        })
     }
 
     /// Builds one current-message proof from the locally configured settings.
@@ -695,7 +790,7 @@ impl ClientSession {
         &self,
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
-    ) -> McpResult<()> {
+    ) -> McpResult<ClientExtensionResultAdmission> {
         if self.selected_era != Some(ProtocolEra::Modern2026) {
             return Err(McpError::invalid_params(
                 "Final client extensions are unavailable in exact MCP 2024-11-05",
@@ -711,7 +806,7 @@ impl ClientSession {
                 "Final client extension settings were not negotiated by server/discover",
             )
         })?;
-        runtime.admit_method(negotiated, extension_id, method)
+        runtime.admit_request(negotiated, extension_id, method)
     }
 
     pub(crate) fn set_mcp_apps_activation_receipt(
