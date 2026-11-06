@@ -130,9 +130,17 @@ fn request(
     settings: Option<fastmcp_rust::JsonValue>,
     value: fastmcp_rust::JsonValue,
 ) -> JsonRpcMessage {
-    let mut capabilities = json!({});
+    // Tasks is ALWAYS advertised, including when this request omits the typed
+    // extension's own settings. The facade's default feature set includes
+    // `tasks`, so ServerBuilder auto-installs the official Tasks extension,
+    // whose descriptor is RejectOneSided. A client that advertises any
+    // extensions object without Tasks is therefore refused for THAT reason,
+    // which would make every negative below pass on an unintended dimension.
+    let mut capabilities = json!({
+        "extensions": {"io.modelcontextprotocol/tasks": {}}
+    });
     if let Some(settings) = settings {
-        capabilities["extensions"] = json!({(EXTENSION): settings});
+        capabilities["extensions"][EXTENSION] = settings;
     }
     JsonRpcMessage::Request(JsonRpcRequest::new(
         METHOD,

@@ -16279,7 +16279,20 @@ impl Server {
         let client = final_client_extension_discovery(request)?;
         let current = self
             .negotiate_extensions(&client)
-            .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
+            .map_err(|error| {
+                // Name the refusal. `map_err(|_| ...)` discarded the only thing
+                // that distinguished NotConfigured from ResolverPoisoned from
+                // each of the seven Protocol variants, so a -32602 on this path
+                // was unactionable from the wire and from a test panic alike --
+                // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
+                // own root cause. Same code and same refusal condition; only a
+                // reason is added. ServerExtensionNegotiationError's Display
+                // carries fixed phrases plus extension ids, which the peer
+                // already advertises, so this discloses nothing new.
+                McpError::invalid_params(format!(
+                    "Extension request negotiation was rejected: {error}"
+                ))
+            })?;
         request_ctx.ensure_live()?;
         if &current != supplied {
             return Err(McpError::invalid_params(
@@ -16339,7 +16352,20 @@ impl Server {
         let client = final_client_extension_discovery(request)?;
         let negotiated = self
             .negotiate_extensions(&client)
-            .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
+            .map_err(|error| {
+                // Name the refusal. `map_err(|_| ...)` discarded the only thing
+                // that distinguished NotConfigured from ResolverPoisoned from
+                // each of the seven Protocol variants, so a -32602 on this path
+                // was unactionable from the wire and from a test panic alike --
+                // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
+                // own root cause. Same code and same refusal condition; only a
+                // reason is added. ServerExtensionNegotiationError's Display
+                // carries fixed phrases plus extension ids, which the peer
+                // already advertises, so this discloses nothing new.
+                McpError::invalid_params(format!(
+                    "Extension request negotiation was rejected: {error}"
+                ))
+            })?;
         let response = self
             .invoke_negotiated_extension_async(request_ctx, &negotiated, extension_id, request)
             .await?;
@@ -16371,7 +16397,20 @@ impl Server {
         let client = final_client_extension_discovery(request)?;
         let negotiated = self
             .negotiate_extensions(&client)
-            .map_err(|_| McpError::invalid_params("Extension request negotiation was rejected"))?;
+            .map_err(|error| {
+                // Name the refusal. `map_err(|_| ...)` discarded the only thing
+                // that distinguished NotConfigured from ResolverPoisoned from
+                // each of the seven Protocol variants, so a -32602 on this path
+                // was unactionable from the wire and from a test panic alike --
+                // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
+                // own root cause. Same code and same refusal condition; only a
+                // reason is added. ServerExtensionNegotiationError's Display
+                // carries fixed phrases plus extension ids, which the peer
+                // already advertises, so this discloses nothing new.
+                McpError::invalid_params(format!(
+                    "Extension request negotiation was rejected: {error}"
+                ))
+            })?;
         self.invoke_negotiated_extension(request_ctx, &negotiated, extension_id, request)
     }
 
