@@ -12836,6 +12836,12 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fmt::Write as _;
     use std::future::Future as _;
+    // Gated to match its only users: the three bare `poll_fn(...)` call sites
+    // in this module (vs the fully-qualified `std::future::poll_fn` used
+    // elsewhere) all sit inside `#[cfg(feature = "legacy-2024-11-05")]` tests.
+    // Ungated, this import is unused at --no-default-features, which
+    // `clippy -- -D warnings` treats as an error.
+    #[cfg(feature = "legacy-2024-11-05")]
     use std::future::poll_fn;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
