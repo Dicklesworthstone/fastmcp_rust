@@ -1302,7 +1302,7 @@ notifications are outside this surface.
 
 Configure `ClientBuilder::extension_registry` with the client's descriptor
 registry, local settings, and a compatibility-resolver factory before connecting.
-The connected HTTP, stdio, and WebSocket clients expose
+The connected HTTP and WebSocket clients, and the Unix stdio client, expose
 `notify_final_extension(cx, extension_id, method, parameters)`, including the
 recommended modern facade. A retained `StdioRequestExecutor` can also publish a
 notification while other request handles remain live. The client attaches fresh
@@ -1312,6 +1312,20 @@ proof, unconfigured methods, wrong directions, and legacy sessions fail before
 publication. Notifications consume no request ID or response waiter. HTTP waits
 for the empty 202 acknowledgement; stdio, memory, and WebSocket publication does
 not imply that the server callback has completed.
+
+On Unix, `modern::Client::request_final_extension(cx, extension_id, method,
+parameters)` also drives stdio extension responses cooperatively on the supplied
+runtime, including deferred discovery. Use `request_final_extension_with_cancellation`
+to retain an explicit request-local cancellation token along with the original
+caller context. A cancelled or dropped request leaves the connection reusable;
+its late response cannot complete a later request. Unregistered methods and
+wrong-direction calls are refused before publication, and successful responses
+must belong to the extension's admitted result owner. An intact result with the
+wrong extension owner fails that request; loss of the original result source
+retires the connection. Use `close_with_cx(cx)` for
+yielding, bounded subprocess and callback cleanup. The lower-level
+`StdioRequestExecutor::execute_final_extension_with_cancellation` provides the
+same cancellation ownership for separately retained request handles.
 
 The in-process client now accepts the same frozen extension configuration through
 `MemoryClient::builder(client_info).extension_registry(...)`. Connect it to an

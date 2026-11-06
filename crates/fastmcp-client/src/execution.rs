@@ -2065,6 +2065,35 @@ where
         )
     }
 
+    /// Starts a synchronous extension publication with its original caller and
+    /// explicit cancellation domain installed before any bytes reach the peer.
+    /// Other driver contexts cannot extend that execution's lifetime.
+    pub(crate) fn execute_final_extension_with_cancellation_and_timeout_policy(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: Request,
+        timeout_policy: RequestTimeoutPolicy,
+        admission: ClientExtensionResultAdmission,
+    ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        admission.validate_request(self.protocol_era(), &request.method)?;
+        if self.state.borrow().external_writes {
+            return Err(McpError::invalid_request(
+                "External executor requires a committed publication callback",
+            ));
+        }
+        self.execute_with_commit(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Request(timeout_policy),
+            Some(cancellation.clone()),
+            Some(admission),
+            |transport, cx, message| transport.send(cx, message),
+        )?
+        .ok_or_else(|| McpError::internal_error("Synchronous executor deferred its own send"))
+    }
+
     /// Starts a modern listener with its own bounded idle and absolute lifetime.
     ///
     /// Valid acknowledgements and accepted subscription events may restart its
@@ -3533,6 +3562,24 @@ where
             }
             return Ok(());
         };
+        if pending.extension_result.is_some()
+            && response.result.is_some()
+            && raw_result.is_none()
+        {
+            // A live extension result must retain the source admitted by this
+            // connection's reader. Losing that sidecar breaks the shared
+            // ingress contract; it is distinct from an intact result that
+            // fails only its owner's extension discriminator or schema.
+            // Keep this check after tombstone routing so a retired request
+            // cannot revoke a live sibling's independent result authority.
+            state.fail_all(
+                McpError::invalid_request(
+                    "Peer final extension response lost its admitted result source",
+                ),
+                ExecutionTerminalReason::ConnectionLost,
+            );
+            return Ok(());
+        }
         let generation = pending.record.execution_generation;
         let expires_at = Instant::now()
             .checked_add(self.tombstone_retention)

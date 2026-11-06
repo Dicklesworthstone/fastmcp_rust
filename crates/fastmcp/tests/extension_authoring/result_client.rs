@@ -1,5 +1,9 @@
 //! Real typed extension producers and the shipped HTTP and memory clients.
 
+#[cfg(unix)]
+#[path = "result_client/stdio.rs"]
+mod stdio;
+
 use std::collections::BTreeMap;
 
 use super::*;

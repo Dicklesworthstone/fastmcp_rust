@@ -4811,6 +4811,7 @@ pub mod modern {
         /// Publishes one configured extension notification through modern stdio.
         /// Deferred discovery runs on the caller's runtime. Every notification
         /// carries fresh settings proof and consumes no request ID or waiter.
+        #[cfg(unix)]
         pub async fn notify_final_extension(
             &mut self,
             cx: &Cx,
@@ -4820,6 +4821,55 @@ pub mod modern {
         ) -> McpResult<()> {
             self.inner
                 .notify_final_extension(cx, extension_id, method, parameters)
+                .await
+        }
+
+        /// Calls one configured extension while yielding on the caller's runtime.
+        ///
+        /// Deferred discovery, response deadlines and the sole stdio reader
+        /// remain caller-owned. The frozen registry admits the method and exact
+        /// result owner before publication. After publication, dropping this
+        /// future cancels its execution without cancelling the connection or
+        /// sibling requests.
+        #[cfg(unix)]
+        pub async fn request_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<JsonValue> {
+            self.request_final_extension_with_cancellation(
+                cx,
+                &McpRequestCancellation::new(),
+                extension_id,
+                method,
+                parameters,
+            )
+            .await
+        }
+
+        /// Calls one configured extension under an explicit cancellation domain.
+        /// The original caller context and token remain binding even when a
+        /// different context services the shared connection. Cancellation after
+        /// publication retains late-response ownership for this request alone.
+        #[cfg(unix)]
+        pub async fn request_final_extension_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> McpResult<JsonValue> {
+            self.inner
+                .request_final_extension_with_cx(
+                    cx,
+                    cancellation,
+                    extension_id,
+                    method,
+                    parameters,
+                )
                 .await
         }
 
@@ -5745,6 +5795,13 @@ pub mod modern {
         /// Closes the owned final client connection.
         pub fn close(&mut self) -> McpResult<()> {
             self.inner.close()
+        }
+
+        /// Closes the final client while yielding during bounded subprocess
+        /// and callback cleanup on the caller's runtime. Caller cancellation
+        /// does not abandon owned subprocess resources during cleanup.
+        pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+            self.inner.close_with_cx(cx).await
         }
     }
 

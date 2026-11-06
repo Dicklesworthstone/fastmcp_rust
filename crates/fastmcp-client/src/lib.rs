@@ -17599,12 +17599,54 @@ impl StdioRequestExecutor {
         cx: &Cx,
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_final_extension_with_cancellation_token(
+            cx,
+            None,
+            extension_id,
+            method,
+            parameters,
+        )
+    }
+
+    /// Commits one admitted extension request with explicit request cancellation.
+    ///
+    /// The original context and cancellation token remain attached to this
+    /// execution when another clone or the client drives the connection.
+    /// Cancelling either retires only this request; its control frame uses the
+    /// next live connection-owned service turn. No background runtime is started.
+    pub fn execute_final_extension_with_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_final_extension_with_cancellation_token(
+            cx,
+            Some(cancellation),
+            extension_id,
+            method,
+            parameters,
+        )
+    }
+
+    fn execute_final_extension_with_cancellation_token(
+        &self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
         mut parameters: serde_json::Value,
     ) -> McpResult<StdioRequestExecution> {
         if let Some(error) = self.executor.terminal_error() {
             return Err(error);
         }
-        if cx.checkpoint().is_err() {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(McpError::request_cancelled());
         }
         if self.peer_era != ProtocolEra::Modern2026 {
@@ -17666,12 +17708,24 @@ impl StdioRequestExecutor {
         let timeout_policy = *self.timeout_policy.lock().map_err(|_| {
             McpError::internal_error("Negotiated stdio timeout policy is unavailable")
         })?;
-        let execution = self.executor.execute_final_extension_with_timeout_policy(
-            cx,
-            JsonRpcRequest::new(method, Some(parameters), id),
-            timeout_policy,
-            admission,
-        )?;
+        let request = JsonRpcRequest::new(method, Some(parameters), id);
+        let execution = match cancellation {
+            Some(cancellation) => self
+                .executor
+                .execute_final_extension_with_cancellation_and_timeout_policy(
+                    cx,
+                    cancellation,
+                    request,
+                    timeout_policy,
+                    admission,
+                ),
+            None => self.executor.execute_final_extension_with_timeout_policy(
+                cx,
+                request,
+                timeout_policy,
+                admission,
+            ),
+        }?;
         Ok(StdioRequestExecution {
             execution,
             require_result_source: true,
@@ -20953,6 +21007,55 @@ impl Client {
         Ok(received.result)
     }
 
+    /// Calls one admitted extension while yielding the caller's Unix runtime.
+    ///
+    /// Deferred discovery and bounded receive turns run under the caller's
+    /// runtime. The request retains its original context, cancellation token,
+    /// configured idle/absolute deadlines, and frozen result authority while
+    /// the connection's sole ingress driver routes all live siblings.
+    ///
+    /// Request-local cancellation sends at most one cancellation control using
+    /// the retained connection context. Dropping this future retires its owned
+    /// execution; the next drive, send, or close flushes the queued control.
+    /// A result belonging to another extension fails only this request. A
+    /// framing failure or lost original result source fails the connection.
+    /// Pipe publication remains bounded synchronous I/O; no private runtime,
+    /// second reader, replay, or automatic retry is introduced.
+    #[cfg(unix)]
+    pub async fn request_final_extension_with_cx(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        self.ensure_initialized_with_cancellation(cx, Some(cancellation))
+            .await?;
+        let executor = self.multiplexed_stdio_executor()?;
+        let execution = match executor.execute_final_extension_with_cancellation(
+            cx,
+            cancellation,
+            extension_id,
+            method,
+            parameters,
+        ) {
+            Err(error) if executor.executor.terminal_error().is_some() => {
+                return Err(self.terminate_connection(error));
+            }
+            result => result?,
+        };
+        self.wait_yielding_prepared_execution_until(
+            cx,
+            cancellation,
+            executor,
+            execution,
+            None,
+        )
+        .await
+        .map(|received| received.result)
+    }
+
     /// Sends one configured modern extension notification through the selected
     /// stdio writer, using the caller's context for admission and publication.
     ///
@@ -20960,6 +21063,7 @@ impl Client {
     /// admission. Every notification carries fresh self-contained settings
     /// proof; it consumes no request ID and never waits for a peer response.
     /// Dropped or failed writes are not retried.
+    #[cfg(unix)]
     pub async fn notify_final_extension(
         &mut self,
         cx: &Cx,
@@ -27535,7 +27639,27 @@ impl Client {
         }
         // Parameters are already typed and extension-admitted. Preparing them
         // again here would re-advertise Tasks on an ordinary tools/call.
-        let mut execution = executor.execute(&connection_cx, method, parameters)?;
+        let execution = executor.execute(&connection_cx, method, parameters)?;
+        self.wait_yielding_prepared_execution_until(
+            cx,
+            cancellation,
+            executor,
+            execution,
+            operation_deadline,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn wait_yielding_prepared_execution_until(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        executor: StdioRequestExecutor,
+        mut execution: StdioRequestExecution,
+        operation_deadline: Option<Instant>,
+    ) -> McpResult<ReceivedPreparedResult> {
+        let connection_cx = self.cx.clone();
         loop {
             let stopped = if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 Some(McpError::request_cancelled())
@@ -27550,9 +27674,16 @@ impl Client {
                 .map_err(|error| {
                     if let Some(stopped) = &stopped {
                         stopped.clone()
-                    } else if error.code == McpErrorCode::InvalidRequest {
+                    } else if (!execution.require_result_source
+                        && error.code == McpErrorCode::InvalidRequest)
+                        || (execution.require_result_source
+                            && executor.executor.terminal_error().is_some())
+                    {
                         self.terminate_connection(error)
                     } else {
+                        // The extension decoder already owns this exact
+                        // request. A foreign or malformed result marker does
+                        // not revoke a sibling's independent result authority.
                         error
                     }
                 })?;
@@ -27577,6 +27708,11 @@ impl Client {
             if let Some((mut response, raw_result, _)) = terminal {
                 if let Some(error) = response.error.take() {
                     return Err(json_rpc_error_to_mcp(error));
+                }
+                if execution.require_result_source && raw_result.is_none() {
+                    return Err(self.terminate_connection(McpError::invalid_request(
+                        "Peer final extension response lost its admitted result source",
+                    )));
                 }
                 let result = response.result.take().ok_or_else(|| {
                     self.terminate_connection(McpError::invalid_request("No result in response"))
@@ -58168,6 +58304,265 @@ while IFS= read -r ignored; do :; done
             }
             client.close().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_stdio_executor_retains_cancellation_across_drivers() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for stop in ["token", "context"] {
+                let (id, registry, discovery) = raw_extension_configuration(
+                    ExtensionDirection::ClientToServer,
+                    fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+                );
+                let peer_discovery = modern_raw_extension_discovery_response(
+                    "extension-cancellation-peer",
+                    Some(serde_json::json!({"mode": "raw"})),
+                );
+                let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r first || exit 11
+case "$first" in *'"method":"example/echo"'*'"id":2'*) ;; *) exit 12 ;; esac
+IFS= read -r sibling || exit 13
+case "$sibling" in *'"method":"example/echo"'*'"id":3'*) ;; *) exit 14 ;; esac
+IFS= read -r cancellation || exit 15
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 16 ;; esac
+IFS= read -r recovery || exit 17
+case "$recovery" in *'"method":"example/echo"'*'"id":4'*) ;; *) exit 18 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"com.example/foreign","owner":"late"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"owner":"sibling"}}'
+printf '{"jsonrpc":"2.0","id":4,"result":{"owner":"recovery","control":%s}}\n' "$cancellation"
+while IFS= read -r unexpected; do exit 19; done
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                    .unwrap()
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                            .unwrap(),
+                    )
+                    .connect_stdio_with_cx(
+                        &healthy,
+                        "sh",
+                        &["-c", script, "extension-peer", peer_discovery.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let cancelled_before_send = McpRequestCancellation::new();
+                cancelled_before_send.cancel();
+                let error = executor
+                    .execute_final_extension_with_cancellation(
+                        &healthy,
+                        &cancelled_before_send,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({}),
+                    )
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                assert_eq!(client.peek_next_request_id(), 2);
+                assert!(executor.executor.pending_records().is_empty());
+
+                let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let cancellation = McpRequestCancellation::new();
+                let mut first = executor
+                    .execute_final_extension_with_cancellation(
+                        &caller,
+                        &cancellation,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({}),
+                    )
+                    .unwrap();
+                let mut sibling = executor
+                    .clone()
+                    .execute_final_extension(
+                        &healthy,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({}),
+                    )
+                    .unwrap();
+                if stop == "token" {
+                    cancellation.cancel();
+                } else {
+                    caller.set_cancel_requested(true);
+                }
+                // No waiter polls the stopped execution. A different live
+                // caller must observe its retained authority before committing
+                // request four, and flush exactly its cancellation first.
+                let recovered = client
+                    .request_final_extension_with_cx(
+                        &healthy,
+                        &McpRequestCancellation::new(),
+                        &id,
+                        "example/echo",
+                        serde_json::json!({}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(recovered["owner"], "recovery");
+                assert_eq!(recovered["control"]["params"]["requestId"], 2);
+                assert!(recovered["control"].get("id").is_none());
+                assert_eq!(
+                    executor.try_take_response(&mut first).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .unwrap()["owner"],
+                    "sibling"
+                );
+                assert_eq!(client.peek_next_request_id(), 5);
+                assert!(executor.executor.pending_records().is_empty());
+                assert!(executor.executor.terminal_error().is_none());
+                assert!(healthy.checkpoint().is_ok());
+                client.close_with_cx(&healthy).await.unwrap();
+                assert!(client.child_cleanup_complete());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_stdio_async_request_drop_and_deadline_preserve_siblings() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for stop in ["drop", "context", "deadline"] {
+                let (id, registry, discovery) = raw_extension_configuration(
+                    ExtensionDirection::ClientToServer,
+                    fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+                );
+                let peer_discovery = modern_raw_extension_discovery_response(
+                    "extension-lifetime-peer",
+                    Some(serde_json::json!({"mode": "raw"})),
+                );
+                let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r sibling || exit 11
+case "$sibling" in *'"method":"example/echo"'*'"id":2'*) ;; *) exit 12 ;; esac
+IFS= read -r pending || exit 13
+case "$pending" in *'"method":"example/echo"'*'"id":3'*) ;; *) exit 14 ;; esac
+IFS= read -r cancellation || exit 15
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":3'*) ;; *) exit 16 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"owner":"late"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"owner":"sibling"}}'
+IFS= read -r recovery || exit 17
+case "$recovery" in *'"method":"example/echo"'*'"id":4'*) ;; *) exit 18 ;; esac
+printf '{"jsonrpc":"2.0","id":4,"result":{"owner":"recovery","control":%s}}\n' "$cancellation"
+while IFS= read -r unexpected; do exit 19; done
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                    .unwrap()
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                            .unwrap(),
+                    )
+                    .connect_stdio_with_cx(
+                        &healthy,
+                        "sh",
+                        &["-c", script, "extension-peer", peer_discovery.as_str()],
+                    )
+                    .await
+                    .unwrap();
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let mut sibling = executor
+                    .execute_final_extension(
+                        &healthy,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({}),
+                    )
+                    .unwrap();
+                let caller = runtime.request_cx_with_budget(if stop == "deadline" {
+                    asupersync::Budget::INFINITE
+                        .with_deadline(healthy.now() + Duration::from_millis(200))
+                } else {
+                    asupersync::Budget::INFINITE
+                });
+                let cancellation = McpRequestCancellation::new();
+                let mut request = Box::pin(client.request_final_extension_with_cx(
+                    &caller,
+                    &cancellation,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({}),
+                ));
+                assert!(
+                    std::future::poll_fn(|task_cx| {
+                        std::task::Poll::Ready(request.as_mut().poll(task_cx))
+                    })
+                    .await
+                    .is_pending(),
+                    "a silent peer must yield the sole runtime worker"
+                );
+                assert_eq!(executor.executor.pending_records().len(), 2);
+                if stop == "drop" {
+                    drop(request);
+                } else {
+                    if stop == "context" {
+                        caller.set_cancel_requested(true);
+                    }
+                    let error = asupersync::time::timeout(
+                        healthy.now(),
+                        Duration::from_secs(1),
+                        request,
+                    )
+                    .await
+                    .expect("the caller stop wins before the two-second response policy")
+                    .unwrap_err();
+                    assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                }
+                assert!(healthy.checkpoint().is_ok());
+                assert!(!cancellation.is_cancel_requested());
+                let recovered = client
+                    .request_final_extension_with_cx(
+                        &healthy,
+                        &McpRequestCancellation::new(),
+                        &id,
+                        "example/echo",
+                        serde_json::json!({}),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(recovered["owner"], "recovery");
+                assert_eq!(recovered["control"]["params"]["requestId"], 3);
+                assert!(recovered["control"].get("id").is_none());
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .unwrap()["owner"],
+                    "sibling"
+                );
+                assert_eq!(client.peek_next_request_id(), 5);
+                assert!(executor.executor.pending_records().is_empty());
+                assert!(executor.executor.terminal_error().is_none());
+                client.close_with_cx(&healthy).await.unwrap();
+                assert!(client.child_cleanup_complete());
+            }
+        });
     }
 
     #[cfg(unix)]
