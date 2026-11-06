@@ -84,7 +84,7 @@ use crate::{
     ClientProtocolPlan, MAX_MRTR_CONTINUATION_ROUNDS, MAX_MRTR_INPUT_RESPONSES,
     MAX_MRTR_TOTAL_INPUT_RESPONSES, MrtrInputResponses, RequestTimeoutPolicy, RequestTimeoutSource,
     ResourceSubscriptionRelations, ReverseRequestHandlers, SubscriptionListenRequest,
-    SubscriptionTimeoutPolicy, admit_mrtr_input_required, validate_protocol_plan_feature,
+    SubscriptionTimeoutPolicy, admit_complete_mrtr_input_batch, validate_protocol_plan_feature,
 };
 #[cfg(feature = "legacy-2024-11-05")]
 use crate::{ReverseCallbackState, ReverseRequestCancellation};
@@ -8500,8 +8500,9 @@ impl ModernHttpClient {
     /// is validated and must differ from every earlier round before it can be
     /// sent. The operation uses the one supplied absolute `deadline` for its
     /// initial request and every continuation. The entire input batch must
-    /// satisfy the capabilities sent on the initial request before `respond`
-    /// runs. The caller receives the original advisory sampling context.
+    /// satisfy the capabilities sent on the initial request and fit the
+    /// remaining total input-response budget before `respond` runs. The
+    /// caller receives the original advisory sampling context.
     pub async fn call_tool_with_mrtr_retry<F, I>(
         &self,
         cx: &Cx,
@@ -8674,21 +8675,18 @@ impl ModernHttpClient {
             driver
                 .begin_continuation()
                 .map_err(ModernHttpMrtrError::Driver)?;
-            admit_mrtr_input_required(
+            admit_complete_mrtr_input_batch(
+                &mut driver,
                 &original_parameters["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY],
                 input_required,
             )
             .map_err(ModernHttpMrtrError::Driver)?;
-            driver
-                .before_request()
-                .map_err(ModernHttpMrtrError::Driver)?;
             let input_responses = respond(input_required).map_err(ModernHttpMrtrError::Driver)?;
-            let input_response_count = input_responses.len();
             let retry_parameters =
                 mrtr_retry_parameters(original_parameters.clone(), input_required, input_responses)
                     .map_err(ModernHttpMrtrError::Driver)?;
             driver
-                .admit_input_responses(input_response_count)
+                .before_request()
                 .map_err(ModernHttpMrtrError::Driver)?;
 
             let next_id = next_request_id().map_err(ModernHttpMrtrError::Driver)?;

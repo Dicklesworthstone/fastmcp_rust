@@ -1161,6 +1161,21 @@ pub(crate) fn admit_mrtr_input_required<'input>(
         .collect()
 }
 
+/// Reserves the answers required by a complete-map responder before it runs.
+///
+/// `mrtr_retry_parameters` requires every requested key even when the peer
+/// supplies `requestState`, so the exact response count is known before any
+/// host effect. Absent and present-empty input batches reserve zero entries
+/// and retain their state-only continuation behavior.
+fn admit_complete_mrtr_input_batch(
+    driver: &mut MrtrDriver<'_>,
+    capabilities: &serde_json::Value,
+    input_required: &InputRequiredResult,
+) -> McpResult<()> {
+    let inputs = admit_mrtr_input_required(capabilities, input_required)?;
+    driver.admit_input_responses(inputs.len())
+}
+
 fn mrtr_operation_deadline(cx: &Cx, policy: RequestTimeoutPolicy) -> McpResult<Instant> {
     cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
     Instant::now()
@@ -9031,8 +9046,9 @@ where
     /// The supplied deadline caps every response wait and is checked after
     /// each synchronous responder returns. A retry cannot restart the caller's
     /// absolute time budget. Each complete input batch must satisfy the
-    /// original request's advertised capabilities before `respond` runs;
-    /// advisory sampling context is retained for the caller's policy.
+    /// original request's advertised capabilities and remaining total input
+    /// budget before `respond` runs; advisory sampling context is retained
+    /// for the caller's policy.
     pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -9072,17 +9088,15 @@ where
                 return require_terminal_websocket_mrtr_result("tools/call", result);
             };
             driver.begin_continuation()?;
-            let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+            admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
             let input_responses = respond(input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
-            let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
                 input_responses,
             )?;
-            driver.admit_input_responses(input_response_count)?;
         }
     }
 
@@ -9132,17 +9146,15 @@ where
                 return require_terminal_websocket_mrtr_result("resources/read", result);
             };
             driver.begin_continuation()?;
-            let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+            admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
             let input_responses = respond(input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
-            let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
                 input_responses,
             )?;
-            driver.admit_input_responses(input_response_count)?;
         }
     }
 
@@ -9191,17 +9203,15 @@ where
                 return require_terminal_websocket_mrtr_result("prompts/get", result);
             };
             driver.begin_continuation()?;
-            let _ = admit_mrtr_input_required(&capabilities, input_required)?;
+            admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
             let input_responses = respond(input_required)?;
             check_mrtr_operation(cx, None, deadline)?;
-            let input_response_count = input_responses.len();
             parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
                 input_responses,
             )?;
-            driver.admit_input_responses(input_response_count)?;
         }
     }
 
@@ -16405,7 +16415,9 @@ impl HttpClient {
     /// the initial request and every continuation. This client allocates the
     /// initial and continuation IDs from its monotonic allocator; `respond`
     /// can therefore be invoked once for each admitted `input_required`
-    /// result. Tasks are neither requested nor accepted by this operation.
+    /// result. The complete input batch must fit the operation's remaining
+    /// total input-response budget before `respond` runs. Tasks are neither
+    /// requested nor accepted by this operation.
     pub async fn call_tool_with_mrtr_retry<F>(
         &mut self,
         cx: &Cx,
@@ -24088,24 +24100,15 @@ impl Client {
                         .map_or(0, |requests| requests.members().len()),
                 )?;
             } else {
-                let _ = admit_mrtr_input_required(&capabilities, input_required)?;
-                driver.before_request()?;
+                admit_complete_mrtr_input_batch(&mut driver, &capabilities, input_required)?;
             }
             let input_responses = respond(input_required, &capabilities)?;
-            let input_response_count = input_responses.len();
             let retry_parameters = mrtr_retry_parameters(
                 original_parameters.clone(),
                 input_required,
                 input_responses,
             )?;
-            match responder_kind {
-                // Preserve caller-provided responders' existing map
-                // validation and returned-response accounting.
-                MrtrResponderKind::CallerProvided => {
-                    driver.admit_input_responses(input_response_count)?;
-                }
-                MrtrResponderKind::Installed => driver.before_request()?,
-            }
+            driver.before_request()?;
             parameters = retry_parameters;
         }
     }
@@ -24187,8 +24190,9 @@ impl Client {
     /// Tasks results return without invoking `respond`. The operation shares
     /// one caller context, absolute deadline, continuation-round bound, and
     /// total input-response bound. The complete peer batch is validated
-    /// against the original request's advertised capabilities before
-    /// `respond` receives its unchanged input and advisory context.
+    /// against the original request's advertised capabilities and reserves
+    /// its input-response budget before `respond` receives its unchanged
+    /// input and advisory context.
     pub fn call_tool_with_mrtr_retry<F>(
         &mut self,
         name: &str,
@@ -41381,11 +41385,47 @@ exec sleep 2
         })
     }
 
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn mrtr_budget_input_result(count: Option<usize>, state: &str) -> serde_json::Value {
+        match count {
+            Some(count) => installed_mrtr_roots_result(count, state),
+            None => serde_json::json!({"resultType":"input_required","requestState":state}),
+        }
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn mrtr_budget_responses(input_required: &InputRequiredResult) -> MrtrInputResponses {
+        input_required
+            .input_requests()
+            .into_iter()
+            .flat_map(|inputs| inputs.members())
+            .map(|input| (input.name.clone(), serde_json::json!({"roots":[]})))
+            .collect()
+    }
+
+    #[cfg(any(unix, feature = "websocket-experimental"))]
+    fn mrtr_budget_terminal_result(method: &str) -> serde_json::Value {
+        match method {
+            "tools/call" => serde_json::json!({"resultType":"complete","content":[]}),
+            "resources/read" => serde_json::json!({
+                "resultType":"complete","contents":[],"ttlMs":0,"cacheScope":"private"
+            }),
+            "prompts/get" => serde_json::json!({"resultType":"complete","messages":[]}),
+            _ => unreachable!("the budget probe covers the three MRTR core methods"),
+        }
+    }
+
     #[cfg(unix)]
-    fn public_http_installed_mrtr_input_budget(second_round_count: usize) {
+    fn public_http_mrtr_input_budget(
+        first_round_count: usize,
+        second_round_count: Option<usize>,
+        explicit_method: Option<&'static str>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let rejected = second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+        let method = explicit_method.unwrap_or("tools/call");
+        let rejected =
+            first_round_count + second_round_count.unwrap_or(0) > MAX_MRTR_TOTAL_INPUT_RESPONSES;
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let discovery = read_http_cache_test_request(&mut stream);
@@ -41397,13 +41437,13 @@ exec sleep 2
                     .as_bytes(),
             );
             for (id, count, state) in [
-                (2, MAX_MRTR_TOTAL_INPUT_RESPONSES / 2, "first"),
+                (2, Some(first_round_count), "first"),
                 (3, second_round_count, "second"),
             ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_http_cache_test_request(&mut stream);
                 assert_eq!(request["id"], id);
-                assert_eq!(request["method"], "tools/call");
+                assert_eq!(request["method"], method);
                 if id == 3 {
                     assert_eq!(request["params"]["requestState"], "first");
                     assert_eq!(
@@ -41411,12 +41451,12 @@ exec sleep 2
                             .as_object()
                             .unwrap()
                             .len(),
-                        64
+                        first_round_count
                     );
                 }
                 let response = serde_json::json!({
                     "jsonrpc":"2.0", "id":id,
-                    "result":installed_mrtr_roots_result(count, state),
+                    "result":mrtr_budget_input_result(count, state),
                 });
                 write_http_cache_test_response(
                     &mut stream,
@@ -41434,16 +41474,20 @@ exec sleep 2
                 );
                 serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
             } else {
-                assert_eq!(request["method"], "tools/call");
+                assert_eq!(request["method"], method);
                 assert_eq!(request["params"]["requestState"], "second");
-                assert_eq!(
-                    request["params"]["inputResponses"]
-                        .as_object()
-                        .unwrap()
-                        .len(),
-                    64
-                );
-                serde_json::json!({"resultType":"complete","content":[]})
+                if second_round_count.unwrap_or(0) == 0 {
+                    assert!(request["params"].get("inputResponses").is_none());
+                } else {
+                    assert_eq!(
+                        request["params"]["inputResponses"]
+                            .as_object()
+                            .unwrap()
+                            .len(),
+                        second_round_count.unwrap()
+                    );
+                }
+                mrtr_budget_terminal_result(method)
             };
             let response = serde_json::json!({"jsonrpc":"2.0","id":4,"result":result});
             write_http_cache_test_response(
@@ -41457,48 +41501,144 @@ exec sleep 2
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(http_cache_test_plan(&format!("http://{address}/mcp")))
-                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .capabilities(serde_json::from_value(serde_json::json!({"roots":{}})).unwrap())
+                .reverse_request_handlers(if explicit_method.is_some() {
+                    ReverseRequestHandlers::new()
+                } else {
+                    installed_mrtr_counting_roots_handler(&callbacks)
+                })
                 .connect_http_client_with_cx(&cx),
         )
         .unwrap();
-        let result =
-            http_test_runtime_block_on(client.call_tool(&cx, "budget-tool", serde_json::json!({})));
+        let respond = |input_required: &InputRequiredResult| {
+            callbacks.fetch_add(1, Ordering::SeqCst);
+            Ok(mrtr_budget_responses(input_required))
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let limits = sse::SseLimits::new(16_384, 65_536, 8).unwrap();
+        let result = http_test_runtime_block_on(async {
+            match explicit_method {
+                None => {
+                    client
+                        .call_tool(&cx, "budget-tool", serde_json::json!({}))
+                        .await
+                }
+                Some("tools/call") => client
+                    .call_tool_with_mrtr_retry(
+                        &cx,
+                        deadline,
+                        "budget-tool",
+                        serde_json::json!({}),
+                        limits,
+                        65_536,
+                        respond,
+                    )
+                    .await
+                    .map(CoreResult::Final),
+                Some("resources/read") => client
+                    .read_resource_with_mrtr_retry(
+                        &cx,
+                        deadline,
+                        "file:///budget-resource",
+                        limits,
+                        65_536,
+                        respond,
+                    )
+                    .await
+                    .map(CoreResult::Final),
+                Some("prompts/get") => client
+                    .get_prompt_with_mrtr_retry(
+                        &cx,
+                        deadline,
+                        "budget-prompt",
+                        HashMap::new(),
+                        limits,
+                        65_536,
+                        respond,
+                    )
+                    .await
+                    .map(CoreResult::Final),
+                _ => unreachable!(),
+            }
+        });
         if rejected {
-            assert!(matches!(result, Err(HttpClientError::CoreResult(ref error))
-                if error.code == McpErrorCode::InvalidParams && error.message == "MRTR total input-response limit exceeded"));
-            assert_eq!(
-                callbacks.load(Ordering::SeqCst),
-                64,
-                "rejected round must not invoke any host callback"
-            );
+            let error = match result.unwrap_err() {
+                HttpClientError::CoreResult(error)
+                | HttpClientError::Connection(ClientHttpConnectionError::Mrtr(
+                    http_executor::ModernHttpMrtrError::Driver(error),
+                )) => error,
+                error => panic!("unexpected MRTR budget error: {error}"),
+            };
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "MRTR total input-response limit exceeded");
             let reused = http_test_runtime_block_on(client.list_tools(&cx, None)).unwrap();
             assert!(matches!(
                 reused,
                 CoreResult::Final(FinalCoreResult::ToolsList { .. })
             ));
         } else {
+            let result = result.unwrap();
+            assert_eq!(result.method(), method);
             assert!(matches!(
                 result,
-                Ok(CoreResult::Final(FinalCoreResult::ToolsCall { .. }))
+                CoreResult::Final(
+                    FinalCoreResult::ToolsCall { .. }
+                        | FinalCoreResult::ResourcesRead { .. }
+                        | FinalCoreResult::PromptsGet { .. }
+                )
             ));
-            assert_eq!(
-                callbacks.load(Ordering::SeqCst),
-                MAX_MRTR_TOTAL_INPUT_RESPONSES
-            );
         }
         peer.join().unwrap();
+        let expected_callbacks = if explicit_method.is_some() {
+            if rejected { 1 } else { 2 }
+        } else if rejected {
+            first_round_count
+        } else {
+            first_round_count + second_round_count.unwrap_or(0)
+        };
+        assert_eq!(
+            callbacks.load(Ordering::SeqCst),
+            expected_callbacks,
+            "a rejected input batch must not invoke any host callback"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn public_http_installed_mrtr_accepts_exact_cumulative_input_budget() {
-        public_http_installed_mrtr_input_budget(64);
+        public_http_mrtr_input_budget(64, Some(64), None);
     }
 
     #[cfg(unix)]
     #[test]
     fn public_http_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
-        public_http_installed_mrtr_input_budget(65);
+        public_http_mrtr_input_budget(64, Some(65), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_caller_mrtr_accepts_exact_cumulative_input_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_http_mrtr_input_budget(64, Some(64), Some(method));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_caller_mrtr_refuses_one_extra_input_before_callback_or_retry() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_http_mrtr_input_budget(64, Some(65), Some(method));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_http_caller_mrtr_allows_state_only_after_exact_input_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            for inputs in [None, Some(0)] {
+                public_http_mrtr_input_budget(MAX_MRTR_TOTAL_INPUT_RESPONSES, inputs, Some(method));
+            }
+        }
     }
 
     #[cfg(any(unix, feature = "websocket-experimental"))]
@@ -42141,28 +42281,37 @@ exec sleep 2
     }
 
     #[cfg(feature = "websocket-experimental")]
-    fn public_websocket_installed_mrtr_input_budget(second_round_count: usize) {
+    fn public_websocket_mrtr_input_budget(
+        first_round_count: usize,
+        second_round_count: Option<usize>,
+        explicit_method: Option<&'static str>,
+    ) {
         run_test(|| async {
             let cx = Cx::current().unwrap();
+            let method = explicit_method.unwrap_or("tools/call");
             let callbacks = Arc::new(AtomicUsize::new(0));
             let (client_io, mut peer_io) = async_websocket_pair();
             write_server_text_frame(&mut peer_io, &raw_modern_discovery_source("1")).await;
-            for (id, count, state) in [(2, 64, "first"), (3, second_round_count, "second")] {
+            for (id, count, state) in [
+                (2, Some(first_round_count), "first"),
+                (3, second_round_count, "second"),
+            ] {
                 write_server_text_frame(
                     &mut peer_io,
                     &serde_json::json!({
                         "jsonrpc":"2.0", "id":id,
-                        "result":installed_mrtr_roots_result(count, state),
+                        "result":mrtr_budget_input_result(count, state),
                     })
                     .to_string(),
                 )
                 .await;
             }
-            let rejected = second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
+            let rejected =
+                first_round_count + second_round_count.unwrap_or(0) > MAX_MRTR_TOTAL_INPUT_RESPONSES;
             let result = if rejected {
                 serde_json::json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"})
             } else {
-                serde_json::json!({"resultType":"complete","content":[]})
+                mrtr_budget_terminal_result(method)
             };
             write_server_text_frame(
                 &mut peer_io,
@@ -42171,18 +42320,56 @@ exec sleep 2
             .await;
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::websocket(ProtocolPolicy::ModernOnly))
-                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .capabilities(serde_json::from_value(serde_json::json!({"roots":{}})).unwrap())
+                .reverse_request_handlers(if explicit_method.is_some() {
+                    ReverseRequestHandlers::new()
+                } else {
+                    installed_mrtr_counting_roots_handler(&callbacks)
+                })
                 .connect_websocket_with_cx(&cx, AsyncWsClientTransport::from_upgraded(client_io))
                 .await
                 .unwrap();
-            let result = client
-                .call_tool(&cx, "budget-tool", serde_json::json!({}))
-                .await;
+            let respond = |input_required: &InputRequiredResult| {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(mrtr_budget_responses(input_required))
+            };
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let result = match explicit_method {
+                None => {
+                    client
+                        .call_tool(&cx, "budget-tool", serde_json::json!({}))
+                        .await
+                }
+                Some("tools/call") => client
+                    .call_tool_with_mrtr_retry(
+                        &cx,
+                        deadline,
+                        "budget-tool",
+                        serde_json::json!({}),
+                        respond,
+                    )
+                    .await
+                    .map(CoreResult::Final),
+                Some("resources/read") => client
+                    .read_resource_with_mrtr_retry(&cx, deadline, "file:///budget-resource", respond)
+                    .await
+                    .map(CoreResult::Final),
+                Some("prompts/get") => client
+                    .get_prompt_with_mrtr_retry(
+                        &cx,
+                        deadline,
+                        "budget-prompt",
+                        HashMap::new(),
+                        respond,
+                    )
+                    .await
+                    .map(CoreResult::Final),
+                _ => unreachable!(),
+            };
             if rejected {
                 let error = result.unwrap_err();
                 assert_eq!(error.code, McpErrorCode::InvalidParams);
                 assert_eq!(error.message, "MRTR total input-response limit exceeded");
-                assert_eq!(callbacks.load(Ordering::SeqCst), 64);
                 assert_eq!(
                     client.next_id, 4,
                     "rejected round must not allocate another request"
@@ -42192,30 +42379,111 @@ exec sleep 2
                     CoreResult::Final(FinalCoreResult::ToolsList { .. })
                 ));
             } else {
+                let result = result.unwrap();
+                assert_eq!(result.method(), method);
                 assert!(matches!(
-                    result.unwrap(),
-                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                    result,
+                    CoreResult::Final(
+                        FinalCoreResult::ToolsCall { .. }
+                            | FinalCoreResult::ResourcesRead { .. }
+                            | FinalCoreResult::PromptsGet { .. }
+                    )
                 ));
-                assert_eq!(
-                    callbacks.load(Ordering::SeqCst),
-                    MAX_MRTR_TOTAL_INPUT_RESPONSES
-                );
             }
             assert_eq!(client.next_id, 5);
+            let mut peer = AsyncWsServerTransport::from_upgraded(peer_io);
+            for id in 1..=4 {
+                let JsonRpcMessage::Request(request) = peer.recv(&cx).await.unwrap() else {
+                    panic!("the MRTR peer expects a request");
+                };
+                assert_eq!(request.id, Some(RequestId::Number(id)));
+                let expected_method = match id {
+                    1 => "server/discover",
+                    4 if rejected => "tools/list",
+                    _ => method,
+                };
+                assert_eq!(request.method, expected_method);
+                let parameters = request.params.unwrap();
+                if id == 3 || (id == 4 && !rejected) {
+                    let count = if id == 3 {
+                        first_round_count
+                    } else {
+                        second_round_count.unwrap_or(0)
+                    };
+                    assert_eq!(
+                        parameters["requestState"],
+                        if id == 3 { "first" } else { "second" }
+                    );
+                    if count == 0 {
+                        assert!(parameters.get("inputResponses").is_none());
+                    } else {
+                        assert_eq!(
+                            parameters["inputResponses"].as_object().unwrap().len(),
+                            count
+                        );
+                    }
+                } else {
+                    assert!(parameters.get("inputResponses").is_none());
+                    assert!(parameters.get("requestState").is_none());
+                }
+            }
             client.close(&cx).await.unwrap();
+            assert!(matches!(peer.recv(&cx).await, Err(TransportError::Closed)));
+            let expected_callbacks = if explicit_method.is_some() {
+                if rejected { 1 } else { 2 }
+            } else if rejected {
+                first_round_count
+            } else {
+                first_round_count + second_round_count.unwrap_or(0)
+            };
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                expected_callbacks,
+                "a rejected input batch must not invoke any host callback"
+            );
         });
     }
 
     #[cfg(feature = "websocket-experimental")]
     #[test]
     fn public_websocket_installed_mrtr_accepts_exact_cumulative_input_budget() {
-        public_websocket_installed_mrtr_input_budget(64);
+        public_websocket_mrtr_input_budget(64, Some(64), None);
     }
 
     #[cfg(feature = "websocket-experimental")]
     #[test]
     fn public_websocket_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
-        public_websocket_installed_mrtr_input_budget(65);
+        public_websocket_mrtr_input_budget(64, Some(65), None);
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_caller_mrtr_accepts_exact_cumulative_input_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_websocket_mrtr_input_budget(64, Some(64), Some(method));
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_caller_mrtr_refuses_one_extra_input_before_callback_or_retry() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_websocket_mrtr_input_budget(64, Some(65), Some(method));
+        }
+    }
+
+    #[cfg(feature = "websocket-experimental")]
+    #[test]
+    fn public_websocket_caller_mrtr_allows_state_only_after_exact_input_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            for inputs in [None, Some(0)] {
+                public_websocket_mrtr_input_budget(
+                    MAX_MRTR_TOTAL_INPUT_RESPONSES,
+                    inputs,
+                    Some(method),
+                );
+            }
+        }
     }
 
     #[cfg(feature = "websocket-experimental")]
@@ -57411,28 +57679,39 @@ exit 0
     }
 
     #[cfg(unix)]
-    fn public_stdio_installed_mrtr_input_budget(second_round_count: usize) {
-        let first_round_count = MAX_MRTR_TOTAL_INPUT_RESPONSES / 2;
-        let rejected = first_round_count + second_round_count > MAX_MRTR_TOTAL_INPUT_RESPONSES;
+    fn public_stdio_mrtr_input_budget(
+        first_round_count: usize,
+        second_round_count: Option<usize>,
+        explicit_method: Option<&'static str>,
+    ) {
+        let method = explicit_method.unwrap_or("tools/call");
+        let rejected =
+            first_round_count + second_round_count.unwrap_or(0) > MAX_MRTR_TOTAL_INPUT_RESPONSES;
         let discovery =
             modern_discovery_response("stdio-input-budget-peer", &[MODERN_PROTOCOL_VERSION]);
         let first = serde_json::json!({"jsonrpc":"2.0","id":2,"result":installed_mrtr_roots_result(first_round_count, "first")}).to_string();
-        let second = serde_json::json!({"jsonrpc":"2.0","id":3,"result":installed_mrtr_roots_result(second_round_count, "second")}).to_string();
+        let second = serde_json::json!({"jsonrpc":"2.0","id":3,"result":mrtr_budget_input_result(second_round_count, "second")}).to_string();
         let expected_responses: serde_json::Map<String, serde_json::Value> = (0..first_round_count)
             .map(|index| (format!("root-{index}"), serde_json::json!({"roots":[]})))
             .collect();
         let expected_responses = serde_json::Value::Object(expected_responses).to_string();
+        let second_responses: serde_json::Map<String, serde_json::Value> = (0..second_round_count
+            .unwrap_or(0))
+            .map(|index| (format!("root-{index}"), serde_json::json!({"roots":[]})))
+            .collect();
+        let second_responses = serde_json::Value::Object(second_responses).to_string();
+        let terminal = mrtr_budget_terminal_result(method).to_string();
         let script = r#"
 IFS= read -r discover || exit 80
 case "$discover" in *'"method":"server/discover"'*) ;; *) exit 81;; esac
 printf '%s\n' "$1"
 IFS= read -r first || exit 82
-case "$first" in *'"method":"tools/call"'*) ;; *) exit 83;; esac
+case "$first" in *'"method":"'"$6"'"'*) ;; *) exit 83;; esac
 case "$first" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 84;; esac
 case "$first" in *inputResponses*|*requestState*) exit 85;; esac
 printf '%s\n' "$2"
 IFS= read -r second || exit 86
-case "$second" in *'"method":"tools/call"'*) ;; *) exit 87;; esac
+case "$second" in *'"method":"'"$6"'"'*) ;; *) exit 87;; esac
 case "$second" in *'"id":3,'*|*'"id":3}'*) ;; *) exit 88;; esac
 case "$second" in *'"requestState":"first"'*) ;; *) exit 89;; esac
 case "$second" in *'"inputResponses":'"$4"*) ;; *) exit 90;; esac
@@ -57440,11 +57719,15 @@ printf '%s\n' "$3"
 next=4
 if [ "$5" = accept ]; then
     IFS= read -r third || exit 91
-    case "$third" in *'"method":"tools/call"'*) ;; *) exit 92;; esac
+    case "$third" in *'"method":"'"$6"'"'*) ;; *) exit 92;; esac
     case "$third" in *'"id":4,'*|*'"id":4}'*) ;; *) exit 93;; esac
     case "$third" in *'"requestState":"second"'*) ;; *) exit 94;; esac
-    case "$third" in *'"inputResponses":'"$4"*) ;; *) exit 95;; esac
-    printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","content":[]}}'
+    if [ "$7" = '{}' ]; then
+        case "$third" in *'"inputResponses":'*) exit 95;; esac
+    else
+        case "$third" in *'"inputResponses":'"$7"*) ;; *) exit 95;; esac
+    fi
+    printf '{"jsonrpc":"2.0","id":4,"result":%s}\n' "$8"
     next=5
 fi
 IFS= read -r reused || exit 96
@@ -57460,7 +57743,12 @@ exit 0
             let cx = Cx::current().unwrap();
             let mut client = ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
-                .reverse_request_handlers(installed_mrtr_counting_roots_handler(&callbacks))
+                .capabilities(serde_json::from_value(serde_json::json!({"roots":{}})).unwrap())
+                .reverse_request_handlers(if explicit_method.is_some() {
+                    ReverseRequestHandlers::new()
+                } else {
+                    installed_mrtr_counting_roots_handler(&callbacks)
+                })
                 .request_timeout_policy(
                     RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
                         .unwrap(),
@@ -57478,35 +57766,51 @@ exit 0
                         &second,
                         &expected_responses,
                         if rejected { "deny" } else { "accept" },
+                        method,
+                        &second_responses,
+                        &terminal,
                     ],
                 )
                 .await
                 .unwrap();
-            let result = client.call_tool_typed("budget-tool", serde_json::json!({}));
+            let respond = |input_required: &InputRequiredResult| {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(mrtr_budget_responses(input_required))
+            };
+            let result = match explicit_method {
+                None => client.call_tool_typed("budget-tool", serde_json::json!({})),
+                Some("tools/call") => {
+                    client.call_tool_with_mrtr_retry("budget-tool", serde_json::json!({}), respond)
+                }
+                Some("resources/read") => {
+                    client.read_resource_with_mrtr_retry("file:///budget-resource", respond)
+                }
+                Some("prompts/get") => {
+                    client.get_prompt_with_mrtr_retry("budget-prompt", HashMap::new(), respond)
+                }
+                _ => unreachable!(),
+            };
             if rejected {
                 let error =
                     result.expect_err("the second round must be refused before its first callback");
                 assert_eq!(error.code, McpErrorCode::InvalidParams);
                 assert_eq!(error.message, "MRTR total input-response limit exceeded");
                 assert_eq!(
-                    callbacks.load(Ordering::SeqCst),
-                    first_round_count,
-                    "none of the 65 second-round callbacks may run"
-                );
-                assert_eq!(
                     client.next_id.load(Ordering::SeqCst),
                     4,
                     "the rejected round must allocate no continuation ID"
                 );
             } else {
+                let result = result.unwrap();
+                assert_eq!(result.method(), method);
                 assert!(matches!(
-                    result.unwrap(),
-                    CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+                    result,
+                    CoreResult::Final(
+                        FinalCoreResult::ToolsCall { .. }
+                            | FinalCoreResult::ResourcesRead { .. }
+                            | FinalCoreResult::PromptsGet { .. }
+                    )
                 ));
-                assert_eq!(
-                    callbacks.load(Ordering::SeqCst),
-                    MAX_MRTR_TOTAL_INPUT_RESPONSES
-                );
                 assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
             }
             assert!(matches!(
@@ -57517,19 +57821,61 @@ exit 0
             cx.checkpoint().unwrap();
             client.close_with_cx(&cx).await.unwrap();
             assert!(client.child.is_none());
+            let expected_callbacks = if explicit_method.is_some() {
+                if rejected { 1 } else { 2 }
+            } else if rejected {
+                first_round_count
+            } else {
+                first_round_count + second_round_count.unwrap_or(0)
+            };
+            assert_eq!(
+                callbacks.load(Ordering::SeqCst),
+                expected_callbacks,
+                "a rejected input batch must not invoke any host callback"
+            );
         });
     }
 
     #[cfg(unix)]
     #[test]
     fn public_stdio_installed_mrtr_accepts_exact_cumulative_input_budget() {
-        public_stdio_installed_mrtr_input_budget(64);
+        public_stdio_mrtr_input_budget(64, Some(64), None);
     }
 
     #[cfg(unix)]
     #[test]
     fn public_stdio_installed_mrtr_refuses_one_extra_input_before_callbacks_or_retry() {
-        public_stdio_installed_mrtr_input_budget(65);
+        public_stdio_mrtr_input_budget(64, Some(65), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_caller_mrtr_accepts_exact_cumulative_input_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_stdio_mrtr_input_budget(64, Some(64), Some(method));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_caller_mrtr_refuses_one_extra_input_before_callback_or_retry() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            public_stdio_mrtr_input_budget(64, Some(65), Some(method));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_stdio_caller_mrtr_allows_state_only_after_exact_input_budget() {
+        for method in ["tools/call", "resources/read", "prompts/get"] {
+            for inputs in [None, Some(0)] {
+                public_stdio_mrtr_input_budget(
+                    MAX_MRTR_TOTAL_INPUT_RESPONSES,
+                    inputs,
+                    Some(method),
+                );
+            }
+        }
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
