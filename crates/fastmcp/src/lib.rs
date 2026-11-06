@@ -5718,9 +5718,11 @@ pub mod modern {
 
     /// Final-only HTTP client whose protocol plan is fixed by this facade.
     ///
-    /// This wrapper intentionally has no generic request dispatcher, no
+    /// This wrapper intentionally has no unrestricted request dispatcher, no
     /// protocol-plan setter, and no accessor for its underlying HTTP client.
-    /// Its typed HTTP methods return only final result vocabulary.
+    /// Its typed HTTP methods return only final result vocabulary. Explicitly
+    /// configured extension requests remain bound to their frozen descriptors
+    /// and current bilateral negotiation.
     ///
     /// ```compile_fail
     /// use fastmcp_rust::{legacy_2024, modern};
@@ -5767,6 +5769,24 @@ pub mod modern {
             self.inner.server_discovery().expect(
                 "the modern facade only retains an HTTP client admitted by final server/discover",
             )
+        }
+
+        /// Calls one explicitly configured, bilaterally negotiated extension.
+        ///
+        /// The request's frozen registry admits its method and result variant.
+        /// This cannot invoke an unregistered method, borrow another extension's
+        /// result discriminator, or dispatch a legacy/core method through an
+        /// extension handle. Payload-only object results remain unchanged.
+        pub async fn request_final_extension(
+            &mut self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> Result<JsonValue, HttpClientError> {
+            self.inner
+                .request_final_extension(cx, extension_id, method, parameters)
+                .await
         }
 
         /// Prepares one independently owned core HTTP request without sending it.

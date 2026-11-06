@@ -98,6 +98,8 @@ mod tasks;
 pub mod transform;
 
 #[cfg(test)]
+mod extension_result_tests;
+#[cfg(test)]
 mod tests;
 
 pub use auth::{
@@ -963,6 +965,13 @@ pub(crate) struct ServerExtensionRuntime {
     local_enablement: ExtensionLocalEnablement,
     server_discovery: ServerExtensionDiscovery,
     resolver: Mutex<BoxedExtensionSettingsResolver>,
+}
+
+/// One current-request negotiation, shared by dispatch and response middleware.
+struct ServerExtensionRequestAdmission {
+    extension_id: ExtensionId,
+    method: String,
+    negotiated: fastmcp_protocol::extensions::NegotiatedExtensionSet,
 }
 
 impl ServerExtensionRuntime {
@@ -16225,6 +16234,83 @@ impl Server {
         Ok(None)
     }
 
+    fn admit_extension_request(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+    ) -> McpResult<Option<ServerExtensionRequestAdmission>> {
+        if modern_protocol_version(request) != Some(MODERN_PROTOCOL_VERSION) {
+            return Ok(None);
+        }
+        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
+            return Ok(None);
+        };
+        require_exact_modern_extension_metadata(request)?;
+        request_ctx.ensure_live()?;
+        if request.is_notification() {
+            return Err(McpError::invalid_params("Extension request is not admitted"));
+        }
+        let client = final_client_extension_discovery(request)?;
+        let negotiated = self.negotiate_extensions(&client).map_err(|error| {
+            McpError::invalid_params(format!(
+                "Extension request negotiation was rejected: {error}"
+            ))
+        })?;
+        request_ctx.ensure_live()?;
+        let runtime = self
+            .extension_runtime
+            .as_deref()
+            .ok_or_else(|| McpError::method_not_found(&request.method))?;
+        negotiated
+            .admit_method(
+                runtime.handlers.descriptor_registry(),
+                ProtocolEra::Modern2026,
+                extension_id,
+                &request.method,
+                fastmcp_protocol::ExtensionDirection::ClientToServer,
+            )
+            .map_err(|_| McpError::invalid_params("Extension request is not admitted"))?;
+        Ok(Some(ServerExtensionRequestAdmission {
+            extension_id: extension_id.clone(),
+            method: request.method.clone(),
+            negotiated,
+        }))
+    }
+
+    fn validate_extension_middleware_response(
+        &self,
+        admission: Option<&ServerExtensionRequestAdmission>,
+        request: &JsonRpcRequest,
+        value: &serde_json::Value,
+        retained_response: Option<&JsonRpcResponse>,
+    ) -> McpResult<()> {
+        let Some(admission) = admission else {
+            return Ok(());
+        };
+        if admission.method != request.method {
+            return Err(McpError::internal_error(
+                "extension response does not match its admitted request",
+            ));
+        }
+        let runtime = self
+            .extension_runtime
+            .as_deref()
+            .ok_or_else(|| McpError::internal_error("extension runtime is unavailable"))?;
+        // A middleware replacement must be encoded and admitted on its own;
+        // the original exact source is useful only while its value is unchanged.
+        let source = retained_response
+            .filter(|response| response.result.as_ref() == Some(value))
+            .and_then(JsonRpcResponse::retained_result_source);
+        runtime.handlers.validate_response_result(
+            &admission.negotiated,
+            ProtocolEra::Modern2026,
+            &admission.extension_id,
+            request,
+            value,
+            source,
+        )
+    }
+
     fn invoke_negotiated_extension(
         &self,
         request_ctx: &McpContext,
@@ -16385,6 +16471,7 @@ impl Server {
             })
     }
 
+    #[cfg(test)]
     async fn dispatch_extension_fallback_async(
         &self,
         request_ctx: &McpContext,
@@ -16392,29 +16479,33 @@ impl Server {
         retained_response: &mut Option<JsonRpcResponse>,
     ) -> McpResult<serde_json::Value> {
         require_exact_modern_extension_metadata(request)?;
+        let admission = self.admit_extension_request(request_ctx, request)?;
+        self.dispatch_admitted_extension_fallback_async(
+            request_ctx,
+            request,
+            admission.as_ref(),
+            retained_response,
+        )
+        .await
+    }
+
+    async fn dispatch_admitted_extension_fallback_async(
+        &self,
+        request_ctx: &McpContext,
+        request: &JsonRpcRequest,
+        admission: Option<&ServerExtensionRequestAdmission>,
+        retained_response: &mut Option<JsonRpcResponse>,
+    ) -> McpResult<serde_json::Value> {
+        require_exact_modern_extension_metadata(request)?;
         request_ctx.ensure_live()?;
-        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
-            return Err(McpError::method_not_found(&request.method));
-        };
-        let client = final_client_extension_discovery(request)?;
-        let negotiated = self
-            .negotiate_extensions(&client)
-            .map_err(|error| {
-                // Name the refusal. `map_err(|_| ...)` discarded the only thing
-                // that distinguished NotConfigured from ResolverPoisoned from
-                // each of the seven Protocol variants, so a -32602 on this path
-                // was unactionable from the wire and from a test panic alike --
-                // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
-                // own root cause. Same code and same refusal condition; only a
-                // reason is added. ServerExtensionNegotiationError's Display
-                // carries fixed phrases plus extension ids, which the peer
-                // already advertises, so this discloses nothing new.
-                McpError::invalid_params(format!(
-                    "Extension request negotiation was rejected: {error}"
-                ))
-            })?;
+        let admission = admission.ok_or_else(|| McpError::method_not_found(&request.method))?;
         let response = self
-            .invoke_negotiated_extension_async(request_ctx, &negotiated, extension_id, request)
+            .invoke_negotiated_extension_async(
+                request_ctx,
+                &admission.negotiated,
+                &admission.extension_id,
+                request,
+            )
             .await?;
         let value = response.result.clone().ok_or_else(|| {
             McpError::internal_error("extension handler omitted its response result")
@@ -16426,6 +16517,7 @@ impl Server {
         Ok(value)
     }
 
+    #[cfg(test)]
     fn dispatch_extension_fallback(
         &self,
         request_ctx: &McpContext,
@@ -16437,34 +16529,22 @@ impl Server {
         // extension handler: admission requires the exact final-era marker
         // carried by the current request.
         require_exact_modern_extension_metadata(request)?;
-        request_ctx.ensure_live()?;
-        let Some(extension_id) = self.registered_extension_handler_id(&request.method)? else {
-            return Err(McpError::method_not_found(&request.method));
-        };
-        let client = final_client_extension_discovery(request)?;
-        let negotiated = self
-            .negotiate_extensions(&client)
-            .map_err(|error| {
-                // Name the refusal. `map_err(|_| ...)` discarded the only thing
-                // that distinguished NotConfigured from ResolverPoisoned from
-                // each of the seven Protocol variants, so a -32602 on this path
-                // was unactionable from the wire and from a test panic alike --
-                // the reason bd-extauth-three-of-five-red-dvh3l cannot state its
-                // own root cause. Same code and same refusal condition; only a
-                // reason is added. ServerExtensionNegotiationError's Display
-                // carries fixed phrases plus extension ids, which the peer
-                // already advertises, so this discloses nothing new.
-                McpError::invalid_params(format!(
-                    "Extension request negotiation was rejected: {error}"
-                ))
-            })?;
-        self.invoke_negotiated_extension(request_ctx, &negotiated, extension_id, request)
+        let admission = self
+            .admit_extension_request(request_ctx, request)?
+            .ok_or_else(|| McpError::method_not_found(&request.method))?;
+        self.invoke_negotiated_extension(
+            request_ctx,
+            &admission.negotiated,
+            &admission.extension_id,
+            request,
+        )
     }
 
     fn maybe_dispatch_extension_fallback(
         &self,
         request_ctx: &McpContext,
         request: &JsonRpcRequest,
+        admission: Option<&ServerExtensionRequestAdmission>,
         result: McpResult<serde_json::Value>,
     ) -> McpResult<serde_json::Value> {
         match result {
@@ -16472,10 +16552,14 @@ impl Server {
                 if error.code == McpErrorCode::MethodNotFound
                     && modern_protocol_version(request) == Some(MODERN_PROTOCOL_VERSION) =>
             {
-                match self.registered_extension_handler_id(&request.method) {
-                    Ok(Some(_)) => self.dispatch_extension_fallback(request_ctx, request),
-                    Ok(None) => Err(error),
-                    Err(lookup) => Err(lookup),
+                match admission {
+                    Some(admission) => self.invoke_negotiated_extension(
+                        request_ctx,
+                        &admission.negotiated,
+                        &admission.extension_id,
+                        request,
+                    ),
+                    None => Err(error),
                 }
             }
             other => other,
@@ -16805,7 +16889,9 @@ impl Server {
 
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
         let mut retained_extension_response = None;
+        let mut extension_admission = None;
         let result: McpResult<serde_json::Value> = async {
+            extension_admission = self.admit_extension_request(&request_ctx, &admission_request)?;
             for middleware in self.middleware.iter() {
                 Self::enforce_request_context(&request_ctx)?;
                 entered_middleware.push(middleware.as_ref());
@@ -16859,9 +16945,10 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback_async(
+                        self.dispatch_admitted_extension_fallback_async(
                             &request_ctx,
                             &admission_request,
+                            extension_admission.as_ref(),
                             &mut retained_extension_response,
                         )
                         .await
@@ -16906,6 +16993,12 @@ impl Server {
                                 final_core_request.as_ref(),
                                 &request,
                                 &value,
+                            )?;
+                            self.validate_extension_middleware_response(
+                                extension_admission.as_ref(),
+                                &admission_request,
+                                &value,
+                                retained_extension_response.as_ref(),
                             )?;
                             Ok(value)
                         })
@@ -17132,8 +17225,15 @@ impl Server {
         }
 
         let mut entered_middleware: Vec<&dyn crate::Middleware> = Vec::new();
-        let mut middleware_result = None;
+        let (extension_admission, mut middleware_result) =
+            match self.admit_extension_request(&request_ctx, &request) {
+                Ok(admission) => (admission, None),
+                Err(error) => (None, Some(Err(error))),
+            };
         for middleware in self.middleware.iter() {
+            if middleware_result.is_some() {
+                break;
+            }
             if let Err(error) = Self::enforce_request_context(&request_ctx) {
                 middleware_result = Some(Err(error));
                 break;
@@ -17220,9 +17320,10 @@ impl Server {
                     .await
                 {
                     Err(error) if error.code == McpErrorCode::MethodNotFound => {
-                        self.dispatch_extension_fallback_async(
+                        self.dispatch_admitted_extension_fallback_async(
                             &request_ctx,
                             &request,
+                            extension_admission.as_ref(),
                             &mut retained_extension_response,
                         )
                         .await
@@ -17302,6 +17403,12 @@ impl Server {
                                 final_core_request.as_ref(),
                                 &request,
                                 &value,
+                            )?;
+                            self.validate_extension_middleware_response(
+                                extension_admission.as_ref(),
+                                &request,
+                                &value,
+                                retained_extension_response.as_ref(),
                             )?;
                             Ok(value)
                         })
@@ -22849,6 +22956,25 @@ impl Server {
             return result;
         }
 
+        let extension_admission = match self.admit_extension_request(&mw_ctx, &request) {
+            Ok(admission) => admission,
+            Err(error) => {
+                let result = Err(self.finalize_global_middleware_error(
+                    request_cancellation,
+                    &mw_ctx,
+                    &request,
+                    error,
+                ));
+                self.maybe_emit_log_notification(
+                    session,
+                    notification_sender,
+                    &request.method,
+                    &result,
+                );
+                return result;
+            }
+        };
+
         // Middleware: on_request
         // We use a temporary context derived from the request context for middleware
         // so they can access session state, request auth, and share the request's lifecycle.
@@ -22902,12 +23028,13 @@ impl Server {
                     } else {
                         Ok(v)
                     };
-                    let result = self.finalize_middleware_result(
+                    let result = self.finalize_middleware_result_with_extension(
                         request_cancellation,
                         &entered_middleware,
                         &mw_ctx,
                         &request,
                         short_circuit_result,
+                        extension_admission.as_ref(),
                     );
                     self.maybe_emit_log_notification(
                         session,
@@ -23123,13 +23250,19 @@ impl Server {
             }
         }
         .await;
-        let result = self.maybe_dispatch_extension_fallback(&mw_ctx, &request, result);
-        let final_result = self.finalize_middleware_result(
+        let result = self.maybe_dispatch_extension_fallback(
+            &mw_ctx,
+            &request,
+            extension_admission.as_ref(),
+            result,
+        );
+        let final_result = self.finalize_middleware_result_with_extension(
             request_cancellation,
             &entered_middleware,
             &mw_ctx,
             &request,
             result,
+            extension_admission.as_ref(),
         );
 
         if final_result.is_err()
@@ -23196,12 +23329,43 @@ impl Server {
         request: &JsonRpcRequest,
         result: McpResult<serde_json::Value>,
     ) -> McpResult<serde_json::Value> {
+        self.finalize_middleware_result_with_extension(
+            request_cancellation,
+            stack,
+            ctx,
+            request,
+            result,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_middleware_result_with_extension(
+        &self,
+        request_cancellation: &McpRequestCancellation,
+        stack: &[&dyn crate::Middleware],
+        ctx: &McpContext,
+        request: &JsonRpcRequest,
+        result: McpResult<serde_json::Value>,
+        extension_admission: Option<&ServerExtensionRequestAdmission>,
+    ) -> McpResult<serde_json::Value> {
         let initial = Self::request_context_error(ctx).map_or(result, Err);
         let mut terminal_cancellation = initial
             .as_ref()
             .is_err_and(|error| error.code == McpErrorCode::RequestCancelled);
         let (result, error_hooks_applied) = match initial {
-            Ok(value) => match self.apply_middleware_response(stack, ctx, request, value) {
+            Ok(value) => match self
+                .apply_middleware_response(stack, ctx, request, value)
+                .and_then(|value| {
+                    self.validate_extension_middleware_response(
+                        extension_admission,
+                        request,
+                        &value,
+                        None,
+                    )?;
+                    Ok(value)
+                })
+            {
                 Ok(value) => (Ok(value), false),
                 Err(error) => {
                     terminal_cancellation |= error.code == McpErrorCode::RequestCancelled;

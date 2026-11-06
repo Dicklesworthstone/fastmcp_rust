@@ -10,6 +10,8 @@
 #[cfg(feature = "extension-authoring")]
 pub mod authoring;
 
+mod result;
+
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -1110,6 +1112,15 @@ impl ExtensionHandlerRegistry {
         context
             .ensure_live()
             .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        self.validate_response_result(
+            negotiated,
+            protocol_era,
+            extension_id,
+            request,
+            &response,
+            None,
+        )
+        .map_err(ExtensionHandlerInvocationError::Handler)?;
         Ok(response)
     }
 
@@ -1146,6 +1157,15 @@ impl ExtensionHandlerRegistry {
         context
             .ensure_live()
             .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        self.validate_response_result(
+            negotiated,
+            protocol_era,
+            extension_id,
+            request,
+            &response,
+            None,
+        )
+        .map_err(ExtensionHandlerInvocationError::Handler)?;
         Ok(response)
     }
 
@@ -1186,6 +1206,20 @@ impl ExtensionHandlerRegistry {
         context
             .ensure_live()
             .map_err(|_| ExtensionHandlerInvocationError::Handler(McpError::request_cancelled()))?;
+        let value = response.result.as_ref().ok_or_else(|| {
+            ExtensionHandlerInvocationError::Handler(McpError::internal_error(
+                "extension handler omitted its response result",
+            ))
+        })?;
+        self.validate_response_result(
+            negotiated,
+            protocol_era,
+            extension_id,
+            request,
+            value,
+            response.retained_result_source(),
+        )
+        .map_err(ExtensionHandlerInvocationError::Handler)?;
         Ok(response)
     }
 

@@ -4,6 +4,9 @@
 #![cfg(feature = "extension-authoring")]
 #![recursion_limit = "512"]
 
+#[path = "extension_authoring/result_client.rs"]
+mod result_client;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

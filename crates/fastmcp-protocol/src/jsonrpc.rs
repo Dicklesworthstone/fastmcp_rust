@@ -1744,6 +1744,19 @@ impl JsonRpcResponse {
         })
     }
 
+    /// Borrows the exact admitted result while its public value is unchanged.
+    ///
+    /// Result validators can inspect the same representation the serializer
+    /// will emit without normalizing numeric lexemes or allocating another
+    /// response. A changed or removed result never exposes stale source.
+    #[must_use]
+    pub fn retained_result_source(&self) -> Option<&str> {
+        self.retained_result
+            .as_ref()
+            .filter(|retained| self.result.as_ref() == Some(&retained.value))
+            .map(|retained| retained.source.get())
+    }
+
     /// Creates an error response.
     #[must_use]
     pub fn error(id: Option<RequestId>, error: JsonRpcError) -> Self {
@@ -2893,6 +2906,7 @@ mod tests {
         let mut changed = original.clone();
         changed.id = Some(RequestId::String("current-owner".to_owned()));
         for response in [&original, &original.clone(), &changed, &changed.clone()] {
+            assert_eq!(response.retained_result_source(), Some(SOURCE));
             let encoded = serde_json::to_string(response).unwrap();
             let raw: std::collections::BTreeMap<String, Box<RawValue>> =
                 serde_json::from_str(&encoded).unwrap();
@@ -2957,6 +2971,7 @@ mod tests {
             let mut changed = original.clone();
             changed.result = Some(result.clone());
             for response in [&changed, &changed.clone()] {
+                assert!(response.retained_result_source().is_none(), "{name}");
                 let encoded = serde_json::to_string(response).unwrap();
                 let envelope: Value = serde_json::from_str(&encoded).unwrap();
                 assert_eq!(envelope.get("result"), Some(&result), "{name}");
@@ -2984,6 +2999,7 @@ mod tests {
         });
         failure.id = None;
         for response in [&failure, &failure.clone()] {
+            assert!(response.retained_result_source().is_none());
             let encoded = serde_json::to_string(response).unwrap();
             let envelope: Value = serde_json::from_str(&encoded).unwrap();
             assert!(envelope.get("result").is_none());
