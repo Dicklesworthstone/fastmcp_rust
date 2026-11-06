@@ -514,9 +514,10 @@ impl ReverseRequestHandlers {
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
             checkpoint()?;
-            let value =
+            let (value, owner) =
                 self.invoke_embedded_input_request(cx, input_key, request, &checkpoint)?;
             checkpoint()?;
+            owner.0.record_response_sent();
             responses.insert(input_key.to_owned(), value);
         }
         Ok(responses)
@@ -533,47 +534,13 @@ impl ReverseRequestHandlers {
     ) -> McpResult<MrtrInputResponses> {
         checkpoint()?;
         let requests = self.prepare_input_required(capabilities, input_required)?;
+        checkpoint()?;
         let mut responses = MrtrInputResponses::new();
         for (input_key, request) in requests {
             checkpoint()?;
-            let cancellation = ReverseRequestCancellation::new();
-            let mut callback = Box::pin(self.invoke_embedded_input_request_async(
-                cx,
-                input_key,
-                request,
-                cancellation.clone(),
-            ));
-            // Declared after the callback so cancellation is recorded before
-            // dropping its future on every abandonment path.
-            let owner = MrtrCallbackOwner(cancellation);
-            let mut wake = Box::pin(asupersync::time::sleep(
-                cx.now(),
-                REVERSE_CALLBACK_POLL_SLICE,
-            ));
-            let value = std::future::poll_fn(|task_cx| {
-                if let Err(error) = checkpoint() {
-                    return std::task::Poll::Ready(Err(error));
-                }
-                let polled = catch_client_callback_unwind(|| callback.as_mut().poll(task_cx))
-                    .unwrap_or_else(|_| {
-                        std::task::Poll::Ready(Err(McpError::internal_error(
-                            "Client reverse request handler failed",
-                        )))
-                    });
-                // Cancellation can win inside the callback's completing poll.
-                if let Err(error) = checkpoint() {
-                    return std::task::Poll::Ready(Err(error));
-                }
-                if polled.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
-                    wake.set(asupersync::time::sleep(
-                        cx.now(),
-                        REVERSE_CALLBACK_POLL_SLICE,
-                    ));
-                    task_cx.waker().wake_by_ref();
-                }
-                polled
-            })
-            .await?;
+            let (value, owner) = self
+                .invoke_embedded_input_request_async(cx, input_key, request, &checkpoint)
+                .await?;
             checkpoint()?;
             owner.0.record_response_sent();
             responses.insert(input_key.to_owned(), value);
@@ -633,7 +600,7 @@ impl ReverseRequestHandlers {
         input_key: &str,
         request: FinalEmbeddedInputRequest,
         checkpoint: &impl Fn() -> McpResult<()>,
-    ) -> McpResult<serde_json::Value> {
+    ) -> McpResult<(serde_json::Value, MrtrCallbackOwner)> {
         match request {
             FinalEmbeddedInputRequest::Sampling(params) => {
                 let Some(handler) = self.modern_sampling_create_message.as_ref() else {
@@ -641,18 +608,19 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed sampling/createMessage reverse handler"
                     )));
                 };
-                let result = invoke_shared_reverse_request_handler(
+                let (result, owner) = invoke_shared_reverse_request_handler(
                     cx,
                     handler,
                     ReverseRequestCancellation::new(),
                     final_create_message_params_from_embedded(params),
                     checkpoint,
                 )?;
-                serde_json::to_value(result).map_err(|error| {
+                let value = serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR sampling input response could not serialize: {error}"
                     ))
-                })
+                })?;
+                Ok((value, owner))
             }
             FinalEmbeddedInputRequest::Roots(params) => {
                 let Some(handler) = self.modern_roots_list.as_ref() else {
@@ -660,18 +628,19 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed roots/list reverse handler"
                     )));
                 };
-                let result = invoke_shared_reverse_request_handler(
+                let (result, owner) = invoke_shared_reverse_request_handler(
                     cx,
                     handler,
                     ReverseRequestCancellation::new(),
                     params,
                     checkpoint,
                 )?;
-                serde_json::to_value(result).map_err(|error| {
+                let value = serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR roots input response could not serialize: {error}"
                     ))
-                })
+                })?;
+                Ok((value, owner))
             }
             FinalEmbeddedInputRequest::Elicitation(params) => {
                 let Some(handler) = self.modern_elicitation_create.as_ref() else {
@@ -679,18 +648,19 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed elicitation/create reverse handler"
                     )));
                 };
-                let result = invoke_shared_reverse_request_handler(
+                let (result, owner) = invoke_shared_reverse_request_handler(
                     cx,
                     handler,
                     ReverseRequestCancellation::new(),
                     elicit_request_params_from_embedded(input_key, params),
                     checkpoint,
                 )?;
-                serde_json::to_value(result).map_err(|error| {
+                let value = serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR elicitation input response could not serialize: {error}"
                     ))
-                })
+                })?;
+                Ok((value, owner))
             }
         }
     }
@@ -700,8 +670,8 @@ impl ReverseRequestHandlers {
         cx: &Cx,
         input_key: &str,
         request: FinalEmbeddedInputRequest,
-        cancellation: ReverseRequestCancellation,
-    ) -> McpResult<serde_json::Value> {
+        checkpoint: &impl Fn() -> McpResult<()>,
+    ) -> McpResult<(serde_json::Value, MrtrCallbackOwner)> {
         match request {
             FinalEmbeddedInputRequest::Sampling(params) => {
                 let Some(handler) = self.modern_sampling_create_message.as_ref() else {
@@ -709,17 +679,19 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed sampling/createMessage reverse handler"
                     )));
                 };
-                let result = handler(
+                let (result, owner) = invoke_mrtr_request_handler_async(
                     cx,
-                    cancellation,
+                    handler,
                     final_create_message_params_from_embedded(params),
+                    checkpoint,
                 )
                 .await?;
-                serde_json::to_value(result).map_err(|error| {
+                let value = serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR sampling input response could not serialize: {error}"
                     ))
-                })
+                })?;
+                Ok((value, owner))
             }
             FinalEmbeddedInputRequest::Roots(params) => {
                 let Some(handler) = self.modern_roots_list.as_ref() else {
@@ -727,12 +699,14 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed roots/list reverse handler"
                     )));
                 };
-                let result = handler(cx, cancellation, params).await?;
-                serde_json::to_value(result).map_err(|error| {
+                let (result, owner) =
+                    invoke_mrtr_request_handler_async(cx, handler, params, checkpoint).await?;
+                let value = serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR roots input response could not serialize: {error}"
                     ))
-                })
+                })?;
+                Ok((value, owner))
             }
             FinalEmbeddedInputRequest::Elicitation(params) => {
                 let Some(handler) = self.modern_elicitation_create.as_ref() else {
@@ -740,17 +714,19 @@ impl ReverseRequestHandlers {
                         "MRTR input request {input_key} requires an installed elicitation/create reverse handler"
                     )));
                 };
-                let result = handler(
+                let (result, owner) = invoke_mrtr_request_handler_async(
                     cx,
-                    cancellation,
+                    handler,
                     elicit_request_params_from_embedded(input_key, params),
+                    checkpoint,
                 )
                 .await?;
-                serde_json::to_value(result).map_err(|error| {
+                let value = serde_json::to_value(result).map_err(|error| {
                     McpError::internal_error(format!(
                         "MRTR elicitation input response could not serialize: {error}"
                     ))
-                })
+                })?;
+                Ok((value, owner))
             }
         }
     }
@@ -3511,7 +3487,7 @@ fn invoke_shared_reverse_request_handler<P, R>(
     cancellation: ReverseRequestCancellation,
     params: P,
     checkpoint: &impl Fn() -> McpResult<()>,
-) -> McpResult<R> {
+) -> McpResult<(R, MrtrCallbackOwner)> {
     cancellation.checkpoint()?;
     checkpoint()?;
     let mut callback = None;
@@ -3566,8 +3542,143 @@ fn invoke_shared_reverse_request_handler<P, R>(
     }
     let result = outcome?;
     check()?;
-    owner.0.record_response_sent();
-    Ok(result)
+    Ok((result, owner))
+}
+
+/// Retains the actual host future, including after a completing or panicking
+/// poll. An enclosing async wrapper must not drop it before reconciling the
+/// operation's lifetime and cancelling its ownership token on failure.
+struct RetainedMrtrCallback<'cx, R> {
+    cx: &'cx Cx,
+    owner: Option<MrtrCallbackOwner>,
+    future: Option<ReverseRequestFuture<'cx, R>>,
+}
+
+impl<R> RetainedMrtrCallback<'_, R> {
+    fn dispose(&mut self) -> McpResult<()> {
+        // Empty the slot before running host cleanup: a destructor panic must
+        // not leave a future for the guard to attempt to destroy a second time.
+        let future = self.future.take();
+        catch_client_callback_unwind(|| {
+            crate::http_auth::caller::with_caller(self.cx, || drop(future));
+        })
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))
+    }
+}
+
+impl<R> Drop for RetainedMrtrCallback<'_, R> {
+    fn drop(&mut self) {
+        if let Some(owner) = &self.owner {
+            owner.0.cancel();
+        }
+        // Dropping an outer request future has no result channel. It still
+        // cancels before cleanup and contains/redacts a host destructor panic.
+        let _ = self.dispose();
+    }
+}
+
+async fn invoke_mrtr_request_handler_async<P, R>(
+    cx: &Cx,
+    handler: &Arc<
+        dyn for<'callback> Fn(
+                &'callback Cx,
+                ReverseRequestCancellation,
+                P,
+            ) -> ReverseRequestFuture<'callback, R>
+            + Send
+            + Sync,
+    >,
+    params: P,
+    checkpoint: &impl Fn() -> McpResult<()>,
+) -> McpResult<(R, MrtrCallbackOwner)> {
+    use crate::http_auth::caller::with_caller;
+
+    checkpoint()?;
+    // Retain the admitted caller view so later polling or drop from a wider
+    // ambient context cannot restore an effect denied when the callback began.
+    // Every synchronous scope additionally intersects the current host ceiling.
+    let caller = with_caller(cx, || Cx::current().expect("MRTR caller is installed"));
+    let cx = &caller;
+    let cancellation = ReverseRequestCancellation::new();
+    let mut callback = RetainedMrtrCallback {
+        cx,
+        owner: Some(MrtrCallbackOwner(cancellation.clone())),
+        future: None,
+    };
+    callback.future = Some(
+        catch_client_callback_unwind(|| {
+            with_caller(cx, || handler(cx, cancellation.clone(), params))
+        })
+        .map_err(|_| McpError::internal_error("Client reverse request handler failed"))?,
+    );
+    let check = || cancellation.checkpoint().and_then(|()| checkpoint());
+    let mut wake = None;
+    let outcome = std::future::poll_fn(|task_cx| {
+        with_caller(cx, || {
+            if let Err(error) = check() {
+                return std::task::Poll::Ready(Err(error));
+            }
+            let polled = catch_client_callback_unwind(|| {
+                callback
+                    .future
+                    .as_mut()
+                    .expect("the callback is constructed before its first poll")
+                    .as_mut()
+                    .poll(task_cx)
+            })
+            .unwrap_or_else(|_| {
+                std::task::Poll::Ready(Err(McpError::internal_error(
+                    "Client reverse request handler failed",
+                )))
+            });
+            // Reconcile a completing poll before destroying its actual future.
+            if let Err(error) = check() {
+                return std::task::Poll::Ready(Err(error));
+            }
+            if polled.is_pending() {
+                let current = Cx::current().expect("MRTR caller is installed");
+                if !current.capabilities().time {
+                    return std::task::Poll::Ready(Err(McpError::internal_error(
+                        "MRTR callback wait requires caller time capability",
+                    )));
+                }
+                if current.timer_driver().is_none() {
+                    return std::task::Poll::Ready(Err(McpError::internal_error(
+                        "MRTR callback wait requires caller timer driver",
+                    )));
+                }
+                // A ready callback needs no timer. A pending callback may
+                // register only on its admitted caller's timer, never Sleep's
+                // out-of-runtime fallback or an unrelated ambient driver.
+                let wake = wake.get_or_insert_with(|| {
+                    Box::pin(asupersync::time::sleep(cx.now(), REVERSE_CALLBACK_POLL_SLICE))
+                });
+                if wake.as_mut().poll(task_cx).is_ready() {
+                    wake.set(asupersync::time::sleep(
+                        cx.now(),
+                        REVERSE_CALLBACK_POLL_SLICE,
+                    ));
+                    task_cx.waker().wake_by_ref();
+                }
+            }
+            polled
+        })
+    })
+    .await;
+    if outcome.is_err() {
+        cancellation.cancel();
+    }
+    // Poll and drop have separate panic boundaries. Cleanup can itself cancel
+    // the operation, so acceptance happens only after both cleanup and a final
+    // lifetime check; an error cannot authorize a sibling or continuation.
+    callback.dispose()?;
+    let result = outcome?;
+    check()?;
+    // Serialization and the batch's last checkpoint still precede acceptance.
+    // Transfer the open token so either can refuse without leaving a response
+    // marked as accepted. The outer responder owns the final election.
+    let owner = callback.owner.take().expect("the callback owns its token");
+    Ok((result, owner))
 }
 
 /// Invokes a reverse handler directly for callers already on an asupersync
@@ -3610,6 +3721,7 @@ const REVERSE_CALLBACK_SHUTDOWN_TIMEOUT_ERROR: &str =
 
 /// Owns one local MRTR callback until its value is accepted. Cancelling this
 /// token does not cancel the caller's Cx or any sibling request.
+#[derive(Debug)]
 struct MrtrCallbackOwner(ReverseRequestCancellation);
 
 impl Drop for MrtrCallbackOwner {
@@ -27946,8 +28058,9 @@ mod tests {
         }
     }
 
-    // bd-mrtr-01-b-otqd: synchronous installed resolvers retain the same
-    // caller lifetime while pending and while producing their final value.
+    // bd-mrtr-01-b-otqd / bd-mcp-mrtr-03-b-ni1v: installed resolvers retain
+    // the same caller lifetime through polling and cleanup. Keep this module's
+    // existing name so its synchronous regression IDs remain stable.
     mod sync_mrtr_lifetime {
         use super::*;
         use asupersync::time::{TimerDriverHandle, VirtualClock};
@@ -27960,6 +28073,9 @@ mod tests {
         struct Observed {
             calls: AtomicUsize,
             polls: AtomicUsize,
+            effects_at_factory: Mutex<Vec<[bool; 5]>>,
+            effects_at_poll: Mutex<Vec<[bool; 5]>>,
+            effects_at_drop: Mutex<Vec<[bool; 5]>>,
             cancelled_at_drop: Mutex<Vec<bool>>,
             redacted_at_drop: Mutex<Vec<bool>>,
             context_at_drop: Mutex<Vec<Option<String>>>,
@@ -27975,6 +28091,10 @@ mod tests {
             PanicOnDrop,
             CancelOnReadyAndDropPanic,
             PanicOnPollAndDrop,
+            Error,
+            PanicOnCreate,
+            Pending,
+            PendingAndDropPanic,
             PendingOnce {
                 clock: Arc<VirtualClock>,
                 advance: u64,
@@ -27995,8 +28115,20 @@ mod tests {
             fn poll(self: Pin<&mut Self>, _task_cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let this = self.get_mut();
                 this.observed.polls.fetch_add(1, Ordering::SeqCst);
+                this.observed
+                    .effects_at_poll
+                    .lock()
+                    .unwrap()
+                    .push(current_effects());
                 let already_polled = std::mem::replace(&mut this.polled, true);
                 match &this.mode {
+                    CallbackMode::Pending | CallbackMode::PendingAndDropPanic => {
+                        return Poll::Pending;
+                    }
+                    CallbackMode::Error => {
+                        return Poll::Ready(Err(McpError::tool_error("host callback refused")));
+                    }
+                    CallbackMode::PanicOnCreate => unreachable!("factory already panicked"),
                     CallbackMode::PendingOnce { clock, advance } if !already_polled => {
                         clock.advance(*advance);
                         // Deliberately arrange no wake. The sync bridge's
@@ -28042,11 +28174,17 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(Cx::current().and_then(|cx| cx.task_type()));
+                self.observed
+                    .effects_at_drop
+                    .lock()
+                    .unwrap()
+                    .push(current_effects());
                 if matches!(
                     &self.mode,
                     CallbackMode::PanicOnDrop
                         | CallbackMode::CancelOnReadyAndDropPanic
                         | CallbackMode::PanicOnPollAndDrop
+                        | CallbackMode::PendingAndDropPanic
                 ) {
                     panic!("private sync callback destructor payload");
                 }
@@ -28059,6 +28197,13 @@ mod tests {
                 move |cx, cancellation, _params| {
                     observed.calls.fetch_add(1, Ordering::SeqCst);
                     observed.tokens.lock().unwrap().push(cancellation.clone());
+                    if Cx::current().is_some() {
+                        observed.effects_at_factory.lock().unwrap().push(current_effects());
+                    }
+                    if matches!(&mode, CallbackMode::PanicOnCreate) {
+                        assert!(REDACT_CLIENT_CALLBACK_PANIC.with(|redacted| redacted.get()));
+                        panic!("private callback factory payload");
+                    }
                     Box::pin(RootsFuture {
                         cx: cx.clone(),
                         cancellation,
@@ -28068,6 +28213,48 @@ mod tests {
                     })
                 },
             )
+        }
+
+        fn current_effects() -> [bool; 5] {
+            let current = Cx::current().expect("callback has an explicit caller");
+            let capabilities = current.capabilities();
+            [
+                capabilities.spawn,
+                capabilities.time,
+                capabilities.entropy,
+                capabilities.io,
+                capabilities.remote,
+            ]
+        }
+
+        fn dispatch(
+            asynchronous: bool,
+            cx: &Cx,
+            handlers: &ReverseRequestHandlers,
+            input: &InputRequiredResult,
+            deadline: Instant,
+        ) -> McpResult<MrtrInputResponses> {
+            let capabilities = serde_json::json!({"roots": {}});
+            if asynchronous {
+                let mut operation = Box::pin(handlers.respond_to_input_required_async(
+                    cx,
+                    &capabilities,
+                    input,
+                    || check_mrtr_operation(cx, None, deadline),
+                ));
+                let mut task_cx = Context::from_waker(std::task::Waker::noop());
+                match operation.as_mut().poll(&mut task_cx) {
+                    Poll::Ready(result) => result,
+                    Poll::Pending => match operation.as_mut().poll(&mut task_cx) {
+                        Poll::Ready(result) => result,
+                        Poll::Pending => panic!("this fixture completes within two polls"),
+                    },
+                }
+            } else {
+                handlers.respond_to_input_required(cx, &capabilities, input, || {
+                    check_mrtr_operation(cx, None, deadline)
+                })
+            }
         }
 
         fn inputs(two_requests: bool) -> InputRequiredResult {
@@ -28087,7 +28274,7 @@ mod tests {
             .unwrap()
         }
 
-        fn ready_callback_probe(cancel: bool) {
+        fn ready_callback_probe(asynchronous: bool, cancel: bool) {
             let cx = Cx::for_testing();
             cx.set_task_type(CALLBACK_CONTEXT);
             let observed = Arc::new(Observed::default());
@@ -28098,11 +28285,12 @@ mod tests {
             };
             let handlers = roots_handler(&observed, mode);
             let deadline = Instant::now() + Duration::from_secs(60);
-            let result = handlers.respond_to_input_required(
+            let result = dispatch(
+                asynchronous,
                 &cx,
-                &serde_json::json!({"roots": {}}),
+                &handlers,
                 &inputs(true),
-                || check_mrtr_operation(&cx, None, deadline),
+                deadline,
             );
             if cancel {
                 assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
@@ -28139,7 +28327,11 @@ mod tests {
             );
         }
 
-        fn cleanup_failure_probe(mode: CallbackMode, cancelled_before_drop: bool) {
+        fn cleanup_failure_probe(
+            asynchronous: bool,
+            mode: CallbackMode,
+            cancelled_before_drop: bool,
+        ) {
             let cancelled_by_drop = matches!(&mode, CallbackMode::CancelOnDrop);
             let caller_cancelled = cancelled_by_drop
                 || matches!(&mode, CallbackMode::CancelOnReadyAndDropPanic);
@@ -28149,13 +28341,7 @@ mod tests {
             let observed = Arc::new(Observed::default());
             let handlers = roots_handler(&observed, mode);
             let deadline = Instant::now() + Duration::from_secs(60);
-            let error = handlers
-                .respond_to_input_required(
-                    &cx,
-                    &serde_json::json!({"roots": {}}),
-                    &inputs(true),
-                    || check_mrtr_operation(&cx, None, deadline),
-                )
+            let error = dispatch(asynchronous, &cx, &handlers, &inputs(true), deadline)
                 .expect_err("callback cleanup must finish before accepting its result");
             let expected = if cancelled_by_drop {
                 McpError::request_cancelled()
@@ -28181,7 +28367,7 @@ mod tests {
             assert_eq!(observed.poll_panic_redacted.load(Ordering::SeqCst), poll_panics);
         }
 
-        fn pending_callback_probe(expire: bool) {
+        fn pending_callback_probe(asynchronous: bool, expire: bool) {
             let clock = Arc::new(VirtualClock::new());
             let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
             let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -28202,11 +28388,12 @@ mod tests {
                 },
             );
             let deadline = Instant::now() + Duration::from_secs(60);
-            let result = handlers.respond_to_input_required(
+            let result = dispatch(
+                asynchronous,
                 &cx,
-                &serde_json::json!({"roots": {}}),
+                &handlers,
                 &inputs(false),
-                || check_mrtr_operation(&cx, None, deadline),
+                deadline,
             );
             assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
             if expire {
@@ -28227,42 +28414,370 @@ mod tests {
 
         #[test]
         fn ready_callbacks_complete_once_without_cancellation() {
-            ready_callback_probe(false);
+            ready_callback_probe(false, false);
         }
 
         #[test]
         fn cancellation_in_first_ready_callback_prevents_later_callbacks() {
-            ready_callback_probe(true);
+            ready_callback_probe(false, true);
         }
 
         #[test]
         fn pending_callback_completes_before_caller_deadline() {
-            pending_callback_probe(false);
+            pending_callback_probe(false, false);
         }
 
         #[test]
         fn pending_callback_observes_caller_deadline_before_drop() {
-            pending_callback_probe(true);
+            pending_callback_probe(false, true);
         }
 
         #[test]
         fn ready_callback_drop_panic_is_redacted_before_any_sibling() {
-            cleanup_failure_probe(CallbackMode::PanicOnDrop, false);
+            cleanup_failure_probe(false, CallbackMode::PanicOnDrop, false);
         }
 
         #[test]
         fn cancelled_callback_drop_panic_is_redacted_without_acceptance() {
-            cleanup_failure_probe(CallbackMode::CancelOnReadyAndDropPanic, true);
+            cleanup_failure_probe(false, CallbackMode::CancelOnReadyAndDropPanic, true);
         }
 
         #[test]
         fn callback_poll_and_drop_panics_are_caught_separately() {
-            cleanup_failure_probe(CallbackMode::PanicOnPollAndDrop, true);
+            cleanup_failure_probe(false, CallbackMode::PanicOnPollAndDrop, true);
         }
 
         #[test]
         fn cancellation_during_callback_drop_stops_later_callbacks() {
-            cleanup_failure_probe(CallbackMode::CancelOnDrop, false);
+            cleanup_failure_probe(false, CallbackMode::CancelOnDrop, false);
+        }
+
+        #[test]
+        fn async_ready_callbacks_complete_once_without_cancellation() {
+            ready_callback_probe(true, false);
+        }
+
+        #[test]
+        fn async_cancellation_in_first_ready_callback_prevents_later_callbacks() {
+            ready_callback_probe(true, true);
+        }
+
+        #[test]
+        fn async_pending_callback_completes_before_caller_deadline() {
+            pending_callback_probe(true, false);
+        }
+
+        #[test]
+        fn async_pending_callback_observes_caller_deadline_before_drop() {
+            pending_callback_probe(true, true);
+        }
+
+        #[test]
+        fn async_ready_callback_drop_panic_is_redacted_before_any_sibling() {
+            cleanup_failure_probe(true, CallbackMode::PanicOnDrop, false);
+        }
+
+        #[test]
+        fn async_cancelled_callback_drop_panic_is_redacted_without_acceptance() {
+            cleanup_failure_probe(true, CallbackMode::CancelOnReadyAndDropPanic, true);
+        }
+
+        #[test]
+        fn async_callback_poll_and_drop_panics_are_caught_separately() {
+            cleanup_failure_probe(true, CallbackMode::PanicOnPollAndDrop, true);
+        }
+
+        #[test]
+        fn async_cancellation_during_callback_drop_stops_later_callbacks() {
+            cleanup_failure_probe(true, CallbackMode::CancelOnDrop, false);
+        }
+
+        #[test]
+        fn async_callback_error_cancels_before_cleanup() {
+            let cx = Cx::for_testing();
+            cx.set_task_type(CALLBACK_CONTEXT);
+            let observed = Arc::new(Observed::default());
+            let handlers = roots_handler(&observed, CallbackMode::Error);
+            let error = dispatch(
+                true,
+                &cx,
+                &handlers,
+                &inputs(true),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::ToolExecutionError);
+            assert_eq!(error.message, "host callback refused");
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
+            assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
+            assert_eq!(*observed.redacted_at_drop.lock().unwrap(), [true]);
+            assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            cx.checkpoint().unwrap();
+        }
+
+        #[test]
+        fn resolved_callback_stays_open_until_serialized_batch_acceptance() {
+            for asynchronous in [false, true] {
+                for cancel_at_acceptance in [false, true] {
+                    let cx = Cx::for_testing();
+                    let observed = Arc::new(Observed::default());
+                    let handlers = roots_handler(&observed, CallbackMode::Ready);
+                    let input = inputs(false);
+                    let capabilities = serde_json::json!({"roots": {}});
+                    let after_cleanup = AtomicUsize::new(0);
+                    let checkpoint = || {
+                        if !observed.cancelled_at_drop.lock().unwrap().is_empty() {
+                            assert!(observed.tokens.lock().unwrap()[0].is_open());
+                            if after_cleanup.fetch_add(1, Ordering::SeqCst) == 1
+                                && cancel_at_acceptance
+                            {
+                                return Err(McpError::request_cancelled());
+                            }
+                        }
+                        Ok(())
+                    };
+                    let result = if asynchronous {
+                        let mut operation = Box::pin(handlers.respond_to_input_required_async(
+                            &cx,
+                            &capabilities,
+                            &input,
+                            checkpoint,
+                        ));
+                        let mut task_cx = Context::from_waker(std::task::Waker::noop());
+                        let Poll::Ready(result) = operation.as_mut().poll(&mut task_cx) else {
+                            panic!("ready input has no asynchronous wait");
+                        };
+                        result
+                    } else {
+                        handlers.respond_to_input_required(&cx, &capabilities, &input, checkpoint)
+                    };
+                    assert_eq!(after_cleanup.load(Ordering::SeqCst), 2);
+                    assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+                    let tokens = observed.tokens.lock().unwrap();
+                    assert!(!tokens[0].is_open());
+                    assert_eq!(tokens[0].is_cancel_requested(), cancel_at_acceptance);
+                    if cancel_at_acceptance {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    } else {
+                        assert_eq!(result.unwrap()["first"], serde_json::json!({"roots": []}));
+                    }
+                    cx.checkpoint().unwrap();
+                }
+            }
+        }
+
+        #[test]
+        fn async_callback_factory_panic_cancels_without_polling() {
+            let cx = Cx::for_testing();
+            let observed = Arc::new(Observed::default());
+            let handlers = roots_handler(&observed, CallbackMode::PanicOnCreate);
+            let error = dispatch(
+                true,
+                &cx,
+                &handlers,
+                &inputs(true),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InternalError);
+            assert_eq!(error.message, "Client reverse request handler failed");
+            assert!(error.data.is_none());
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.polls.load(Ordering::SeqCst), 0);
+            assert!(observed.cancelled_at_drop.lock().unwrap().is_empty());
+            assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            cx.checkpoint().unwrap();
+        }
+
+        #[test]
+        fn async_ready_callback_needs_no_unused_timer_authority() {
+            use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+            let cx = Cx::for_testing();
+            assert!(cx.timer_driver().is_none());
+            let observed = Arc::new(Observed::default());
+            let handlers = roots_handler(&observed, CallbackMode::Ready);
+            let _host = Cx::set_current(Some(Cx::for_testing()));
+            let _restriction =
+                Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+            let responses = dispatch(
+                true,
+                &cx,
+                &handlers,
+                &inputs(true),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+            assert_eq!(responses.len(), 2);
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(observed.polls.load(Ordering::SeqCst), 2);
+            assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [false, false]);
+            assert_eq!(
+                *observed.effects_at_drop.lock().unwrap(),
+                [[true, false, true, true, true]; 2],
+            );
+        }
+
+        #[test]
+        fn async_pending_callback_refuses_missing_timer_or_time_authority() {
+            use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+
+            for deny_time in [false, true] {
+                let cx = Cx::for_testing();
+                assert!(cx.timer_driver().is_none());
+                let observed = Arc::new(Observed::default());
+                let handlers = roots_handler(&observed, CallbackMode::Pending);
+                let _host = Cx::set_current(Some(Cx::for_testing()));
+                let _restriction = Cx::push_restriction(if deny_time {
+                    CapSet::<true, false, true, true, true>::MASK
+                } else {
+                    CapMask::all()
+                });
+                let error = dispatch(
+                    true,
+                    &cx,
+                    &handlers,
+                    &inputs(true),
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(
+                    error.message,
+                    if deny_time {
+                        "MRTR callback wait requires caller time capability"
+                    } else {
+                        "MRTR callback wait requires caller timer driver"
+                    },
+                );
+                assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
+                assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
+                assert_eq!(*observed.redacted_at_drop.lock().unwrap(), [true]);
+                assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+                cx.checkpoint().unwrap();
+            }
+        }
+
+        #[test]
+        fn async_pending_callback_rechecks_timer_authority_after_suspension() {
+            use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::new(VirtualClock::new()));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer)
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let observed = Arc::new(Observed::default());
+            let handlers = roots_handler(&observed, CallbackMode::Pending);
+            let input = inputs(true);
+            let capabilities = serde_json::json!({"roots": {}});
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut operation = Box::pin(handlers.respond_to_input_required_async(
+                &cx,
+                &capabilities,
+                &input,
+                || check_mrtr_operation(&cx, None, deadline),
+            ));
+            let mut task_cx = Context::from_waker(std::task::Waker::noop());
+            assert!(operation.as_mut().poll(&mut task_cx).is_pending());
+            {
+                let _host = Cx::set_current(Some(Cx::for_testing()));
+                let _restriction =
+                    Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                let Poll::Ready(Err(error)) = operation.as_mut().poll(&mut task_cx) else {
+                    panic!("a resumed wait cannot use revoked time authority");
+                };
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "MRTR callback wait requires caller time capability");
+            }
+            drop(operation);
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.polls.load(Ordering::SeqCst), 2);
+            assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
+            assert_eq!(*observed.effects_at_drop.lock().unwrap(), [[true, false, true, true, true]]);
+            assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            cx.checkpoint().unwrap();
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        fn dropped_pending_callback_probe(panic_on_drop: bool) {
+            use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(clock);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer)
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            cx.set_task_type(CALLBACK_CONTEXT);
+            let host = Cx::for_testing();
+            host.set_task_type("unrelated-callback-host");
+            let observed = Arc::new(Observed::default());
+            let mode = if panic_on_drop {
+                CallbackMode::PendingAndDropPanic
+            } else {
+                CallbackMode::Pending
+            };
+            let handlers = roots_handler(&observed, mode);
+            let input = inputs(true);
+            let capabilities = serde_json::json!({"roots": {}});
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let mut operation = Box::pin(handlers.respond_to_input_required_async(
+                &cx,
+                &capabilities,
+                &input,
+                || check_mrtr_operation(&cx, None, deadline),
+            ));
+            let mut task_cx = Context::from_waker(std::task::Waker::noop());
+            {
+                let _host = Cx::set_current(Some(host.clone()));
+                let _restriction =
+                    Cx::push_restriction(CapSet::<false, true, false, false, false>::MASK);
+                assert!(operation.as_mut().poll(&mut task_cx).is_pending());
+                assert_eq!(Cx::current().unwrap().task_type().as_deref(), Some("unrelated-callback-host"));
+                assert_eq!(current_effects(), [false, true, false, false, false]);
+            }
+            {
+                // Drop from a wider host after the original restriction has
+                // ended. Cleanup retains the admitted ceiling and caller ID.
+                let _host = Cx::set_current(Some(host.clone()));
+                assert_eq!(current_effects(), [true; 5]);
+                drop(operation);
+                assert_eq!(Cx::current().unwrap().task_type().as_deref(), Some("unrelated-callback-host"));
+                assert_eq!(current_effects(), [true; 5]);
+            }
+            let expected = [false, true, false, false, false];
+            assert_eq!(*observed.effects_at_factory.lock().unwrap(), [expected]);
+            assert_eq!(*observed.effects_at_poll.lock().unwrap(), [expected]);
+            assert_eq!(*observed.effects_at_drop.lock().unwrap(), [expected]);
+            assert_eq!(*observed.cancelled_at_drop.lock().unwrap(), [true]);
+            assert_eq!(*observed.redacted_at_drop.lock().unwrap(), [true]);
+            assert_eq!(*observed.context_at_drop.lock().unwrap(), [Some(CALLBACK_CONTEXT.to_owned())]);
+            assert_eq!(observed.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observed.polls.load(Ordering::SeqCst), 1);
+            assert!(observed.tokens.lock().unwrap()[0].is_cancel_requested());
+            assert!(Cx::current().is_none());
+            cx.checkpoint().unwrap();
+            host.checkpoint().unwrap();
+            drop(cx);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn async_drop_preserves_caller_ceiling_and_cancels_before_cleanup() {
+            dropped_pending_callback_probe(false);
+        }
+
+        #[test]
+        fn async_drop_contains_destructor_panic_and_restores_host_context() {
+            dropped_pending_callback_probe(true);
         }
     }
 
@@ -59203,6 +59718,136 @@ exec sleep 5
     #[test]
     fn sync_mrtr_public_ready_cancellation_stops_later_handler_and_retry() {
         sync_mrtr_public_callback_lifetime_probe(true);
+    }
+
+    #[cfg(unix)]
+    fn async_mrtr_public_callback_cleanup_probe(panic_on_drop: bool) {
+        const CALLER: &str = "async-mrtr-public-caller";
+
+        struct RootsFuture {
+            dropped: Arc<AtomicUsize>,
+            panic_on_drop: bool,
+        }
+
+        impl Future for RootsFuture {
+            type Output = McpResult<FinalEmbeddedRootsListResult>;
+
+            fn poll(
+                self: Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                assert_eq!(Cx::current().unwrap().task_type().as_deref(), Some(CALLER));
+                std::task::Poll::Ready(Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }))
+            }
+        }
+
+        impl Drop for RootsFuture {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(Cx::current().unwrap().task_type().as_deref(), Some(CALLER));
+                assert!(REDACT_CLIENT_CALLBACK_PANIC.with(|redacted| redacted.get()));
+                if self.panic_on_drop {
+                    panic!("private public-client callback cleanup payload");
+                }
+            }
+        }
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        caller.set_task_type(CALLER);
+        runtime.block_on(async {
+            let connection_cx = Cx::current().unwrap();
+            let roots_calls = Arc::new(AtomicUsize::new(0));
+            let sampling_calls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let token = Arc::new(Mutex::new(None));
+            let handlers = ReverseRequestHandlers::new()
+                .with_modern_roots_list({
+                    let calls = Arc::clone(&roots_calls);
+                    let dropped = Arc::clone(&dropped);
+                    let token = Arc::clone(&token);
+                    move |_cx, cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        *token.lock().unwrap() = Some(cancellation);
+                        Box::pin(RootsFuture {
+                            dropped: Arc::clone(&dropped),
+                            panic_on_drop,
+                        })
+                    }
+                })
+                .with_modern_sampling_create_message({
+                    let calls = Arc::clone(&sampling_calls);
+                    move |_cx, _cancellation, _params| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async {
+                            Ok(serde_json::from_value(serde_json::json!({
+                                "role": "assistant",
+                                "model": "mrtr-test-model",
+                                "content": {"type": "text", "text": "complete"},
+                            }))
+                            .unwrap())
+                        })
+                    }
+                });
+            let script = modern_mrtr_two_input_client_script(!panic_on_drop);
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .reverse_request_handlers(handlers)
+                .connect_stdio_with_cx(&connection_cx, "sh", &["-c", &script])
+                .await
+                .unwrap();
+            let result = client
+                .call_tool_with_cx(
+                    &caller,
+                    &McpRequestCancellation::new(),
+                    "retry-tool",
+                    serde_json::json!({}),
+                )
+                .await;
+            let next_id = client.next_id.load(Ordering::SeqCst);
+            client.close_with_cx(&connection_cx).await.unwrap();
+            assert!(client.child.is_none());
+            assert_eq!(roots_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                token.lock().unwrap().as_ref().unwrap().is_cancel_requested(),
+                panic_on_drop,
+            );
+            if panic_on_drop {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InternalError);
+                assert_eq!(error.message, "Client reverse request handler failed");
+                assert!(error.data.is_none());
+                assert_eq!(sampling_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(next_id, 3, "failed cleanup cannot allocate a continuation");
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsCall { .. }),
+                ));
+                assert_eq!(sampling_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(next_id, 4, "the complete batch makes exactly one continuation");
+            }
+            caller.checkpoint().unwrap();
+            connection_cx.checkpoint().unwrap();
+        });
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_mrtr_public_cleanup_preserves_caller_and_retries_once() {
+        async_mrtr_public_callback_cleanup_probe(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn async_mrtr_public_cleanup_panic_stops_sibling_and_continuation() {
+        async_mrtr_public_callback_cleanup_probe(true);
     }
 
     #[cfg(unix)]

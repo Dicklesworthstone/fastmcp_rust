@@ -8,7 +8,7 @@
 use asupersync::Cx;
 use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 
-pub(super) fn with_caller<T>(cx: &Cx, operation: impl FnOnce() -> T) -> T {
+pub(crate) fn with_caller<T>(cx: &Cx, operation: impl FnOnce() -> T) -> T {
     let ceiling = ambient_ceiling();
     let _caller = Cx::set_current(Some(cx.clone()));
     let _restriction = Cx::push_restriction(ceiling);
