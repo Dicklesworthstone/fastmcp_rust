@@ -34,20 +34,31 @@
 #   3  preflight refused (dirty tracker / moving checkout)
 #
 # USAGE
-#   scripts/check_all_targets.sh [--retries N] [--json] [--arm default|all-features|both]
+#   scripts/check_all_targets.sh [--retries N] [--json]
+#       [--arm default|all-features|no-default-features|both|all]
+#
+#   `both` = default + all-features (the cheap pre-submit pair).
+#   `all`  = adds --no-default-features, which bd-yhx86 measured as a THIRD
+#            non-comparable projection with lint rows the other two cannot see.
 
 set -uo pipefail
 
 RETRIES=3
 JSON=0
 ARM=both
+DRY=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --retries) RETRIES="${2:?--retries needs a value}"; shift 2 ;;
     --json)    JSON=1; shift ;;
     --arm)     ARM="${2:?--arm needs a value}"; shift 2 ;;
-    -h|--help) sed -n '1,40p' "$0"; exit 0 ;;
+    # --dry-run exists because exercising the argument paths of a script that
+    # performs real work costs real work: validating these five --arm values
+    # by running them dispatched five multi-arm remote builds. Validate the
+    # parsing without touching the fleet.
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '1,45p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
 done
@@ -107,7 +118,11 @@ run_arm() {
     fi
     echo "  $label: try $try produced no verdict (void), retrying" >&2
   done
-  printf 'void\t\t\t\t\t%s\n' "$LOGDIR/${label}.$RETRIES.log"
+  # Placeholders, not empty fields: TAB is IFS whitespace, so bash collapses a
+  # run of consecutive tabs into ONE delimiter and strips leading/trailing
+  # ones. Emitting five empty fields therefore shifted the log path into
+  # remote_exit in the JSON. Observed 2026-11-05 on the first live run.
+  printf 'void\t-\t-\t-\t-\t%s\n' "$LOGDIR/${label}.$RETRIES.log"
   return 0
 }
 
@@ -128,15 +143,38 @@ run_and_record() {
 # Explicit ifs: `[ a ] || [ b ] && cmd` parses as `([ a ] || [ b ]) && cmd`,
 # which happens to work here but is a precedence trap waiting for an edit.
 case "$ARM" in
-  both|default|all-features) ;;
-  *) echo "--arm must be one of: default, all-features, both" >&2; exit 64 ;;
+  both|all|default|all-features|no-default-features) ;;
+  *) echo "--arm must be one of: default, all-features, no-default-features, both, all" >&2
+     exit 64 ;;
 esac
 
-if [ "$ARM" = both ] || [ "$ARM" = default ]; then
+if [ "$DRY" -eq 1 ]; then
+  echo "dry run: arm selection '$ARM', retries $RETRIES, json $JSON"
+  echo "would run:"
+  { [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = default ]; } &&
+    echo "  cargo check --workspace --all-targets"
+  { [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = all-features ]; } &&
+    echo "  cargo check --workspace --all-targets --all-features"
+  { [ "$ARM" = all ] || [ "$ARM" = no-default-features ]; } &&
+    echo "  cargo check --workspace --all-targets --no-default-features"
+  exit 0
+fi
+
+if [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = default ]; then
   run_and_record default
 fi
-if [ "$ARM" = both ] || [ "$ARM" = all-features ]; then
+if [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = all-features ]; then
   run_and_record all-features --all-features
+fi
+# THIRD ARM. bd-yhx86 measured three lint rows that exist ONLY at
+# --no-default-features, two of them rustc dead_code: with legacy-2024-11-05
+# off, handle_application_tools_call_in_request (router.rs, exactly one caller)
+# and LegacyToolResultMode::Application lose their only caller. Its words: "a
+# 22-finding projection is not a subset of a 73-finding one". So the three
+# feature projections are mutually non-comparable and a two-arm gate is still
+# blind. Not in `both` (which stays the cheap pre-submit pair); use `--arm all`.
+if [ "$ARM" = all ] || [ "$ARM" = no-default-features ]; then
+  run_and_record no-default-features --no-default-features
 fi
 
 # A checkout that moved mid-run invalidates the receipt: the arms would have
