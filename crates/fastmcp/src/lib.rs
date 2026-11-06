@@ -387,7 +387,12 @@ pub mod core {
         McpCatalogKind, McpContext, McpContextLeaseGuard, McpError, McpErrorCode, McpLogLevel,
         McpOutcome, McpRequestCancellation, McpResult, NONCE_DOMAIN_MATERIAL_BYTES,
         NoOpElicitationSender, NoOpNotificationSender, NoOpSamplingSender, NonceDomainMaterial,
-        NotificationSender, Outcome, OutcomeExt, PROTOCOL_LIMITS_INITIAL_GENERATION,
+        NotificationSender, OperatorConnectionCapacity, OperatorConnectionCounters,
+        OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
+        OperatorExecutorState, OperatorHttpConnections, OperatorLifecycle, OperatorProfile,
+        OperatorReadiness, OperatorReason, OperatorRequestCapacity, OperatorSnapshot,
+        OperatorSnapshotError, OperatorSnapshotSource, Outcome, OutcomeExt,
+        PROTOCOL_LIMITS_INITIAL_GENERATION,
         ParseDurationError, PercentEncodingPolicy, PreAuthSourceBucketKey, ProgressReporter,
         PromptCaller, PromptGetResult, PromptMessageItem, PromptMessageRole, ProtocolLimit,
         ProtocolLimits, ProtocolLimitsBuilder, ProtocolLimitsError, QueryPolicy, QuotaPartitionKey,
@@ -514,6 +519,10 @@ pub use serde_json::{self, Map as JsonMap, Value as JsonValue, json};
 pub use asupersync::{LabConfig, LabRuntime};
 
 // Re-export core types
+pub use fastmcp_core::{
+    OperatorCorrelationCapacity, OperatorExecutorCapacity, OperatorExecutorSnapshot,
+    OperatorExecutorState, OperatorHttpConnections, OperatorRequestCapacity,
+};
 pub use fastmcp_core::{
     AccessToken, AuthContext, Budget, CancelledError, CatalogChangePublisher, ClientCapabilityInfo,
     ClientImplementationInfo, ClientRoot, Cx, ElicitationAction, ElicitationMode,

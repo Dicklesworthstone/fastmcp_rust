@@ -1300,6 +1300,48 @@ notifications are outside this surface.
 
 ---
 
+## Client executor observations
+
+`OperatorExecutorSnapshot` captures the selected protocol profile, lifecycle,
+structural readiness, and the capacity actually charged by a client executor.
+It is available from `RequestExecutor`, a retained `StdioRequestExecutor`
+handle, and `MemoryClient`:
+
+```rust
+use fastmcp_rust::{
+    OperatorExecutorCapacity, OperatorExecutorSnapshot,
+    OperatorSnapshotError, OperatorSnapshotSource,
+};
+
+fn observe(
+    client: &(impl OperatorSnapshotSource<OperatorExecutorCapacity> + ?Sized),
+) -> Result<OperatorExecutorSnapshot, OperatorSnapshotError> {
+    OperatorExecutorSnapshot::capture(client)
+}
+```
+
+A snapshot's `requests()` counts pending requests and deferred transport
+controls. Its `correlations()` counts pending requests, retained tombstones,
+and unconsumed terminal outcomes. These use the same charge arithmetic as
+request admission. Capturing a snapshot never sends a message, reads the
+transport, reserves a slot, or performs expiry maintenance. If an executor turn
+currently holds its state lock, capture returns `OperatorSnapshotError::Busy`
+immediately.
+
+`Ready` describes structural admission; the capacity gauges can simultaneously
+report saturation. Ordinary service turns release expired and abandoned-owner
+charges. The snapshot includes no request IDs, peer data, credentials, endpoint
+addresses, or error text. Retained handles keep their configuration generation
+after shutdown and distinguish an intentional stop from a real connection
+failure, including a failure followed by successful cleanup.
+
+HTTP listeners retain their existing `OperatorSnapshot` connection-admission
+surface. These client observations cover the executor-backed stdio and memory
+paths; they do not imply readiness of other client transports, durable task
+workers, credentials, or the entire application.
+
+---
+
 ## Architecture
 
 ```

@@ -105,6 +105,10 @@ pub enum MemoryRequestEvent {
 /// A caller timer driver is required when an operation must wait: response
 /// deadlines and the 30-second send-admission bound remain observable even if
 /// the peer is silent. There is no blocking-pool or reactor requirement.
+///
+/// [`fastmcp_core::OperatorSnapshot::capture`] observes the live executor's
+/// admission state without sending, receiving, or servicing queued controls.
+/// A closed client continues to report its terminal executor state.
 pub struct MemoryClient {
     receiver: MemoryRecvHalf,
     sender: MemorySendHalf,
@@ -123,6 +127,14 @@ impl std::fmt::Debug for MemoryClient {
             .field("next_id", &self.next_id)
             .field("closed", &self.closed)
             .finish_non_exhaustive()
+    }
+}
+
+impl fastmcp_core::OperatorSnapshotSource<fastmcp_core::OperatorExecutorCapacity> for MemoryClient {
+    fn operator_snapshot(
+        &self,
+    ) -> Result<fastmcp_core::OperatorExecutorSnapshot, fastmcp_core::OperatorSnapshotError> {
+        fastmcp_core::OperatorSnapshot::capture(&self.executor)
     }
 }
 
@@ -866,6 +878,114 @@ mod tests {
                 None => panic!("execution lost its result"),
             }
         }
+    }
+
+    #[test]
+    fn memory_client_operator_snapshot_uses_live_executor_and_retains_shutdown() {
+        use fastmcp_core::{
+            OperatorExecutorSnapshot, OperatorLifecycle, OperatorProfile, OperatorReadiness,
+            OperatorReason, OperatorSnapshot,
+        };
+
+        run(|cx| async move {
+            for peer_failure in [false, true] {
+                let (mut client, mut peer) = connected(&cx).await;
+                let initial = OperatorSnapshot::capture(&client).unwrap();
+                let _: &OperatorExecutorSnapshot = &initial;
+                assert_eq!(initial.profile(), OperatorProfile::Modern);
+                assert_eq!(initial.lifecycle(), OperatorLifecycle::Running);
+                assert_eq!(initial.readiness(), OperatorReadiness::Ready);
+                assert_eq!(initial.requests().pending, 0);
+                assert_eq!(initial.correlations().pending, 0);
+                assert_eq!(initial.correlations().retained_terminals, 0);
+
+                let cancellation = McpRequestCancellation::new();
+                let mut first = client
+                    .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(2)).await;
+                peer.send_async(&cx, &response(2, tools())).await.unwrap();
+
+                // The result is physically queued. Observation must leave it
+                // unread and preserve the live request's admission charge.
+                let queued = OperatorSnapshot::capture(&client).unwrap();
+                assert_eq!(queued.requests().pending, 1);
+                assert_eq!(queued.correlations().pending, 1);
+                assert_eq!(queued.requests().deferred_controls, 0);
+                assert!(matches!(
+                    result(&cx, &mut client, &mut first).await,
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+                let completed = OperatorSnapshot::capture(&client).unwrap();
+                assert_eq!(completed.requests().pending, 0);
+                assert_eq!(completed.correlations().pending, 0);
+                assert_eq!(completed.correlations().retained_terminals, 0);
+                assert_eq!(
+                    completed.correlations().tombstones,
+                    initial.correlations().tombstones + 1
+                );
+
+                let mut pending = client
+                    .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                assert_eq!(
+                    OperatorSnapshot::capture(&client).unwrap().requests().pending,
+                    1
+                );
+                if peer_failure {
+                    peer.close(&cx).unwrap();
+                    assert!(
+                        client
+                            .next_event(&cx, &cancellation, &mut pending)
+                            .await
+                            .is_err()
+                    );
+                }
+                client.close(&cx).unwrap();
+                if !peer_failure {
+                    assert!(
+                        client
+                            .next_event(&cx, &cancellation, &mut pending)
+                            .await
+                            .is_err()
+                    );
+                }
+                assert!(
+                    client
+                        .next_event(&cx, &cancellation, &mut pending)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+
+                let stopped = OperatorSnapshot::capture(&client).unwrap();
+                assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+                assert_eq!(stopped.readiness(), OperatorReadiness::NotReady);
+                assert_eq!(stopped.requests().pending, 0);
+                assert_eq!(
+                    stopped.reasons()[0],
+                    Some(if peer_failure {
+                        OperatorReason::ExecutorFailed
+                    } else {
+                        OperatorReason::ExecutorStopped
+                    })
+                );
+                assert_eq!(
+                    stopped.configuration_generation(),
+                    initial.configuration_generation()
+                );
+                assert_eq!(initial.readiness(), OperatorReadiness::Ready);
+                assert!(
+                    client
+                        .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                        .await
+                        .is_err()
+                );
+            }
+        });
     }
 
     #[test]

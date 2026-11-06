@@ -17280,6 +17280,10 @@ struct ReceivedPreparedResult {
 /// sole connection ingress driver and delivers exact admitted frames to this
 /// executor. That prevents a handle wait from racing a Client convenience API
 /// for the next stdio frame.
+///
+/// [`fastmcp_core::OperatorSnapshot::capture`] observes the shared executor's
+/// admission state without driving ingress or taking a request slot. Retained
+/// clones continue to observe its terminal state after the client closes.
 #[derive(Clone)]
 pub struct StdioRequestExecutor {
     executor: RequestExecutor<SelectedStdioTransport>,
@@ -17297,6 +17301,16 @@ impl std::fmt::Debug for StdioRequestExecutor {
             .debug_struct("StdioRequestExecutor")
             .field("peer_era", &self.peer_era)
             .finish_non_exhaustive()
+    }
+}
+
+impl fastmcp_core::OperatorSnapshotSource<fastmcp_core::OperatorExecutorCapacity>
+    for StdioRequestExecutor
+{
+    fn operator_snapshot(
+        &self,
+    ) -> Result<fastmcp_core::OperatorExecutorSnapshot, fastmcp_core::OperatorSnapshotError> {
+        fastmcp_core::OperatorSnapshot::capture(&self.executor)
     }
 }
 
@@ -17859,6 +17873,10 @@ impl StdioRequestExecutor {
 
     fn fail_connection(&self, error: McpError) {
         self.executor.fail_connection(error);
+    }
+
+    fn stop_connection(&self, error: McpError) {
+        self.executor.stop_connection(error);
     }
 
     fn set_timeout_policy(&self, timeout_policy: RequestTimeoutPolicy) -> McpResult<()> {
@@ -27118,7 +27136,7 @@ impl Client {
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
         if let Some(executor) = &self.multiplexed_executor {
-            executor.fail_connection(McpError::internal_error("Client connection closed"));
+            executor.stop_connection(McpError::internal_error("Client connection closed"));
         }
         self.cancel_reverse_callback_pool();
         deferred_retirement_result
@@ -27186,7 +27204,7 @@ impl Drop for Client {
         self.responses
             .fail_all(McpError::internal_error("Client connection closed"));
         if let Some(executor) = &self.multiplexed_executor {
-            executor.fail_connection(McpError::internal_error("Client connection closed"));
+            executor.stop_connection(McpError::internal_error("Client connection closed"));
         }
         self.cancel_reverse_callback_pool();
         self.abort_reverse_callback_pool_for_drop();
@@ -52972,6 +52990,118 @@ exec sleep 30
             Some(serde_json::json!({"owner": "first"}))
         );
         assert_eq!(registry.pending_len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_operator_snapshot_tracks_public_executor_and_retained_close() {
+        use fastmcp_core::{
+            OperatorExecutorSnapshot, OperatorLifecycle, OperatorProfile, OperatorReadiness,
+            OperatorReason, OperatorSnapshot,
+        };
+
+        for termination in ["close", "drop", "peer-failure"] {
+            let mut script = r#"IFS= read -r first || exit 90
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}'
+IFS= read -r second || exit 91
+"#
+            .to_owned();
+            script.push_str(if termination == "peer-failure" {
+                "exit 0\n"
+            } else {
+                "while IFS= read -r ignored; do :; done\n"
+            });
+            let mut client = make_shell_scripted_initialized_client_for_version(
+                &script,
+                Duration::from_secs(2),
+                MODERN_PROTOCOL_VERSION,
+            );
+            let cx = Cx::for_request();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let observer = executor.clone();
+            let initial = OperatorSnapshot::capture(&observer).unwrap();
+            let _: &OperatorExecutorSnapshot = &initial;
+            assert_eq!(initial.profile(), OperatorProfile::Modern);
+            assert_eq!(initial.lifecycle(), OperatorLifecycle::Running);
+            assert_eq!(initial.readiness(), OperatorReadiness::Ready);
+            assert_eq!(initial.requests().pending, 0);
+
+            let mut first = executor
+                .execute(&cx, "tools/list", Some(serde_json::json!({})))
+                .unwrap();
+            assert_eq!(first.request_id(), &RequestId::Number(2));
+            let active = OperatorSnapshot::capture(&observer).unwrap();
+            assert_eq!(active.requests().pending, 1);
+            assert_eq!(active.correlations().pending, 1);
+            assert!(executor.try_take_response(&mut first).unwrap().is_none());
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            let response = executor.try_take_response(&mut first).unwrap().unwrap();
+            assert_eq!(response.id, Some(RequestId::Number(2)));
+            assert!(response.error.is_none());
+            let completed = OperatorSnapshot::capture(&observer).unwrap();
+            assert_eq!(completed.requests().pending, 0);
+            assert_eq!(completed.correlations().pending, 0);
+            assert_eq!(completed.correlations().retained_terminals, 0);
+            assert_eq!(
+                completed.correlations().tombstones,
+                initial.correlations().tombstones + 1
+            );
+
+            let mut pending = executor
+                .execute(&cx, "tools/list", Some(serde_json::json!({})))
+                .unwrap();
+            assert_eq!(pending.request_id(), &RequestId::Number(3));
+            assert_eq!(
+                OperatorSnapshot::capture(&observer)
+                    .unwrap()
+                    .requests()
+                    .pending,
+                1
+            );
+            if termination == "peer-failure" {
+                assert!(client.drive_multiplexed_stdio(&cx).is_err());
+            }
+            if termination != "drop" {
+                let cleanup = client.close();
+                if termination == "close" {
+                    cleanup.unwrap();
+                }
+                // A failed connection may retain its original error through
+                // close; the owned subprocess must still be fully retired.
+                assert!(client.child_cleanup_complete());
+                assert!(client.transport_is_closed());
+            }
+            drop(client);
+            drop(executor);
+
+            let stopped = OperatorSnapshot::capture(&observer).unwrap();
+            assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+            assert_eq!(stopped.readiness(), OperatorReadiness::NotReady);
+            assert_eq!(stopped.requests().pending, 0);
+            assert_eq!(
+                stopped.reasons()[0],
+                Some(if termination == "peer-failure" {
+                    OperatorReason::ExecutorFailed
+                } else {
+                    OperatorReason::ExecutorStopped
+                }),
+                "{termination}"
+            );
+            assert_eq!(
+                stopped.configuration_generation(),
+                initial.configuration_generation()
+            );
+            assert_eq!(initial.readiness(), OperatorReadiness::Ready);
+            let error = observer.try_take_response(&mut pending).unwrap_err();
+            if termination != "peer-failure" {
+                assert_eq!(error.message, "Client connection closed");
+            }
+            assert!(
+                observer
+                    .execute(&cx, "tools/list", Some(serde_json::json!({})))
+                    .is_err()
+            );
+        }
     }
 
     #[cfg(unix)]

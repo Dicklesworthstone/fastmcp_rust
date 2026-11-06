@@ -9,13 +9,16 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use fastmcp_core::{
-    McpError, McpErrorCode, McpRequestCancellation, McpResult, Sha256Digest, sha256_bounded,
+    McpError, McpErrorCode, McpRequestCancellation, McpResult, OperatorCorrelationCapacity,
+    OperatorExecutorCapacity, OperatorExecutorSnapshot, OperatorExecutorState, OperatorProfile,
+    OperatorRequestCapacity, OperatorSnapshot, OperatorSnapshotError, OperatorSnapshotSource,
+    Sha256Digest, sha256_bounded,
 };
 #[cfg(any(feature = "tasks", test))]
 use fastmcp_protocol::FinalCoreResult;
@@ -70,6 +73,19 @@ pub const DEFAULT_MAX_RESPONSE_CORRELATIONS: usize = 4_096;
 pub const DEFAULT_TOMBSTONE_RETENTION: Duration = Duration::from_mins(10);
 
 const MAX_RETAINED_PEER_ACTIVITY: usize = 1_024;
+
+// Observation identities are process-local counters, never transport addresses,
+// peer identifiers, or request generations. Exhaustion disables observation of
+// new executors without changing their protocol admission or execution.
+static NEXT_EXECUTOR_OPERATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn reserve_operator_generation(next: &AtomicU64) -> Option<u64> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+        generation.checked_add(1)
+    })
+    .ok()
+}
+
 /// Minimum automatic-pagination page bound admitted by CLT-01 B.
 pub const MIN_AUTOMATIC_PAGINATION_PAGES: usize = 1_000;
 /// Minimum automatic-pagination item bound admitted by CLT-01 B.
@@ -1225,6 +1241,7 @@ struct PendingCancellationControl {
 #[derive(Debug)]
 struct ExecutorState<T> {
     transport: T,
+    operator_generation: Option<u64>,
     // An asynchronous connection owner commits writes itself. Its bounded
     // controls remain here until an actual channel/transport commit succeeds.
     external_writes: bool,
@@ -1250,6 +1267,9 @@ struct ExecutorState<T> {
     next_generation: u64,
     result_peer_era: ResultPeerEra,
     terminal_error: Option<McpError>,
+    /// An elected real failure remains observable after successful cleanup;
+    /// deliberate owner teardown carries a separate fixed observation class.
+    terminal_disposition: Option<ExecutorTerminalDisposition>,
     shutdown: bool,
     /// Cleanup has its own outcome: a prior connection failure does not mean
     /// transport closure failed, and a failed closure never becomes success.
@@ -1271,7 +1291,33 @@ enum IngressOwner {
     ExternalDriver,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExecutorTerminalDisposition {
+    Failed,
+    OwnerStopped,
+}
+
 impl<T> ExecutorState<T> {
+    fn admission_capacity(
+        &self,
+        max_in_flight: usize,
+        max_correlations: usize,
+    ) -> OperatorExecutorCapacity {
+        OperatorExecutorCapacity {
+            requests: OperatorRequestCapacity {
+                limit: max_in_flight,
+                pending: self.pending.len(),
+                deferred_controls: self.deferred_control_count(),
+            },
+            correlations: OperatorCorrelationCapacity {
+                limit: max_correlations,
+                pending: self.pending.len(),
+                tombstones: self.tombstones.len(),
+                retained_terminals: self.completed.len().max(self.terminal_records.len()),
+            },
+        }
+    }
+
     fn retain_notification(&mut self, request: JsonRpcRequest) -> bool {
         if self.notifications.len() >= MAX_RETAINED_PEER_ACTIVITY {
             return false;
@@ -1404,10 +1450,20 @@ impl<T> ExecutorState<T> {
     }
 
     fn fail_all(&mut self, error: McpError, reason: ExecutionTerminalReason) {
+        self.finish_all(error, reason, ExecutorTerminalDisposition::Failed);
+    }
+
+    fn finish_all(
+        &mut self,
+        error: McpError,
+        reason: ExecutionTerminalReason,
+        disposition: ExecutorTerminalDisposition,
+    ) {
         if self.terminal_error.is_some() {
             return;
         }
         self.terminal_error = Some(error.clone());
+        self.terminal_disposition = Some(disposition);
         self.tombstones.clear();
         self.cancel_reverse_requests();
         #[cfg(feature = "tasks")]
@@ -1472,6 +1528,15 @@ impl<T> ExecutorState<T> {
 /// transport reader routes each final response by its exact request ID, so a
 /// reordered final response becomes available to its owner rather than being
 /// consumed by the request currently driving the reader.
+///
+/// [`OperatorSnapshot::capture`] observes this executor as an
+/// [`OperatorExecutorSnapshot`], including its selected era, lifecycle, request
+/// slots, and retained correlations. Capture uses a non-waiting lock and never
+/// performs I/O, runs maintenance, reserves capacity, or copies peer data. A
+/// clone observes the same generation even after shutdown. `Ready` describes
+/// structural admission only, not a promise of a free request slot or a live
+/// transport peer. Retained expiry and abandoned-owner charges are released by
+/// ordinary executor service turns, not by observation.
 #[derive(Debug)]
 pub struct RequestExecutor<T> {
     state: SharedExecutorState<T>,
@@ -1488,6 +1553,50 @@ impl<T> Clone for RequestExecutor<T> {
             max_in_flight: self.max_in_flight,
             max_correlations: self.max_correlations,
         }
+    }
+}
+
+impl<T> OperatorSnapshotSource<OperatorExecutorCapacity> for RequestExecutor<T> {
+    fn operator_snapshot(&self) -> Result<OperatorExecutorSnapshot, OperatorSnapshotError> {
+        let state = self.state.0.try_lock().map_err(|error| match error {
+            TryLockError::WouldBlock => OperatorSnapshotError::Busy,
+            TryLockError::Poisoned(_) => OperatorSnapshotError::Poisoned,
+        })?;
+        let generation = state
+            .operator_generation
+            .ok_or(OperatorSnapshotError::GenerationExhausted)?;
+        let captured_at = Instant::now();
+        let profile = match state.result_peer_era {
+            ResultPeerEra::Modern => OperatorProfile::Modern,
+            ResultPeerEra::Legacy => OperatorProfile::Legacy2024,
+        };
+        // Successful shutdown installs a synthetic terminal_error to wake
+        // consumers. It is a stopped executor, not a connection failure.
+        let executor_state = if state.terminal_disposition
+            == Some(ExecutorTerminalDisposition::Failed)
+            || state.shutdown_error.is_some()
+        {
+            OperatorExecutorState::Failed
+        } else if state.shutdown
+            || state.terminal_disposition == Some(ExecutorTerminalDisposition::OwnerStopped)
+        {
+            OperatorExecutorState::Stopped
+        } else if state.terminal_error.is_some() {
+            OperatorExecutorState::Failed
+        } else if state.next_generation == u64::MAX {
+            OperatorExecutorState::GenerationExhausted
+        } else {
+            OperatorExecutorState::Running
+        };
+        let capacity = state.admission_capacity(self.max_in_flight, self.max_correlations);
+        Ok(OperatorSnapshot::request_executor(
+            captured_at,
+            generation,
+            profile,
+            executor_state,
+            capacity.requests,
+            capacity.correlations,
+        ))
     }
 }
 
@@ -1543,6 +1652,7 @@ where
         Self {
             state: SharedExecutorState::new(ExecutorState {
                 transport,
+                operator_generation: reserve_operator_generation(&NEXT_EXECUTOR_OPERATOR_GENERATION),
                 external_writes: false,
                 receive_frame,
                 ingress_owner: IngressOwner::Unclaimed,
@@ -1564,6 +1674,7 @@ where
                 next_generation: 0,
                 result_peer_era,
                 terminal_error: None,
+                terminal_disposition: None,
                 shutdown: false,
                 shutdown_error: None,
             }),
@@ -1959,24 +2070,13 @@ where
                 "Request ID still owns a queued cancellation control",
             ));
         }
-        if state
-            .pending
-            .len()
-            .saturating_add(state.deferred_control_count())
-            >= self.max_in_flight
-        {
+        let capacity = state.admission_capacity(self.max_in_flight, self.max_correlations);
+        if capacity.requests.is_saturated() {
             return Err(McpError::internal_error(
                 "Client in-flight execution limit reached",
             ));
         }
-        let retained_terminals = state.completed.len().max(state.terminal_records.len());
-        if state
-            .pending
-            .len()
-            .saturating_add(state.tombstones.len())
-            .saturating_add(retained_terminals)
-            >= self.max_correlations
-        {
+        if capacity.correlations.is_saturated() {
             return Err(McpError::internal_error(
                 "Client response correlation limit reached",
             ));
@@ -3107,6 +3207,20 @@ where
         self.state
             .borrow_mut()
             .fail_all(error, ExecutionTerminalReason::ConnectionLost);
+    }
+
+    /// Retires waiters when the connection owner deliberately stops service.
+    ///
+    /// The owner retains transport cleanup authority. This performs no I/O and
+    /// preserves the existing connection-lost waiter/error contract, while
+    /// distinguishing intentional teardown in operational observations. A
+    /// previously elected real failure remains a failure after this call.
+    pub(crate) fn stop_connection(&self, error: McpError) {
+        self.state.borrow_mut().finish_all(
+            error,
+            ExecutionTerminalReason::ConnectionLost,
+            ExecutorTerminalDisposition::OwnerStopped,
+        );
     }
 
     /// Lets the owning client publish an executor-selected failure before
@@ -5073,6 +5187,7 @@ mod tests {
         received_frames: VecDeque<Result<ReceivedTransportFrame, TransportError>>,
         sent: Vec<JsonRpcMessage>,
         send_error: Option<std::io::ErrorKind>,
+        io_calls: [usize; 3],
     }
 
     impl ScriptedTransport {
@@ -5082,6 +5197,7 @@ mod tests {
                 received_frames: VecDeque::new(),
                 sent: Vec::new(),
                 send_error: None,
+                io_calls: [0; 3],
             }
         }
 
@@ -5093,12 +5209,14 @@ mod tests {
                 received_frames: received_frames.into_iter().collect(),
                 sent: Vec::new(),
                 send_error: None,
+                io_calls: [0; 3],
             }
         }
     }
 
     impl Transport for ScriptedTransport {
         fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.io_calls[0] += 1;
             if let Some(kind) = self.send_error {
                 return Err(TransportError::Io(std::io::Error::from(kind)));
             }
@@ -5107,12 +5225,14 @@ mod tests {
         }
 
         fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            self.io_calls[1] += 1;
             self.received
                 .pop_front()
                 .unwrap_or(Err(TransportError::Closed))
         }
 
         fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            self.io_calls[2] += 1;
             Ok(())
         }
     }
@@ -5125,6 +5245,419 @@ mod tests {
             .received_frames
             .pop_front()
             .unwrap_or(Err(TransportError::Closed))
+    }
+
+    mod operator_observations {
+        use super::*;
+        use fastmcp_core::{OperatorLifecycle, OperatorReadiness, OperatorReason};
+
+        fn call(id: i64) -> Request {
+            JsonRpcRequest::new(
+                TOOLS_CALL,
+                Some(serde_json::json!({"name": "operator_probe", "arguments": {}})),
+                id,
+            )
+        }
+
+        fn final_response(era: ProtocolEra, id: i64) -> JsonRpcResponse {
+            let mut result = serde_json::json!({"content": [], "isError": false});
+            if era == ProtocolEra::Modern2026 {
+                result["resultType"] = serde_json::json!("complete");
+            }
+            JsonRpcResponse::success(RequestId::Number(id), result)
+        }
+
+        #[test]
+        fn operator_snapshot_tracks_real_admission_and_final_retention_without_io() {
+            let cx = Cx::for_testing();
+            for era in [ProtocolEra::Modern2026, ProtocolEra::Legacy2024] {
+                let response = final_response(era, 1);
+                let mut executor = RequestExecutor::with_protocol_era(
+                    ScriptedTransport::new([Ok(JsonRpcMessage::Response(response.clone()))]),
+                    era,
+                );
+                executor.max_in_flight = 1;
+                executor.max_correlations = 2;
+                let observer = executor.clone();
+                // Exercise type inference and the exported named type through
+                // the public capture API, not a hand-constructed snapshot.
+                let initial: OperatorExecutorSnapshot =
+                    OperatorSnapshot::capture(&observer).unwrap();
+                assert_eq!(initial.readiness(), OperatorReadiness::Ready);
+                assert_eq!(initial.requests().in_use(), 0);
+                assert_eq!(initial.correlations().in_use(), 0);
+                assert_eq!(initial.requests().limit, 1);
+                assert_eq!(initial.correlations().limit, 2);
+                assert_eq!(
+                    initial.profile(),
+                    match era {
+                        ProtocolEra::Modern2026 => OperatorProfile::Modern,
+                        ProtocolEra::Legacy2024 => OperatorProfile::Legacy2024,
+                    }
+                );
+
+                let mut execution = executor.execute(&cx, call(1)).unwrap();
+                let pending = OperatorSnapshot::capture(&observer).unwrap();
+                assert_eq!(pending.requests().pending, 1);
+                assert!(pending.requests().is_saturated());
+                assert_eq!(pending.correlations().pending, 1);
+                assert!(!pending.correlations().is_saturated());
+                assert_eq!(pending.readiness(), OperatorReadiness::Ready);
+                assert_eq!(
+                    pending.reasons(),
+                    &[None, Some(OperatorReason::RequestCapacitySaturated), None]
+                );
+                assert!(executor.execute(&cx, call(2)).is_err());
+                assert_eq!(executor.state.borrow().transport.io_calls, [1, 0, 0]);
+                assert_eq!(
+                    OperatorSnapshot::capture(&observer).unwrap().contributor(),
+                    pending.contributor()
+                );
+
+                executor.drive(&cx).unwrap();
+                let completed = OperatorSnapshot::capture(&observer).unwrap();
+                assert_eq!(completed.requests().in_use(), 0);
+                assert_eq!(completed.correlations().pending, 0);
+                assert_eq!(completed.correlations().tombstones, 1);
+                assert_eq!(completed.correlations().retained_terminals, 1);
+                assert!(completed.correlations().is_saturated());
+                assert_eq!(completed.readiness(), OperatorReadiness::Ready);
+                assert_eq!(
+                    completed.reasons(),
+                    &[None, None, Some(OperatorReason::CorrelationCapacitySaturated)]
+                );
+                assert!(executor.execute(&cx, call(2)).is_err());
+                assert_eq!(executor.state.borrow().transport.io_calls, [1, 1, 0]);
+                assert_eq!(
+                    executor.try_take_response(&mut execution).unwrap(),
+                    Some(response)
+                );
+                let consumed = OperatorSnapshot::capture(&observer).unwrap();
+                assert_eq!(consumed.correlations().retained_terminals, 0);
+                assert_eq!(consumed.correlations().in_use(), 1);
+                assert!(!consumed.correlations().is_saturated());
+
+                // Capture is observational even when ordinary maintenance
+                // could retire an expired correlation and free its charge.
+                executor
+                    .state
+                    .borrow_mut()
+                    .tombstones
+                    .get_mut(&RequestId::Number(1).correlation_key().unwrap())
+                    .unwrap()
+                    .expires_at = Instant::now();
+                assert_eq!(
+                    OperatorSnapshot::capture(&observer).unwrap().correlations(),
+                    consumed.correlations()
+                );
+                let replacement = executor.execute(&cx, call(2)).unwrap();
+                let admitted = OperatorSnapshot::capture(&observer).unwrap();
+                assert_eq!(admitted.correlations().tombstones, 0);
+                assert_eq!(admitted.correlations().pending, 1);
+                assert_eq!(
+                    admitted.configuration_generation(),
+                    initial.configuration_generation()
+                );
+                assert!(admitted.captured_at() >= initial.captured_at());
+                assert_eq!(executor.state.borrow().transport.io_calls, [2, 1, 0]);
+                drop(replacement);
+                executor.shutdown(&cx).unwrap();
+            }
+        }
+
+        #[test]
+        fn operator_snapshot_charges_deferred_controls_until_real_service() {
+            let cx = Cx::for_testing();
+            let mut executor = RequestExecutor::with_protocol_era(
+                ScriptedTransport::new([]),
+                ProtocolEra::Modern2026,
+            );
+            executor.max_in_flight = 1;
+            let abandoned = executor.execute(&cx, call(1)).unwrap();
+            drop(abandoned);
+            let queued = OperatorSnapshot::capture(&executor).unwrap();
+            assert_eq!(queued.requests().pending, 0);
+            assert_eq!(queued.requests().deferred_controls, 1);
+            assert!(queued.requests().is_saturated());
+            assert_eq!(queued.readiness(), OperatorReadiness::Ready);
+            assert_eq!(queued.correlations().tombstones, 1);
+            assert_eq!(queued.correlations().retained_terminals, 0);
+            assert_eq!(executor.state.borrow().transport.io_calls, [1, 0, 0]);
+
+            let replacement = executor.execute(&cx, call(2)).unwrap();
+            let serviced = OperatorSnapshot::capture(&executor).unwrap();
+            assert_eq!(serviced.requests().pending, 1);
+            assert_eq!(serviced.requests().deferred_controls, 0);
+            assert_eq!(serviced.correlations().in_use(), 2);
+            assert_eq!(executor.state.borrow().transport.io_calls, [3, 0, 0]);
+            drop(replacement);
+            executor.shutdown(&cx).unwrap();
+        }
+
+        #[test]
+        fn operator_snapshot_failure_is_terminal_and_sanitized() {
+            let cx = Cx::for_testing();
+            for failed in [false, true] {
+                let received = if failed {
+                    Err(TransportError::Io(std::io::Error::other(
+                        "private-operator-peer-error-canary",
+                    )))
+                } else {
+                    Ok(JsonRpcMessage::Response(final_response(
+                        ProtocolEra::Modern2026,
+                        1,
+                    )))
+                };
+                let executor = RequestExecutor::with_protocol_era(
+                    ScriptedTransport::new([received]),
+                    ProtocolEra::Modern2026,
+                );
+                let mut execution = executor.execute(&cx, call(1)).unwrap();
+                assert_eq!(
+                    OperatorSnapshot::capture(&executor).unwrap().readiness(),
+                    OperatorReadiness::Ready
+                );
+                assert_eq!(executor.drive(&cx).is_err(), failed);
+                let snapshot = OperatorSnapshot::capture(&executor).unwrap();
+                assert_eq!(snapshot.requests().in_use(), 0);
+                assert_eq!(snapshot.correlations().retained_terminals, 1);
+                assert_eq!(snapshot.correlations().tombstones, usize::from(!failed));
+                assert_eq!(
+                    snapshot.readiness(),
+                    if failed {
+                        OperatorReadiness::NotReady
+                    } else {
+                        OperatorReadiness::Ready
+                    }
+                );
+                assert_eq!(
+                    snapshot.reasons()[0],
+                    failed.then_some(OperatorReason::ExecutorFailed)
+                );
+                assert!(!format!("{snapshot:?}").contains("private-operator-peer-error-canary"));
+                assert_eq!(executor.state.borrow().transport.io_calls, [1, 1, 0]);
+                assert_eq!(executor.try_take_response(&mut execution).is_err(), failed);
+                let replacement = executor.execute(&cx, call(2));
+                assert_eq!(replacement.is_err(), failed);
+                assert_eq!(
+                    executor.state.borrow().transport.io_calls,
+                    [if failed { 1 } else { 2 }, 1, 0]
+                );
+                drop(replacement);
+                executor.shutdown(&cx).unwrap();
+                let stopped = OperatorSnapshot::capture(&executor).unwrap();
+                assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+                assert_eq!(stopped.readiness(), OperatorReadiness::NotReady);
+                assert_eq!(
+                    stopped.reasons()[0],
+                    Some(if failed {
+                        OperatorReason::ExecutorFailed
+                    } else {
+                        OperatorReason::ExecutorStopped
+                    })
+                );
+            }
+        }
+
+        #[test]
+        fn operator_snapshot_shutdown_stays_stopped_across_retained_clones() {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::with_protocol_era(
+                ScriptedTransport::new([Ok(JsonRpcMessage::Response(final_response(
+                    ProtocolEra::Modern2026,
+                    1,
+                )))]),
+                ProtocolEra::Modern2026,
+            );
+            let observer = executor.clone();
+            let initial = OperatorSnapshot::capture(&observer).unwrap();
+            let mut execution = executor.execute(&cx, call(1)).unwrap();
+            executor.shutdown(&cx).unwrap();
+            drop(executor);
+            let stopped = OperatorSnapshot::capture(&observer).unwrap();
+            assert_eq!(stopped.lifecycle(), OperatorLifecycle::Stopped);
+            assert_eq!(stopped.readiness(), OperatorReadiness::NotReady);
+            assert_eq!(stopped.reasons()[0], Some(OperatorReason::ExecutorStopped));
+            assert_eq!(stopped.requests().in_use(), 0);
+            assert_eq!(stopped.correlations().retained_terminals, 1);
+            assert_eq!(
+                stopped.configuration_generation(),
+                initial.configuration_generation()
+            );
+            assert_eq!(observer.state.borrow().transport.io_calls, [2, 0, 1]);
+            assert_eq!(observer.state.borrow().transport.received.len(), 1);
+            assert!(observer.try_take_response(&mut execution).is_err());
+            assert!(observer.execute(&cx, call(2)).is_err());
+            observer.shutdown(&cx).unwrap();
+            assert_eq!(
+                OperatorSnapshot::capture(&observer).unwrap().readiness(),
+                OperatorReadiness::NotReady
+            );
+            assert_eq!(observer.state.borrow().transport.io_calls, [2, 0, 1]);
+        }
+
+        #[test]
+        fn operator_snapshot_owner_stop_preserves_waiters_and_prior_failure_without_io() {
+            let cx = Cx::for_testing();
+            for failed in [false, true] {
+                let executor = RequestExecutor::with_protocol_era(
+                    ScriptedTransport::new([Err(TransportError::Io(std::io::Error::other(
+                        "private-operator-prior-failure-canary",
+                    )))]),
+                    ProtocolEra::Modern2026,
+                );
+                let mut execution = executor.execute(&cx, call(1)).unwrap();
+                let stopped_error = McpError::internal_error("private-operator-owner-stop-canary");
+                let expected = if failed {
+                    executor.drive(&cx).unwrap_err()
+                } else {
+                    stopped_error.clone()
+                };
+                let io_before = executor.state.borrow().transport.io_calls;
+                executor.stop_connection(stopped_error);
+                let snapshot = OperatorSnapshot::capture(&executor).unwrap();
+                assert_eq!(snapshot.lifecycle(), OperatorLifecycle::Stopped);
+                assert_eq!(snapshot.readiness(), OperatorReadiness::NotReady);
+                assert_eq!(
+                    snapshot.reasons()[0],
+                    Some(if failed {
+                        OperatorReason::ExecutorFailed
+                    } else {
+                        OperatorReason::ExecutorStopped
+                    })
+                );
+                assert_eq!(snapshot.requests().in_use(), 0);
+                assert_eq!(snapshot.correlations().retained_terminals, 1);
+                assert!(!format!("{snapshot:?}").contains("private-operator-"));
+                assert_eq!(executor.state.borrow().transport.io_calls, io_before);
+                assert_eq!(
+                    executor.terminal_records()[0].terminal_reason,
+                    ExecutionTerminalReason::ConnectionLost
+                );
+                let error = executor.try_take_response(&mut execution).unwrap_err();
+                assert_eq!(error.code, expected.code);
+                assert_eq!(error.message, expected.message);
+                assert!(executor.execute(&cx, call(2)).is_err());
+                assert_eq!(executor.state.borrow().transport.io_calls, io_before);
+                // An observation-only stop cannot consume the actual cleanup
+                // owner's one permitted transport-close attempt.
+                executor.shutdown(&cx).unwrap();
+                assert_eq!(executor.state.borrow().transport.io_calls[2], 1);
+            }
+        }
+
+        #[test]
+        fn operator_snapshot_busy_and_unique_peer_values_have_no_side_effects() {
+            let cx = Cx::for_testing();
+            let executor = RequestExecutor::with_protocol_era(
+                ScriptedTransport::new([]),
+                ProtocolEra::Modern2026,
+            );
+            let mut owners = Vec::new();
+            for index in 0..64 {
+                let request = JsonRpcRequest::new(
+                    format!("private-operator-method-{index}"),
+                    Some(serde_json::json!({"token": format!("private-operator-payload-{index}")})),
+                    RequestId::String(format!("private-operator-id-{index}")),
+                );
+                owners.push(executor.execute(&cx, request).unwrap());
+                let state = executor.state.borrow();
+                assert_eq!(
+                    OperatorSnapshot::capture(&executor),
+                    Err(OperatorSnapshotError::Busy)
+                );
+                assert_eq!(state.transport.io_calls, [owners.len(), 0, 0]);
+                assert_eq!(state.pending.len(), owners.len());
+                drop(state);
+                let source: &dyn OperatorSnapshotSource<OperatorExecutorCapacity> = &executor;
+                let snapshot = OperatorSnapshot::capture(source).unwrap();
+                assert_eq!(snapshot.requests().pending, owners.len());
+                assert_eq!(snapshot.correlations().pending, owners.len());
+                assert_eq!(snapshot.reasons(), &[None, None, None]);
+                let rendered = format!("{snapshot:?}");
+                assert!(!rendered.contains("private-operator-"));
+                assert!(
+                    rendered.len() < 1_024,
+                    "fixed-cardinality observation grew with peer identities"
+                );
+                assert_eq!(
+                    executor.state.borrow().transport.io_calls,
+                    [owners.len(), 0, 0]
+                );
+            }
+            executor.shutdown(&cx).unwrap();
+        }
+
+        #[test]
+        fn operator_snapshot_structural_limits_match_admission_refusal() {
+            let cx = Cx::for_testing();
+            for (requests, correlations, reason) in [
+                (0, 2, OperatorReason::RequestCapacityDisabled),
+                (1, 0, OperatorReason::CorrelationCapacityDisabled),
+            ] {
+                let mut executor = RequestExecutor::new(ScriptedTransport::new([]));
+                executor.max_in_flight = requests;
+                executor.max_correlations = correlations;
+                let snapshot = OperatorSnapshot::capture(&executor).unwrap();
+                assert_eq!(snapshot.readiness(), OperatorReadiness::NotReady);
+                assert_eq!(snapshot.reasons()[0], Some(reason));
+                assert!(executor.execute(&cx, call(1)).is_err());
+                assert_eq!(executor.state.borrow().transport.io_calls, [0, 0, 0]);
+            }
+            let executor = RequestExecutor::new(ScriptedTransport::new([]));
+            executor.state.borrow_mut().next_generation = u64::MAX;
+            let exhausted = OperatorSnapshot::capture(&executor).unwrap();
+            assert_eq!(exhausted.readiness(), OperatorReadiness::NotReady);
+            assert_eq!(
+                exhausted.reasons()[0],
+                Some(OperatorReason::ExecutorGenerationExhausted)
+            );
+            assert!(executor.execute(&cx, call(1)).is_err());
+            assert_eq!(executor.state.borrow().transport.io_calls, [0, 0, 0]);
+        }
+
+        #[test]
+        fn operator_snapshot_generation_exhaustion_does_not_disable_execution() {
+            let next = AtomicU64::new(u64::MAX - 1);
+            assert_eq!(reserve_operator_generation(&next), Some(u64::MAX - 1));
+            assert_eq!(reserve_operator_generation(&next), None);
+            assert_eq!(reserve_operator_generation(&next), None);
+            assert_eq!(next.load(Ordering::Relaxed), u64::MAX);
+
+            let executor = RequestExecutor::new(ScriptedTransport::new([]));
+            let independent = RequestExecutor::new(ScriptedTransport::new([]));
+            assert_ne!(
+                OperatorSnapshot::capture(&executor)
+                    .unwrap()
+                    .configuration_generation(),
+                OperatorSnapshot::capture(&independent)
+                    .unwrap()
+                    .configuration_generation()
+            );
+            executor.state.borrow_mut().operator_generation = None;
+            assert_eq!(
+                OperatorSnapshot::capture(&executor),
+                Err(OperatorSnapshotError::GenerationExhausted)
+            );
+            let cx = Cx::for_testing();
+            let execution = executor.execute(&cx, call(1)).unwrap();
+            assert_eq!(executor.state.borrow().transport.io_calls, [1, 0, 0]);
+            drop(execution);
+            executor.shutdown(&cx).unwrap();
+        }
+
+        #[test]
+        fn operator_snapshot_poisoned_state_has_only_a_fixed_error() {
+            let executor = RequestExecutor::new(ScriptedTransport::new([]));
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _state = executor.state.borrow_mut();
+                panic!("private-operator-panic-canary");
+            }));
+            assert!(panic.is_err());
+            let error = OperatorSnapshot::capture(&executor).unwrap_err();
+            assert_eq!(error, OperatorSnapshotError::Poisoned);
+            assert!(!error.to_string().contains("private-operator-panic-canary"));
+        }
     }
 
     mod execution_identity {
@@ -5870,6 +6403,7 @@ mod tests {
             received_frames: VecDeque::new(),
             sent: Vec::new(),
             send_error: Some(std::io::ErrorKind::WouldBlock),
+            io_calls: [0; 3],
         });
         assert!(backpressured.execute(&cx, request(21)).is_err());
         assert_eq!(backpressured.pending_records().len(), 0);

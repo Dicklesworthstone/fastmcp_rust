@@ -85,8 +85,10 @@ pub mod stats;
 pub mod uri;
 
 pub use stats::{
-    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorLifecycle, OperatorProfile,
-    OperatorReadiness, OperatorReason, OperatorSnapshot, OperatorSnapshotError,
+    OperatorConnectionCapacity, OperatorConnectionCounters, OperatorCorrelationCapacity,
+    OperatorExecutorCapacity, OperatorExecutorSnapshot, OperatorExecutorState,
+    OperatorHttpConnections, OperatorLifecycle, OperatorProfile, OperatorReadiness,
+    OperatorReason, OperatorRequestCapacity, OperatorSnapshot, OperatorSnapshotError,
     OperatorSnapshotSource,
 };
 

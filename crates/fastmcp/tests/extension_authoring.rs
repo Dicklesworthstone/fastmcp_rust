@@ -865,6 +865,14 @@ fn exercise_notification_stdio(auto: bool) {
             peer.send_async(&cx, &frame(fresh, Some(TOKEN)))
                 .await
                 .unwrap();
+            // Input EOF cancels still-running id-less children. Discovery is
+            // allowed to overtake a notification, so wait for the callbacks
+            // themselves before using EOF to verify complete wire silence.
+            while observations.authorized.load(Ordering::SeqCst) < 5
+                || observations.completed.load(Ordering::SeqCst) < 2
+            {
+                asupersync::runtime::yield_now().await;
+            }
             peer.send_async(&cx, &discovery(82_i64)).await.unwrap();
 
             // Half-close the actual socket, preserving the peer's reader.
@@ -1018,6 +1026,14 @@ fn typed_notification_memory_authenticates_each_frame_and_revalidates_activation
             )
             .await
             .unwrap();
+            // Input EOF cancels still-running id-less children. Discovery is
+            // allowed to overtake a notification, so wait for the callbacks
+            // themselves before using EOF to verify complete wire silence.
+            while observations.authorized.load(Ordering::SeqCst) < 5
+                || observations.completed.load(Ordering::SeqCst) < 2
+            {
+                asupersync::runtime::yield_now().await;
+            }
             peer.send_async(&cx, &notification_discovery(2))
                 .await
                 .unwrap();

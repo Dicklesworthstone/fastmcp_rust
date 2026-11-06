@@ -1,4 +1,4 @@
-//! Renderer-independent server statistics for headless and interactive hosts.
+//! Renderer-independent operational observations and server statistics.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ pub enum OperatorLifecycle {
     Running,
     /// New admission is fenced while already admitted work drains.
     Stopping,
-    /// The listener lifetime has ended; retained children may still settle.
+    /// The contributor no longer admits work; retained children may still settle.
     Stopped,
 }
 
@@ -41,7 +41,7 @@ pub enum OperatorReadiness {
     Stopping,
 }
 
-/// Closed, identity-free reason vocabulary for core listener observations.
+/// Closed, identity-free reason vocabulary for core operational observations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorReason {
     /// The listener has not entered its serving loop.
@@ -54,6 +54,20 @@ pub enum OperatorReason {
     ListenerStopping,
     /// The listener lifetime has ended.
     ListenerStopped,
+    /// The configured request capacity is zero.
+    RequestCapacityDisabled,
+    /// All configured request slots are currently charged.
+    RequestCapacitySaturated,
+    /// The configured response correlation capacity is zero.
+    CorrelationCapacityDisabled,
+    /// All configured response correlation slots are currently charged.
+    CorrelationCapacitySaturated,
+    /// The executor cannot allocate another request generation.
+    ExecutorGenerationExhausted,
+    /// A terminal connection or cleanup failure fenced execution.
+    ExecutorFailed,
+    /// The executor has intentionally stopped admitting work; cleanup may still settle.
+    ExecutorStopped,
 }
 
 /// Fixed-size connection gauges from the same admission critical section.
@@ -102,16 +116,129 @@ pub struct OperatorConnectionCounters {
     pub overflowed: bool,
 }
 
+/// Typed HTTP connection contributor; never used for executor request counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorHttpConnections {
+    /// Connection slots charged by native admission and live probes.
+    pub connections: OperatorConnectionCapacity,
+    /// Fixed counters for this listener generation.
+    pub counters: OperatorConnectionCounters,
+}
+
+/// Request slots charged by the client executor's own admission primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorRequestCapacity {
+    /// Immutable maximum number of charged request slots.
+    pub limit: usize,
+    /// Requests awaiting their elected terminal outcome.
+    pub pending: usize,
+    /// Cancellation and rejection controls still awaiting a transport commit.
+    pub deferred_controls: usize,
+}
+
+impl OperatorRequestCapacity {
+    /// Currently charged slots, including controls retained after owner release.
+    #[must_use]
+    pub const fn in_use(self) -> usize {
+        self.pending.saturating_add(self.deferred_controls)
+    }
+
+    /// Whether every configured request slot is currently charged.
+    #[must_use]
+    pub const fn is_saturated(self) -> bool {
+        self.in_use() >= self.limit
+    }
+
+    /// Whether the sum exceeds the representable gauge range.
+    #[must_use]
+    pub const fn overflowed(self) -> bool {
+        self.pending.checked_add(self.deferred_controls).is_none()
+    }
+}
+
+/// Correlation charges retained by the client executor.
+///
+/// An unconsumed final result can retain both a terminal receipt and a
+/// tombstone. They are separate charges in the executor's admission budget,
+/// so this is a resource count, not a count of distinct request IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorCorrelationCapacity {
+    /// Immutable maximum number of charged correlation slots.
+    pub limit: usize,
+    /// Correlations retained by requests awaiting their terminal outcome.
+    pub pending: usize,
+    /// Retired response correlations retained against late peer frames.
+    pub tombstones: usize,
+    /// Unconsumed outcomes or terminal receipts, charged once per retained pair.
+    pub retained_terminals: usize,
+}
+
+impl OperatorCorrelationCapacity {
+    /// Currently retained charges, using the executor's admission arithmetic.
+    #[must_use]
+    pub const fn in_use(self) -> usize {
+        self.pending
+            .saturating_add(self.tombstones)
+            .saturating_add(self.retained_terminals)
+    }
+
+    /// Whether every configured correlation slot is currently charged.
+    #[must_use]
+    pub const fn is_saturated(self) -> bool {
+        self.in_use() >= self.limit
+    }
+
+    /// Whether the sum exceeds the representable gauge range.
+    #[must_use]
+    pub const fn overflowed(self) -> bool {
+        match self.pending.checked_add(self.tombstones) {
+            Some(charged) => charged.checked_add(self.retained_terminals).is_none(),
+            None => true,
+        }
+    }
+}
+
+/// Typed client contributor containing only bounded admission gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorExecutorCapacity {
+    /// In-flight requests and deferred transport controls.
+    pub requests: OperatorRequestCapacity,
+    /// Pending and retired response-correlation charges.
+    pub correlations: OperatorCorrelationCapacity,
+}
+
+/// Executor admission state copied from the same cell as its capacity gauges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorExecutorState {
+    /// The selected transport era is installed and new execution is possible.
+    Running,
+    /// The immutable connection has used every request generation.
+    GenerationExhausted,
+    /// A terminal connection or cleanup failure prevents new execution.
+    Failed,
+    /// The owner has stopped execution; transport cleanup may still settle.
+    Stopped,
+}
+
 /// Snapshot collection could not immediately copy its bounded contributor state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorSnapshotError {
     /// Admission currently owns the contributor cell; retry a later observation.
     Busy,
+    /// No unique configuration generation could be allocated for this contributor.
+    /// Protocol execution is independent of observation generation allocation.
+    GenerationExhausted,
+    /// A panic poisoned the contributor cell; no coherent snapshot is available.
+    Poisoned,
 }
 
 impl std::fmt::Display for OperatorSnapshotError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("operator snapshot contributor is busy")
+        formatter.write_str(match self {
+            Self::Busy => "operator snapshot contributor is busy",
+            Self::GenerationExhausted => "operator snapshot configuration generation exhausted",
+            Self::Poisoned => "operator snapshot contributor state is poisoned",
+        })
     }
 }
 
@@ -121,41 +248,91 @@ impl std::error::Error for OperatorSnapshotError {}
 ///
 /// Capturing a snapshot never reserves admission or invokes protocol dispatch.
 /// Exporters consume the returned value after all contributor locks are released.
-pub trait OperatorSnapshotSource {
+pub trait OperatorSnapshotSource<Contributor = OperatorHttpConnections> {
     /// Attempts a non-waiting capture of the contributor's current generation.
-    fn operator_snapshot(&self) -> Result<OperatorSnapshot, OperatorSnapshotError>;
+    fn operator_snapshot(&self) -> Result<OperatorSnapshot<Contributor>, OperatorSnapshotError>;
 }
 
-/// Immutable, privacy-safe observation of one HTTP connection-admission generation.
+/// Immutable, privacy-safe observation of one typed contributor generation.
 ///
-/// Schema 1 covers HTTP listener lifecycle and connection slots. It makes no
-/// assertion about process-wide executor progress, credentials, durable task
-/// workers, per-request byte budgets, or other contributors not represented here.
+/// Schema 2 distinguishes HTTP connection admission from client request and
+/// correlation admission. The default contributor preserves the HTTP listener
+/// API; [`OperatorExecutorSnapshot`] names the client observation explicitly.
+/// Neither contributor asserts process-wide progress, credential availability,
+/// durable task readiness, or per-request byte budgets.
 /// In particular, `Ready` may coincide with saturation: only an acquired live
 /// admission permit reserves capacity. No address, peer identity, error text,
 /// request data, wall-clock time, or dynamic label appears in this value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OperatorSnapshot {
+pub struct OperatorSnapshot<Contributor = OperatorHttpConnections> {
+    schema_version: u32,
     captured_at: Instant,
     configuration_generation: u64,
     profile: OperatorProfile,
     lifecycle: OperatorLifecycle,
     readiness: OperatorReadiness,
-    reasons: [Option<OperatorReason>; 2],
-    connections: OperatorConnectionCapacity,
-    counters: OperatorConnectionCounters,
+    reasons: [Option<OperatorReason>; 3],
+    contributor: Contributor,
 }
 
-impl OperatorSnapshot {
-    /// Version of the fixed HTTP-listener observation schema.
-    pub const SCHEMA_VERSION: u32 = 1;
+/// Explicit client snapshot type for storage, trait objects, and exporter APIs.
+pub type OperatorExecutorSnapshot = OperatorSnapshot<OperatorExecutorCapacity>;
 
+impl<Contributor> OperatorSnapshot<Contributor> {
     /// Captures through a shipped contributor without acquiring an admission slot.
+    /// The contributor type is inferred from `source`.
     pub fn capture(
-        source: &(impl OperatorSnapshotSource + ?Sized),
+        source: &(impl OperatorSnapshotSource<Contributor> + ?Sized),
     ) -> Result<Self, OperatorSnapshotError> {
         source.operator_snapshot()
     }
+
+    /// Version of the bounded, typed contributor observation schema.
+    #[must_use]
+    pub const fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    /// Monotonic capture instant; not a wall-clock timestamp or portable identity.
+    #[must_use]
+    pub const fn captured_at(&self) -> Instant {
+        self.captured_at
+    }
+
+    /// Opaque process-local configuration identity, scoped to its contributor kind.
+    #[must_use]
+    pub const fn configuration_generation(&self) -> u64 {
+        self.configuration_generation
+    }
+
+    /// Frozen protocol policy of the observed contributor.
+    #[must_use]
+    pub const fn profile(&self) -> OperatorProfile {
+        self.profile
+    }
+
+    /// Contributor lifecycle at capture.
+    #[must_use]
+    pub const fn lifecycle(&self) -> OperatorLifecycle {
+        self.lifecycle
+    }
+
+    /// Structural admission readiness, independent of saturation.
+    #[must_use]
+    pub const fn readiness(&self) -> OperatorReadiness {
+        self.readiness
+    }
+
+    /// Typed contributor data from the same configuration and capture instant.
+    #[must_use]
+    pub const fn contributor(&self) -> &Contributor {
+        &self.contributor
+    }
+}
+
+impl OperatorSnapshot<OperatorHttpConnections> {
+    /// Version of the bounded, typed contributor observation schema.
+    pub const SCHEMA_VERSION: u32 = 2;
 
     /// Constructs a bounded HTTP-listener observation from one coherent cell.
     ///
@@ -190,6 +367,7 @@ impl OperatorSnapshot {
             ),
         };
         Self {
+            schema_version: Self::SCHEMA_VERSION,
             captured_at,
             configuration_generation,
             profile,
@@ -200,58 +378,120 @@ impl OperatorSnapshot {
                 connections
                     .is_saturated()
                     .then_some(OperatorReason::ConnectionCapacitySaturated),
+                None,
             ],
-            connections,
-            counters,
+            contributor: OperatorHttpConnections {
+                connections,
+                counters,
+            },
         }
     }
 
-    /// Monotonic capture instant; not a wall-clock timestamp or portable identity.
-    #[must_use]
-    pub const fn captured_at(&self) -> Instant {
-        self.captured_at
-    }
-
-    /// Opaque process-local identity of the immutable listener configuration.
-    #[must_use]
-    pub const fn configuration_generation(&self) -> u64 {
-        self.configuration_generation
-    }
-
-    /// Frozen protocol policy of the observed listener.
-    #[must_use]
-    pub const fn profile(&self) -> OperatorProfile {
-        self.profile
-    }
-
-    /// Listener lifecycle at capture.
-    #[must_use]
-    pub const fn lifecycle(&self) -> OperatorLifecycle {
-        self.lifecycle
-    }
-
-    /// Structural connection readiness, independent of saturation.
-    #[must_use]
-    pub const fn readiness(&self) -> OperatorReadiness {
-        self.readiness
-    }
-
-    /// Fixed-size reason set; no peer-controlled strings can be inserted.
+    /// Fixed HTTP reason slots, preserving the listener's const array API.
     #[must_use]
     pub const fn reasons(&self) -> &[Option<OperatorReason>; 2] {
-        &self.reasons
+        self.reasons
+            .first_chunk()
+            .expect("HTTP snapshot always contains its two fixed reason slots")
     }
 
     /// Connection capacity charged at the same capture generation.
     #[must_use]
     pub const fn connections(&self) -> OperatorConnectionCapacity {
-        self.connections
+        self.contributor.connections
     }
 
     /// Fixed counters, with an explicit saturation indicator.
     #[must_use]
     pub const fn counters(&self) -> OperatorConnectionCounters {
-        self.counters
+        self.contributor.counters
+    }
+}
+
+impl OperatorSnapshot<OperatorExecutorCapacity> {
+    /// Constructs a bounded client observation from one coherent executor cell.
+    ///
+    /// Counts describe retained charges at capture. Expired correlations and
+    /// abandoned owners remain charged until the executor's ordinary maintenance
+    /// retires them; snapshot collection never performs that maintenance.
+    #[must_use]
+    pub fn request_executor(
+        captured_at: Instant,
+        configuration_generation: u64,
+        profile: OperatorProfile,
+        state: OperatorExecutorState,
+        requests: OperatorRequestCapacity,
+        correlations: OperatorCorrelationCapacity,
+    ) -> Self {
+        let (lifecycle, readiness, reason) = match state {
+            OperatorExecutorState::Failed => (
+                OperatorLifecycle::Stopped,
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::ExecutorFailed),
+            ),
+            OperatorExecutorState::Stopped => (
+                OperatorLifecycle::Stopped,
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::ExecutorStopped),
+            ),
+            OperatorExecutorState::GenerationExhausted => (
+                OperatorLifecycle::Running,
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::ExecutorGenerationExhausted),
+            ),
+            OperatorExecutorState::Running if requests.limit == 0 => (
+                OperatorLifecycle::Running,
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::RequestCapacityDisabled),
+            ),
+            OperatorExecutorState::Running if correlations.limit == 0 => (
+                OperatorLifecycle::Running,
+                OperatorReadiness::NotReady,
+                Some(OperatorReason::CorrelationCapacityDisabled),
+            ),
+            OperatorExecutorState::Running => {
+                (OperatorLifecycle::Running, OperatorReadiness::Ready, None)
+            }
+        };
+        Self {
+            schema_version: OperatorSnapshot::SCHEMA_VERSION,
+            captured_at,
+            configuration_generation,
+            profile,
+            lifecycle,
+            readiness,
+            reasons: [
+                reason,
+                requests
+                    .is_saturated()
+                    .then_some(OperatorReason::RequestCapacitySaturated),
+                correlations
+                    .is_saturated()
+                    .then_some(OperatorReason::CorrelationCapacitySaturated),
+            ],
+            contributor: OperatorExecutorCapacity {
+                requests,
+                correlations,
+            },
+        }
+    }
+
+    /// Fixed executor reason slots: structural state, requests, and correlations.
+    #[must_use]
+    pub const fn reasons(&self) -> &[Option<OperatorReason>; 3] {
+        &self.reasons
+    }
+
+    /// In-flight and deferred-control charges at this capture generation.
+    #[must_use]
+    pub const fn requests(&self) -> OperatorRequestCapacity {
+        self.contributor.requests
+    }
+
+    /// Pending and retired correlation charges at this capture generation.
+    #[must_use]
+    pub const fn correlations(&self) -> OperatorCorrelationCapacity {
+        self.contributor.correlations
     }
 }
 
@@ -460,6 +700,14 @@ pub struct StatsSnapshot {
 mod tests {
     use super::*;
 
+    // These exact source forms were supported by the HTTP-only snapshot API.
+    // Keep inference and const-array compatibility when adding contributors.
+    const _: u32 = OperatorSnapshot::SCHEMA_VERSION;
+
+    const fn http_reasons(snapshot: &OperatorSnapshot) -> &[Option<OperatorReason>; 2] {
+        snapshot.reasons()
+    }
+
     #[test]
     fn operator_snapshot_keeps_structural_readiness_distinct_from_saturation() {
         let now = Instant::now();
@@ -509,6 +757,10 @@ mod tests {
                     assert_eq!(snapshot.configuration_generation(), 7);
                     assert_eq!(snapshot.captured_at(), now);
                     assert_eq!(snapshot.profile(), profile);
+                    assert_eq!(http_reasons(&snapshot).len(), 2);
+                    assert_eq!(snapshot.schema_version(), OperatorSnapshot::SCHEMA_VERSION);
+                    assert_eq!(snapshot.contributor().connections, snapshot.connections());
+                    assert_eq!(snapshot.contributor().counters, snapshot.counters());
                 }
             }
             let disabled = OperatorSnapshot::http_connections(
@@ -528,6 +780,47 @@ mod tests {
                 disabled.reasons()[0],
                 Some(OperatorReason::ConnectionCapacityDisabled)
             );
+        }
+    }
+
+    #[test]
+    fn executor_capacity_arithmetic_saturates_without_hiding_overflow() {
+        let requests = OperatorRequestCapacity {
+            limit: usize::MAX,
+            pending: usize::MAX - 1,
+            deferred_controls: 1,
+        };
+        assert_eq!(requests.in_use(), usize::MAX);
+        assert!(requests.is_saturated());
+        assert!(!requests.overflowed());
+        let overflowed = OperatorRequestCapacity {
+            deferred_controls: 2,
+            ..requests
+        };
+        assert_eq!(overflowed.in_use(), usize::MAX);
+        assert!(overflowed.overflowed());
+
+        let correlations = OperatorCorrelationCapacity {
+            limit: usize::MAX,
+            pending: usize::MAX - 2,
+            tombstones: 1,
+            retained_terminals: 1,
+        };
+        assert_eq!(correlations.in_use(), usize::MAX);
+        assert!(correlations.is_saturated());
+        assert!(!correlations.overflowed());
+        for overflowed in [
+            OperatorCorrelationCapacity {
+                retained_terminals: 2,
+                ..correlations
+            },
+            OperatorCorrelationCapacity {
+                tombstones: 3,
+                ..correlations
+            },
+        ] {
+            assert_eq!(overflowed.in_use(), usize::MAX);
+            assert!(overflowed.overflowed());
         }
     }
 
