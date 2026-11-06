@@ -139,5 +139,10 @@ name = "task_02_b"
 path = "tests/task_02_b.rs"
 required-features = ["tasks"]
 
+[[test]]
+name = "task_admission"
+path = "tests/task_admission.rs"
+required-features = ["tasks"]
+
 [lints]
 workspace = true

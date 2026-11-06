@@ -21,6 +21,13 @@
 //!   either, a task-creating request is refused with "Final task creation
 //!   requires an installed ready task service".
 //!
+//! Creation reserves bounded per-principal and runtime-wide admission before
+//! invoking the store, without retaining the service's readiness mutex.
+//! Permits are fenced to the entered service generation. A store operation
+//! already admitted may commit while that service exits; its accepted handle
+//! remains valid and a replacement service recovers the work. Admission and
+//! payload charges remain held until the creation callback path settles.
+//!
 //! The backend owns finite execution limits independently of result retention.
 //! The in-memory defaults allow one hour per claim, 24 hours from creation,
 //! and eight claims across retries and input resumptions. Input waiting consumes
@@ -6351,12 +6358,14 @@ pub trait FinalTaskRetentionAuthority: Send + Sync {
     fn authorize_unlimited_retention(&self) -> McpResult<()>;
 }
 
-/// Immutable final Tasks retention and polling policy. Execution limits are
-/// owned separately by the backend and cannot be widened by rebinding a runtime.
+/// Immutable final Tasks retention, polling, and creation-admission policy.
+/// Execution limits are owned separately by the backend and cannot be widened
+/// by rebinding a runtime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FinalTaskRuntimeConfig {
     ttl_ms: Option<u64>,
     poll_interval_ms: Option<u64>,
+    admission: TaskServiceAdmissionLimits,
 }
 
 impl FinalTaskRuntimeConfig {
@@ -6381,6 +6390,7 @@ impl FinalTaskRuntimeConfig {
         Ok(Self {
             ttl_ms: Some(ttl_ms),
             poll_interval_ms,
+            admission: TaskServiceAdmissionLimits::default(),
         })
     }
 
@@ -6398,13 +6408,174 @@ impl FinalTaskRuntimeConfig {
         Ok(Self {
             ttl_ms: None,
             poll_interval_ms,
+            admission: TaskServiceAdmissionLimits::default(),
         })
+    }
+
+    /// Bounds simultaneous create operations across every service generation
+    /// of this runtime. Both total and per-principal capacities must be
+    /// positive, with maxima of 16,384 and 256 permits respectively.
+    /// Defaults are 1,024 and 32. Trusted unowned embedding calls share one
+    /// principal partition; they do not acquire separate anonymous quotas.
+    ///
+    /// The byte limits charge conservative compact-JSON sizes for the work
+    /// descriptor and the framework's task/notification copies while a store
+    /// operation is outstanding. They default to 64 MiB total and 16 MiB per
+    /// principal, with hard maxima of 512 MiB and 128 MiB. These are encoded
+    /// payload bounds, not a measurement of arbitrary provider allocations or
+    /// decoded heap. A pending provider retains its charge until it settles,
+    /// even if its caller or service generation has already exited.
+    pub fn with_admission_capacity(
+        mut self,
+        maximum: usize,
+        maximum_per_principal: usize,
+        maximum_payload_bytes: usize,
+        maximum_payload_bytes_per_principal: usize,
+    ) -> McpResult<Self> {
+        if !(1..=16_384).contains(&maximum)
+            || !(1..=256).contains(&maximum_per_principal)
+            || maximum_per_principal > maximum
+            || !(1..=512 * 1_024 * 1_024).contains(&maximum_payload_bytes)
+            || !(1..=128 * 1_024 * 1_024)
+                .contains(&maximum_payload_bytes_per_principal)
+            || maximum_payload_bytes_per_principal > maximum_payload_bytes
+        {
+            return Err(McpError::invalid_params("Invalid Task service admission capacity"));
+        }
+        self.admission.maximum = maximum;
+        self.admission.maximum_per_principal = maximum_per_principal;
+        self.admission.maximum_payload_bytes = maximum_payload_bytes;
+        self.admission.maximum_payload_bytes_per_principal = maximum_payload_bytes_per_principal;
+        Ok(self)
+    }
+
+    /// Sets the finite interval between obtaining a Task creation permit and
+    /// entering the store's atomic create operation. The default is 30 seconds
+    /// and the hard maximum is five minutes. Expiry prevents an unstarted
+    /// commit; it never recycles the charge of a provider operation already
+    /// running or discards a proven committed Task.
+    pub fn with_admission_timeout(mut self, timeout: StdDuration) -> McpResult<Self> {
+        if timeout.is_zero() || timeout > StdDuration::from_secs(300) {
+            return Err(McpError::invalid_params("Invalid Task service admission timeout"));
+        }
+        self.admission.timeout = timeout;
+        Ok(self)
     }
 
     /// Returns the configured presence-aware TTL for locally created Tasks.
     #[must_use]
     pub const fn ttl_ms(&self) -> Option<u64> {
         self.ttl_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaskServiceAdmissionLimits {
+    maximum: usize,
+    maximum_per_principal: usize,
+    maximum_payload_bytes: usize,
+    maximum_payload_bytes_per_principal: usize,
+    timeout: StdDuration,
+}
+
+impl Default for TaskServiceAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            maximum: 1_024,
+            maximum_per_principal: 32,
+            maximum_payload_bytes: 64 * 1_024 * 1_024,
+            maximum_payload_bytes_per_principal: 16 * 1_024 * 1_024,
+            timeout: StdDuration::from_secs(30),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskServiceAdmissionCharge {
+    permits: usize,
+    payload_bytes: usize,
+}
+
+/// Runtime-wide custody survives service exit/re-entry and replacement, so
+/// old provider operations cannot evade the next generation's admission cap.
+#[derive(Default)]
+struct TaskServiceAdmissionState {
+    total: TaskServiceAdmissionCharge,
+    principals: BTreeMap<Option<[u8; 32]>, TaskServiceAdmissionCharge>,
+}
+
+/// Sealed, non-Clone custody of exactly one admitted create operation. It
+/// contains no application payload and retains only a shared ledger, a fixed
+/// principal digest, generation numbers, a byte charge, and a deadline.
+struct TaskServiceAdmissionPermit {
+    ledger: Arc<Mutex<TaskServiceAdmissionState>>,
+    principal: Option<[u8; 32]>,
+    service_id: u64,
+    ready_generation: u64,
+    payload_bytes: usize,
+    deadline: Instant,
+}
+
+impl TaskServiceAdmissionPermit {
+    /// The last fallible local check before entering the store mutation. A
+    /// service exit after this boundary cannot undo a subsequently proven
+    /// commit; that work remains available to authoritative recovery.
+    fn admit_commit(
+        &self,
+        runtime: &FinalTaskRuntime,
+        ctx: Option<&McpContext>,
+    ) -> McpResult<()> {
+        if !Arc::ptr_eq(&self.ledger, &runtime.admission) {
+            return Err(McpError::invalid_request(
+                "Task service admission permit belongs to another runtime",
+            ));
+        }
+        let current = {
+            let signal = runtime
+                .service_signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            signal.as_ref().is_some_and(|service| {
+                service.service_id == self.service_id
+                    && service.ready_generation == Some(self.ready_generation)
+                    && !service.sender.is_closed()
+            })
+        };
+        if !current {
+            return Err(McpError::invalid_request(
+                "Task service generation exited before creation could commit",
+            ));
+        }
+        if let Some(ctx) = ctx {
+            ctx.checkpoint()?;
+        }
+        if Instant::now() >= self.deadline {
+            return Err(McpError::invalid_request(
+                "Task service admission permit expired",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for TaskServiceAdmissionPermit {
+    fn drop(&mut self) {
+        let mut ledger = self
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only this non-Clone value can release its reservation. Counts are
+        // shared across generations, so releasing an old permit leaves every
+        // outstanding replacement-generation permit charged.
+        ledger.total.permits -= 1;
+        ledger.total.payload_bytes -= self.payload_bytes;
+        if let Some(owner) = ledger.principals.get_mut(&self.principal) {
+            owner.permits -= 1;
+            owner.payload_bytes -= self.payload_bytes;
+            if owner.permits == 0 {
+                ledger.principals.remove(&self.principal);
+            }
+        }
     }
 }
 
@@ -6490,6 +6661,8 @@ struct FinalTaskServiceSignal {
     /// owns the live readiness lease. `None` means installation has not yet
     /// entered a runnable service, or that service has exited.
     ready_generation: Option<u64>,
+    /// Advances on every entered invocation, including retained-runner reuse.
+    last_ready_generation: u64,
     /// A direct wake path for the bounded supervisor handoffs running in
     /// this service generation. The durable store remains the cancellation
     /// authority; this merely makes a newly-recorded cancellation observable
@@ -6776,6 +6949,7 @@ pub struct FinalTaskRuntime {
     application_notification_emitter: OwnedTaskNotificationEmitter,
     notification_emitters: Arc<Mutex<Vec<WeakTaskNotificationEmitter>>>,
     service_signal: Arc<Mutex<Option<FinalTaskServiceSignal>>>,
+    admission: Arc<Mutex<TaskServiceAdmissionState>>,
     next_task_service_id: Arc<AtomicU64>,
     retention_administration: Arc<TaskRetentionAdministration>,
     access_authorizers: Arc<Mutex<Vec<Arc<dyn TaskAccessAuthorizer>>>>,
@@ -6798,6 +6972,7 @@ impl FinalTaskRuntime {
             }),
             notification_emitters: Arc::new(Mutex::new(Vec::new())),
             service_signal: Arc::new(Mutex::new(None)),
+            admission: Arc::new(Mutex::new(TaskServiceAdmissionState::default())),
             next_task_service_id: Arc::new(AtomicU64::new(0)),
             retention_administration: Arc::new(TaskRetentionAdministration::default()),
             access_authorizers: Arc::new(Mutex::new(Vec::new())),
@@ -7097,6 +7272,7 @@ impl FinalTaskRuntime {
             // an entered `runner.run_service` that holds its readiness lease
             // establishes the ready creation authority.
             ready_generation: None,
+            last_ready_generation: 0,
             cancellation_wake: Arc::new(FinalTaskCancellationWake::default()),
         });
         Ok(AuthorizedTaskServiceRunner {
@@ -7422,7 +7598,7 @@ impl FinalTaskRuntime {
         work_descriptor: FinalTaskWorkDescriptor,
         status_message: Option<String>,
     ) -> McpResult<CreateTaskResult> {
-        self.create_task_with_principal(work_descriptor, status_message, None, None)
+        self.create_task_with_principal(work_descriptor, status_message, None, None, None)
     }
 
     /// Creates application work on behalf of the authenticated ingress caller.
@@ -7441,6 +7617,7 @@ impl FinalTaskRuntime {
             status_message,
             task_request_principal(ctx)?,
             None,
+            Some(ctx),
         )
     }
 
@@ -7459,6 +7636,7 @@ impl FinalTaskRuntime {
             status_message,
             principal,
             Some(operation),
+            Some(ctx),
         )
     }
 
@@ -7468,7 +7646,11 @@ impl FinalTaskRuntime {
         status_message: Option<String>,
         principal: Option<Sha256Digest>,
         operation: Option<FinalTaskOperation>,
+        ctx: Option<&McpContext>,
     ) -> McpResult<CreateTaskResult> {
+        if let Some(ctx) = ctx {
+            ctx.checkpoint()?;
+        }
         if self.config.ttl_ms.is_none()
             && self
                 .retention_administration
@@ -7497,7 +7679,7 @@ impl FinalTaskRuntime {
                 .transpose()?,
         });
         self.persist_new_with_work_while_service_ready(
-            task.clone(), work_descriptor, principal, operation,
+            &task, work_descriptor, principal, operation, ctx,
         )?;
         Ok(CreateTaskResult {
             task,
@@ -8412,68 +8594,145 @@ impl FinalTaskRuntime {
         Ok(())
     }
 
-    /// Persists a publicly created task while its exact ready service
-    /// generation is still live.
-    ///
-    /// A readiness probe followed by an independent durable write would be a
-    /// TOCTOU boundary: a runner could exit after the probe but before a
-    /// caller receives an accepted task handle. Holding the signal lock only
-    /// through the synchronous store commit makes runner teardown wait until
-    /// the task is recoverable by the generation that authorized it. Delivery
-    /// and best-effort wakeup remain outside that lock.
+    /// Reserves bounded create custody from the exact entered service
+    /// generation before invoking an application-owned store. No service or
+    /// admission mutex crosses a provider call. Once the store proves its
+    /// commit, a concurrently exited generation cannot revoke the Task; the
+    /// next entered generation recovers it through the authoritative scan.
     fn persist_new_with_work_while_service_ready(
         &self,
-        task: FinalTask,
+        task: &FinalTask,
         work_descriptor: FinalTaskWorkDescriptor,
         principal: Option<Sha256Digest>,
         operation: Option<FinalTaskOperation>,
+        ctx: Option<&McpContext>,
     ) -> McpResult<()> {
+        // Measure without materializing encoded JSON or cloning the task.
+        // Four task copies and two notification copies conservatively cover
+        // request storage, mutation arguments and receipt validation. Each
+        // framework-created notification has less than 256 envelope bytes.
+        let task_bytes = final_task_payload_bytes(
+            task,
+            MAX_FINAL_TASK_METADATA_BYTES,
+            "creation metadata",
+        )?;
+        let descriptor_bytes = final_task_payload_bytes(
+            work_descriptor.as_value(),
+            MAX_FINAL_TASK_DESCRIPTOR_BYTES,
+            "work descriptor",
+        )?;
+        let payload_bytes = task_bytes
+            .checked_mul(6)
+            .and_then(|bytes| bytes.checked_add(512))
+            .and_then(|bytes| bytes.checked_add(descriptor_bytes))
+            .ok_or_else(|| McpError::invalid_params("Task admission payload size overflow"))?;
+        let permit = self.reserve_task_creation(principal, payload_bytes, ctx)?;
         let task_id = task.base().task_id.clone();
-        let notification = final_task_notification(&task);
-        self.validate_new_task_write(&task, &notification)?;
+        let notification = final_task_notification(task);
+        self.validate_new_task_write(task, &notification)?;
         validate_final_task_work_descriptor(&work_descriptor)?;
         // Check the capability before any durable creation. Existing custom
         // stores must implement finite accounting before admitting new work.
+        // A provider may re-enter readiness or cancel the ingress while this
+        // permit keeps its bounded charge. Recheck both before the mutation.
         self.store.execution_limits()?;
-        let committed = {
-            let signal = self
-                .service_signal
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !Self::task_service_is_ready(signal.as_ref()) {
-                return Err(McpError::invalid_params(
-                    "Final task creation requires an installed ready task service",
-                ));
-            }
-            if let Some(operation) = operation.as_ref() {
-                self.store.create_task_with_operation(
-                    task.clone(),
-                    notification.clone(),
-                    work_descriptor,
-                    principal,
-                    operation.clone(),
-                )?
-            } else if let Some(principal) = principal {
-                self.store.create_task_with_authenticated_work(
-                    task.clone(),
-                    notification.clone(),
-                    work_descriptor,
-                    principal,
-                )?
-            } else {
-                self.store.create_task_with_work(
-                    task.clone(),
-                    notification.clone(),
-                    work_descriptor,
-                )?
-            }
+        permit.admit_commit(self, ctx)?;
+        let committed = if let Some(operation) = operation.as_ref() {
+            self.store.create_task_with_operation(
+                task.clone(),
+                notification.clone(),
+                work_descriptor,
+                principal,
+                operation.clone(),
+            )?
+        } else if let Some(principal) = principal {
+            self.store.create_task_with_authenticated_work(
+                task.clone(),
+                notification.clone(),
+                work_descriptor,
+                principal,
+            )?
+        } else {
+            self.store.create_task_with_work(
+                task.clone(),
+                notification.clone(),
+                work_descriptor,
+            )?
         };
-        let committed = self.validate_committed_new_task(&task, principal, operation.as_ref(), committed)?;
+        let committed = self.validate_committed_new_task(task, principal, operation.as_ref(), committed)?;
         // The durable commit above is the acceptance point. Observer failures
-        // cannot revoke the returned task handle.
+        // and caller/service cancellation cannot revoke the returned handle.
+        // A missed wakeup never rolls back or retries this proven create: the
+        // service's bounded authoritative scan is the recovery backstop.
         self.emit_committed(notification, &committed);
         self.signal_task_service(task_id);
+        drop(permit);
         Ok(())
+    }
+
+    fn reserve_task_creation(
+        &self,
+        principal: Option<Sha256Digest>,
+        payload_bytes: usize,
+        ctx: Option<&McpContext>,
+    ) -> McpResult<TaskServiceAdmissionPermit> {
+        if let Some(ctx) = ctx {
+            ctx.checkpoint()?;
+        }
+        let principal = principal.map(Sha256Digest::into_bytes);
+        let limits = self.config.admission;
+        let deadline = Instant::now().checked_add(limits.timeout).ok_or_else(|| {
+            McpError::invalid_params("Task admission timeout exceeds the local clock range")
+        })?;
+        // The only nested order is service -> ledger. Permit destruction
+        // touches only the ledger, and no callback runs under either lock.
+        let signal = self
+            .service_signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let service = signal
+            .as_ref()
+            .filter(|service| Self::task_service_is_ready(Some(service)))
+            .ok_or_else(|| {
+                McpError::invalid_params(
+                    "Final task creation requires an installed ready task service",
+                )
+            })?;
+        let ready_generation = service.ready_generation.ok_or_else(|| {
+            McpError::internal_error("Task service lost its entered generation")
+        })?;
+        let mut ledger = self
+            .admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = ledger.principals.get(&principal);
+        let owner_permits = owner.map_or(0, |owner| owner.permits);
+        let owner_bytes = owner.map_or(0, |owner| owner.payload_bytes);
+        let total_bytes = ledger.total.payload_bytes.checked_add(payload_bytes);
+        let principal_bytes = owner_bytes.checked_add(payload_bytes);
+        if ledger.total.permits >= limits.maximum
+            || owner_permits >= limits.maximum_per_principal
+            || total_bytes.is_none_or(|bytes| bytes > limits.maximum_payload_bytes)
+            || principal_bytes
+                .is_none_or(|bytes| bytes > limits.maximum_payload_bytes_per_principal)
+        {
+            return Err(McpError::invalid_request(
+                "Task service admission capacity exhausted",
+            ));
+        }
+        let owner = ledger.principals.entry(principal).or_default();
+        owner.permits += 1;
+        owner.payload_bytes += payload_bytes;
+        ledger.total.permits += 1;
+        ledger.total.payload_bytes += payload_bytes;
+        Ok(TaskServiceAdmissionPermit {
+            ledger: Arc::clone(&self.admission),
+            principal,
+            service_id: service.service_id,
+            ready_generation,
+            payload_bytes,
+            deadline,
+        })
     }
 
     fn persist_transition_appending_input(
@@ -8782,7 +9041,7 @@ impl FinalTaskRuntime {
 
     fn task_service_is_ready(service: Option<&FinalTaskServiceSignal>) -> bool {
         service.is_some_and(|service| {
-            service.ready_generation == Some(service.service_id) && !service.sender.is_closed()
+            service.ready_generation.is_some() && !service.sender.is_closed()
         })
     }
 
@@ -8818,14 +9077,18 @@ impl FinalTaskRuntime {
                 "Task service readiness is already owned by a live runner",
             ));
         }
-        // `service_id` is allocated monotonically at installation. Recording
-        // it while returning the RAII lease makes the creation probe and the
-        // live runner's ownership one mutex-protected generation election.
-        service.ready_generation = Some(service_id);
+        // Retaining a runner across service invocations must not revive an
+        // old admission permit. Pair its installation ID with a fresh entered
+        // generation every time this readiness lease is established.
+        let ready_generation = service.last_ready_generation.checked_add(1).ok_or_else(|| {
+            McpError::internal_error("Task service readiness generation space is exhausted")
+        })?;
+        service.last_ready_generation = ready_generation;
+        service.ready_generation = Some(ready_generation);
         Ok(FinalTaskServiceReadinessLease {
             runtime: self.clone(),
             service_id,
-            ready_generation: service_id,
+            ready_generation,
         })
     }
 
@@ -13015,12 +13278,14 @@ mod tests {
         }
     }
 
-    /// Test store that observes whether public task creation retains its
-    /// durable record while the service-readiness generation is still held.
+    /// Test store that observes service readiness from inside the public
+    /// creation callback without waiting on a framework-held service lock.
     struct ReadinessLeaseProbeFinalTaskStore {
         inner: Arc<InMemoryFinalTaskStore>,
         service_signal: Mutex<Option<Arc<Mutex<Option<FinalTaskServiceSignal>>>>>,
-        observed_ready_lease: AtomicBool,
+        observed_unlocked_ready_service: AtomicBool,
+        execution_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        after_creation: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl ReadinessLeaseProbeFinalTaskStore {
@@ -13028,7 +13293,9 @@ mod tests {
             Self {
                 inner,
                 service_signal: Mutex::new(None),
-                observed_ready_lease: AtomicBool::new(false),
+                observed_unlocked_ready_service: AtomicBool::new(false),
+                execution_hook: Mutex::new(None),
+                after_creation: Mutex::new(None),
             }
         }
 
@@ -13044,7 +13311,39 @@ mod tests {
     }
 
     impl FinalTaskStore for ReadinessLeaseProbeFinalTaskStore {
-        delegate_final_execution_policy!();
+        fn get_task_access_metadata(
+            &self,
+            task_id: &FinalTaskId,
+        ) -> McpResult<Option<FinalTaskAccessMetadata>> {
+            self.inner.get_task_access_metadata(task_id)
+        }
+
+        fn execution_limits(&self) -> McpResult<FinalTaskExecutionLimits> {
+            let hook = self.execution_hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.execution_limits()
+        }
+
+        fn task_execution_budget_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskExecutionBudget>> {
+            self.inner.task_execution_budget_if_current(expected)
+        }
+
+        fn expire_task_execution_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.expire_task_execution_if_current(expected)
+        }
+
+        fn next_expired_execution_snapshot(&self) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner.next_expired_execution_snapshot()
+        }
+
         fn create_task(
             &self,
             task: FinalTask,
@@ -13065,15 +13364,20 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone()
                 .expect("test store receives the runtime service signal before public creation");
-            self.observed_ready_lease.store(
+            self.observed_unlocked_ready_service.store(
                 matches!(
                     service_signal.try_lock(),
-                    Err(std::sync::TryLockError::WouldBlock)
+                    Ok(service) if FinalTaskRuntime::task_service_is_ready(service.as_ref())
                 ),
                 AtomicOrdering::SeqCst,
             );
-            self.inner
-                .create_task_with_work(task, notification, work_descriptor)
+            let committed = self.inner
+                .create_task_with_work(task, notification, work_descriptor)?;
+            let hook = self.after_creation.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            Ok(committed)
         }
 
         fn get_task(&self, task_id: &FinalTaskId) -> McpResult<Option<FinalTask>> {
@@ -24817,7 +25121,7 @@ mod tests {
     }
 
     #[test]
-    fn task_03_final_public_creation_holds_readiness_through_durable_commit() {
+    fn task_03_final_public_creation_keeps_service_available_during_commit() {
         let inner = Arc::new(InMemoryFinalTaskStore::default());
         let store = Arc::new(ReadinessLeaseProbeFinalTaskStore::new(inner));
         let runtime = FinalTaskRuntime::new(
@@ -24837,10 +25141,123 @@ mod tests {
             .expect("an entered runner accepts a durably recoverable task");
 
         assert!(
-            store.observed_ready_lease.load(AtomicOrdering::SeqCst),
-            "the durable create commit holds the exact ready service generation"
+            store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst),
+            "the provider can inspect readiness while its creation permit owns admission"
         );
+        assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
+        assert_eq!(runtime.admission.lock().unwrap().total.payload_bytes, 0);
+        assert!(runtime.admission.lock().unwrap().principals.is_empty());
         drop(running_service);
+    }
+
+    #[test]
+    fn task_creation_admission_fences_reentered_generations_and_owner_capacity() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let config = FinalTaskRuntimeConfig::new(60_000, None).unwrap()
+            .with_admission_capacity(3, 1, 4_096, 2_048).unwrap();
+        let runtime = FinalTaskRuntime::new(store.clone(), config, Arc::new(|_| {}));
+        let mut runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let cx = Cx::for_testing();
+        let mut running = Box::pin(runner.run_service(&cx));
+        let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(running.as_mut().poll(&mut poll).is_pending());
+        let first_owner = Some(Sha256Digest::from_bytes([1; 32]));
+        let second_owner = Some(Sha256Digest::from_bytes([2; 32]));
+        let third_owner = Some(Sha256Digest::from_bytes([3; 32]));
+        let first = runtime.reserve_task_creation(first_owner, 1_000, None).unwrap();
+        assert!(runtime.reserve_task_creation(first_owner, 1, None).is_err());
+        let second = runtime.reserve_task_creation(second_owner, 1_000, None).unwrap();
+        let unowned = runtime.reserve_task_creation(None, 1_000, None).unwrap();
+        assert!(runtime.reserve_task_creation(None, 1, None).is_err());
+        assert!(runtime.reserve_task_creation(third_owner, 1, None).is_err());
+        assert_eq!(runtime.admission.lock().unwrap().total.permits, 3);
+        assert_eq!(runtime.admission.lock().unwrap().total.payload_bytes, 3_000);
+        assert!(first.admit_commit(&runtime, None).is_ok());
+        drop(running);
+        let mut running = Box::pin(runner.run_service(&cx));
+        assert!(running.as_mut().poll(&mut poll).is_pending());
+        assert!(first.admit_commit(&runtime, None).is_err(), "re-entering the same runner cannot revive an old permit");
+        assert!(runtime.reserve_task_creation(third_owner, 1, None).is_err(), "old providers remain charged across the new invocation");
+        let old_generation = first.ready_generation;
+        drop(first);
+        let successor = runtime.reserve_task_creation(first_owner, 1_000, None).unwrap();
+        assert!(successor.ready_generation > old_generation);
+        drop(second);
+        assert!(successor.admit_commit(&runtime, None).is_ok(), "an old permit's drop preserves the successor's custody");
+        assert_eq!(runtime.admission.lock().unwrap().total.permits, 2);
+        assert_eq!(runtime.admission.lock().unwrap().total.payload_bytes, 2_000);
+        drop(successor);
+        drop(unowned);
+        let ledger = runtime.admission.lock().unwrap();
+        assert_eq!(ledger.total.permits, 0);
+        assert_eq!(ledger.total.payload_bytes, 0);
+        assert!(ledger.principals.is_empty());
+        drop(ledger);
+        assert_eq!(store.task_count(), 0, "permits never create Task records on their own");
+        drop(running);
+    }
+
+    #[test]
+    fn task_creation_admission_expiry_retains_custody_until_drop() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let config = FinalTaskRuntimeConfig::new(60_000, None).unwrap()
+            .with_admission_capacity(1, 1, 4_096, 4_096).unwrap();
+        let runtime = FinalTaskRuntime::new(store.clone(), config, Arc::new(|_| {}));
+        let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let cx = Cx::for_testing();
+        let running = enter_task_service_runner(runner, &cx);
+        let mut permit = runtime.reserve_task_creation(None, 1_000, None).unwrap();
+        assert!(permit.admit_commit(&runtime, None).is_ok());
+        permit.deadline = Instant::now();
+        assert!(permit.admit_commit(&runtime, None).unwrap_err().message.contains("permit expired"));
+        assert!(runtime.reserve_task_creation(None, 1, None).is_err(), "expiry cannot recycle a provider's live custody");
+        assert_eq!(store.task_count(), 0);
+        drop(permit);
+        let next = runtime.reserve_task_creation(None, 1_000, None).unwrap();
+        assert!(next.admit_commit(&runtime, None).is_ok());
+        drop(next);
+        assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
+        drop(running);
+    }
+
+    #[test]
+    fn task_creation_checks_ingress_after_preparation_but_preserves_postcommit_acceptance() {
+        let inner = Arc::new(InMemoryFinalTaskStore::default());
+        let store = Arc::new(ReadinessLeaseProbeFinalTaskStore::new(inner.clone()));
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(|_| {}),
+        );
+        store.observe_service_signal(Arc::clone(&runtime.service_signal));
+        let runner = runtime.install_task_service(1, Arc::new(FailingFinalTaskSupervisor)).unwrap();
+        let cx = Cx::for_testing();
+        let running = enter_task_service_runner(runner, &cx);
+        let cancelled = fastmcp_core::McpRequestCancellation::new();
+        let hook_cancellation = cancelled.clone();
+        *store.execution_hook.lock().unwrap() = Some(Box::new(move || { let _ = hook_cancellation.cancel(); }));
+        let ctx = McpContext::new(Cx::for_testing(), 17).with_request_cancellation(cancelled);
+        assert_eq!(runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None).unwrap_err().code, fastmcp_core::McpErrorCode::RequestCancelled);
+        assert_eq!(inner.task_count(), 0, "cancellation during preparation cannot reach create");
+        assert!(!store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst));
+        assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
+
+        let ctx = McpContext::new(Cx::for_testing(), 18);
+        let positive = runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None).unwrap();
+        assert!(inner.get_task(&positive.task.base().task_id).unwrap().is_some());
+        let cancelled = fastmcp_core::McpRequestCancellation::new();
+        let hook_cancellation = cancelled.clone();
+        *store.after_creation.lock().unwrap() = Some(Box::new(move || { let _ = hook_cancellation.cancel(); }));
+        let ctx = McpContext::new(Cx::for_testing(), 19).with_request_cancellation(cancelled.clone());
+        let accepted = runtime.create_task_for_request(&ctx, final_test_work_descriptor(), None)
+            .expect("cancellation after a valid commit cannot erase its accepted handle");
+        assert!(cancelled.is_cancel_requested());
+        assert!(inner.get_task(&accepted.task.base().task_id).unwrap().is_some());
+        assert_eq!(inner.task_count(), 2);
+        assert_eq!(runtime.admission.lock().unwrap().total.permits, 0);
+        assert_eq!(runtime.admission.lock().unwrap().total.payload_bytes, 0);
+        assert!(runtime.admission.lock().unwrap().principals.is_empty());
+        drop(running);
     }
 
     #[test]
@@ -24864,7 +25281,7 @@ mod tests {
             "changing only entered runner state rejects public task creation"
         );
         assert!(
-            !store.observed_ready_lease.load(AtomicOrdering::SeqCst),
+            !store.observed_unlocked_ready_service.load(AtomicOrdering::SeqCst),
             "a rejected creation cannot call the durable store"
         );
     }
