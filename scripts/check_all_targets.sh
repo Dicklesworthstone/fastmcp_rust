@@ -48,11 +48,21 @@ JSON=0
 ARM=both
 DRY=0
 
+# `${2:?msg}` would exit 1 on a missing OR empty value, reporting a usage error
+# with a code this script documents as something else. Check explicitly so every
+# usage failure is 64.
+need_value() {
+  if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+    echo "$1 needs a non-empty value" >&2
+    exit 64
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --retries) RETRIES="${2:?--retries needs a value}"; shift 2 ;;
+    --retries) need_value "$@"; RETRIES="$2"; shift 2 ;;
     --json)    JSON=1; shift ;;
-    --arm)     ARM="${2:?--arm needs a value}"; shift 2 ;;
+    --arm)     need_value "$@"; ARM="$2"; shift 2 ;;
     # --dry-run exists because exercising the argument paths of a script that
     # performs real work costs real work: validating these five --arm values
     # by running them dispatched five multi-arm remote builds. Validate the
@@ -62,6 +72,19 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
 done
+
+# Validate usage BEFORE any side effect. Previously this lived after the
+# preflight, so `--arm bogus` on a dirty tracker exited 3 (preflight refused)
+# instead of 64 (bad usage) -- a usage error reported as an environment error.
+case "$ARM" in
+  both|all|default|all-features|no-default-features) ;;
+  *) echo "--arm must be one of: default, all-features, no-default-features, both, all" >&2
+     exit 64 ;;
+esac
+case "$RETRIES" in
+  ''|*[!0-9]*) echo "--retries must be a positive integer, got '$RETRIES'" >&2; exit 64 ;;
+  0)           echo "--retries must be at least 1" >&2; exit 64 ;;
+esac
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository" >&2; exit 64; }
 cd "$ROOT" || exit 64
@@ -76,7 +99,12 @@ LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/check_all_targets.XXXXXX")
 # RCH_SOURCE_NAMESPACE_INTERRUPTED. Measured 2026-11-05: four workers voided
 # during a concurrent rewire, then the same command greened on the first
 # attempt once serialized. Refusing up front is cheaper than four voids.
-dirty_fingerprint() { git status --porcelain --untracked-files=no | sha256sum | cut -c1-16; }
+# Compare the porcelain output directly rather than hashing it. `sha256sum` is
+# NOT on a stock macOS (that is `shasum -a 256`), and if it were missing this
+# function would silently return the empty string for both the before and after
+# reading, making them compare EQUAL and quietly disabling the moving-checkout
+# guard. A safety check that fails silently is worse than one that is absent.
+dirty_fingerprint() { git status --porcelain --untracked-files=no; }
 FP_BEFORE=$(dirty_fingerprint)
 if git status --porcelain --untracked-files=no -- .beads | grep -q .; then
   echo "PREFLIGHT REFUSED: .beads has tracked modifications, so the checkout is" >&2
@@ -109,6 +137,13 @@ run_arm() {
       members=$(strip_ansi <"$log" | grep -oE 'Checking fastmcp[a-z-]*' | sort -u | wc -l | tr -d ' ')
       errors=$(strip_ansi <"$log" | grep -cE '^error' || true)
       cnc=$(strip_ansi <"$log" | grep -c 'could not compile' || true)
+      # Default to 0: `grep -c` prints "0" and exits 1 when it matches nothing
+      # (handled by `|| true`), but exits 2 printing NOTHING on a read error,
+      # which would leave these empty and make `[ "" -eq 0 ]` a bash syntax
+      # error that silently evaluates false -- classifying a green run as red.
+      errors=${errors:-0}
+      cnc=${cnc:-0}
+      members=${members:-0}
       if [ "$remote" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$cnc" -eq 0 ]; then
         printf 'green\t%s\t%s\t%s\t%s\t%s\n' "$remote" "$members" "$errors" "$cnc" "$log"
       else
@@ -139,14 +174,6 @@ run_and_record() {
   IFS=$'\t' read -r v e m er c l <<<"$line"
   record "$name" "$v" "$e" "$m" "$er" "$c" "$l"
 }
-
-# Explicit ifs: `[ a ] || [ b ] && cmd` parses as `([ a ] || [ b ]) && cmd`,
-# which happens to work here but is a precedence trap waiting for an edit.
-case "$ARM" in
-  both|all|default|all-features|no-default-features) ;;
-  *) echo "--arm must be one of: default, all-features, no-default-features, both, all" >&2
-     exit 64 ;;
-esac
 
 if [ "$DRY" -eq 1 ]; then
   echo "dry run: arm selection '$ARM', retries $RETRIES, json $JSON"
@@ -191,7 +218,11 @@ for i in "${!NAMES[@]}"; do
     void) [ "$status" -eq 1 ] || status=2 ;;
   esac
 done
-[ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ] && status=2
+# Explicit if, not `[ a ] && [ b ] && assign`: I flagged that precedence trap
+# in this file's own comments and should not then rely on it.
+if [ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ]; then
+  status=2
+fi
 
 if [ "$JSON" -eq 1 ]; then
   printf '{"head":"%s","tree":"%s","dirty_rs":%s,"checkout_moved":%s,"arms":[' \
