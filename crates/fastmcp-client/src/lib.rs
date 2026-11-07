@@ -17423,6 +17423,14 @@ pub struct StdioRequestExecutor {
     extension_notification_discovery: Option<Arc<ServerDiscoverResult>>,
 }
 
+/// Public executor calls own their connection metadata. Only already-admitted
+/// [`Client`] paths may retain a gateway overlay or deliberately narrowed settings.
+#[derive(Clone, Copy)]
+enum StdioRequestMetadata {
+    Configured,
+    Prepared,
+}
+
 impl std::fmt::Debug for StdioRequestExecutor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -17599,19 +17607,127 @@ impl StdioRequestExecutor {
     /// A completed handle is observed with [`Self::try_take_response`] after
     /// the owning [`Client`] drives ingress.
     ///
-    /// A Modern2026 executor stamps the negotiated protocol version and
-    /// advertised client capabilities when the caller omitted them. Already
-    /// present `_meta` keys are left unchanged.
+    /// A Modern2026 executor stamps the configured protocol version, client
+    /// identity and capabilities. Caller metadata cannot replace those fields;
+    /// other metadata, including progress tokens, remains request-local.
     pub fn execute(
         &self,
         cx: &Cx,
         method: impl Into<String>,
         params: Option<serde_json::Value>,
     ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_options(cx, None, method.into(), params, None)
+    }
+
+    /// Commits one request with independent response-wait deadlines.
+    ///
+    /// The override belongs only to this execution; it never changes the
+    /// connection default or a sibling's deadlines. Both clocks start when
+    /// publication commits, and the originating context's earlier budget
+    /// remains binding. Overrides can only tighten the configured policy,
+    /// including its matching-progress reset preference, and retain the
+    /// ordinary request duration ceilings. The client must continue driving
+    /// shared ingress.
+    pub fn execute_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_options(cx, None, method.into(), params, Some(timeout_policy))
+    }
+
+    /// Commits one request with an independently cancellable lifetime.
+    ///
+    /// Cancellation is retained even when another clone drives the connection.
+    /// The next service turn retires only this owner and commits at most one
+    /// selected-era cancellation control. A pre-cancelled token allocates no
+    /// request ID or waiter and performs no transport write.
+    pub fn execute_with_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_options(cx, Some(cancellation), method.into(), params, None)
+    }
+
+    /// Combines request-local cancellation and response-wait deadlines.
+    pub fn execute_with_cancellation_and_timeout_policy(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_options(
+            cx,
+            Some(cancellation),
+            method.into(),
+            params,
+            Some(timeout_policy),
+        )
+    }
+
+    fn execute_with_options(
+        &self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: String,
+        params: Option<serde_json::Value>,
+        timeout_policy: Option<RequestTimeoutPolicy>,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_metadata(
+            cx,
+            cancellation,
+            method,
+            params,
+            timeout_policy,
+            StdioRequestMetadata::Configured,
+        )
+    }
+
+    /// Retains metadata that [`Client`] has already prepared and admitted. This
+    /// private seam preserves native gateway identity and reverse capabilities,
+    /// as well as Tasks deliberately withheld by a core or Apps caller.
+    fn execute_prepared(
+        &self,
+        cx: &Cx,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_metadata(
+            cx,
+            None,
+            method.into(),
+            params,
+            None,
+            StdioRequestMetadata::Prepared,
+        )
+    }
+
+    fn execute_with_metadata(
+        &self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: String,
+        params: Option<serde_json::Value>,
+        timeout_policy: Option<RequestTimeoutPolicy>,
+        metadata_policy: StdioRequestMetadata,
+    ) -> McpResult<StdioRequestExecution> {
         if let Some(error) = self.executor.terminal_error() {
             return Err(error);
         }
-        let method = method.into();
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
+        {
+            return Err(McpError::request_cancelled());
+        }
+        let timeout_policy = self.selected_timeout_policy(timeout_policy)?;
         if self
             .client_extension_runtime
             .as_ref()
@@ -17621,10 +17737,23 @@ impl StdioRequestExecutor {
                 "Registered final extension methods require an admitted final extension API",
             ));
         }
-        let params = self.decorate_modern_request_parameters(params)?;
+        let params = self.decorate_modern_request_parameters(params, metadata_policy)?;
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
-        self.execute_request(cx, JsonRpcRequest::new(method, params, id))
+        let request = JsonRpcRequest::new(method, params, id);
+        let execution = match cancellation {
+            Some(cancellation) => self.executor.execute_with_cancellation_and_timeout_policy(
+                cx,
+                cancellation,
+                request,
+                timeout_policy,
+            ),
+            None => self.executor.execute_with_timeout_policy(cx, request, timeout_policy),
+        }?;
+        Ok(StdioRequestExecution {
+            execution,
+            require_result_source: false,
+        })
     }
 
     /// Commits one admitted extension request without waiting for its result.
@@ -17656,6 +17785,27 @@ impl StdioRequestExecutor {
             extension_id,
             method,
             parameters,
+            None,
+        )
+    }
+
+    /// Combines admitted extension execution, cancellation and local deadlines.
+    pub fn execute_final_extension_with_cancellation_and_timeout_policy(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_final_extension_with_cancellation_token(
+            cx,
+            Some(cancellation),
+            extension_id,
+            method,
+            parameters,
+            Some(timeout_policy),
         )
     }
 
@@ -17679,6 +17829,27 @@ impl StdioRequestExecutor {
             extension_id,
             method,
             parameters,
+            None,
+        )
+    }
+
+    /// Commits an admitted extension request with independent response deadlines.
+    /// The frozen extension authority and connection defaults are unchanged.
+    pub fn execute_final_extension_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_final_extension_with_cancellation_token(
+            cx,
+            None,
+            extension_id,
+            method,
+            parameters,
+            Some(timeout_policy),
         )
     }
 
@@ -17689,15 +17860,18 @@ impl StdioRequestExecutor {
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
         mut parameters: serde_json::Value,
+        timeout_policy: Option<RequestTimeoutPolicy>,
     ) -> McpResult<StdioRequestExecution> {
         if let Some(error) = self.executor.terminal_error() {
             return Err(error);
         }
         if cx.checkpoint().is_err()
             || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+            || cx.budget().deadline.is_some_and(|deadline| cx.now() >= deadline)
         {
             return Err(McpError::request_cancelled());
         }
+        let timeout_policy = self.selected_timeout_policy(timeout_policy)?;
         if self.peer_era != ProtocolEra::Modern2026 {
             return Err(McpError::invalid_params(
                 "Final client extensions are unavailable in exact MCP 2024-11-05",
@@ -17754,9 +17928,6 @@ impl StdioRequestExecutor {
 
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
-        let timeout_policy = *self.timeout_policy.lock().map_err(|_| {
-            McpError::internal_error("Negotiated stdio timeout policy is unavailable")
-        })?;
         let request = JsonRpcRequest::new(method, Some(parameters), id);
         let execution = match cancellation {
             Some(cancellation) => self
@@ -17826,20 +17997,29 @@ impl StdioRequestExecutor {
             .send_notification(cx, JsonRpcRequest::notification(method, Some(parameters)))
     }
 
-    fn execute_request(
+    fn selected_timeout_policy(
         &self,
-        cx: &Cx,
-        request: JsonRpcRequest,
-    ) -> McpResult<StdioRequestExecution> {
-        let timeout_policy = *self.timeout_policy.lock().map_err(|_| {
+        override_policy: Option<RequestTimeoutPolicy>,
+    ) -> McpResult<RequestTimeoutPolicy> {
+        let configured = *self.timeout_policy.lock().map_err(|_| {
             McpError::internal_error("Negotiated stdio timeout policy is unavailable")
         })?;
-        let execution = self
-            .executor
-            .execute_with_timeout_policy(cx, request, timeout_policy)?;
-        Ok(StdioRequestExecution {
-            execution,
-            require_result_source: false,
+        configured.validate()?;
+        let Some(policy) = override_policy else {
+            return Ok(configured);
+        };
+        // ApplicationConfigured is an explicit connection-level escape hatch,
+        // never an authority to broaden an individual request's lifetime.
+        let bounded = RequestTimeoutPolicy::new(policy.idle_timeout(), policy.absolute_timeout())?;
+        RequestTimeoutPolicy::new(
+            bounded.idle_timeout().min(configured.idle_timeout()),
+            bounded.absolute_timeout().min(configured.absolute_timeout()),
+        )
+        .map(|selected| {
+            selected.reset_idle_on_matching_progress(
+                policy.resets_idle_on_matching_progress()
+                    && configured.resets_idle_on_matching_progress(),
+            )
         })
     }
 
@@ -17851,7 +18031,10 @@ impl StdioRequestExecutor {
         timeout_policy: SubscriptionTimeoutPolicy,
     ) -> McpResult<StdioRequestExecution> {
         timeout_policy.validate()?;
-        let parameters = self.decorate_modern_request_parameters(Some(parameters))?;
+        let parameters = self.decorate_modern_request_parameters(
+            Some(parameters),
+            StdioRequestMetadata::Prepared,
+        )?;
         let id = next_stdio_request_id(&self.next_id)?;
         let id = i64::try_from(id).expect("client request ID allocator enforces the i64 bound");
         let request = JsonRpcRequest::new("subscriptions/listen", parameters, id);
@@ -17872,6 +18055,7 @@ impl StdioRequestExecutor {
     fn decorate_modern_request_parameters(
         &self,
         params: Option<serde_json::Value>,
+        metadata_policy: StdioRequestMetadata,
     ) -> McpResult<Option<serde_json::Value>> {
         let Some(final_metadata) = self.modern_request_meta.as_ref() else {
             return Ok(params);
@@ -17895,7 +18079,14 @@ impl StdioRequestExecutor {
             McpError::internal_error("Modern request metadata did not serialize as an object")
         })?;
         for (key, value) in stamped {
-            metadata.entry(key.clone()).or_insert(value.clone());
+            match metadata_policy {
+                StdioRequestMetadata::Configured => {
+                    metadata.insert(key.clone(), value.clone());
+                }
+                StdioRequestMetadata::Prepared => {
+                    metadata.entry(key.clone()).or_insert(value.clone());
+                }
+            }
         }
         Ok(Some(params))
     }
@@ -19984,7 +20175,7 @@ impl Client {
             }
             None => None,
         };
-        match executor.execute(cx, method, params) {
+        match executor.execute_prepared(cx, method, params) {
             Err(error) if executor.executor.terminal_error().is_some() => {
                 Err(self.terminate_connection(error))
             }
@@ -20104,7 +20295,7 @@ impl Client {
         // Do not prepare the parameters again: that would re-advertise Tasks.
         // The connection owns I/O; the caller owns only this execution.
         executor.service(&self.cx)?;
-        let execution = executor.execute(&self.cx, method, parameters)?;
+        let execution = executor.execute_prepared(&self.cx, method, parameters)?;
         Ok(StdioFinalMrtrExecution {
             request,
             execution,
@@ -21650,7 +21841,7 @@ impl Client {
             return Err(McpError::request_cancelled());
         }
         executor.service(&connection_cx)?;
-        let mut execution = executor.execute(&connection_cx, method, Some(params_value))?;
+        let mut execution = executor.execute_prepared(&connection_cx, method, Some(params_value))?;
         loop {
             if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
                 executor.cancel(&connection_cx, &mut execution)?;
@@ -22103,7 +22294,7 @@ impl Client {
             .map_err(|error| self.terminate_connection(error))?;
         // The parameters are already admitted. Preparing them again would
         // restore negotiated Tasks without this View's creation consent.
-        let mut execution = match executor.execute(cx, core_method, parameters) {
+        let mut execution = match executor.execute_prepared(cx, core_method, parameters) {
             Err(error) if executor.executor.terminal_error().is_some() => {
                 return Err(self.terminate_connection(error));
             }
@@ -27812,7 +28003,7 @@ impl Client {
         }
         // Parameters are already typed and extension-admitted. Preparing them
         // again here would re-advertise Tasks on an ordinary tools/call.
-        let execution = executor.execute(&connection_cx, method, parameters)?;
+        let execution = executor.execute_prepared(&connection_cx, method, parameters)?;
         self.wait_yielding_prepared_execution_until(
             cx,
             cancellation,
@@ -29757,6 +29948,204 @@ exec sleep 2
             metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["sampling"],
             serde_json::json!({})
         );
+    }
+
+    #[cfg(unix)]
+    fn stdio_metadata_echo_client(
+        discovery_response: &str,
+        capabilities: ClientCapabilities,
+    ) -> (Cx, Client) {
+        let script = format!(
+            "IFS= read -r discovery || exit 1; \
+             printf '%s\\n' '{discovery_response}'; \
+             id=2; \
+             while IFS= read -r request; do \
+             printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"resultType\":\"complete\",\"tools\":[],\"content\":[],\"isError\":false,\"ttlMs\":0,\"cacheScope\":\"private\",\"observed\":%s}}}}\\n' \"$id\" \"$request\"; \
+             id=$((id + 1)); \
+             done"
+        );
+        let cx = Cx::for_request();
+        let client = block_on(
+            ClientBuilder::new()
+                .client_info("configured-stdio-owner", "2")
+                .capabilities(capabilities)
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script.as_str()]),
+        )
+        .expect("the metadata probe discovers its selected stdio peer");
+        (cx, client)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_executor_keeps_configured_metadata_authority_on_the_wire() {
+        let discovery = modern_discovery_response("metadata-peer", &[MODERN_PROTOCOL_VERSION]);
+        let (cx, mut client) = stdio_metadata_echo_client(
+            &discovery,
+            ClientCapabilities {
+                sampling: Some(SamplingCapability::default()),
+                ..ClientCapabilities::default()
+            },
+        );
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        for replacement in [
+            serde_json::json!({}),
+            serde_json::json!({fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY: "2024-11-05"}),
+            serde_json::json!({
+                FINAL_CLIENT_INFO_META_KEY: {"name": "injected-owner", "version": "9"}
+            }),
+            serde_json::json!({
+                FINAL_CLIENT_CAPABILITIES_META_KEY: {
+                    "roots": {"listChanged": true},
+                    "extensions": {"com.example/injected": {"enabled": true}}
+                }
+            }),
+        ] {
+            let mut metadata = serde_json::json!({
+                "progressToken": "metadata-probe",
+                FINAL_LOG_LEVEL_META_KEY: "warning",
+                "com.example/trace": {"retained": true},
+            });
+            metadata
+                .as_object_mut()
+                .unwrap()
+                .extend(replacement.as_object().unwrap().clone());
+            let mut execution = executor
+                .execute(&cx, "tools/list", Some(serde_json::json!({"_meta": metadata})))
+                .unwrap();
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            let response = executor.try_take_response(&mut execution).unwrap().unwrap();
+            let result = response.result.unwrap();
+            let observed = &result["observed"]["params"]["_meta"];
+            assert_eq!(
+                observed[fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY],
+                MODERN_PROTOCOL_VERSION,
+            );
+            assert_eq!(
+                observed[FINAL_CLIENT_INFO_META_KEY],
+                serde_json::json!({"name": "configured-stdio-owner", "version": "2"}),
+            );
+            assert_eq!(
+                observed[FINAL_CLIENT_CAPABILITIES_META_KEY],
+                serde_json::json!({"sampling": {}}),
+            );
+            assert_eq!(observed["progressToken"], "metadata-probe");
+            assert_eq!(observed[FINAL_LOG_LEVEL_META_KEY], "warning");
+            assert_eq!(observed["com.example/trace"]["retained"], true);
+        }
+        let next_id = client.next_id.load(Ordering::SeqCst);
+        let error = executor
+            .execute(&cx, "tools/list", Some(serde_json::json!({"_meta": []})))
+            .unwrap_err();
+        assert_eq!(error.code, McpErrorCode::InvalidParams);
+        assert_eq!(client.next_id.load(Ordering::SeqCst), next_id);
+        assert!(executor.executor.pending_records().is_empty());
+        client.close().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_prepared_client_paths_keep_gateway_metadata_on_the_wire() {
+        let discovery = modern_discovery_response("metadata-peer", &[MODERN_PROTOCOL_VERSION]);
+        let (cx, mut client) = stdio_metadata_echo_client(
+            &discovery,
+            ClientCapabilities {
+                sampling: Some(SamplingCapability::default()),
+                ..ClientCapabilities::default()
+            },
+        );
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        for typed_catalog in [false, true] {
+            let parameters = serde_json::json!({
+                "_meta": {
+                    FINAL_CLIENT_INFO_META_KEY: {"name": "inbound-owner", "version": "3"},
+                    FINAL_CLIENT_CAPABILITIES_META_KEY: {"roots": {"listChanged": true}},
+                    FINAL_LOG_LEVEL_META_KEY: "notice",
+                    "progressToken": "gateway-probe",
+                    "com.example/trace": {"retained": true},
+                }
+            });
+            let mut execution = if typed_catalog {
+                client
+                    .start_yielding_final_catalog_request(&cx, "tools/list", parameters)
+                    .unwrap()
+                    .execution
+            } else {
+                client
+                    .start_multiplexed_request(&cx, "tools/list", Some(parameters))
+                    .unwrap()
+            };
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            let response = executor.try_take_response(&mut execution).unwrap().unwrap();
+            let result = response.result.unwrap();
+            let observed = &result["observed"]["params"]["_meta"];
+            assert_eq!(
+                observed[fastmcp_protocol::FINAL_PROTOCOL_VERSION_META_KEY],
+                MODERN_PROTOCOL_VERSION,
+            );
+            assert_eq!(
+                observed[FINAL_CLIENT_INFO_META_KEY],
+                serde_json::json!({"name": "inbound-owner", "version": "3"}),
+            );
+            assert_eq!(
+                observed[FINAL_CLIENT_CAPABILITIES_META_KEY],
+                serde_json::json!({"roots": {"listChanged": true}}),
+            );
+            assert_eq!(observed[FINAL_LOG_LEVEL_META_KEY], "notice");
+            assert_eq!(observed["progressToken"], "gateway-probe");
+            assert_eq!(observed["com.example/trace"]["retained"], true);
+        }
+        client.close().unwrap();
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn stdio_prepared_core_execution_does_not_restore_withheld_tasks() {
+        let discovery = modern_tasks_discovery_response("metadata-peer", serde_json::json!({}));
+        let (cx, mut client) = stdio_metadata_echo_client(
+            &discovery,
+            ClientCapabilities {
+                extensions: Some(BTreeMap::from([(
+                    fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                    serde_json::json!({}),
+                )])),
+                ..ClientCapabilities::default()
+            },
+        );
+        let executor = client.multiplexed_stdio_executor().unwrap();
+        assert!(
+            executor
+                .modern_request_meta
+                .as_ref()
+                .unwrap()
+                .client_capabilities
+                .extensions
+                .as_ref()
+                .unwrap()
+                .contains_key(fastmcp_protocol::TASKS_EXTENSION),
+            "the configured metadata would restore Tasks if prepared dispatch restamped it",
+        );
+        let mut execution = client
+            .start_yielding_final_mrtr_request(
+                &cx,
+                "tools/call",
+                serde_json::json!({"name": "ordinary", "arguments": {}}),
+                false,
+            )
+            .unwrap()
+            .execution;
+        client.drive_multiplexed_stdio(&cx).unwrap();
+        let response = executor.try_take_response(&mut execution).unwrap().unwrap();
+        let result = response.result.unwrap();
+        assert_eq!(result["resultType"], "complete");
+        let capabilities = &result["observed"]["params"]["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY];
+        assert!(
+            capabilities
+                .get("extensions")
+                .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
+                .is_none(),
+            "ordinary execution must not recover the withheld Tasks advertisement: {capabilities}",
+        );
+        client.close().unwrap();
     }
 
     #[cfg(feature = "tasks")]
@@ -58881,6 +59270,277 @@ while IFS= read -r ignored; do :; done
             }
             client.close().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_stdio_request_options_cancel_only_the_selected_owner() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for (modern, cancel_context) in [(true, false), (true, true), (false, false), (false, true)] {
+                if !modern && !cfg!(feature = "legacy-2024-11-05") {
+                    continue;
+                }
+                let discovery = if modern {
+                    modern_discovery_response("request-options", &[MODERN_PROTOCOL_VERSION])
+                } else {
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": 1,
+                        "result": {
+                            "protocolVersion": "2024-11-05", "capabilities": {},
+                            "serverInfo": {"name": "request-options", "version": "1"}
+                        }
+                    })
+                    .to_string()
+                };
+                let script = r#"
+IFS= read -r handshake || exit 10
+printf '%s\n' "$1"
+if [ "$2" = legacy ]; then
+    IFS= read -r initialized || exit 11
+    case "$initialized" in *notifications/initialized*) ;; *) exit 12 ;; esac
+fi
+IFS= read -r first || exit 13
+case "$first" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 14 ;; esac
+IFS= read -r sibling || exit 15
+case "$sibling" in *'"method":"tools/list"'*'"id":3'*) ;; *) exit 16 ;; esac
+IFS= read -r cancellation || exit 17
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 18 ;; esac
+IFS= read -r recovery || exit 19
+case "$recovery" in *'"method":"tools/list"'*'"id":4'*) ;; *) exit 20 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"owner":"late"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"owner":"sibling"}}'
+printf '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","tools":[],"ttlMs":0,"control":%s}}\n' "$cancellation"
+while IFS= read -r unexpected; do exit 21; done
+"#;
+                let default_policy =
+                    RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(10))
+                        .unwrap()
+                        .reset_idle_on_matching_progress(false);
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(if modern {
+                        ProtocolPolicy::ModernOnly
+                    } else {
+                        ProtocolPolicy::LegacyOnly
+                    }))
+                    .request_timeout_policy(default_policy)
+                    .connect_stdio_with_cx(
+                        &cx,
+                        "sh",
+                        &[
+                            "-c", script, "request-options", discovery.as_str(),
+                            if modern { "modern" } else { "legacy" },
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let cancelled = McpRequestCancellation::new();
+                cancelled.cancel();
+                assert_eq!(
+                    executor
+                        .execute_with_cancellation(&cx, &cancelled, "tools/list", None)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                let invalid_policy = RequestTimeoutPolicy {
+                    idle_timeout: Duration::ZERO,
+                    ..default_policy
+                };
+                assert_eq!(
+                    executor
+                        .execute_with_timeout_policy(&cx, "tools/list", None, invalid_policy)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                let expired = runtime.request_cx_with_budget(
+                    asupersync::Budget::INFINITE.with_deadline(cx.now()),
+                );
+                assert_eq!(
+                    executor.execute(&expired, "tools/list", None).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor
+                        .execute_with_timeout_policy(
+                            &cx,
+                            "tools/list",
+                            None,
+                            RequestTimeoutPolicy::from_application_timeout_ms(3_600_000).unwrap(),
+                        )
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams
+                );
+                let larger = RequestTimeoutPolicy::new(Duration::from_secs(15), Duration::from_secs(30))
+                    .unwrap();
+                assert_eq!(executor.selected_timeout_policy(Some(larger)).unwrap(), default_policy);
+                assert_eq!(client.peek_next_request_id(), 2);
+                assert!(executor.executor.pending_records().is_empty());
+
+                let cancellation = McpRequestCancellation::new();
+                let origin = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let mut first = executor
+                    .execute_with_cancellation_and_timeout_policy(
+                        &origin,
+                        &cancellation,
+                        "tools/list",
+                        Some(serde_json::json!({})),
+                        RequestTimeoutPolicy::new(Duration::from_secs(3), Duration::from_secs(4))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let mut sibling = executor
+                    .clone()
+                    .execute(&cx, "tools/list", Some(serde_json::json!({})))
+                    .unwrap();
+                if cancel_context {
+                    origin.set_cancel_requested(true);
+                } else {
+                    cancellation.cancel();
+                }
+                let mut recovery = executor
+                    .clone()
+                    .execute_with_cancellation(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/list",
+                        Some(serde_json::json!({})),
+                    )
+                    .unwrap();
+                for _ in 0..3 {
+                    client.drive_multiplexed_stdio(&cx).unwrap();
+                }
+                assert_eq!(
+                    executor.try_take_response(&mut first).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(
+                    executor.try_take_response(&mut sibling).unwrap().unwrap().result.unwrap()
+                        ["owner"],
+                    "sibling"
+                );
+                let response = executor
+                    .try_take_response(&mut recovery)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_eq!(response["control"]["params"]["requestId"], 2);
+                assert!(response["control"].get("id").is_none());
+                assert!(response["control"]["params"].get("_meta").is_none());
+                assert_eq!(client.request_timeout_policy(), default_policy);
+                assert!(executor.executor.pending_records().is_empty());
+                assert!(executor.executor.terminal_error().is_none());
+                assert!(cx.checkpoint().is_ok());
+                client.close_with_cx(&cx).await.unwrap();
+                assert!(client.child_cleanup_complete());
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_stdio_request_options_deadlines_are_independent_for_core_and_extensions() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for extension in [false, true] {
+                for idle in [false, true] {
+                    let (id, registry, discovery) = raw_extension_configuration(
+                        ExtensionDirection::ClientToServer,
+                        fastmcp_protocol::extensions::ExtensionFallbackPolicy::RejectOneSided,
+                    );
+                    let peer_discovery = modern_raw_extension_discovery_response(
+                        "request-deadlines",
+                        Some(serde_json::json!({"mode": "raw"})),
+                    );
+                    let script = r#"
+IFS= read -r discovery || exit 10
+printf '%s\n' "$1"
+IFS= read -r first || exit 11
+IFS= read -r sibling || exit 12
+IFS= read -r cancellation || exit 13
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 14 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"owner":"late"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"owner":"sibling"}}'
+while IFS= read -r unexpected; do exit 15; done
+"#;
+                    let default_policy =
+                        RequestTimeoutPolicy::new(Duration::from_secs(5), Duration::from_secs(10))
+                            .unwrap();
+                    let mut client = ClientBuilder::new()
+                        .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                        .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                        .unwrap()
+                        .request_timeout_policy(default_policy)
+                        .connect_stdio_with_cx(
+                            &cx, "sh", &["-c", script, "request-deadlines", peer_discovery.as_str()],
+                        )
+                        .await
+                        .unwrap();
+                    let executor = client.multiplexed_stdio_executor().unwrap();
+                    let policy = RequestTimeoutPolicy::new(
+                        Duration::from_secs(if idle { 1 } else { 2 }),
+                        Duration::from_secs(if idle { 2 } else { 1 }),
+                    )
+                    .unwrap();
+                    let mut first = if extension {
+                        executor.execute_final_extension_with_timeout_policy(
+                            &cx, &id, "example/echo", serde_json::json!({}), policy,
+                        )
+                    } else {
+                        executor.execute_with_timeout_policy(
+                            &cx, "tools/list", Some(serde_json::json!({})), policy,
+                        )
+                    }
+                    .unwrap();
+                    let mut sibling = if extension {
+                        executor.execute_final_extension_with_cancellation_and_timeout_policy(
+                            &cx, &McpRequestCancellation::new(), &id, "example/echo",
+                            serde_json::json!({}), default_policy,
+                        )
+                    } else {
+                        executor.execute(&cx, "tools/list", Some(serde_json::json!({})))
+                    }
+                    .unwrap();
+                    let records = executor.executor.pending_records();
+                    let first_record = records.iter().find(|record| record.request_id == *first.request_id()).unwrap();
+                    let sibling_record = records.iter().find(|record| record.request_id == *sibling.request_id()).unwrap();
+                    let deadline = if idle { first_record.idle_deadline } else { first_record.absolute_deadline };
+                    assert!(deadline < sibling_record.idle_deadline);
+                    assert!(deadline < sibling_record.absolute_deadline);
+                    executor.service_at(&cx, deadline).unwrap();
+                    executor.service_at(&cx, deadline).unwrap();
+                    let error = executor.try_take_response(&mut first).unwrap_err();
+                    assert_eq!(
+                        error.data,
+                        Some(serde_json::json!({"timeoutSource": if idle { "idle" } else { "absolute" }}))
+                    );
+                    assert_eq!(executor.executor.pending_records().len(), 1);
+                    assert!(executor.try_take_response(&mut sibling).unwrap().is_none());
+                    client.drive_multiplexed_stdio(&cx).unwrap();
+                    client.drive_multiplexed_stdio(&cx).unwrap();
+                    assert_eq!(
+                        executor.try_take_response(&mut sibling).unwrap().unwrap().result.unwrap()["owner"],
+                        "sibling"
+                    );
+                    assert_eq!(client.request_timeout_policy(), default_policy);
+                    assert!(executor.executor.pending_records().is_empty());
+                    assert!(executor.executor.terminal_error().is_none());
+                    client.close_with_cx(&cx).await.unwrap();
+                }
+            }
+        });
     }
 
     #[cfg(unix)]

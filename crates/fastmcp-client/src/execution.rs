@@ -2042,6 +2042,29 @@ where
             request,
             ExecutionTimeoutPolicy::Request(timeout_policy),
             None,
+            None,
+        )
+    }
+
+    /// Starts one request with its own cancellation token and response deadlines.
+    ///
+    /// The token is retained before publication, so service turns driven by
+    /// another caller still retire only this execution. A token cancelled
+    /// before admission neither allocates a waiter nor publishes a request.
+    pub fn execute_with_cancellation_and_timeout_policy(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: Request,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> McpResult<RequestExecution<T>> {
+        timeout_policy.validate()?;
+        self.execute_with_deadline_policy(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Request(timeout_policy),
+            Some(cancellation),
+            None,
         )
     }
 
@@ -2061,6 +2084,7 @@ where
             cx,
             request,
             ExecutionTimeoutPolicy::Request(timeout_policy),
+            None,
             Some(admission),
         )
     }
@@ -2078,20 +2102,13 @@ where
     ) -> McpResult<RequestExecution<T>> {
         timeout_policy.validate()?;
         admission.validate_request(self.protocol_era(), &request.method)?;
-        if self.state.borrow().external_writes {
-            return Err(McpError::invalid_request(
-                "External executor requires a committed publication callback",
-            ));
-        }
-        self.execute_with_commit(
+        self.execute_with_deadline_policy(
             cx,
             request,
             ExecutionTimeoutPolicy::Request(timeout_policy),
-            Some(cancellation.clone()),
+            Some(cancellation),
             Some(admission),
-            |transport, cx, message| transport.send(cx, message),
-        )?
-        .ok_or_else(|| McpError::internal_error("Synchronous executor deferred its own send"))
+        )
     }
 
     /// Starts a modern listener with its own bounded idle and absolute lifetime.
@@ -2122,6 +2139,7 @@ where
             request,
             ExecutionTimeoutPolicy::Subscription(timeout_policy),
             None,
+            None,
         )
     }
 
@@ -2130,6 +2148,7 @@ where
         cx: &Cx,
         request: Request,
         timeout_policy: ExecutionTimeoutPolicy,
+        request_cancellation: Option<&McpRequestCancellation>,
         extension_result: Option<ClientExtensionResultAdmission>,
     ) -> McpResult<RequestExecution<T>> {
         if self.state.borrow().external_writes {
@@ -2141,7 +2160,7 @@ where
             cx,
             request,
             timeout_policy,
-            None,
+            request_cancellation.cloned(),
             extension_result,
             |transport, cx, message| transport.send(cx, message),
         )?
