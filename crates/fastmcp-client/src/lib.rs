@@ -166,7 +166,8 @@ use fastmcp_protocol::{
 };
 pub use http_executor::{
     ClientHttpConnection, ClientHttpConnectionError, ClientHttpResponse, ModernHttpClient,
-    ModernHttpClientError, ModernHttpRequestControl, ModernHttpRequestExecution,
+    ModernHttpClientError, ModernHttpExtensionEvent, ModernHttpExtensionExecution,
+    ModernHttpRequestControl, ModernHttpRequestExecution,
     ModernHttpResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
     ModernHttpSubscriptionTermination,
@@ -243,7 +244,7 @@ use std::sync::atomic::AtomicU8;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(all(test, unix, any(feature = "legacy-2024-11-05", feature = "tasks")))]
+#[cfg(all(test, unix))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
@@ -15063,7 +15064,116 @@ impl HttpClient {
         Ok(execution)
     }
 
-    /// Cancels every pending owned ordinary execution and returns the number
+    /// Prepares one independently owned, negotiated extension execution.
+    ///
+    /// The first event poll sends one POST. JSON and SSE responses use the
+    /// same frozen request/result authority, and progress retains exact JSON
+    /// numbers. Cancellation and dropping the handle release only this request.
+    /// Core and extension handles share this client's count and byte limits.
+    pub fn execute_final_extension(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        limits: sse::SseLimits,
+    ) -> Result<ModernHttpExtensionExecution, HttpClientError> {
+        self.execute_final_extension_with_timeout_policy(
+            cx,
+            extension_id,
+            method,
+            parameters,
+            limits,
+            self.request_timeout_policy,
+        )
+    }
+
+    /// Prepares an extension execution with stricter idle and absolute bounds.
+    ///
+    /// Owner, method, direction, metadata, count, and byte validation happen
+    /// before request-ID allocation or network contact. The per-request policy
+    /// is bounded by this client's policy and the original caller's budget.
+    pub fn execute_final_extension_with_timeout_policy(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        limits: sse::SseLimits,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<ModernHttpExtensionExecution, HttpClientError> {
+        self.connection
+            .admit_final_extension_method(extension_id, method)
+            .map_err(HttpClientError::CoreResult)?;
+        cx.checkpoint()
+            .map_err(|_| HttpClientError::CoreResult(McpError::request_cancelled()))?;
+        RequestTimeoutPolicy::new(
+            timeout_policy.idle_timeout(),
+            timeout_policy.absolute_timeout(),
+        )
+        .map_err(HttpClientError::CoreResult)?;
+        #[allow(clippy::infallible_destructuring_match)]
+        let client = match &self.connection {
+            ClientHttpConnection::Modern(client) => client,
+            #[cfg(feature = "legacy-2024-11-05")]
+            ClientHttpConnection::LegacySse(_) => {
+                return Err(HttpClientError::Connection(
+                    ClientHttpConnectionError::FinalCoreListenRequiresModern,
+                ));
+            }
+        };
+        if parameters
+            .get("_meta")
+            .is_some_and(|metadata| !metadata.is_object())
+        {
+            return Err(HttpClientError::CoreResult(McpError::invalid_params(
+                "HTTP extension request metadata must be an object",
+            )));
+        }
+        measure_serialized_bytes(&parameters, MAX_HTTP_EXECUTION_REQUEST_BYTES).map_err(|_| {
+            HttpClientError::CoreResult(McpError::invalid_params(
+                "HTTP owned execution request byte limit exceeded",
+            ))
+        })?;
+        client.owned_core_metadata_bytes(cx, MAX_HTTP_EXECUTION_METADATA_BYTES)?;
+        let mut parameters = self.core_request_parameters(&parameters)?;
+        if let Some(metadata) = parameters
+            .get_mut("_meta")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            metadata.remove(fastmcp_protocol::FINAL_CLIENT_INFO_META_KEY);
+            metadata.remove("clientInfo");
+        }
+        let request_bytes = client.owned_extension_request_bytes(
+            cx,
+            method,
+            &parameters,
+            MAX_HTTP_EXECUTION_METADATA_BYTES,
+            MAX_HTTP_EXECUTION_REQUEST_BYTES,
+        )?;
+        let admission = self.owned_executions.reserve(request_bytes)?;
+        let request_id = self.next_request_id()?;
+        let execution = client
+            .execute_final_extension(
+                cx,
+                extension_id,
+                method,
+                parameters,
+                request_id,
+                limits,
+                timeout_policy,
+            )
+            .map_err(|error| {
+                HttpClientError::Connection(ClientHttpConnectionError::FinalCoreListen(error))
+            })?;
+        if !admission.commit(execution.control()) {
+            execution.control().cancel();
+            return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
+        }
+        Ok(execution)
+    }
+
+    /// Cancels every pending owned core or extension execution and returns the number
     /// whose cancellation won. Already terminal handles are unchanged.
     ///
     /// Native requests and response bodies are released without waiting for
@@ -15077,7 +15187,7 @@ impl HttpClient {
 
     /// Consumes the high-level wrapper and returns its transport.
     ///
-    /// Any ordinary executions created through this wrapper are cancelled
+    /// Any owned core or extension executions created through this wrapper are cancelled
     /// before ownership of the selected transport is transferred.
     #[must_use]
     pub fn into_connection(self) -> ClientHttpConnection {
@@ -42525,6 +42635,613 @@ exec sleep 2
         .expect("public HTTP raw extension request uses the admitted source path");
         assert_eq!(result["echoed"]["input"], "ok");
         server.join().expect("raw extension HTTP peer joins");
+    }
+
+    #[cfg(unix)]
+    fn http_owned_extension_fixture() -> (
+        HttpClient,
+        TcpListener,
+        fastmcp_protocol::ExtensionId,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let discovery_listener = listener.try_clone().unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut stream = accept_owned_extension_peer(&discovery_listener);
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["id"], 1);
+            assert_eq!(request["method"], "server/discover");
+            write_http_cache_test_response(
+                &mut stream,
+                "application/json",
+                extension_result_pair_discovery_response().as_bytes(),
+            );
+        });
+        let (id, registry, discovery) = extension_result_pair_configuration();
+        let policy =
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(3)).unwrap();
+        let client = http_test_runtime_block_on(
+            ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .client_info("owned-extension-client", "1.2.3")
+                .request_timeout_policy(policy)
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_http_client_with_cx(&Cx::for_request()),
+        )
+        .unwrap();
+        peer.join().unwrap();
+        (client, listener, id)
+    }
+
+    #[cfg(unix)]
+    fn accept_owned_extension_peer(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "owned extension POST did not arrive"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("owned extension accept failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_owned_extension_chunk(stream: &mut TcpStream, message: &str) {
+        let event = format!("data: {message}\n\n");
+        write!(stream, "{:x}\r\n{event}\r\n", event.len()).unwrap();
+        stream.flush().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_extension_json_sse_preserve_exact_results_and_request_authority() {
+        for use_sse in [false, true] {
+            let cases = [
+                (
+                    r#"{"resultType":"com.example/raw-result", "value":7.30e-2,"extra":{"n":1.20e+4}}"#,
+                    true,
+                ),
+                (
+                    r#"{"resultType":"com.example/other-result", "value":7.30e-2,"extra":{"n":1.20e+4}}"#,
+                    false,
+                ),
+                (
+                    r#"{"resultType":"com.example/unknown-result","value":21}"#,
+                    false,
+                ),
+                (r#"{"resultType":"task","value":21}"#, false),
+                (
+                    r#"{"resultType":"com.example/raw-result","_meta":null,"value":21}"#,
+                    false,
+                ),
+                (r#"{"resultType":"complete","value":21}"#, true),
+                (r#"{"value":21}"#, true),
+            ];
+            let (client, listener, extension_id) = http_owned_extension_fixture();
+            let peer = std::thread::spawn(move || {
+                for (offset, (source, _)) in cases.iter().enumerate() {
+                    let mut stream = accept_owned_extension_peer(&listener);
+                    let request = read_http_cache_test_request(&mut stream);
+                    assert_eq!(request["id"], offset + 2);
+                    assert_eq!(request["method"], "example/echo");
+                    let metadata = &request["params"]["_meta"];
+                    assert_eq!(
+                        metadata[FINAL_CLIENT_INFO_META_KEY]["name"],
+                        "owned-extension-client"
+                    );
+                    assert_eq!(
+                        metadata[FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]["com.example/raw"],
+                        serde_json::json!({"mode":"raw"})
+                    );
+                    let response = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{source}}}"#,
+                        offset + 2
+                    );
+                    if use_sse {
+                        let progress = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"owned-extension","progress":7.30e-2,"total":1.20e+4}}"#;
+                        let events = format!("data: {progress}\n\ndata: {response}\n\n");
+                        write_http_cache_test_response(
+                            &mut stream,
+                            "text/event-stream",
+                            events.as_bytes(),
+                        );
+                    } else {
+                        write_http_cache_test_response(
+                            &mut stream,
+                            "application/json",
+                            response.as_bytes(),
+                        );
+                    }
+                }
+            });
+            let cx = Cx::for_request();
+            for (source, accepted) in cases {
+                let mut execution = client
+                    .execute_final_extension(
+                        &cx,
+                        &extension_id,
+                        "example/echo",
+                        serde_json::json!({
+                            "_meta": {
+                                "progressToken": "owned-extension",
+                                FINAL_CLIENT_INFO_META_KEY: {
+                                    "name": "forged-owner",
+                                    "version": "9"
+                                },
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {
+                                    "extensions": {
+                                        "com.example/raw": {"mode": "forged"}
+                                    }
+                                }
+                            }
+                        }),
+                        http_owned_execution_limits(),
+                    )
+                    .unwrap();
+                let control = execution.control();
+                assert!(execution.raw_result_source().is_none());
+                if use_sse {
+                    let Some(ModernHttpExtensionEvent::Progress(progress)) =
+                        http_test_runtime_block_on(execution.next_event(&cx)).unwrap()
+                    else {
+                        panic!("extension progress must precede its result")
+                    };
+                    assert_eq!(progress.progress.as_str(), "7.30e-2");
+                    assert_eq!(progress.total.unwrap().as_str(), "1.20e+4");
+                    assert!(execution.raw_result_source().is_none());
+                }
+                let event = http_test_runtime_block_on(execution.next_event(&cx));
+                if accepted {
+                    let Some(ModernHttpExtensionEvent::Terminal(result)) = event.unwrap() else {
+                        panic!("owned extension emits one terminal value")
+                    };
+                    assert_eq!(
+                        result,
+                        serde_json::from_str::<serde_json::Value>(source).unwrap()
+                    );
+                    assert_eq!(execution.raw_result_source(), Some(source));
+                    assert_eq!(
+                        control.terminal_reason(),
+                        Some(ExecutionTerminalReason::FinalResponse)
+                    );
+                } else {
+                    assert!(matches!(
+                        event,
+                        Err(http_executor::ModernHttpFinalCoreListenError::ExtensionAdmission(_))
+                    ));
+                    assert!(execution.raw_result_source().is_none());
+                    assert_eq!(
+                        control.terminal_reason(),
+                        Some(ExecutionTerminalReason::PeerProtocol)
+                    );
+                }
+                assert!(
+                    http_test_runtime_block_on(execution.next_event(&cx))
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    !control.cancel(),
+                    "a selected terminal cannot be cancelled again"
+                );
+            }
+            assert!(client.final_progress_notifications.is_empty());
+            peer.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_extension_cancellation_closes_only_its_pending_post() {
+        let (client, listener, extension_id) = http_owned_extension_fixture();
+        let peer = std::thread::spawn(move || {
+            let mut pending = accept_owned_extension_peer(&listener);
+            let request = read_http_cache_test_request(&mut pending);
+            assert_eq!(request["id"], 2);
+            pending.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            write_owned_extension_chunk(
+                &mut pending,
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"pending","progress":1}}"#,
+            );
+
+            let mut sibling = accept_owned_extension_peer(&listener);
+            let request = read_http_cache_test_request(&mut sibling);
+            assert_eq!(request["id"], 3);
+            write_http_cache_test_response(&mut sibling, "application/json", br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"com.example/raw-result","value":33}}"#);
+            let mut byte = [0_u8; 1];
+            assert!(matches!(pending.read(&mut byte), Ok(0)));
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "resuming a dropped event wait must not send another POST"
+            );
+        });
+        let cx = Cx::for_request();
+        let mut pending = client
+            .execute_final_extension(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({"_meta":{"progressToken":"pending"}}),
+                http_owned_execution_limits(),
+            )
+            .unwrap();
+        let mut sibling = client
+            .execute_final_extension(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .unwrap();
+        let control = pending.control();
+        http_test_runtime_block_on(async {
+            assert!(matches!(
+                pending.next_event(&cx).await.unwrap(),
+                Some(ModernHttpExtensionEvent::Progress(_))
+            ));
+            {
+                let mut wait = Box::pin(pending.next_event(&cx));
+                assert!(
+                    std::future::poll_fn(|task| std::task::Poll::Ready(wait.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+            }
+            let Some(ModernHttpExtensionEvent::Terminal(result)) =
+                sibling.next_event(&cx).await.unwrap()
+            else {
+                panic!("sibling must complete while its owner is pending")
+            };
+            assert_eq!(result["value"], 33);
+            assert!(control.cancel());
+            assert!(!control.cancel());
+            assert!(matches!(
+                pending.next_event(&cx).await,
+                Err(http_executor::ModernHttpFinalCoreListenError::CallerCancelled { .. })
+            ));
+            assert!(pending.next_event(&cx).await.unwrap().is_none());
+            assert!(cx.checkpoint().is_ok());
+        });
+        assert_eq!(
+            control.take_cancellation_event().unwrap().reason,
+            ExecutionTerminalReason::CallerCancelled
+        );
+        assert!(control.take_cancellation_event().is_none());
+        assert!(pending.raw_result_source().is_none());
+        assert!(sibling.raw_result_source().is_some());
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_extension_resumes_dropped_wait_without_reissuing_post() {
+        let (client, listener, extension_id) = http_owned_extension_fixture();
+        let (release, released) = mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let mut stream = accept_owned_extension_peer(&listener);
+            let request = read_http_cache_test_request(&mut stream);
+            assert_eq!(request["id"], 2);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            write_owned_extension_chunk(
+                &mut stream,
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"resume","progress":1}}"#,
+            );
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_owned_extension_chunk(
+                &mut stream,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"com.example/raw-result","value":7.30e-2}}"#,
+            );
+            let mut byte = [0_u8; 1];
+            assert!(matches!(stream.read(&mut byte), Ok(0)));
+            assert!(
+                matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+            );
+        });
+        let cx = Cx::for_request();
+        let mut execution = client
+            .execute_final_extension(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({"_meta":{"progressToken":"resume"}}),
+                http_owned_execution_limits(),
+            )
+            .unwrap();
+        http_test_runtime_block_on(async {
+            assert!(matches!(
+                execution.next_event(&cx).await.unwrap(),
+                Some(ModernHttpExtensionEvent::Progress(_))
+            ));
+            {
+                let mut wait = Box::pin(execution.next_event(&cx));
+                assert!(
+                    std::future::poll_fn(|task| std::task::Poll::Ready(wait.as_mut().poll(task)))
+                        .await
+                        .is_pending()
+                );
+            }
+            assert!(execution.control().terminal_reason().is_none());
+            release.send(()).unwrap();
+            let Some(ModernHttpExtensionEvent::Terminal(value)) =
+                execution.next_event(&cx).await.unwrap()
+            else {
+                panic!("the original pending exchange must deliver its terminal")
+            };
+            assert_eq!(value["value"].to_string(), "7.30e-2");
+            assert!(execution.next_event(&cx).await.unwrap().is_none());
+        });
+        assert_eq!(
+            execution.raw_result_source(),
+            Some(r#"{"resultType":"com.example/raw-result","value":7.30e-2}"#)
+        );
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_extension_timeout_releases_stream_and_preserves_fresh_sibling() {
+        let (client, listener, extension_id) = http_owned_extension_fixture();
+        let peer = std::thread::spawn(move || {
+            let mut pending = accept_owned_extension_peer(&listener);
+            let request = read_http_cache_test_request(&mut pending);
+            assert_eq!(request["id"], 2);
+            pending.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").unwrap();
+            pending.flush().unwrap();
+            let mut byte = [0_u8; 1];
+            assert!(
+                matches!(pending.read(&mut byte), Ok(0)),
+                "timeout must release its owned response body"
+            );
+            let mut sibling = accept_owned_extension_peer(&listener);
+            let request = read_http_cache_test_request(&mut sibling);
+            assert_eq!(request["id"], 3);
+            write_http_cache_test_response(&mut sibling, "application/json", br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"com.example/raw-result","value":33}}"#);
+        });
+        let cx = Cx::for_request();
+        let policy =
+            RequestTimeoutPolicy::new(Duration::from_millis(100), Duration::from_secs(1)).unwrap();
+        let mut execution = client
+            .execute_final_extension_with_timeout_policy(
+                &cx,
+                &extension_id,
+                "example/echo",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+                policy,
+            )
+            .unwrap();
+        let control = execution.control();
+        http_test_runtime_block_on(async {
+            assert!(matches!(
+                execution.next_event(&cx).await,
+                Err(http_executor::ModernHttpFinalCoreListenError::Executor(
+                    http_executor::ModernHttpExecutorError::Timeout(RequestTimeoutSource::Idle)
+                ))
+            ));
+            assert!(execution.next_event(&cx).await.unwrap().is_none());
+            assert_eq!(
+                control.terminal_reason(),
+                Some(ExecutionTerminalReason::IdleTimeout)
+            );
+            assert_eq!(
+                control.take_cancellation_event().unwrap().reason,
+                ExecutionTerminalReason::IdleTimeout
+            );
+            assert!(control.take_cancellation_event().is_none());
+            assert!(execution.raw_result_source().is_none());
+            assert!(cx.checkpoint().is_ok());
+            let mut sibling = client
+                .execute_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/echo",
+                    serde_json::json!({}),
+                    http_owned_execution_limits(),
+                )
+                .unwrap();
+            let Some(ModernHttpExtensionEvent::Terminal(result)) =
+                sibling.next_event(&cx).await.unwrap()
+            else {
+                panic!("fresh sibling must remain usable after an extension timeout")
+            };
+            assert_eq!(result["value"], 33);
+        });
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_extension_rejects_foreign_progress_and_response_identity() {
+        let cases = [
+            (
+                r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"foreign","progress":7.30e-2}}"#,
+                false,
+            ),
+            (
+                r#"{"jsonrpc":"2.0","id":999,"result":{"resultType":"com.example/raw-result","value":21}}"#,
+                true,
+            ),
+        ];
+        for (invalid, wrong_id) in cases {
+            let (client, listener, extension_id) = http_owned_extension_fixture();
+            let peer = std::thread::spawn(move || {
+                let mut stream = accept_owned_extension_peer(&listener);
+                let request = read_http_cache_test_request(&mut stream);
+                assert_eq!(request["id"], 2);
+                let events = format!(
+                    "data: {invalid}\n\ndata: {{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"resultType\":\"com.example/raw-result\",\"value\":21}}}}\n\n"
+                );
+                write_http_cache_test_response(&mut stream, "text/event-stream", events.as_bytes());
+                let mut sibling = accept_owned_extension_peer(&listener);
+                let request = read_http_cache_test_request(&mut sibling);
+                assert_eq!(request["id"], 3);
+                write_http_cache_test_response(&mut sibling, "application/json", br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"com.example/raw-result","value":33}}"#);
+            });
+            let cx = Cx::for_request();
+            let mut execution = client
+                .execute_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/echo",
+                    serde_json::json!({"_meta":{"progressToken":"owned-extension"}}),
+                    http_owned_execution_limits(),
+                )
+                .unwrap();
+            let error = http_test_runtime_block_on(execution.next_event(&cx)).unwrap_err();
+            if wrong_id {
+                assert!(matches!(
+                    error,
+                    http_executor::ModernHttpFinalCoreListenError::ResponseIdMismatch { .. }
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    http_executor::ModernHttpFinalCoreListenError::NotificationAdmission(_)
+                ));
+            }
+            assert!(execution.raw_result_source().is_none());
+            assert!(
+                http_test_runtime_block_on(execution.next_event(&cx))
+                    .unwrap()
+                    .is_none()
+            );
+            let mut sibling = client
+                .execute_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/echo",
+                    serde_json::json!({}),
+                    http_owned_execution_limits(),
+                )
+                .unwrap();
+            assert!(matches!(
+                http_test_runtime_block_on(sibling.next_event(&cx)).unwrap(),
+                Some(ModernHttpExtensionEvent::Terminal(_))
+            ));
+            peer.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn http_owned_extension_shares_core_admission_and_rejects_before_ids_or_contact() {
+        let (client, listener, extension_id) = http_owned_extension_fixture();
+        let cx = Cx::for_request();
+        let initial_id = client.next_id.load(Ordering::Relaxed);
+        for (method, parameters) in [
+            ("example/other", serde_json::json!({})),
+            ("example/echo", serde_json::json!({"_meta": false})),
+            ("example/echo", serde_json::Value::Null),
+            (
+                "example/echo",
+                serde_json::json!({"payload":"x".repeat(MAX_HTTP_EXECUTION_REQUEST_BYTES)}),
+            ),
+        ] {
+            assert!(
+                client
+                    .execute_final_extension(
+                        &cx,
+                        &extension_id,
+                        method,
+                        parameters,
+                        http_owned_execution_limits()
+                    )
+                    .is_err()
+            );
+            assert_eq!(client.next_id.load(Ordering::Relaxed), initial_id);
+        }
+        let core = client
+            .execute_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .unwrap();
+        let mut extensions = Vec::new();
+        for _ in 1..MAX_HTTP_IN_FLIGHT_EXECUTIONS {
+            extensions.push(
+                client
+                    .execute_final_extension(
+                        &cx,
+                        &extension_id,
+                        "example/echo",
+                        serde_json::json!({}),
+                        http_owned_execution_limits(),
+                    )
+                    .unwrap(),
+            );
+        }
+        let next_id = client.next_id.load(Ordering::Relaxed);
+        assert!(
+            client
+                .execute_final_extension(
+                    &cx,
+                    &extension_id,
+                    "example/echo",
+                    serde_json::json!({}),
+                    http_owned_execution_limits()
+                )
+                .is_err()
+        );
+        assert_eq!(client.next_id.load(Ordering::Relaxed), next_id);
+        let dropped = extensions.pop().unwrap();
+        let dropped_control = dropped.control();
+        drop(dropped);
+        assert_eq!(
+            dropped_control.terminal_reason(),
+            Some(ExecutionTerminalReason::CallerDropped)
+        );
+        let replacement = client
+            .execute_core(
+                &cx,
+                "tools/list",
+                serde_json::json!({}),
+                http_owned_execution_limits(),
+            )
+            .unwrap();
+        assert_eq!(
+            client.cancel_pending_executions(),
+            MAX_HTTP_IN_FLIGHT_EXECUTIONS
+        );
+        assert_eq!(
+            core.control().terminal_reason(),
+            Some(ExecutionTerminalReason::CallerCancelled)
+        );
+        assert_eq!(
+            replacement.control().terminal_reason(),
+            Some(ExecutionTerminalReason::CallerCancelled)
+        );
+        assert!(
+            extensions
+                .iter()
+                .all(|execution| execution.control().terminal_reason()
+                    == Some(ExecutionTerminalReason::CallerCancelled))
+        );
+        assert_eq!(
+            client.owned_executions.state.lock().unwrap().request_bytes,
+            0
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[cfg(unix)]

@@ -289,8 +289,9 @@ pub mod client {
         HttpEndpointConfigError, MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT,
         MODERN_MCP_ACCEPT_ENCODING, MODERN_MCP_CONTENT_TYPE, McpConfig, ModernHttpClient,
         ModernHttpClientError, ModernHttpConnectOutcome, ModernHttpExecutor,
-        ModernHttpExecutorError, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
-        ModernHttpRequest, ModernHttpRequestControl, ModernHttpRequestExecution,
+        ModernHttpExecutorError, ModernHttpExtensionEvent, ModernHttpExtensionExecution,
+        ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequest,
+        ModernHttpRequestControl, ModernHttpRequestExecution,
         ModernHttpResponseKind, ModernHttpResponseMetadata, ModernHttpResponseStream,
         ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
@@ -1167,8 +1168,9 @@ pub use fastmcp_client::http_executor::{LegacySseHttpClient, LegacySseHttpClient
 pub use fastmcp_client::http_executor::{
     MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
     MODERN_MCP_CONTENT_TYPE, ModernHttpClient, ModernHttpClientError, ModernHttpConnectOutcome,
-    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpFinalCoreEvent,
-    ModernHttpFinalCoreListenError, ModernHttpRequest, ModernHttpRequestControl,
+    ModernHttpExecutor, ModernHttpExecutorError, ModernHttpExtensionEvent,
+    ModernHttpExtensionExecution, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+    ModernHttpRequest, ModernHttpRequestControl,
     ModernHttpRequestExecution, ModernHttpResponseKind, ModernHttpResponseMetadata,
     ModernHttpResponseStream, ModernHttpSseResponseStream, ModernHttpSubscriptionListenCollector,
     ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
@@ -1204,8 +1206,9 @@ pub mod auto {
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
-        ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError, ModernHttpRequestControl,
-        ModernHttpRequestExecution, ModernHttpSubscriptionListenCollector,
+        ModernHttpExtensionEvent, ModernHttpExtensionExecution, ModernHttpFinalCoreEvent,
+        ModernHttpFinalCoreListenError, ModernHttpRequestControl, ModernHttpRequestExecution,
+        ModernHttpSubscriptionListenCollector,
         ModernHttpSubscriptionListenError, ModernHttpSubscriptionListenEvent,
         ModernHttpSubscriptionListener, ModernHttpSubscriptionTermination,
     };
@@ -3023,8 +3026,9 @@ pub mod modern {
     pub use fastmcp_client::StdioTaskSubscriptionEvent;
     pub use fastmcp_client::http_executor::{
         MAX_MODERN_HTTP_PROBE_BODY_BYTES, MODERN_MCP_ACCEPT, MODERN_MCP_ACCEPT_ENCODING,
-        MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpFinalCoreEvent,
-        ModernHttpFinalCoreListenError, ModernHttpRequestControl, ModernHttpRequestExecution,
+        MODERN_MCP_CONTENT_TYPE, ModernHttpClientError, ModernHttpExtensionEvent,
+        ModernHttpExtensionExecution, ModernHttpFinalCoreEvent, ModernHttpFinalCoreListenError,
+        ModernHttpRequestControl, ModernHttpRequestExecution,
         ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError,
         ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListener,
         ModernHttpSubscriptionTermination,
@@ -6133,6 +6137,44 @@ pub mod modern {
         ) -> Result<ModernHttpRequestExecution, HttpClientError> {
             self.inner.execute_core_with_timeout_policy(
                 cx,
+                method,
+                parameters,
+                limits,
+                timeout_policy,
+            )
+        }
+
+        /// Prepares one independently owned negotiated extension HTTP request.
+        ///
+        /// The handle retains its exact method/result authority, cancellation,
+        /// progress and source-preserving terminal. Core and extension executions
+        /// share client admission bounds and IDs while owning independent POSTs.
+        pub fn execute_final_extension(
+            &self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+            limits: SseLimits,
+        ) -> Result<ModernHttpExtensionExecution, HttpClientError> {
+            self.inner
+                .execute_final_extension(cx, extension_id, method, parameters, limits)
+        }
+
+        /// Prepares an extension execution with stricter idle/absolute bounds.
+        /// The configured client policy and caller lifetime remain ceilings.
+        pub fn execute_final_extension_with_timeout_policy(
+            &self,
+            cx: &Cx,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+            limits: SseLimits,
+            timeout_policy: RequestTimeoutPolicy,
+        ) -> Result<ModernHttpExtensionExecution, HttpClientError> {
+            self.inner.execute_final_extension_with_timeout_policy(
+                cx,
+                extension_id,
                 method,
                 parameters,
                 limits,
@@ -11785,6 +11827,8 @@ pub mod prelude {
         ModernHttpConnectOutcome,
         ModernHttpExecutor,
         ModernHttpExecutorError,
+        ModernHttpExtensionEvent,
+        ModernHttpExtensionExecution,
         ModernHttpFinalCoreEvent,
         ModernHttpFinalCoreListenError,
         ModernHttpRequest,

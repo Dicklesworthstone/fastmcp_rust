@@ -1838,16 +1838,69 @@ pub struct ModernHttpFinalCoreCollector {
     pub terminal: FinalCoreResult,
 }
 
+/// One admitted event from an owned final extension HTTP execution.
+#[derive(Debug, Clone)]
+pub enum ModernHttpExtensionEvent {
+    /// Exact progress for this request, without floating-point conversion.
+    Progress(FinalProgressNotificationParams),
+    /// Another final server notification admitted by its declared direction.
+    Notification(ServerNotification),
+    /// The one result admitted by this request's frozen extension authority.
+    Terminal(serde_json::Value),
+}
+
+enum ModernHttpOwnedEvent {
+    Progress(FinalProgressNotificationParams),
+    Notification(ServerNotification),
+    CoreTerminal(FinalCoreResult),
+    ExtensionTerminal {
+        result: serde_json::Value,
+        raw_result_source: String,
+    },
+}
+
+impl From<ModernHttpFinalCoreEvent> for ModernHttpOwnedEvent {
+    fn from(event: ModernHttpFinalCoreEvent) -> Self {
+        match event {
+            ModernHttpFinalCoreEvent::Progress(progress) => Self::Progress(progress),
+            ModernHttpFinalCoreEvent::Notification(notification) => {
+                Self::Notification(notification)
+            }
+            ModernHttpFinalCoreEvent::Terminal(terminal) => Self::CoreTerminal(terminal),
+        }
+    }
+}
+
+enum ModernHttpOwnedListener {
+    Core(ModernHttpFinalCoreListener),
+    Extension(ModernHttpExtensionListener),
+}
+
+impl ModernHttpOwnedListener {
+    async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpOwnedEvent>, ModernHttpFinalCoreListenError> {
+        match self {
+            Self::Core(listener) => listener
+                .next_event(cx)
+                .await
+                .map(|event| event.map(Into::into)),
+            Self::Extension(listener) => listener.next_event(cx).await,
+        }
+    }
+}
+
 type ModernHttpExecutionStep = (
-    Option<ModernHttpFinalCoreListener>,
-    Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError>,
+    Option<ModernHttpOwnedListener>,
+    Result<Option<ModernHttpOwnedEvent>, ModernHttpFinalCoreListenError>,
 );
 type ModernHttpExecutionFuture =
     Pin<Box<dyn Future<Output = ModernHttpExecutionStep> + Send + 'static>>;
 
 struct ModernHttpExecutionState {
     operation: Option<ModernHttpExecutionFuture>,
-    listener: Option<ModernHttpFinalCoreListener>,
+    listener: Option<ModernHttpOwnedListener>,
     // At most one exclusive `next_event` poll and one winning retirement.
     active_cleanup_owners: u8,
     terminal_reason: Option<ExecutionTerminalReason>,
@@ -1864,7 +1917,7 @@ struct ModernHttpExecutionState {
 struct ModernHttpExecutionPollGuard {
     control: ModernHttpRequestControl,
     operation: Option<ModernHttpExecutionFuture>,
-    listener: Option<ModernHttpFinalCoreListener>,
+    listener: Option<ModernHttpOwnedListener>,
     armed: bool,
 }
 
@@ -2043,6 +2096,31 @@ impl fmt::Debug for ModernHttpRequestExecution {
 }
 
 impl ModernHttpRequestExecution {
+    fn new(
+        cx: &Cx,
+        request_id: RequestId,
+        progress_marker: Option<fastmcp_protocol::ProgressMarker>,
+        operation: ModernHttpExecutionFuture,
+    ) -> Self {
+        Self {
+            cx: cx.clone(),
+            control: ModernHttpRequestControl {
+                request_id,
+                state: Arc::new(std::sync::Mutex::new(ModernHttpExecutionState {
+                    operation: Some(operation),
+                    listener: None,
+                    active_cleanup_owners: 0,
+                    terminal_reason: None,
+                    cancellation_event: None,
+                    terminal_error: None,
+                    waker: None,
+                    progress_marker,
+                    last_progress: None,
+                })),
+            },
+        }
+    }
+
     /// Returns the exact JSON-RPC identity of the prepared request.
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
@@ -2062,6 +2140,29 @@ impl ModernHttpRequestExecution {
         &mut self,
         cx: &Cx,
     ) -> Result<Option<ModernHttpFinalCoreEvent>, ModernHttpFinalCoreListenError> {
+        self.next_owned_event(cx)
+            .await?
+            .map(|event| match event {
+                ModernHttpOwnedEvent::Progress(progress) => {
+                    Ok(ModernHttpFinalCoreEvent::Progress(progress))
+                }
+                ModernHttpOwnedEvent::Notification(notification) => {
+                    Ok(ModernHttpFinalCoreEvent::Notification(notification))
+                }
+                ModernHttpOwnedEvent::CoreTerminal(terminal) => {
+                    Ok(ModernHttpFinalCoreEvent::Terminal(terminal))
+                }
+                ModernHttpOwnedEvent::ExtensionTerminal { .. } => {
+                    Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult)
+                }
+            })
+            .transpose()
+    }
+
+    async fn next_owned_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpOwnedEvent>, ModernHttpFinalCoreListenError> {
         let (_cancellation_guard, mut cancellation_signal) = oneshot::channel::<()>();
         let mut cancelled = std::pin::pin!(cancellation_signal.recv(cx));
         let mut caller_deadline = cx.budget().deadline.map(Sleep::new);
@@ -2163,7 +2264,7 @@ impl ModernHttpRequestExecution {
                 event = Err(ModernHttpFinalCoreListenError::Executor(error));
             }
             let waker = state.waker.take();
-            if let Ok(Some(ModernHttpFinalCoreEvent::Progress(progress))) = &event {
+            if let Ok(Some(ModernHttpOwnedEvent::Progress(progress))) = &event {
                 if state.progress_marker.as_ref() != Some(&progress.progress_token)
                     || state
                         .last_progress
@@ -2180,7 +2281,13 @@ impl ModernHttpRequestExecution {
                 }
             }
             match &event {
-                Ok(Some(ModernHttpFinalCoreEvent::Terminal(_)) | None) => {
+                Ok(
+                    Some(
+                        ModernHttpOwnedEvent::CoreTerminal(_)
+                        | ModernHttpOwnedEvent::ExtensionTerminal { .. },
+                    )
+                    | None,
+                ) => {
                     state.terminal_reason = Some(ExecutionTerminalReason::FinalResponse);
                 }
                 Ok(Some(_)) => state.listener = listener.take(),
@@ -2233,6 +2340,69 @@ impl ModernHttpRequestExecution {
 impl Drop for ModernHttpRequestExecution {
     fn drop(&mut self) {
         self.control.retire(ExecutionTerminalReason::CallerDropped);
+    }
+}
+
+/// An owned final extension POST with exact request-local progress and results.
+///
+/// Network I/O begins at the first event poll. Dropping a pending event future
+/// preserves the same exchange inside the handle; polling again never reissues
+/// its POST. Dropping or cancelling the handle closes only its owned response,
+/// leaving sibling requests and the caller's context usable.
+#[derive(Debug)]
+pub struct ModernHttpExtensionExecution {
+    inner: ModernHttpRequestExecution,
+    raw_result_source: Option<String>,
+}
+
+impl ModernHttpExtensionExecution {
+    /// Returns the immutable JSON-RPC request identity.
+    #[must_use]
+    pub const fn request_id(&self) -> &RequestId {
+        self.inner.request_id()
+    }
+
+    /// Clones the request-local cancellation and terminal observation control.
+    #[must_use]
+    pub fn control(&self) -> ModernHttpRequestControl {
+        self.inner.control()
+    }
+
+    /// Returns the exact result JSON after one successful terminal event.
+    ///
+    /// This preserves number lexemes and open members that a parsed JSON value
+    /// cannot reproduce byte for byte. Errors and cancellation leave it absent.
+    #[must_use]
+    pub fn raw_result_source(&self) -> Option<&str> {
+        self.raw_result_source.as_deref()
+    }
+
+    /// Drives the next event. A terminal result or error is delivered only once.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpExtensionEvent>, ModernHttpFinalCoreListenError> {
+        let Some(event) = self.inner.next_owned_event(cx).await? else {
+            return Ok(None);
+        };
+        Ok(Some(match event {
+            ModernHttpOwnedEvent::Progress(progress) => {
+                ModernHttpExtensionEvent::Progress(progress)
+            }
+            ModernHttpOwnedEvent::Notification(notification) => {
+                ModernHttpExtensionEvent::Notification(notification)
+            }
+            ModernHttpOwnedEvent::ExtensionTerminal {
+                result,
+                raw_result_source,
+            } => {
+                self.raw_result_source = Some(raw_result_source);
+                ModernHttpExtensionEvent::Terminal(result)
+            }
+            ModernHttpOwnedEvent::CoreTerminal(_) => {
+                return Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult);
+            }
+        }))
     }
 }
 
@@ -2756,6 +2926,127 @@ pub struct ModernHttpFinalCoreListener {
     terminal_received: bool,
 }
 
+struct ModernHttpExtensionListener {
+    stream: ModernHttpSseResponseStream,
+    admission: ClientExtensionResultAdmission,
+    request_id: RequestId,
+    maximum_jsonrpc_bytes: usize,
+}
+
+impl ModernHttpExtensionListener {
+    async fn next_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpOwnedEvent>, ModernHttpFinalCoreListenError> {
+        let result = self.read_event(cx).await;
+        if !matches!(
+            result,
+            Ok(Some(
+                ModernHttpOwnedEvent::Progress(_) | ModernHttpOwnedEvent::Notification(_)
+            ))
+        ) {
+            self.stream.close();
+        }
+        result
+    }
+
+    async fn read_event(
+        &mut self,
+        cx: &Cx,
+    ) -> Result<Option<ModernHttpOwnedEvent>, ModernHttpFinalCoreListenError> {
+        let event = self
+            .stream
+            .next_event(cx)
+            .await
+            .map_err(ModernHttpFinalCoreListenError::Executor)?
+            .ok_or_else(|| ModernHttpFinalCoreListenError::EndOfStream {
+                framing: self.stream.end_of_stream(),
+            })?;
+        match decode_strict_jsonrpc_message(event.as_bytes(), self.maximum_jsonrpc_bytes)
+            .map_err(ModernHttpFinalCoreListenError::JsonRpcAdmission)?
+        {
+            JsonRpcMessage::Response(_) => decode_final_extension_terminal(
+                event.as_bytes(),
+                self.maximum_jsonrpc_bytes,
+                &self.request_id,
+                &self.admission,
+            )
+            .map(Some),
+            JsonRpcMessage::Request(request) => {
+                let notification =
+                    decode_final_http_server_notification(&request, event.as_bytes())?;
+                Ok(Some(match notification {
+                    ServerNotification::Progress(progress) => {
+                        ModernHttpOwnedEvent::Progress(progress)
+                    }
+                    notification => ModernHttpOwnedEvent::Notification(notification),
+                }))
+            }
+        }
+    }
+}
+
+fn decode_final_http_server_notification(
+    request: &JsonRpcRequest,
+    source: &[u8],
+) -> Result<ServerNotification, ModernHttpFinalCoreListenError> {
+    let raw_params = raw_final_notification_params(request, source)
+        .map_err(ModernHttpFinalCoreListenError::NotificationAdmission)?;
+    let notification = match raw_params.as_deref() {
+        Some(raw_params) => ServerNotification::decode_with_raw_params(request, raw_params),
+        None => ServerNotification::decode(request),
+    }
+    .map_err(ModernHttpFinalCoreListenError::NotificationAdmission)?;
+    if matches!(notification, ServerNotification::Cancelled(_)) {
+        return Err(ModernHttpFinalCoreListenError::ServerCancellationOnHttp);
+    }
+    Ok(notification)
+}
+
+fn decode_final_extension_terminal(
+    body: &[u8],
+    maximum_jsonrpc_bytes: usize,
+    expected_id: &RequestId,
+    authority: &ClientExtensionResultAdmission,
+) -> Result<ModernHttpOwnedEvent, ModernHttpFinalCoreListenError> {
+    let admitted = decode_strict_jsonrpc_response(body, maximum_jsonrpc_bytes)
+        .map_err(ModernHttpFinalCoreListenError::JsonRpcAdmission)?;
+    let (response, raw_result_source) = admitted.into_parts();
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|id| id.correlates_with(expected_id))
+    {
+        return Err(ModernHttpFinalCoreListenError::ResponseIdMismatch {
+            expected: expected_id.clone(),
+            actual: response.id,
+        });
+    }
+    if let Some(error) = response.error {
+        return Err(ModernHttpFinalCoreListenError::RemoteError {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let raw_result_source = raw_result_source.ok_or_else(|| {
+        ModernHttpFinalCoreListenError::ExtensionAdmission(McpError::invalid_request(
+            "HTTP extension response omitted exact result source",
+        ))
+    })?;
+    authority
+        .decode_result(&raw_result_source)
+        .map_err(ModernHttpFinalCoreListenError::ExtensionAdmission)?;
+    let result = response.result.ok_or_else(|| {
+        ModernHttpFinalCoreListenError::ExtensionAdmission(McpError::invalid_request(
+            "HTTP extension response omitted its result",
+        ))
+    })?;
+    Ok(ModernHttpOwnedEvent::ExtensionTerminal {
+        result,
+        raw_result_source,
+    })
+}
+
 impl ModernHttpFinalCoreListener {
     /// Returns the JSON-RPC request ID that owns this listener.
     #[must_use]
@@ -2843,33 +3134,14 @@ impl ModernHttpFinalCoreListener {
                 Ok(Some(ModernHttpFinalCoreEvent::Terminal(terminal)))
             }
             JsonRpcMessage::Request(request) => {
-                let raw_params = match raw_final_notification_params(&request, event.as_bytes()) {
-                    Ok(raw_params) => raw_params,
-                    Err(error) => {
-                        return self
-                            .fail(ModernHttpFinalCoreListenError::NotificationAdmission(error));
-                    }
-                };
-                let notification = match raw_params.as_deref() {
-                    Some(raw_params) => {
-                        ServerNotification::decode_with_raw_params(&request, raw_params)
-                    }
-                    None => ServerNotification::decode(&request),
-                };
-                let notification = match notification {
-                    Ok(notification) => notification,
-                    Err(error) => {
-                        return self
-                            .fail(ModernHttpFinalCoreListenError::NotificationAdmission(error));
-                    }
-                };
-
+                let notification =
+                    match decode_final_http_server_notification(&request, event.as_bytes()) {
+                        Ok(notification) => notification,
+                        Err(error) => return self.fail(error),
+                    };
                 match notification {
                     ServerNotification::Progress(progress) => {
                         Ok(Some(ModernHttpFinalCoreEvent::Progress(progress)))
-                    }
-                    ServerNotification::Cancelled(_) => {
-                        self.fail(ModernHttpFinalCoreListenError::ServerCancellationOnHttp)
                     }
                     notification => Ok(Some(ModernHttpFinalCoreEvent::Notification(notification))),
                 }
@@ -2910,7 +3182,7 @@ impl ModernHttpFinalCoreListener {
     }
 }
 
-/// Errors raised while consuming an ordinary final core HTTP SSE response stream.
+/// Errors raised while consuming an owned final core or extension HTTP response.
 #[derive(Debug)]
 #[allow(
     clippy::large_enum_variant,
@@ -2948,6 +3220,8 @@ pub enum ModernHttpFinalCoreListenError {
     },
     /// The terminal result contradicted the selected final core method.
     TerminalResult(CoreDispatchError),
+    /// The result did not satisfy this request's frozen extension authority.
+    ExtensionAdmission(McpError),
     /// A generic core listener received a Tasks-only `tools/call` result.
     TasksResultRequiresNegotiatedListener,
     /// The decoded terminal branch was not final.
@@ -2996,6 +3270,9 @@ impl fmt::Display for ModernHttpFinalCoreListenError {
             Self::TerminalResult(error) => {
                 write!(formatter, "invalid final core terminal result: {error}")
             }
+            Self::ExtensionAdmission(error) => {
+                write!(formatter, "invalid final extension terminal result: {error}")
+            }
             Self::TasksResultRequiresNegotiatedListener => formatter
                 .write_str("final core listener received a Tasks result without Tasks negotiation"),
             Self::UnexpectedTerminalResult => {
@@ -3026,6 +3303,7 @@ impl std::error::Error for ModernHttpFinalCoreListenError {
             Self::JsonRpcAdmission(error) => Some(error),
             Self::NotificationAdmission(error) => Some(error),
             Self::TerminalResult(error) => Some(error),
+            Self::ExtensionAdmission(error) => Some(error),
             Self::InvalidRequestId
             | Self::UnexpectedHttpStatus { .. }
             | Self::NonFinalCoreRequest
@@ -8185,6 +8463,94 @@ impl ModernHttpClient {
         Ok(bytes)
     }
 
+    /// Measures the exact extension envelope before admission or ID allocation.
+    pub(crate) fn owned_extension_request_bytes(
+        &self,
+        cx: &Cx,
+        method: &str,
+        parameters: &serde_json::Value,
+        maximum_metadata: usize,
+        maximum_request: usize,
+    ) -> McpResult<usize> {
+        crate::measure_serialized_bytes(parameters, maximum_request).map_err(|_| {
+            McpError::invalid_params("HTTP owned execution request byte limit exceeded")
+        })?;
+        crate::measure_serialized_bytes(
+            &(
+                &self.client_info,
+                &self.client_implementation,
+                &self.client_capabilities,
+            ),
+            maximum_metadata,
+        )
+        .map_err(|_| {
+            McpError::invalid_params("HTTP owned execution metadata byte limit exceeded")
+        })?;
+        let metadata = self
+            .build_admitted_final_extension_request(
+                cx,
+                SERVER_DISCOVER,
+                serde_json::json!({}),
+                RequestId::Number(i64::MAX),
+            )
+            .map_err(|_| {
+                McpError::invalid_params("HTTP owned extension metadata could not be encoded")
+            })?;
+        if metadata.body.len() > maximum_metadata {
+            return Err(McpError::invalid_params(
+                "HTTP owned execution metadata byte limit exceeded",
+            ));
+        }
+        let request = self
+            .build_admitted_final_extension_request(
+                cx,
+                method,
+                parameters.clone(),
+                RequestId::Number(i64::MAX),
+            )
+            .map_err(|_| {
+                McpError::invalid_params("HTTP owned extension request could not be encoded")
+            })?;
+        if request.body.len() > maximum_request {
+            return Err(McpError::invalid_params(
+                "HTTP owned execution request byte limit exceeded",
+            ));
+        }
+        Ok(request.body.len())
+    }
+
+    fn owned_execution_timeout_policy(
+        &self,
+        policy: RequestTimeoutPolicy,
+    ) -> Result<RequestTimeoutPolicy, ModernHttpFinalCoreListenError> {
+        let bounded = RequestTimeoutPolicy::new(policy.idle_timeout(), policy.absolute_timeout())
+            .map_err(|_| {
+                ModernHttpFinalCoreListenError::Executor(
+                    ModernHttpExecutorError::InvalidTimeoutPolicy,
+                )
+            })?;
+        RequestTimeoutPolicy::new(
+            bounded
+                .idle_timeout()
+                .min(self.executor.request_timeout_policy.idle_timeout()),
+            bounded
+                .absolute_timeout()
+                .min(self.executor.request_timeout_policy.absolute_timeout()),
+        )
+        .map(|effective| {
+            effective.reset_idle_on_matching_progress(
+                policy.resets_idle_on_matching_progress()
+                    && self
+                        .executor
+                        .request_timeout_policy
+                        .resets_idle_on_matching_progress(),
+            )
+        })
+        .map_err(|_| {
+            ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::InvalidTimeoutPolicy)
+        })
+    }
+
     /// Prepares one owned ordinary core execution without starting network I/O.
     ///
     /// The first [`ModernHttpRequestExecution::next_event`] poll sends one POST.
@@ -8220,31 +8586,7 @@ impl ModernHttpClient {
                 },
             ));
         }
-        let bounded_policy = RequestTimeoutPolicy::new(
-            timeout_policy.idle_timeout(),
-            timeout_policy.absolute_timeout(),
-        )
-        .map_err(|_| {
-            ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::InvalidTimeoutPolicy)
-        })?;
-        let effective_policy = RequestTimeoutPolicy::new(
-            bounded_policy
-                .idle_timeout()
-                .min(self.executor.request_timeout_policy.idle_timeout()),
-            bounded_policy
-                .absolute_timeout()
-                .min(self.executor.request_timeout_policy.absolute_timeout()),
-        )
-        .map_err(|_| {
-            ModernHttpFinalCoreListenError::Executor(ModernHttpExecutorError::InvalidTimeoutPolicy)
-        })?
-        .reset_idle_on_matching_progress(
-            timeout_policy.resets_idle_on_matching_progress()
-                && self
-                    .executor
-                    .request_timeout_policy
-                    .resets_idle_on_matching_progress(),
-        );
+        let effective_policy = self.owned_execution_timeout_policy(timeout_policy)?;
         let request = self
             .build_post_discovery_request(
                 cx,
@@ -8300,33 +8642,114 @@ impl ModernHttpClient {
                         expected_id,
                         false,
                     )?;
-                    Ok((None, Ok(Some(ModernHttpFinalCoreEvent::Terminal(terminal)))))
+                    Ok((None, Ok(Some(ModernHttpOwnedEvent::CoreTerminal(terminal)))))
                 } else {
                     let mut listener =
                         response.into_final_core_listener(expected_id, core_request, limits)?;
-                    let event = listener.next_event(&owner_cx).await;
-                    Ok((Some(listener), event))
+                    let event = listener
+                        .next_event(&owner_cx)
+                        .await
+                        .map(|event| event.map(Into::into));
+                    Ok((Some(ModernHttpOwnedListener::Core(listener)), event))
                 }
             }
             .await;
             result.unwrap_or_else(|error| (None, Err(error)))
         });
-        Ok(ModernHttpRequestExecution {
-            cx: cx.clone(),
-            control: ModernHttpRequestControl {
-                request_id,
-                state: Arc::new(std::sync::Mutex::new(ModernHttpExecutionState {
-                    operation: Some(operation),
-                    listener: None,
-                    active_cleanup_owners: 0,
-                    terminal_reason: None,
-                    cancellation_event: None,
-                    terminal_error: None,
-                    waker: None,
-                    progress_marker,
-                    last_progress: None,
-                })),
-            },
+        Ok(ModernHttpRequestExecution::new(
+            cx,
+            request_id,
+            progress_marker,
+            operation,
+        ))
+    }
+
+    /// Prepares one independently owned, bilaterally negotiated extension call.
+    ///
+    /// Request/result authority is frozen before any network contact. JSON and
+    /// SSE responses share strict correlation and the same owner-bound decoder.
+    /// Progress belongs only to this handle, preserves exact number lexemes, and
+    /// is delivered as it arrives. Per-request timeouts cannot exceed the client
+    /// policy. No Tasks lifecycle or MRTR continuation is performed implicitly.
+    pub fn execute_final_extension(
+        &self,
+        cx: &Cx,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+        request_id: RequestId,
+        limits: SseLimits,
+        timeout_policy: RequestTimeoutPolicy,
+    ) -> Result<ModernHttpExtensionExecution, ModernHttpFinalCoreListenError> {
+        check_modern_http_context(cx).map_err(ModernHttpFinalCoreListenError::Executor)?;
+        if request_id.validate().is_err() {
+            return Err(ModernHttpFinalCoreListenError::InvalidRequestId);
+        }
+        let authority = self
+            .admit_final_extension_method(extension_id, method)
+            .map_err(ModernHttpFinalCoreListenError::ExtensionAdmission)?;
+        let effective_policy = self.owned_execution_timeout_policy(timeout_policy)?;
+        let request = self
+            .build_admitted_final_extension_request(cx, method, parameters, request_id.clone())
+            .map_err(ModernHttpFinalCoreListenError::Request)?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body).map_err(|_| {
+            ModernHttpFinalCoreListenError::Request(ModernHttpClientError::RequestEncodingFailed)
+        })?;
+        let progress_marker = wire
+            .params
+            .as_ref()
+            .and_then(|params| params.pointer("/_meta/progressToken"))
+            .and_then(|marker| serde_json::from_value(marker.clone()).ok());
+        let executor = self.executor.clone().with_timeout_policy(effective_policy);
+        let owner_cx = cx.clone();
+        let expected_id = request_id.clone();
+        let operation = Box::pin(async move {
+            let result: Result<ModernHttpExecutionStep, ModernHttpFinalCoreListenError> = async {
+                let response = executor
+                    .execute(&owner_cx, &request)
+                    .await
+                    .map_err(ModernHttpFinalCoreListenError::Executor)?;
+                match response.metadata().kind() {
+                    ModernHttpResponseKind::Json => {
+                        let maximum_bytes = limits.max_event_bytes();
+                        let body = response
+                            .read_to_end(&owner_cx, maximum_bytes)
+                            .await
+                            .map_err(ModernHttpFinalCoreListenError::Executor)?;
+                        let terminal = decode_final_extension_terminal(
+                            &body,
+                            maximum_bytes,
+                            &expected_id,
+                            &authority,
+                        )?;
+                        Ok((None, Ok(Some(terminal))))
+                    }
+                    ModernHttpResponseKind::Sse => {
+                        let mut listener = ModernHttpExtensionListener {
+                            stream: response
+                                .into_sse_stream(limits)
+                                .map_err(ModernHttpFinalCoreListenError::Executor)?,
+                            admission: authority,
+                            request_id: expected_id,
+                            maximum_jsonrpc_bytes: limits.max_event_bytes(),
+                        };
+                        let event = listener.next_event(&owner_cx).await;
+                        Ok((Some(ModernHttpOwnedListener::Extension(listener)), event))
+                    }
+                    ModernHttpResponseKind::HttpFailure
+                    | ModernHttpResponseKind::EmptyAcknowledgement => {
+                        Err(ModernHttpFinalCoreListenError::UnexpectedHttpStatus {
+                            status: response.metadata().status(),
+                        })
+                    }
+                }
+            }
+            .await;
+            result.unwrap_or_else(|error| (None, Err(error)))
+        });
+        Ok(ModernHttpExtensionExecution {
+            inner: ModernHttpRequestExecution::new(cx, request_id, progress_marker, operation),
+            raw_result_source: None,
         })
     }
 
@@ -8478,6 +8901,29 @@ impl ModernHttpClient {
                 ModernHttpExecutorError::Cancelled,
             ));
         }
+        let request =
+            self.build_admitted_final_extension_request(cx, method, parameters, request_id)?;
+        match cancellation {
+            Some(cancellation) => {
+                self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
+                    .await
+            }
+            None => self.execute_post_discovery_request(cx, &request).await,
+        }
+    }
+
+    fn build_admitted_final_extension_request(
+        &self,
+        cx: &Cx,
+        method: &str,
+        mut parameters: serde_json::Value,
+        request_id: RequestId,
+    ) -> Result<ModernHttpRequest, ModernHttpClientError> {
+        if cx.checkpoint().is_err() {
+            return Err(ModernHttpClientError::Executor(
+                ModernHttpExecutorError::Cancelled,
+            ));
+        }
         if request_id.validate().is_err() {
             return Err(ModernHttpClientError::InvalidRequestId);
         }
@@ -8493,7 +8939,23 @@ impl ModernHttpClient {
                 .flatten(),
             client_extension_settings.as_ref(),
         );
-        let request = build_modern_request_after_method_validation(
+        if let Some(level) = self.final_log_level
+            && let Some(object) = parameters.as_object_mut()
+        {
+            let metadata = object
+                .entry("_meta")
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if let Some(metadata) = metadata.as_object_mut() {
+                if !metadata.contains_key(FINAL_LOG_LEVEL_META_KEY) {
+                    metadata.insert(
+                        FINAL_LOG_LEVEL_META_KEY.to_owned(),
+                        serde_json::to_value(level)
+                            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?,
+                    );
+                }
+            }
+        }
+        build_modern_request_after_method_validation(
             &self.modern_post_target,
             &self.stamped_client_identity(),
             &self.client_capabilities,
@@ -8501,14 +8963,7 @@ impl ModernHttpClient {
             parameters,
             Some(request_id),
             client_extensions.as_ref(),
-        )?;
-        match cancellation {
-            Some(cancellation) => {
-                self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
-                    .await
-            }
-            None => self.execute_post_discovery_request(cx, &request).await,
-        }
+        )
     }
 
     async fn request_with_cancellation(
