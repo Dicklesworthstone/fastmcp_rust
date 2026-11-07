@@ -1327,6 +1327,14 @@ or a durable terminal noncommit proof that fences out the original writer.
 A missing record, timeout or expired intent is insufficient. The authority
 verifies each proof against the original intent before settling it.
 
+After process loss, `RestoreEpochFacade::recover_after_restart` accepts the
+original deployment configuration and complete store union without requiring
+an existing facade. It creates only quarantined internal handles, resolves the
+persisted intents, and performs ordinary authority registration only at the
+end. Every provider request must match the authority's previously registered
+deployment, configuration and store-set identity; recovery cannot bootstrap a
+new authority namespace or silently change an epoch.
+
 Recovery permanently retires the old handles. A completed snapshot returns a
 summary; fresh handles are returned only if a new authority registration
 atomically refuses every remaining unresolved intent or closed deployment and

@@ -304,7 +304,7 @@ pub enum RestoreAuthorityOperation {
         cursor: Option<RestoreIntentCursor>,
     },
     ReconcileWrite {
-        intent: RestoreReconcileIntent,
+        intent: Box<RestoreReconcileIntent>,
         resolution: DurableRestoreResolution,
     },
 }
@@ -442,6 +442,16 @@ pub type RestoreAuthorityFuture<'a> = Pin<
 /// outcomes remain queryable by original operation ID. No fresh mutation
 /// is an implicit retry. Registration after reconciliation still atomically
 /// refuses ANY unresolved intent, including writes newer than a scan high-water.
+/// Every non-registration operation must require an ALREADY registered exact
+/// store_set_digest and matching deployment/configuration/authority/store-set/
+/// policy generations. This is essential for cold recovery: shape-valid store
+/// subsets, new namespaces or changed routes must not acquire a snapshot or
+/// reconcile another deployment's intents. The authority atomically enforces
+/// reconciliation rate/backlog, active snapshot count, and retained snapshot byte
+/// limits per PERSISTED deployment/policy across facade instances, bootstrap
+/// attempts, processes and restarts. A newly constructed facade's local rate
+/// counter is only additional admission control, never the deployment limit.
+/// Refused admissions do not allocate snapshot state or dispatch store work.
 /// Adapters must bound wire decoding before allocating response collections.
 pub trait RestoreEpochAuthority: Send + Sync + 'static {
     fn execute<'a>(
@@ -469,13 +479,71 @@ pub struct RestoreEpochFacade {
     stores: Vec<RegisteredRestoreStore>,
 }
 
+/// Private construction states never expose store handles to callers.
+enum InitialAdmission {
+    Registration,
+    Recovery,
+}
+
 impl RestoreEpochFacade {
     pub async fn register(
         cx: &Cx,
         configuration: RestoreEpochConfiguration,
-        mut stores: Vec<RestoreStoreDeclaration>,
+        stores: Vec<RestoreStoreDeclaration>,
         backend: Arc<dyn RestoreEpochAuthority>,
         deadline: Time,
+    ) -> Result<Self, RestoreError> {
+        with_operation_caller(
+            cx,
+            Self::register_inner(cx, configuration, stores, backend, deadline),
+        ).await
+    }
+
+    async fn register_inner(
+        cx: &Cx,
+        configuration: RestoreEpochConfiguration,
+        stores: Vec<RestoreStoreDeclaration>,
+        backend: Arc<dyn RestoreEpochAuthority>,
+        deadline: Time,
+    ) -> Result<Self, RestoreError> {
+        let facade = Self::configured(
+            configuration,
+            stores,
+            backend,
+            InitialAdmission::Registration,
+        )?;
+        let shared = &facade.stores[0].shared;
+        let request = shared.request(
+            cx,
+            RestoreAuthorityOperation::RegisterStoreSet {
+                stores: facade
+                    .stores
+                    .iter()
+                    .map(|store| (*store.declaration).clone())
+                    .collect(),
+            },
+            deadline,
+        )?;
+        let mut uncertain = UncertainMutation::new(Arc::clone(shared));
+        let response = shared.call(cx, &request, Some(&mut uncertain)).await?;
+        match response.outcome {
+            RestoreAuthorityOutcome::Registered {
+                store_set_digest: echoed,
+            } if echoed == shared.store_set_digest => {}
+            _ => return Err(RestoreError::InvalidReceipt),
+        }
+        uncertain.settled = true;
+        Ok(facade)
+    }
+
+    // Both normal registration and operator bootstrap validate precisely the
+    // same configuration, exact union, namespace uniqueness and process token.
+    // Recovery construction starts quarantined and cannot produce live handles.
+    fn configured(
+        configuration: RestoreEpochConfiguration,
+        mut stores: Vec<RestoreStoreDeclaration>,
+        backend: Arc<dyn RestoreEpochAuthority>,
+        admission: InitialAdmission,
     ) -> Result<Self, RestoreError> {
         configuration.validate()?;
         if stores.is_empty() || stores.len() > configuration.limits.stores {
@@ -507,29 +575,13 @@ impl RestoreEpochFacade {
             backend,
             store_set_digest,
             process,
-            quarantined: AtomicBool::new(false),
+            quarantined: AtomicBool::new(matches!(admission, InitialAdmission::Recovery)),
             recovering: AtomicBool::new(false),
             recovery_rate: Mutex::new(recovery::RecoveryRate::default()),
             calls: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             intents: AtomicUsize::new(0),
         });
-        let request = shared.request(
-            cx,
-            RestoreAuthorityOperation::RegisterStoreSet {
-                stores: stores.clone(),
-            },
-            deadline,
-        )?;
-        let mut uncertain = UncertainMutation::new(Arc::clone(&shared));
-        let response = shared.call(cx, &request, Some(&mut uncertain)).await?;
-        match response.outcome {
-            RestoreAuthorityOutcome::Registered {
-                store_set_digest: echoed,
-            } if echoed == store_set_digest => {}
-            _ => return Err(RestoreError::InvalidReceipt),
-        }
-        uncertain.settled = true;
         Ok(Self {
             stores: stores
                 .into_iter()
@@ -645,6 +697,15 @@ impl RegisteredRestoreStore {
         record_digest: [u8; 32],
         deadline: Time,
     ) -> Result<RestoreWriteFence, RestoreError> {
+        with_operation_caller(cx, self.prepare_write_inner(cx, record_digest, deadline)).await
+    }
+
+    async fn prepare_write_inner(
+        &self,
+        cx: &Cx,
+        record_digest: [u8; 32],
+        deadline: Time,
+    ) -> Result<RestoreWriteFence, RestoreError> {
         self.shared.check()?;
         let intent = OwnedIntentLease::acquire(Arc::clone(&self.shared))?;
         let (binding, generation, observed_at) = self.current(cx, deadline).await?;
@@ -691,6 +752,16 @@ impl RegisteredRestoreStore {
     /// intent. A timeout or malformed receipt retains the intent externally and
     /// quarantines this deployment; it never releases a replay reservation.
     pub async fn complete_write(
+        &self,
+        cx: &Cx,
+        fence: RestoreWriteFence,
+        receipt: DurableRestoreCommitReceipt,
+        deadline: Time,
+    ) -> Result<CompletedRestoreWrite, RestoreError> {
+        with_operation_caller(cx, self.complete_write_inner(cx, fence, receipt, deadline)).await
+    }
+
+    async fn complete_write_inner(
         &self,
         cx: &Cx,
         mut fence: RestoreWriteFence,
@@ -1273,6 +1344,30 @@ impl<F> Drop for CallerFuture<'_, F> {
         let _restriction = Cx::push_restriction(ceiling);
         drop(self.future.take());
     }
+}
+
+// Retain the narrowest caller ceiling across the ENTIRE logical operation,
+// including transitions between sequential provider awaits and final Drop.
+// Per-provider wrappers alone would forget a restriction when one await
+// finishes under its saved ceiling and the next begins in a wider ambient poll.
+async fn with_operation_caller<F: Future>(cx: &Cx, future: F) -> F::Output {
+    let mut future = CallerFuture {
+        cx,
+        ceiling: ambient_capability_ceiling(),
+        future: Some(Box::pin(future)),
+    };
+    poll_fn(|task| {
+        future.ceiling = future.ceiling.intersect(ambient_capability_ceiling());
+        let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(future.ceiling);
+        future
+            .future
+            .as_mut()
+            .expect("operation future is owned")
+            .as_mut()
+            .poll(task)
+    })
+    .await
 }
 
 async fn within_access<F: Future>(

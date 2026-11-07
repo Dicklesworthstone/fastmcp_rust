@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::runtime::block_on;
+use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
 use std::collections::BTreeMap;
 use std::task::{Context, Wake, Waker};
 
@@ -53,6 +54,7 @@ struct Store {
     unknown: AtomicBool,
     pending: AtomicBool,
     drop_effects: Arc<Mutex<Vec<[bool; 5]>>>,
+    recover_effects: Mutex<Vec<bool>>,
 }
 
 impl Store {
@@ -63,6 +65,7 @@ impl Store {
             unknown: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             drop_effects: Arc::new(Mutex::new(Vec::new())),
+            recover_effects: Mutex::new(Vec::new()),
         }
     }
 
@@ -146,6 +149,7 @@ impl RestoreStoreRecovery for Store {
         _deadline: Time,
     ) -> RestoreStoreRecoveryFuture<'a> {
         assert!(intent.store() == &self.declaration);
+        self.recover_effects.lock().unwrap().push(Cx::current().unwrap().capabilities().spawn);
         self.state.lock().unwrap().queried.push(intent.operation_id());
         if self.unknown.load(Ordering::Acquire) {
             return Box::pin(std::future::ready(Err(RestoreStoreRecoveryFailure {
@@ -201,6 +205,9 @@ struct AuthorityState {
     generation: u64,
     next_snapshot: u128,
     registrations: usize,
+    registration_attempts: usize,
+    registered_digest: Option<[u8; 32]>,
+    configuration: Option<RestoreEpochConfiguration>,
     lists: usize,
     reconciliations: Vec<([u8; 16], [u8; 16])>,
     epoch: u128,
@@ -210,6 +217,8 @@ struct Authority {
     stores: Vec<Arc<Store>>,
     state: Mutex<AuthorityState>,
     fault: Mutex<Option<Fault>>,
+    yield_current_once: AtomicBool,
+    effects: Mutex<Vec<(&'static str, bool)>>,
 }
 
 impl Authority {
@@ -218,6 +227,8 @@ impl Authority {
             stores,
             state: Mutex::new(AuthorityState { epoch: 7, ..AuthorityState::default() }),
             fault: Mutex::new(None),
+            yield_current_once: AtomicBool::new(false),
+            effects: Mutex::new(Vec::new()),
         }
     }
 
@@ -236,8 +247,18 @@ impl Authority {
         let mut state = self.state.lock().unwrap();
         let refused = || RestoreAuthorityFailure { dispatch: RestoreDispatch::Dispatched };
         let fault = *self.fault.lock().unwrap();
+        if let Some(configured) = &state.configuration {
+            if !same_configuration(configured, request.configuration())
+                || state.registered_digest != Some(request.store_set_digest())
+            {
+                return Err(refused());
+            }
+        } else if !matches!(request.operation(), RestoreAuthorityOperation::RegisterStoreSet { .. }) {
+            return Err(refused());
+        }
         let outcome = match request.operation() {
             RestoreAuthorityOperation::RegisterStoreSet { stores } => {
+                state.registration_attempts += 1;
                 if !state.intents.is_empty()
                     || (!state.stores.is_empty() && state.stores != *stores)
                 {
@@ -247,6 +268,8 @@ impl Authority {
                     state.epoch += 1;
                 }
                 state.stores = stores.clone();
+                state.configuration = Some(request.configuration().clone());
+                state.registered_digest = Some(request.store_set_digest());
                 state.registrations += 1;
                 RestoreAuthorityOutcome::Registered { store_set_digest: request.store_set_digest() }
             }
@@ -423,8 +446,45 @@ impl Authority {
 
 impl RestoreEpochAuthority for Authority {
     fn execute<'a>(&'a self, _cx: &'a Cx, request: &'a RestoreAuthorityRequest) -> RestoreAuthorityFuture<'a> {
-        Box::pin(std::future::ready(self.execute_operation(request)))
+        let phase = match request.operation() {
+            RestoreAuthorityOperation::RegisterStoreSet { .. } => "register",
+            RestoreAuthorityOperation::Current { .. } => "current",
+            RestoreAuthorityOperation::PrepareWrite { .. } => "prepare",
+            RestoreAuthorityOperation::CompleteWrite { .. } => "complete",
+            RestoreAuthorityOperation::ListUnresolvedWrites { .. } => "scan",
+            RestoreAuthorityOperation::ReconcileWrite { .. } => "reconcile",
+        };
+        self.effects.lock().unwrap().push((phase, Cx::current().unwrap().capabilities().spawn));
+        let result = self.execute_operation(request);
+        if matches!(request.operation(), RestoreAuthorityOperation::Current { .. })
+            && self.yield_current_once.swap(false, Ordering::AcqRel)
+        {
+            let mut yielded = false;
+            let mut result = Some(result);
+            return Box::pin(poll_fn(move |task| {
+                if yielded {
+                    Poll::Ready(result.take().expect("one response"))
+                } else {
+                    yielded = true;
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            }));
+        }
+        Box::pin(std::future::ready(result))
     }
+}
+
+fn same_configuration(left: &RestoreEpochConfiguration, right: &RestoreEpochConfiguration) -> bool {
+    left.authority_id == right.authority_id
+        && left.provider_artifact == right.provider_artifact
+        && left.provider_artifact_digest == right.provider_artifact_digest
+        && left.configuration_fingerprint == right.configuration_fingerprint
+        && left.authority_generation == right.authority_generation
+        && left.deployment_uuid == right.deployment_uuid
+        && left.store_set_generation == right.store_set_generation
+        && left.policy_generation == right.policy_generation
+        && left.certificate_mode == right.certificate_mode
 }
 
 fn cursor_token(snapshot: [u8; 16], offset: usize) -> Vec<u8> {
@@ -901,4 +961,249 @@ fn noncommit_receipt_requires_a_new_durable_fence_and_bounded_proof() {
         refused(DurableRestoreNonCommitReceipt::new([1; 16], [2; 32], old, [3; 32], new, proof),
             RestoreError::InvalidReceipt);
     }
+}
+
+
+fn declared(stores: &[Arc<Store>]) -> Vec<RestoreStoreDeclaration> {
+    stores.iter().map(|store| store.declaration.clone()).collect()
+}
+
+#[test]
+fn cold_start_recovers_committed_and_noncommitted_intents_without_initial_registration() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        let committed = prepare(&cx, &facade, "browser", 31).await;
+        let uncommitted = prepare(&cx, &facade, "replay", 32).await;
+        let committed_id = committed.operation_id();
+        let uncommitted_id = uncommitted.operation_id();
+        let binding = committed.binding_digest();
+        let _receipt = stores[0].commit(&committed);
+        drop(committed);
+        drop(uncommitted);
+        drop(facade);
+        refused(RestoreEpochFacade::register(
+            &cx, configuration(), declared(&stores), authority.clone(), Time::MAX,
+        ).await, RestoreError::Uncertain);
+        let before = authority.state.lock().unwrap().registration_attempts;
+        let outcome = RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), declared(&stores), authority.clone(), adapters(&stores),
+            RestoreRecoveryLimits { page_items: 1, ..RestoreRecoveryLimits::default() }, Time::MAX,
+        ).await.unwrap();
+        assert_eq!(outcome.summary().committed, 1);
+        assert_eq!(outcome.summary().fenced_not_committed, 1);
+        assert_eq!(outcome.summary().pages, 2);
+        let recovered = outcome.into_facade().unwrap();
+        assert!(!recovered.is_quarantined());
+        let observed = recovered.store("browser").unwrap().current_binding(&cx, Time::MAX).await.unwrap();
+        assert_eq!(observed.binding().digest(), binding);
+        let state = authority.state.lock().unwrap();
+        assert!(state.intents.is_empty());
+        assert_eq!(state.registration_attempts, before + 1, "only the final real admission transaction");
+        assert!(state.settled.contains_key(&committed_id));
+        assert!(state.settled.contains_key(&uncommitted_id));
+    });
+}
+
+#[test]
+fn cold_start_shape_valid_store_subset_cannot_scan_the_registered_union() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        abandon_two(&cx, &facade).await;
+        drop(facade);
+        refused(RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), vec![stores[0].declaration.clone()], authority.clone(),
+            vec![stores[0].clone()], RestoreRecoveryLimits::default(), Time::MAX,
+        ).await, RestoreError::Uncertain);
+        let state = authority.state.lock().unwrap();
+        assert_eq!(state.lists, 0);
+        assert!(state.reconciliations.is_empty());
+        assert_eq!(state.intents.len(), 2);
+        assert_eq!(state.registrations, 1);
+    });
+}
+
+#[test]
+fn cold_start_changed_configuration_cannot_adopt_existing_authority_state() {
+    for changed in 0..3 {
+        block_on(async {
+            let cx = Cx::current().unwrap();
+            let (facade, authority, stores) = setup(&cx).await;
+            drop(prepare(&cx, &facade, "browser", 31).await);
+            drop(facade);
+            let mut config = configuration();
+            match changed {
+                0 => config.deployment_uuid[0] ^= 1,
+                1 => config.configuration_fingerprint[0] ^= 1,
+                _ => config.policy_generation += 1,
+            }
+            refused(RestoreEpochFacade::recover_after_restart(
+                &cx, config, declared(&stores), authority.clone(), adapters(&stores),
+                RestoreRecoveryLimits::default(), Time::MAX,
+            ).await, RestoreError::Uncertain);
+            let state = authority.state.lock().unwrap();
+            assert_eq!(state.lists, 0);
+            assert!(state.reconciliations.is_empty());
+            assert_eq!(state.intents.len(), 1);
+            assert_eq!(state.registrations, 1);
+        });
+    }
+}
+
+#[test]
+fn cold_start_newer_unresolved_intent_still_blocks_final_registration() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        drop(prepare(&cx, &facade, "browser", 31).await);
+        drop(facade);
+        authority.inject(Fault::NewerIntent);
+        let outcome = RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), declared(&stores), authority.clone(), adapters(&stores),
+            RestoreRecoveryLimits::default(), Time::MAX,
+        ).await.unwrap();
+        assert_eq!(outcome.summary().fenced_not_committed, 1);
+        assert_eq!(outcome.registration_error(), Some(RestoreError::Uncertain));
+        refused(outcome.into_facade(), RestoreError::Uncertain);
+        let state = authority.state.lock().unwrap();
+        assert_eq!(state.intents.len(), 1);
+        assert!(state.intents.contains_key(&[0xfe; 16]));
+        assert_eq!(state.registrations, 1);
+    });
+}
+
+#[test]
+fn cold_start_unknown_store_proof_preserves_intent_for_later_operator_attempt() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        let fence = prepare(&cx, &facade, "browser", 31).await;
+        let original = fence.operation_id();
+        drop(fence);
+        drop(facade);
+        stores[0].unknown.store(true, Ordering::Release);
+        refused(RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), declared(&stores), authority.clone(), adapters(&stores),
+            RestoreRecoveryLimits::default(), Time::MAX,
+        ).await, RestoreError::Uncertain);
+        assert!(authority.state.lock().unwrap().intents.contains_key(&original));
+        assert!(stores[0].state.lock().unwrap().facts.is_empty());
+        assert_eq!(authority.state.lock().unwrap().registrations, 1);
+        stores[0].unknown.store(false, Ordering::Release);
+        let recovered = RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), declared(&stores), authority.clone(), adapters(&stores),
+            RestoreRecoveryLimits::default(), Time::MAX,
+        ).await.unwrap().into_facade().unwrap();
+        assert!(!recovered.is_quarantined());
+        assert!(authority.state.lock().unwrap().intents.is_empty());
+        assert_eq!(stores[0].state.lock().unwrap().queried, vec![original, original]);
+    });
+}
+
+#[test]
+fn cold_start_cannot_create_a_new_authority_registration_or_epoch() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let stores = vec![Arc::new(Store::new("browser", 7)), Arc::new(Store::new("replay", 8))];
+        let authority = Arc::new(Authority::new(stores.clone()));
+        refused(RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), declared(&stores), authority.clone(), adapters(&stores),
+            RestoreRecoveryLimits::default(), Time::MAX,
+        ).await, RestoreError::Uncertain);
+        let state = authority.state.lock().unwrap();
+        assert!(state.stores.is_empty());
+        assert_eq!(state.lists, 0);
+        assert_eq!(state.registration_attempts, 0);
+        assert_eq!(state.registrations, 0);
+    });
+}
+
+#[test]
+fn cold_start_final_current_must_match_the_preserved_scan_binding() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        drop(prepare(&cx, &facade, "browser", 31).await);
+        drop(facade);
+        authority.inject(Fault::ChangedBinding);
+        let outcome = RestoreEpochFacade::recover_after_restart(
+            &cx, configuration(), declared(&stores), authority.clone(), adapters(&stores),
+            RestoreRecoveryLimits::default(), Time::MAX,
+        ).await.unwrap();
+        assert_eq!(outcome.registration_error(), Some(RestoreError::Quarantined));
+        refused(outcome.into_facade(), RestoreError::Quarantined);
+        assert!(authority.state.lock().unwrap().intents.is_empty());
+    });
+}
+
+
+#[test]
+fn preparation_retains_earlier_narrow_ceiling_across_current_to_prepare_transition() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        authority.effects.lock().unwrap().clear();
+        authority.yield_current_once.store(true, Ordering::Release);
+        let store = facade.store("browser").unwrap();
+        let mut preparation = Box::pin(store.prepare_write(&cx, [41; 32], Time::MAX));
+        {
+            let _restriction = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+            assert!(poll_once(preparation.as_mut()).is_pending());
+        }
+        assert!(Cx::current().unwrap().capabilities().spawn);
+        let fence = preparation.await.unwrap();
+        assert_eq!(authority.effects.lock().unwrap().as_slice(), &[("current", false), ("prepare", false)]);
+        let receipt = stores[0].commit(&fence);
+        store.complete_write(&cx, fence, receipt, Time::MAX).await.unwrap();
+        assert!(!facade.is_quarantined());
+    });
+}
+
+#[test]
+fn recovery_retains_earlier_narrow_ceiling_across_scan_store_reconcile_and_register() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        drop(prepare(&cx, &facade, "browser", 41).await);
+        authority.effects.lock().unwrap().clear();
+        authority.yield_current_once.store(true, Ordering::Release);
+        let mut recovery = Box::pin(facade.recover(&cx, adapters(&stores), RestoreRecoveryLimits::default(), Time::MAX));
+        {
+            let _restriction = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+            assert!(poll_once(recovery.as_mut()).is_pending());
+        }
+        assert!(Cx::current().unwrap().capabilities().spawn);
+        let recovered = recovery.await.unwrap().into_facade().unwrap();
+        assert!(!recovered.is_quarantined());
+        assert!(authority.effects.lock().unwrap().iter().all(|(_, spawn)| !spawn));
+        assert_eq!(stores[0].recover_effects.lock().unwrap().as_slice(), &[false]);
+        let effects = authority.effects.lock().unwrap();
+        for required in ["current", "scan", "reconcile", "register"] {
+            assert!(effects.iter().any(|(phase, _)| *phase == required));
+        }
+    });
+}
+
+#[test]
+fn recovery_drop_after_later_provider_transition_keeps_the_original_ceiling() {
+    block_on(async {
+        let cx = Cx::current().unwrap();
+        let (facade, authority, stores) = setup(&cx).await;
+        drop(prepare(&cx, &facade, "browser", 41).await);
+        authority.yield_current_once.store(true, Ordering::Release);
+        stores[0].pending.store(true, Ordering::Release);
+        let mut recovery = Box::pin(facade.recover(&cx, adapters(&stores), RestoreRecoveryLimits::default(), Time::MAX));
+        {
+            let _restriction = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+            assert!(poll_once(recovery.as_mut()).is_pending());
+        }
+        assert!(Cx::current().unwrap().capabilities().spawn);
+        assert!(poll_once(recovery.as_mut()).is_pending(), "later store provider is now pending");
+        drop(recovery);
+        assert_eq!(stores[0].drop_effects.lock().unwrap().as_slice(), &[[false, true, true, true, true]]);
+        assert_eq!(stores[0].recover_effects.lock().unwrap().as_slice(), &[false]);
+        assert!(facade.is_quarantined());
+        assert_eq!(authority.state.lock().unwrap().intents.len(), 1);
+    });
 }

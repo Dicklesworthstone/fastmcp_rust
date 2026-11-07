@@ -416,6 +416,14 @@ impl RegisteredRestoreStore {
         cx: &Cx,
         deadline: Time,
     ) -> Result<RestoreBindingObservation, RestoreError> {
+        with_operation_caller(cx, self.current_binding_inner(cx, deadline)).await
+    }
+
+    async fn current_binding_inner(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+    ) -> Result<RestoreBindingObservation, RestoreError> {
         let (binding, generation, observed_at) = self.current(cx, deadline).await?;
         let observation = RestoreBindingObservation {
             store: self.clone(),
@@ -434,6 +442,16 @@ impl RegisteredRestoreStore {
     /// proved CAS loser to return a normal conflict without quarantining every
     /// store. Any ambiguous/malformed outcome still drops an unresolved fence.
     pub async fn reconcile_write(
+        &self,
+        cx: &Cx,
+        fence: RestoreWriteFence,
+        resolution: DurableRestoreResolution,
+        deadline: Time,
+    ) -> Result<ReconciledRestoreWrite, RestoreError> {
+        with_operation_caller(cx, self.reconcile_write_inner(cx, fence, resolution, deadline)).await
+    }
+
+    async fn reconcile_write_inner(
         &self,
         cx: &Cx,
         mut fence: RestoreWriteFence,
@@ -486,7 +504,10 @@ async fn reconcile(
     let outcome = resolution.outcome();
     let request = shared.request_with_access(
         cx,
-        RestoreAuthorityOperation::ReconcileWrite { intent, resolution },
+        RestoreAuthorityOperation::ReconcileWrite {
+            intent: Box::new(intent),
+            resolution,
+        },
         deadline,
         access,
     )?;
@@ -599,6 +620,36 @@ impl Drop for RecoveryLease {
 
 
 impl RestoreEpochFacade {
+    /// Operator bootstrap after process loss, when no old facade survives and
+    /// ordinary registration correctly refuses persisted unresolved intents.
+    ///
+    /// This constructs only an inaccessible quarantined facade. The authority
+    /// must already know the EXACT declared store union and configuration, and
+    /// must reject a different union/configuration on every Current/scan/settle
+    /// request. No initial registration, fresh deployment UUID, epoch reset,
+    /// namespace wipe or caller assertion substitutes for that durable identity.
+    /// Live handles escape only after the normal recovery consumer obtains a
+    /// real final registration and matching certified bindings for every store.
+    pub async fn recover_after_restart(
+        cx: &Cx,
+        configuration: RestoreEpochConfiguration,
+        declarations: Vec<RestoreStoreDeclaration>,
+        backend: Arc<dyn RestoreEpochAuthority>,
+        stores: Vec<Arc<dyn RestoreStoreRecovery>>,
+        limits: RestoreRecoveryLimits,
+        deadline: Time,
+    ) -> Result<RestoreRecoveryOutcome, RestoreError> {
+        with_operation_caller(cx, async move {
+            let retired = Self::configured(
+                configuration,
+                declarations,
+                backend,
+                InitialAdmission::Recovery,
+            )?;
+            retired.recover(cx, stores, limits, deadline).await
+        }).await
+    }
+
     /// Reconcile a bounded immutable snapshot using the exact predeclared store
     /// union. The old facade remains quarantined even on successful recovery.
     ///
@@ -607,6 +658,16 @@ impl RestoreEpochFacade {
     /// The operator can start a new bounded scan, which queries persisted state
     /// for the original intent IDs instead of replaying an uncertain mutation.
     pub async fn recover(
+        &self,
+        cx: &Cx,
+        stores: Vec<Arc<dyn RestoreStoreRecovery>>,
+        limits: RestoreRecoveryLimits,
+        deadline: Time,
+    ) -> Result<RestoreRecoveryOutcome, RestoreError> {
+        with_operation_caller(cx, self.recover_inner(cx, stores, limits, deadline)).await
+    }
+
+    async fn recover_inner(
         &self,
         cx: &Cx,
         mut stores: Vec<Arc<dyn RestoreStoreRecovery>>,
