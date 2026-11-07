@@ -54,7 +54,7 @@ mod execution;
 mod memory;
 #[cfg(feature = "tasks")]
 mod task_wait;
-#[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+#[cfg(feature = "tasks")]
 pub use task_wait::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
 pub use task_wait::{FinalTaskWaitOutcome, FinalTaskWaitPolicy};

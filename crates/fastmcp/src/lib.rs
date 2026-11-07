@@ -321,7 +321,7 @@ pub mod client {
         SubscriptionTimeoutPolicy,
     };
     /// Tasks client APIs are available only with the official Tasks extension.
-    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    #[cfg(feature = "tasks")]
     pub use crate::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use crate::{
@@ -1108,7 +1108,7 @@ pub use fastmcp_client::{ResourceSubscriptionRelations, SubscriptionListenReques
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_client::{WebSocketClient, WebSocketResponse};
 
-#[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+#[cfg(feature = "tasks")]
 pub use fastmcp_client::FinalTaskStreamWatch;
 #[cfg(feature = "tasks")]
 pub use fastmcp_client::{
@@ -1247,7 +1247,7 @@ pub mod auto {
     pub use fastmcp_transport::Transport;
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
-    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    #[cfg(feature = "tasks")]
     pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
@@ -3250,7 +3250,7 @@ pub mod modern {
     };
     pub use serde_json::{Map as JsonMap, Value as JsonValue};
 
-    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    #[cfg(feature = "tasks")]
     pub use fastmcp_client::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use fastmcp_client::{
@@ -12278,7 +12278,7 @@ pub mod prelude {
         tool,
         validate_final_core_result,
     };
-    #[cfg(all(feature = "tasks", any(unix, feature = "websocket-experimental")))]
+    #[cfg(feature = "tasks")]
     pub use crate::FinalTaskStreamWatch;
     #[cfg(feature = "tasks")]
     pub use crate::{

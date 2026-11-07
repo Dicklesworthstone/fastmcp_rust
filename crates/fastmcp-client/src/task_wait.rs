@@ -18,15 +18,12 @@ use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 use crate::WebSocketClient;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 #[cfg(unix)]
-use crate::{Client, SubscriptionTimeoutPolicy};
+use crate::Client;
 use crate::{
     FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses, FinalUpdateTaskResult,
-    HttpClient, HttpClientError, MemoryClient, TaskInputLedger,
-};
-#[cfg(any(unix, feature = "websocket-experimental"))]
-use crate::{
-    FinalTaskWatchEvent, RequestId, StdioTaskSubscriptionEvent, SubscriptionFilter,
-    task_subscription_ids,
+    FinalTaskWatchEvent, HttpClient, HttpClientError, MemoryClient, MemorySubscriptionEvent,
+    MemorySubscriptionExecution, RequestId, StdioTaskSubscriptionEvent, SubscriptionFilter,
+    SubscriptionTimeoutPolicy, TaskInputLedger, task_subscription_ids,
 };
 
 /// Explicit finite limits for one observation of an already-created Task.
@@ -379,6 +376,29 @@ impl FinalTaskHandle {
         open_task_stream_watch(self, cx, client, cancellation).await
     }
 
+    /// Watches this Task through an independently owned Memory subscription.
+    ///
+    /// The existing connection driver admits acknowledgements and exact Task
+    /// snapshots while retaining unrelated request and subscription events.
+    /// Equal or regressed conflicting snapshots cause one authoritative read;
+    /// neither polling nor input callbacks run otherwise. The default listen
+    /// lifetime is tightened by the caller deadline and live Task retention.
+    ///
+    /// Dropping an event wait preserves its subscription. Dropping the watch
+    /// retires only its listen request and defers the id-only cancellation
+    /// control to the next client operation. Remote Tasks are never cancelled
+    /// implicitly, and no runtime or competing ingress reader is constructed.
+    pub async fn watch_with_memory<'client, 'handle>(
+        &'handle mut self,
+        cx: &Cx,
+        client: &'client mut MemoryClient,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<
+        FinalTaskStreamWatch<'client, 'handle, MemoryClient, MemorySubscriptionExecution>,
+    > {
+        open_task_stream_watch(self, cx, client, cancellation).await
+    }
+
     /// Watches this Task through the existing WebSocket subscription owner.
     ///
     /// The client's subscription timeout policy bounds the entire watch;
@@ -400,7 +420,7 @@ impl FinalTaskHandle {
     }
 }
 
-/// A caller-driven Task watch on a retained stdio or WebSocket connection.
+/// A caller-driven Task watch on a retained Memory, stdio or WebSocket connection.
 ///
 /// This watcher borrows the existing client and handle, so it cannot introduce
 /// a competing ingress reader or a second request-ID allocator. It yields the
@@ -415,19 +435,17 @@ impl FinalTaskHandle {
 /// watch because its ambiguous notification cannot be silently forgotten.
 /// Dropping the watcher retires its exact subscription without cancelling the
 /// remote Task, a catalog listener, or an unrelated request.
-#[cfg(any(unix, feature = "websocket-experimental"))]
-pub struct FinalTaskStreamWatch<'client, 'handle, T> {
+pub struct FinalTaskStreamWatch<'client, 'handle, T, O = RequestId> {
     handle: &'handle mut FinalTaskHandle,
     client: &'client mut T,
-    request_id: Option<RequestId>,
+    owner: Option<O>,
     budget: Option<WaitBudget>,
     observing: bool,
     stop_reason: Option<FinalTaskWaitOutcome>,
-    abandon: fn(&mut T, &RequestId),
+    abandon: fn(&mut T, O),
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
-impl<T> FinalTaskStreamWatch<'_, '_, T> {
+impl<T, O> FinalTaskStreamWatch<'_, '_, T, O> {
     /// Returns the latest fully admitted Task, including its exact result.
     #[must_use]
     pub fn task(&self) -> &FinalTask {
@@ -446,12 +464,28 @@ impl<T> FinalTaskStreamWatch<'_, '_, T> {
     }
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
-impl<T> Drop for FinalTaskStreamWatch<'_, '_, T> {
+impl<T, O> Drop for FinalTaskStreamWatch<'_, '_, T, O> {
     fn drop(&mut self) {
-        if let Some(request_id) = self.request_id.take() {
-            (self.abandon)(self.client, &request_id);
+        if let Some(owner) = self.owner.take() {
+            (self.abandon)(self.client, owner);
         }
+    }
+}
+
+impl FinalTaskStreamWatch<'_, '_, MemoryClient, MemorySubscriptionExecution> {
+    /// Receives one acknowledged, changed or authoritatively reconciled Task.
+    ///
+    /// Exact repeats are skipped. A conflicting freshness hint causes one
+    /// bounded read through the same Memory client. Cancellation, deadline or
+    /// retention expiry preserves the latest admitted snapshot and returns
+    /// `None` with a typed [`Self::stop_reason`]. A terminal Task is yielded
+    /// once before its independent listener is retired.
+    pub async fn next_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<Option<FinalTaskWatchEvent>> {
+        next_task_stream_event(self, cx, cancellation).await
     }
 }
 
@@ -493,8 +527,9 @@ where
     }
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 trait TaskWatchTransport: TaskWaitTransport<Error = McpError> {
+    type Owner;
+
     fn watch_timeout(&self) -> Duration;
     fn live_watch_id(&self) -> Option<RequestId>;
     async fn open_watch(
@@ -502,18 +537,77 @@ trait TaskWatchTransport: TaskWaitTransport<Error = McpError> {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         filter: SubscriptionFilter,
+        owner: &mut Option<Self::Owner>,
     ) -> McpResult<()>;
     async fn next_watch_event(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
+        owner: &mut Self::Owner,
     ) -> McpResult<StdioTaskSubscriptionEvent>;
-    async fn cancel_watch(&mut self, request_id: &RequestId) -> McpResult<()>;
-    fn abandon_watch(&mut self, request_id: &RequestId);
+    async fn cancel_watch(&mut self, cx: &Cx, owner: &mut Self::Owner) -> McpResult<()>;
+    fn abandon_watch(&mut self, owner: Self::Owner);
+}
+
+impl TaskWatchTransport for MemoryClient {
+    type Owner = MemorySubscriptionExecution;
+
+    fn watch_timeout(&self) -> Duration {
+        SubscriptionTimeoutPolicy::default().absolute_timeout()
+    }
+
+    fn live_watch_id(&self) -> Option<RequestId> {
+        // Memory subscriptions are owned independently by their handles; an
+        // unrelated live listener never reserves a singleton Tasks slot.
+        None
+    }
+
+    async fn open_watch(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        filter: SubscriptionFilter,
+        owner: &mut Option<Self::Owner>,
+    ) -> McpResult<()> {
+        *owner = Some(self.subscribe(cx, cancellation, filter).await?);
+        Ok(())
+    }
+
+    async fn next_watch_event(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        owner: &mut Self::Owner,
+    ) -> McpResult<StdioTaskSubscriptionEvent> {
+        match self.next_subscription_event(cx, cancellation, owner).await? {
+            Some(MemorySubscriptionEvent::Acknowledged { accepted, .. }) => {
+                Ok(StdioTaskSubscriptionEvent::Acknowledged(accepted))
+            }
+            Some(MemorySubscriptionEvent::Task(notification)) => {
+                Ok(StdioTaskSubscriptionEvent::Notification(*notification))
+            }
+            Some(MemorySubscriptionEvent::Terminal) | None => {
+                Ok(StdioTaskSubscriptionEvent::Terminal)
+            }
+            Some(MemorySubscriptionEvent::Notification(_)) => Err(McpError::invalid_request(
+                "Final Task watch received an unrequested core notification",
+            )),
+        }
+    }
+
+    async fn cancel_watch(&mut self, cx: &Cx, owner: &mut Self::Owner) -> McpResult<()> {
+        self.cancel_subscription(cx, owner)
+    }
+
+    fn abandon_watch(&mut self, owner: Self::Owner) {
+        drop(owner);
+    }
 }
 
 #[cfg(unix)]
 impl TaskWatchTransport for Client {
+    type Owner = RequestId;
+
     fn watch_timeout(&self) -> Duration {
         SubscriptionTimeoutPolicy::default().absolute_timeout()
     }
@@ -529,21 +623,26 @@ impl TaskWatchTransport for Client {
         cx: &Cx,
         cancellation: &McpRequestCancellation,
         filter: SubscriptionFilter,
+        owner: &mut Option<Self::Owner>,
     ) -> McpResult<()> {
-        self.open_final_task_subscription_listener_with_cx(cx, cancellation, filter)
-            .await
+        let result = self
+            .open_final_task_subscription_listener_with_cx(cx, cancellation, filter)
+            .await;
+        *owner = self.live_watch_id();
+        result
     }
 
     async fn next_watch_event(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
+        _owner: &mut Self::Owner,
     ) -> McpResult<StdioTaskSubscriptionEvent> {
         self.next_final_task_subscription_event_with_cx(cx, cancellation)
             .await
     }
 
-    async fn cancel_watch(&mut self, request_id: &RequestId) -> McpResult<()> {
+    async fn cancel_watch(&mut self, _cx: &Cx, request_id: &mut Self::Owner) -> McpResult<()> {
         if self
             .live_watch_id()
             .is_some_and(|owned| owned.correlates_with(request_id))
@@ -553,10 +652,10 @@ impl TaskWatchTransport for Client {
         Ok(())
     }
 
-    fn abandon_watch(&mut self, request_id: &RequestId) {
+    fn abandon_watch(&mut self, request_id: Self::Owner) {
         if self
             .live_watch_id()
-            .is_some_and(|owned| owned.correlates_with(request_id))
+            .is_some_and(|owned| owned.correlates_with(&request_id))
         {
             // RequestExecution::drop installs the exact tombstone and queues
             // its cancellation for the sole connection driver. No I/O here.
@@ -570,6 +669,8 @@ impl<IO> TaskWatchTransport for WebSocketClient<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    type Owner = RequestId;
+
     fn watch_timeout(&self) -> Duration {
         self.subscription_timeout_policy.absolute_timeout()
     }
@@ -586,20 +687,24 @@ where
         cx: &Cx,
         _cancellation: &McpRequestCancellation,
         filter: SubscriptionFilter,
+        owner: &mut Option<Self::Owner>,
     ) -> McpResult<()> {
-        self.open_final_task_subscription_listener(cx, filter).await
+        let result = self.open_final_task_subscription_listener(cx, filter).await;
+        *owner = self.live_watch_id();
+        result
     }
 
     async fn next_watch_event(
         &mut self,
         cx: &Cx,
         cancellation: &McpRequestCancellation,
+        _owner: &mut Self::Owner,
     ) -> McpResult<StdioTaskSubscriptionEvent> {
         self.next_final_task_subscription_event(cx, cancellation)
             .await
     }
 
-    async fn cancel_watch(&mut self, request_id: &RequestId) -> McpResult<()> {
+    async fn cancel_watch(&mut self, _cx: &Cx, request_id: &mut Self::Owner) -> McpResult<()> {
         if self
             .live_task_subscription
             .as_ref()
@@ -610,9 +715,9 @@ where
         Ok(())
     }
 
-    fn abandon_watch(&mut self, request_id: &RequestId) {
+    fn abandon_watch(&mut self, request_id: Self::Owner) {
         if let Some(subscription) = self.live_task_subscription.as_mut()
-            && subscription.request_id.correlates_with(request_id)
+            && subscription.request_id.correlates_with(&request_id)
         {
             // The next connection operation owns the bounded cancellation
             // write. Keep its exact slot rather than creating a new queue.
@@ -621,19 +726,18 @@ where
     }
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
     handle: &'handle mut FinalTaskHandle,
     cx: &Cx,
     client: &'client mut T,
     cancellation: &McpRequestCancellation,
-) -> McpResult<FinalTaskStreamWatch<'client, 'handle, T>> {
+) -> McpResult<FinalTaskStreamWatch<'client, 'handle, T, T::Owner>> {
     let terminal = handle.is_terminal();
     let mut watch = FinalTaskStreamWatch {
         stop_reason: terminal.then(|| ready_outcome(handle.task())).flatten(),
         handle,
         client,
-        request_id: None,
+        owner: None,
         budget: None,
         observing: false,
         abandon: T::abandon_watch,
@@ -662,21 +766,23 @@ async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
         .guard(
             cx,
             cancellation,
-            watch.client.open_watch(cx, cancellation, filter),
+            watch
+                .client
+                .open_watch(cx, cancellation, filter, &mut watch.owner),
         )
         .await;
-    // The guard can select cancellation immediately after open committed.
-    // Capture the new owner before inspecting that result so it cannot leak.
-    watch.request_id = watch.client.live_watch_id();
+    // Each adapter stores its exact owner before the open future returns.
+    // The guard can then select cancellation immediately after publication
+    // without losing ownership of the newly committed listen request.
     match opened {
         Ok(result) => result?,
         Err(reason) => {
             watch.stop_reason = Some(reason);
-            stop_task_stream_watch(&mut watch).await?;
+            stop_task_stream_watch(&mut watch, cx).await?;
             return Ok(watch);
         }
     }
-    if watch.request_id.is_none() {
+    if watch.owner.is_none() {
         return Err(McpError::internal_error(
             "Final Task watch lost its listen owner",
         ));
@@ -686,20 +792,19 @@ async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
     Ok(watch)
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 async fn stop_task_stream_watch<T: TaskWatchTransport>(
-    watch: &mut FinalTaskStreamWatch<'_, '_, T>,
+    watch: &mut FinalTaskStreamWatch<'_, '_, T, T::Owner>,
+    cx: &Cx,
 ) -> McpResult<()> {
-    if let Some(request_id) = watch.request_id.as_ref() {
-        watch.client.cancel_watch(request_id).await?;
-        watch.request_id = None;
+    if let Some(owner) = watch.owner.as_mut() {
+        watch.client.cancel_watch(cx, owner).await?;
+        watch.owner = None;
     }
     Ok(())
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 async fn next_task_stream_event<T: TaskWatchTransport>(
-    watch: &mut FinalTaskStreamWatch<'_, '_, T>,
+    watch: &mut FinalTaskStreamWatch<'_, '_, T, T::Owner>,
     cx: &Cx,
     cancellation: &McpRequestCancellation,
 ) -> McpResult<Option<FinalTaskWatchEvent>> {
@@ -708,14 +813,13 @@ async fn next_task_stream_event<T: TaskWatchTransport>(
         watch.observing = false;
     }
     if !watch.observing {
-        stop_task_stream_watch(watch).await?;
+        stop_task_stream_watch(watch, cx).await?;
     }
     result
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 async fn next_task_stream_event_inner<T: TaskWatchTransport>(
-    watch: &mut FinalTaskStreamWatch<'_, '_, T>,
+    watch: &mut FinalTaskStreamWatch<'_, '_, T, T::Owner>,
     cx: &Cx,
     cancellation: &McpRequestCancellation,
 ) -> McpResult<Option<FinalTaskWatchEvent>> {
@@ -728,7 +832,11 @@ async fn next_task_stream_event_inner<T: TaskWatchTransport>(
             .guard(
                 cx,
                 cancellation,
-                watch.client.next_watch_event(cx, cancellation),
+                watch.client.next_watch_event(
+                    cx,
+                    cancellation,
+                    watch.owner.as_mut().expect("a live watch has an owner"),
+                ),
             )
             .await
         {
@@ -820,14 +928,13 @@ async fn next_task_stream_event_inner<T: TaskWatchTransport>(
             }
             StdioTaskSubscriptionEvent::Terminal => {
                 watch.observing = false;
-                watch.request_id = None;
+                watch.owner = None;
                 return Ok(None);
             }
         }
     }
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 fn task_watch_comparison_error(error: HttpClientError) -> McpError {
     match error {
         HttpClientError::CoreResult(error) => error,
@@ -1397,3 +1504,7 @@ mod input_stdio_tests;
 #[cfg(all(test, any(unix, feature = "websocket-experimental")))]
 #[path = "task_watch_tests.rs"]
 mod watch_tests;
+
+#[cfg(test)]
+#[path = "task_watch_memory_tests.rs"]
+mod memory_watch_tests;
