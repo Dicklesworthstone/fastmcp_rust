@@ -449,19 +449,469 @@ mod typed_client {
     }
 }
 
+mod subscriptions {
+    use super::*;
+    use std::future::{Future, poll_fn};
+    use std::pin::pin;
+    use std::task::Poll;
+
+    use fastmcp_rust::{
+        ClientInfo, CoreResult, FinalCoreResult, McpError, McpErrorCode,
+        McpRequestCancellation, MemorySubscriptionEvent, ServerNotification,
+        SubscriptionFilter, resource, serde_json,
+    };
+
+    const RESOURCE: &str = "memory://subscriptions/observed";
+
+    #[resource(uri = "memory://subscriptions/observed")]
+    async fn memory_observed(ctx: &McpContext) -> McpResult<String> {
+        ctx.checkpoint()?;
+        Ok("current resource value".to_owned())
+    }
+
+    #[tool]
+    async fn memory_emit(ctx: &McpContext, category: String) -> McpResult<bool> {
+        ctx.checkpoint()?;
+        match category.as_str() {
+            "resource" => Ok(ctx.notify_resource_updated(RESOURCE)),
+            "tools" => Ok(ctx.disable_tool("memory_echo")),
+            "restore" => Ok(ctx.enable_tool("memory_echo")),
+            _ => Err(McpError::invalid_params("unknown fixture category")),
+        }
+    }
+
+    async fn emit(cx: &Cx, client: &mut modern::MemoryClient, category: &str) {
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = client
+            .call_tool(
+                cx, &McpRequestCancellation::new(), "memory_emit", json!({"category": category}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("publishing a change must not consume a listener's result");
+        };
+        assert!(!result.payload.is_error);
+        assert_eq!(serde_json::to_value(result.payload).unwrap()["content"][0]["text"], "true");
+    }
+
+    #[test]
+    fn memory_subscriptions_multiplex_real_catalog_and_resource_events_with_owned_teardown() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                let server = modern::ServerBuilder::new("memory-subscriptions", "1")
+                    .tool(MemoryEcho)
+                    .tool(MemoryEmit)
+                    .resource(MemoryObservedResource)
+                    .build();
+                let (transport, peer) = create_memory_transport_pair_with_capacity(1);
+                let mut serving = cx
+                    .spawn(move |serve_cx| async move { server.serve_memory(&serve_cx, peer).await })
+                    .unwrap();
+                let mut client = modern::MemoryClient::builder(ClientInfo {
+                    name: "memory-subscription-client".to_owned(),
+                    version: "1".to_owned(),
+                })
+                .connect(&cx, transport)
+                .await
+                .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let mut catalog: fastmcp_rust::prelude::MemorySubscriptionExecution = client
+                    .subscribe(&cx, &cancellation, SubscriptionFilter {
+                        tools_list_changed: Some(true),
+                        ..SubscriptionFilter::default()
+                    })
+                    .await
+                    .unwrap();
+                let Some(MemorySubscriptionEvent::Acknowledged { accepted, .. }) = client
+                    .next_subscription_event(&cx, &cancellation, &mut catalog)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the actual server must acknowledge the catalog listener first");
+                };
+                assert_eq!(accepted.tools_list_changed, Some(true));
+                assert_eq!(catalog.accepted_filter(), Some(accepted));
+                let mut resource = client
+                    .subscribe(&cx, &cancellation, SubscriptionFilter {
+                        resource_subscriptions: Some(vec![RESOURCE.to_owned()]),
+                        ..SubscriptionFilter::default()
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation, &mut resource).await.unwrap(),
+                    Some(MemorySubscriptionEvent::Acknowledged { accepted, .. })
+                        if accepted.resource_subscriptions == Some(vec![RESOURCE.to_owned()])
+                ));
+
+                // Abandon only a pending event wait, then drive ordinary
+                // requests. Both listener owners and their ingress survive.
+                {
+                    let mut waiting = pin!(client.next_subscription_event(
+                        &cx, &cancellation, &mut resource,
+                    ));
+                    assert!(poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                }
+                emit(&cx, &mut client, "resource").await;
+                emit(&cx, &mut client, "tools").await;
+                let Some(MemorySubscriptionEvent::Notification(notification)) = client
+                    .next_subscription_event(&cx, &cancellation, &mut catalog)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the catalog owner must retain its notification while calls run");
+                };
+                assert!(matches!(*notification, ServerNotification::ToolsListChanged(_)));
+                assert_eq!(
+                    notification.encode().unwrap().params.unwrap()["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    serde_json::to_value(catalog.request_id()).unwrap(),
+                );
+                let Some(MemorySubscriptionEvent::Notification(notification)) = client
+                    .next_subscription_event(&cx, &cancellation, &mut resource)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the resource owner must retain its separate notification");
+                };
+                assert!(matches!(*notification, ServerNotification::ResourceUpdated(_)));
+                let wire = notification.encode().unwrap();
+                let params = wire.params.unwrap();
+                assert_eq!(params["uri"], RESOURCE);
+                assert_eq!(params["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                    serde_json::to_value(resource.request_id()).unwrap());
+                assert!(client.take_server_notifications().is_empty());
+
+                client.cancel_subscription(&cx, &mut catalog).unwrap();
+                assert_eq!(
+                    client.next_subscription_event(&cx, &cancellation, &mut catalog)
+                        .await.unwrap_err().code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert!(catalog.terminal_result().is_none());
+                emit(&cx, &mut client, "resource").await;
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation, &mut resource).await.unwrap(),
+                    Some(MemorySubscriptionEvent::Notification(notification))
+                        if matches!(*notification, ServerNotification::ResourceUpdated(_))
+                ));
+
+                // An empty accepted filter remains a live listener. Local
+                // cancellation must not fabricate a successful complete result.
+                let mut empty = client
+                    .subscribe(&cx, &cancellation, SubscriptionFilter::default())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    client.next_subscription_event(&cx, &cancellation, &mut empty).await.unwrap(),
+                    Some(MemorySubscriptionEvent::Acknowledged { accepted, .. })
+                        if accepted == SubscriptionFilter::default()
+                ));
+                {
+                    let mut waiting = pin!(client.next_subscription_event(
+                        &cx, &cancellation, &mut empty,
+                    ));
+                    assert!(poll_fn(|task| Poll::Ready(waiting.as_mut().poll(task))).await.is_pending());
+                }
+                client.cancel_subscription(&cx, &mut empty).unwrap();
+                assert_eq!(
+                    client.next_subscription_event(&cx, &cancellation, &mut empty)
+                        .await.unwrap_err().code,
+                    McpErrorCode::RequestCancelled,
+                );
+                assert!(empty.terminal_result().is_none());
+                assert!(client.next_subscription_event(&cx, &cancellation, &mut empty).await.unwrap().is_none());
+
+                drop(resource);
+                emit(&cx, &mut client, "restore").await;
+                client.call_tool(&cx, &cancellation, "memory_echo", json!({"value": "listeners retired"})).await.unwrap();
+                assert!(client.take_server_notifications().is_empty());
+                client.close(&cx).unwrap();
+                serving.join(&cx).await.unwrap().unwrap();
+                assert!(cx.checkpoint().is_ok());
+            })
+            .await
+            .expect("subscriptions and ordinary work must share bounded Memory transport");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+}
+
+mod interactions {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+
+    use fastmcp_rust::{
+        ClientCapabilities, ClientInfo, CompleteResult, CoreResult, FinalCoreResult,
+        FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalGetPromptResult,
+        FinalMethodOutcome, FinalReadResourceResult, FinalRootsContextExt,
+        FinalSamplingContextExt, FinalToolOutcome, McpError, McpRequestCancellation,
+        MrtrCompletedInputs, ResultMeta, ReverseRequestHandlers, prompt, resource, serde_json,
+    };
+
+    #[tool]
+    async fn memory_interactive_tool(
+        ctx: &McpContext,
+        subject: String,
+        completed_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalToolOutcome> {
+        ctx.checkpoint()?;
+        let Some(inputs) = completed_inputs else {
+            return Ok(FinalToolOutcome::InputRequired(
+                ctx.final_sampling(
+                    "sample",
+                    serde_json::from_value(json!({
+                        "messages": [{"role": "user", "content": {
+                            "type": "text", "text": subject,
+                        }}],
+                        "maxTokens": 16,
+                    }))
+                    .unwrap(),
+                )?
+                .into_input_required()?,
+            ));
+        };
+        let sample = inputs
+            .sampling("sample")?
+            .ok_or_else(|| McpError::internal_error("missing admitted sample"))?;
+        Ok(FinalToolOutcome::Complete(CompleteResult::new(
+            serde_json::from_value(json!({
+                "content": [{"type": "text", "text": format!("{subject}:{}", sample.model)}],
+                "isError": false,
+            }))
+            .unwrap(),
+            ResultMeta::empty(),
+        )))
+    }
+
+    #[resource(uri = "memory://interactive/{subject}")]
+    async fn memory_interactive_resource(
+        ctx: &McpContext,
+        subject: String,
+        completed_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalReadResourceResult>> {
+        ctx.checkpoint()?;
+        let Some(inputs) = completed_inputs else {
+            return Ok(FinalMethodOutcome::InputRequired(
+                ctx.final_roots("roots", FinalEmbeddedRootsListParams::default())?
+                    .into_input_required()?,
+            ));
+        };
+        let roots = inputs
+            .roots("roots")?
+            .ok_or_else(|| McpError::internal_error("missing admitted roots"))?;
+        Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+            serde_json::from_value(json!({
+                "contents": [{
+                    "uri": format!("memory://interactive/{subject}"),
+                    "text": format!("{subject}:{}", roots.roots.len()),
+                }],
+                "ttlMs": 0,
+                "cacheScope": "private",
+            }))
+            .unwrap(),
+            ResultMeta::empty(),
+        )))
+    }
+
+    #[prompt]
+    async fn memory_interactive_prompt(
+        ctx: &McpContext,
+        subject: String,
+        completed_inputs: Option<&MrtrCompletedInputs>,
+    ) -> McpResult<FinalMethodOutcome<FinalGetPromptResult>> {
+        ctx.checkpoint()?;
+        let Some(inputs) = completed_inputs else {
+            return Ok(FinalMethodOutcome::InputRequired(
+                ctx.final_elicitation_form(
+                    "approval",
+                    "Approve the memory operation",
+                    json!({
+                        "type": "object", "properties": {"approved": {"type": "boolean"}},
+                        "required": ["approved"],
+                    }),
+                )?
+                .into_input_required()?,
+            ));
+        };
+        let answer = inputs
+            .elicitation("approval")?
+            .ok_or_else(|| McpError::internal_error("missing admitted approval"))?;
+        Ok(FinalMethodOutcome::Complete(CompleteResult::new(
+            serde_json::from_value(json!({
+                "messages": [{"role": "assistant", "content": {
+                    "type": "text", "text": format!(
+                        "{subject}:{}", answer.get_bool("approved").unwrap_or(false)
+                    ),
+                }}],
+            }))
+            .unwrap(),
+            ResultMeta::empty(),
+        )))
+    }
+
+    fn handlers(calls: &Arc<AtomicUsize>) -> ReverseRequestHandlers {
+        let sampling = Arc::clone(calls);
+        let roots = Arc::clone(calls);
+        let elicitation = Arc::clone(calls);
+        let worker = std::thread::current().id();
+        ReverseRequestHandlers::new()
+            .with_modern_sampling_create_message(move |cx, _, params| {
+                let calls = Arc::clone(&sampling);
+                Box::pin(async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    assert!(cx.blocking_pool_handle().is_none());
+                    assert_eq!(serde_json::to_value(params).unwrap()["maxTokens"], 16);
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    asupersync::runtime::yield_now().await;
+                    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                    Ok(serde_json::from_value(json!({
+                        "role": "assistant", "model": "caller-model",
+                        "content": {"type": "text", "text": "sampled résumé"},
+                    }))
+                    .unwrap())
+                })
+            })
+            .with_modern_roots_list(move |cx, _, _| {
+                let calls = Arc::clone(&roots);
+                Box::pin(async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    assert!(cx.blocking_pool_handle().is_none());
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    asupersync::runtime::yield_now().await;
+                    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                    Ok(serde_json::from_value(json!({"roots": []})).unwrap())
+                })
+            })
+            .with_modern_elicitation_create(move |cx, _, _| {
+                let calls = Arc::clone(&elicitation);
+                Box::pin(async move {
+                    assert_eq!(std::thread::current().id(), worker);
+                    assert!(cx.blocking_pool_handle().is_none());
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    asupersync::runtime::yield_now().await;
+                    cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+                    Ok(serde_json::from_value(json!({
+                        "action": "accept", "content": {"approved": true},
+                    }))
+                    .unwrap())
+                })
+            })
+    }
+
+    #[test]
+    fn memory_interactions_resolve_sampling_roots_and_elicitation_through_the_real_server() {
+        for installed in [false, true] {
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let cx = Cx::current().unwrap();
+                asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                    let server = modern::ServerBuilder::new("memory-interactions", "1")
+                        .tool(MemoryEcho)
+                        .tool(MemoryInteractiveTool)
+                        .resource(MemoryInteractiveResourceResource)
+                        .prompt(MemoryInteractivePromptPrompt)
+                        .build();
+                    let (transport, peer) = create_memory_transport_pair_with_capacity(1);
+                    let mut serving = cx
+                        .spawn(move |serve_cx| async move { server.serve_memory(&serve_cx, peer).await })
+                        .unwrap();
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let capabilities: ClientCapabilities = serde_json::from_value(json!({
+                        "sampling": {}, "roots": {}, "elicitation": {"form": {}},
+                    }))
+                    .unwrap();
+                    let builder = modern::MemoryClient::builder(ClientInfo {
+                        name: "memory-interactions-client".to_owned(),
+                        version: "1".to_owned(),
+                    })
+                    .capabilities(capabilities);
+                    let builder = if installed {
+                        builder.reverse_request_handlers(handlers(&calls))
+                    } else {
+                        builder
+                    };
+                    let mut client = builder.connect(&cx, transport).await.unwrap();
+                    let cancellation = McpRequestCancellation::new();
+                    let tool = client
+                        .call_tool(
+                            &cx, &cancellation, "memory_interactive_tool", json!({"subject": "tool"}),
+                        )
+                        .await
+                        .unwrap();
+                    let resource = client
+                        .read_resource(&cx, &cancellation, "memory://interactive/resource")
+                        .await
+                        .unwrap();
+                    let prompt = client
+                        .get_prompt(
+                            &cx, &cancellation, "memory_interactive_prompt",
+                            HashMap::from([("subject".to_owned(), "prompt".to_owned())]),
+                        )
+                        .await
+                        .unwrap();
+                    if installed {
+                        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = tool else {
+                            panic!("sampling must complete the original tool invocation");
+                        };
+                        assert_eq!(serde_json::to_value(result.payload).unwrap()["content"][0]["text"], "tool:caller-model");
+                        let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) = resource else {
+                            panic!("roots must complete the original resource read");
+                        };
+                        assert_eq!(serde_json::to_value(result.payload).unwrap()["contents"][0]["text"], "resource:0");
+                        let CoreResult::Final(FinalCoreResult::PromptsGet { result, .. }) = prompt else {
+                            panic!("elicitation must complete the original prompt invocation");
+                        };
+                        assert_eq!(serde_json::to_value(result.payload).unwrap()["messages"][0]["content"]["text"], "prompt:true");
+                        assert_eq!(calls.load(Ordering::Acquire), 3);
+                    } else {
+                        for result in [tool, resource, prompt] {
+                            let required = match result {
+                                CoreResult::Final(FinalCoreResult::ToolsCallInputRequired { result, .. })
+                                | CoreResult::Final(FinalCoreResult::ResourcesReadInputRequired { result, .. })
+                                | CoreResult::Final(FinalCoreResult::PromptsGetInputRequired { result, .. }) => result,
+                                _ => panic!("without handlers the typed input-required result remains caller-owned"),
+                            };
+                            assert!(required.request_state().is_some());
+                        }
+                        assert_eq!(calls.load(Ordering::Acquire), 0);
+                    }
+                    client.call_tool(&cx, &cancellation, "memory_echo", json!({"value": "still live"})).await.unwrap();
+                    assert!(cx.checkpoint().is_ok());
+                    client.close(&cx).unwrap();
+                    serving.join(&cx).await.unwrap().unwrap();
+                })
+                .await
+                .expect("all three interaction kinds must progress on their caller runtime");
+            });
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+}
+
 #[cfg(feature = "tasks")]
 mod typed_tasks {
     use super::*;
+    use asupersync::Outcome;
     use std::future::Future;
     use std::sync::atomic::AtomicUsize;
 
     use fastmcp_rust::{
-        ApplicationTaskSupervisor, ClientCapabilities, ClientInfo, Content, ContentBlock,
+        ApplicationTaskSupervisor, BoxFuture, ClientCapabilities, ClientInfo, Content, ContentBlock,
         CoreResult, FinalCoreResult, FinalTask, FinalTaskCallToolResult, FinalTaskId,
         FinalTaskInputRequests, FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig,
-        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
-        FinalToolCallOutcome, FinalToolOutcome, McpError, McpRequestCancellation, Tool,
-        ToolHandler, serde_json,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWaitOutcome,
+        FinalTaskWaitPolicy, FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome,
+        McpError, McpErrorCode, McpOutcome, McpRequestCancellation, MemorySubscriptionEvent,
+        SubscriptionFilter, Tool, ToolExecutionMode, ToolHandler, serde_json,
     };
 
     const TASK_TOOL: &str = "memory-task";
@@ -502,6 +952,10 @@ mod typed_tasks {
             true
         }
 
+        fn execution_mode(&self) -> ToolExecutionMode {
+            ToolExecutionMode::Async
+        }
+
         fn call_final_outcome(
             &self,
             _ctx: &McpContext,
@@ -511,6 +965,21 @@ mod typed_tasks {
             Ok(FinalToolOutcome::CreateTask {
                 work_descriptor: FinalTaskWorkDescriptor::new(arguments)?,
                 status_message: Some("accepted over memory transport".to_owned()),
+            })
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            _request_cx: &'a Cx,
+            arguments: JsonValue,
+        ) -> BoxFuture<'a, McpOutcome<FinalToolOutcome>> {
+            Box::pin(async move {
+                assert!(ctx.cx().blocking_pool_handle().is_none());
+                match self.call_final_outcome(ctx, arguments) {
+                    Ok(outcome) => Outcome::Ok(outcome),
+                    Err(error) => Outcome::Err(error),
+                }
             })
         }
     }
@@ -593,7 +1062,7 @@ mod typed_tasks {
 
     fn task_runtime() -> FinalTaskRuntime {
         FinalTaskRuntime::in_memory(
-            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+            FinalTaskRuntimeConfig::new(60_000, Some(5)).unwrap(),
             Arc::new(|_| {}),
         )
     }
@@ -670,10 +1139,38 @@ mod typed_tasks {
                 panic!("explicitly negotiated Tasks must admit task creation");
             };
             let id = created.task.base().task_id.clone();
-            let waiting = wait_for_task(&cx, &mut client, &id, |task| {
-                matches!(task, FinalTask::InputRequired { .. })
-            })
-            .await;
+            let mut handle = client
+                .attach_final_task(&cx, &cancellation, id.clone())
+                .await
+                .unwrap();
+            let wait_policy = FinalTaskWaitPolicy::new(
+                Duration::from_secs(2),
+                256,
+                Duration::from_millis(5),
+            )
+            .unwrap();
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, wait_policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::InputRequired,
+            );
+            let waiting = handle.task().clone();
+            let filter: SubscriptionFilter = serde_json::from_value(json!({
+                "taskIds": [id.as_str()],
+            }))
+            .unwrap();
+            let mut observation = client.subscribe(&cx, &cancellation, filter).await.unwrap();
+            let Some(MemorySubscriptionEvent::Acknowledged { accepted, unsupported }) = client
+                .next_subscription_event(&cx, &cancellation, &mut observation)
+                .await
+                .unwrap()
+            else {
+                panic!("the real server must acknowledge the exact Task listener");
+            };
+            assert_eq!(accepted.additional["taskIds"], json!([id.as_str()]));
+            assert!(unsupported.additional.is_empty());
             let wrong: FinalTaskInputResponses =
                 serde_json::from_value(json!({"different-key": {"roots": []}})).unwrap();
             assert!(
@@ -694,15 +1191,28 @@ mod typed_tasks {
 
             let input: FinalTaskInputResponses =
                 serde_json::from_value(json!({"roots": {"roots": []}})).unwrap();
-            client
-                .update_task_final(&cx, &cancellation, &waiting, input)
+            let before = serde_json::to_value(handle.task()).unwrap();
+            handle
+                .resume_input_with_memory(&cx, &mut client, &cancellation, input)
                 .await
                 .unwrap();
-            let completed = wait_for_task(&cx, &mut client, &id, |task| {
-                matches!(task, FinalTask::Completed { .. })
-            })
-            .await;
-            let FinalTask::Completed { result, .. } = completed else {
+            assert_eq!(
+                serde_json::to_value(handle.task()).unwrap(),
+                before,
+                "an update acknowledgement does not manufacture a newer Task snapshot",
+            );
+            handle
+                .poll_with_memory(&cx, &mut client, &cancellation)
+                .await
+                .unwrap();
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, wait_policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::Completed,
+            );
+            let FinalTask::Completed { result, .. } = handle.task() else {
                 unreachable!();
             };
             assert_eq!(
@@ -713,6 +1223,39 @@ mod typed_tasks {
                 }),
             );
             assert_eq!(effects.resumed.load(Ordering::Acquire), 1);
+            loop {
+                let Some(MemorySubscriptionEvent::Task(notification)) = client
+                    .next_subscription_event(&cx, &cancellation, &mut observation)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("an acknowledged Task listener must deliver its state changes");
+                };
+                assert_eq!(notification.params.task.base().task_id, id);
+                if matches!(&notification.params.task, FinalTask::Completed { .. }) {
+                    let wire = serde_json::to_value(&notification).unwrap();
+                    assert_eq!(
+                        wire["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+                        serde_json::to_value(observation.request_id()).unwrap(),
+                    );
+                    assert_eq!(
+                        serde_json::to_value(&notification.params.task).unwrap(),
+                        serde_json::to_value(handle.task()).unwrap(),
+                        "subscription delivery and authoritative polling must agree",
+                    );
+                    break;
+                }
+            }
+            client.cancel_subscription(&cx, &mut observation).unwrap();
+            assert_eq!(
+                client
+                    .next_subscription_event(&cx, &cancellation, &mut observation)
+                    .await
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled,
+            );
+            assert!(observation.terminal_result().is_none());
 
             let FinalToolCallOutcome::Task(holding) = client
                 .call_tool_final_outcome(&cx, &cancellation, TASK_TOOL, json!({"mode": "hold"}))
