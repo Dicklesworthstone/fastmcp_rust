@@ -2630,6 +2630,72 @@ fn resource_result_ok() {
     assert_eq!(result[0].text, Some("ok".to_string()));
 }
 
+#[resource(uri = "status://{state}", mime_type = "text/plain")]
+fn fallible_numeric_resource(state: String) -> McpResult<u64> {
+    if state == "ready" {
+        Ok(42)
+    } else {
+        Err(McpError::invalid_params("status unavailable"))
+    }
+}
+
+#[test]
+fn resource_result_fallback_formats_only_the_successful_payload() {
+    let handler = FallibleNumericResourceResource;
+    let ctx = test_ctx();
+    let params = HashMap::from([("state".to_owned(), "ready".to_owned())]);
+    let contents = handler
+        .read_with_uri(&ctx, "status://ready", &params)
+        .expect("the numeric Ok payload is a text resource");
+    assert_eq!(contents.len(), 1);
+    assert_eq!(contents[0].uri, "status://ready");
+    assert_eq!(contents[0].mime_type.as_deref(), Some("text/plain"));
+    assert_eq!(contents[0].text.as_deref(), Some("42"));
+    assert!(contents[0].blob.is_none());
+
+    let params = HashMap::from([("state".to_owned(), "missing".to_owned())]);
+    let error = handler
+        .read_with_uri(&ctx, "status://missing", &params)
+        .expect_err("an Err is never converted into resource text");
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidParams);
+    assert_eq!(error.message, "status unavailable");
+}
+
+#[resource(uri = "flag://{state}")]
+async fn fallible_boolean_resource(state: String) -> Result<bool, &'static str> {
+    asupersync::runtime::yield_now().await;
+    if state == "ready" {
+        Ok(true)
+    } else {
+        Err("flag unavailable")
+    }
+}
+
+#[test]
+fn async_resource_result_fallback_maps_errors_without_formatting_them() {
+    for (state, succeeds) in [("ready", true), ("missing", false)] {
+        let ctx = test_ctx();
+        let params = HashMap::from([("state".to_owned(), state.to_owned())]);
+        let outcome = run_outcome(async move {
+            FallibleBooleanResourceResource
+                .read_async_with_uri(&ctx, &format!("flag://{state}"), &params)
+                .await
+        });
+        if succeeds {
+            let contents = expect_outcome_ok(outcome);
+            assert_eq!(contents.len(), 1);
+            assert_eq!(contents[0].uri, "flag://ready");
+            assert_eq!(contents[0].text.as_deref(), Some("true"));
+        } else {
+            let Outcome::Err(error) = outcome else {
+                panic!("failed resource must retain an error outcome");
+            };
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+            assert_eq!(error.message, "flag unavailable");
+        }
+    }
+}
+
 // --- Final complete resource result projection ---
 
 fn final_result_meta() -> ResultMeta {
@@ -3468,6 +3534,82 @@ fn prompt_result_err() {
         .get(&ctx, args)
         .expect_err("prompt should return an error");
     assert_eq!(err.code, fastmcp_rust::McpErrorCode::InvalidParams);
+}
+
+type AliasedPromptMessages = Vec<PromptMessage>;
+
+#[prompt]
+fn fallible_aliased_prompt(fail: Option<String>) -> Result<AliasedPromptMessages, &'static str> {
+    if fail.is_some() {
+        Err("aliased prompt unavailable")
+    } else {
+        Ok(vec![PromptMessage {
+            role: Role::User,
+            content: Content::Text {
+                text: "aliased prompt".to_owned(),
+            },
+        }])
+    }
+}
+
+#[test]
+fn prompt_result_fallback_accepts_message_alias_and_maps_error() {
+    let handler = FallibleAliasedPromptPrompt;
+    let ctx = test_ctx();
+    let messages = handler
+        .get(&ctx, HashMap::new())
+        .expect("an aliased message vector retains the ordinary prompt contract");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, Role::User);
+    assert_eq!(expect_text(&messages[0].content), "aliased prompt");
+
+    let error = handler
+        .get(&ctx, HashMap::from([("fail".to_owned(), "true".to_owned())]))
+        .expect_err("the same aliased prompt preserves its error branch");
+    assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+    assert_eq!(error.message, "aliased prompt unavailable");
+}
+
+#[prompt]
+async fn fallible_aliased_async_prompt(fail: Option<String>) -> McpResult<AliasedPromptMessages> {
+    asupersync::runtime::yield_now().await;
+    if fail.is_some() {
+        Err(McpError::invalid_params("async aliased prompt unavailable"))
+    } else {
+        Ok(vec![PromptMessage {
+            role: Role::Assistant,
+            content: Content::Text {
+                text: "async aliased prompt".to_owned(),
+            },
+        }])
+    }
+}
+
+#[test]
+fn async_prompt_result_fallback_preserves_mcp_error() {
+    for fail in [false, true] {
+        let ctx = test_ctx();
+        let args = if fail {
+            HashMap::from([("fail".to_owned(), "true".to_owned())])
+        } else {
+            HashMap::new()
+        };
+        let outcome = run_outcome(async move {
+            FallibleAliasedAsyncPromptPrompt.get_async(&ctx, args).await
+        });
+        if fail {
+            let Outcome::Err(error) = outcome else {
+                panic!("failed prompt must retain an error outcome");
+            };
+            assert_eq!(error.code, fastmcp_rust::McpErrorCode::InvalidParams);
+            assert_eq!(error.message, "async aliased prompt unavailable");
+        } else {
+            let messages = expect_outcome_ok(outcome);
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].role, Role::Assistant);
+            assert_eq!(expect_text(&messages[0].content), "async aliased prompt");
+        }
+    }
 }
 
 // --- Final complete prompt result projection ---

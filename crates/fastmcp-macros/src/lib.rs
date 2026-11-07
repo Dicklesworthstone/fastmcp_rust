@@ -1944,7 +1944,13 @@ fn analyze_prompt_type(ty: &Type) -> PromptReturnTypeKind {
                                         PromptReturnTypeKind::ResultVecPromptMessage
                                     }
                                 }
-                                _ => PromptReturnTypeKind::Other,
+                                // The payload may be a type alias that the macro cannot
+                                // inspect. Preserve the outer error boundary and let
+                                // Rust check that the successful value is a message vec.
+                                _ if type_name == "McpResult" => {
+                                    PromptReturnTypeKind::McpResultVecPromptMessage
+                                }
+                                _ => PromptReturnTypeKind::ResultVecPromptMessage,
                             };
                         }
                     }
@@ -2388,6 +2394,10 @@ enum ResourceReturnTypeKind {
     ResultVecResourceContent,
     /// Returns McpResult<Vec<ResourceContent>>
     McpResultVecResourceContent,
+    /// Returns Result<T, E> where T uses ToString
+    ResultOther,
+    /// Returns McpResult<T> where T uses ToString
+    McpResultOther,
     /// Unknown type - use ToString
     Other,
 }
@@ -2455,7 +2465,10 @@ fn analyze_resource_type(ty: &Type) -> ResourceReturnTypeKind {
                                         ResourceReturnTypeKind::ResultVecResourceContent
                                     }
                                 }
-                                _ => ResourceReturnTypeKind::Other,
+                                _ if type_name == "McpResult" => {
+                                    ResourceReturnTypeKind::McpResultOther
+                                }
+                                _ => ResourceReturnTypeKind::ResultOther,
                             };
                         }
                     }
@@ -2473,6 +2486,7 @@ fn analyze_resource_type(ty: &Type) -> ResourceReturnTypeKind {
 /// - `String` → wrap in ResourceContent
 /// - `Result<String, E>` → unwrap result, then wrap in ResourceContent
 /// - `McpResult<String>` → unwrap result, then wrap in ResourceContent
+/// - `Result<T, E>` / `McpResult<T>` → unwrap result, then use ToString on T
 /// - Other types → use ToString trait
 ///
 /// The generated code uses `uri` and `mime_type` variables that must be in scope.
@@ -2526,6 +2540,26 @@ fn generate_resource_result_conversion(output: &syn::ReturnType, mime_type: &str
         },
         ResourceReturnTypeKind::McpResultVecResourceContent => quote! {
             result
+        },
+        ResourceReturnTypeKind::ResultOther => quote! {
+            let text = result
+                .map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))?
+                .to_string();
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some(#mime_type.to_string()),
+                text: Some(text),
+                blob: None,
+            }])
+        },
+        ResourceReturnTypeKind::McpResultOther => quote! {
+            let text = result?.to_string();
+            Ok(vec![fastmcp_protocol::ResourceContent {
+                uri: uri.to_string(),
+                mime_type: Some(#mime_type.to_string()),
+                text: Some(text),
+                blob: None,
+            }])
         },
         ResourceReturnTypeKind::Other => quote! {
             // Fallback: use ToString trait
