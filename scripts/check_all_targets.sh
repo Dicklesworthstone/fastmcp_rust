@@ -126,6 +126,11 @@ run_arm() {
   local try log remote members errors cnc
   for try in $(seq 1 "$RETRIES"); do
     log="$LOGDIR/${label}.$try.log"
+    # Progress to STDERR only. run_arm's STDOUT is the tab-separated verdict
+    # line the caller parses, and anything else there corrupts the field split.
+    # Without this the script prints nothing until every arm finishes, so a
+    # thirty-minute arm is indistinguishable from a hang.
+    echo "  $(date -u +%H:%M:%SZ) $label: dispatching try $try/$RETRIES" >&2
     # Deliberately NOT pinning a worker: RCH sizes some commands at 8 cores and
     # a pinned 3-slot box can never satisfy that (RCH-I003 no_free_slots) even
     # with most of the fleet idle. Let the scheduler pick.
@@ -146,12 +151,33 @@ run_arm() {
       members=${members:-0}
       if [ "$remote" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$cnc" -eq 0 ]; then
         printf 'green\t%s\t%s\t%s\t%s\t%s\n' "$remote" "$members" "$errors" "$cnc" "$log"
-      else
-        printf 'red\t%s\t%s\t%s\t%s\t%s\n' "$remote" "$members" "$errors" "$cnc" "$log"
+        return 0
       fi
-      return 0
+      # RED REQUIRES COMPILER EVIDENCE, NOT MERELY A NONZERO EXIT.
+      #
+      # Measured 2026-11-07: the default arm ended
+      #   Remote command finished: exit=137 in 1811703ms
+      # which is SIGKILL at RCH's thirty-minute external deadline -- the log
+      # carries RCH_EXTERNAL_DEADLINE:..._DISK_USAGE with "complete":false, and
+      # peak disk growth was 1.0GB against a 10GB budget, so disk was not the
+      # constraint. Nothing compiled and failed; the command was STOPPED. The
+      # earlier form (`green` iff exit==0 && no errors, everything else `red`)
+      # reported that as a real compile failure, and did the same to the
+      # --no-default-features arm. Two of three arms misclassified, by the
+      # very gate whose header calls a false red the thing that makes a lane
+      # untrustworthy.
+      #
+      # Void detection cannot key on the ABSENCE of the `Remote command
+      # finished: exit=N` line, because a kill still prints it. It has to key
+      # on whether the compiler said anything.
+      if [ "$errors" -gt 0 ] || [ "$cnc" -gt 0 ]; then
+        printf 'red\t%s\t%s\t%s\t%s\t%s\n' "$remote" "$members" "$errors" "$cnc" "$log"
+        return 0
+      fi
+      echo "  $label: try $try exited $remote with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void); retrying on a fresh worker draw" >&2
+      continue
     fi
-    echo "  $label: try $try produced no verdict (void), retrying" >&2
+    echo "  $label: try $try produced no verdict at all, no remote exit line (void), retrying" >&2
   done
   # Placeholders, not empty fields: TAB is IFS whitespace, so bash collapses a
   # run of consecutive tabs into ONE delimiter and strips leading/trailing
@@ -244,7 +270,8 @@ else
   [ "$MOVED" -eq 1 ] && echo "  WARNING: the checkout moved during the run; this receipt is not bindable."
   case $status in
     0) echo "  RESULT: green (every requested arm compiled)" ;;
-    1) echo "  RESULT: RED -- a real compile failure. Note members_reached: cargo stops"
+    1) echo "  RESULT: RED -- at least one arm compiled and FAILED, with compiler"
+       echo "          diagnostics to prove it. Note members_reached: cargo stops"
        echo "          scheduling after a failure, so the red set is a FLOOR, not a count." ;;
     2) echo "  RESULT: NO VERDICT (void or moving checkout). This is NOT a red; retry." ;;
   esac
