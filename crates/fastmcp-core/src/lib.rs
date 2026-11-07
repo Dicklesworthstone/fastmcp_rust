@@ -54,6 +54,8 @@ mod limit_01_rows;
 pub mod logging;
 /// AUTH-00 B security-partition admission and non-oracular lookup.
 pub mod partition;
+/// Persistent replay aliases from named external MAC providers.
+pub mod replay;
 #[cfg_attr(
     not(feature = "test-runtime"),
     doc = r#"
