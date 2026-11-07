@@ -13955,10 +13955,11 @@ async fn send_modern_sse_stream(
     // handler admission commits a notification or their final response is queued.
     let (outcome_gate, mut outcome_receiver) = ModernSseOutcomeGate::new();
     // H1 request input is complete before this request-owned response starts.
-    // A clean peer write-half EOF preserves the response, but a reset or
-    // unexpected input abandons it. Observe that distinction even before the
-    // handler elects a response representation, when no write can expose a
-    // disconnected peer.
+    // A clean peer write-half EOF is therefore ordinary request completion,
+    // not cancellation of the still-owned response body. A reset or unexpected
+    // post-body bytes do abandon this single-request connection, including
+    // while the handler has not yet elected a response representation. A clean
+    // full close remains indistinguishable from half-close until output fails.
     let (mut peer_reader, mut writer) = stream.into_split();
 
     let dispatch = match spawn_modern_sse_dispatch(
@@ -14138,19 +14139,19 @@ async fn send_modern_sse_stream(
         // The read belongs to this connection's future, so every return or
         // dropped connection releases it without leaving a watcher task.
         std::future::poll_fn(|task_cx| {
-            if !peer_read_finished
-                && let std::task::Poll::Ready(read) = peer_read.as_mut().poll(task_cx)
-            {
-                peer_read_finished = true;
-                match read {
-                    Ok(0) => {}
-                    Ok(_) => {
-                        request_cancellation.cancel();
+            if !peer_read_finished {
+                match peer_read.as_mut().poll(task_cx) {
+                    std::task::Poll::Ready(Ok(0)) => peer_read_finished = true,
+                    std::task::Poll::Ready(Err(error))
+                        if error.kind() == std::io::ErrorKind::Interrupted
+                            && cx.is_cancel_requested() =>
+                    {
+                        // Listener cancellation may still owe an elected
+                        // terminal frame its bounded output drain.
+                        peer_read_finished = true;
                     }
-                    Err(_) if !cx.is_cancel_requested() => {
-                        request_cancellation.cancel();
-                    }
-                    Err(_) => {}
+                    std::task::Poll::Ready(_) => return std::task::Poll::Ready(Err(())),
+                    std::task::Poll::Pending => {}
                 }
             }
             deliver_response.as_mut().poll(task_cx)
@@ -52052,6 +52053,277 @@ mod lib_unit_tests {
         });
     }
 
+    struct LiveModernParkedTool {
+        inner: LiveModernControlledTool,
+        release: Arc<asupersync::sync::Notify>,
+    }
+
+    impl ToolHandler for LiveModernParkedTool {
+        fn definition(&self) -> Tool {
+            self.inner.definition()
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.inner.call(ctx, arguments)
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            _arguments: serde_json::Value,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            struct ParkedCallGuard<'a> {
+                control: &'a LiveModernControl,
+                ctx: &'a McpContext,
+                request_cx: &'a Cx,
+            }
+
+            impl Drop for ParkedCallGuard<'_> {
+                fn drop(&mut self) {
+                    let mut state = self
+                        .control
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.active = state.active.saturating_sub(1);
+                    if self.ctx.request_cancellation().is_cancel_requested()
+                        || self.request_cx.is_cancel_requested()
+                    {
+                        state.cancelled.insert(self.ctx.request_id());
+                    }
+                    self.control.changed.notify_all();
+                }
+            }
+
+            Box::pin(async move {
+                let control = &self.inner.control;
+                let request_id = ctx.request_id();
+                let _guard = ParkedCallGuard {
+                    control,
+                    ctx,
+                    request_cx,
+                };
+                {
+                    let mut state = control
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.active += 1;
+                    state.max_active = state.max_active.max(state.active);
+                    state.started.insert(request_id);
+                    control.changed.notify_all();
+                }
+                // Keep the runtime free to poll the socket reactor. A loop of
+                // yield_now calls would keep runnable work queued throughout
+                // the very readiness transition this test needs to observe.
+                let mut released = std::pin::pin!(self.release.wait_until(|| {
+                    let state = control
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    state.release_all || state.released.contains(&request_id)
+                }));
+                let mut cancelled = std::pin::pin!(ctx.request_cancelled());
+                let completed = std::future::poll_fn(|task_cx| {
+                    if cancelled.as_mut().poll(task_cx).is_ready() {
+                        return std::task::Poll::Ready(false);
+                    }
+                    released.as_mut().poll(task_cx).map(|()| true)
+                })
+                .await;
+                if !completed || ctx.checkpoint().is_err() || request_cx.is_cancel_requested() {
+                    return fastmcp_core::Outcome::Cancelled(asupersync::CancelReason::user(
+                        "parked modern tool was cancelled",
+                    ));
+                }
+                match crate::handler::promote_legacy_tool_content(vec![Content::text(format!(
+                    "modern request {request_id}",
+                ))]) {
+                    Ok(result) => fastmcp_core::Outcome::Ok(FinalToolOutcome::Complete(result)),
+                    Err(error) => fastmcp_core::Outcome::Err(error),
+                }
+            })
+        }
+    }
+
+    fn live_http_sse_peer_failure_before_election(
+        fail_peer: impl FnOnce(std::net::TcpStream) -> Result<(), String> + Send + 'static,
+    ) {
+        run_live_http_test(move |cx| async move {
+            const ABANDONED_ID: u64 = 817;
+            const SIBLING_ID: u64 = 818;
+            let control = Arc::new(LiveModernControl::default());
+            let release = Arc::new(asupersync::sync::Notify::new());
+            let bound = Server::new("live-http-sse-peer-failure", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .http_config(HttpServerConfig::new().max_connections(2))
+                .tool(LiveModernParkedTool {
+                    inner: LiveModernControlledTool {
+                        control: Arc::clone(&control),
+                    },
+                    release: Arc::clone(&release),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("peer-failure SSE bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("peer-failure SSE address failed: {error}"))?;
+            let limiter = Arc::clone(&bound.connection_limiter);
+            let sessions = Arc::clone(&bound.modern_sessions);
+            let caller_cx = cx.clone();
+            let controller = thread::spawn(move || -> Result<(), String> {
+                struct CancelServerOnDrop(Cx);
+
+                impl Drop for CancelServerOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel_with(
+                            CancelKind::User,
+                            Some("peer-failure SSE controller finished"),
+                        );
+                    }
+                }
+
+                let _server_cancellation = CancelServerOnDrop(caller_cx);
+                let open_request = |request_id: u64| -> Result<std::net::TcpStream, String> {
+                    let request = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_modern_controlled_tool",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        request_id as i64,
+                    );
+                    let body = serde_json::to_vec(&request).map_err(|error| {
+                        format!("peer-failure SSE request did not serialize: {error}")
+                    })?;
+                    let request = live_http_post(
+                        "/mcp",
+                        &body,
+                        &[
+                            ("Accept", "text/event-stream"),
+                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                            ("Mcp-Method", "tools/call"),
+                            ("Mcp-Name", "live_modern_controlled_tool"),
+                        ],
+                    );
+                    let mut stream = std::net::TcpStream::connect(address)
+                        .map_err(|error| format!("peer-failure SSE connect failed: {error}"))?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|error| {
+                            format!("peer-failure SSE read timeout failed: {error}")
+                        })?;
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|error| {
+                            format!("peer-failure SSE write timeout failed: {error}")
+                        })?;
+                    std::io::Write::write_all(&mut stream, &request).map_err(|error| {
+                        format!("peer-failure SSE request write failed: {error}")
+                    })?;
+                    Ok(stream)
+                };
+                let abandoned = open_request(ABANDONED_ID)?;
+                let mut sibling = open_request(SIBLING_ID)?;
+                if !control.wait_for_started(2, Duration::from_secs(2)) {
+                    return Err(
+                        "peer-failure SSE handlers did not enter before election".to_owned()
+                    );
+                }
+
+                // Neither handler emits a frame or completes before release.
+                // Peer failure must therefore settle without any server write
+                // or listener shutdown discovering it on the request's behalf.
+                fail_peer(abandoned)?;
+                if !control.wait_for_cancellation(ABANDONED_ID, Duration::from_secs(2)) {
+                    return Err(
+                        "peer failure did not cancel the pre-election SSE handler".to_owned()
+                    );
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while limiter.active.load(Ordering::Acquire) != 1
+                    || sessions
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .len()
+                        != 1
+                {
+                    if Instant::now() >= deadline {
+                        return Err(
+                            "peer failure retained the abandoned HTTP connection or response owner"
+                                .to_owned(),
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                if control.was_cancelled(SIBLING_ID) {
+                    return Err("peer failure cancelled a healthy sibling request".to_owned());
+                }
+                control.release(SIBLING_ID);
+                release.notify_waiters();
+                let mut response = Vec::new();
+                std::io::Read::read_to_end(&mut sibling, &mut response)
+                    .map_err(|error| format!("healthy SSE sibling read failed: {error}"))?;
+                if !response.starts_with(b"HTTP/1.1 200")
+                    || !live_http_chunked_sse_messages(&response)?
+                        .iter()
+                        .any(|message| {
+                            matches!(
+                                message,
+                                JsonRpcMessage::Response(response)
+                                    if response.id == Some((SIBLING_ID as i64).into())
+                                        && response.error.is_none()
+                            )
+                        })
+                {
+                    return Err("healthy SSE sibling lost its terminal response".to_owned());
+                }
+                if control.was_cancelled(SIBLING_ID) {
+                    return Err("healthy SSE sibling was cancelled while completing".to_owned());
+                }
+                Ok(())
+            });
+
+            let shutdown = bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("peer-failure SSE server failed: {error}"))?;
+            controller
+                .join()
+                .map_err(|_| "peer-failure SSE controller panicked".to_owned())??;
+            require_quiescent_http_shutdown(shutdown, "pre-election SSE peer failure").await
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_http_sse_reset_before_election_releases_connection_capacity() {
+        live_http_sse_peer_failure_before_election(|stream| {
+            rustix::net::sockopt::set_socket_linger(&stream, Some(Duration::ZERO))
+                .map_err(|error| format!("abortive SSE close setup failed: {error}"))?;
+            // Close without shutdown(Write/Both), which would send a FIN first.
+            drop(stream);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn live_http_sse_post_body_bytes_before_election_cancel_only_owned_handler() {
+        live_http_sse_peer_failure_before_election(|mut stream| {
+            std::io::Write::write_all(&mut stream, b"unexpected post-body bytes")
+                .map_err(|error| format!("post-body SSE write failed: {error}"))
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn live_http_sse_reset_before_election_cancels_only_owning_handler() {
@@ -52059,11 +52331,15 @@ mod lib_unit_tests {
             const RESET_ID: u64 = 817;
             const SIBLING_ID: u64 = 818;
             let control = Arc::new(LiveModernControl::default());
+            let release = Arc::new(asupersync::sync::Notify::new());
             let bound = Server::new("live-http-sse-reset-before-election", "1.0.0")
                 .protocol_policy(ProtocolPolicy::ModernOnly)
                 .expect("ModernOnly must be available to this test build")
-                .tool(LiveModernControlledTool {
-                    control: Arc::clone(&control),
+                .tool(LiveModernParkedTool {
+                    inner: LiveModernControlledTool {
+                        control: Arc::clone(&control),
+                    },
+                    release: Arc::clone(&release),
                 })
                 .build()
                 .bind_http(&cx, "127.0.0.1:0")
@@ -52163,6 +52439,7 @@ mod lib_unit_tests {
                     return Err("reset SSE cancellation reached the sibling handler".to_owned());
                 }
                 controller_control.release(SIBLING_ID);
+                release.notify_waiters();
                 let mut response = Vec::new();
                 std::io::Read::read_to_end(&mut sibling, &mut response)
                     .map_err(|error| format!("reset SSE sibling response read failed: {error}"))?;

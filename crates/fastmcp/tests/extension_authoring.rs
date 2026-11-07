@@ -822,7 +822,7 @@ fn exercise_notification_stdio(auto: bool) {
                 .await
                 .unwrap();
             while observations.completed.load(Ordering::SeqCst) == 0 {
-                asupersync::runtime::yield_now().await;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             assert_eq!(
                 observations.authorized.load(Ordering::SeqCst),
@@ -871,7 +871,7 @@ fn exercise_notification_stdio(auto: bool) {
             while observations.authorized.load(Ordering::SeqCst) < 5
                 || observations.completed.load(Ordering::SeqCst) < 2
             {
-                asupersync::runtime::yield_now().await;
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
             }
             peer.send_async(&cx, &discovery(82_i64)).await.unwrap();
 
