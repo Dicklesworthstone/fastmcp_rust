@@ -20,8 +20,10 @@ use super::policy::{EnterpriseClientAuthentication, EnterpriseProfile, IdJagGran
 use super::verification::{
     IdJagExpectations, IdJagVerificationKeys, JwtTimePolicy, OidcIdTokenExpectations,
     OidcVerificationKeys, ResourceTenantExpectation, TenantExpectation,
-    VerifiedIdJag, VerifiedOidcIdToken, verify_id_jag, verify_oidc_id_token,
+    VerifiedIdJag, VerifiedOidcIdToken, verify_id_jag, verify_id_jag_with_disclosure,
+    verify_oidc_id_token,
 };
+use super::verification::disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 
 /// Fixed diagnostics retain no tokens, claims, scopes, issuer text or peer body.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -245,9 +247,13 @@ impl EnterpriseIdJagResponse {
         }
         let granted_scopes = self.granted_scopes.admit_access_grant(body.scope.as_deref())
             .map_err(|_| EnterpriseResponseError::ScopeRejected)?;
-        let expires_at = bounded_expiry(
+        let mut expires_at = bounded_expiry(
             received_at, body.expires_in, 86_400, self.policy.access_token_lifetime, None,
         )?;
+        let id_jag_disclosure = self.assertion.disclosure().cloned();
+        if let Some(disclosure) = &id_jag_disclosure {
+            expires_at = expires_at.min(disclosure.review_expires_at());
+        }
         let token = body.access_token.ok_or(EnterpriseResponseError::InvalidResponse)?;
         if !AccessToken::is_valid_token68(token.as_str()) {
             return Err(EnterpriseResponseError::InvalidResponse);
@@ -257,7 +263,7 @@ impl EnterpriseIdJagResponse {
                 _access_token: token, resource: self.resource,
                 requested_scopes: self.requested_scopes,
                 idp_granted_scopes: self.granted_scopes.as_slice().to_vec(),
-                granted_scopes, expires_at,
+                granted_scopes, expires_at, id_jag_disclosure,
             },
             cache,
         })
@@ -277,6 +283,7 @@ pub struct EnterpriseAccessTokenResponse {
     idp_granted_scopes: Vec<String>,
     granted_scopes: Vec<String>,
     expires_at: SystemTime,
+    id_jag_disclosure: Option<IdJagDisclosureFacts>,
 }
 impl EnterpriseAccessTokenResponse {
     pub fn resource(&self) -> &str { &self.resource }
@@ -284,6 +291,10 @@ impl EnterpriseAccessTokenResponse {
     pub fn idp_granted_scopes(&self) -> &[String] { &self.idp_granted_scopes }
     pub fn granted_scopes(&self) -> &[String] { &self.granted_scopes }
     pub fn expires_at(&self) -> SystemTime { self.expires_at }
+    /// Reviewed policy and admitted optional claim names, never claim values.
+    pub fn id_jag_disclosure(&self) -> Option<&IdJagDisclosureFacts> {
+        self.id_jag_disclosure.as_ref()
+    }
 }
 
 impl EnterpriseProfile {
@@ -354,6 +365,42 @@ impl EnterpriseProfile {
         policy: EnterpriseResponsePolicy,
         received_at: SystemTime,
     ) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
+        self.admit_id_jag_response_inner(
+            response, keys, idp_tenant, resource_tenant, policy, None, received_at,
+        )
+    }
+
+    /// Admits reviewed optional disclosures through the same signed grant and
+    /// scope checks. Claim values are discarded. The review expiry bounds both
+    /// this owner and any locally admitted final token; an expired policy cannot
+    /// survive into a later stage. This does not establish policy attestation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_id_jag_response_with_disclosure(
+        &self,
+        response: EnterpriseTokenResponse<'_>,
+        keys: &IdJagVerificationKeys,
+        idp_tenant: TenantExpectation<'_>,
+        resource_tenant: ResourceTenantExpectation<'_>,
+        policy: EnterpriseResponsePolicy,
+        disclosure: &IdJagDisclosurePolicy,
+        received_at: SystemTime,
+    ) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
+        self.admit_id_jag_response_inner(
+            response, keys, idp_tenant, resource_tenant, policy, Some(disclosure), received_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_id_jag_response_inner(
+        &self,
+        response: EnterpriseTokenResponse<'_>,
+        keys: &IdJagVerificationKeys,
+        idp_tenant: TenantExpectation<'_>,
+        resource_tenant: ResourceTenantExpectation<'_>,
+        policy: EnterpriseResponsePolicy,
+        disclosure: Option<&IdJagDisclosurePolicy>,
+        received_at: SystemTime,
+    ) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
         if keys.issuer() != self.idp_issuer() || keys.generation() != self.id_jag_key_generation() {
             return Err(EnterpriseResponseError::PolicyBindingMismatch);
         }
@@ -372,14 +419,21 @@ impl EnterpriseProfile {
             time: JwtTimePolicy::new(policy.id_jag_lifetime, policy.clock_skew)
                 .map_err(|_| EnterpriseResponseError::InvalidPolicy)?,
         };
-        let assertion = verify_id_jag(compact.as_str(), keys, &expected, received_at)
-            .map_err(|_| EnterpriseResponseError::AssertionRejected)?;
+        let assertion = match disclosure {
+            Some(disclosure) => verify_id_jag_with_disclosure(
+                compact.as_str(), keys, &expected, disclosure, received_at,
+            ),
+            None => verify_id_jag(compact.as_str(), keys, &expected, received_at),
+        }.map_err(|_| EnterpriseResponseError::AssertionRejected)?;
         let granted_scopes = self.requested_scopes()
             .admit_id_jag_grant(body.scope.as_deref(), assertion.scope())
             .map_err(|_| EnterpriseResponseError::ScopeRejected)?;
-        let effective_expires_at = bounded_expiry(
+        let mut effective_expires_at = bounded_expiry(
             received_at, body.expires_in, 900, policy.id_jag_lifetime, Some(assertion.expires_at()),
         )?;
+        if let Some(disclosure) = assertion.disclosure() {
+            effective_expires_at = effective_expires_at.min(disclosure.review_expires_at());
+        }
         Ok(EnterpriseResponseOutcome::Success {
             value: EnterpriseIdJagResponse {
                 _assertion: compact, assertion,

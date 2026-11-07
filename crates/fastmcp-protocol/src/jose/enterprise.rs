@@ -9,14 +9,16 @@
 //!
 //! Only bounded three-segment RS256 JWS values are admitted. OIDC permits an
 //! absent typ or the PRT-01 JWT media type; ID-JAG requires oauth-id-jag+jwt.
-//! Both use a closed local header and claim vocabulary. Optional disclosure
-//! claims are refused here; a richer profile needs its own explicit policy.
+//! Both use a closed local header and claim vocabulary. Optional ID-JAG
+//! disclosures require an explicit, current ValidateAndDiscard policy.
 //! Returned facts contain no compact assertion, signing input or signature and
 //! cannot become an Authorization header. The caller owns and destroys the
 //! borrowed input token and, for OIDC at_hash, its temporary access token.
 
 #[cfg(test)]
 mod tests;
+
+pub mod disclosure;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -31,6 +33,7 @@ use super::{
     decode_base64url, parse_json, split_compact_jws, verify_compact_jws_rs256,
 };
 use crate::security_admission::{AdmittedCompactJws, CompactJwsProfile, admit_compact_jws};
+use disclosure::{IdJagDisclosureFacts, IdJagDisclosurePolicy};
 
 /// Local identifier cap; never permission to use an identifier as a provider key.
 pub const MAX_ENTERPRISE_IDENTIFIER_BYTES: usize = 1024;
@@ -369,6 +372,7 @@ pub struct VerifiedIdJag {
     key_id: String,
     generation: u64,
     compact_digest: Sha256Digest,
+    disclosure: Option<IdJagDisclosureFacts>,
 }
 
 impl VerifiedIdJag {
@@ -402,6 +406,9 @@ impl VerifiedIdJag {
     pub const fn generation(&self) -> u64 { self.generation }
     #[must_use]
     pub const fn compact_digest(&self) -> Sha256Digest { self.compact_digest }
+    /// Names and policy identity only; optional claim values are discarded.
+    #[must_use]
+    pub const fn disclosure(&self) -> Option<&IdJagDisclosureFacts> { self.disclosure.as_ref() }
 }
 
 impl fmt::Debug for VerifiedIdJag {
@@ -501,6 +508,31 @@ pub fn verify_id_jag(
     expected: &IdJagExpectations<'_>,
     now: SystemTime,
 ) -> Result<VerifiedIdJag, EnterpriseVerificationError> {
+    verify_id_jag_with_policy(compact, keys, expected, None, now)
+}
+
+/// Verifies an ID-JAG with a separately reviewed optional-disclosure policy.
+/// The signature covers every optional value before its bounded schema is
+/// admitted. Those values are discarded; only policy identity and claim names
+/// are retained. This cannot enable actor, RAR, aliases, cnf or key-location
+/// claims, and does not alter any core issuer/client/resource/subject checks.
+pub fn verify_id_jag_with_disclosure(
+    compact: &str,
+    keys: &IdJagVerificationKeys,
+    expected: &IdJagExpectations<'_>,
+    disclosure: &IdJagDisclosurePolicy,
+    now: SystemTime,
+) -> Result<VerifiedIdJag, EnterpriseVerificationError> {
+    verify_id_jag_with_policy(compact, keys, expected, Some(disclosure), now)
+}
+
+fn verify_id_jag_with_policy(
+    compact: &str,
+    keys: &IdJagVerificationKeys,
+    expected: &IdJagExpectations<'_>,
+    disclosure: Option<&IdJagDisclosurePolicy>,
+    now: SystemTime,
+) -> Result<VerifiedIdJag, EnterpriseVerificationError> {
     validate_issuer(expected.audience)?;
     validate_identifier(expected.client_id)?;
     validate_resource(expected.resource)?;
@@ -512,13 +544,22 @@ pub fn verify_id_jag(
     if expected.time.max_lifetime > MAX_ID_JAG_LIFETIME {
         return Err(EnterpriseVerificationError::InvalidConfiguration);
     }
+    if let Some(policy) = disclosure {
+        policy.admit_context(keys.issuer(), expected.audience, now)?;
+    }
     let admitted = verify_profile(
         compact,
         &keys.0,
         CompactJwsProfile::IdentityAssertionJwtAuthorizationGrant,
     )?;
     let claims = admitted.claims();
-    closed_claims(claims, ID_JAG_CLAIMS)?;
+    let disclosure = match disclosure {
+        Some(policy) => Some(policy.admit_claims(claims)?),
+        None => {
+            closed_claims(claims, ID_JAG_CLAIMS)?;
+            None
+        }
+    };
     exact_string(claims, "iss", keys.issuer())?;
     exact_singleton(claims.get("aud"), expected.audience)?;
     exact_string(claims, "client_id", expected.client_id)?;
@@ -576,6 +617,7 @@ pub fn verify_id_jag(
             .ok_or(EnterpriseVerificationError::InvalidToken)?.to_owned(),
         generation: keys.generation(),
         compact_digest: token_digest(compact)?,
+        disclosure,
     })
 }
 

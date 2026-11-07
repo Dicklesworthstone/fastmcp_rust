@@ -1185,6 +1185,18 @@ response; its original scope request, signed IdP grant and final grant remain
 separate. Missing cache-prevention headers produce bounded diagnostics, while
 conflicting or explicitly cacheable policies are rejected.
 
+Optional signed ID-JAG disclosures require an explicit
+`verification::disclosure::IdJagDisclosurePolicy` for the exact IdP and
+resource-AS relationship. The current schemas cover `email`, `auth_time`,
+`acr` and `amr`; each permission has a reviewed purpose and the policy has a
+finite review window. Use `verify_id_jag_with_disclosure` or
+`EnterpriseProfile::admit_id_jag_response_with_disclosure` to select it.
+Values are validated and discarded. Only admitted claim names and the
+configuration digest remain, and review expiry bounds later response admission
+and the locally retained final token. The ordinary verification method keeps
+its closed claim set; actor, subject-alias, RAR and sender-constraining claims
+cannot be enabled through this policy.
+
 These are local validation operations, not a complete enterprise sign-in
 client. They perform no network exchange and do not activate the MCP extension.
 Framework-owned OIDC acquisition, confidential credential providers, subject

@@ -346,3 +346,102 @@ fn enterprise_effective_expiry_uses_one_time_and_checked_absolute_limits() {
     assert_eq!(bounded_expiry(now, None, 900, cap, Some(now)),
         Err(EnterpriseResponseError::InvalidLifetime));
 }
+
+fn disclosure_policy(expires_after: u64) -> IdJagDisclosurePolicy {
+    use super::super::verification::disclosure::{
+        IdJagDisclosureClaim, IdJagDisclosureConfiguration, IdJagDisclosureRule,
+    };
+    IdJagDisclosurePolicy::from_trusted_configuration(IdJagDisclosureConfiguration {
+        policy_id: "reviewed-email-discard".to_owned(),
+        generation: 41,
+        idp_issuer: "https://idp.example".to_owned(),
+        resource_as_issuer: "https://as.example".to_owned(),
+        reviewed_at: now() - Duration::from_secs(1),
+        review_expires_at: now() + Duration::from_secs(expires_after),
+        rules: vec![IdJagDisclosureRule {
+            claim: IdJagDisclosureClaim::Email,
+            purpose: "Validate and discard an issuer-mandated signed disclosure".to_owned(),
+        }],
+    }).unwrap()
+}
+
+fn disclosure_body() -> Value {
+    let fixture: Value = serde_json::from_str(include_str!("disclosure_assertions.json")).unwrap();
+    let mut body = jag_body();
+    body["access_token"] = fixture["id_jag"].clone();
+    body
+}
+
+fn disclosed_jag(
+    profile: &EnterpriseProfile,
+    keys: &IdJagVerificationKeys,
+    body: &Value,
+    disclosure: &IdJagDisclosurePolicy,
+    at: SystemTime,
+) -> Result<EnterpriseResponseOutcome<EnterpriseIdJagResponse>, EnterpriseResponseError> {
+    let headers = headers();
+    let body = serde_json::to_vec(body).unwrap();
+    profile.admit_id_jag_response_with_disclosure(
+        EnterpriseTokenResponse { status: 200, headers: &headers, body: &body },
+        keys, TenantExpectation::SingleTenant, ResourceTenantExpectation::SingleTenant,
+        EnterpriseResponsePolicy::default(), disclosure, at,
+    )
+}
+
+#[test]
+fn optional_signed_disclosure_requires_explicit_policy_and_preserves_final_provenance() {
+    use super::super::verification::disclosure::IdJagDisclosureClaim;
+    let selected = profile(&["read"]);
+    let (_, keys) = keys();
+    let body = disclosure_body();
+    let disclosure = disclosure_policy(30);
+    assert!(matches!(
+        jag(&selected, &keys, &body, now()),
+        Err(EnterpriseResponseError::AssertionRejected)
+    ));
+    let admitted = success(disclosed_jag(&selected, &keys, &body, &disclosure, now()).unwrap());
+    assert_eq!(admitted.effective_expires_at(), now() + Duration::from_secs(30));
+    assert_eq!(admitted.granted_scopes(), ["read"]);
+    let facts = admitted.assertion().disclosure().unwrap();
+    assert_eq!(facts.admitted_claims(), &[IdJagDisclosureClaim::Email]);
+    assert_eq!(facts.configuration_digest(), disclosure.configuration_digest());
+    assert_eq!(facts.generation(), 41);
+    let headers = headers();
+    let access = serde_json::to_vec(&access_body()).unwrap();
+    let token = success(admitted.admit_access_token_response(
+        EnterpriseTokenResponse { status: 200, headers: &headers, body: &access },
+        now() + Duration::from_secs(1),
+    ).unwrap());
+    assert_eq!(token.expires_at(), now() + Duration::from_secs(30));
+    assert_eq!(token.granted_scopes(), ["read"]);
+    let retained = token.id_jag_disclosure().unwrap();
+    assert_eq!(retained.configuration_digest(), disclosure.configuration_digest());
+    assert_eq!(retained.admitted_claims(), &[IdJagDisclosureClaim::Email]);
+    let debug = format!("{retained:?}");
+    assert!(!debug.contains("hidden-contact"));
+    assert!(!debug.contains("reviewed-email-discard"));
+}
+
+#[test]
+fn disclosure_review_expiry_cannot_cross_initial_or_final_response_admission() {
+    let selected = profile(&["read"]);
+    let (_, keys) = keys();
+    let body = disclosure_body();
+    let disclosure = disclosure_policy(30);
+    for elapsed in [30, 31] {
+        let time = now() + Duration::from_secs(elapsed);
+        assert!(matches!(
+            disclosed_jag(&selected, &keys, &body, &disclosure, time),
+            Err(EnterpriseResponseError::AssertionRejected)
+        ));
+        let admitted = success(disclosed_jag(&selected, &keys, &body, &disclosure, now()).unwrap());
+        let headers = headers();
+        let access = serde_json::to_vec(&access_body()).unwrap();
+        assert!(matches!(
+            admitted.admit_access_token_response(
+                EnterpriseTokenResponse { status: 200, headers: &headers, body: &access }, time,
+            ),
+            Err(EnterpriseResponseError::InvalidLifetime)
+        ));
+    }
+}
