@@ -46,20 +46,30 @@
 #   orchestrator's own `br` flush, which writes a TRACKED .beads/issues.jsonl.
 #
 #   PICK THE MODE FOR THE JOB; the difference is a cold cache, not a detail.
-#   `--clean-overlay` dispatches under its OWN rch project namespace, and that
-#   namespace appears to be keyed on the base revision: two base-mode runs at
-#   different bases showed `...n-overlay::eb6fa723..` and
-#   `...n-overlay::2d49e6d5..`, and the second built from scratch on a worker
-#   the first had just warmed. So base mode does not warm across commits, and a
-#   cold --workspace --all-targets does NOT fit RCH's ~30-minute check-wrapper
-#   deadline on a slow worker (measured: killed at 1811s three times, finished
-#   in 248-330s warm).
+#   `--clean-overlay` builds in a per-pairing directory on the worker --
+#   observed: /data/tmp/fastmcp_rust/paired-670fdc34../ -- under its own rch
+#   project namespace, and the FIRST base-mode run on a given worker is cold.
 #
-#     --working-tree   warm, fast, binds NO revision. Right for an iterative
-#                      fix-and-recheck loop, which is most of a session.
-#     base (default)   cold per revision, slower, BINDS the revision and
-#                      survives tracker writes and foreign pushes. Right for
-#                      the receipt that closes a bead.
+#   IT DOES WARM, though, and an earlier version of this comment overstated the
+#   cost. I had inferred from two `rch queue` lines at different bases that the
+#   namespace is keyed on the base revision and therefore never warms across
+#   commits. A third run refuted the strong form: at base 4d6f32d9 the default
+#   arm came back `Finished dev profile in 0.55s` with ZERO members reached --
+#   fully cached -- on a worker that had compiled this content before, while the
+#   all-features arm on the same worker compiled 8 members in 2m50s. So the
+#   earlier cold draws were worker-specific, not proof that each revision gets a
+#   fresh namespace.
+#
+#   What survives, and is what matters: a COLD --workspace --all-targets does
+#   NOT fit RCH's ~30-minute check-wrapper deadline on a slow worker (killed at
+#   1811s three times on 2026-11-07; 248-330s warm, 0.55s fully cached), and
+#   which you draw is luck. Retry-on-void is the mechanism that absorbs it.
+#
+#     --working-tree   uses the project's long-warm namespace; binds NO
+#                      revision. Right for an iterative fix-and-recheck loop.
+#     base (default)   cold on a worker's first pairing, warm after; BINDS the
+#                      revision and survives tracker writes and foreign pushes.
+#                      Right for the receipt that closes a bead.
 #
 #   Retry-on-void is what makes the cold draw a delay instead of a false red.
 #   NOT measured: whether rch shares any compilation cache across namespaces.
