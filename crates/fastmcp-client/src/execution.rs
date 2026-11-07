@@ -1759,6 +1759,42 @@ where
         )
     }
 
+    /// Commits a request-owned subscription on an externally driven connection.
+    /// Its originating caller and token remain authoritative while other
+    /// executions drive ingress, and only validated events reset its idle bound.
+    pub(crate) fn execute_external_subscription(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        request: Request,
+        timeout_policy: SubscriptionTimeoutPolicy,
+        commit: impl FnOnce(&JsonRpcMessage) -> Result<(), TransportError>,
+    ) -> McpResult<Option<RequestExecution<T>>> {
+        timeout_policy.validate()?;
+        if !self.state.borrow().external_writes
+            || self.protocol_era() != ProtocolEra::Modern2026
+            || request.method != SUBSCRIPTIONS_LISTEN
+        {
+            return Err(McpError::invalid_params(
+                "External subscription execution requires modern subscriptions/listen",
+            ));
+        }
+        CoreRequest::decode(
+            ProtocolEra::Modern2026,
+            &request.method,
+            request.params.as_ref(),
+        )
+        .map_err(|_| McpError::invalid_params("Invalid modern subscription request"))?;
+        self.execute_with_commit(
+            cx,
+            request,
+            ExecutionTimeoutPolicy::Subscription(timeout_policy),
+            Some(cancellation.clone()),
+            None,
+            |_, _, message| commit(message),
+        )
+    }
+
     /// Publishes one already-admitted modern notification without allocating a
     /// request ID, result waiter, execution generation, or correlation charge.
     /// Ordinary owner maintenance and deferred controls precede application I/O.
@@ -3348,6 +3384,44 @@ where
         )
     }
 
+    /// Refuses malformed or over-budget traffic for one live subscription.
+    /// Retirement uses the normal cancellation/tombstone path; a previously
+    /// elected response, cancellation, or deadline always wins instead.
+    pub(crate) fn fail_subscription(
+        &self,
+        cx: &Cx,
+        execution: &mut RequestExecution<T>,
+        error: McpError,
+    ) -> McpResult<()> {
+        let turn = ExecutionTurn::new(cx);
+        let cx = &turn;
+        execution.ensure_owner(&self.state)?;
+        let mut state = self.state.borrow_mut();
+        let key = execution.request_id.correlation_key().map_err(|_| {
+            McpError::invalid_params("Subscription execution has an invalid request ID")
+        })?;
+        if state.pending.get(&key).is_none_or(|pending| {
+            pending.record.execution_generation != execution.generation
+                || pending.method != SUBSCRIPTIONS_LISTEN
+        }) {
+            return Ok(());
+        }
+        self.cancel_pending_locked(
+            cx,
+            &mut state,
+            &execution.request_id,
+            ExecutionTerminalReason::PeerProtocol,
+        )?;
+        let owner = (execution.request_id.clone(), execution.generation);
+        if let Some(outcome) = state.completed.get_mut(&owner) {
+            *outcome = ExecutionOutcome::Failure(error);
+        }
+        if let Some(record) = state.terminal_records.get_mut(&owner) {
+            record.terminal_state = ExecutionTerminalState::Failed;
+        }
+        Ok(())
+    }
+
     /// Expires committed request deadlines at a runtime-supplied monotonic instant.
     ///
     /// Also observes each pending execution's original caller, using that
@@ -4577,6 +4651,29 @@ pub struct RequestExecution<T> {
 }
 
 impl<T> RequestExecution<T> {
+    /// Whether this exact generation still owns a live subscription request.
+    pub(crate) fn is_pending_subscription(&self) -> bool {
+        if self.completed {
+            return false;
+        }
+        let Ok(key) = self.request_id.correlation_key() else {
+            return false;
+        };
+        self.state.borrow().pending.get(&key).is_some_and(|pending| {
+            pending.record.execution_generation == self.generation
+                && pending.method == SUBSCRIPTIONS_LISTEN
+        })
+    }
+
+    /// Observes the winning terminal without consuming its owned outcome.
+    pub(crate) fn terminal_reason(&self) -> Option<ExecutionTerminalReason> {
+        self.state
+            .borrow()
+            .terminal_records
+            .get(&(self.request_id.clone(), self.generation))
+            .map(|record| record.terminal_reason)
+    }
+
     /// A selected failure takes precedence over buffered subscription events.
     pub(crate) fn terminal_error(&self) -> Option<McpError> {
         match self

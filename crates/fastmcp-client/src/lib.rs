@@ -132,7 +132,7 @@ pub use fastmcp_protocol::extensions::McpAppsClientSettings;
 pub use fastmcp_transport::websocket::AsyncWsClientTransport;
 pub use memory::{
     MemoryClient, MemoryClientBuilder, MemoryExtensionEvent, MemoryExtensionExecution,
-    MemoryRequestEvent, MemoryRequestExecution,
+    MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent, MemorySubscriptionExecution,
 };
 // The public re-export is feature-gated, while the client keeps this type
 // internally to reject configuration that names Apps when that feature is

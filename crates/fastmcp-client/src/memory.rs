@@ -38,6 +38,9 @@ use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime, Cli
 use crate::{RequestTimeoutPolicy, ReverseRequestHandlers, transport_error_to_mcp};
 
 mod interaction;
+mod subscriptions;
+
+pub use subscriptions::{MemorySubscriptionEvent, MemorySubscriptionExecution};
 
 #[cfg(feature = "tasks")]
 mod tasks;
@@ -258,8 +261,8 @@ impl MemoryClientBuilder {
 ///
 /// Ordinary core methods share the same typed protocol admission and request
 /// executor as other clients. Configured extensions use their own admitted
-/// execution and notification APIs. Long-lived subscriptions are not opened
-/// by this adapter.
+/// execution and notification APIs. Independently owned subscriptions share
+/// the same reader and executor, with bounded per-listener event queues.
 /// Client metadata is frozen at connect and stamped on every request.
 ///
 /// A caller timer driver is required when an operation must wait: response
@@ -278,6 +281,7 @@ pub struct MemoryClient {
     next_id: i64,
     timeout_policy: RequestTimeoutPolicy,
     reverse_request_handlers: ReverseRequestHandlers,
+    subscriptions: subscriptions::MemorySubscriptionRegistry,
     cache_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
     #[cfg(feature = "tasks")]
     tasks: Option<tasks::MemoryTaskRuntime>,
@@ -409,6 +413,7 @@ impl MemoryClient {
             next_id: 1,
             timeout_policy,
             reverse_request_handlers,
+            subscriptions: subscriptions::MemorySubscriptionRegistry::default(),
             cache_diagnostics: VecDeque::new(),
             #[cfg(feature = "tasks")]
             tasks,
@@ -567,6 +572,7 @@ impl MemoryClient {
                 &mut self.sender,
                 &mut self.receiver,
                 &self.executor,
+                &mut self.subscriptions,
                 cx,
                 cancellation,
                 deadline,
@@ -723,6 +729,7 @@ impl MemoryClient {
                 &mut self.sender,
                 &mut self.receiver,
                 &self.executor,
+                &mut self.subscriptions,
                 cx,
                 cancellation,
                 deadline,
@@ -783,6 +790,7 @@ impl MemoryClient {
                 &mut self.sender,
                 &mut self.receiver,
                 &self.executor,
+                &mut self.subscriptions,
                 cx,
                 cancellation,
                 deadline,
@@ -1172,6 +1180,7 @@ impl MemoryClient {
                 &mut self.sender,
                 &mut self.receiver,
                 &self.executor,
+                &mut self.subscriptions,
                 cx,
                 cancellation,
                 deadline,
@@ -1221,13 +1230,17 @@ impl MemoryClient {
                 Some(Ok(Err(error))) | Some(Err(Err(error))) => {
                     return Err(fail_transport(&self.executor, error));
                 }
-                Some(Err(Ok(frame))) => admit_frame(&self.executor, cx, frame)?,
+                Some(Err(Ok(frame))) => {
+                    admit_frame(&self.executor, &mut self.subscriptions, cx, frame)?;
+                }
                 None => {}
             }
         } else {
             let mut receiving = pin!(self.receiver.recv_with_source_async(cx));
             match wait_turn(cx, cancellation, None, receiving.as_mut()).await? {
-                Some(Ok(frame)) => admit_frame(&self.executor, cx, frame)?,
+                Some(Ok(frame)) => {
+                    admit_frame(&self.executor, &mut self.subscriptions, cx, frame)?;
+                }
                 Some(Err(TransportError::Cancelled)) => return Err(McpError::request_cancelled()),
                 Some(Err(error)) => return Err(fail_transport(&self.executor, error)),
                 None => {}
@@ -1270,7 +1283,16 @@ fn fail_transport(executor: &MemoryExecutor, error: TransportError) -> McpError 
     error
 }
 
-fn admit_frame(executor: &MemoryExecutor, cx: &Cx, frame: ReceivedTransportFrame) -> McpResult<()> {
+fn admit_frame(
+    executor: &MemoryExecutor,
+    subscriptions: &mut subscriptions::MemorySubscriptionRegistry,
+    cx: &Cx,
+    frame: ReceivedTransportFrame,
+) -> McpResult<()> {
+    executor.poll_timeouts_at(cx, Instant::now())?;
+    if subscriptions.route(executor, cx, &frame)? {
+        return Ok(());
+    }
     if let Err(error) = executor.drive_frame(cx, frame) {
         executor.fail_connection(error.clone());
         return Err(error);
@@ -1284,6 +1306,7 @@ async fn reserve_capacity<'a>(
     sender: &'a mut MemorySendHalf,
     receiver: &mut MemoryRecvHalf,
     executor: &MemoryExecutor,
+    subscriptions: &mut subscriptions::MemorySubscriptionRegistry,
     cx: &'a Cx,
     cancellation: &McpRequestCancellation,
     deadline: Instant,
@@ -1310,7 +1333,7 @@ async fn reserve_capacity<'a>(
             Some(Ok(Err(error))) | Some(Err(Err(error))) => {
                 return Err(fail_transport(executor, error));
             }
-            Some(Err(Ok(frame))) => admit_frame(executor, cx, frame)?,
+            Some(Err(Ok(frame))) => admit_frame(executor, subscriptions, cx, frame)?,
             None => {}
         }
     }
