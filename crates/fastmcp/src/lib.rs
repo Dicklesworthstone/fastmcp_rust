@@ -5479,6 +5479,151 @@ pub mod modern {
             }
         }
 
+        /// Calls one tool on the caller's Unix runtime with live, exact progress.
+        ///
+        /// The callback consumes each validated update as it arrives, so updates
+        /// do not accumulate in the client's retained progress queue. It must be
+        /// short and nonblocking. A panic is converted to a sanitized error and
+        /// cancels this request alone. The full result retains `input_required`;
+        /// this single request does not automatically perform MRTR retries or
+        /// advertise Tasks. After publication, cancellation and dropping the
+        /// future retire only this request's ownership. Deferred discovery keeps
+        /// its existing connection-level cancellation rules.
+        #[cfg(unix)]
+        pub async fn call_tool_result_with_progress<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+            on_progress: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&FinalProgressNotificationParams) + Send,
+        {
+            self.request_with_live_progress(
+                cx,
+                cancellation,
+                "tools/call",
+                serde_json::json!({"name": name, "arguments": arguments}),
+                on_progress,
+            )
+            .await
+        }
+
+        /// Reads one resource with live progress and the complete final result
+        /// algebra. See [`Self::call_tool_result_with_progress`] for callback,
+        /// cancellation, and single-request semantics.
+        #[cfg(unix)]
+        pub async fn read_resource_result_with_progress<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+            on_progress: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&FinalProgressNotificationParams) + Send,
+        {
+            self.request_with_live_progress(
+                cx,
+                cancellation,
+                "resources/read",
+                serde_json::json!({"uri": uri}),
+                on_progress,
+            )
+            .await
+        }
+
+        /// Gets one prompt with live progress and the complete final result
+        /// algebra. See [`Self::call_tool_result_with_progress`] for callback,
+        /// cancellation, and single-request semantics.
+        #[cfg(unix)]
+        pub async fn get_prompt_result_with_progress<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+            on_progress: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&FinalProgressNotificationParams) + Send,
+        {
+            self.request_with_live_progress(
+                cx,
+                cancellation,
+                "prompts/get",
+                serde_json::json!({"name": name, "arguments": arguments}),
+                on_progress,
+            )
+            .await
+        }
+
+        /// Completes an argument with live exact progress on the caller's runtime.
+        /// The client generates the progress token. See
+        /// [`Self::call_tool_result_with_progress`] for callback semantics.
+        #[cfg(unix)]
+        pub async fn complete_with_progress<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: CompletionParams,
+            on_progress: F,
+        ) -> McpResult<FinalCompletionResult>
+        where
+            F: FnMut(&FinalProgressNotificationParams) + Send,
+        {
+            let parameters = serde_json::to_value(params).map_err(|_| {
+                McpError::invalid_params("Completion parameters could not be encoded")
+            })?;
+            match self
+                .request_with_live_progress(
+                    cx,
+                    cancellation,
+                    "completion/complete",
+                    parameters,
+                    on_progress,
+                )
+                .await?
+            {
+                FinalCoreResult::Completion { result, .. } => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final completion/complete result",
+                )),
+            }
+        }
+
+        #[cfg(unix)]
+        async fn request_with_live_progress<F>(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            method: &str,
+            parameters: JsonValue,
+            on_progress: F,
+        ) -> McpResult<FinalCoreResult>
+        where
+            F: FnMut(&FinalProgressNotificationParams) + Send,
+        {
+            match self
+                .inner
+                .request_core_with_progress_with_cx(
+                    cx,
+                    cancellation,
+                    method,
+                    parameters,
+                    on_progress,
+                )
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(result) => Ok(result),
+                fastmcp_protocol::CoreResult::Legacy(_) => Err(McpError::internal_error(
+                    "Modern client received a legacy result",
+                )),
+            }
+        }
+
         /// Reads one resource and keeps a live `input_required` branch.
         pub fn read_resource_result(&mut self, uri: &str) -> McpResult<FinalCoreResult> {
             match self.inner.read_resource_typed(uri)? {

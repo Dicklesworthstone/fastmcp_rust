@@ -373,3 +373,181 @@ fn auto_facade_native_stdio_selects_exact_legacy() {
 fn legacy_facade_native_stdio_serves_exact_legacy() {
     run_facade(Facade::Legacy, PeerEra::Legacy);
 }
+
+#[test]
+fn modern_facade_stdio_live_progress_preserves_all_typed_results() {
+    fn require_send<F: std::future::Future + Send>(future: F) -> F {
+        future
+    }
+
+    let runtime = RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let cx = Cx::current().unwrap();
+        assert!(cx.blocking_pool_handle().is_none());
+        let discovery = modern::ServerDiscoverResult::new(
+            modern::ServerDiscoverCapabilities::from_registry(
+                &modern::ServerBehaviorRegistry::default(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            serde_json::from_value(json!({
+                "name": "public-live-progress-peer",
+                "version": "1.0.0",
+            }))
+            .unwrap(),
+            None,
+            modern::DiscoveryCacheHints::private_ttl_ms(0),
+        );
+        let discovery = serde_json::to_string(&discovery).unwrap();
+        let script = r#"
+numeric_id() {
+    printf '%s\n' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p'
+}
+IFS= read -r discover || exit 10
+case "$discover" in *'"method":"server/discover"'*) ;; *) exit 11 ;; esac
+id=$(numeric_id "$discover")
+case "$id" in ''|*[!0-9]*) exit 12 ;; esac
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$1"
+for method in tools/call resources/read prompts/get completion/complete; do
+    IFS= read -r request || exit 13
+    case "$request" in *'"method":"'"$method"'"'*) ;; *) exit 14 ;; esac
+    id=$(numeric_id "$request")
+    token=$(printf '%s\n' "$request" | sed -n 's/.*"progressToken":\([0-9][0-9]*\)[,}].*/\1/p')
+    case "$id" in ''|*[!0-9]*) exit 15 ;; esac
+    case "$token" in ''|*[!0-9]*) exit 16 ;; esac
+    case "$method" in
+        tools/call)
+            case "$request" in *'"name":"echo"'*) ;; *) exit 17 ;; esac
+            case "$request" in *'"value":"tool input"'*) ;; *) exit 18 ;; esac
+            result='{"resultType":"complete","content":[{"type":"text","text":"tool result"}]}'
+            ;;
+        resources/read)
+            case "$request" in *'"uri":"test://resource"'*) ;; *) exit 19 ;; esac
+            result='{"resultType":"complete","contents":[{"uri":"test://resource","text":"resource result"}],"ttlMs":0,"cacheScope":"private"}'
+            ;;
+        prompts/get)
+            case "$request" in *'"name":"greet"'*) ;; *) exit 20 ;; esac
+            case "$request" in *'"person":"Ada"'*) ;; *) exit 21 ;; esac
+            result='{"resultType":"complete","description":"greeting","messages":[{"role":"user","content":{"type":"text","text":"Hello Ada"}}]}'
+            ;;
+        completion/complete)
+            case "$request" in *'"type":"ref/prompt"'*) ;; *) exit 22 ;; esac
+            case "$request" in *'"name":"person"'*) ;; *) exit 23 ;; esac
+            case "$request" in *'"value":"A"'*) ;; *) exit 24 ;; esac
+            case "$request" in *'"context":{"arguments":{"style":"formal"}}'*) ;; *) exit 25 ;; esac
+            result='{"resultType":"complete","completion":{"values":["Ada","Alan"],"total":2,"hasMore":false}}'
+            ;;
+    esac
+    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":%s,"progress":1.2300e+400,"total":9.8700e+500,"message":"%s"}}\n' "$token" "$method"
+    printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$id" "$result"
+done
+while IFS= read -r unexpected; do exit 26; done
+"#;
+        let mut client = modern::ClientBuilder::new()
+            .request_timeout_policy(
+                modern::RequestTimeoutPolicy::new(
+                    Duration::from_secs(5),
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+            )
+            .connect_stdio_with_cx(
+                &cx,
+                "sh",
+                &["-c", script, "public-progress-peer", &discovery],
+            )
+            .await
+            .unwrap();
+        let cancellation = modern::McpRequestCancellation::new();
+        let mut progress = Vec::new();
+
+        let tool = require_send(client.call_tool_result_with_progress(
+            &cx,
+            &cancellation,
+            "echo",
+            json!({"value": "tool input"}),
+            |update| progress.push(update.clone()),
+        ))
+        .await
+        .unwrap();
+        let modern::FinalCoreResult::ToolsCall { result, .. } = tool else {
+            panic!("the public tool method must retain its typed final result");
+        };
+        assert_eq!(result.payload.content, vec![modern::ContentBlock::text("tool result")]);
+
+        let resource = require_send(client.read_resource_result_with_progress(
+            &cx,
+            &cancellation,
+            "test://resource",
+            |update| progress.push(update.clone()),
+        ))
+        .await
+        .unwrap();
+        let modern::FinalCoreResult::ResourcesRead { result, .. } = resource else {
+            panic!("the public resource method must retain its typed final result");
+        };
+        assert_eq!(
+            serde_json::to_value(result.payload.contents).unwrap(),
+            json!([{"uri": "test://resource", "text": "resource result"}])
+        );
+
+        let prompt = require_send(client.get_prompt_result_with_progress(
+            &cx,
+            &cancellation,
+            "greet",
+            std::collections::HashMap::from([("person".to_owned(), "Ada".to_owned())]),
+            |update| progress.push(update.clone()),
+        ))
+        .await
+        .unwrap();
+        let modern::FinalCoreResult::PromptsGet { result, .. } = prompt else {
+            panic!("the public prompt method must retain its typed final result");
+        };
+        assert_eq!(
+            serde_json::to_value(result.payload).unwrap(),
+            json!({
+                "description": "greeting",
+                "messages": [{"role": "user", "content": {"type": "text", "text": "Hello Ada"}}],
+            })
+        );
+
+        let completion = require_send(client.complete_with_progress(
+            &cx,
+            &cancellation,
+            serde_json::from_value::<modern::CompletionParams>(json!({
+                "ref": {"type": "ref/prompt", "name": "greet"},
+                "argument": {"name": "person", "value": "A"},
+                "context": {"arguments": {"style": "formal"}},
+            }))
+            .unwrap(),
+            |update| progress.push(update.clone()),
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(completion).unwrap(),
+            json!({"completion": {"values": ["Ada", "Alan"], "total": 2, "hasMore": false}})
+        );
+
+        assert_eq!(progress.len(), 4);
+        let mut tokens = std::collections::BTreeSet::new();
+        for (update, method) in progress.iter().zip([
+            "tools/call",
+            "resources/read",
+            "prompts/get",
+            "completion/complete",
+        ]) {
+            assert_eq!(update.progress.as_str(), "1.2300e+400");
+            assert_eq!(update.total.as_ref().unwrap().as_str(), "9.8700e+500");
+            assert_eq!(update.message.as_deref(), Some(method));
+            assert!(tokens.insert(serde_json::to_string(&update.progress_token).unwrap()));
+        }
+        assert!(client.take_progress_notifications().is_empty());
+        assert!(cx.checkpoint().is_ok());
+        client.close_with_cx(&cx).await.unwrap();
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+}

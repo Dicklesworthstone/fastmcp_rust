@@ -934,6 +934,58 @@ portable process-tree containment or a substitute for Windows Job Objects.
 **Requirements:**
 - Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
+### Live exact stdio progress (current source tree, Unix)
+
+Modern stdio clients can observe progress while awaiting a tool, resource,
+prompt, or completion result. The client generates and owns a progress token,
+validates matching updates, and calls your observer on the caller's runtime.
+Delivered updates are consumed immediately, so a long-running operation can
+report more than the client's 64 retained diagnostic entries without filling
+that queue. Progress and total retain their original JSON numeric spelling;
+use `as_str()` when values must remain exact.
+
+```rust
+use fastmcp_rust::modern::{
+    Client, Cx, FinalCoreResult, McpRequestCancellation, McpResult,
+};
+
+#[cfg(unix)]
+async fn index_with_progress(client: &mut Client, cx: &Cx) -> McpResult<FinalCoreResult> {
+    let cancellation = McpRequestCancellation::new();
+    client
+        .call_tool_result_with_progress(
+            cx,
+            &cancellation,
+            "index_workspace",
+            serde_json::json!({"uri": "file:///workspace"}),
+            |update| {
+                eprintln!(
+                    "progress={} total={:?}",
+                    update.progress.as_str(),
+                    update.total.as_ref().map(|total| total.as_str()),
+                );
+            },
+        )
+        .await
+}
+```
+
+The corresponding methods are `read_resource_result_with_progress`,
+`get_prompt_result_with_progress`, and `complete_with_progress`.
+For ordinary core catalog operations, the underlying `fastmcp_client::Client`
+also offers `request_core_with_progress_with_cx`; that method rejects
+caller-supplied `_meta.progressToken` values because it owns token allocation.
+
+Keep observers short and nonblocking. A caught observer panic produces a
+sanitized error; cancellation, timeout, or dropping the published request
+retires only that request and preserves unrelated requests. Dropping queues
+wire cancellation for the next client drive, send, or close. Deferred discovery
+retains its separate connection-level cancellation rules. These methods send
+one request and preserve the complete typed result, including
+`input_required`, without automatically continuing MRTR or advertising Tasks.
+They use the existing yielding receive path; subprocess creation and bounded
+pipe writes retain their synchronous limits.
+
 ### Tasks commands (current source tree, optional)
 
 Build the CLI with `--features tasks` to expose `tasks get`, `watch`, `update`,
