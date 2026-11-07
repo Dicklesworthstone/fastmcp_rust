@@ -45,6 +45,10 @@
 #   therefore void if anything tracked moves during the run -- including the
 #   orchestrator's own `br` flush, which writes a TRACKED .beads/issues.jsonl.
 #
+#   Every arm runs with `--keep-going`, so one error does not hide the rest:
+#   cargo fail-fasts by default, which is why a red run understates the red set
+#   and why repairing this tree took five sequential rounds on 2026-11-07.
+#
 #   `both` = default + all-features (the cheap pre-submit pair).
 #   `all`  = adds --no-default-features, which bd-yhx86 measured as a THIRD
 #            non-comparable projection with lint rows the other two cannot see.
@@ -174,11 +178,23 @@ run_arm() {
     # Deliberately NOT pinning a worker: RCH sizes some commands at 8 cores and
     # a pinned 3-slot box can never satisfy that (RCH-I003 no_free_slots) even
     # with most of the fleet idle. Let the scheduler pick.
+    # --keep-going, on bd-zqn34's recommendation and on this session's own
+    # evidence. Cargo FAIL-FASTS by default: one error hides the rest, so a red
+    # run understates the red set and you learn the next layer only after
+    # repairing the current one. Repairing HEAD today took FIVE sequential
+    # rounds for exactly that reason, and bd-zqn34 lists five separate
+    # occurrences of the same class in one session. --keep-going surfaces them
+    # together.
+    #
+    # It does NOT weaken the verdict: a run that would have exited non-zero
+    # still does, it just reports more of why. members_reached also becomes a
+    # truer figure, because cargo no longer stops scheduling at the first
+    # failure.
     if [ "$SOURCE_MODE" = base ]; then
       rch exec --base "$BASE" --clean-overlay --no-overlay -- \
-        cargo check --workspace --all-targets "$@" >"$log" 2>&1
+        cargo check --workspace --all-targets --keep-going "$@" >"$log" 2>&1
     else
-      rch exec -- cargo check --workspace --all-targets "$@" >"$log" 2>&1
+      rch exec -- cargo check --workspace --all-targets --keep-going "$@" >"$log" 2>&1
     fi
     # The wrapper's exit status can mask the remote one; this line is the
     # authoritative remote exit, and its ABSENCE means no verdict at all.
@@ -255,11 +271,11 @@ if [ "$DRY" -eq 1 ]; then
   fi
   echo "would run:"
   { [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = default ]; } &&
-    echo "  cargo check --workspace --all-targets"
+    echo "  cargo check --workspace --all-targets --keep-going"
   { [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = all-features ]; } &&
-    echo "  cargo check --workspace --all-targets --all-features"
+    echo "  cargo check --workspace --all-targets --keep-going --all-features"
   { [ "$ARM" = all ] || [ "$ARM" = no-default-features ]; } &&
-    echo "  cargo check --workspace --all-targets --no-default-features"
+    echo "  cargo check --workspace --all-targets --keep-going --no-default-features"
   exit 0
 fi
 
