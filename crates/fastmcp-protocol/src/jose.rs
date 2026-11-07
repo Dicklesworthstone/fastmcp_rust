@@ -4,6 +4,9 @@
 //! evaluates token policy. In particular, issuer, audience, expiry, replay,
 //! and authorization policy remain the responsibility of the owning layer.
 
+/// Purpose-bound local OIDC ID-token and ID-JAG claim verification.
+pub mod enterprise;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
