@@ -37,6 +37,7 @@ use crate::execution::{
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime, ClientSession};
 use crate::{RequestTimeoutPolicy, ReverseRequestHandlers, transport_error_to_mcp};
 
+mod catalog;
 mod interaction;
 mod subscriptions;
 
@@ -1293,6 +1294,7 @@ fn admit_frame(
     if subscriptions.route(executor, cx, &frame)? {
         return Ok(());
     }
+    subscriptions.observe_unowned_catalog_frame(&frame);
     if let Err(error) = executor.drive_frame(cx, frame) {
         executor.fail_connection(error.clone());
         return Err(error);

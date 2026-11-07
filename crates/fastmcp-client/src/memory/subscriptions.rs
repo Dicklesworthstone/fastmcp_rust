@@ -194,9 +194,65 @@ impl SubscriptionState {
 #[derive(Debug, Default)]
 pub(super) struct MemorySubscriptionRegistry {
     owners: HashMap<CorrelationKey, Weak<Mutex<SubscriptionState>>>,
+    catalog_generations: [u64; 3],
 }
 
 impl MemorySubscriptionRegistry {
+    /// Observes catalog changes without consuming any listener's event queue.
+    pub(super) fn catalog_generation(&self, method: &str) -> u64 {
+        match method {
+            "tools/list" => self.catalog_generations[0],
+            "resources/list" | "resources/templates/list" => self.catalog_generations[1],
+            "prompts/list" => self.catalog_generations[2],
+            _ => 0,
+        }
+    }
+
+    /// Called only on the ordinary ingress path after subscription routing has
+    /// declined the frame. A valid unsolicited catalog event invalidates an
+    /// ongoing traversal while remaining available in the executor's queue.
+    pub(super) fn observe_unowned_catalog_frame(&mut self, frame: &ReceivedTransportFrame) {
+        let JsonRpcMessage::Request(request) = frame.message() else {
+            return;
+        };
+        if request.id.is_some()
+            || !matches!(
+                request.method.as_str(),
+                "notifications/tools/list_changed"
+                    | "notifications/resources/list_changed"
+                    | "notifications/prompts/list_changed"
+            )
+            || request
+                .params
+                .as_ref()
+                .and_then(|params| params.get("_meta"))
+                .and_then(|meta| meta.get(SUBSCRIPTION_ID))
+                .is_some()
+        {
+            return;
+        }
+        if let Ok(
+            ServerNotification::ToolsListChanged(_)
+            | ServerNotification::ResourcesListChanged(_)
+            | ServerNotification::PromptsListChanged(_),
+        ) = ServerNotification::decode(request)
+        {
+            self.record_catalog_change(&request.method);
+        }
+    }
+
+    fn record_catalog_change(&mut self, notification_method: &str) {
+        let generation = match notification_method {
+            "notifications/tools/list_changed" => &mut self.catalog_generations[0],
+            "notifications/resources/list_changed" => &mut self.catalog_generations[1],
+            "notifications/prompts/list_changed" => &mut self.catalog_generations[2],
+            _ => return,
+        };
+        // A bounded traversal cannot receive 2^64 events. Wrapping preserves
+        // the next change at MAX instead of permanently saturating the signal.
+        *generation = generation.wrapping_add(1);
+    }
+
     fn ensure_capacity(&mut self) -> McpResult<()> {
         self.owners.retain(|_, owner| {
             owner.upgrade().is_some_and(|owner| {
@@ -291,6 +347,8 @@ impl MemorySubscriptionRegistry {
         let result = admit_notification(&mut state, executor, cx, frame);
         if let Err(error) = result {
             executor.fail_subscription(cx, &mut state.inner, error)?;
+        } else {
+            self.record_catalog_change(method);
         }
         Ok(true)
     }
