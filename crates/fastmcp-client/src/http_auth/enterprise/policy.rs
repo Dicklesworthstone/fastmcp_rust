@@ -193,6 +193,7 @@ pub struct EnterpriseProfileConfiguration {
 #[derive(Clone, Debug)]
 pub struct EnterpriseProfile {
     configuration: EnterpriseProfileConfiguration,
+    oidc_openid_allowed: bool,
 }
 
 impl EnterpriseProfile {
@@ -318,7 +319,24 @@ impl EnterpriseProfile {
                 require_scope_subset(configuration.requested_scopes.as_slice(), &allowed)?;
             }
         }
-        Ok(Self { configuration })
+        let mut oidc_openid_allowed = configuration.idp.scope_allowance.iter()
+            .any(|scope| scope == "openid");
+        if idp.contains_key("scopes_supported") {
+            oidc_openid_allowed &= required_array(&idp, "scopes_supported")?.contains(&"openid");
+        }
+        if let Some(value) = idp_client.get("scope") {
+            oidc_openid_allowed &= scope_string(
+                value.as_str().ok_or(EnterprisePolicyError::InvalidScopes)?,
+            )?.iter().any(|scope| scope == "openid");
+        }
+        Ok(Self { configuration, oidc_openid_allowed })
+    }
+
+    /// Whether the original IdP deployment, metadata and registration scope
+    /// allowances permit the separate OIDC openid request. MCP scope grants
+    /// cannot fill a missing OIDC permission; later metadata cannot widen it.
+    pub fn permits_oidc_openid(&self) -> bool {
+        self.oidc_openid_allowed
     }
 
     /// Admits the request-local client extension value, never a server overlay.
@@ -1178,6 +1196,26 @@ mod tests {
                 EnterprisePolicyError::ScopeExpansion
             );
         }
+    }
+
+    #[test]
+    fn enterprise_oidc_scope_permission_retains_each_original_idp_allowance() {
+        assert!(!admit(configuration(), &documents()).unwrap().permits_oidc_openid());
+        let mut configured = configuration();
+        configured.idp.scope_allowance.push("openid".to_owned());
+        assert!(admit(configured.clone(), &documents()).unwrap().permits_oidc_openid());
+        for source in 0..2 {
+            let mut docs = documents();
+            if source == 0 {
+                docs[0]["scopes_supported"] = json!(["tool:read", "tool:write"]);
+            } else {
+                docs[3]["scope"] = json!("tool:read tool:write");
+            }
+            assert!(!admit(configured.clone(), &docs).unwrap().permits_oidc_openid());
+        }
+        let mut docs = documents();
+        docs[3]["scope"] = json!("tool:read openid tool:write");
+        assert!(admit(configured, &docs).unwrap().permits_oidc_openid());
     }
 
     #[test]

@@ -1139,8 +1139,9 @@ and do not disable certificate or hostname verification.
 ### Enterprise assertion and token-response admission (native, opt-in)
 
 Enable `enterprise-auth` to use
-`fastmcp_rust::http_auth::enterprise`. Its three modules keep independently
-configured trust, cryptographic verification, and response handling separate:
+`fastmcp_rust::http_auth::enterprise`. Its modules keep independently
+configured trust, cryptographic verification, response handling and local
+identity resolution separate:
 
 - `policy::EnterpriseProfile::from_documents` admits both authorization
   servers and both preregistered clients. It checks their exact issuers,
@@ -1155,6 +1156,12 @@ configured trust, cryptographic verification, and response handling separate:
   distinct accepted shapes. Signed scope narrowing must agree with the
   top-level grant, and the final response must name the exact scalar resource
   and explicit scope subset.
+- `identity::EnterpriseSubjectMappingTable` resolves the verified OIDC and
+  ID-JAG subjects through an immutable, preexisting mapping table. Its reviewed
+  snapshot fixes three distinct registration roles, explicit tenant
+  relationships, trust domains and client-ID scope. Pairwise subject strings
+  may differ; matching text never creates an account association. Lookup is
+  bounded and uses an ordered index, with no create, link or update operation.
 
 With an already-admitted profile, independently imported ID-JAG keys, and a
 response obtained from the selected trusted endpoint:
@@ -1199,9 +1206,16 @@ cannot be enabled through this policy.
 
 These are local validation operations, not a complete enterprise sign-in
 client. They perform no network exchange and do not activate the MCP extension.
-Framework-owned OIDC acquisition, confidential credential providers, subject
-mapping, durable assertion/replay custody and deployment attestations remain
-required before activation. SAML and durable/distributed server Task stores
+The mapping table supports public and redirect-host pairwise OIDC subject
+namespaces. It rechecks the current profile, selected snapshot, signed token
+bindings and review/claim lifetimes on every lookup; results retain the exact
+token and snapshot digests. A local snapshot digest does not establish a
+rollback-resistant policy fence or prove that responses came from one exchange.
+Guarded sector-document retrieval remains separate work.
+
+Framework-owned OIDC acquisition, confidential credential providers, attested
+mapping authority, durable assertion/replay custody and deployment attestations
+remain required before activation. SAML and durable/distributed server Task stores
 remain separate incomplete extension work.
 
 ### Sender-constrained credentials: DPoP (RFC 9449), caller-driven
