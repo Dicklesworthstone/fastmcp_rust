@@ -16,7 +16,7 @@ use fastmcp_protocol::extensions::{
     ExtensionNegotiationError, ExtensionSettings, NegotiatedExtensionSet,
     official_tasks_empty_settings, register_official_tasks_extension,
 };
-use fastmcp_protocol::tasks_extension::{TASK_CANCEL, TASK_GET, TASK_UPDATE, TaskInputLedger};
+use fastmcp_protocol::tasks_extension::{TASK_CANCEL, TASK_GET, TASK_UPDATE};
 use fastmcp_protocol::{CoreResult, ExtensionId, FinalCoreResult, ServerDiscoverResult};
 use serde_json::Value;
 
@@ -44,17 +44,12 @@ impl MemoryTaskRuntime {
             McpError::internal_error("Official memory Tasks descriptor could not be registered")
         })?;
         let discovery = ClientExtensionDiscovery {
-            extensions: BTreeMap::from([(
-                extension_id.clone(),
-                official_tasks_empty_settings(),
-            )]),
+            extensions: BTreeMap::from([(extension_id.clone(), official_tasks_empty_settings())]),
         };
         Ok(Self {
-            runtime: Arc::new(ClientExtensionRuntime::new(
-                descriptors,
-                discovery,
-                || compatible_tasks_settings,
-            )?),
+            runtime: Arc::new(ClientExtensionRuntime::new(descriptors, discovery, || {
+                compatible_tasks_settings
+            })?),
             extension_id,
             negotiated: None,
         })
@@ -244,9 +239,11 @@ impl MemoryClient {
 
     /// Supplies typed responses for an input-required Task.
     ///
-    /// Response kinds are checked against the retained input descriptors before
-    /// allocating an ID or publishing bytes. Partial updates retain the official
-    /// Tasks semantics; the server owns which outstanding keys remain live.
+    /// Phase, response kinds, and locally observed finite retention are checked
+    /// against the retained snapshot before allocating an ID or publishing bytes.
+    /// Partial updates retain the official Tasks semantics; the server owns
+    /// which outstanding keys remain live. Acknowledgement does not establish
+    /// the resulting state or authorize replay after uncertain delivery.
     pub async fn update_task_final(
         &mut self,
         cx: &Cx,
@@ -257,30 +254,16 @@ impl MemoryClient {
         self.ensure_open()?;
         checkpoint(cx, cancellation)?;
         self.require_tasks()?;
-        let FinalTask::InputRequired {
-            base,
-            input_requests,
-        } = task
-        else {
-            return Err(McpError::invalid_params(
-                "tasks/update requires an input_required final task",
-            ));
-        };
-        TaskInputLedger::from_requests(input_requests)
-            .and_then(|ledger| ledger.validate_responses(&input_responses))
-            .map_err(|_| {
-                McpError::invalid_params(
-                    "tasks/update inputResponses do not match the retained task input requests",
-                )
-            })?;
+        crate::task_wait::admit_task_input(task, &input_responses)?;
         let responses = serde_json::to_value(input_responses).map_err(|_| {
             McpError::invalid_params("Memory Tasks input responses could not be encoded")
         })?;
-        self.request_task(
+        self.request_task_checked(
             cx,
             cancellation,
             TASK_UPDATE,
-            serde_json::json!({"taskId": base.task_id.as_str(), "inputResponses": responses}),
+            serde_json::json!({"taskId": task.base().task_id.as_str(), "inputResponses": responses}),
+            || crate::task_wait::admit_input_retention(task),
         )
         .await
     }
@@ -318,18 +301,31 @@ impl MemoryClient {
         method: &str,
         parameters: Value,
     ) -> McpResult<R> {
+        self.request_task_checked(cx, cancellation, method, parameters, || Ok(()))
+            .await
+    }
+
+    async fn request_task_checked<R: serde::de::DeserializeOwned, F: FnMut() -> McpResult<()>>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Value,
+        before_send: F,
+    ) -> McpResult<R> {
         self.ensure_open()?;
         checkpoint(cx, cancellation)?;
         let admission = self.require_tasks()?.admit_request(method)?;
         let parameters = self.parameters_with_tasks(parameters, true)?;
         let mut execution = self
-            .execute_admitted_extension(
+            .execute_admitted_extension_checked(
                 cx,
                 cancellation,
                 method,
                 parameters,
                 self.timeout_policy,
                 admission,
+                before_send,
             )
             .await?;
         loop {
@@ -343,7 +339,9 @@ impl MemoryClient {
                         McpError::invalid_request("Memory Tasks response omitted its result source")
                     })?;
                     let result = serde_json::from_str(source).map_err(|_| {
-                        McpError::invalid_request("Memory Tasks response has an invalid result shape")
+                        McpError::invalid_request(
+                            "Memory Tasks response has an invalid result shape",
+                        )
                     })?;
                     checkpoint(cx, cancellation)?;
                     return Ok(result);
@@ -370,9 +368,7 @@ mod tests {
     use fastmcp_protocol::{
         ClientInfo, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId,
     };
-    use fastmcp_transport::memory::{
-        MemoryTransport, create_memory_transport_pair_with_capacity,
-    };
+    use fastmcp_transport::memory::{MemoryTransport, create_memory_transport_pair_with_capacity};
     use serde_json::json;
 
     use super::*;

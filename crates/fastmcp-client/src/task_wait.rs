@@ -14,16 +14,14 @@ use asupersync::io::{AsyncRead, AsyncWrite};
 use asupersync::types::Time;
 use fastmcp_core::{McpError, McpRequestCancellation, McpResult};
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
-use crate::FinalUpdateTaskResult;
 #[cfg(feature = "websocket-experimental")]
 use crate::WebSocketClient;
 use crate::http_auth::managed::tasks::watch::checkpoint::resume::timestamp_nanos;
 #[cfg(unix)]
 use crate::{Client, SubscriptionTimeoutPolicy};
 use crate::{
-    FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses, HttpClient, HttpClientError,
-    TaskInputLedger,
+    FinalTask, FinalTaskHandle, FinalTaskId, FinalTaskInputResponses, FinalUpdateTaskResult,
+    HttpClient, HttpClientError, MemoryClient, TaskInputLedger,
 };
 #[cfg(any(unix, feature = "websocket-experimental"))]
 use crate::{
@@ -155,6 +153,69 @@ impl FinalTaskHandle {
         policy: FinalTaskWaitPolicy,
     ) -> McpResult<FinalTaskWaitOutcome> {
         wait_for_task(self, cx, client, cancellation, policy).await
+    }
+
+    /// Observes this Task through the caller-owned in-process client.
+    ///
+    /// The same finite wait, poll-count, peer minimum-interval, and retention
+    /// bounds apply as for [`Self::wait`]. The existing Memory request owner
+    /// handles each read, including channel backpressure and sibling responses.
+    /// Cancelling or dropping observation retires only the in-flight read; it
+    /// neither cancels the remote Task nor repeats an uncertain request.
+    /// Use the client that attached this handle. No runtime is constructed.
+    pub async fn wait_with_memory(
+        &mut self,
+        cx: &Cx,
+        client: &mut MemoryClient,
+        cancellation: &McpRequestCancellation,
+        policy: FinalTaskWaitPolicy,
+    ) -> McpResult<FinalTaskWaitOutcome> {
+        wait_for_task(self, cx, client, cancellation, policy).await
+    }
+
+    /// Reconciles this handle through one negotiated Memory `tasks/get`.
+    ///
+    /// The exact Task ID and creation instant must match before replacing the
+    /// retained snapshot. A failed, cancelled, or abandoned read leaves it
+    /// unchanged. Already delivered terminal results return without I/O.
+    /// Call this explicitly after an acknowledged input update to learn the
+    /// resulting state before waiting again.
+    pub async fn poll_with_memory(
+        &mut self,
+        cx: &Cx,
+        client: &mut MemoryClient,
+        cancellation: &McpRequestCancellation,
+    ) -> McpResult<&FinalTask> {
+        if self.is_terminal() {
+            return Ok(&self.task);
+        }
+        checkpoint_task_operation(cx, cancellation)?;
+        let result = client
+            .get_task_final(cx, cancellation, self.task_id().clone())
+            .await?;
+        admit_identity(self.task(), &result.task)?;
+        checkpoint_task_operation(cx, cancellation)?;
+        self.task = result.task;
+        Ok(&self.task)
+    }
+
+    /// Supplies one explicit input batch through the in-process client.
+    ///
+    /// The retained phase, input descriptors, and finite retention are admitted
+    /// before publication. The empty acknowledgement leaves this handle's
+    /// snapshot unchanged; use [`Self::poll_with_memory`] to reconcile it.
+    /// No input callback or retry runs implicitly. Cancellation or abandonment
+    /// cannot undo an update already sent, so reconcile before resubmission.
+    pub async fn resume_input_with_memory(
+        &mut self,
+        cx: &Cx,
+        client: &mut MemoryClient,
+        cancellation: &McpRequestCancellation,
+        input_responses: FinalTaskInputResponses,
+    ) -> McpResult<FinalUpdateTaskResult> {
+        client
+            .update_task_final(cx, cancellation, &self.task, input_responses)
+            .await
     }
 
     /// The same bounded observation over the caller-owned WebSocket client.
@@ -774,6 +835,24 @@ fn task_watch_comparison_error(error: HttpClientError) -> McpError {
     }
 }
 
+impl MemoryClient {
+    /// Attaches an existing Task through one negotiated in-process read.
+    ///
+    /// The returned handle can poll, wait, and submit explicit input using this
+    /// same client. Attachment never repeats a creating call, starts background
+    /// observation, or claims persistence across a process restart.
+    pub async fn attach_final_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTaskHandle> {
+        self.get_task_final(cx, cancellation, task_id)
+            .await
+            .map(|result| FinalTaskHandle::new(result.task))
+    }
+}
+
 #[cfg(unix)]
 impl Client {
     /// Reads and attaches an existing final Task using the yielding Unix
@@ -878,7 +957,6 @@ pub(super) fn admit_task_input(
     admit_input_retention(task)
 }
 
-#[cfg(any(unix, feature = "websocket-experimental"))]
 fn checkpoint_task_operation(cx: &Cx, cancellation: &McpRequestCancellation) -> McpResult<()> {
     if cancellation.is_cancel_requested()
         || cx
@@ -940,6 +1018,21 @@ impl TaskWaitTransport for HttpClient {
         task_id: FinalTaskId,
     ) -> Result<FinalTask, Self::Error> {
         self.get_final_task_snapshot(cx, task_id).await
+    }
+}
+
+impl TaskWaitTransport for MemoryClient {
+    type Error = McpError;
+
+    async fn read_task(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        task_id: FinalTaskId,
+    ) -> McpResult<FinalTask> {
+        self.get_task_final(cx, cancellation, task_id)
+            .await
+            .map(|result| result.task)
     }
 }
 

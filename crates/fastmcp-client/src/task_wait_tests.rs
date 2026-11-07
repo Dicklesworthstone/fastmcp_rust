@@ -7,6 +7,690 @@ use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use fastmcp_protocol::{ClientCapabilities, ClientInfo, ServerDiscoverResult, ServerInfo};
 use serde_json::{Value, json};
 
+mod memory {
+    use super::*;
+    use std::future::poll_fn;
+    use std::pin::pin;
+
+    use fastmcp_core::McpErrorCode;
+    use fastmcp_protocol::{CoreResult, FinalCoreResult, JsonRpcMessage, JsonRpcRequest};
+    use fastmcp_transport::memory::{MemoryTransport, create_memory_transport_pair_with_capacity};
+
+    fn run_memory<F: Future<Output = ()>>(test: impl FnOnce(Cx) -> F) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert!(cx.blocking_pool_handle().is_none());
+            asupersync::time::timeout(cx.now(), Duration::from_secs(8), test(cx))
+                .await
+                .expect("Memory Task handles must progress on the caller runtime");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    async fn receive(
+        cx: &Cx,
+        peer: &mut MemoryTransport,
+        method: &str,
+        id: Option<i64>,
+    ) -> JsonRpcRequest {
+        let JsonRpcMessage::Request(request) = peer.recv_async(cx).await.unwrap() else {
+            panic!("expected the caller's Memory request");
+        };
+        assert_eq!(request.method, method);
+        assert_eq!(request.id, id.map(fastmcp_protocol::RequestId::Number));
+        request
+    }
+
+    async fn reply_task(cx: &Cx, peer: &mut MemoryTransport, id: u64, task: Value) {
+        peer.send_async(cx, &serde_json::from_value(response(id, task)).unwrap())
+            .await
+            .unwrap();
+    }
+
+    async fn reply_empty(cx: &Cx, peer: &mut MemoryTransport, id: i64) {
+        peer.send_async(
+            cx,
+            &JsonRpcMessage::Response(fastmcp_protocol::JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(id),
+                json!({"resultType":"complete"}),
+            )),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn reply_tools(cx: &Cx, peer: &mut MemoryTransport, id: i64) {
+        peer.send_async(
+            cx,
+            &JsonRpcMessage::Response(fastmcp_protocol::JsonRpcResponse::success(
+                fastmcp_protocol::RequestId::Number(id),
+                json!({"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}),
+            )),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn attached(cx: &Cx, initial: Value) -> (MemoryClient, FinalTaskHandle, MemoryTransport) {
+        let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
+        peer.send_async(cx, &serde_json::from_value(discovery()).unwrap())
+            .await
+            .unwrap();
+        let mut client = MemoryClient::builder(ClientInfo {
+            name: "task-handle-memory-client".to_owned(),
+            version: "1".to_owned(),
+        })
+        .capabilities(ClientCapabilities {
+            roots: Some(Default::default()),
+            ..ClientCapabilities::default()
+        })
+        .with_tasks()
+        .connect(cx, transport)
+        .await
+        .unwrap();
+        receive(cx, &mut peer, "server/discover", Some(1)).await;
+        reply_task(cx, &mut peer, 2, initial).await;
+        let handle = client
+            .attach_final_task(
+                cx,
+                &McpRequestCancellation::new(),
+                FinalTaskId::parse("wait-task").unwrap(),
+            )
+            .await
+            .unwrap();
+        let attached = receive(cx, &mut peer, "tasks/get", Some(2)).await;
+        assert_eq!(attached.params.unwrap()["taskId"], "wait-task");
+        (client, handle, peer)
+    }
+
+    fn answers() -> FinalTaskInputResponses {
+        serde_json::from_value(json!({"roots":{"roots":[]}})).unwrap()
+    }
+
+    async fn assert_core_usable(
+        cx: &Cx,
+        client: &mut MemoryClient,
+        peer: &mut MemoryTransport,
+        expected_id: i64,
+    ) {
+        reply_tools(cx, peer, expected_id).await;
+        assert!(matches!(
+            client
+                .list_tools(cx, &McpRequestCancellation::new(), None)
+                .await
+                .unwrap(),
+            CoreResult::Final(FinalCoreResult::ToolsList { .. }),
+        ));
+        receive(cx, peer, "tools/list", Some(expected_id)).await;
+        assert!(cx.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn public_memory_task_handle_wait_pauses_resumes_and_retains_exact_terminal_result() {
+        run_memory(|cx| async move {
+            let (mut client, mut handle, mut peer) = attached(&cx, task("working", Some(1))).await;
+            let mut server = cx
+                .spawn(move |peer_cx| async move {
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(3)).await;
+                    reply_task(&peer_cx, &mut peer, 3, task("working", None)).await;
+                    let suggestion_cleared = Instant::now();
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                    assert!(
+                        suggestion_cleared.elapsed() >= Duration::from_millis(20),
+                        "an absent fresh suggestion must restore the configured fallback",
+                    );
+                    reply_task(&peer_cx, &mut peer, 4, task("input_required", None)).await;
+                    let update = receive(&peer_cx, &mut peer, "tasks/update", Some(5)).await;
+                    assert_eq!(
+                        update.params.unwrap()["inputResponses"],
+                        json!({"roots":{"roots":[]}})
+                    );
+                    reply_empty(&peer_cx, &mut peer, 5).await;
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(6)).await;
+                    reply_task(&peer_cx, &mut peer, 6, task("working", Some(1))).await;
+                    receive(&peer_cx, &mut peer, "tasks/get", Some(7)).await;
+                    let mut complete = task("completed", None);
+                    complete["result"]["exact"] = Value::Number(
+                        serde_json::Number::from_string_unchecked("7.30e-2".to_owned()),
+                    );
+                    complete["result"]["resultTypeLookalike"] = json!("input_required");
+                    reply_task(&peer_cx, &mut peer, 7, complete).await;
+                    peer
+                })
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let policy = policy(2000, 4, 20);
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::InputRequired,
+            );
+            let before = serde_json::to_vec(handle.task()).unwrap();
+            handle
+                .resume_input_with_memory(&cx, &mut client, &cancellation, answers())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(handle.task()).unwrap(),
+                before,
+                "an acknowledgement must not fabricate a successor Task snapshot"
+            );
+            handle
+                .poll_with_memory(&cx, &mut client, &cancellation)
+                .await
+                .unwrap();
+            assert!(matches!(handle.task(), FinalTask::Working(_)));
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::Completed,
+            );
+            let result = serde_json::to_value(handle.task()).unwrap();
+            assert_eq!(result["result"]["opaque"], json!({"x":[1,true,"kept"]}));
+            assert_eq!(result["result"]["resultTypeLookalike"], "input_required");
+            assert!(
+                serde_json::to_string(handle.task())
+                    .unwrap()
+                    .contains("7.30e-2")
+            );
+            let terminal = serde_json::to_vec(handle.task()).unwrap();
+            cancellation.cancel();
+            assert_eq!(
+                handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, policy)
+                    .await
+                    .unwrap(),
+                FinalTaskWaitOutcome::Completed,
+                "already delivered terminal data remains available without another request",
+            );
+            handle
+                .poll_with_memory(&cx, &mut client, &cancellation)
+                .await
+                .unwrap();
+            assert_eq!(serde_json::to_vec(handle.task()).unwrap(), terminal);
+            let mut peer = server.join(&cx).await.unwrap();
+            assert_core_usable(&cx, &mut client, &mut peer, 8).await;
+            client.close(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn public_memory_task_wait_honors_poll_limit_peer_floor_and_original_retention() {
+        run_memory(|cx| async move {
+            for mode in [
+                "poll-limit",
+                "peer-floor",
+                "expired-working",
+                "expired-input",
+                "cancelled",
+            ] {
+                let mut initial = task(
+                    if mode == "expired-input" {
+                        "input_required"
+                    } else {
+                        "working"
+                    },
+                    Some(1),
+                );
+                if mode == "peer-floor" {
+                    initial["pollIntervalMs"] = json!(600_001);
+                }
+                if mode.starts_with("expired-") {
+                    initial["ttlMs"] = json!(1);
+                    initial["lastUpdatedAt"] = json!("2040-01-01T00:00:00Z");
+                }
+                let (mut client, mut handle, peer) = attached(&cx, initial).await;
+                let mut peer = Some(peer);
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                if mode == "cancelled" {
+                    cancellation.cancel();
+                }
+                let server = if mode == "poll-limit" {
+                    let mut peer = peer.take().unwrap();
+                    Some(
+                        cx.spawn(move |peer_cx| async move {
+                            for id in [3, 4] {
+                                receive(&peer_cx, &mut peer, "tasks/get", Some(id)).await;
+                                reply_task(
+                                    &peer_cx,
+                                    &mut peer,
+                                    u64::try_from(id).unwrap(),
+                                    task("working", Some(1)),
+                                )
+                                .await;
+                            }
+                            peer
+                        })
+                        .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let outcome = handle
+                    .wait_with_memory(&cx, &mut client, &cancellation, policy(30, 2, 1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    match mode {
+                        "poll-limit" => FinalTaskWaitOutcome::PollLimitReached,
+                        "peer-floor" => FinalTaskWaitOutcome::DeadlineElapsed,
+                        "cancelled" => FinalTaskWaitOutcome::ObservationCancelled,
+                        _ => FinalTaskWaitOutcome::TaskExpired,
+                    }
+                );
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                // This branch is deliberately separate: the spawned peer owns
+                // its transport only when authoritative polls are expected.
+                if let Some(mut server) = server {
+                    let mut peer = server.join(&cx).await.unwrap();
+                    assert_core_usable(&cx, &mut client, &mut peer, 5).await;
+                } else {
+                    assert_core_usable(&cx, &mut client, peer.as_mut().unwrap(), 3).await;
+                }
+                assert!(
+                    client.take_cancellation_events().is_empty(),
+                    "a local stop between reads must never request remote Task cancellation"
+                );
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn public_memory_task_poll_rejects_changed_identity_without_replacing_snapshot() {
+        run_memory(|cx| async move {
+            for changed in ["task-id", "created-at", "shape"] {
+                let (mut client, mut handle, mut peer) =
+                    attached(&cx, task("working", Some(1))).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let mut candidate = task("completed", None);
+                match changed {
+                    "task-id" => candidate["taskId"] = json!("another-task"),
+                    "created-at" => candidate["createdAt"] = json!("2026-07-28T12:00:00.001Z"),
+                    _ => {
+                        candidate.as_object_mut().unwrap().remove("result");
+                    }
+                }
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        receive(&peer_cx, &mut peer, "tasks/get", Some(3)).await;
+                        reply_task(&peer_cx, &mut peer, 3, candidate).await;
+                        receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                        let mut complete = task("completed", None);
+                        complete["createdAt"] = json!("2026-07-28T12:00:00+00:00");
+                        reply_task(&peer_cx, &mut peer, 4, complete).await;
+                        peer
+                    })
+                    .unwrap();
+                let cancellation = McpRequestCancellation::new();
+                assert_eq!(
+                    handle
+                        .poll_with_memory(&cx, &mut client, &cancellation)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidRequest,
+                );
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                handle
+                    .poll_with_memory(&cx, &mut client, &cancellation)
+                    .await
+                    .unwrap();
+                assert!(matches!(handle.task(), FinalTask::Completed { .. }));
+                assert_eq!(handle.task().base().created_at, "2026-07-28T12:00:00+00:00");
+                let mut peer = server.join(&cx).await.unwrap();
+                assert_core_usable(&cx, &mut client, &mut peer, 5).await;
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn public_memory_task_wait_cancel_or_drop_retires_only_its_read_and_preserves_siblings() {
+        run_memory(|cx| async move {
+            for abandon in [false, true] {
+                let (mut client, mut handle, mut peer) =
+                    attached(&cx, task("working", Some(1))).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let live = McpRequestCancellation::new();
+                let mut sibling = client
+                    .execute_core(&cx, &live, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                let original = McpRequestCancellation::new();
+                {
+                    let mut waiting = pin!(handle.wait_with_memory(
+                        &cx,
+                        &mut client,
+                        &original,
+                        policy(2000, 4, 1),
+                    ));
+                    let mut request = pin!(peer.recv_async(&cx));
+                    let sent = poll_fn(|task_cx| {
+                        assert!(waiting.as_mut().poll(task_cx).is_pending());
+                        request.as_mut().poll(task_cx)
+                    })
+                    .await
+                    .unwrap();
+                    let JsonRpcMessage::Request(sent) = sent else {
+                        panic!("expected one Task read");
+                    };
+                    assert_eq!(sent.method, "tasks/get");
+                    assert_eq!(sent.id, Some(fastmcp_protocol::RequestId::Number(4)));
+                    if !abandon {
+                        original.cancel();
+                        assert_eq!(
+                            waiting.await.unwrap(),
+                            FinalTaskWaitOutcome::ObservationCancelled
+                        );
+                    }
+                }
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        let cancellation =
+                            receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                        assert_eq!(cancellation.params.unwrap()["requestId"], 4);
+                        reply_task(&peer_cx, &mut peer, 4, task("failed", None)).await;
+                        reply_tools(&peer_cx, &mut peer, 3).await;
+                        receive(&peer_cx, &mut peer, "tasks/get", Some(5)).await;
+                        reply_task(&peer_cx, &mut peer, 5, task("completed", None)).await;
+                        peer
+                    })
+                    .unwrap();
+                let Some(crate::MemoryRequestEvent::Result(result)) =
+                    client.next_event(&cx, &live, &mut sibling).await.unwrap()
+                else {
+                    panic!("the unrelated core request must still complete");
+                };
+                assert!(matches!(
+                    *result,
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+                assert_eq!(
+                    serde_json::to_vec(handle.task()).unwrap(),
+                    before,
+                    "a late reply to a retired read must not become the retained Task"
+                );
+                handle
+                    .poll_with_memory(&cx, &mut client, &live)
+                    .await
+                    .unwrap();
+                assert!(matches!(handle.task(), FinalTask::Completed { .. }));
+                assert_eq!(client.take_cancellation_events().len(), 1);
+                let mut peer = server.join(&cx).await.unwrap();
+                assert_core_usable(&cx, &mut client, &mut peer, 6).await;
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn public_memory_task_input_refuses_stale_or_wrong_inputs_and_never_replays_updates() {
+        run_memory(|cx| async move {
+            for abandon in [false, true] {
+                let (mut client, mut handle, mut peer) =
+                    attached(&cx, task("input_required", None)).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let cancellation = McpRequestCancellation::new();
+                let wrong = serde_json::from_value(json!({"roots":{"action":"accept"}})).unwrap();
+                assert_eq!(
+                    handle
+                        .resume_input_with_memory(&cx, &mut client, &cancellation, wrong)
+                        .await
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::InvalidParams,
+                );
+                for phase in ["working", "completed", "cancelled", "input_required"] {
+                    let mut value = task(phase, None);
+                    if phase == "input_required" {
+                        value["ttlMs"] = json!(1);
+                    }
+                    let mut stale = FinalTaskHandle::new(snapshot(&value));
+                    assert!(
+                        stale
+                            .resume_input_with_memory(&cx, &mut client, &cancellation, answers())
+                            .await
+                            .is_err()
+                    );
+                }
+                {
+                    let mut update = pin!(handle.resume_input_with_memory(
+                        &cx,
+                        &mut client,
+                        &cancellation,
+                        answers(),
+                    ));
+                    let mut request = pin!(peer.recv_async(&cx));
+                    let sent = poll_fn(|task_cx| {
+                        assert!(update.as_mut().poll(task_cx).is_pending());
+                        request.as_mut().poll(task_cx)
+                    })
+                    .await
+                    .unwrap();
+                    let JsonRpcMessage::Request(sent) = sent else {
+                        panic!("expected one explicit input update");
+                    };
+                    assert_eq!(sent.method, "tasks/update");
+                    assert_eq!(
+                        sent.id,
+                        Some(fastmcp_protocol::RequestId::Number(3)),
+                        "all refused input submissions must leave the allocator untouched"
+                    );
+                    if !abandon {
+                        cancellation.cancel();
+                        assert_eq!(
+                            update.await.unwrap_err().code,
+                            McpErrorCode::RequestCancelled
+                        );
+                    }
+                }
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let mut server = cx
+                    .spawn(move |peer_cx| async move {
+                        let cancel =
+                            receive(&peer_cx, &mut peer, "notifications/cancelled", None).await;
+                        assert_eq!(cancel.params.unwrap()["requestId"], 3);
+                        reply_empty(&peer_cx, &mut peer, 3).await;
+                        // Recovery is an explicit read; no second update is sent.
+                        receive(&peer_cx, &mut peer, "tasks/get", Some(4)).await;
+                        reply_task(&peer_cx, &mut peer, 4, task("input_required", None)).await;
+                        receive(&peer_cx, &mut peer, "tasks/update", Some(5)).await;
+                        reply_empty(&peer_cx, &mut peer, 5).await;
+                        peer
+                    })
+                    .unwrap();
+                let live = McpRequestCancellation::new();
+                handle
+                    .poll_with_memory(&cx, &mut client, &live)
+                    .await
+                    .unwrap();
+                handle
+                    .resume_input_with_memory(&cx, &mut client, &live, answers())
+                    .await
+                    .unwrap();
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let mut peer = server.join(&cx).await.unwrap();
+                assert_core_usable(&cx, &mut client, &mut peer, 6).await;
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn public_memory_task_wait_caller_deadline_bounds_sleep_and_pending_read() {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                for pending_read in [false, true] {
+                    let initial = task("working", Some(if pending_read { 1 } else { 500 }));
+                    let (mut client, mut handle, peer) = attached(&cx, initial).await;
+                    let mut peer = Some(peer);
+                    let before = serde_json::to_vec(handle.task()).unwrap();
+                    let server = if pending_read {
+                        let mut peer = peer.take().unwrap();
+                        Some(
+                            cx.spawn(move |peer_cx| async move {
+                                receive(&peer_cx, &mut peer, "tasks/get", Some(3)).await;
+                                let cancelled =
+                                    receive(&peer_cx, &mut peer, "notifications/cancelled", None)
+                                        .await;
+                                assert_eq!(cancelled.params.unwrap()["requestId"], 3);
+                                reply_task(&peer_cx, &mut peer, 3, task("completed", None)).await;
+                                receive(&peer_cx, &mut peer, "tools/list", Some(4)).await;
+                                reply_tools(&peer_cx, &mut peer, 4).await;
+                                peer
+                            })
+                            .unwrap(),
+                        )
+                    } else {
+                        None
+                    };
+                    let limited = runtime.request_cx_with_budget(
+                        asupersync::Budget::INFINITE
+                            .with_deadline(cx.now() + Duration::from_millis(80)),
+                    );
+                    let cancellation = McpRequestCancellation::new();
+                    let started = Instant::now();
+                    assert_eq!(
+                        handle
+                            .wait_with_memory(
+                                &limited,
+                                &mut client,
+                                &cancellation,
+                                policy(2000, 8, 1)
+                            )
+                            .await
+                            .unwrap(),
+                        FinalTaskWaitOutcome::DeadlineElapsed,
+                    );
+                    assert!(
+                        started.elapsed() < Duration::from_secs(1),
+                        "the earlier caller budget must wake the operation, not a later watchdog"
+                    );
+                    assert!(!cancellation.is_cancel_requested());
+                    assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                    if let Some(mut server) = server {
+                        assert!(matches!(
+                            client.list_tools(&cx, &cancellation, None).await.unwrap(),
+                            CoreResult::Final(FinalCoreResult::ToolsList { .. }),
+                        ));
+                        let _peer = server.join(&cx).await.unwrap();
+                    } else {
+                        assert_core_usable(&cx, &mut client, peer.as_mut().unwrap(), 3).await;
+                    }
+                    assert_eq!(
+                        client.take_cancellation_events().len(),
+                        usize::from(pending_read)
+                    );
+                    assert!(cx.checkpoint().is_ok());
+                    client.close(&cx).unwrap();
+                }
+            })
+            .await
+            .expect("caller deadline must release the Memory Task observer");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn public_memory_task_input_rechecks_retention_after_waiting_for_channel_capacity() {
+        run_memory(|cx| async move {
+            for expire_while_full in [false, true] {
+                let mut initial = task("input_required", None);
+                let elapsed = wall_now_nanos()
+                    .checked_sub(timestamp_nanos(initial["createdAt"].as_str().unwrap()).unwrap())
+                    .unwrap();
+                initial["ttlMs"] = json!(u64::try_from(elapsed / 1_000_000).unwrap() + 500);
+                let (mut client, mut handle, mut peer) = attached(&cx, initial).await;
+                let before = serde_json::to_vec(handle.task()).unwrap();
+                let remaining = input_retention_remaining(handle.task()).unwrap().unwrap();
+                let cancellation = McpRequestCancellation::new();
+                // Leave the only request slot occupied. The update must wait
+                // after passing its initial input/retention admission.
+                let mut sibling = client
+                    .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                {
+                    let mut update = pin!(handle.resume_input_with_memory(
+                        &cx,
+                        &mut client,
+                        &cancellation,
+                        answers(),
+                    ));
+                    poll_fn(|task_cx| {
+                        assert!(update.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    if expire_while_full {
+                        asupersync::time::sleep(cx.now(), remaining + Duration::from_millis(5))
+                            .await;
+                    }
+                    receive(&cx, &mut peer, "tools/list", Some(3)).await;
+                    if expire_while_full {
+                        assert_eq!(update.await.unwrap_err().code, McpErrorCode::InvalidRequest);
+                        reply_tools(&cx, &mut peer, 3).await;
+                    } else {
+                        // Route the sibling response while the explicit input
+                        // update is published through the newly available slot.
+                        reply_tools(&cx, &mut peer, 3).await;
+                        poll_fn(|task_cx| {
+                            assert!(update.as_mut().poll(task_cx).is_pending());
+                            Poll::Ready(())
+                        })
+                        .await;
+                        receive(&cx, &mut peer, "tasks/update", Some(4)).await;
+                        reply_empty(&cx, &mut peer, 4).await;
+                        update.await.unwrap();
+                    }
+                }
+                assert_eq!(serde_json::to_vec(handle.task()).unwrap(), before);
+                let Some(crate::MemoryRequestEvent::Result(result)) = client
+                    .next_event(&cx, &cancellation, &mut sibling)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("input admission must preserve the unrelated request");
+                };
+                assert!(matches!(
+                    *result,
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+                assert_core_usable(
+                    &cx,
+                    &mut client,
+                    &mut peer,
+                    if expire_while_full { 4 } else { 5 },
+                )
+                .await;
+                assert!(
+                    client.take_cancellation_events().is_empty(),
+                    "an expired unpublished update has no request owner to cancel"
+                );
+                client.close(&cx).unwrap();
+            }
+        });
+    }
+}
+
 struct Reply {
     task: Value,
     minimum_delay: Duration,

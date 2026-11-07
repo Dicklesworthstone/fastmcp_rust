@@ -658,8 +658,36 @@ impl MemoryClient {
         timeout_policy: RequestTimeoutPolicy,
         admission: ClientExtensionResultAdmission,
     ) -> McpResult<MemoryExtensionExecution> {
+        self.execute_admitted_extension_checked(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            timeout_policy,
+            admission,
+            || Ok(()),
+        )
+        .await
+    }
+
+    /// Revalidates retained operation authority at the publication boundary.
+    /// A full channel may outlive authority that was valid at initial admission.
+    pub(super) async fn execute_admitted_extension_checked<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Value,
+        timeout_policy: RequestTimeoutPolicy,
+        admission: ClientExtensionResultAdmission,
+        mut before_send: F,
+    ) -> McpResult<MemoryExtensionExecution>
+    where
+        F: FnMut() -> McpResult<()>,
+    {
         self.ensure_open()?;
         checkpoint(cx, cancellation)?;
+        before_send()?;
         let next_id = self
             .next_id
             .checked_add(1)
@@ -680,6 +708,7 @@ impl MemoryClient {
                 deadline,
             )
             .await?;
+            before_send()?;
             if let Some(inner) = self.executor.execute_external_extension(
                 cx,
                 cancellation,
