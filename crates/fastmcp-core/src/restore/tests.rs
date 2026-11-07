@@ -77,7 +77,10 @@ struct Authority {
 impl Default for Authority {
     fn default() -> Self {
         Self {
-            state: Mutex::new(AuthorityState { epoch: 7, ..AuthorityState::default() }),
+            state: Mutex::new(AuthorityState {
+                epoch: 7,
+                ..AuthorityState::default()
+            }),
             fault: Mutex::new(None),
             drops: Arc::new(Mutex::new(Vec::new())),
         }
@@ -106,7 +109,9 @@ impl Authority {
         request: &RestoreAuthorityRequest,
     ) -> Result<RestoreAuthorityResponse, RestoreAuthorityFailure> {
         let mut state = self.state.lock().unwrap();
-        let refused = || RestoreAuthorityFailure { dispatch: RestoreDispatch::Dispatched };
+        let refused = || RestoreAuthorityFailure {
+            dispatch: RestoreDispatch::Dispatched,
+        };
         let outcome = match request.operation() {
             RestoreAuthorityOperation::RegisterStoreSet { stores } => {
                 if !state.stores.is_empty() || !state.intents.is_empty() {
@@ -116,45 +121,60 @@ impl Authority {
                 for store in stores {
                     state.generations.insert(store.id.clone(), 1);
                 }
-                RestoreAuthorityOutcome::Registered { store_set_digest: request.store_set_digest() }
+                RestoreAuthorityOutcome::Registered {
+                    store_set_digest: request.store_set_digest(),
+                }
             }
             RestoreAuthorityOperation::Current { store } => {
                 if !state.stores.contains(store) {
                     return Err(refused());
                 }
                 let certified = certified(request.configuration(), store, state.epoch)
-                    .canonical_bytes().unwrap();
+                    .canonical_bytes()
+                    .unwrap();
                 RestoreAuthorityOutcome::Current {
                     certified_binding: certified,
                     store_fence_generation: *state.generations.get(&store.id).unwrap(),
                 }
             }
             RestoreAuthorityOperation::PrepareWrite {
-                store, binding_digest, store_fence_generation, record_digest, ..
+                store,
+                binding_digest,
+                store_fence_generation,
+                record_digest,
+                ..
             } => {
                 if !state.stores.contains(store) {
                     return Err(refused());
                 }
                 let expected = certified(request.configuration(), store, state.epoch)
-                    .canonical_bytes().unwrap();
+                    .canonical_bytes()
+                    .unwrap();
                 if *binding_digest != hash(&expected).unwrap()
                     || state.generations.get(&store.id) != Some(store_fence_generation)
                     || state.intents.contains_key(&request.operation_id())
                 {
                     return Err(refused());
                 }
-                state.intents.insert(request.operation_id(), Intent {
-                    store: store.id.clone(),
-                    binding: *binding_digest,
-                    generation: *store_fence_generation,
-                    record: *record_digest,
-                });
+                state.intents.insert(
+                    request.operation_id(),
+                    Intent {
+                        store: store.id.clone(),
+                        binding: *binding_digest,
+                        generation: *store_fence_generation,
+                        record: *record_digest,
+                    },
+                );
                 RestoreAuthorityOutcome::Prepared {
                     binding_digest: *binding_digest,
                     store_fence_generation: *store_fence_generation,
                 }
             }
-            RestoreAuthorityOperation::CompleteWrite { store, intent_operation_id, receipt } => {
+            RestoreAuthorityOperation::CompleteWrite {
+                store,
+                intent_operation_id,
+                receipt,
+            } => {
                 let Some(intent) = state.intents.get(intent_operation_id) else {
                     return Err(refused());
                 };
@@ -192,7 +212,10 @@ impl Authority {
         assert_eq!(intent.record, fence.record_digest());
         assert_eq!(intent.generation, fence.store_fence_generation());
         let generation = state.generations.get_mut(&intent.store).unwrap();
-        assert_eq!(*generation, intent.generation, "the store CAS uses the prepared generation");
+        assert_eq!(
+            *generation, intent.generation,
+            "the store CAS uses the prepared generation"
+        );
         *generation += 1;
         let mut proof = b"restore-store-commit-witness-v1".to_vec();
         proof.extend_from_slice(&fence.operation_id());
@@ -200,12 +223,23 @@ impl Authority {
         proof.extend_from_slice(&fence.store_fence_generation().to_be_bytes());
         proof.extend_from_slice(&fence.record_digest());
         let digest = hash(&proof).unwrap();
-        state.commits.insert(fence.operation_id(), StoreCommit { digest, proof: proof.clone() });
+        state.commits.insert(
+            fence.operation_id(),
+            StoreCommit {
+                digest,
+                proof: proof.clone(),
+            },
+        );
         state.events.push(Phase::StoreCommit);
         DurableRestoreCommitReceipt::new(
-            fence.operation_id(), fence.binding_digest(), fence.store_fence_generation(),
-            fence.record_digest(), digest, proof,
-        ).unwrap()
+            fence.operation_id(),
+            fence.binding_digest(),
+            fence.store_fence_generation(),
+            fence.record_digest(),
+            digest,
+            proof,
+        )
+        .unwrap()
     }
 }
 
@@ -215,21 +249,33 @@ impl Drop for ObserveDrop {
     fn drop(&mut self) {
         let current = Cx::current().expect("provider destruction retains its caller");
         let caps = current.capabilities();
-        self.0.lock().unwrap().push([caps.spawn, caps.time, caps.entropy, caps.io, caps.remote]);
+        self.0
+            .lock()
+            .unwrap()
+            .push([caps.spawn, caps.time, caps.entropy, caps.io, caps.remote]);
     }
 }
 
 impl RestoreEpochAuthority for Authority {
-    fn execute<'a>(&'a self, cx: &'a Cx, request: &'a RestoreAuthorityRequest) -> RestoreAuthorityFuture<'a> {
+    fn execute<'a>(
+        &'a self,
+        cx: &'a Cx,
+        request: &'a RestoreAuthorityRequest,
+    ) -> RestoreAuthorityFuture<'a> {
         let stage = phase(request.operation());
         {
             let mut state = self.state.lock().unwrap();
             state.events.push(stage);
-            state.requests.push((stage, request.operation_id(), request.request_digest()));
+            state
+                .requests
+                .push((stage, request.operation_id(), request.request_digest()));
         }
         let fault = {
             let mut selected = self.fault.lock().unwrap();
-            if selected.as_ref().is_some_and(|(expected, _)| *expected == stage) {
+            if selected
+                .as_ref()
+                .is_some_and(|(expected, _)| *expected == stage)
+            {
                 selected.take().map(|(_, fault)| fault)
             } else {
                 None
@@ -272,25 +318,36 @@ impl RestoreEpochAuthority for Authority {
             Some(Fault::WrongRequestDigest) => response.request_digest[0] ^= 1,
             Some(Fault::WrongDispatch) => response.dispatch = RestoreDispatch::NotDispatched,
             Some(Fault::WrongBinding) => {
-                let RestoreAuthorityOutcome::Prepared { binding_digest, .. } = &mut response.outcome else {
+                let RestoreAuthorityOutcome::Prepared { binding_digest, .. } =
+                    &mut response.outcome
+                else {
                     panic!("fault is for preparation");
                 };
                 binding_digest[0] ^= 1;
             }
             Some(Fault::WrongGeneration) => {
-                let RestoreAuthorityOutcome::Prepared { store_fence_generation, .. } = &mut response.outcome else {
+                let RestoreAuthorityOutcome::Prepared {
+                    store_fence_generation,
+                    ..
+                } = &mut response.outcome
+                else {
                     panic!("fault is for preparation");
                 };
                 *store_fence_generation += 1;
             }
             Some(Fault::WrongCompletion) => {
-                let RestoreAuthorityOutcome::Completed { commit_digest, .. } = &mut response.outcome else {
+                let RestoreAuthorityOutcome::Completed { commit_digest, .. } =
+                    &mut response.outcome
+                else {
                     panic!("fault is for completion");
                 };
                 commit_digest[0] ^= 1;
             }
             Some(Fault::InvalidCertificate) => {
-                let RestoreAuthorityOutcome::Current { certified_binding, .. } = &mut response.outcome else {
+                let RestoreAuthorityOutcome::Current {
+                    certified_binding, ..
+                } = &mut response.outcome
+                else {
                     panic!("fault is for current");
                 };
                 certified_binding[0] ^= 1;
@@ -317,7 +374,10 @@ fn configuration() -> RestoreEpochConfiguration {
 }
 
 fn declaration(id: &str, namespace: u8) -> RestoreStoreDeclaration {
-    RestoreStoreDeclaration { id: id.into(), namespace_digest: [namespace; 32] }
+    RestoreStoreDeclaration {
+        id: id.into(),
+        namespace_digest: [namespace; 32],
+    }
 }
 
 fn declarations() -> Vec<RestoreStoreDeclaration> {
@@ -346,7 +406,9 @@ async fn register(
     config: RestoreEpochConfiguration,
     authority: &Arc<Authority>,
 ) -> RestoreEpochFacade {
-    RestoreEpochFacade::register(cx, config, declarations(), authority.clone(), Time::MAX).await.unwrap()
+    RestoreEpochFacade::register(cx, config, declarations(), authority.clone(), Time::MAX)
+        .await
+        .unwrap()
 }
 
 async fn finish(
@@ -356,7 +418,10 @@ async fn finish(
     fence: RestoreWriteFence,
 ) -> CompletedRestoreWrite {
     let receipt = authority.commit_store(&fence);
-    store.complete_write(cx, fence, receipt, Time::MAX).await.unwrap()
+    store
+        .complete_write(cx, fence, receipt, Time::MAX)
+        .await
+        .unwrap()
 }
 
 fn refused<T>(result: Result<T, RestoreError>, expected: RestoreError) {
@@ -381,25 +446,41 @@ fn registered_store_union_drives_current_prepare_store_proof_then_completion() {
         let facade = register(&cx, configuration(), &authority).await;
         assert!(facade.store("unregistered").is_none());
         let store = facade.store("replay").unwrap();
-        let fence = store.prepare_write(&cx, [0x66; 32], Time::MAX).await.unwrap();
+        let fence = store
+            .prepare_write(&cx, [0x66; 32], Time::MAX)
+            .await
+            .unwrap();
         let id = fence.operation_id();
         let binding = fence.binding_digest();
         assert_eq!(fence.store_id(), "replay");
         assert_eq!(fence.namespace_digest(), [0x55; 32]);
         assert_eq!(fence.store_set_digest(), store.store_set_digest());
         assert_eq!(authority.intents(), 1);
-        assert_eq!(authority.events(), vec![Phase::Register, Phase::Current, Phase::Prepare]);
+        assert_eq!(
+            authority.events(),
+            vec![Phase::Register, Phase::Current, Phase::Prepare]
+        );
 
         let completed = finish(&cx, &store, &authority, fence).await;
         assert_eq!(completed.operation_id(), id);
         assert_eq!(completed.binding_digest(), binding);
-        assert_eq!(completed.commit_digest(), authority.state.lock().unwrap().commits[&id].digest);
+        assert_eq!(
+            completed.commit_digest(),
+            authority.state.lock().unwrap().commits[&id].digest
+        );
         assert_eq!(authority.intents(), 0);
         assert_eq!(store.shared.intents.load(Ordering::Acquire), 0);
         assert!(!facade.is_quarantined());
-        assert_eq!(authority.events(), vec![
-            Phase::Register, Phase::Current, Phase::Prepare, Phase::StoreCommit, Phase::Complete,
-        ]);
+        assert_eq!(
+            authority.events(),
+            vec![
+                Phase::Register,
+                Phase::Current,
+                Phase::Prepare,
+                Phase::StoreCommit,
+                Phase::Complete,
+            ]
+        );
     });
 }
 
@@ -421,7 +502,11 @@ fn stable_binding_is_independent_of_transient_ids_and_store_fence_versions() {
         assert_eq!(second.binding_digest(), binding);
         assert_eq!(second.store_fence_generation(), 2);
         let state = authority.state.lock().unwrap();
-        let currents: Vec<_> = state.requests.iter().filter(|entry| entry.0 == Phase::Current).collect();
+        let currents: Vec<_> = state
+            .requests
+            .iter()
+            .filter(|entry| entry.0 == Phase::Current)
+            .collect();
         assert_eq!(currents.len(), 2);
         assert_ne!(currents[0].1, currents[1].1);
         assert_ne!(currents[0].2, currents[1].2);
@@ -443,7 +528,10 @@ fn canonical_parser_rejects_truncation_trailing_bytes_tags_types_and_lengths() {
     assert_eq!(binding.digest(), hash(&bytes).unwrap());
 
     for end in 0..bytes.len() {
-        refused(parse_binding(&bytes[..end], &config, &store), RestoreError::InvalidBinding);
+        refused(
+            parse_binding(&bytes[..end], &config, &store),
+            RestoreError::InvalidBinding,
+        );
     }
     let mut malformed = Vec::new();
     let mut candidate = bytes.clone();
@@ -458,7 +546,10 @@ fn canonical_parser_rejects_truncation_trailing_bytes_tags_types_and_lengths() {
     oversized_length[15..19].copy_from_slice(&u32::MAX.to_be_bytes());
     malformed.push(oversized_length);
     for candidate in malformed {
-        refused(parse_binding(&candidate, &config, &store), RestoreError::InvalidBinding);
+        refused(
+            parse_binding(&candidate, &config, &store),
+            RestoreError::InvalidBinding,
+        );
     }
 }
 
@@ -481,7 +572,10 @@ fn canonical_binding_couples_authority_configuration_generation_deployment_and_n
             refused(claim.canonical_bytes(), RestoreError::InvalidBinding);
         } else {
             let bytes = claim.canonical_bytes().unwrap();
-            refused(parse_binding(&bytes, &config, &store), RestoreError::InvalidBinding);
+            refused(
+                parse_binding(&bytes, &config, &store),
+                RestoreError::InvalidBinding,
+            );
         }
     }
 }
@@ -496,13 +590,25 @@ fn certificate_mode_and_size_are_enforced_before_a_binding_is_sealed() {
     let with_certificate = certified(&required, &store, 7).canonical_bytes().unwrap();
     assert!(parse_binding(&plain, &forbidden, &store).is_ok());
     assert!(parse_binding(&with_certificate, &required, &store).is_ok());
-    refused(parse_binding(&plain, &required, &store), RestoreError::InvalidBinding);
-    refused(parse_binding(&with_certificate, &forbidden, &store), RestoreError::InvalidBinding);
+    refused(
+        parse_binding(&plain, &required, &store),
+        RestoreError::InvalidBinding,
+    );
+    refused(
+        parse_binding(&with_certificate, &forbidden, &store),
+        RestoreError::InvalidBinding,
+    );
     required.limits.certificate_bytes = 1;
-    refused(parse_binding(&with_certificate, &required, &store), RestoreError::InvalidBinding);
+    refused(
+        parse_binding(&with_certificate, &required, &store),
+        RestoreError::InvalidBinding,
+    );
     let mut oversized = forbidden.clone();
     oversized.limits.binding_bytes = plain.len() - 1;
-    refused(parse_binding(&plain, &oversized, &store), RestoreError::InvalidBinding);
+    refused(
+        parse_binding(&plain, &oversized, &store),
+        RestoreError::InvalidBinding,
+    );
 }
 
 #[test]
@@ -515,7 +621,10 @@ fn epoch_changes_quarantine_all_handles_and_do_not_create_another_intent() {
         let first = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         finish(&cx, &store, &authority, first).await;
         authority.state.lock().unwrap().epoch += 1;
-        refused(store.prepare_write(&cx, [2; 32], Time::MAX).await, RestoreError::Quarantined);
+        refused(
+            store.prepare_write(&cx, [2; 32], Time::MAX).await,
+            RestoreError::Quarantined,
+        );
         assert!(facade.store("browser").unwrap().is_quarantined());
         assert_eq!(authority.intents(), 0);
         assert_eq!(authority.events().last(), Some(&Phase::Current));
@@ -529,8 +638,14 @@ fn malformed_authority_binding_quarantines_before_prepare_dispatch() {
         let authority = Arc::new(Authority::default());
         let facade = register(&cx, configuration(), &authority).await;
         authority.inject(Phase::Current, Fault::InvalidCertificate);
-        refused(facade.store("replay").unwrap().prepare_write(&cx, [1; 32], Time::MAX).await,
-            RestoreError::InvalidBinding);
+        refused(
+            facade
+                .store("replay")
+                .unwrap()
+                .prepare_write(&cx, [1; 32], Time::MAX)
+                .await,
+            RestoreError::InvalidBinding,
+        );
         assert!(facade.is_quarantined());
         assert_eq!(authority.events(), vec![Phase::Register, Phase::Current]);
         assert_eq!(authority.intents(), 0);
@@ -539,14 +654,25 @@ fn malformed_authority_binding_quarantines_before_prepare_dispatch() {
 
 #[test]
 fn preparation_rejects_response_operation_digest_binding_and_generation_substitution() {
-    for fault in [Fault::WrongOperation, Fault::WrongRequestDigest, Fault::WrongBinding, Fault::WrongGeneration] {
+    for fault in [
+        Fault::WrongOperation,
+        Fault::WrongRequestDigest,
+        Fault::WrongBinding,
+        Fault::WrongGeneration,
+    ] {
         block_on(async {
             let cx = Cx::current().unwrap();
             let authority = Arc::new(Authority::default());
             let facade = register(&cx, configuration(), &authority).await;
             authority.inject(Phase::Prepare, fault);
-            refused(facade.store("replay").unwrap().prepare_write(&cx, [1; 32], Time::MAX).await,
-                RestoreError::InvalidReceipt);
+            refused(
+                facade
+                    .store("replay")
+                    .unwrap()
+                    .prepare_write(&cx, [1; 32], Time::MAX)
+                    .await,
+                RestoreError::InvalidReceipt,
+            );
             assert!(facade.is_quarantined());
             assert_eq!(authority.intents(), 1, "external uncertainty is not erased");
         });
@@ -562,10 +688,20 @@ fn forged_store_proof_is_not_a_completion_witness() {
         let store = facade.store("replay").unwrap();
         let fence = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         let fabricated = DurableRestoreCommitReceipt::new(
-            fence.operation_id(), fence.binding_digest(), fence.store_fence_generation(),
-            fence.record_digest(), [8; 32], b"not-recorded-by-the-store".to_vec(),
-        ).unwrap();
-        refused(store.complete_write(&cx, fence, fabricated, Time::MAX).await, RestoreError::Uncertain);
+            fence.operation_id(),
+            fence.binding_digest(),
+            fence.store_fence_generation(),
+            fence.record_digest(),
+            [8; 32],
+            b"not-recorded-by-the-store".to_vec(),
+        )
+        .unwrap();
+        refused(
+            store
+                .complete_write(&cx, fence, fabricated, Time::MAX)
+                .await,
+            RestoreError::Uncertain,
+        );
         assert!(facade.is_quarantined());
         assert_eq!(authority.intents(), 1);
         assert!(!authority.events().contains(&Phase::StoreCommit));
@@ -590,7 +726,10 @@ fn commit_receipt_field_substitution_is_rejected_before_completion_dispatch() {
                 _ => unreachable!(),
             }
             let calls = authority.calls();
-            refused(store.complete_write(&cx, fence, receipt, Time::MAX).await, RestoreError::InvalidReceipt);
+            refused(
+                store.complete_write(&cx, fence, receipt, Time::MAX).await,
+                RestoreError::InvalidReceipt,
+            );
             assert_eq!(authority.calls(), calls);
             assert!(facade.is_quarantined());
             assert_eq!(authority.intents(), 1);
@@ -609,7 +748,10 @@ fn another_registered_store_cannot_complete_the_original_stores_fence() {
         let fence = replay.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         let receipt = authority.commit_store(&fence);
         let calls = authority.calls();
-        refused(browser.complete_write(&cx, fence, receipt, Time::MAX).await, RestoreError::InvalidReceipt);
+        refused(
+            browser.complete_write(&cx, fence, receipt, Time::MAX).await,
+            RestoreError::InvalidReceipt,
+        );
         assert_eq!(authority.calls(), calls);
         assert!(replay.is_quarantined());
         assert!(browser.is_quarantined());
@@ -626,8 +768,14 @@ fn completion_requires_the_exact_authority_acknowledgement() {
         let fence = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         let receipt = authority.commit_store(&fence);
         authority.inject(Phase::Complete, Fault::WrongCompletion);
-        refused(store.complete_write(&cx, fence, receipt, Time::MAX).await, RestoreError::InvalidReceipt);
-        assert!(facade.is_quarantined(), "a committed store is not rolled back on an invalid acknowledgement");
+        refused(
+            store.complete_write(&cx, fence, receipt, Time::MAX).await,
+            RestoreError::InvalidReceipt,
+        );
+        assert!(
+            facade.is_quarantined(),
+            "a committed store is not rolled back on an invalid acknowledgement"
+        );
         assert!(authority.events().contains(&Phase::StoreCommit));
     });
 }
@@ -645,7 +793,10 @@ fn dropping_an_owned_fence_quarantines_every_clone_without_dispatching_cleanup()
         drop(fence);
         assert!(clone.is_quarantined());
         assert!(facade.store("browser").unwrap().is_quarantined());
-        refused(clone.prepare_write(&cx, [2; 32], Time::MAX).await, RestoreError::Quarantined);
+        refused(
+            clone.prepare_write(&cx, [2; 32], Time::MAX).await,
+            RestoreError::Quarantined,
+        );
         assert_eq!(authority.calls(), calls);
         assert_eq!(authority.intents(), 1);
         assert_eq!(store.shared.intents.load(Ordering::Acquire), 0);
@@ -691,21 +842,34 @@ fn provider_drop_retains_the_tightest_ceiling_observed_during_partial_progress()
         }
         assert!(Cx::current().unwrap().capabilities().spawn);
         drop(operation);
-        assert_eq!(authority.drops.lock().unwrap().as_slice(), &[[false, true, true, true, true]]);
+        assert_eq!(
+            authority.drops.lock().unwrap().as_slice(),
+            &[[false, true, true, true, true]]
+        );
         assert!(facade.is_quarantined());
     });
 }
 
 #[test]
 fn uncertain_or_dispatched_failures_and_wrong_dispatch_reports_quarantine() {
-    for fault in [Fault::UnknownAfterDispatch, Fault::FailedAfterDispatch, Fault::WrongDispatch] {
+    for fault in [
+        Fault::UnknownAfterDispatch,
+        Fault::FailedAfterDispatch,
+        Fault::WrongDispatch,
+    ] {
         block_on(async {
             let cx = Cx::current().unwrap();
             let authority = Arc::new(Authority::default());
             let facade = register(&cx, configuration(), &authority).await;
             authority.inject(Phase::Prepare, fault);
-            refused(facade.store("replay").unwrap().prepare_write(&cx, [1; 32], Time::MAX).await,
-                RestoreError::Uncertain);
+            refused(
+                facade
+                    .store("replay")
+                    .unwrap()
+                    .prepare_write(&cx, [1; 32], Time::MAX)
+                    .await,
+                RestoreError::Uncertain,
+            );
             assert!(facade.is_quarantined());
             assert_eq!(authority.intents(), 1);
         });
@@ -737,15 +901,25 @@ fn provably_not_dispatched_prepare_can_retry_but_not_dispatched_completion_stays
         let facade = register(&cx, configuration(), &authority).await;
         let store = facade.store("replay").unwrap();
         authority.inject(Phase::Prepare, Fault::NotDispatched);
-        refused(store.prepare_write(&cx, [1; 32], Time::MAX).await, RestoreError::ProviderUnavailable);
+        refused(
+            store.prepare_write(&cx, [1; 32], Time::MAX).await,
+            RestoreError::ProviderUnavailable,
+        );
         assert!(!facade.is_quarantined());
         assert_eq!(authority.intents(), 0);
         let fence = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         let receipt = authority.commit_store(&fence);
         authority.inject(Phase::Complete, Fault::NotDispatched);
-        refused(store.complete_write(&cx, fence, receipt, Time::MAX).await, RestoreError::ProviderUnavailable);
+        refused(
+            store.complete_write(&cx, fence, receipt, Time::MAX).await,
+            RestoreError::ProviderUnavailable,
+        );
         assert!(facade.is_quarantined());
-        assert_eq!(authority.intents(), 1, "an undispatched completion does not undo its preparation");
+        assert_eq!(
+            authority.intents(),
+            1,
+            "an undispatched completion does not undo its preparation"
+        );
     });
 }
 
@@ -764,10 +938,16 @@ fn pending_read_and_call_capacity_are_bounded_and_released_on_drop() {
             let mut first = Box::pin(store.prepare_write(&cx, [1; 32], Time::MAX));
             assert!(poll_once(first.as_mut()).is_pending());
             let calls = authority.calls();
-            refused(store.prepare_write(&cx, [2; 32], Time::MAX).await, RestoreError::CapacityExceeded);
+            refused(
+                store.prepare_write(&cx, [2; 32], Time::MAX).await,
+                RestoreError::CapacityExceeded,
+            );
             assert_eq!(authority.calls(), calls);
             drop(first);
-            assert!(!facade.is_quarantined(), "dropping only a read creates no uncertain mutation");
+            assert!(
+                !facade.is_quarantined(),
+                "dropping only a read creates no uncertain mutation"
+            );
             assert_eq!(store.shared.calls.load(Ordering::Acquire), 0);
             assert_eq!(store.shared.reads.load(Ordering::Acquire), 0);
             assert_eq!(store.shared.intents.load(Ordering::Acquire), 0);
@@ -788,7 +968,10 @@ fn outstanding_intent_capacity_is_not_released_until_the_fence_settles() {
         let store = facade.store("replay").unwrap();
         let fence = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         let calls = authority.calls();
-        refused(store.prepare_write(&cx, [2; 32], Time::MAX).await, RestoreError::CapacityExceeded);
+        refused(
+            store.prepare_write(&cx, [2; 32], Time::MAX).await,
+            RestoreError::CapacityExceeded,
+        );
         assert_eq!(authority.calls(), calls);
         assert_eq!(store.shared.intents.load(Ordering::Acquire), 1);
         finish(&cx, &store, &authority, fence).await;
@@ -815,14 +998,30 @@ fn denied_retained_and_ambient_effects_never_construct_a_provider_future() {
                 let _restriction = Cx::push_restriction(mask);
                 Cx::current().unwrap()
             };
-            refused(RestoreEpochFacade::register(
-                &restricted, configuration(), declarations(), authority.clone(), Time::MAX,
-            ).await, RestoreError::CapabilityUnavailable);
+            refused(
+                RestoreEpochFacade::register(
+                    &restricted,
+                    configuration(),
+                    declarations(),
+                    authority.clone(),
+                    Time::MAX,
+                )
+                .await,
+                RestoreError::CapabilityUnavailable,
+            );
             {
                 let _restriction = Cx::push_restriction(mask);
-                refused(RestoreEpochFacade::register(
-                    &cx, configuration(), declarations(), authority.clone(), Time::MAX,
-                ).await, RestoreError::CapabilityUnavailable);
+                refused(
+                    RestoreEpochFacade::register(
+                        &cx,
+                        configuration(),
+                        declarations(),
+                        authority.clone(),
+                        Time::MAX,
+                    )
+                    .await,
+                    RestoreError::CapabilityUnavailable,
+                );
             }
             assert_eq!(authority.calls(), 0);
         });
@@ -836,9 +1035,16 @@ fn cancellation_between_request_construction_and_execution_does_not_dispatch() {
         let authority = Arc::new(Authority::default());
         let facade = register(&cx, configuration(), &authority).await;
         let store = facade.store("replay").unwrap();
-        let request = store.shared.request(&cx, RestoreAuthorityOperation::Current {
-            store: (*store.declaration).clone(),
-        }, Time::MAX).unwrap();
+        let request = store
+            .shared
+            .request(
+                &cx,
+                RestoreAuthorityOperation::Current {
+                    store: (*store.declaration).clone(),
+                },
+                Time::MAX,
+            )
+            .unwrap();
         let calls = authority.calls();
         cx.set_cancel_requested(true);
         let result = store.shared.call(&cx, &request, None).await;
@@ -856,12 +1062,22 @@ fn an_elapsed_request_deadline_is_checked_before_provider_construction() {
         let authority = Arc::new(Authority::default());
         let facade = register(&cx, configuration(), &authority).await;
         let store = facade.store("replay").unwrap();
-        let mut request = store.shared.request(&cx, RestoreAuthorityOperation::Current {
-            store: (*store.declaration).clone(),
-        }, Time::MAX).unwrap();
+        let mut request = store
+            .shared
+            .request(
+                &cx,
+                RestoreAuthorityOperation::Current {
+                    store: (*store.declaration).clone(),
+                },
+                Time::MAX,
+            )
+            .unwrap();
         request.deadline = cx.now();
         let calls = authority.calls();
-        refused(store.shared.call(&cx, &request, None).await, RestoreError::DeadlineExceeded);
+        refused(
+            store.shared.call(&cx, &request, None).await,
+            RestoreError::DeadlineExceeded,
+        );
         assert_eq!(authority.calls(), calls);
         assert!(!facade.is_quarantined());
     });
@@ -879,9 +1095,17 @@ fn invalid_store_sets_and_limits_are_rejected_without_provider_dispatch() {
             vec![declaration("contains space", 1)],
         ];
         for stores in invalid_sets {
-            refused(RestoreEpochFacade::register(
-                &cx, configuration(), stores, authority.clone(), Time::MAX,
-            ).await, RestoreError::InvalidConfiguration);
+            refused(
+                RestoreEpochFacade::register(
+                    &cx,
+                    configuration(),
+                    stores,
+                    authority.clone(),
+                    Time::MAX,
+                )
+                .await,
+                RestoreError::InvalidConfiguration,
+            );
         }
         for field in 0..6 {
             let mut config = configuration();
@@ -894,9 +1118,17 @@ fn invalid_store_sets_and_limits_are_rejected_without_provider_dispatch() {
                 5 => config.limits.binding_bytes = MAX_BINDING + 1,
                 _ => unreachable!(),
             }
-            refused(RestoreEpochFacade::register(
-                &cx, config, declarations(), authority.clone(), Time::MAX,
-            ).await, RestoreError::InvalidConfiguration);
+            refused(
+                RestoreEpochFacade::register(
+                    &cx,
+                    config,
+                    declarations(),
+                    authority.clone(),
+                    Time::MAX,
+                )
+                .await,
+                RestoreError::InvalidConfiguration,
+            );
         }
         assert_eq!(authority.calls(), 0);
     });
@@ -905,13 +1137,15 @@ fn invalid_store_sets_and_limits_are_rejected_without_provider_dispatch() {
 #[test]
 fn store_proof_shape_and_length_have_fixed_finite_bounds() {
     for proof in [Vec::new(), vec![0; MAX_COMMIT_PROOF + 1]] {
-        refused(DurableRestoreCommitReceipt::new(
-            [1; 16], [2; 32], 3, [4; 32], [5; 32], proof,
-        ), RestoreError::InvalidReceipt);
+        refused(
+            DurableRestoreCommitReceipt::new([1; 16], [2; 32], 3, [4; 32], [5; 32], proof),
+            RestoreError::InvalidReceipt,
+        );
     }
-    refused(DurableRestoreCommitReceipt::new(
-        [1; 16], [2; 32], 0, [4; 32], [5; 32], vec![1],
-    ), RestoreError::InvalidReceipt);
+    refused(
+        DurableRestoreCommitReceipt::new([1; 16], [2; 32], 0, [4; 32], [5; 32], vec![1]),
+        RestoreError::InvalidReceipt,
+    );
 }
 
 #[test]
@@ -934,7 +1168,10 @@ fn dropping_pending_completion_quarantines_even_if_the_authority_already_settled
         drop(completion);
         assert!(facade.is_quarantined());
         assert_eq!(store.shared.intents.load(Ordering::Acquire), 0);
-        refused(store.prepare_write(&cx, [2; 32], Time::MAX).await, RestoreError::Quarantined);
+        refused(
+            store.prepare_write(&cx, [2; 32], Time::MAX).await,
+            RestoreError::Quarantined,
+        );
         assert_eq!(authority.calls(), calls);
         assert_eq!(authority.drops.lock().unwrap().len(), 1);
     });
@@ -947,7 +1184,10 @@ fn parser_rejects_a_zero_epoch_even_when_the_wire_shape_is_canonical() {
     let mut bytes = certified(&config, &store, 7).canonical_bytes().unwrap();
     let epoch_offset = bytes.len() - 16;
     bytes[epoch_offset..].fill(0);
-    refused(parse_binding(&bytes, &config, &store), RestoreError::InvalidBinding);
+    refused(
+        parse_binding(&bytes, &config, &store),
+        RestoreError::InvalidBinding,
+    );
 }
 
 #[test]
@@ -958,9 +1198,20 @@ fn preparation_dispatch_deadline_cannot_outlive_the_write_intent() {
     }
 
     impl RestoreEpochAuthority for CapturePrepareDeadline {
-        fn execute<'a>(&'a self, cx: &'a Cx, request: &'a RestoreAuthorityRequest) -> RestoreAuthorityFuture<'a> {
-            if let RestoreAuthorityOperation::PrepareWrite { intent_lifetime, .. } = request.operation() {
-                self.observed.lock().unwrap().push((cx.now(), *intent_lifetime, request.deadline()));
+        fn execute<'a>(
+            &'a self,
+            cx: &'a Cx,
+            request: &'a RestoreAuthorityRequest,
+        ) -> RestoreAuthorityFuture<'a> {
+            if let RestoreAuthorityOperation::PrepareWrite {
+                intent_lifetime, ..
+            } = request.operation()
+            {
+                self.observed.lock().unwrap().push((
+                    cx.now(),
+                    *intent_lifetime,
+                    request.deadline(),
+                ));
             }
             self.authority.execute(cx, request)
         }
@@ -977,9 +1228,10 @@ fn preparation_dispatch_deadline_cannot_outlive_the_write_intent() {
         config.limits.intent_lifetime = Duration::from_secs(1);
         config.limits.observation_freshness = Duration::from_secs(30);
         config.limits.call_timeout = Duration::from_secs(60);
-        let facade = RestoreEpochFacade::register(
-            &cx, config, declarations(), capture.clone(), Time::MAX,
-        ).await.unwrap();
+        let facade =
+            RestoreEpochFacade::register(&cx, config, declarations(), capture.clone(), Time::MAX)
+                .await
+                .unwrap();
         let store = facade.store("replay").unwrap();
         let fence = store.prepare_write(&cx, [1; 32], Time::MAX).await.unwrap();
         let observations = capture.observed.lock().unwrap();

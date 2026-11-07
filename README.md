@@ -1166,6 +1166,10 @@ response admission and local identity resolution separate:
   relationships, trust domains and client-ID scope. Pairwise subject strings
   may differ; matching text never creates an account association. Lookup is
   bounded and uses an ordered index, with no create, link or update operation.
+- `replay::IdentityAssertionReplay` consumes a verified assertion and composes
+  persistent MAC derivation, a registered restore-authority write intent, an
+  atomic assertion-use store, and independent commit acknowledgment. It returns
+  an exclusive reserved assertion only after the complete transaction succeeds.
 
 The local OIDC sequence is
 `OidcCodeFlowConfiguration::prepare` →
@@ -1225,8 +1229,8 @@ and the locally retained final token. The ordinary verification method keeps
 its closed claim set; actor, subject-alias, RAR and sender-constraining claims
 cannot be enabled through this policy.
 
-These components do not yet provide complete enterprise sign-in. They perform
-no network exchange and do not activate the MCP extension.
+These components do not yet perform OAuth token exchanges or complete
+enterprise sign-in, and they do not activate the MCP extension.
 The mapping table supports public and redirect-host pairwise OIDC subject
 namespaces. It rechecks the current profile, selected snapshot, signed token
 bindings and review/claim lifetimes on every lookup; results retain the exact
@@ -1234,10 +1238,57 @@ token and snapshot digests. A local snapshot digest does not establish a
 rollback-resistant policy fence or prove that responses came from one exchange.
 Guarded sector-document retrieval remains separate work.
 
+#### External replay and restore providers
+
+The replay path has three independently implemented provider boundaries:
+
+- `fastmcp_core::replay::PersistentHmacSha256Backend` supplies persistent MAC
+  creation and verification. `PersistentReplayDigest` constructs the exact
+  purpose-separated input and derives aliases under **every** configured active
+  and previous generation. Partial results never become an alias set.
+- `fastmcp_core::restore::RestoreEpochAuthority` supplies external store-set
+  registration, current-epoch certification, write-intent preparation and
+  completion. `RestoreEpochFacade::register` fixes the entire configured store
+  union before releasing any `RegisteredRestoreStore`. Canonical stable binding
+  digests exclude transient operation IDs, observation times and transport data.
+- `replay::IdentityAssertionUseStore` atomically checks and reserves the whole
+  alias set, journals its exact outcome with the durable fence CAS, and returns
+  a commit proof for the independent restore authority to verify. The client
+  pins the store adapter's artifact and configuration identity as well as the
+  MAC ring and its deployment acknowledgment identity.
+
+Facade users can import the provider modules through
+`fastmcp_rust::http_auth::enterprise::replay::{persistent_mac, restore_authority}`.
+
+The replay key depends on the exact verified issuer and compact-token digest.
+Changing flow, browser session, client registration or policy evidence cannot
+create a second key for the same assertion. Tombstones retain authority through
+the signed expiration plus the fixed global 300-second positive-skew ceiling;
+a later policy cannot shorten that horizon. Rotation looks up every admitted
+previous alias before allowing a new reservation.
+
+`IdentityAssertionReplay::reserve` consumes the protected assertion on every
+outcome. Its caller-owned operation is bounded by the caller deadline, remaining
+assertion lifetime and a 30-second ceiling; store work is also bounded by the
+write intent's expiry. An uncertain write, malformed receipt, cancelled
+post-dispatch operation or abandoned fence closes the registered deployment to
+new writes and preserves unresolved external state. Dropping a local owner
+never releases a tombstone or automatically retries a mutation.
+
+These contracts are implementable external boundaries, not bundled persistent
+services or attestations. The adapters must independently prove durable key
+custody, atomic all-generation reservation, cluster ring agreement, external
+rollback/clone resistance and authenticated commit verification. The shipped
+test adapters are explicitly in-memory fault fixtures. The restore facade
+currently implements ordinary writes; administrative reconciliation, epoch
+advance and fenced migration remain unfinished, so it has no local reset or
+reopen shortcut.
+
 Durable browser launch/callback custody, confidential credential providers,
-the native token-exchange driver, attested mapping authority and durable
-assertion/replay protection remain required before activation. SAML and durable/distributed server Task stores
-remain separate incomplete extension work.
+the native token-exchange driver, attested mapping authority and qualified
+deployments of the replay/restore providers remain required before activation.
+SAML and durable/distributed server Task stores remain separate incomplete
+extension work.
 
 ### Sender-constrained credentials: DPoP (RFC 9449), caller-driven
 
