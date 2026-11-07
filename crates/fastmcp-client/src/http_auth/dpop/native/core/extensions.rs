@@ -22,7 +22,8 @@ use fastmcp_protocol::{
     CoreRequest, CoreResult, ExtensionId, FINAL_CLIENT_CAPABILITIES_META_KEY,
     FINAL_CLIENT_INFO_META_KEY, FINAL_PROTOCOL_VERSION, FINAL_PROTOCOL_VERSION_META_KEY,
     FinalCoreResult, FinalRequestMeta, JsonRpcMessage, ProgressMarker, RequestId,
-    ServerNotification, decode_strict_jsonrpc_message, decode_strict_jsonrpc_response,
+    ServerDiscoverResult, ServerNotification, decode_strict_jsonrpc_message,
+    decode_strict_jsonrpc_response,
 };
 use serde_json::{Value, json};
 
@@ -30,13 +31,16 @@ use super::stream::{
     DpopStreamError, DpopStreamLimits, Idle, PreparedStream, StreamDecoder, StreamEvent,
 };
 use super::{
-    BoundedWriter, CoreDecoder, DpopCredential, DpopHttpClient, DpopHttpResponse,
+    BoundedWriter, CoreDecoder, DpopCoreError, DpopCredential, DpopHttpClient, DpopHttpResponse,
     ManagedCoreError, ManagedCoreLimits, ModernHttpRequest, WaitBounds, check_live,
     decode_response,
 };
 use crate::http_auth::rpc::admit_http_notification;
 use crate::http_auth::caller::with_caller;
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime};
+
+/// One-way, proof-bound extension notifications over authenticated DPoP HTTPS.
+pub mod notification;
 
 /// Immutable local extension configuration, without credentials or peer state.
 ///
@@ -146,14 +150,78 @@ impl DpopExtensionResult {
     pub fn into_result(self) -> Value { self.result }
 }
 
+// Request and notification owners share only discovery preparation/admission.
+// A valid discovery is data; its consumer must still negotiate the exact
+// method or current-message notification before its own second POST.
+struct PreparedDiscovery {
+    wire: ModernHttpRequest,
+    decoder: CoreDecoder,
+}
+
+impl PreparedDiscovery {
+    fn new(
+        target: &str,
+        configuration: &DpopExtensionConfiguration,
+        metadata: FinalRequestMeta,
+        discovery_id: RequestId,
+        limits: ManagedCoreLimits,
+        native_maximum: usize,
+    ) -> Result<(Self, Value), ManagedCoreError> {
+        if metadata.protocol_version != FINAL_PROTOCOL_VERSION
+            || [FINAL_PROTOCOL_VERSION_META_KEY, FINAL_CLIENT_CAPABILITIES_META_KEY,
+                FINAL_CLIENT_INFO_META_KEY].iter()
+                .any(|key| metadata.additional_metadata.contains_key(*key))
+        {
+            return Err(ManagedCoreError::InvalidRequest);
+        }
+        let mut metadata = serde_json::to_value(metadata)
+            .map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
+            .and_then(Value::as_object_mut).ok_or(ManagedCoreError::InvalidRequest)?;
+        if capabilities.get("extensions")
+            .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
+        {
+            return Err(ManagedCoreError::UnsupportedRequest);
+        }
+        capabilities.insert("extensions".to_owned(),
+            serde_json::to_value(configuration.runtime.client_wire_extensions())
+                .map_err(|_| ManagedCoreError::InvalidRequest)?);
+        let discovery = CoreRequest::decode(
+            ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":metadata})),
+        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
+        let parameters = discovery.encode_params()
+            .map_err(|_| ManagedCoreError::InvalidRequest)?
+            .ok_or(ManagedCoreError::InvalidRequest)?;
+        let wire = wire(target, "server/discover", &discovery_id, parameters,
+            limits.request_bytes().min(native_maximum))?;
+        let decoder = CoreDecoder::for_request(discovery, discovery_id, limits)?;
+        Ok((Self { wire, decoder }, metadata))
+    }
+
+    fn admit(mut self, response: DpopHttpResponse)
+        -> Result<(ServerDiscoverResult, (usize, usize)), DpopCoreError>
+    {
+        let result = decode_response(&mut self.decoder, response)?;
+        let CoreResult::Final(FinalCoreResult::Discover(discovery)) = result else {
+            return Err(ManagedCoreError::InvalidResponse.into());
+        };
+        if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
+            return Err(ManagedCoreError::UnsupportedRequest.into());
+        }
+        // The decoder charges every byte. An empty notification acknowledgement
+        // needs no residual payload capacity; ordinary results check that
+        // separately before constructing their response decoder.
+        Ok((discovery, self.decoder.usage()))
+    }
+}
+
 // Local preparation retains no negotiated receipt. Both bounded wire bodies
 // and their metadata are admitted before signing or sending discovery.
 struct Prepared {
     runtime: Arc<ClientExtensionRuntime>,
     extension_id: ExtensionId,
     method: String,
-    discovery_wire: ModernHttpRequest,
-    discovery_decoder: CoreDecoder,
+    discovery: PreparedDiscovery,
     operation_wire: ModernHttpRequest,
     operation_id: RequestId,
     progress: Option<ProgressMarker>,
@@ -187,37 +255,10 @@ impl Prepared {
         configuration.runtime
             .admit_local_method(&operation.extension_id, &operation.method)
             .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
-        if metadata.protocol_version != FINAL_PROTOCOL_VERSION
-            || [FINAL_PROTOCOL_VERSION_META_KEY, FINAL_CLIENT_CAPABILITIES_META_KEY,
-                FINAL_CLIENT_INFO_META_KEY].iter()
-                .any(|key| metadata.additional_metadata.contains_key(*key))
-        {
-            return Err(ManagedCoreError::InvalidRequest);
-        }
-        let mut metadata = serde_json::to_value(metadata)
-            .map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let capabilities = metadata.get_mut(FINAL_CLIENT_CAPABILITIES_META_KEY)
-            .and_then(Value::as_object_mut).ok_or(ManagedCoreError::InvalidRequest)?;
-        if capabilities.get("extensions")
-            .is_some_and(|value| !value.as_object().is_some_and(serde_json::Map::is_empty))
-        {
-            return Err(ManagedCoreError::UnsupportedRequest);
-        }
-        capabilities.insert("extensions".to_owned(),
-            serde_json::to_value(configuration.runtime.client_wire_extensions())
-                .map_err(|_| ManagedCoreError::InvalidRequest)?);
-
+        let (discovery, mut metadata) = PreparedDiscovery::new(
+            target, configuration, metadata, operation.discovery_id, limits, native_maximum,
+        )?;
         let maximum = limits.request_bytes().min(native_maximum);
-        let discovery = CoreRequest::decode(
-            ProtocolEra::Modern2026, "server/discover", Some(&json!({"_meta":metadata})),
-        ).map_err(|_| ManagedCoreError::InvalidRequest)?;
-        let discovery_parameters = discovery.encode_params()
-            .map_err(|_| ManagedCoreError::InvalidRequest)?
-            .ok_or(ManagedCoreError::InvalidRequest)?;
-        let discovery_wire = wire(target, "server/discover", &operation.discovery_id,
-            discovery_parameters, maximum)?;
-        let discovery_decoder = CoreDecoder::for_request(discovery, operation.discovery_id, limits)?;
-
         let mut parameters = operation.parameters;
         let object = parameters.as_object_mut().ok_or(ManagedCoreError::InvalidRequest)?;
         let metadata_object = metadata.as_object_mut().ok_or(ManagedCoreError::InvalidRequest)?;
@@ -248,8 +289,7 @@ impl Prepared {
             runtime: Arc::clone(&configuration.runtime),
             extension_id: operation.extension_id,
             method: operation.method,
-            discovery_wire,
-            discovery_decoder,
+            discovery,
             operation_wire,
             operation_id: operation.operation_id,
             progress,
@@ -257,21 +297,14 @@ impl Prepared {
         })
     }
 
-    fn admit(mut self, response: DpopHttpResponse)
+    fn admit(self, response: DpopHttpResponse)
         -> Result<(ModernHttpRequest, ExtensionDecoder), DpopStreamError>
     {
-        let result = decode_response(&mut self.discovery_decoder, response)?;
-        let CoreResult::Final(FinalCoreResult::Discover(discovery)) = result else {
-            return Err(ManagedCoreError::InvalidResponse.into());
-        };
-        if !discovery.supported_versions().iter().any(|version| version == FINAL_PROTOCOL_VERSION) {
-            return Err(ManagedCoreError::UnsupportedRequest.into());
-        }
+        let (discovery, (bytes, notifications)) = self.discovery.admit(response)?;
         let negotiated = self.runtime.negotiate(&discovery)
             .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
         let admission = self.runtime.admit_request(&negotiated, &self.extension_id, &self.method)
             .map_err(|_| ManagedCoreError::UnsupportedRequest)?;
-        let (bytes, notifications) = self.discovery_decoder.usage();
         if bytes >= self.limits.total_bytes() {
             return Err(ManagedCoreError::ResponseByteLimit.into());
         }
@@ -431,7 +464,7 @@ impl DpopHttpClient {
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         let prepared = prepared?;
         let response = self.post_resource_with_bounds(
-            cx, cancellation, credential, &prepared.discovery_wire, idle.bounds(bounds),
+            cx, cancellation, credential, &prepared.discovery.wire, idle.bounds(bounds),
         ).await?;
         check_live(cx, cancellation, &self.session, credential, idle.bounds(bounds))?;
         // The resolver factory and resolver are caller code. Select the

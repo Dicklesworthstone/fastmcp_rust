@@ -301,6 +301,7 @@ enum Case {
     ForeignResult,
     UnknownResult,
     MissingDiscriminator,
+    InvalidDiscriminator,
     InvalidResultMeta,
     DuplicateMember,
     DuplicateTerminal,
@@ -460,6 +461,7 @@ async fn exercise(case: Case) {
                             Case::ForeignResult => json!({"resultType":OTHER_RESULT}).to_string(),
                             Case::UnknownResult => json!({"resultType":"com.example/unregistered-result"}).to_string(),
                             Case::MissingDiscriminator => json!({"value":7}).to_string(),
+                            Case::InvalidDiscriminator => json!({"resultType":null,"value":7}).to_string(),
                             Case::InvalidResultMeta => json!({"resultType":RESULT,"_meta":[]}).to_string(),
                             _ => SOURCE.to_owned(),
                         };
@@ -490,13 +492,21 @@ async fn exercise(case: Case) {
     let (outcome, ()) = pair(application, peer).await;
     if matches!(case, Case::Json | Case::Sse) {
         assert_result(outcome.unwrap(), &RequestId::String("2".to_owned()));
+    } else if matches!(case, Case::MissingDiscriminator) {
+        // The pinned peer-compatibility rule admits an absent marker as
+        // complete. Preserve the source without synthesizing a discriminator;
+        // explicit null is the near-identical invalid case below.
+        let result = outcome.unwrap();
+        assert_eq!(result.request_id(), &RequestId::String("2".to_owned()));
+        assert_eq!(result.raw_result_source(), r#"{"value":7}"#);
+        assert_eq!(result.into_result(), json!({"value":7}));
     } else {
         let error = outcome.err().expect("planted failure must not publish a result");
         assert!(!format!("{error:?} {error}").contains("canary"));
         let expected = match (&case, &error) {
             (Case::ForeignId | Case::DiscoveryWrongId,
                 DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::ResponseIdMismatch)))
-            | (Case::ForeignResult | Case::UnknownResult | Case::MissingDiscriminator | Case::InvalidResultMeta,
+            | (Case::ForeignResult | Case::UnknownResult | Case::InvalidDiscriminator | Case::InvalidResultMeta,
                 DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResult)))
             | (Case::DuplicateMember | Case::DuplicateTerminal | Case::IncompleteTail,
                 DpopStreamError::Core(DpopCoreError::Protocol(ManagedCoreError::InvalidResponse)))
@@ -567,7 +577,7 @@ async fn exercise(case: Case) {
 
 #[test]
 fn public_extension_json_and_sse_keep_source_and_fresh_dpop_authority() {
-    for case in [Case::Json, Case::Sse] {
+    for case in [Case::Json, Case::Sse, Case::MissingDiscriminator] {
         run(exercise(case));
     }
 }
@@ -583,7 +593,7 @@ fn extension_discovery_cannot_dispatch_absent_incompatible_or_foreign_capability
 #[test]
 fn extension_streams_reject_unowned_results_ids_and_unclean_completion() {
     for case in [Case::ForeignId, Case::ForeignResult, Case::UnknownResult,
-        Case::MissingDiscriminator, Case::InvalidResultMeta, Case::DuplicateMember,
+        Case::InvalidDiscriminator, Case::InvalidResultMeta, Case::DuplicateMember,
         Case::DuplicateTerminal, Case::IncompleteTail, Case::MissingTerminal, Case::RemoteError] {
         run(exercise(case));
     }
@@ -970,3 +980,5 @@ fn resolver_cancellation_revocation_and_panics_cannot_dispatch_the_extension() {
         });
     }
 }
+
+mod notifications;

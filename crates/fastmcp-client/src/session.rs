@@ -352,18 +352,17 @@ impl ClientExtensionRuntime {
         })
     }
 
-    /// Builds one current-message proof from the locally configured settings.
+    /// Builds and validates one current-message proof without peer contact.
     ///
-    /// Discovery only supplies the peer's settings for this fresh compatibility
-    /// decision; it never substitutes for the proof emitted in this notification.
-    /// A caller cannot widen the local advertisement with a conflicting field.
-    pub(crate) fn prepare_notification(
+    /// The returned settings belong to the exact stamped proof. Local owner,
+    /// direction, metadata, proof identity, and proof size are checked here;
+    /// this step invokes no resolver and grants no bilateral authority.
+    pub(crate) fn prepare_local_notification(
         &self,
-        discovery: &ServerDiscoverResult,
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
         mut parameters: serde_json::Value,
-    ) -> McpResult<serde_json::Value> {
+    ) -> McpResult<(serde_json::Value, ExtensionSettings)> {
         use fastmcp_protocol::extensions::{
             NotificationActivationProofDescriptor, NotificationActivationProofLocation,
             validate_extension_notification_metadata,
@@ -408,6 +407,45 @@ impl ClientExtensionRuntime {
             .descriptors
             .notification_activation_settings(extension_id, method, &parameters)
             .map_err(|_| refused())?;
+        Ok((parameters, current))
+    }
+
+    /// Builds one current-message proof from the locally configured settings.
+    ///
+    /// Discovery only supplies the peer's settings for this fresh compatibility
+    /// decision; it never substitutes for the proof emitted in this notification.
+    /// A caller cannot widen the local advertisement with a conflicting field.
+    pub(crate) fn prepare_notification(
+        &self,
+        discovery: &ServerDiscoverResult,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> McpResult<serde_json::Value> {
+        let (parameters, current) =
+            self.prepare_local_notification(extension_id, method, parameters)?;
+        self.admit_notification_settings(discovery, extension_id, method, current)?;
+        Ok(parameters)
+    }
+
+    /// Negotiates one already validated current-message proof with the peer.
+    ///
+    /// An asynchronous publisher retains these settings together with its
+    /// immutable encoded notification. Admission does not require cloning or
+    /// reparsing that payload after discovery.
+    pub(crate) fn admit_notification_settings(
+        &self,
+        discovery: &ServerDiscoverResult,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        current: ExtensionSettings,
+    ) -> McpResult<()> {
+        let refused = || McpError::invalid_params("Final extension notification is not admitted");
+        if !self.local_enablement.is_enabled(extension_id)
+            || self.client_discovery.extensions.get(extension_id) != Some(&current)
+        {
+            return Err(refused());
+        }
 
         // Enable exactly this message's owner. An unrelated extension whose
         // fallback rejects one-sided support cannot activate or veto this POST.
@@ -429,7 +467,7 @@ impl ClientExtensionRuntime {
                 ExtensionDirection::ClientToServer,
             )
             .map_err(|_| refused())?;
-        Ok(parameters)
+        Ok(())
     }
 
     /// Returns whether a configured descriptor owns this raw request method.

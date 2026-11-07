@@ -516,7 +516,7 @@ impl ModernHttpRequest {
 
     /// Constructs a notification only after its frozen activation was admitted.
     /// No ordinary request metadata or routing headers are synthesized here.
-    fn notification(
+    pub(crate) fn notification(
         target: &str,
         method: &str,
         parameters: serde_json::Value,
