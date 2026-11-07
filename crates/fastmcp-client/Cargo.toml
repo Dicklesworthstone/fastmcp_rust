@@ -20,6 +20,9 @@ tasks = ["fastmcp-protocol/tasks"]
 # because fastmcp-protocol/jose pulls ring and zeroize; keeping it off the
 # default graph preserves FND-01's frozen dependency evidence.
 builtin-auth-server = ["fastmcp-protocol/jose"]
+# Native enterprise metadata and purpose-bound assertion/response admission.
+# The feature does not activate an exchange or install deployment credentials.
+enterprise-auth = ["fastmcp-protocol/jose"]
 apps = ["fastmcp-protocol/apps", "dep:html5ever"]
 # Use the operating system trust store for private-CA HTTPS deployments.
 # Without this option, the transport's bundled WebPKI roots remain in use.

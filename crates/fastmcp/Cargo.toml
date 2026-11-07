@@ -81,6 +81,9 @@ oauth-client-credentials = [
     "fastmcp-server/oauth-client-credentials",
     "fastmcp-console/oauth-client-credentials",
 ]
+# Explicit enterprise trust/registration and signed response admission. This
+# exposes the native client building blocks, not automatic SSO activation.
+enterprise-auth = ["fastmcp-client/enterprise-auth"]
 # Explicitly provisioned RS256 resource-server authentication: the shipped
 # `JwtResourceVerifier` and `ManagedJwtResourceVerifier`, installed through the
 # ordinary `TokenAuthProvider` hook. In-workspace JOSE only -- the server
