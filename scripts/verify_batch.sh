@@ -620,6 +620,7 @@ def qualify(args, gates, receipt):
         # libtest `--format json` event stream and corrupt the parse. A single
         # merged file would be worse still: `> f 2> f` opens two descriptors on
         # one path in truncate mode and they overwrite each other.
+        #
         # RCH_SHIM_LOCAL_IDE=1 is the cargo shim's OWN documented operator escape
         # hatch ("force this one build local"), and it is required rather than
         # optional here: `cargo` on this host is intercepted three ways --
@@ -639,6 +640,29 @@ def qualify(args, gates, receipt):
         stderr = gates.output / f"{label}.log"
         command = "RCH_SHIM_LOCAL_IDE=1 CARGO_TERM_COLOR=never " + redirected(argv, stdout, stderr)
         gates.run(label, [(label, command)], target_ids)
+        # REFUSE A LANE THAT SILENTLY WENT REMOTE. Without this the receipt would
+        # claim "lane": "local-policy" with this host's name even if the shim
+        # escape hatch stopped working -- a shim rewrite, DSR dropping leading
+        # env assignments, an operator setting force_local off -- and the rows
+        # this lane exists for would have run somewhere with no `.git`, reporting
+        # a green for inputs that were never read. That is the exact false
+        # receipt the split exists to prevent, so it must fail loudly rather
+        # than be assumed.
+        #
+        # The predicate is ONE-SIDED on purpose. A remote build reports paths
+        # under the worker roots below; a local one never does. Their ABSENCE is
+        # therefore not proof of locality -- a fully cached run prints no paths
+        # at all -- but their PRESENCE is proof of the opposite, which is the
+        # direction that can produce a false claim.
+        observed = stdout.read_text(errors="replace") + stderr.read_text(errors="replace")
+        offloaded = [marker for marker in ("/data/tmp/", "/data/projects/") if marker in observed]
+        if offloaded:
+            raise Rejected(
+                f"{label}: the local lane was OFFLOADED -- worker path marker(s) "
+                f"{offloaded} appear in its output. RCH_SHIM_LOCAL_IDE=1 did not take "
+                f"effect, so this receipt would have claimed a local run that read no "
+                f"local .git. Logs: {stdout} , {stderr}"
+            )
         machine = os.uname()
         receipt.setdefault("local_runs", []).append({
             "label": label,
@@ -648,6 +672,10 @@ def qualify(args, gates, receipt):
             "stdout_log": str(stdout),
             "stderr_log": str(stderr),
             "lane": "local-policy",
+            "locality_check": (
+                "refused on worker path markers /data/tmp/ or /data/projects/ in the "
+                "captured output; one-sided, so absence is not proof of locality"
+            ),
         })
         return stdout.read_text(errors="replace")
 
