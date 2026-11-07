@@ -35,7 +35,9 @@ use crate::execution::{
     decode_core_result_with_cache_ttl_from_source,
 };
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime, ClientSession};
-use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
+use crate::{RequestTimeoutPolicy, ReverseRequestHandlers, transport_error_to_mcp};
+
+mod interaction;
 
 #[cfg(feature = "tasks")]
 mod tasks;
@@ -149,14 +151,27 @@ pub enum MemoryExtensionEvent {
 /// The builder freezes extension descriptors and local settings before any
 /// discovery request is published. Connection setup uses only the supplied
 /// runtime context and consumes no background worker or independent runtime.
-#[derive(Debug)]
 pub struct MemoryClientBuilder {
     client_info: ClientInfo,
     capabilities: ClientCapabilities,
     extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     timeout_policy: RequestTimeoutPolicy,
+    reverse_request_handlers: ReverseRequestHandlers,
     #[cfg(feature = "tasks")]
     tasks_enabled: bool,
+}
+
+impl std::fmt::Debug for MemoryClientBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryClientBuilder")
+            .field("client_info", &self.client_info)
+            .field("timeout_policy", &self.timeout_policy)
+            .field(
+                "has_modern_handlers",
+                &self.reverse_request_handlers.has_modern_handlers(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl MemoryClientBuilder {
@@ -168,6 +183,7 @@ impl MemoryClientBuilder {
             capabilities: ClientCapabilities::default(),
             extension_runtime: None,
             timeout_policy: RequestTimeoutPolicy::default(),
+            reverse_request_handlers: ReverseRequestHandlers::new(),
             #[cfg(feature = "tasks")]
             tasks_enabled: false,
         }
@@ -261,6 +277,7 @@ pub struct MemoryClient {
     session: ClientSession,
     next_id: i64,
     timeout_policy: RequestTimeoutPolicy,
+    reverse_request_handlers: ReverseRequestHandlers,
     cache_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
     #[cfg(feature = "tasks")]
     tasks: Option<tasks::MemoryTaskRuntime>,
@@ -335,6 +352,7 @@ impl MemoryClient {
             mut capabilities,
             extension_runtime,
             timeout_policy,
+            reverse_request_handlers,
             #[cfg(feature = "tasks")]
             tasks_enabled,
         } = builder;
@@ -368,6 +386,7 @@ impl MemoryClient {
         if extension_runtime.is_some() || !configured.is_empty() {
             capabilities.extensions = Some(configured);
         }
+        reverse_request_handlers.derive_modern_capabilities(&mut capabilities);
         let session = ClientSession::try_new(
             client_info,
             capabilities,
@@ -389,6 +408,7 @@ impl MemoryClient {
             session,
             next_id: 1,
             timeout_policy,
+            reverse_request_handlers,
             cache_diagnostics: VecDeque::new(),
             #[cfg(feature = "tasks")]
             tasks,
@@ -1003,7 +1023,11 @@ impl MemoryClient {
             .await
     }
 
-    /// Calls a tool, retaining complete or input-required typed outcomes.
+    /// Calls a tool, following input-required results through installed handlers.
+    ///
+    /// [`MemoryClientBuilder::reverse_request_handlers`] enables continuations
+    /// under one originating caller and absolute operation deadline. Without
+    /// modern handlers, an input-required outcome is returned directly.
     pub async fn call_tool(
         &mut self,
         cx: &Cx,
@@ -1011,7 +1035,7 @@ impl MemoryClient {
         name: &str,
         arguments: Value,
     ) -> McpResult<CoreResult> {
-        self.request_core(
+        self.follow_installed_mrtr(
             cx,
             cancellation,
             "tools/call",
