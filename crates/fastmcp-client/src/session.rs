@@ -292,6 +292,29 @@ impl ClientExtensionRuntime {
             })
     }
 
+    /// Checks immutable local ownership before an authenticated discovery.
+    /// This is only preflight: a fresh bilateral negotiation must still admit
+    /// the request before publication and retain its result authority.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn admit_local_method(
+        &self,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+    ) -> McpResult<()> {
+        if self.local_enablement.is_enabled(extension_id)
+            && self
+                .descriptors
+                .method_descriptor(extension_id, method)
+                .is_some_and(|descriptor| descriptor.direction == ExtensionDirection::ClientToServer)
+        {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params(
+                "Final extension method is not locally enabled",
+            ))
+        }
+    }
+
     pub(crate) fn admit_method(
         &self,
         negotiated: &NegotiatedExtensionSet,

@@ -82,7 +82,7 @@ impl ManagedCoreLimits {
     pub(crate) fn total_bytes(self) -> usize {
         self.total_bytes
     }
-    #[cfg(feature = "tasks")]
+    #[cfg(any(feature = "tasks", not(target_arch = "wasm32")))]
     pub(crate) fn notifications(self) -> usize {
         self.notifications
     }

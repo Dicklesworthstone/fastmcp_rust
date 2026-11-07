@@ -28,6 +28,8 @@ use crate::http_auth::rpc::{
 
 /// Complete catalog traversal under one original credential and deadline.
 pub mod catalog;
+/// Negotiated generic extension calls under one original DPoP credential.
+pub mod extensions;
 /// Explicit host-driven multi-round operations with one credential and deadline.
 pub mod interaction;
 /// Incremental JSON/SSE core responses under the original DPoP credential.
