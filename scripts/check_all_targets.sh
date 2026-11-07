@@ -159,7 +159,32 @@ ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repositor
 cd "$ROOT" || exit 64
 command -v rch >/dev/null 2>&1 || { echo "rch is not on PATH" >&2; exit 64; }
 
-LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/check_all_targets.XXXXXX")
+# LOGS GO SOMEWHERE DURABLE, NOT $TMPDIR. Measured 2026-11-07: ZERO log files
+# survived across 27 earlier run directories on this machine, and the directory
+# of a run that had finished 39 minutes earlier was gone entirely -- the arm
+# logs backing six bead closures among them. $TMPDIR here is reaped
+# aggressively (disk-pressure janitor and/or the periodic cleaner), so a gate
+# that writes its evidence there produces receipts whose `log` paths are dead
+# by the time anyone follows them. AGENTS.md section 4 requires a receipt to
+# retain every attempt; a reaped log retains nothing.
+#
+# Default is outside the repository on purpose: no .gitignore entry to forget,
+# no interaction with RCH's working-tree sync, and no chance of a log landing
+# in a commit. Named by UTC timestamp and short revision so a receipt's paths
+# can be found later.
+LOGROOT=${CHECK_ALL_TARGETS_LOGDIR:-${XDG_STATE_HOME:-$HOME/.local/state}/fastmcp-gate}
+LOGDIR="(none; dry run creates no directory)"
+# A dry run must have NO side effects -- that is the whole point of it, and this
+# file already moved usage validation ahead of the preflight for the same
+# reason. Creating a dated log directory per dry run would litter the log root
+# with empties.
+if [ "$DRY" -eq 0 ]; then
+  if ! mkdir -p "$LOGROOT" 2>/dev/null; then
+    echo "cannot create log root $LOGROOT" >&2
+    exit 3
+  fi
+  LOGDIR=$(mktemp -d "$LOGROOT/$(date -u +%Y%m%dT%H%M%SZ).XXXXXX")
+fi
 
 # PREFLIGHT: refuse a moving checkout.
 # .beads/beads.db and .beads/issues.jsonl are TRACKED and large. A concurrent
@@ -175,18 +200,6 @@ LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/check_all_targets.XXXXXX")
 # guard. A safety check that fails silently is worse than one that is absent.
 dirty_fingerprint() { git status --porcelain --untracked-files=no; }
 FP_BEFORE=$(dirty_fingerprint)
-# Only a working-tree dispatch can be disturbed by a live checkout. In base mode
-# the worker builds from git objects, which are immutable for a given revision,
-# so a concurrent tracker write cannot change what gets compiled.
-if [ "$SOURCE_MODE" = working-tree ] &&
-   git status --porcelain --untracked-files=no -- .beads | grep -q .; then
-  echo "PREFLIGHT REFUSED: .beads has tracked modifications, so the checkout is" >&2
-  echo "  probably being mutated, and --working-tree rsyncs it. Let the tracker" >&2
-  echo "  settle, re-run, or use the default base mode." >&2
-  echo "  (Run 'br sync --flush-only' and commit, or wait for the writer.)" >&2
-  exit 3
-fi
-
 HEAD_SHA=$(git rev-parse HEAD)
 # Captured ONCE. Everything below binds this revision, so a later HEAD move
 # cannot retroactively change what any arm compiled.
@@ -315,6 +328,24 @@ if [ "$DRY" -eq 1 ]; then
   exit 0
 fi
 
+# PREFLIGHT REFUSAL, placed AFTER the dry run on purpose. A dry run must REPORT
+# what would happen, not refuse: previously `--working-tree --dry-run` on a
+# dirty tracker exited 3 and printed nothing, which answers a different question
+# than the one asked. Same principle that moved usage validation ahead of the
+# preflight earlier in this file.
+#
+# Only a working-tree dispatch can be disturbed by a live checkout. In base mode
+# the worker builds from git objects, which are immutable for a given revision,
+# so a concurrent tracker write cannot change what gets compiled.
+if [ "$SOURCE_MODE" = working-tree ] &&
+   git status --porcelain --untracked-files=no -- .beads | grep -q .; then
+  echo "PREFLIGHT REFUSED: .beads has tracked modifications, so the checkout is" >&2
+  echo "  probably being mutated, and --working-tree rsyncs it. Let the tracker" >&2
+  echo "  settle, re-run, or use the default base mode." >&2
+  echo "  (Run 'br sync --flush-only' and commit, or wait for the writer.)" >&2
+  exit 3
+fi
+
 if [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = default ]; then
   run_and_record default
 fi
@@ -361,8 +392,8 @@ if [ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ] && [ "$SOURCE_MODE" = working-tree 
 fi
 
 if [ "$JSON" -eq 1 ]; then
-  printf '{"head":"%s","tree":"%s","source_mode":"%s","base":"%s","dirty_rs":%s,"checkout_moved":%s,"arms":[' \
-    "$HEAD_SHA" "$TREE_SHA" "$SOURCE_MODE" "$BASE" "$DIRTY_RS" "$MOVED"
+  printf '{"head":"%s","tree":"%s","source_mode":"%s","base":"%s","dirty_rs":%s,"checkout_moved":%s,"logdir":"%s","arms":[' \
+    "$HEAD_SHA" "$TREE_SHA" "$SOURCE_MODE" "$BASE" "$DIRTY_RS" "$MOVED" "$LOGDIR"
   for i in "${!NAMES[@]}"; do
     [ "$i" -gt 0 ] && printf ','
     printf '{"arm":"%s","verdict":"%s","remote_exit":"%s","members_reached":"%s","error_lines":"%s","could_not_compile":"%s","log":"%s"}' \
@@ -372,6 +403,9 @@ if [ "$JSON" -eq 1 ]; then
 else
   echo
   echo "compile gate -- HEAD $HEAD_SHA tree $TREE_SHA dirty_rs=$DIRTY_RS"
+  echo "  logs:   $LOGDIR"
+  echo "          retained outside \$TMPDIR, which is reaped on this machine;"
+  echo "          override the root with CHECK_ALL_TARGETS_LOGDIR."
   if [ "$SOURCE_MODE" = base ]; then
     echo "  source: committed revision $BASE (rch --base --clean-overlay --no-overlay);"
     echo "          the working tree was NOT read, so this receipt binds that revision."
