@@ -1252,7 +1252,7 @@ mod legacy_async_peer_errors {
     use super::*;
     use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
     use fastmcp_client::{Client, ClientProtocolPlan, ProtocolPolicy};
-    use fastmcp_protocol::messages::{LegacyCoreRequest, LegacyCoreResult};
+    use fastmcp_protocol::{LegacyCoreRequest, LegacyCoreResult};
 
     // The peer withholds a sibling response until it has answered the typed
     // request. A valid error must leave that already-published owner intact.

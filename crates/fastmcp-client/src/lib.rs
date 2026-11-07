@@ -315,6 +315,9 @@ use crate::session::mcp_apps_activation_receipt;
 /// The callback receives the progress value, optional total, and optional message.
 pub type ProgressCallback<'a> = &'a mut dyn FnMut(f64, Option<f64>, Option<&str>);
 
+#[cfg(unix)]
+type ExactProgressCallback<'a> = &'a mut (dyn FnMut(&FinalProgressNotificationParams) + Send);
+
 /// Erased, cancellation-aware result future returned by a reverse handler.
 pub type ReverseRequestFuture<'cx, T> = Pin<Box<dyn Future<Output = McpResult<T>> + Send + 'cx>>;
 
@@ -21103,6 +21106,7 @@ impl Client {
             executor,
             execution,
             None,
+            None,
         )
         .await
         .map(|received| received.result)
@@ -27567,6 +27571,51 @@ impl Client {
             .await
     }
 
+    /// Sends one modern core stdio request and delivers its progress as it arrives.
+    ///
+    /// The callback receives exact validated protocol numbers, including their
+    /// original decimal/exponent spellings, without conversion to `f64`.
+    /// Delivered updates are consumed instead of being copied into
+    /// [`Self::take_final_progress_notifications`]'s bounded retention queue,
+    /// so a long-running request can report more than that queue's capacity.
+    /// Other requests keep their own progress and result ownership.
+    ///
+    /// This method generates a unique local progress token and refuses an
+    /// explicit `_meta.progressToken`. It supports the ordinary core methods
+    /// accepted by [`Self::request_core_with_cx`] on MCP 2026-07-28 only, returns
+    /// the full typed result, and does not follow pagination or MRTR retries.
+    /// Tasks are not advertised by this request.
+    ///
+    /// Callbacks run synchronously on the caller's runtime and must be short
+    /// and nonblocking. A callback panic becomes a fixed, sanitized error and
+    /// cancels only this execution. Cancellation and deadlines are checked
+    /// before each callback. After publication, dropping the future retires
+    /// this request; the next client drive, send, or close flushes its queued
+    /// cancellation control. Deferred discovery retains its existing
+    /// connection-level cancellation rules.
+    #[cfg(unix)]
+    pub async fn request_core_with_progress_with_cx<F>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+        mut on_progress: F,
+    ) -> McpResult<CoreResult>
+    where
+        F: FnMut(&FinalProgressNotificationParams) + Send,
+    {
+        self.request_core_with_cx_until_and_progress(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            None,
+            Some(&mut on_progress),
+        )
+        .await
+    }
+
     #[cfg(unix)]
     async fn request_core_with_cx_until(
         &mut self,
@@ -27575,6 +27624,27 @@ impl Client {
         method: &str,
         parameters: serde_json::Value,
         operation_deadline: Option<Instant>,
+    ) -> McpResult<CoreResult> {
+        self.request_core_with_cx_until_and_progress(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            operation_deadline,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn request_core_with_cx_until_and_progress(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: serde_json::Value,
+        operation_deadline: Option<Instant>,
+        on_progress: Option<ExactProgressCallback<'_>>,
     ) -> McpResult<CoreResult> {
         if (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
             && self.pending_initialization.is_none()
@@ -27598,6 +27668,11 @@ impl Client {
         }
         self.ensure_initialized_with_cancellation_until(cx, Some(cancellation), operation_deadline)
             .await?;
+        if on_progress.is_some() && self.session.selected_era() != Some(ProtocolEra::Modern2026) {
+            return Err(McpError::invalid_params(
+                "Exact live progress requires MCP 2026-07-28",
+            ));
+        }
         let parameters = self.prepare_request_parameters(parameters)?;
         #[cfg(feature = "tasks")]
         let parameters = {
@@ -27605,20 +27680,45 @@ impl Client {
             remove_tasks_client_extension(&mut parameters);
             parameters
         };
-        let request = self
+        let mut request = self
             .prepared_core_request(method, &parameters)?
             .ok_or_else(|| McpError::invalid_params("Unsupported selected-era core request"))?;
+        if on_progress.is_some() {
+            let mut parameters = parameters;
+            let metadata = parameters
+                .get_mut("_meta")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| McpError::invalid_params("Modern request metadata is missing"))?;
+            if metadata.contains_key("progressToken") {
+                return Err(McpError::invalid_params(
+                    "Live progress owns the request progress token",
+                ));
+            }
+            if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                return Err(McpError::request_cancelled());
+            }
+            // Reserve from the same monotonic allocator as wire IDs. The next
+            // value belongs to the request itself; neither value can be reused
+            // by another cloned executor. Its active-token registry still
+            // rejects a collision with an explicitly chosen raw-request token.
+            let token = self.next_request_id()?;
+            metadata.insert("progressToken".to_owned(), serde_json::json!(token));
+            request = self
+                .prepared_core_request(method, &parameters)?
+                .ok_or_else(|| McpError::invalid_params("Unsupported selected-era core request"))?;
+        }
         let parameters = request.encode_params().map_err(|error| {
             McpError::invalid_params(format!("Invalid selected-era core parameters: {error}"))
         })?;
         self.last_core_result_receipt = None;
         let received = self
-            .send_yielding_prepared_request_until(
+            .send_yielding_prepared_request_until_and_progress(
                 cx,
                 cancellation,
                 method,
                 parameters,
                 operation_deadline,
+                on_progress,
             )
             .await?;
         let (result, diagnostic) = decode_core_result_with_cache_ttl_from_source(
@@ -27680,6 +27780,27 @@ impl Client {
         parameters: Option<serde_json::Value>,
         operation_deadline: Option<Instant>,
     ) -> McpResult<ReceivedPreparedResult> {
+        self.send_yielding_prepared_request_until_and_progress(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            operation_deadline,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn send_yielding_prepared_request_until_and_progress(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Option<serde_json::Value>,
+        operation_deadline: Option<Instant>,
+        on_progress: Option<ExactProgressCallback<'_>>,
+    ) -> McpResult<ReceivedPreparedResult> {
         let connection_cx = self.cx.clone();
         let executor = self.multiplexed_stdio_executor()?;
         executor.service(&connection_cx)?;
@@ -27698,6 +27819,7 @@ impl Client {
             executor,
             execution,
             operation_deadline,
+            on_progress,
         )
         .await
     }
@@ -27710,6 +27832,7 @@ impl Client {
         executor: StdioRequestExecutor,
         mut execution: StdioRequestExecution,
         operation_deadline: Option<Instant>,
+        mut on_progress: Option<ExactProgressCallback<'_>>,
     ) -> McpResult<ReceivedPreparedResult> {
         let connection_cx = self.cx.clone();
         loop {
@@ -27754,8 +27877,73 @@ impl Client {
                 None => execution.take_stream_notifications()?,
             };
             for notification in notifications {
+                if let Some(callback) = on_progress.as_deref_mut() {
+                    let stopped = if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
+                        Some(McpError::request_cancelled())
+                    } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        Some(request_timeout_error(RequestTimeoutSource::Absolute))
+                    } else {
+                        None
+                    };
+                    if let Some(error) = stopped {
+                        if terminal.is_none() {
+                            self.cancel_multiplexed_request_with_connection_cx(
+                                &connection_cx,
+                                &executor,
+                                &mut execution,
+                            )?;
+                        }
+                        return Err(error);
+                    }
+                    if terminal.is_none() {
+                        // A queued update cannot revive an idle or absolute
+                        // deadline that expired before its observer runs.
+                        executor
+                            .service(&connection_cx)
+                            .map_err(|error| self.terminate_connection(error))?;
+                        if let Some(error) = execution.execution.terminal_error() {
+                            return Err(error);
+                        }
+                    }
+                    let decoded = decode_final_server_notification(&notification, None)
+                        .map_err(|error| {
+                            self.terminate_connection(McpError::invalid_request(format!(
+                                "Invalid final server notification: {error}"
+                            )))
+                        })?;
+                    if let ServerNotification::Progress(progress) = decoded {
+                        if catch_client_callback_unwind(|| callback(&progress)).is_err() {
+                            if terminal.is_none() {
+                                self.cancel_multiplexed_request_with_connection_cx(
+                                    &connection_cx,
+                                    &executor,
+                                    &mut execution,
+                                )?;
+                            }
+                            return Err(McpError::internal_error(PROGRESS_CALLBACK_PANIC_ERROR));
+                        }
+                        // The observer consumes this admitted update. Retaining
+                        // it too would overflow the client's bounded diagnostic
+                        // queue while this future owns its mutable borrow.
+                        continue;
+                    }
+                }
                 self.retain_stream_notification(&notification)
                     .map_err(|error| self.terminate_connection(error))?;
+            }
+            if on_progress.is_some()
+                && (cancellation.is_cancel_requested() || cx.checkpoint().is_err())
+            {
+                // The observer may cancel its own operation. Observe that
+                // before another receive turn or a simultaneously ready result.
+                if terminal.is_none() {
+                    self.cancel_multiplexed_request_with_connection_cx(
+                        &connection_cx,
+                        &executor,
+                        &mut execution,
+                    )?;
+                }
+                return Err(McpError::request_cancelled());
             }
             if let Some((mut response, raw_result, _)) = terminal {
                 if let Some(error) = response.error.take() {
@@ -58693,6 +58881,400 @@ while IFS= read -r ignored; do :; done
             }
             client.close().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_async_progress_consumes_exact_updates_and_preserves_sibling_ownership() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let discovery =
+                modern_discovery_response("live-progress-peer", &[MODERN_PROTOCOL_VERSION]);
+            let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r sibling || exit 11
+case "$sibling" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 12 ;; esac
+IFS= read -r pending || exit 13
+case "$pending" in *'"method":"tools/call"'*'"id":4'*) ;; *) exit 14 ;; esac
+case "$pending" in *'"progressToken":3'*) ;; *) exit 15 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"sibling","progress":7,"message":"sibling"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":999,"progress":1e400,"message":"foreign"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":3,"progress":1e400,"total":1.2300e500,"message":"step-1"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":3,"progress":1e400,"total":1.2300e500,"message":"duplicate"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":3,"progress":9e399,"total":1.2300e500,"message":"regression"}}'
+step=2
+while [ "$step" -le 80 ]; do
+    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":3,"progress":%se400,"total":1.2300e500,"message":"step-%s"}}\n' "$step" "$step"
+    step=$((step + 1))
+done
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"sibling"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","content":[{"type":"text","text":"done"}]}}'
+while IFS= read -r unexpected; do exit 16; done
+"#;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script, "progress-peer", &discovery])
+                .await
+                .unwrap();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let mut sibling = executor
+                .execute(
+                    &cx,
+                    "tools/list",
+                    Some(serde_json::json!({"_meta": {"progressToken": "sibling"}})),
+                )
+                .unwrap();
+            let mut observed = Vec::new();
+            let result = client
+                .request_core_with_progress_with_cx(
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    "tools/call",
+                    serde_json::json!({"name": "work", "arguments": {}}),
+                    |progress| {
+                        assert_eq!(
+                            serde_json::to_value(&progress.progress_token).unwrap(),
+                            serde_json::json!(3)
+                        );
+                        observed.push((
+                            progress.progress.as_str().to_owned(),
+                            progress.total.as_ref().unwrap().as_str().to_owned(),
+                            progress.message.clone().unwrap(),
+                        ));
+                    },
+                )
+                .await
+                .unwrap();
+            let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = result else {
+                panic!("live progress must retain the ordinary typed tools/call result");
+            };
+            assert_eq!(result.payload.content, vec![ContentBlock::text("done")]);
+            assert_eq!(observed.len(), 80);
+            assert!(observed.len() > MAX_QUEUED_FINAL_SERVER_NOTIFICATIONS);
+            for (index, (progress, total, message)) in observed.iter().enumerate() {
+                assert_eq!(progress, &format!("{}e400", index + 1));
+                assert_eq!(total, "1.2300e500");
+                assert_eq!(message, &format!("step-{}", index + 1));
+            }
+            let diagnostics = client.take_final_progress_notifications();
+            assert_eq!(diagnostics.len(), 1, "delivered updates must not be retained");
+            assert_eq!(diagnostics[0].message.as_deref(), Some("foreign"));
+            let sibling_progress = sibling.take_stream_notifications().unwrap();
+            assert_eq!(sibling_progress.len(), 1);
+            assert_eq!(
+                sibling_progress[0].params.as_ref().unwrap()["progressToken"],
+                "sibling"
+            );
+            assert_eq!(
+                executor
+                    .try_take_response(&mut sibling)
+                    .unwrap()
+                    .unwrap()
+                    .result
+                    .unwrap()["owner"],
+                "sibling"
+            );
+            assert!(executor.executor.pending_records().is_empty());
+            assert!(executor.executor.terminal_error().is_none());
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_async_progress_refuses_invalid_inputs_before_allocating_or_sending() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let discovery =
+                modern_discovery_response("progress-preflight-peer", &[MODERN_PROTOCOL_VERSION]);
+            let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r pending || exit 11
+case "$pending" in *'"method":"tools/call"'*'"id":3'*) ;; *) exit 12 ;; esac
+case "$pending" in *'"progressToken":2'*) ;; *) exit 13 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[]}}'
+while IFS= read -r unexpected; do exit 14; done
+"#;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script, "progress-peer", &discovery])
+                .await
+                .unwrap();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            for (method, parameters) in [
+                (
+                    "tools/call",
+                    serde_json::json!({"name": "work", "_meta": {"progressToken": 17}}),
+                ),
+                ("tools/call", serde_json::json!({"name": 17})),
+                ("subscriptions/listen", serde_json::json!({})),
+            ] {
+                let error = client
+                    .request_core_with_progress_with_cx(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        method,
+                        parameters,
+                        |_| panic!("an uncommitted request cannot deliver progress"),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(client.peek_next_request_id(), 2);
+                assert!(executor.executor.pending_records().is_empty());
+            }
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            let error = client
+                .request_core_with_progress_with_cx(
+                    &cx,
+                    &cancelled,
+                    "tools/call",
+                    serde_json::json!({"name": "work"}),
+                    |_| panic!("pre-send cancellation cannot deliver progress"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::RequestCancelled);
+            assert_eq!(client.peek_next_request_id(), 2);
+            assert!(matches!(
+                client
+                    .request_core_with_progress_with_cx(
+                        &cx,
+                        &McpRequestCancellation::new(),
+                        "tools/call",
+                        serde_json::json!({"name": "work"}),
+                        |_| panic!("this peer emits only a final response"),
+                    )
+                    .await
+                    .unwrap(),
+                CoreResult::Final(FinalCoreResult::ToolsCall { .. })
+            ));
+            assert_eq!(client.peek_next_request_id(), 4);
+            client.close_with_cx(&cx).await.unwrap();
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_async_progress_stops_locally_and_preserves_siblings() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for stop in ["panic", "token", "context", "drop", "deadline"] {
+                let discovery =
+                    modern_discovery_response("progress-lifetime-peer", &[MODERN_PROTOCOL_VERSION]);
+                let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r sibling || exit 11
+case "$sibling" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 12 ;; esac
+IFS= read -r pending || exit 13
+case "$pending" in *'"method":"tools/call"'*'"id":4'*) ;; *) exit 14 ;; esac
+case "$pending" in *'"progressToken":3'*) ;; *) exit 15 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":3,"progress":1e400}}'
+IFS= read -r cancellation || exit 16
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":4'*) ;; *) exit 17 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":3,"progress":2e400}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","content":[]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"sibling"}}'
+IFS= read -r recovery || exit 18
+case "$recovery" in *'"method":"tools/list"'*'"id":5'*) ;; *) exit 19 ;; esac
+printf '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","control":%s}}\n' "$cancellation"
+while IFS= read -r unexpected; do exit 20; done
+"#;
+                let mut client = ClientBuilder::new()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                    .request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(10), Duration::from_secs(10))
+                            .unwrap(),
+                    )
+                    .connect_stdio_with_cx(
+                        &healthy,
+                        "sh",
+                        &["-c", script, "progress-peer", &discovery],
+                    )
+                    .await
+                    .unwrap();
+                let executor = client.multiplexed_stdio_executor().unwrap();
+                let mut sibling = executor
+                    .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                    .unwrap();
+                client
+                    .set_request_timeout_policy(
+                        RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let cancellation = McpRequestCancellation::new();
+                let observed = Arc::new(AtomicUsize::new(0));
+                let mut request = Box::pin(client.request_core_with_progress_with_cx(
+                    &caller,
+                    &cancellation,
+                    "tools/call",
+                    serde_json::json!({"name": "work"}),
+                    {
+                        let observed = Arc::clone(&observed);
+                        let cancellation = cancellation.clone();
+                        move |progress| {
+                            assert_eq!(progress.progress.as_str(), "1e400");
+                            observed.fetch_add(1, Ordering::SeqCst);
+                            if stop == "panic" {
+                                panic!("private observer panic payload");
+                            }
+                            if stop == "token" {
+                                cancellation.cancel();
+                            }
+                        }
+                    },
+                ));
+                if matches!(stop, "panic" | "token") {
+                    let error = request.await.unwrap_err();
+                    if stop == "panic" {
+                        assert_eq!(error.code, McpErrorCode::InternalError);
+                        assert_eq!(error.message, PROGRESS_CALLBACK_PANIC_ERROR);
+                        assert!(!error.message.contains("private observer"));
+                    } else {
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                    }
+                } else {
+                    std::future::poll_fn(|task_cx| {
+                        assert!(
+                            request.as_mut().poll(task_cx).is_pending(),
+                            "the peer waits for cancellation before its terminal response"
+                        );
+                        if observed.load(Ordering::SeqCst) == 1 {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    if stop == "drop" {
+                        drop(request);
+                    } else {
+                        if stop == "context" {
+                            caller.set_cancel_requested(true);
+                        } else {
+                            // Drive the actual executor deadline deterministically;
+                            // the independently owned sibling has a later deadline.
+                            let deadline = executor
+                                .executor
+                                .pending_records()
+                                .into_iter()
+                                .find(|record| record.request_id == RequestId::Number(4))
+                                .unwrap()
+                                .absolute_deadline;
+                            executor.service_at(&healthy, deadline).unwrap();
+                        }
+                        let error = request.await.unwrap_err();
+                        assert_eq!(error.code, McpErrorCode::RequestCancelled);
+                        if stop == "deadline" {
+                            assert_eq!(
+                                error.data.as_ref().unwrap()["timeoutSource"],
+                                "absolute"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(observed.load(Ordering::SeqCst), 1);
+                assert!(healthy.checkpoint().is_ok());
+                let recovered = client
+                    .request_with_cx(&healthy, "tools/list", Some(serde_json::json!({})))
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                assert_eq!(recovered["control"]["params"]["requestId"], 4);
+                assert!(recovered["control"].get("id").is_none());
+                assert_eq!(
+                    executor
+                        .try_take_response(&mut sibling)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .unwrap()["owner"],
+                    "sibling"
+                );
+                assert_eq!(observed.load(Ordering::SeqCst), 1);
+                assert_eq!(client.peek_next_request_id(), 6);
+                assert!(executor.executor.pending_records().is_empty());
+                assert!(executor.executor.terminal_error().is_none());
+                client.close_with_cx(&healthy).await.unwrap();
+            }
+        });
+    }
+
+    #[cfg(all(unix, feature = "legacy-2024-11-05"))]
+    #[test]
+    fn clt_01_async_progress_refuses_legacy_without_sending() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let script = r#"
+IFS= read -r initialize || exit 10
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"legacy-progress-peer","version":"1"}}}'
+IFS= read -r initialized || exit 11
+case "$initialized" in *'"method":"notifications/initialized"'*) ;; *) exit 12 ;; esac
+IFS= read -r recovery || exit 13
+case "$recovery" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 14 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+while IFS= read -r unexpected; do exit 15; done
+"#;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                .request_timeout_policy(
+                    RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2))
+                        .unwrap(),
+                )
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script])
+                .await
+                .unwrap();
+            let error = client
+                .request_core_with_progress_with_cx(
+                    &cx,
+                    &McpRequestCancellation::new(),
+                    "tools/call",
+                    serde_json::json!({"name": "work"}),
+                    |_| panic!("the modern observer cannot receive legacy progress"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(client.peek_next_request_id(), 2);
+            let recovered = client
+                .request_with_cx(&cx, "tools/list", Some(serde_json::json!({})))
+                .await
+                .unwrap();
+            assert_eq!(recovered.result.unwrap()["tools"], serde_json::json!([]));
+            assert!(client.is_initialized());
+            client.close_with_cx(&cx).await.unwrap();
+        });
     }
 
     #[cfg(unix)]
