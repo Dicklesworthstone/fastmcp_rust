@@ -20518,9 +20518,15 @@ impl Client {
                 "Legacy client request parameters are invalid: {error}"
             ))
         })?;
-        let (response, raw_result) = self
+        let (mut response, raw_result) = self
             .request_with_cx_and_raw_result(cx, method, params)
             .await?;
+        // The ingress owner has already validated and correlated the envelope.
+        // Only a successful response has a result source; an ordinary peer
+        // error settles this request without revoking the shared connection.
+        if let Some(error) = response.error.take() {
+            return Err(json_rpc_error_to_mcp(error));
+        }
         let raw_result = raw_result.as_deref().ok_or_else(|| {
             self.terminate_connection(McpError::invalid_request(
                 "Exact-2024 typed response lost its admitted result source",

@@ -1245,3 +1245,152 @@ fn clt_01_b_planted_negative() {
     );
     assert_eq!(probe.sent_len(), 1);
 }
+
+
+#[cfg(all(unix, feature = "legacy-2024-11-05"))]
+mod legacy_async_peer_errors {
+    use super::*;
+    use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
+    use fastmcp_client::{Client, ClientProtocolPlan, ProtocolPolicy};
+    use fastmcp_protocol::messages::{LegacyCoreRequest, LegacyCoreResult};
+
+    // The peer withholds a sibling response until it has answered the typed
+    // request. A valid error must leave that already-published owner intact.
+    const PEER: &str = r#"
+set -eu
+IFS= read -r line
+case "$line" in *'"method":"initialize"'*) ;; *) exit 71 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"legacy-errors","version":"1.0"}}}'
+IFS= read -r line
+case "$line" in *'"method":"notifications/initialized"'*) ;; *) exit 72 ;; esac
+IFS= read -r line
+case "$line" in *'"method":"tools/list"'*) ;; *) exit 73 ;; esac
+IFS= read -r line
+case "$line" in *'"method":"ping"'*) ;; *) exit 74 ;; esac
+printf '%s\n' "$1"
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}'
+IFS= read -r line
+case "$line" in *'"method":"ping"'*) ;; *) exit 75 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
+while IFS= read -r line; do :; done
+"#;
+
+    fn exercise(reply: &str, expected_peer_error: Option<(McpErrorCode, serde_json::Value)>) {
+        let runtime = RuntimeBuilder::current_thread()
+            .with_reactor(create_reactor().expect("caller reactor"))
+            .build()
+            .expect("caller-owned runtime");
+        runtime.block_on(async {
+            let cx = Cx::current().expect("caller context");
+            asupersync::time::timeout(cx.now(), Duration::from_secs(10), async {
+                let mut client = Client::builder()
+                    .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::LegacyOnly))
+                    .connect_stdio_with_cx(&cx, "sh", &["-c", PEER, "legacy-error-peer", reply])
+                    .await
+                    .expect("exact-2024 peer initializes");
+                let executor = client
+                    .multiplexed_stdio_executor()
+                    .expect("selected connection has one shared executor");
+                let mut sibling = client
+                    .start_multiplexed_request(&cx, "tools/list", Some(serde_json::json!({})))
+                    .expect("sibling request commits before the typed request");
+                assert_eq!(sibling.request_id(), &RequestId::Number(2));
+
+                let error = client
+                    .request_legacy_core_with_cx(&cx, LegacyCoreRequest::Ping)
+                    .await
+                    .expect_err("the peer refuses this typed request");
+
+                if let Some((code, data)) = expected_peer_error {
+                    assert_eq!(error.code, code);
+                    assert_eq!(error.message, "request refused");
+                    assert_eq!(error.data, Some(data));
+                    assert!(client.is_initialized(), "peer errors do not undo selection");
+                    assert!(!client.transport_is_closed(), "peer errors do not close stdio");
+
+                    let response = loop {
+                        if let Some(response) = executor
+                            .try_take_response(&mut sibling)
+                            .expect("the sibling owner survives the peer error")
+                        {
+                            break response;
+                        }
+                        client
+                            .drive_yielding_stdio_slice()
+                            .expect("the shared reader remains usable");
+                        asupersync::runtime::yield_now().await;
+                    };
+                    assert_eq!(response.id, Some(RequestId::Number(2)));
+                    assert!(response.error.is_none());
+                    assert_eq!(response.result, Some(serde_json::json!({"tools": []})));
+                    let followup = client
+                        .request_legacy_core_with_cx(&cx, LegacyCoreRequest::Ping)
+                        .await
+                        .expect("a new typed request succeeds on the same connection");
+                    assert!(matches!(followup, LegacyCoreResult::Ping(_)));
+                } else {
+                    assert!(!client.is_initialized(), "invalid wire data revokes selection");
+                    assert!(client.transport_is_closed(), "invalid wire data closes stdio");
+                    assert!(
+                        executor.try_take_response(&mut sibling).is_err(),
+                        "malformed peer data still fails every outstanding owner"
+                    );
+                }
+
+                client
+                    .close_with_cx(&cx)
+                    .await
+                    .expect("subprocess cleanup settles");
+                assert!(client.child_cleanup_complete());
+                assert!(!client.has_pending_cleanup_error());
+            })
+            .await
+            .expect("bounded peer exchange and cleanup");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn clt_01_legacy_async_peer_error_preserves_sibling_and_connection() {
+        exercise(
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"request refused","data":{"retryable":true}}}"#,
+            Some((McpErrorCode::InvalidParams, serde_json::json!({"retryable": true}))),
+        );
+    }
+
+    #[test]
+    fn clt_01_legacy_async_wide_peer_error_preserves_exact_code_and_connection() {
+        let peer_code = "-999999999999999999999999999999999999999999999";
+        let reply = format!(
+            r#"{{"jsonrpc":"2.0","id":3,"error":{{"code":{peer_code},"message":"request refused","data":["detail",7]}}}}"#
+        );
+        let code: serde_json::Value = serde_json::from_str(peer_code).unwrap();
+        exercise(
+            &reply,
+            Some((
+                McpErrorCode::InternalError,
+                serde_json::json!({
+                    "jsonrpcErrorCode": code,
+                    "jsonrpcErrorData": ["detail", 7],
+                }),
+            )),
+        );
+    }
+
+    #[test]
+    fn clt_01_legacy_async_error_with_result_still_terminates_connection() {
+        // Only the forbidden simultaneous result is added to the valid error.
+        exercise(
+            r#"{"jsonrpc":"2.0","id":3,"result":{},"error":{"code":-32602,"message":"request refused","data":{"retryable":true}}}"#,
+            None,
+        );
+    }
+
+    #[test]
+    fn clt_01_legacy_async_final_success_payload_still_terminates_connection() {
+        exercise(
+            r#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}}"#,
+            None,
+        );
+    }
+}
