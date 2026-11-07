@@ -17819,6 +17819,27 @@ impl StdioRequestExecutor {
         )
     }
 
+    /// Retains the prepared request's originating lifetime even while its
+    /// future is not polled. A sibling's service turn must observe this caller's
+    /// cancellation and budget without reconstructing admitted metadata.
+    #[cfg(unix)]
+    fn execute_prepared_with_cancellation(
+        &self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> McpResult<StdioRequestExecution> {
+        self.execute_with_metadata(
+            cx,
+            Some(cancellation),
+            method.into(),
+            params,
+            None,
+            StdioRequestMetadata::Prepared,
+        )
+    }
+
     fn execute_with_metadata(
         &self,
         cx: &Cx,
@@ -28113,7 +28134,11 @@ impl Client {
         }
         // Parameters are already typed and extension-admitted. Preparing them
         // again here would re-advertise Tasks on an ordinary tools/call.
-        let execution = executor.execute_prepared(&connection_cx, method, parameters)?;
+        // Retain the real caller and token before publication; the connection
+        // context authorizes shared service and ingress, not this request's
+        // lifetime when another executor runs while its future is parked.
+        let execution =
+            executor.execute_prepared_with_cancellation(cx, cancellation, method, parameters)?;
         self.wait_yielding_prepared_execution_until(
             cx,
             cancellation,
@@ -60258,6 +60283,317 @@ while IFS= read -r unexpected; do exit 15; done
                 }
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_01_prepared_async_requests_retain_parked_caller_lifetimes() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for with_progress in [false, true] {
+                for stop in ["active", "token", "context", "deadline"] {
+                    #[cfg(feature = "tasks")]
+                    let discovery = modern_tasks_discovery_response(
+                        "prepared-origin-peer",
+                        serde_json::json!({}),
+                    );
+                    #[cfg(not(feature = "tasks"))]
+                    let discovery = modern_discovery_response(
+                        "prepared-origin-peer",
+                        &[MODERN_PROTOCOL_VERSION],
+                    );
+                    let script = r#"
+numeric_id() {
+    printf '%s\n' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p'
+}
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r sibling || exit 11
+case "$sibling" in *'"method":"tools/list"'*) ;; *) exit 12 ;; esac
+sibling_id=$(numeric_id "$sibling")
+IFS= read -r pending || exit 13
+case "$pending" in *'"method":"tools/call"'*) ;; *) exit 14 ;; esac
+pending_id=$(numeric_id "$pending")
+IFS= read -r next || exit 15
+control=null
+if [ "$2" != active ]; then
+    case "$next" in *'"method":"notifications/cancelled"'*) ;; *) exit 16 ;; esac
+    cancelled_id=$(printf '%s\n' "$next" | sed -n 's/.*"requestId":\([0-9][0-9]*\)[,}].*/\1/p')
+    [ "$cancelled_id" = "$pending_id" ] || exit 17
+    control=$next
+    IFS= read -r next || exit 18
+fi
+case "$next" in *'"method":"tools/list"'*) ;; *) exit 19 ;; esac
+service_id=$(numeric_id "$next")
+if [ "$3" = progress ]; then
+    token=$(printf '%s\n' "$pending" | sed -n 's/.*"progressToken":\([0-9][0-9]*\)[,}].*/\1/p')
+    case "$token" in ''|*[!0-9]*) exit 20 ;; esac
+    printf '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":%s,"progress":1.2300e+400,"message":"owned"}}\n' "$token"
+fi
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","content":[{"type":"text","text":"owned"}]}}\n' "$pending_id"
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"sibling"}}\n' "$sibling_id"
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","observed":%s,"control":%s}}\n' "$service_id" "$pending" "$control"
+IFS= read -r fresh || exit 21
+case "$fresh" in *'"method":"tools/list"'*) ;; *) exit 22 ;; esac
+fresh_id=$(numeric_id "$fresh")
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"fresh"}}\n' "$fresh_id"
+while IFS= read -r unexpected; do exit 23; done
+"#;
+                    let mut client = ClientBuilder::new()
+                        .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                        .client_info("configured-owner", "1")
+                        .capabilities(ClientCapabilities {
+                            sampling: Some(SamplingCapability::default()),
+                            #[cfg(feature = "tasks")]
+                            extensions: Some(BTreeMap::from([(
+                                fastmcp_protocol::TASKS_EXTENSION.to_owned(),
+                                serde_json::json!({}),
+                            )])),
+                            ..ClientCapabilities::default()
+                        })
+                        .request_timeout_policy(
+                            RequestTimeoutPolicy::new(
+                                Duration::from_secs(5),
+                                Duration::from_secs(5),
+                            )
+                            .unwrap(),
+                        )
+                        .connect_stdio_with_cx(
+                            &healthy,
+                            "sh",
+                            &[
+                                "-c",
+                                script,
+                                "prepared-origin-peer",
+                                discovery.as_str(),
+                                stop,
+                                if with_progress { "progress" } else { "core" },
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                    let executor = client.multiplexed_stdio_executor().unwrap();
+                    #[cfg(feature = "tasks")]
+                    assert!(
+                        executor
+                            .modern_request_meta
+                            .as_ref()
+                            .unwrap()
+                            .client_capabilities
+                            .extensions
+                            .as_ref()
+                            .unwrap()
+                            .contains_key(fastmcp_protocol::TASKS_EXTENSION),
+                        "configured dispatch would restore Tasks if this seam restamped metadata",
+                    );
+                    let mut sibling = executor
+                        .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                        .unwrap();
+                    let sibling_before = executor.executor.pending_records()[0].clone();
+                    let origin = runtime.request_cx_with_budget(
+                        asupersync::Budget::INFINITE
+                            .with_deadline(healthy.now() + Duration::from_secs(1)),
+                    );
+                    let cancellation = McpRequestCancellation::new();
+                    let callbacks = Arc::new(AtomicUsize::new(0));
+                    let parameters = serde_json::json!({
+                        "name": "work",
+                        "arguments": {},
+                        "_meta": {
+                            FINAL_CLIENT_INFO_META_KEY: {"name": "gateway-owner", "version": "9"},
+                            FINAL_CLIENT_CAPABILITIES_META_KEY: {"roots": {"listChanged": true}},
+                            FINAL_LOG_LEVEL_META_KEY: "notice",
+                            "com.example/correlation": {"value": "preserved"},
+                        },
+                    });
+                    let mut pending = Box::pin(async {
+                        if with_progress {
+                            client
+                                .request_core_with_progress_with_cx(
+                                    &origin,
+                                    &cancellation,
+                                    "tools/call",
+                                    parameters,
+                                    |progress| {
+                                        assert_eq!(progress.progress.as_str(), "1.2300e+400");
+                                        callbacks.fetch_add(1, Ordering::SeqCst);
+                                    },
+                                )
+                                .await
+                        } else {
+                            client
+                                .request_core_with_cx(
+                                    &origin,
+                                    &cancellation,
+                                    "tools/call",
+                                    parameters,
+                                )
+                                .await
+                        }
+                    });
+                    assert!(
+                        std::future::poll_fn(|task_cx| {
+                            std::task::Poll::Ready(pending.as_mut().poll(task_cx))
+                        })
+                        .await
+                        .is_pending(),
+                        "the peer withholds every result until a different caller sends",
+                    );
+                    let owned_id = executor
+                        .executor
+                        .pending_records()
+                        .into_iter()
+                        .find(|record| record.request_id != *sibling.request_id())
+                        .unwrap()
+                        .request_id;
+                    assert_eq!(callbacks.load(Ordering::SeqCst), 0);
+                    match stop {
+                        "active" => {}
+                        "token" => {
+                            cancellation.cancel();
+                        }
+                        "context" => {
+                            origin.set_cancel_requested(true);
+                        }
+                        "deadline" => {
+                            clock.advance(1_000_000_000);
+                        }
+                        _ => unreachable!(),
+                    }
+
+                    // Do not poll or drop the originating future. A healthy
+                    // clone must retire its stopped owner before publishing
+                    // another application frame or admitting any peer result.
+                    let mut service = executor
+                        .clone()
+                        .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                        .unwrap();
+                    let stopped = stop != "active";
+                    let records = executor.executor.pending_records();
+                    assert_eq!(
+                        records.iter().any(|record| record.request_id == owned_id),
+                        !stopped,
+                        "parked caller ownership: progress={with_progress}, stop={stop}",
+                    );
+                    assert_eq!(
+                        records
+                            .iter()
+                            .find(|record| record.request_id == *sibling.request_id()),
+                        Some(&sibling_before),
+                        "servicing a stopped origin must not mutate its sibling",
+                    );
+                    let events = executor.executor.take_cancellation_events();
+                    if stopped {
+                        assert_eq!(events.len(), 1);
+                        assert_eq!(events[0].request_id, owned_id);
+                        assert_eq!(events[0].reason, ExecutionTerminalReason::CallerCancelled);
+                        let terminals = executor.executor.terminal_records();
+                        assert_eq!(terminals.len(), 1);
+                        assert_eq!(
+                            terminals[0].terminal_state,
+                            ExecutionTerminalState::Cancelled,
+                        );
+                        assert_eq!(
+                            terminals[0].terminal_reason,
+                            ExecutionTerminalReason::CallerCancelled,
+                        );
+                        assert!(terminals[0].cancellation_committed);
+                        assert_eq!(terminals[0].cancellation_transport_attempts, 1);
+                        assert!(!terminals[0].final_delivered);
+                    } else {
+                        assert!(events.is_empty());
+                        assert!(executor.executor.terminal_records().is_empty());
+                    }
+                    executor.service(&healthy).unwrap();
+                    assert!(executor.executor.take_cancellation_events().is_empty());
+                    let result = pending.await;
+                    if stopped {
+                        assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    } else {
+                        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) =
+                            result.unwrap()
+                        else {
+                            panic!("the active parked request must complete normally");
+                        };
+                        assert_eq!(result.payload.content, vec![ContentBlock::text("owned")]);
+                    }
+                    assert_eq!(
+                        callbacks.load(Ordering::SeqCst),
+                        usize::from(with_progress && !stopped),
+                    );
+                    let fresh = client
+                        .request_with_cx(&healthy, "tools/list", Some(serde_json::json!({})))
+                        .await
+                        .unwrap();
+                    assert_eq!(fresh.result.unwrap()["owner"], "fresh");
+                    assert_eq!(
+                        executor
+                            .try_take_response(&mut sibling)
+                            .unwrap()
+                            .unwrap()
+                            .result
+                            .unwrap()["owner"],
+                        "sibling",
+                    );
+                    let observed = executor
+                        .try_take_response(&mut service)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .unwrap();
+                    if stopped {
+                        assert_eq!(
+                            observed["control"]["params"]["requestId"],
+                            serde_json::to_value(&owned_id).unwrap(),
+                        );
+                        assert!(observed["control"].get("id").is_none());
+                    } else {
+                        assert!(observed["control"].is_null());
+                    }
+                    let metadata = &observed["observed"]["params"]["_meta"];
+                    assert_eq!(
+                        metadata[FINAL_CLIENT_INFO_META_KEY],
+                        serde_json::json!({"name": "gateway-owner", "version": "9"}),
+                    );
+                    assert_eq!(metadata[FINAL_LOG_LEVEL_META_KEY], "notice");
+                    assert_eq!(metadata["com.example/correlation"]["value"], "preserved");
+                    let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
+                    assert_eq!(capabilities["roots"], serde_json::json!({"listChanged": true}));
+                    assert!(capabilities.get("sampling").is_none());
+                    #[cfg(feature = "tasks")]
+                    assert!(
+                        capabilities
+                            .get("extensions")
+                            .and_then(|extensions| extensions.get(fastmcp_protocol::TASKS_EXTENSION))
+                            .is_none(),
+                        "prepared ordinary calls must keep Tasks withheld",
+                    );
+                    assert_eq!(
+                        callbacks.load(Ordering::SeqCst),
+                        usize::from(with_progress && !stopped),
+                        "late progress cannot revive an already cancelled observer",
+                    );
+                    assert!(executor.executor.pending_records().is_empty());
+                    assert!(executor.executor.take_cancellation_events().is_empty());
+                    assert!(executor.executor.take_uncorrelated_responses().is_empty());
+                    assert!(executor.executor.terminal_error().is_none());
+                    assert!(healthy.checkpoint().is_ok());
+                    client.close_with_cx(&healthy).await.unwrap();
+                    assert!(client.child_cleanup_complete());
+                }
+            }
+        });
+        drop(healthy);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(unix)]
