@@ -6,14 +6,15 @@
 //! with the store's receipt. An unfinished fence quarantines the shared facade;
 //! dropping a future never means that an external mutation did not happen.
 //!
-//! This implements the ordinary-write subset of FND-08. Administrative epoch
-//! advance, migration, snapshot reconciliation, persistent encryption, and
-//! provider qualification are separate, not implemented here. In particular a
-//! quarantined facade has no reset or reopen method. Recreating one is safe only
-//! if the external authority refuses unresolved/closed registrations as required
-//! by its contract. An ordinary database or in-memory implementation is NOT an
-//! external rollback/clone authority. The named adapter and its independent
-//! persistence service remain part of the deployment's trusted computing base.
+//! The write and bounded reconciliation consumers implement a subset of FND-08.
+//! Recovery retires the old handles, resolves exact persisted operation IDs
+//! against independent durable store proofs, and requests a fresh registration.
+//! Only the authority's atomic refusal of unresolved/closed registrations can
+//! admit fresh handles; a local reset is never sufficient. Administrative epoch
+//! advance, migration, persistent encryption, and provider qualification remain
+//! separate. An ordinary database or in-memory implementation is NOT an external
+//! rollback/clone authority. The named adapter and its independent persistence
+//! service remain part of the deployment's trusted computing base.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -31,6 +32,10 @@ use asupersync::{Cx, Time};
 
 use crate::crypto::{draw_security_identifier, sha256_bounded};
 use crate::runtime::{ProcessBoundToken, ProcessGenerationGuard, ambient_capability_ceiling};
+
+pub mod recovery;
+
+pub use recovery::*;
 
 #[cfg(test)]
 mod tests;
@@ -64,6 +69,8 @@ pub enum RestoreError {
     ProviderUnavailable,
     Uncertain,
     Quarantined,
+    RecoveryBusy,
+    ScanRestartRequired,
 }
 
 impl fmt::Display for RestoreError {
@@ -81,6 +88,8 @@ impl fmt::Display for RestoreError {
             Self::ProviderUnavailable => "restore authority unavailable",
             Self::Uncertain => "restore mutation disposition is uncertain",
             Self::Quarantined => "restore deployment requires external reconciliation",
+            Self::RecoveryBusy => "restore recovery requires exclusive drained ownership",
+            Self::ScanRestartRequired => "restore snapshot must be restarted",
         })
     }
 }
@@ -268,8 +277,8 @@ impl RestoreEpochBinding {
     }
 }
 
-/// The closed ordinary-write operations. Administrative operations are not
-/// exposed by this subset and cannot be smuggled in through arbitrary bytes.
+/// Closed write and reconciliation operations. Administrative epoch changes
+/// cannot be smuggled in through arbitrary request bytes.
 pub enum RestoreAuthorityOperation {
     RegisterStoreSet {
         stores: Vec<RestoreStoreDeclaration>,
@@ -289,6 +298,15 @@ pub enum RestoreAuthorityOperation {
         intent_operation_id: [u8; 16],
         receipt: DurableRestoreCommitReceipt,
     },
+    ListUnresolvedWrites {
+        limits: RestoreRecoveryLimits,
+        expires_at: Time,
+        cursor: Option<RestoreIntentCursor>,
+    },
+    ReconcileWrite {
+        intent: RestoreReconcileIntent,
+        resolution: DurableRestoreResolution,
+    },
 }
 
 impl RestoreAuthorityOperation {
@@ -298,6 +316,8 @@ impl RestoreAuthorityOperation {
             Self::Current { .. } => 2,
             Self::PrepareWrite { .. } => 3,
             Self::CompleteWrite { .. } => 4,
+            Self::ListUnresolvedWrites { .. } => 5,
+            Self::ReconcileWrite { .. } => 6,
         }
     }
 }
@@ -351,6 +371,12 @@ pub enum RestoreAuthorityOutcome {
         intent_operation_id: [u8; 16],
         commit_digest: [u8; 32],
     },
+    UnresolvedWrites(RestoreUnresolvedPage),
+    ScanRestartRequired,
+    Reconciled {
+        intent_operation_id: [u8; 16],
+        resolution_digest: [u8; 32],
+    },
 }
 
 pub struct RestoreAuthorityResponse {
@@ -398,6 +424,25 @@ pub type RestoreAuthorityFuture<'a> = Pin<
 ///
 /// A truthful implementation and its external failure domain are deployment
 /// requirements, not properties Rust can prove by checking these receipts.
+///
+/// Snapshot scans must retain every intent unresolved at the captured high-water
+/// generation, including versioned tombstones for concurrent completions. They
+/// order by (intent generation, operation ID), reserve bounded snapshot storage
+/// before returning a first page, enforcing active_snapshots and
+/// retained_snapshot_bytes atomically across the entire deployment/configuration
+/// (including abandoned scans and other processes), integrity-protect continuation bytes over the
+/// entire scan binding, and release snapshot storage on completion or expiry.
+/// Abandoned/cancelled scans retain no authority beyond their bounded lease.
+/// Invalidation returns the typed restart outcome, never a shifted offset.
+/// Reconciliation verifies the independent durable commit or terminal fenced
+/// noncommit proof for the original intent; a lookup miss is never such proof.
+/// Each reconciliation transaction has its own request operation ID and targets
+/// the original prepare intent ID. Settlement of that original intent is durably
+/// idempotent, including when an earlier acknowledgement was lost. Unknown
+/// outcomes remain queryable by original operation ID. No fresh mutation
+/// is an implicit retry. Registration after reconciliation still atomically
+/// refuses ANY unresolved intent, including writes newer than a scan high-water.
+/// Adapters must bound wire decoding before allocating response collections.
 pub trait RestoreEpochAuthority: Send + Sync + 'static {
     fn execute<'a>(
         &'a self,
@@ -412,6 +457,8 @@ struct Shared {
     store_set_digest: [u8; 32],
     process: ProcessBoundToken,
     quarantined: AtomicBool,
+    recovering: AtomicBool,
+    recovery_rate: Mutex<recovery::RecoveryRate>,
     calls: AtomicUsize,
     reads: AtomicUsize,
     intents: AtomicUsize,
@@ -461,6 +508,8 @@ impl RestoreEpochFacade {
             store_set_digest,
             process,
             quarantined: AtomicBool::new(false),
+            recovering: AtomicBool::new(false),
+            recovery_rate: Mutex::new(recovery::RecoveryRate::default()),
             calls: AtomicUsize::new(0),
             reads: AtomicUsize::new(0),
             intents: AtomicUsize::new(0),
@@ -538,18 +587,28 @@ impl RegisteredRestoreStore {
         cx: &Cx,
         deadline: Time,
     ) -> Result<(RestoreEpochBinding, u64, Time), RestoreError> {
+        self.current_with_access(cx, deadline, CallAccess::Ordinary).await
+    }
+
+    async fn current_with_access(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+        access: CallAccess,
+    ) -> Result<(RestoreEpochBinding, u64, Time), RestoreError> {
         let _read = CounterLease::acquire(
             &self.shared.reads,
             self.shared.configuration.limits.active_reads,
         )?;
-        let request = self.shared.request(
+        let request = self.shared.request_with_access(
             cx,
             RestoreAuthorityOperation::Current {
                 store: (*self.declaration).clone(),
             },
             deadline,
+            access,
         )?;
-        let response = self.shared.call(cx, &request, None).await?;
+        let response = self.shared.call_with_access(cx, &request, None, access).await?;
         let (bytes, generation) = match response.outcome {
             RestoreAuthorityOutcome::Current {
                 certified_binding,
@@ -692,6 +751,14 @@ pub struct RestoreWriteFence {
 }
 
 impl RestoreWriteFence {
+    /// Borrow the authority-admitted stable binding; callers cannot construct it.
+    pub const fn binding(&self) -> &RestoreEpochBinding {
+        &self.binding
+    }
+    /// Recheck process, quarantine, cancellation, deadline and caller effects.
+    pub fn check(&self, cx: &Cx) -> Result<(), RestoreError> {
+        recovery::check_owned_binding(&self.store.shared, cx, self.expires_at)
+    }
     pub const fn operation_id(&self) -> [u8; 16] {
         self.operation_id
     }
@@ -797,6 +864,29 @@ impl CompletedRestoreWrite {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CallAccess {
+    Ordinary,
+    Recovery,
+}
+
+impl CallAccess {
+    fn check(self, shared: &Shared) -> Result<(), RestoreError> {
+        match self {
+            Self::Ordinary => shared.check(),
+            Self::Recovery => {
+                shared.process.verify().map_err(|_| RestoreError::ProcessChanged)?;
+                if !shared.quarantined.load(Ordering::Acquire)
+                    || !shared.recovering.load(Ordering::Acquire)
+                {
+                    return Err(RestoreError::RecoveryBusy);
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Shared {
     fn quarantine(&self) {
         self.quarantined.store(true, Ordering::Release);
@@ -818,7 +908,17 @@ impl Shared {
         operation: RestoreAuthorityOperation,
         deadline: Time,
     ) -> Result<RestoreAuthorityRequest, RestoreError> {
-        self.check()?;
+        self.request_with_access(cx, operation, deadline, CallAccess::Ordinary)
+    }
+
+    fn request_with_access(
+        &self,
+        cx: &Cx,
+        operation: RestoreAuthorityOperation,
+        deadline: Time,
+        access: CallAccess,
+    ) -> Result<RestoreAuthorityRequest, RestoreError> {
+        access.check(self)?;
         let deadline = with_caller(cx, || {
             let active = Cx::current().ok_or(RestoreError::CapabilityUnavailable)?;
             require_caller(&active)?;
@@ -889,6 +989,12 @@ impl Shared {
                 bytes.extend_from_slice(&receipt.commit_digest);
                 encode_bytes(&mut bytes, &receipt.proof);
             }
+            RestoreAuthorityOperation::ListUnresolvedWrites { limits, expires_at, cursor } => {
+                recovery::encode_scan_request(&mut bytes, *limits, *expires_at, cursor.as_ref());
+            }
+            RestoreAuthorityOperation::ReconcileWrite { intent, resolution } => {
+                recovery::encode_reconciliation(&mut bytes, intent, resolution);
+            }
         }
         let request_digest = hash(&bytes)?;
         Ok(RestoreAuthorityRequest {
@@ -905,10 +1011,23 @@ impl Shared {
         &self,
         cx: &Cx,
         request: &RestoreAuthorityRequest,
-        mut uncertain: Option<&mut UncertainMutation>,
+        uncertain: Option<&mut UncertainMutation>,
     ) -> Result<RestoreAuthorityResponse, RestoreError> {
-        self.check()?;
+        self.call_with_access(cx, request, uncertain, CallAccess::Ordinary).await
+    }
+
+    async fn call_with_access(
+        &self,
+        cx: &Cx,
+        request: &RestoreAuthorityRequest,
+        mut uncertain: Option<&mut UncertainMutation>,
+        access: CallAccess,
+    ) -> Result<RestoreAuthorityResponse, RestoreError> {
+        access.check(self)?;
         let _lease = CounterLease::acquire(&self.calls, self.configuration.limits.active_calls)?;
+        // Check again after admission. Recovery can close the facade between
+        // the first check and lease acquisition, before provider construction.
+        access.check(self)?;
         let caller = with_caller(cx, || {
             let current = Cx::current().ok_or(RestoreError::CapabilityUnavailable)?;
             require_caller(&current)?;
@@ -924,7 +1043,7 @@ impl Shared {
             guard.armed = true;
         }
         let future = with_caller(&caller, || self.backend.execute(&caller, request));
-        let result = within(self, &caller, request.deadline, future).await?;
+        let result = within_access(self, &caller, request.deadline, future, access).await?;
         match result {
             Err(failure) => {
                 if failure.dispatch == RestoreDispatch::NotDispatched {
@@ -946,7 +1065,7 @@ impl Shared {
                 if response.dispatch != RestoreDispatch::Dispatched {
                     return Err(RestoreError::Uncertain);
                 }
-                self.check()?;
+                access.check(self)?;
                 Ok(response)
             }
         }
@@ -1156,11 +1275,12 @@ impl<F> Drop for CallerFuture<'_, F> {
     }
 }
 
-async fn within<F: Future>(
+async fn within_access<F: Future>(
     shared: &Shared,
     cx: &Cx,
     deadline: Time,
     future: F,
+    access: CallAccess,
 ) -> Result<F::Output, RestoreError> {
     let mut future = CallerFuture {
         cx,
@@ -1175,7 +1295,7 @@ async fn within<F: Future>(
         let _caller = Cx::set_current(Some(cx.clone()));
         let _restriction = Cx::push_restriction(future.ceiling);
         let active = Cx::current().ok_or(RestoreError::CapabilityUnavailable)?;
-        shared.check()?;
+        access.check(shared)?;
         require_caller(&active)?;
         active.checkpoint().map_err(|_| RestoreError::Cancelled)?;
         if active.now() >= deadline {
@@ -1197,7 +1317,7 @@ async fn within<F: Future>(
             .expect("provider future is owned")
             .as_mut()
             .poll(task);
-        shared.check()?;
+        access.check(shared)?;
         if active.is_cancel_requested() {
             return Poll::Ready(Err(RestoreError::Cancelled));
         }

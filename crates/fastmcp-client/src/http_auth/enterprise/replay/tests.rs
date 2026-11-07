@@ -395,6 +395,12 @@ impl RestoreEpochAuthority for Authority {
                         commit_digest: receipt.commit_digest(),
                     }
                 }
+                RestoreAuthorityOperation::ListUnresolvedWrites { .. }
+                | RestoreAuthorityOperation::ReconcileWrite { .. } => {
+                    return Err(RestoreAuthorityFailure {
+                        dispatch: RestoreDispatch::NotDispatched,
+                    });
+                }
             };
             Ok(RestoreAuthorityResponse::for_request(request, outcome))
         })

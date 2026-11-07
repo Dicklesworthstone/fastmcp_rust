@@ -17,6 +17,8 @@ enum Phase {
     Prepare,
     StoreCommit,
     Complete,
+    Scan,
+    Reconcile,
 }
 
 fn phase(operation: &RestoreAuthorityOperation) -> Phase {
@@ -25,6 +27,8 @@ fn phase(operation: &RestoreAuthorityOperation) -> Phase {
         RestoreAuthorityOperation::Current { .. } => Phase::Current,
         RestoreAuthorityOperation::PrepareWrite { .. } => Phase::Prepare,
         RestoreAuthorityOperation::CompleteWrite { .. } => Phase::Complete,
+        RestoreAuthorityOperation::ListUnresolvedWrites { .. } => Phase::Scan,
+        RestoreAuthorityOperation::ReconcileWrite { .. } => Phase::Reconcile,
     }
 }
 
@@ -197,6 +201,10 @@ impl Authority {
                     intent_operation_id: *intent_operation_id,
                     commit_digest,
                 }
+            }
+            RestoreAuthorityOperation::ListUnresolvedWrites { .. }
+            | RestoreAuthorityOperation::ReconcileWrite { .. } => {
+                return Err(RestoreAuthorityFailure { dispatch: RestoreDispatch::NotDispatched });
             }
         };
         Ok(RestoreAuthorityResponse::for_request(request, outcome))

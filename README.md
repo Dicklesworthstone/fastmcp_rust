@@ -1279,10 +1279,22 @@ These contracts are implementable external boundaries, not bundled persistent
 services or attestations. The adapters must independently prove durable key
 custody, atomic all-generation reservation, cluster ring agreement, external
 rollback/clone resistance and authenticated commit verification. The shipped
-test adapters are explicitly in-memory fault fixtures. The restore facade
-currently implements ordinary writes; administrative reconciliation, epoch
-advance and fenced migration remain unfinished, so it has no local reset or
-reopen shortcut.
+test adapters are explicitly in-memory fault fixtures.
+
+`RestoreEpochFacade::recover` reconciles a bounded, snapshot-consistent view of
+unresolved writes through the exact pre-registered store union. Each independent
+`RestoreStoreRecovery` adapter must supply either the real durable commit proof
+or a durable terminal noncommit proof that fences out the original writer.
+A missing record, timeout or expired intent is insufficient. The authority
+verifies each proof against the original intent before settling it.
+
+Recovery permanently retires the old handles. A completed snapshot returns a
+summary; fresh handles are returned only if a new authority registration
+atomically refuses every remaining unresolved intent or closed deployment and
+every store retains its original stable epoch binding. A proved live CAS loser
+can use `RegisteredRestoreStore::reconcile_write` to settle its owned fence and
+return a normal conflict. Unknown outcomes remain unresolved. Administrative
+epoch advance and fenced migration remain unfinished.
 
 Durable browser launch/callback custody, confidential credential providers,
 the native token-exchange driver, attested mapping authority and qualified
