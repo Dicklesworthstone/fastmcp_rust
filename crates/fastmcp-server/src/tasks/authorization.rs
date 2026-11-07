@@ -1643,7 +1643,15 @@ mod tests {
         assert_eq!(deliveries.load(Ordering::SeqCst), acknowledged + 1);
         assert!(cancellation.is_cancel_requested());
         drop(listening);
-        executor.shutdown_timeout(StdDuration::from_secs(2));
+        // `shutdown_timeout` is #[must_use] and returns whether the runtime
+        // actually settled. Dropping it made this the only one of ~30 calls in
+        // the workspace that does not assert, and it let the test pass while
+        // leaking a runtime that never quiesced. Asserted in the form every
+        // sibling uses.
+        assert!(
+            executor.shutdown_timeout(StdDuration::from_secs(2)),
+            "the authorization executor quiesced"
+        );
     }
 
     #[test]

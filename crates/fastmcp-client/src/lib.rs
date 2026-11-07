@@ -28698,16 +28698,6 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_core::block_on;
-    // `use super::*` does NOT reach `Poll`: the parent module has no such name
-    // in scope to re-export, which is why the three bare `Poll::` sites in this
-    // module failed to resolve. Gated to match its only users -- the
-    // `#[cfg(unix)]` extension-over-HTTP helper and test at 42369 and 42516.
-    // Ungated it would be an unused import on a non-unix target, and this
-    // workspace builds x86_64-pc-windows-msvc, where `-D warnings` makes an
-    // unused import an error.
-    #[cfg(unix)]
-    use std::task::Poll;
-
     // bd-mrtr-01-b-otqd: automatic resolver coverage is an all-input barrier.
     mod mrtr_handler_preflight {
         use super::*;
@@ -42386,14 +42376,14 @@ exec sleep 2
                 "the peer has not completed this response"
             );
             match ready.try_recv() {
-                Ok(()) => Poll::Ready(()),
+                Ok(()) => std::task::Poll::Ready(()),
                 Err(mpsc::TryRecvError::Empty) => {
                     assert!(
                         Instant::now() < deadline,
                         "extension request did not reach peer"
                     );
                     task.waker().wake_by_ref();
-                    Poll::Pending
+                    std::task::Poll::Pending
                 }
                 Err(error) => panic!("extension peer stopped before request: {error}"),
             }
@@ -42631,7 +42621,7 @@ exec sleep 2
                     // Poll the now-delivered partial head/body once more before
                     // cancelling; no phase supplies a terminal response.
                     assert!(
-                        std::future::poll_fn(|task| Poll::Ready(request.as_mut().poll(task)))
+                        std::future::poll_fn(|task| std::task::Poll::Ready(request.as_mut().poll(task)))
                             .await
                             .is_pending()
                     );

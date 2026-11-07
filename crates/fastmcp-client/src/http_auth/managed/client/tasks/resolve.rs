@@ -33,9 +33,22 @@ use crate::WebSocketClient;
 use crate::http_auth::rpc::interaction::{admit_embedded_input, normalize_embedded_input_context};
 use crate::{
     FinalTask, FinalTaskId, FinalTaskInputResponses, FinalUpdateTaskResult, HttpClient,
-    HttpClientError, MrtrCallbackOwner, ReverseRequestCancellation, ReverseRequestHandlers,
-    catch_client_callback_unwind,
+    HttpClientError, MrtrCallbackOwner, ReverseRequestHandlers, catch_client_callback_unwind,
 };
+// `#[cfg(test)]`, not unconditional and not absent. Its only remaining users
+// are in this file's test module (`owners: &Arc<Mutex<Vec<..>>>` at :934 and
+// `cancellation: ..` at :971); the production use went away when resolve_one
+// stopped making its own token, because
+// invoke_embedded_input_request_async now creates one internally and returns
+// the owner.
+//
+// `warning: unused import` is computed PER TARGET. It is genuinely unused in
+// `--lib`, which is what emitted the warning, and genuinely required in
+// `--lib --test`. Deleting it silenced the warning and produced two E0425s;
+// gating it to `cfg(test)` satisfies both targets, which is the only form that
+// does.
+#[cfg(test)]
+use crate::ReverseRequestCancellation;
 
 fn invalid(message: &'static str) -> McpError {
     McpError::invalid_params(message)
