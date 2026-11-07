@@ -13955,11 +13955,11 @@ async fn send_modern_sse_stream(
     // handler admission commits a notification or their final response is queued.
     let (outcome_gate, mut outcome_receiver) = ModernSseOutcomeGate::new();
     // H1 request input is complete before this request-owned response starts.
-    // A clean peer write-half EOF is therefore ordinary request completion,
-    // not cancellation of the still-owned response body. TCP cannot tell that
-    // half-close from a full close through this read side alone; output writes
-    // are the only definitive disconnect signal for this SSE response.
-    let (_reader, mut writer) = stream.into_split();
+    // A clean peer write-half EOF preserves the response, but a reset or
+    // unexpected input abandons it. Observe that distinction even before the
+    // handler elects a response representation, when no write can expose a
+    // disconnected peer.
+    let (mut peer_reader, mut writer) = stream.into_split();
 
     let dispatch = match spawn_modern_sse_dispatch(
         cx,
@@ -13991,7 +13991,7 @@ async fn send_modern_sse_stream(
         return Err(());
     }
 
-    let result = async {
+    let deliver_response = async {
         match await_modern_sse_dispatch_election(cx, &request_cancellation, &mut outcome_receiver)
             .await?
         {
@@ -14129,8 +14129,34 @@ async fn send_modern_sse_stream(
             ),
         )
         .await
-    }
-    .await;
+    };
+    let result = {
+        let mut deliver_response = std::pin::pin!(deliver_response);
+        let mut probe = [0_u8; 1];
+        let mut peer_read = std::pin::pin!(peer_reader.read(&mut probe));
+        let mut peer_read_finished = false;
+        // The read belongs to this connection's future, so every return or
+        // dropped connection releases it without leaving a watcher task.
+        std::future::poll_fn(|task_cx| {
+            if !peer_read_finished
+                && let std::task::Poll::Ready(read) = peer_read.as_mut().poll(task_cx)
+            {
+                peer_read_finished = true;
+                match read {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        request_cancellation.cancel();
+                    }
+                    Err(_) if !cx.is_cancel_requested() => {
+                        request_cancellation.cancel();
+                    }
+                    Err(_) => {}
+                }
+            }
+            deliver_response.as_mut().poll(task_cx)
+        })
+        .await
+    };
 
     if result.is_err() {
         terminal_delivery.mark_failed();
@@ -52021,6 +52047,159 @@ mod lib_unit_tests {
             }
             if control.was_cancelled(REQUEST_ID) {
                 return Err("write-half EOF cancelled the completed SSE request".to_owned());
+            }
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_http_sse_reset_before_election_cancels_only_owning_handler() {
+        run_live_http_test(|cx| async move {
+            const RESET_ID: u64 = 817;
+            const SIBLING_ID: u64 = 818;
+            let control = Arc::new(LiveModernControl::default());
+            let bound = Server::new("live-http-sse-reset-before-election", "1.0.0")
+                .protocol_policy(ProtocolPolicy::ModernOnly)
+                .expect("ModernOnly must be available to this test build")
+                .tool(LiveModernControlledTool {
+                    control: Arc::clone(&control),
+                })
+                .build()
+                .bind_http(&cx, "127.0.0.1:0")
+                .await
+                .map_err(|error| format!("reset SSE bind failed: {error}"))?;
+            let address = bound
+                .local_addr()
+                .map_err(|error| format!("reset SSE address failed: {error}"))?;
+            let caller_cx = cx.clone();
+            let controller_control = Arc::clone(&control);
+            let controller = thread::spawn(move || -> Result<(), String> {
+                struct CancelServerOnDrop(Cx);
+
+                impl Drop for CancelServerOnDrop {
+                    fn drop(&mut self) {
+                        self.0.cancel_with(
+                            CancelKind::User,
+                            Some("reset SSE controller finished"),
+                        );
+                    }
+                }
+
+                let _server_cancellation = CancelServerOnDrop(caller_cx);
+                let open_request = |request_id: u64| -> Result<std::net::TcpStream, String> {
+                    let request = JsonRpcRequest::new(
+                        "tools/call",
+                        Some(serde_json::json!({
+                            "name": "live_modern_controlled_tool",
+                            "arguments": {},
+                            "_meta": {
+                                MODERN_PROTOCOL_VERSION_METADATA_KEY: MODERN_PROTOCOL_VERSION,
+                                FINAL_CLIENT_CAPABILITIES_META_KEY: {},
+                            },
+                        })),
+                        request_id as i64,
+                    );
+                    let body = serde_json::to_vec(&request)
+                        .map_err(|error| format!("reset SSE request serialization failed: {error}"))?;
+                    let request = live_http_post(
+                        "/mcp",
+                        &body,
+                        &[
+                            ("Accept", "text/event-stream"),
+                            ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                            ("Mcp-Method", "tools/call"),
+                            ("Mcp-Name", "live_modern_controlled_tool"),
+                        ],
+                    );
+                    let mut stream = std::net::TcpStream::connect(address)
+                        .map_err(|error| format!("reset SSE connect failed: {error}"))?;
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .map_err(|error| format!("reset SSE read timeout setup failed: {error}"))?;
+                    std::io::Write::write_all(&mut stream, &request)
+                        .map_err(|error| format!("reset SSE request write failed: {error}"))?;
+                    std::io::Write::flush(&mut stream)
+                        .map_err(|error| format!("reset SSE request flush failed: {error}"))?;
+                    Ok(stream)
+                };
+
+                let mut reset_peer = open_request(RESET_ID)?;
+                if !controller_control.wait_for_started(1, Duration::from_secs(2)) {
+                    return Err("reset SSE handler did not reach its pre-election gate".to_owned());
+                }
+                let mut sibling = open_request(SIBLING_ID)?;
+                if !controller_control.wait_for_started(2, Duration::from_secs(2)) {
+                    return Err("reset SSE sibling did not reach its pre-election gate".to_owned());
+                }
+                reset_peer
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .map_err(|error| format!("reset SSE probe timeout setup failed: {error}"))?;
+                let mut probe = [0_u8; 1];
+                match std::io::Read::read(&mut reset_peer, &mut probe) {
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    result => {
+                        return Err(format!(
+                            "reset SSE response was not pending before election: {result:?}"
+                        ));
+                    }
+                }
+                // Unlike a legal request write-half EOF, an abortive close
+                // must cancel a handler that has not elected any response.
+                // Do not call shutdown first: its FIN would conceal the reset.
+                rustix::net::sockopt::set_socket_linger(&reset_peer, Some(Duration::ZERO))
+                    .map_err(|error| format!("reset SSE linger setup failed: {error}"))?;
+                drop(reset_peer);
+                if !controller_control.wait_for_cancellation(RESET_ID, Duration::from_secs(2)) {
+                    return Err(
+                        "reset SSE handler survived peer loss before outcome election".to_owned(),
+                    );
+                }
+                if controller_control.was_cancelled(SIBLING_ID) {
+                    return Err("reset SSE cancellation reached the sibling handler".to_owned());
+                }
+                controller_control.release(SIBLING_ID);
+                let mut response = Vec::new();
+                std::io::Read::read_to_end(&mut sibling, &mut response)
+                    .map_err(|error| format!("reset SSE sibling response read failed: {error}"))?;
+                if !response.starts_with(b"HTTP/1.1 200") {
+                    return Err(format!("reset SSE sibling response was unexpected: {response:?}"));
+                }
+                let expected_text = format!("modern request {SIBLING_ID}");
+                if !live_http_chunked_sse_messages(&response)?.iter().any(|message| {
+                    matches!(
+                        message,
+                        JsonRpcMessage::Response(response)
+                            if response.id == Some((SIBLING_ID as i64).into())
+                                && response.error.is_none()
+                                && response.result.as_ref().is_some_and(|result| {
+                                    result["resultType"] == "complete"
+                                        && result["content"][0]["text"] == expected_text
+                                })
+                    )
+                }) {
+                    return Err("reset SSE sibling omitted its terminal response".to_owned());
+                }
+                Ok(())
+            });
+
+            let shutdown = bound
+                .serve(&cx)
+                .await
+                .map_err(|error| format!("reset SSE server failed: {error}"))?;
+            controller
+                .join()
+                .map_err(|_| "reset SSE controller panicked".to_owned())??;
+            require_quiescent_http_shutdown(shutdown, "reset SSE before election").await?;
+            if !control.was_cancelled(RESET_ID) || control.was_cancelled(SIBLING_ID) {
+                return Err("reset SSE did not isolate cancellation to its owner".to_owned());
+            }
+            if control.max_active() != 2 {
+                return Err("reset SSE handlers did not overlap".to_owned());
             }
             Ok(())
         });
