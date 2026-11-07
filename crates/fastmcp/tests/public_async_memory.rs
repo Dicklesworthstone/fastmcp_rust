@@ -450,6 +450,501 @@ mod typed_client {
 }
 
 #[cfg(feature = "tasks")]
+mod typed_tasks {
+    use super::*;
+    use std::future::Future;
+    use std::sync::atomic::AtomicUsize;
+
+    use fastmcp_rust::{
+        ApplicationTaskSupervisor, ClientCapabilities, ClientInfo, Content, ContentBlock,
+        CoreResult, FinalCoreResult, FinalTask, FinalTaskCallToolResult, FinalTaskId,
+        FinalTaskInputRequests, FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig,
+        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWorkDescriptor,
+        FinalToolCallOutcome, FinalToolOutcome, McpError, McpRequestCancellation, Tool,
+        ToolHandler, serde_json,
+    };
+
+    const TASK_TOOL: &str = "memory-task";
+
+    #[derive(Default)]
+    struct Effects {
+        created: AtomicUsize,
+        resumed: AtomicUsize,
+        holding: AtomicUsize,
+        cancelled: AtomicUsize,
+    }
+
+    struct TaskTool(Arc<Effects>);
+
+    impl ToolHandler for TaskTool {
+        fn definition(&self) -> Tool {
+            Tool {
+                name: TASK_TOOL.to_owned(),
+                description: Some("A task driven by the caller's in-process runtime".to_owned()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"mode": {"enum": ["input", "hold"]}},
+                    "required": ["mode"],
+                }),
+                output_schema: None,
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+                annotations: None,
+            }
+        }
+
+        fn call(&self, _ctx: &McpContext, _arguments: JsonValue) -> McpResult<Vec<Content>> {
+            Err(McpError::invalid_request("This operation requires modern Tasks"))
+        }
+
+        fn declares_final_tasks(&self) -> bool {
+            true
+        }
+
+        fn call_final_outcome(
+            &self,
+            _ctx: &McpContext,
+            arguments: JsonValue,
+        ) -> McpResult<FinalToolOutcome> {
+            self.0.created.fetch_add(1, Ordering::AcqRel);
+            Ok(FinalToolOutcome::CreateTask {
+                work_descriptor: FinalTaskWorkDescriptor::new(arguments)?,
+                status_message: Some("accepted over memory transport".to_owned()),
+            })
+        }
+    }
+
+    struct Supervisor(Arc<Effects>);
+
+    impl ApplicationTaskSupervisor for Supervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                assert!(cx.blocking_pool_handle().is_none());
+                match handoff {
+                    FinalTaskSupervisorHandoff::Initial(initial) => {
+                        if initial.work_descriptor().as_value()["mode"] == "input" {
+                            let requests: FinalTaskInputRequests = serde_json::from_value(json!({
+                                "roots": {"method": "roots/list"},
+                            }))
+                            .unwrap();
+                            initial.require_input(requests, None)?;
+                        } else {
+                            self.0.holding.fetch_add(1, Ordering::AcqRel);
+                            loop {
+                                if initial.is_cancellation_requested()? {
+                                    initial.honor_cancellation(None)?;
+                                    self.0.cancelled.fetch_add(1, Ordering::AcqRel);
+                                    break;
+                                }
+                                cx.checkpoint()
+                                    .map_err(|_| McpError::request_cancelled())?;
+                                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                            }
+                        }
+                    }
+                    FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        assert_eq!(
+                            serde_json::to_value(accepted.input_responses()).unwrap(),
+                            json!({"roots": {"roots": []}}),
+                        );
+                        self.0.resumed.fetch_add(1, Ordering::AcqRel);
+                        let result: FinalTaskCallToolResult = serde_json::from_value(json!({
+                            "content": [{"type": "text", "text": "task résumé 東京"}],
+                            "receipt": {"source": "caller runtime", "items": 0},
+                        }))
+                        .unwrap();
+                        accepted.complete_task(result, None)?;
+                    }
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn run<F: Future<Output = ()>>(test: impl FnOnce(Cx) -> F) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(8), test(cx))
+                .await
+                .expect("Tasks must progress on the caller runtime with one-slot channels");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    fn info() -> ClientInfo {
+        ClientInfo {
+            name: "public-memory-tasks".to_owned(),
+            version: "1".to_owned(),
+        }
+    }
+
+    fn capabilities() -> ClientCapabilities {
+        serde_json::from_value(json!({"roots": {}})).unwrap()
+    }
+
+    fn task_runtime() -> FinalTaskRuntime {
+        FinalTaskRuntime::in_memory(
+            FinalTaskRuntimeConfig::new(60_000, Some(5_000)).unwrap(),
+            Arc::new(|_| {}),
+        )
+    }
+
+    async fn wait_for_task(
+        cx: &Cx,
+        client: &mut modern::MemoryClient,
+        id: &FinalTaskId,
+        predicate: impl Fn(&FinalTask) -> bool,
+    ) -> FinalTask {
+        loop {
+            let observed = client
+                .get_task_final(cx, &McpRequestCancellation::new(), id.clone())
+                .await
+                .unwrap();
+            assert_eq!(&observed.task.base().task_id, id);
+            if predicate(&observed.task) {
+                return observed.task;
+            }
+            asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+        }
+    }
+
+    async fn assert_echo(cx: &Cx, client: &mut modern::MemoryClient) {
+        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = client
+            .call_tool(
+                cx,
+                &McpRequestCancellation::new(),
+                "memory_echo",
+                json!({"value": "independent core request"}),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the core tool must remain usable after Tasks operations");
+        };
+        assert!(matches!(
+            result.payload.content.as_slice(),
+            [ContentBlock::Text { text, .. }] if text == "independent core request"
+        ));
+    }
+
+    #[test]
+    fn memory_tasks_create_accept_input_complete_and_cancel_on_the_caller_runtime() {
+        run(|cx| async move {
+            let effects = Arc::new(Effects::default());
+            let tasks = task_runtime();
+            let server = modern::ServerBuilder::new("memory-task-server", "1")
+                .tool(TaskTool(Arc::clone(&effects)))
+                .tool(MemoryEcho)
+                .final_tasks(tasks.clone())
+                .unwrap()
+                .task_supervisor(Arc::new(Supervisor(Arc::clone(&effects))))
+                .build();
+            let (transport, server_transport) = create_memory_transport_pair_with_capacity(1);
+            let mut serving = cx
+                .spawn(move |serve_cx| async move {
+                    server.serve_memory(&serve_cx, server_transport).await
+                })
+                .unwrap();
+            let mut client = modern::MemoryClient::builder(info())
+                .capabilities(capabilities())
+                .with_tasks()
+                .connect(&cx, transport)
+                .await
+                .unwrap();
+            assert!(client.tasks_active());
+            let cancellation = McpRequestCancellation::new();
+            let FinalToolCallOutcome::Task(created) = client
+                .call_tool_final_outcome(&cx, &cancellation, TASK_TOOL, json!({"mode": "input"}))
+                .await
+                .unwrap()
+            else {
+                panic!("explicitly negotiated Tasks must admit task creation");
+            };
+            let id = created.task.base().task_id.clone();
+            let waiting = wait_for_task(&cx, &mut client, &id, |task| {
+                matches!(task, FinalTask::InputRequired { .. })
+            })
+            .await;
+            let wrong: FinalTaskInputResponses =
+                serde_json::from_value(json!({"different-key": {"roots": []}})).unwrap();
+            assert!(
+                client
+                    .update_task_final(&cx, &cancellation, &waiting, wrong)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(effects.resumed.load(Ordering::Acquire), 0);
+            assert!(matches!(
+                client
+                    .get_task_final(&cx, &cancellation, id.clone())
+                    .await
+                    .unwrap()
+                    .task,
+                FinalTask::InputRequired { .. }
+            ));
+
+            let input: FinalTaskInputResponses =
+                serde_json::from_value(json!({"roots": {"roots": []}})).unwrap();
+            client
+                .update_task_final(&cx, &cancellation, &waiting, input)
+                .await
+                .unwrap();
+            let completed = wait_for_task(&cx, &mut client, &id, |task| {
+                matches!(task, FinalTask::Completed { .. })
+            })
+            .await;
+            let FinalTask::Completed { result, .. } = completed else {
+                unreachable!();
+            };
+            assert_eq!(
+                serde_json::to_value(result).unwrap(),
+                json!({
+                    "content": [{"type": "text", "text": "task résumé 東京"}],
+                    "receipt": {"source": "caller runtime", "items": 0},
+                }),
+            );
+            assert_eq!(effects.resumed.load(Ordering::Acquire), 1);
+
+            let FinalToolCallOutcome::Task(holding) = client
+                .call_tool_final_outcome(&cx, &cancellation, TASK_TOOL, json!({"mode": "hold"}))
+                .await
+                .unwrap()
+            else {
+                panic!("the second independent operation must create a task");
+            };
+            let held_id = holding.task.base().task_id.clone();
+            // Wait for the worker, so this exercises cooperative cancellation
+            // rather than cancellation of a not-yet-delivered handoff.
+            while effects.holding.load(Ordering::Acquire) == 0 {
+                asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+            }
+            client
+                .cancel_task_final(&cx, &cancellation, held_id.clone())
+                .await
+                .unwrap();
+            wait_for_task(&cx, &mut client, &held_id, |task| {
+                matches!(task, FinalTask::Cancelled(_))
+            })
+            .await;
+            assert_eq!(effects.created.load(Ordering::Acquire), 2);
+            assert_eq!(effects.cancelled.load(Ordering::Acquire), 1);
+            assert_echo(&cx, &mut client).await;
+            client.close(&cx).unwrap();
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(!tasks.is_task_service_ready());
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn memory_tasks_require_opt_in_before_any_application_request() {
+        run(|cx| async move {
+            let effects = Arc::new(Effects::default());
+            let server = modern::ServerBuilder::new("memory-task-server", "1")
+                .tool(TaskTool(Arc::clone(&effects)))
+                .tool(MemoryEcho)
+                .final_tasks(task_runtime())
+                .unwrap()
+                .task_supervisor(Arc::new(Supervisor(Arc::clone(&effects))))
+                .build();
+            let (transport, server_transport) = create_memory_transport_pair_with_capacity(1);
+            let mut serving = cx
+                .spawn(move |serve_cx| async move {
+                    server.serve_memory(&serve_cx, server_transport).await
+                })
+                .unwrap();
+            let mut client = modern::MemoryClient::builder(info())
+                .capabilities(capabilities())
+                .connect(&cx, transport)
+                .await
+                .unwrap();
+            assert!(!client.tasks_active());
+            let cancellation = McpRequestCancellation::new();
+            assert!(
+                client
+                    .call_tool_final_outcome(
+                        &cx,
+                        &cancellation,
+                        TASK_TOOL,
+                        json!({"mode": "input"}),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(
+                client
+                    .get_task_final(
+                        &cx,
+                        &cancellation,
+                        FinalTaskId::parse("never-created").unwrap(),
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(effects.created.load(Ordering::Acquire), 0);
+            let mut echo = client
+                .execute_core(
+                    &cx,
+                    &cancellation,
+                    "tools/call",
+                    json!({"name": "memory_echo", "arguments": {"value": "no ID consumed"}}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(echo.request_id(), &RequestId::Number(2));
+            loop {
+                match client.next_event(&cx, &cancellation, &mut echo).await.unwrap() {
+                    Some(fastmcp_rust::MemoryRequestEvent::Result(_)) => break,
+                    Some(fastmcp_rust::MemoryRequestEvent::Notification(_)) => {}
+                    None => panic!("the surviving core request must complete"),
+                }
+            }
+            assert_echo(&cx, &mut client).await;
+            client.close(&cx).unwrap();
+            serving.join(&cx).await.unwrap().unwrap();
+        });
+    }
+}
+
+mod ordinary_task_boundary {
+    use super::*;
+    use fastmcp_rust::{
+        ClientInfo, CoreResult, FinalCoreResult, McpErrorCode, McpRequestCancellation,
+        MemoryRequestEvent,
+    };
+
+    const TASKS: &str = "io.modelcontextprotocol/tasks";
+
+    fn reply(id: i64, result: JsonValue) -> JsonRpcMessage {
+        JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::Number(id), result))
+    }
+
+    async fn request(cx: &Cx, peer: &mut MemoryTransport, method: &str) -> JsonRpcRequest {
+        let JsonRpcMessage::Request(request) = peer.recv_async(cx).await.unwrap() else {
+            panic!("the memory client must publish a request");
+        };
+        assert_eq!(request.method, method);
+        request
+    }
+
+    fn run(opt_in: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            asupersync::time::timeout(cx.now(), Duration::from_secs(5), async {
+                let (transport, mut peer) = create_memory_transport_pair_with_capacity(1);
+                peer.send_async(
+                    &cx,
+                    &reply(1, json!({
+                        "resultType": "complete", "supportedVersions": [modern::PROTOCOL_VERSION],
+                        "capabilities": {"extensions": {TASKS: {}}},
+                        "ttlMs": 0, "cacheScope": "private",
+                    })),
+                )
+                .await
+                .unwrap();
+                let builder = modern::MemoryClient::builder(ClientInfo {
+                    name: "ordinary-memory-client".to_owned(),
+                    version: "1".to_owned(),
+                });
+                #[cfg(feature = "tasks")]
+                let builder = if opt_in { builder.with_tasks() } else { builder };
+                #[cfg(not(feature = "tasks"))]
+                assert!(!opt_in);
+                let mut client = builder.connect(&cx, transport).await.unwrap();
+                request(&cx, &mut peer, "server/discover").await;
+                let cancellation = McpRequestCancellation::new();
+                let mut ordinary = client
+                    .execute_core(
+                        &cx,
+                        &cancellation,
+                        "tools/call",
+                        json!({
+                            "name": "untrusted-tool", "arguments": {},
+                            "_meta": {FINAL_CLIENT_CAPABILITIES_META_KEY: {"extensions": {TASKS: {}}}},
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let sent = request(&cx, &mut peer, "tools/call").await;
+                assert_eq!(sent.id, Some(RequestId::Number(2)));
+                assert!(
+                    sent.params.unwrap()["_meta"][FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                        .get(TASKS)
+                        .is_none(),
+                    "caller metadata and a client opt-in cannot authorize an ordinary request"
+                );
+                let mut sibling = client
+                    .execute_core(&cx, &cancellation, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(request(&cx, &mut peer, "tools/list").await.id, Some(RequestId::Number(3)));
+                peer.send_async(
+                    &cx,
+                    &reply(2, json!({
+                        "resultType": "task",
+                        "taskId": "unsolicited-task", "status": "working", "ttlMs": 60_000,
+                        "createdAt": "2026-07-28T12:00:00.000Z",
+                        "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                    })),
+                )
+                .await
+                .unwrap();
+                let refused = client
+                    .next_event(&cx, &cancellation, &mut ordinary)
+                    .await
+                    .expect_err("a well-shaped unsolicited Task must fail its ordinary owner");
+                assert_eq!(refused.code, McpErrorCode::InvalidRequest);
+                peer.send_async(
+                    &cx,
+                    &reply(3, json!({
+                        "resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private",
+                    })),
+                )
+                .await
+                .unwrap();
+                let Some(MemoryRequestEvent::Result(result)) = client
+                    .next_event(&cx, &cancellation, &mut sibling)
+                    .await
+                    .unwrap()
+                else {
+                    panic!("an unrelated request must survive an unsolicited Task result");
+                };
+                assert!(matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. })));
+                assert!(cx.checkpoint().is_ok());
+                client.close(&cx).unwrap();
+            })
+            .await
+            .expect("Task refusal must not stall a bounded memory connection");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn ordinary_memory_requests_reject_unsolicited_tasks_in_every_feature_profile() {
+        run(false);
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn opted_in_memory_clients_do_not_grant_tasks_to_ordinary_requests() {
+        run(true);
+    }
+}
+
+#[cfg(feature = "tasks")]
 mod retention_administration {
     use super::*;
     use std::sync::atomic::AtomicU64;

@@ -407,15 +407,27 @@ fn typed_extension_memory_client_multiplexes_requests_and_notifications() {
                 .spawn(move |server_cx| async move { server.serve_memory(&server_cx, peer).await })
                 .unwrap();
             let (id, descriptors, discovery) = client_configuration_with_notifications(true);
-            let mut client = modern::MemoryClient::builder(ClientInfo {
+            // Memory Tasks is an explicit client policy, independent of this
+            // generic extension's descriptor, settings, and result authority.
+            #[cfg(feature = "tasks")]
+            let discovery = {
+                let mut discovery = discovery;
+                discovery
+                    .extensions
+                    .remove(&ExtensionId::parse("io.modelcontextprotocol/tasks").unwrap());
+                discovery
+            };
+            let builder = modern::MemoryClient::builder(ClientInfo {
                 name: "typed-memory-consumer".to_owned(),
                 version: "1.0".to_owned(),
             })
             .extension_registry(descriptors, discovery, || accept_settings)
-            .unwrap()
-            .connect(&cx, transport)
-            .await
             .unwrap();
+            #[cfg(feature = "tasks")]
+            let builder = builder.with_tasks();
+            let mut client = builder.connect(&cx, transport).await.unwrap();
+            #[cfg(feature = "tasks")]
+            assert!(client.tasks_active());
             let cancellation = McpRequestCancellation::new();
             client
                 .notify_final_extension(

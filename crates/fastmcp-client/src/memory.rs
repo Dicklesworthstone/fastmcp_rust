@@ -34,12 +34,17 @@ use crate::execution::{
     CancellationRequested, FinalCacheTtlDiagnostic, RequestExecution, RequestExecutor,
     decode_core_result_with_cache_ttl_from_source,
 };
-use crate::session::{ClientExtensionRuntime, ClientSession};
+use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime, ClientSession};
 use crate::{RequestTimeoutPolicy, transport_error_to_mcp};
+
+#[cfg(feature = "tasks")]
+mod tasks;
 
 const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(20);
 const SEND_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_DIAGNOSTICS: usize = 1_024;
+// This exclusion also applies when the typed Tasks implementation is absent.
+const TASKS_EXTENSION_NAME: &str = "io.modelcontextprotocol/tasks";
 
 /// The executor owns correlation, never the memory channel's actual I/O.
 #[derive(Debug)]
@@ -77,6 +82,7 @@ pub struct MemoryRequestExecution {
     inner: RequestExecution<ExternalMemoryTransport>,
     request: CoreRequest,
     notifications: VecDeque<JsonRpcRequest>,
+    allow_tasks: bool,
     finished: bool,
 }
 
@@ -149,6 +155,8 @@ pub struct MemoryClientBuilder {
     capabilities: ClientCapabilities,
     extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     timeout_policy: RequestTimeoutPolicy,
+    #[cfg(feature = "tasks")]
+    tasks_enabled: bool,
 }
 
 impl MemoryClientBuilder {
@@ -160,6 +168,8 @@ impl MemoryClientBuilder {
             capabilities: ClientCapabilities::default(),
             extension_runtime: None,
             timeout_policy: RequestTimeoutPolicy::default(),
+            #[cfg(feature = "tasks")]
+            tasks_enabled: false,
         }
     }
 
@@ -167,7 +177,8 @@ impl MemoryClientBuilder {
     ///
     /// Nonempty extension settings must exactly match the settings installed
     /// by [`Self::extension_registry`]; raw capability advertisements never
-    /// grant extension execution authority.
+    /// grant extension execution authority. The official Tasks advertisement
+    /// requires the separately selected Tasks builder policy.
     #[must_use]
     pub fn capabilities(mut self, capabilities: ClientCapabilities) -> Self {
         self.capabilities = capabilities;
@@ -251,6 +262,8 @@ pub struct MemoryClient {
     next_id: i64,
     timeout_policy: RequestTimeoutPolicy,
     cache_diagnostics: VecDeque<FinalCacheTtlDiagnostic>,
+    #[cfg(feature = "tasks")]
+    tasks: Option<tasks::MemoryTaskRuntime>,
     closed: bool,
 }
 
@@ -322,27 +335,38 @@ impl MemoryClient {
             mut capabilities,
             extension_runtime,
             timeout_policy,
+            #[cfg(feature = "tasks")]
+            tasks_enabled,
         } = builder;
-        if let Some(runtime) = &extension_runtime {
-            let configured = runtime.client_wire_extensions();
-            if capabilities
-                .extensions
-                .as_ref()
-                .is_some_and(|advertised| !advertised.is_empty() && advertised != &configured)
-            {
-                return Err(McpError::invalid_params(
-                    "Memory client extension capabilities differ from its configured registry",
-                ));
-            }
-            capabilities.extensions = Some(configured);
-        } else if capabilities
+        let configured = extension_runtime
+            .as_ref()
+            .map(|runtime| runtime.client_wire_extensions())
+            .unwrap_or_default();
+        if configured.contains_key(TASKS_EXTENSION_NAME) {
+            return Err(McpError::invalid_params(
+                "Memory Tasks requires the explicit Tasks builder policy",
+            ));
+        }
+        #[cfg(feature = "tasks")]
+        let (configured, tasks) = if tasks_enabled {
+            let runtime = tasks::MemoryTaskRuntime::new()?;
+            let mut configured = configured;
+            configured.insert(TASKS_EXTENSION_NAME.to_owned(), serde_json::json!({}));
+            (configured, Some(runtime))
+        } else {
+            (configured, None)
+        };
+        if capabilities
             .extensions
             .as_ref()
-            .is_some_and(|extensions| !extensions.is_empty())
+            .is_some_and(|advertised| !advertised.is_empty() && advertised != &configured)
         {
             return Err(McpError::invalid_params(
-                "Memory client extension capabilities require a configured registry",
+                "Memory client extension capabilities differ from its configured registry",
             ));
+        }
+        if extension_runtime.is_some() || !configured.is_empty() {
+            capabilities.extensions = Some(configured);
         }
         let session = ClientSession::try_new(
             client_info,
@@ -366,6 +390,8 @@ impl MemoryClient {
             next_id: 1,
             timeout_policy,
             cache_diagnostics: VecDeque::new(),
+            #[cfg(feature = "tasks")]
+            tasks,
             closed: false,
         };
         let result = client
@@ -402,6 +428,15 @@ impl MemoryClient {
         client
             .session
             .negotiate_client_extensions_after_discovery()?;
+        #[cfg(feature = "tasks")]
+        if let Some(tasks) = &mut client.tasks {
+            tasks.negotiate(
+                client
+                    .session
+                    .server_discovery()
+                    .expect("discovery was installed before Tasks negotiation"),
+            )?;
+        }
         Ok(client)
     }
 
@@ -443,6 +478,26 @@ impl MemoryClient {
         parameters: Value,
         timeout_policy: RequestTimeoutPolicy,
     ) -> McpResult<MemoryRequestExecution> {
+        self.execute_core_admitted(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            timeout_policy,
+            false,
+        )
+        .await
+    }
+
+    async fn execute_core_admitted(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Value,
+        timeout_policy: RequestTimeoutPolicy,
+        allow_tasks: bool,
+    ) -> McpResult<MemoryRequestExecution> {
         self.ensure_open()?;
         checkpoint(cx, cancellation)?;
         RequestTimeoutPolicy::new(
@@ -461,7 +516,18 @@ impl MemoryClient {
                 "Ordinary memory execution cannot open a subscription",
             ));
         }
-        let parameters = self.parameters(parameters)?;
+        let discovery_tasks = {
+            #[cfg(feature = "tasks")]
+            {
+                method == "server/discover" && self.tasks.is_some()
+            }
+            #[cfg(not(feature = "tasks"))]
+            {
+                false
+            }
+        };
+        let parameters =
+            self.parameters_with_tasks(parameters, allow_tasks || discovery_tasks)?;
         let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&parameters))
             .map_err(|_| McpError::invalid_params("Invalid modern memory core request"))?;
         let next_id = self
@@ -500,6 +566,7 @@ impl MemoryClient {
                     inner,
                     request,
                     notifications: VecDeque::new(),
+                    allow_tasks,
                     finished: false,
                 });
             }
@@ -562,7 +629,37 @@ impl MemoryClient {
         let admission = self
             .session
             .admit_final_extension_method(extension_id, method)?;
-        let parameters = self.parameters(parameters)?;
+        // The server revalidates its full negotiated extension set on every
+        // extension request. Retain an explicitly negotiated Tasks advertisement
+        // here; the separate immutable result receipt still admits only this
+        // custom extension's result families, never a Task result.
+        #[cfg(feature = "tasks")]
+        let advertise_tasks = self.tasks_active();
+        #[cfg(not(feature = "tasks"))]
+        let advertise_tasks = false;
+        let parameters = self.parameters_with_tasks(parameters, advertise_tasks)?;
+        self.execute_admitted_extension(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            timeout_policy,
+            admission,
+        )
+        .await
+    }
+
+    async fn execute_admitted_extension(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        method: &str,
+        parameters: Value,
+        timeout_policy: RequestTimeoutPolicy,
+        admission: ClientExtensionResultAdmission,
+    ) -> McpResult<MemoryExtensionExecution> {
+        self.ensure_open()?;
+        checkpoint(cx, cancellation)?;
         let next_id = self
             .next_id
             .checked_add(1)
@@ -689,7 +786,12 @@ impl MemoryClient {
                 .try_take_response_with_raw_result(&mut execution.inner)?
             {
                 execution.finished = true;
-                let result = decode_response(&execution.request, response, source.as_deref())?;
+                let result = decode_response(
+                    &execution.request,
+                    response,
+                    source.as_deref(),
+                    execution.allow_tasks,
+                )?;
                 if let Some(diagnostic) = result.1 {
                     if self.cache_diagnostics.len() == MAX_DIAGNOSTICS {
                         self.cache_diagnostics.pop_front();
@@ -968,13 +1070,23 @@ impl MemoryClient {
         Ok(())
     }
 
-    fn parameters(&self, mut parameters: Value) -> McpResult<Value> {
+    fn parameters_with_tasks(
+        &self,
+        mut parameters: Value,
+        advertise_tasks: bool,
+    ) -> McpResult<Value> {
         let object = parameters.as_object_mut().ok_or_else(|| {
             McpError::invalid_params("Memory request parameters must be an object")
         })?;
+        let mut capabilities = self.session.client_capabilities().clone();
+        if !advertise_tasks
+            && let Some(extensions) = &mut capabilities.extensions
+        {
+            extensions.remove(TASKS_EXTENSION_NAME);
+        }
         let mut metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),
-            client_capabilities: self.session.client_capabilities().clone(),
+            client_capabilities: capabilities,
             client_info: Some(self.session.modern_client_implementation()),
             additional_metadata: BTreeMap::new(),
         })
@@ -1204,8 +1316,14 @@ fn decode_response(
     request: &CoreRequest,
     response: JsonRpcResponse,
     source: Option<&str>,
+    allow_tasks: bool,
 ) -> McpResult<(CoreResult, Option<FinalCacheTtlDiagnostic>)> {
     let result = response_result(response)?;
+    if !allow_tasks && result.get("resultType").and_then(Value::as_str) == Some("task") {
+        return Err(McpError::invalid_request(
+            "Memory Task result requires an explicitly admitted Tasks tool call",
+        ));
+    }
     decode_core_result_with_cache_ttl_from_source(request, &result, source)
 }
 
