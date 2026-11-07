@@ -37,10 +37,14 @@ use crate::execution::{
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime, ClientSession};
 use crate::{RequestTimeoutPolicy, ReverseRequestHandlers, transport_error_to_mcp};
 
+#[cfg(feature = "apps")]
+mod apps;
 mod catalog;
 mod interaction;
 mod subscriptions;
 
+#[cfg(feature = "apps")]
+pub use apps::McpAppsMemoryClientWirePolicy;
 pub use subscriptions::{MemorySubscriptionEvent, MemorySubscriptionExecution};
 
 #[cfg(feature = "tasks")]
@@ -161,6 +165,8 @@ pub struct MemoryClientBuilder {
     extension_runtime: Option<Arc<ClientExtensionRuntime>>,
     timeout_policy: RequestTimeoutPolicy,
     reverse_request_handlers: ReverseRequestHandlers,
+    #[cfg(feature = "apps")]
+    mcp_apps_settings: Option<crate::McpAppsClientSettings>,
     #[cfg(feature = "tasks")]
     tasks_enabled: bool,
 }
@@ -188,6 +194,8 @@ impl MemoryClientBuilder {
             extension_runtime: None,
             timeout_policy: RequestTimeoutPolicy::default(),
             reverse_request_handlers: ReverseRequestHandlers::new(),
+            #[cfg(feature = "apps")]
+            mcp_apps_settings: None,
             #[cfg(feature = "tasks")]
             tasks_enabled: false,
         }
@@ -358,9 +366,13 @@ impl MemoryClient {
             extension_runtime,
             timeout_policy,
             reverse_request_handlers,
+            #[cfg(feature = "apps")]
+            mcp_apps_settings,
             #[cfg(feature = "tasks")]
             tasks_enabled,
         } = builder;
+        #[cfg(not(feature = "apps"))]
+        let mcp_apps_settings = None;
         let configured = extension_runtime
             .as_ref()
             .map(|runtime| runtime.client_wire_extensions())
@@ -370,6 +382,31 @@ impl MemoryClient {
                 "Memory Tasks requires the explicit Tasks builder policy",
             ));
         }
+        #[cfg(not(feature = "apps"))]
+        if configured.contains_key(
+            fastmcp_protocol::extensions::official_mcp_apps_extension_id().as_str(),
+        ) {
+            return Err(McpError::invalid_params(
+                "Memory MCP Apps requires the apps feature",
+            ));
+        }
+        #[cfg(feature = "apps")]
+        let configured = {
+            let mut configured = configured;
+            if !extension_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.configures_mcp_apps())
+                && let Some(settings) = &mcp_apps_settings
+            {
+                configured.insert(
+                    fastmcp_protocol::extensions::official_mcp_apps_extension_id()
+                        .as_str()
+                        .to_owned(),
+                    settings.to_extension_settings().into_value(),
+                );
+            }
+            configured
+        };
         #[cfg(feature = "tasks")]
         let (configured, tasks) = if tasks_enabled {
             let runtime = tasks::MemoryTaskRuntime::new()?;
@@ -400,7 +437,8 @@ impl MemoryClient {
             MODERN_PROTOCOL_VERSION.to_owned(),
         )
         .map_err(|_| McpError::internal_error("Modern memory protocol version is unavailable"))?
-        .with_client_extension_runtime(extension_runtime.clone());
+        .with_client_extension_runtime(extension_runtime.clone())
+        .with_mcp_apps_settings(mcp_apps_settings.clone());
         let (receiver, sender) = transport.into_split();
         let mut client = Self {
             receiver,
@@ -450,10 +488,25 @@ impl MemoryClient {
         )
         .map_err(|_| McpError::internal_error("Modern memory session could not be established"))?
         .with_client_extension_runtime(extension_runtime)
+        .with_mcp_apps_settings(mcp_apps_settings)
         .with_server_discovery(discovery);
         client
             .session
             .negotiate_client_extensions_after_discovery()?;
+        #[cfg(feature = "apps")]
+        {
+            let activation = if client.session.generic_mcp_apps_configured() {
+                client.session.generic_mcp_apps_activation_receipt()
+            } else {
+                client.session.server_discovery().and_then(|discovery| {
+                    crate::session::mcp_apps_activation_receipt(
+                        client.session.mcp_apps_settings(),
+                        discovery,
+                    )
+                })
+            };
+            client.session.set_mcp_apps_activation_receipt(activation);
+        }
         #[cfg(feature = "tasks")]
         if let Some(tasks) = &mut client.tasks {
             tasks.negotiate(
@@ -1145,6 +1198,16 @@ impl MemoryClient {
             && let Some(extensions) = &mut capabilities.extensions
         {
             extensions.remove(TASKS_EXTENSION_NAME);
+        }
+        #[cfg(feature = "apps")]
+        if !self.session.generic_mcp_apps_configured()
+            && self.session.server_discovery().is_some()
+            && !self.session.mcp_apps_active()
+            && let Some(extensions) = &mut capabilities.extensions
+        {
+            extensions.remove(
+                fastmcp_protocol::extensions::official_mcp_apps_extension_id().as_str(),
+            );
         }
         let mut metadata = serde_json::to_value(FinalRequestMeta {
             protocol_version: MODERN_PROTOCOL_VERSION.to_owned(),

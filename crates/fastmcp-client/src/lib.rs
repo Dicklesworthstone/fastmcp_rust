@@ -130,6 +130,8 @@ pub use fastmcp_protocol::common_types::LoggingLevel;
 pub use fastmcp_protocol::extensions::McpAppsClientSettings;
 #[cfg(feature = "websocket-experimental")]
 pub use fastmcp_transport::websocket::AsyncWsClientTransport;
+#[cfg(feature = "apps")]
+pub use memory::McpAppsMemoryClientWirePolicy;
 pub use memory::{
     MemoryClient, MemoryClientBuilder, MemoryExtensionEvent, MemoryExtensionExecution,
     MemoryRequestEvent, MemoryRequestExecution, MemorySubscriptionEvent, MemorySubscriptionExecution,

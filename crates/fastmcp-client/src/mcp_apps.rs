@@ -829,8 +829,7 @@ pub struct McpAppsWireHostCleanup<'operation> {
 }
 
 impl<'operation> McpAppsWireHostCleanup<'operation> {
-    #[cfg(feature = "websocket-experimental")]
-    fn native(
+    pub(crate) fn native(
         future: impl Future<Output = Result<(), McpAppsHostError>> + Send + 'operation,
     ) -> Self {
         Self {
@@ -4133,7 +4132,7 @@ pub(crate) fn project_reused_core_result(
 // they own fresh IDs, exact selected-era decoding, and transport cleanup on
 // drop. The Host owns consent and one bounded MRTR/Task observation operation.
 #[allow(async_fn_in_trait)]
-trait McpAppsServerInputClient {
+pub(crate) trait McpAppsServerInputClient {
     fn prepare_apps_server_input(
         &self,
         cx: &Cx,
@@ -4174,7 +4173,9 @@ trait McpAppsServerInputClient {
 }
 
 #[cfg(feature = "tasks")]
-fn admit_apps_task_discovery(discovery: &fastmcp_protocol::ServerDiscoverResult) -> McpResult<()> {
+pub(crate) fn admit_apps_task_discovery(
+    discovery: &fastmcp_protocol::ServerDiscoverResult,
+) -> McpResult<()> {
     crate::admit_final_tasks_result_discriminator(
         discovery,
         crate::OFFICIAL_TASKS_RESULT_DISCRIMINATOR,
@@ -4693,7 +4694,10 @@ fn apps_task_input_required(
     .map_err(|_| invalid())
 }
 
-async fn dispatch_apps_server_input<C: McpAppsServerInputClient, E: McpAppsWireHostEffects>(
+pub(crate) async fn dispatch_apps_server_input<
+    C: McpAppsServerInputClient,
+    E: McpAppsWireHostEffects,
+>(
     client: &mut C,
     cx: &Cx,
     cancellation: &McpRequestCancellation,
