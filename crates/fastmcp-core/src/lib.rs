@@ -56,6 +56,8 @@ pub mod logging;
 pub mod partition;
 /// Persistent replay aliases from named external MAC providers.
 pub mod replay;
+/// External restore-authority registration and fenced durable writes.
+pub mod restore;
 #[cfg_attr(
     not(feature = "test-runtime"),
     doc = r#"

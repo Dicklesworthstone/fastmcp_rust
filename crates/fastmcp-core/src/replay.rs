@@ -487,7 +487,10 @@ fn encode_mac(purpose: ReplayPurpose, key: &PersistentMacKeyGeneration, context:
     Ok(out)
 }
 fn alias_set_digest(purpose: ReplayPurpose, ring: Sha256Digest, aliases: &[PersistentReplayAlias]) -> Result<Sha256Digest, ReplayDigestError> {
-    let mut bytes = bounded_vec(OPERATION_OVERHEAD)?;
+    let size = aliases.iter().try_fold(46_usize, |size, alias| {
+        size.checked_add(42 + alias.key_id().len()).ok_or(ReplayDigestError::InputTooLarge)
+    })?;
+    let mut bytes = bounded_vec(size)?;
     bytes.extend_from_slice(b"FMCPRAS\0");
     bytes.extend_from_slice(&1_u16.to_be_bytes());
     bytes.extend_from_slice(&purpose_id(purpose).to_be_bytes());
