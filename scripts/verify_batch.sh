@@ -26,6 +26,56 @@ ROOT = SCRIPT.parent.parent
 ALIASES = ("fastmcp", "fastmcp_rust")
 LIB_KINDS = {"lib", "rlib", "proc-macro", "dylib", "cdylib", "staticlib"}
 
+# THE LANE PARTITION (bd-green-rch-batch-unsatisfiable-qkr6e).
+#
+# A handful of test targets cannot be evaluated on an RCH worker no matter how
+# healthy the fleet is, because `.rchignore` excludes `.git/` and a worker has
+# no git repository at all. Every remote batch containing them is permanently
+# red, so no batch can ever be centrally closed -- which is the arithmetic
+# behind 167 closes in September, 1 in October and 0 in November against 1,018
+# commits.
+#
+# THIS IS A SCOPE SPLIT OF THE INSTRUMENT, NOT A RELAXATION OF ANY ASSERTION
+# (RH-1). Every row still runs, exactly once, with its full predicate, on a
+# host where its inputs exist. Nothing is skipped, ignored or made
+# conditional: `#[ignore]`-on-absence would be gate self-weakening and would
+# also let PL-1 count an unexecuted row as executed, turning a visible
+# structural failure into an invisible one.
+#
+# MEMBERSHIP IS MEASURED PER TARGET, by reading what each file actually does at
+# RUNTIME rather than by counting how often it mentions a path. That
+# distinction removed three targets the filing census had listed and added two
+# it had missed:
+#
+#   NOT HERE, though the filing census listed them. Their only AGENTS.md
+#   mentions are inside assertion MESSAGE strings or a module comment, and
+#   their filesystem reads are all synced paths:
+#     banned_dependency_fence      reads POLICY_PATH and LOCK_PATH only
+#     provenance_user_agent_fence  sweeps SWEPT_TREES = ["evidence", "spec"]
+#     limit_01_rows_do_not_drift   include_str! of two synced sources
+#
+#   NOT HERE, measured 2026-11-07: fnd_01_dependency_evidence. It validates a
+#   RECORDED `.git` probe (it requires probe_result == "absent-not-found"),
+#   never stats `.git` itself, and the eight repository-surface documents it
+#   does read -- AGENTS.md, README.md, FEATURE_PARITY.md, CHANGELOG.md,
+#   rust-toolchain.toml, crates/fastmcp/src/lib.rs and both workflow files --
+#   are NONE of them in `.rchignore`, so a `--clean-overlay --no-overlay`
+#   baseline carries all eight. If a remote run of it proves otherwise, add it
+#   here WITH the observed failure, not on the strength of this reasoning.
+LOCAL_LANE = {
+    "fastmcp-rust::--test::fnd_01_a_evidence_binding":
+        "shells out to git (std::process::Command::new(\"git\"), :397) and reads "
+        "AGENTS.md from the repository root (:767); the file's own comment at :408 "
+        "already records that this check cannot evaluate on a worker",
+    "fastmcp-rust::--test::fnd_04_runtime_conformance":
+        "reads .git/HEAD and .git/packed-refs directly (:2434). It DEGRADES rather "
+        "than fails -- revision_and_tree() returns \"<unresolved>\" when .git is "
+        "absent -- which is worse than a red: a remote green here would bind a "
+        "receipt with no revision identity at all, defeating PL-5",
+    "fastmcp-xtask::--test::fnd_02_a":
+        "stats root/.git/index (:44)",
+}
+
 
 def digest(data):
     return hashlib.sha256(data).hexdigest()
@@ -383,6 +433,33 @@ def target_inventory(metadata):
     return inventory
 
 
+def target_flag(kind):
+    """The cargo selector for a metadata target kind, or None if unsupported.
+
+    Extracted so the lane partition can compute the SAME target ids that
+    select_targets produces. A second copy of this mapping would let the two
+    disagree, and a lane key that silently matches nothing is precisely the
+    permanently-red condition the split exists to remove.
+    """
+    if LIB_KINDS.intersection(kind):
+        return "--lib"
+    for name, flag in (("test", "--test"), ("bin", "--bin"),
+                       ("example", "--example"), ("bench", "--bench")):
+        if name in kind:
+            return flag
+    return None
+
+
+def target_id(package, flag, name):
+    return f"{package}::{flag}::{name}"
+
+
+def inventory_ids(inventory):
+    return {target_id(target["package"], flag, target["name"])
+            for target in inventory
+            if (flag := target_flag(target["kind"])) is not None}
+
+
 def select_targets(inventory, packages, workspace, selectors, compile_only=False):
     names = {target["package"] for target in inventory}
     if set(packages) - names:
@@ -393,10 +470,7 @@ def select_targets(inventory, packages, workspace, selectors, compile_only=False
         if not workspace and target["package"] not in packages:
             continue
         kind = target["kind"]
-        flag = "--lib" if LIB_KINDS.intersection(kind) else (
-            "--test" if "test" in kind else "--bin" if "bin" in kind else
-            "--example" if "example" in kind else "--bench" if "bench" in kind else None
-        )
+        flag = target_flag(kind)
         if flag is None:
             continue
         for index, (selector, name) in enumerate(selectors):
@@ -415,7 +489,7 @@ def select_targets(inventory, packages, workspace, selectors, compile_only=False
                         # selectors. The full inventory retains them as ineligible.
                         continue
                     raise Rejected(f"selected target {target['package']}::{target['name']} requires {target['required_features']}; enable its features")
-                item = dict(target, flag=flag, id=f"{target['package']}::{flag}::{target['name']}")
+                item = dict(target, flag=flag, id=target_id(target["package"], flag, target["name"]))
                 if item not in selected:
                     selected.append(item)
     for index, (selector, name) in enumerate(selectors):
@@ -528,6 +602,84 @@ def qualify(args, gates, receipt):
         receipt.setdefault("remote_runs", []).append(envelopes[0])
         return stderr.read_text(errors="replace")
 
+    def local(label, argv, target_ids):
+        """Run one declared policy/git target on THIS host.
+
+        Same DSR gate, same argv, same toolchain pin, same features and the
+        same libtest JSON observation as the remote lane. The only difference
+        is the absence of the rch prefix, because the inputs these rows read
+        -- a real `.git` -- exist only here. It deliberately does NOT set
+        RCH_REQUIRE_REMOTE, and it is reachable only for an id listed in
+        LOCAL_LANE, so it cannot become a general escape hatch from the
+        build-first doctrine.
+        """
+        # stdout and stderr go to SEPARATE files, and the libtest stream is read
+        # from stdout. The remote lane reads its output from stderr only because
+        # RCH merges the worker's stdout into the local process's stderr; doing
+        # the same here would interleave cargo's own progress lines into the
+        # libtest `--format json` event stream and corrupt the parse. A single
+        # merged file would be worse still: `> f 2> f` opens two descriptors on
+        # one path in truncate mode and they overwrite each other.
+        # RCH_SHIM_LOCAL_IDE=1 is the cargo shim's OWN documented operator escape
+        # hatch ("force this one build local"), and it is required rather than
+        # optional here: `cargo` on this host is intercepted three ways --
+        # ~/.rch/shims/cargo sits ahead of ~/.cargo/bin on PATH, the active
+        # toolchain's bin/cargo is an "rch toolchain cargo wrapper" whose real
+        # binary was renamed to cargo-rch-real, and Claude Code's PreToolUse hook
+        # matches the literal word. Without this, a lane that calls itself local
+        # would be offloaded to a worker that has no `.git`, and the receipt
+        # would be false in the one way this split exists to prevent.
+        #
+        # The shim's exec_local path also caps CARGO_BUILD_JOBS at
+        # RCH_LOCAL_MAX_JOBS (default 8), which is what keeps a local lane from
+        # becoming the compilation storm RCH exists to avoid. RCH_REQUIRE_REMOTE
+        # is deliberately NOT set: the shim refuses a caller-set bypass while it
+        # is enabled.
+        stdout = gates.output / f"{label}.out"
+        stderr = gates.output / f"{label}.log"
+        command = "RCH_SHIM_LOCAL_IDE=1 CARGO_TERM_COLOR=never " + redirected(argv, stdout, stderr)
+        gates.run(label, [(label, command)], target_ids)
+        machine = os.uname()
+        receipt.setdefault("local_runs", []).append({
+            "label": label,
+            "host": machine.nodename,
+            "platform": f"{machine.sysname} {machine.release} {machine.machine}",
+            "command": command,
+            "stdout_log": str(stdout),
+            "stderr_log": str(stderr),
+            "lane": "local-policy",
+        })
+        return stdout.read_text(errors="replace")
+
+    # A lane key that matches no real target is worse than no key at all: its
+    # rows would stay on the remote lane, permanently red, while the receipt
+    # claimed a partition that covered them. Validate against the FULL
+    # inventory rather than the selected subset, so a narrowly scoped run does
+    # not report a stale declaration it simply did not select.
+    all_ids = inventory_ids(inventories["selected"])
+    unknown_lane_keys = sorted(set(LOCAL_LANE) - all_ids)
+    if unknown_lane_keys:
+        raise Rejected("LOCAL_LANE names targets that do not exist in the inventory; "
+                       f"the declaration is stale: {unknown_lane_keys}")
+    receipt["lane_partition"] = {
+        "rule": (
+            "Every required target runs exactly once. A target listed in LOCAL_LANE runs on "
+            "this host because its assertions read inputs RCH does not transfer (.rchignore "
+            "excludes .git/, and a worker has no git repository); every other target runs on "
+            "RCH exactly as before. No row is skipped, ignored or made conditional, so this "
+            "is a scope split of the instrument and not a relaxation of any assertion."
+        ),
+        "local": LOCAL_LANE,
+        "selected_local": sorted(set(LOCAL_LANE) & set(receipt["required_targets"])),
+        "selected_remote": sorted(set(receipt["required_targets"]) - set(LOCAL_LANE)),
+        "receipt_scope": (
+            "Each lane binds its own host, toolchain, profile, features and executed test "
+            "IDs. Neither lane's result is evidence for the other lane's rows, and "
+            "required/executed set equality (PL-1) is checked per lane and then over the "
+            "union."
+        ),
+    }
+
     if args.check_only or args.clippy:
         scope = ["--workspace"] if workspace else [value for name in packages for value in ("-p", name)]
         for flag, name in selectors:
@@ -549,11 +701,18 @@ def qualify(args, gates, receipt):
             flags.append(target["name"])
         argv = cargo_base + ["test", *common, *flags]
         label = f"target-{index:03d}"
-        remote(label + "-compile", argv + ["--no-run"], [target["id"]])
-        listing = remote(label + "-list", argv + ["--", "--list"], [target["id"]])
-        execution = remote(label + "-run", argv + ["--", "-Z", "unstable-options", "--format", "json",
-                                                   "--test-threads", str(args.test_threads), *args.filter], [target["id"]])
+        # One runner per target, chosen by the declared partition. Compile,
+        # discovery and execution all go to the SAME lane: compiling remotely
+        # and running locally would bind a receipt to a binary this host never
+        # produced.
+        run = local if target["id"] in LOCAL_LANE else remote
+        run(label + "-compile", argv + ["--no-run"], [target["id"]])
+        listing = run(label + "-list", argv + ["--", "--list"], [target["id"]])
+        execution = run(label + "-run", argv + ["--", "-Z", "unstable-options", "--format", "json",
+                                                "--test-threads", str(args.test_threads), *args.filter], [target["id"]])
         observed = observe_tests(listing, execution, args.filter)
+        observed["lane"] = "local-policy" if target["id"] in LOCAL_LANE else "rch-remote"
+        observed["lane_reason"] = LOCAL_LANE.get(target["id"])
         receipt.setdefault("test_targets", {})[target["id"]] = observed
         write_json(gates.output / f"{label}-tests.json", observed)
         if observed["reasons"]:
