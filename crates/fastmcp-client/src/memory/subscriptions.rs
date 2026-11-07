@@ -996,7 +996,17 @@ mod tests {
                 match cause {
                     "idle" => client.executor.poll_timeouts_at(&cx, record.idle_deadline).unwrap(),
                     "absolute" => client.executor.poll_timeouts_at(&cx, record.absolute_deadline).unwrap(),
-                    _ => origin.cancel(),
+                    // `McpRequestCancellation::cancel` returns bool (did this
+                    // call perform the transition), while the two timeout arms
+                    // are (). Asserting it rather than discarding it keeps the
+                    // arm honest: a `false` here would mean the token was
+                    // ALREADY cancelled, so the refusal asserted below would
+                    // not have been caused by this line, and the test would be
+                    // passing for a reason it does not name.
+                    _ => assert!(
+                        origin.cancel(),
+                        "the origin token must still be live for this arm to be the cause"
+                    ),
                 }
                 let error = client.next_subscription_event(&cx, &live, &mut owner).await.unwrap_err();
                 assert_eq!(error.code, McpErrorCode::RequestCancelled);

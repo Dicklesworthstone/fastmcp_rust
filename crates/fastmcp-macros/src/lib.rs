@@ -653,6 +653,17 @@ enum ReturnTypeKind {
     McpResultString,
     /// Unknown type - try to convert via Display or Debug
     Other,
+    /// Returns `Result<T, E>` for some other `T`: unwrap, then Display `T`.
+    ///
+    /// Without this, such a return type fell into [`Other`], whose generator
+    /// Displays the WHOLE `Result` instead of its `Ok` value -- so a tool
+    /// returning `McpResult<bool>` failed with "`Result<bool, McpError>`
+    /// doesn't implement `std::fmt::Display`" even though `bool` does. The
+    /// `Other` arm's own comment says "convert via ToString or Debug", which
+    /// was always about the value, not the Result wrapping it.
+    ResultOther,
+    /// Returns `McpResult<T>` for some other `T`: unwrap, then Display `T`.
+    McpResultOther,
     /// Unit type () - return empty content
     Unit,
 }
@@ -719,7 +730,20 @@ fn analyze_type(ty: &Type) -> ReturnTypeKind {
                                         ReturnTypeKind::ResultString
                                     }
                                 }
-                                _ => ReturnTypeKind::Other,
+                                // NOT `Other`: that generator Displays the
+                                // whole Result. Unwrap first, then Display the
+                                // Ok value, which is what the fallback always
+                                // meant and what the failing consumer expects
+                                // (public_async_memory.rs asserts the text
+                                // content of an `McpResult<bool>` tool is
+                                // "true").
+                                _ => {
+                                    if type_name == "McpResult" {
+                                        ReturnTypeKind::McpResultOther
+                                    } else {
+                                        ReturnTypeKind::ResultOther
+                                    }
+                                }
                             };
                         }
                     }
@@ -886,8 +910,19 @@ fn generate_result_conversion(output: &syn::ReturnType) -> TokenStream2 {
         ReturnTypeKind::McpResultString => quote! {
             result.map(|s| vec![fastmcp_protocol::Content::Text { text: s }])
         },
+        ReturnTypeKind::ResultOther => quote! {
+            result
+                .map(|value| vec![fastmcp_protocol::Content::Text { text: format!("{value}") }])
+                .map_err(|e| fastmcp_core::McpError::internal_error(e.to_string()))
+        },
+        ReturnTypeKind::McpResultOther => quote! {
+            result.map(|value| vec![fastmcp_protocol::Content::Text { text: format!("{value}") }])
+        },
         ReturnTypeKind::Other => quote! {
-            // Convert via ToString or Debug as fallback
+            // Convert via ToString or Debug as fallback. This arm now sees only
+            // BARE values: a `Result`/`McpResult` wrapping an unrecognized `T`
+            // is classified as ResultOther/McpResultOther above, so the Display
+            // bound lands on `T` rather than on the Result.
             let text = format!("{}", result);
             Ok(vec![fastmcp_protocol::Content::Text { text }])
         },

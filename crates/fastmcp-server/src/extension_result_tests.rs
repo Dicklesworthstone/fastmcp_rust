@@ -272,7 +272,11 @@ fn dispatch(server: &Arc<Server>, request: JsonRpcRequest, route: Dispatch) -> J
                 None,
             ));
             match result {
-                Ok(value) => JsonRpcResponse::success(REQUEST_ID, value),
+                // `.into()`, not the compiler's suggested
+                // `RequestId::Number(REQUEST_ID)`: this file already converts
+                // the same constant that way at :277 and :354, so matching it
+                // keeps one spelling for one conversion.
+                Ok(value) => JsonRpcResponse::success(REQUEST_ID.into(), value),
                 Err(error) => JsonRpcResponse::error(
                     Some(REQUEST_ID.into()),
                     JsonRpcError {

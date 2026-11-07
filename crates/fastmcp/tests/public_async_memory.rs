@@ -649,17 +649,28 @@ mod interactions {
     use fastmcp_rust::{
         ClientCapabilities, ClientInfo, CompleteResult, CoreResult, FinalCoreResult,
         FinalElicitationContextExt, FinalEmbeddedRootsListParams, FinalGetPromptResult,
-        FinalMethodOutcome, FinalReadResourceResult, FinalRootsContextExt,
-        FinalSamplingContextExt, FinalToolOutcome, McpError, McpRequestCancellation,
-        MrtrCompletedInputs, ResultMeta, ReverseRequestHandlers, prompt, resource, serde_json,
+        FinalReadResourceResult, FinalRootsContextExt, FinalSamplingContextExt,
+        FinalToolOutcome, McpError, McpRequestCancellation, MrtrCompletedInputs, ResultMeta,
+        prompt, resource, serde_json,
     };
+    // The facade scopes these two under `modern::` rather than re-exporting them
+    // at the root; the root carries `FinalToolOutcome` but not these. Naming the
+    // module the facade actually exposes is the fix, not widening the root.
+    use fastmcp_rust::modern::{FinalMethodOutcome, ReverseRequestHandlers};
 
+    // The return type must be WRITTEN as a qualified path.
+    // `is_canonical_final_tool_outcome` in fastmcp-macros requires at least two
+    // path segments rooted at `fastmcp_rust` or `fastmcp_server`, so a bare
+    // `FinalToolOutcome` -- however it was imported -- is refused. The macro
+    // matches tokens, not resolved types, and that is deliberate: the generated
+    // code must not be able to bind some other same-named type. Same spelling
+    // as macro_expansion.rs:1690.
     #[tool]
     async fn memory_interactive_tool(
         ctx: &McpContext,
         subject: String,
         completed_inputs: Option<&MrtrCompletedInputs>,
-    ) -> McpResult<FinalToolOutcome> {
+    ) -> McpResult<fastmcp_rust::FinalToolOutcome> {
         ctx.checkpoint()?;
         let Some(inputs) = completed_inputs else {
             return Ok(FinalToolOutcome::InputRequired(

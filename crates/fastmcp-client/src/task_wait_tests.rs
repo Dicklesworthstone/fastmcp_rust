@@ -347,7 +347,14 @@ mod memory {
                     .await
                     .unwrap();
                 assert!(matches!(handle.task(), FinalTask::Completed { .. }));
-                assert_eq!(handle.task().base().created_at, "2026-07-28T12:00:00+00:00");
+                // `created_at` is a TaskTimestamp, not a String: the type was
+                // strengthened to retain the canonical final spelling. Compare
+                // through as_str() so the assertion still checks that exact
+                // spelling rather than only that some timestamp arrived.
+                assert_eq!(
+                    handle.task().base().created_at.as_str(),
+                    "2026-07-28T12:00:00+00:00"
+                );
                 let mut peer = server.join(&cx).await.unwrap();
                 assert_core_usable(&cx, &mut client, &mut peer, 5).await;
                 client.close(&cx).unwrap();
@@ -615,7 +622,18 @@ mod memory {
             for expire_while_full in [false, true] {
                 let mut initial = task("input_required", None);
                 let elapsed = wall_now_nanos()
-                    .checked_sub(timestamp_nanos(initial["createdAt"].as_str().unwrap()).unwrap())
+                    // timestamp_nanos takes &TaskTimestamp since the field was
+                    // strengthened; parse the fixture's wire string into one
+                    // rather than widening the function back to &str.
+                    .checked_sub(
+                        timestamp_nanos(
+                            &fastmcp_protocol::TaskTimestamp::parse(
+                                initial["createdAt"].as_str().unwrap(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap(),
+                    )
                     .unwrap();
                 initial["ttlMs"] = json!(u64::try_from(elapsed / 1_000_000).unwrap() + 500);
                 let (mut client, mut handle, mut peer) = attached(&cx, initial).await;

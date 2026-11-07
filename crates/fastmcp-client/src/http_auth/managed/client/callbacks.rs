@@ -221,7 +221,12 @@ mod tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use crate::{FinalEmbeddedRootsListResult, ReverseRequestCancellation};
+    // ReverseRequestCancellation is no longer imported here: this module's
+    // only uses were the 4th argument of
+    // `invoke_embedded_input_request_async`, which has taken the caller's
+    // checkpoint since 5f60e8de. An import left behind would be an
+    // unused_imports warning, which `-D warnings` treats as an error.
+    use crate::FinalEmbeddedRootsListResult;
     use fastmcp_core::McpErrorCode;
     use fastmcp_protocol::FinalEmbeddedInputRequest;
 
@@ -262,12 +267,15 @@ mod tests {
                 },
             ));
             let request = || FinalEmbeddedInputRequest::Roots(serde_json::from_str("{}").unwrap());
-            let mut answer = Box::pin(handlers.invoke_embedded_input_request_async(
-                &cx,
-                "roots",
-                request(),
-                ReverseRequestCancellation::new(),
-            ));
+            // The 4th argument is the caller's CHECKPOINT since 5f60e8de; the
+            // method makes its own ReverseRequestCancellation and returns the
+            // owner. A checkpoint that never refuses keeps this test's subject
+            // intact: what it asserts about is the handler/boundary transition,
+            // not a caller refusal.
+            let admit = || Ok(());
+            let mut answer = Box::pin(
+                handlers.invoke_embedded_input_request_async(&cx, "roots", request(), &admit),
+            );
             let Poll::Ready(result) = answer
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()))
@@ -276,18 +284,18 @@ mod tests {
             };
             if close {
                 assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
-                let mut again = Box::pin(handlers.invoke_embedded_input_request_async(
-                    &cx,
-                    "roots",
-                    request(),
-                    ReverseRequestCancellation::new(),
-                ));
+                let mut again = Box::pin(
+                    handlers.invoke_embedded_input_request_async(&cx, "roots", request(), &admit),
+                );
                 assert!(matches!(
                     again.as_mut().poll(&mut Context::from_waker(Waker::noop())),
                     Poll::Ready(Err(_))
                 ));
             } else {
-                assert_eq!(result.unwrap(), serde_json::json!({"roots": []}));
+                // `.0` is the value; `.1` is the MrtrCallbackOwner the method
+                // now transfers. This test does not reach acceptance, so the
+                // owner is simply dropped.
+                assert_eq!(result.unwrap().0, serde_json::json!({"roots": []}));
             }
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert!(!boundary.cancellation.is_cancel_requested());
@@ -422,10 +430,9 @@ mod construction_tests {
     use std::task::{Context, Poll, Waker};
     use std::time::Duration;
 
-    use crate::{
-        ElicitResult, FinalCreateMessageResult, FinalEmbeddedRootsListResult,
-        ReverseRequestCancellation,
-    };
+    // ReverseRequestCancellation dropped for the same reason as the sibling
+    // module above: its only use was the pre-5f60e8de 4th argument.
+    use crate::{ElicitResult, FinalCreateMessageResult, FinalEmbeddedRootsListResult};
     use fastmcp_core::McpErrorCode;
     use fastmcp_protocol::FinalEmbeddedInputRequest;
     use serde_json::json;
@@ -574,13 +581,15 @@ mod construction_tests {
                 let handlers = handlers(&boundary, transition, &counts);
                 let request: FinalEmbeddedInputRequest =
                     serde_json::from_value(descriptor.clone()).unwrap();
-                let local = ReverseRequestCancellation::new();
-                let mut call = Box::pin(handlers.invoke_embedded_input_request_async(
-                    &cx,
-                    "selected",
-                    request,
-                    local,
-                ));
+                // See the note at the Roots site above: the 4th argument is the
+                // caller's checkpoint since 5f60e8de. The refusal this test
+                // asserts comes from the boundary transition, not from a
+                // caller-supplied token, so a never-refusing checkpoint leaves
+                // the subject unchanged.
+                let admit = || Ok(());
+                let mut call = Box::pin(
+                    handlers.invoke_embedded_input_request_async(&cx, "selected", request, &admit),
+                );
                 let Poll::Ready(Err(error)) =
                     call.as_mut().poll(&mut Context::from_waker(Waker::noop()))
                 else {

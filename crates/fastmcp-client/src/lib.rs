@@ -28698,6 +28698,15 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_core::block_on;
+    // `use super::*` does NOT reach `Poll`: the parent module has no such name
+    // in scope to re-export, which is why the three bare `Poll::` sites in this
+    // module failed to resolve. Gated to match its only users -- the
+    // `#[cfg(unix)]` extension-over-HTTP helper and test at 42369 and 42516.
+    // Ungated it would be an unused import on a non-unix target, and this
+    // workspace builds x86_64-pc-windows-msvc, where `-D warnings` makes an
+    // unused import an error.
+    #[cfg(unix)]
+    use std::task::Poll;
 
     // bd-mrtr-01-b-otqd: automatic resolver coverage is an all-input barrier.
     mod mrtr_handler_preflight {

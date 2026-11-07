@@ -9,12 +9,17 @@ use std::io::{self, Write};
 use fastmcp_core::{McpError, McpResult};
 use fastmcp_protocol::extensions::NegotiatedExtensionSet;
 use fastmcp_protocol::protocol_policy::ProtocolEra;
-use fastmcp_protocol::result::{
-    DecodedResult, DeferringResultDiscriminatorPolicy, ExactJsonValue,
-    MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
+// From the crate ROOT, not `fastmcp_protocol::result::`. That module is
+// declared `mod result;` (private) at fastmcp-protocol/src/lib.rs:56 and its
+// contents reach consumers through `pub use result::*;` at :131 -- the same
+// shape as `jsonrpc`, `messages` and `types`. The module PATH is private even
+// though every item on it is public, so naming the path is E0603 while naming
+// the root is fine. All nine items below resolve at the root.
+use fastmcp_protocol::{
+    DecodedResult, DeferringResultDiscriminatorPolicy, ExactJsonValue, ExtensionId,
+    JsonRpcRequest, MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_DEPTH, MAX_RESULT_ENCODED_BYTES,
     decode_peer_result_for_era,
 };
-use fastmcp_protocol::{ExtensionId, JsonRpcRequest};
 use serde_json::Value;
 
 use super::ExtensionHandlerRegistry;

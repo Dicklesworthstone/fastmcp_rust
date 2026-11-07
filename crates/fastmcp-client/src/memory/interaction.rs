@@ -329,13 +329,36 @@ mod tests {
         }
 
         fn assert_completed(self, result: CoreResult) {
+            // `encode_complete_result`, not `serde_json::to_string`.
+            // `CompleteResult<T>` derives only Debug + Clone -- deliberately,
+            // because serde cannot carry what this test asserts. The exact
+            // number `7.30e-2` survives only through the ExactJsonValue
+            // algebra; a serde round trip would re-emit it as `0.073` and the
+            // `contains("7.30e-2")` assertion below would fail even though the
+            // product had preserved it correctly. `Vec::new()` / `&[]` claim no
+            // known members, which is the shape every other call site in this
+            // crate uses (core_listen.rs:95/406, tasks/listen.rs:122/386), and
+            // it is right here because `com.example/receipt` is an unknown
+            // top-level member and therefore rides in `extras`.
+            // A generic `fn`, not a closure: the three arms carry three
+            // different payload types and a closure is monomorphic, so one
+            // closure cannot serve all three.
+            fn encode<T>(result: &fastmcp_protocol::CompleteResult<T>) -> String {
+                fastmcp_protocol::encode_complete_result(
+                    &result.meta,
+                    Vec::new(),
+                    &[],
+                    &result.extras,
+                )
+                .expect("a decoded complete result re-encodes")
+            }
             let source = match (self, result) {
                 (Self::Tool, CoreResult::Final(FinalCoreResult::ToolsCall { result, .. })) =>
-                    serde_json::to_string(&result).unwrap(),
+                    encode(&result),
                 (Self::Resource, CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. })) =>
-                    serde_json::to_string(&result).unwrap(),
+                    encode(&result),
                 (Self::Prompt, CoreResult::Final(FinalCoreResult::PromptsGet { result, .. })) =>
-                    serde_json::to_string(&result).unwrap(),
+                    encode(&result),
                 _ => panic!("MRTR must preserve its exact method result family"),
             };
             let result: Value = serde_json::from_str(&source).unwrap();

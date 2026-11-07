@@ -17161,7 +17161,15 @@ impl Server {
                 )
                 .await;
             if let Some(stats) = &self.stats {
-                if result.as_ref().is_err_and(McpError::is_cancelled) {
+                // `McpError::is_cancelled` does not exist. `is_internal` is the
+                // type's only `is_*` predicate and it exists for masking, not
+                // as the head of a family, so this asks the question directly
+                // against the code `McpError::request_cancelled()` sets rather
+                // than adding a cross-crate helper for one call site.
+                if result
+                    .as_ref()
+                    .is_err_and(|error| error.code == McpErrorCode::RequestCancelled)
+                {
                     stats.record_cancelled(&method, started_at.elapsed());
                 } else {
                     stats.record_request(&method, started_at.elapsed(), result.is_ok());
@@ -41521,7 +41529,7 @@ mod lib_unit_tests {
     /// `LegacyOnly` is deliberately absent. The served half of the rule -- a
     /// 2024-11-05 ping answering an empty object -- is already proven on the
     /// path that owns it, by the legacy arm of
-    /// `builder::tests::proxy_registration_tests::public_legacy_and_stateless_ping_answer_empty_object_without_entering_the_final_request_union`,
+    /// `builder::tests::proxy_registration_tests::public_legacy_ping_is_served_while_the_removed_modern_ping_is_refused_outside_the_final_request_union`,
     /// which dispatches through a negotiated 2024-11-05 `Session`. Asserting
     /// it here would mean pairing `LegacyOnly` with a `ModernConnection`
     /// inbound context and a session-less request, which is not a shape any

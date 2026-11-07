@@ -197,17 +197,24 @@ async fn resolve_one(
     checkpoint(cx, cancellation)?;
     retention.check(cx)?;
     let kind = request.response_kind();
-    let local = ReverseRequestCancellation::new();
-    let mut callback = std::pin::pin!(handlers.invoke_embedded_input_request_async(
-        cx,
-        key,
-        request,
-        local.clone(),
-    ));
-    // Declared after the callback: abandonment records local cancellation before
-    // disposing the callback future. Successful owners remain live until ACK.
-    let owner = MrtrCallbackOwner(local);
-    let value = poll_fn(|task| {
+    // `invoke_embedded_input_request_async` takes the caller's CHECKPOINT and
+    // creates its own `ReverseRequestCancellation` internally, returning the
+    // `MrtrCallbackOwner` it made -- the shape of the canonical call in
+    // `Client::respond_to_input_required_async`. This site still passed a
+    // caller-made cancellation and built its own owner, which is the signature
+    // that existed before 5f60e8de moved ownership transfer inside the method
+    // ("Transfer successful ownership explicitly"); that commit updated lib.rs
+    // and left this call behind. The owner is forwarded to this function's
+    // caller, which is what records RESPONSE_SENT, so the "live until ACK"
+    // invariant the previous comment described is preserved -- it is now the
+    // method's and the caller's, not this frame's.
+    let guard = || {
+        checkpoint(cx, cancellation)?;
+        retention.check(cx)
+    };
+    let mut callback =
+        std::pin::pin!(handlers.invoke_embedded_input_request_async(cx, key, request, &guard));
+    let (value, owner) = poll_fn(|task| {
         if let Err(error) = checkpoint(cx, cancellation) {
             return Poll::Ready(Err(error));
         }
