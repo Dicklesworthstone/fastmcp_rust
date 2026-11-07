@@ -32,7 +32,9 @@ pub mod apps;
 mod catalog;
 mod core_listen;
 mod cursors;
+mod extensions;
 pub use catalog::{CatalogError, CatalogLimits, Collected as CatalogCollection, ManagedCatalog};
+pub use extensions::{ManagedExtensionLimits, ManagedExtensionResult};
 pub(crate) use catalog::CatalogCollector;
 use cursors::{CatalogKind, CursorLedger};
 #[cfg(feature = "tasks")]
@@ -144,16 +146,21 @@ enum CallResult {
     Core(Box<CoreResult>),
     Catalog(Result<catalog::Collected, ManagedHttpClientError>),
     CoreListen(core_listen::ListenResult),
+    Extension(Box<ManagedExtensionResult>),
+    ExtensionNotification,
     #[cfg(feature = "tasks")]
     Task(Box<tasks::TaskResult>),
 }
 
 impl CallResult {
-    // Catalog, listen and task results cannot be returned by a single-core-call API.
+    // Other completed operations cannot be returned by a single-core-call API.
     fn into_core(self) -> Result<CoreResult, ManagedHttpClientError> {
         match self {
             Self::Core(value) => Ok(*value),
-            Self::Catalog(_) | Self::CoreListen(_) => Err(ManagedHttpClientError::InvalidPolicy),
+            Self::Catalog(_)
+            | Self::CoreListen(_)
+            | Self::Extension(_)
+            | Self::ExtensionNotification => Err(ManagedHttpClientError::InvalidPolicy),
             #[cfg(feature = "tasks")]
             Self::Task(_) => Err(ManagedHttpClientError::InvalidPolicy),
         }
@@ -171,7 +178,10 @@ impl CallResult {
                 cursors.take(kind, None)?;
                 Ok(())
             }
-            Self::Catalog(Err(_)) | Self::CoreListen(_) => {
+            Self::Catalog(Err(_))
+            | Self::CoreListen(_)
+            | Self::Extension(_)
+            | Self::ExtensionNotification => {
                 Err(ManagedHttpClientError::InvalidPolicy)
             }
             #[cfg(feature = "tasks")]
@@ -199,6 +209,9 @@ impl CallResult {
 /// observers run inside a bounded managed listen; subscription streams and
 /// arbitrary callbacks into a raw `HttpClient` remain unexposed, because those
 /// could escape the credential lifetime guard.
+/// Registered third-party extension calls and proof-bearing notifications use
+/// that same guard. Extension event observers receive bounded live progress and
+/// notifications; only a completed, admitted result can leave the operation.
 ///
 /// Returned catalog cursors are opaque, single-use LOCAL handles, not the
 /// upstream cursor bytes. Pass them back only to the same client's same list
@@ -653,6 +666,8 @@ enum Call<'a> {
     Prompts(Option<&'a str>),
     Catalog(CatalogKind, CatalogLimits),
     CoreListen(core_listen::ListenRequest<'a>),
+    Extension(extensions::ExtensionRequest<'a>),
+    ExtensionNotification(extensions::ExtensionNotification<'a>),
     Tool {
         name: &'a str,
         arguments: Value,
@@ -706,6 +721,15 @@ impl<'a> Call<'a> {
                 return Box::pin(request.dispatch(cx, client, boundary))
                     .await
                     .map(CallResult::CoreListen);
+            }
+            Self::Extension(request) => {
+                return Box::pin(request.dispatch(cx, client, boundary))
+                    .await
+                    .map(|result| CallResult::Extension(Box::new(result)));
+            }
+            Self::ExtensionNotification(notification) => {
+                notification.dispatch(cx, client, boundary).await?;
+                return Ok(CallResult::ExtensionNotification);
             }
             Self::Tool { name, arguments } => {
                 client

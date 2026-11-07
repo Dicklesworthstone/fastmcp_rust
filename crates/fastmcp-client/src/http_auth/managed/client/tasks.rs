@@ -283,7 +283,11 @@ impl ManagedHttpClient {
         self.admit_tasks(cx, cancellation)?;
         match self.perform_any(cx, cancellation, Call::Task(call)).await? {
             CallResult::Task(value) => Ok(*value),
-            CallResult::Core(_) | CallResult::Catalog(_) | CallResult::CoreListen(_) => {
+            CallResult::Core(_)
+            | CallResult::Catalog(_)
+            | CallResult::CoreListen(_)
+            | CallResult::Extension(_)
+            | CallResult::ExtensionNotification => {
                 Err(ManagedHttpClientError::InvalidPolicy)
             }
         }

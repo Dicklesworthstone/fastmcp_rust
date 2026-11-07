@@ -12,13 +12,21 @@ use std::time::Instant;
 
 use crate::http_auth::managed::OAuthSessionPolicy;
 use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
+use crate::http_executor::ModernHttpExtensionEvent;
 use crate::{ClientProtocolPlan, ReverseRequestHandlers};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use asupersync::net::{TcpListener, TcpStream};
 use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
 use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor, TlsAcceptorBuilder};
 use fastmcp_core::McpError;
-use fastmcp_protocol::{FINAL_PROTOCOL_VERSION, FinalCoreResult};
+use fastmcp_protocol::extensions::{
+    ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry, ExtensionDirection,
+    ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionMethodDescriptor,
+    ExtensionNegotiationError, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+    ExtensionSettings, ExtensionSettingsSchema, NotificationActivationProofDescriptor,
+    NotificationActivationProofLocation,
+};
+use fastmcp_protocol::{ExtensionId, FINAL_PROTOCOL_VERSION, FinalCoreResult};
 use serde_json::json;
 
 // TEST ONLY: the same private CA as tests/oauth_managed.rs, valid 2020-2049.
@@ -382,6 +390,112 @@ async fn warmup(cx: &Cx, peer: &Peer, client: &mut ManagedHttpClient) {
     })
     .await;
     assert_catalog(listed.unwrap(), "lookup");
+}
+
+fn managed_extension_builder(peer: &Peer) -> (ExtensionId, ClientBuilder, Arc<AtomicUsize>) {
+    let id = ExtensionId::parse("com.example/raw").unwrap();
+    let descriptor = ExtensionDescriptor {
+        id: id.clone(),
+        client_settings: ExtensionSettingsSchema {
+            schema_id: "managed-client-v1".into(),
+            codec_id: "managed-client-v1".into(),
+        },
+        server_settings: ExtensionSettingsSchema {
+            schema_id: "managed-server-v1".into(),
+            codec_id: "managed-server-v1".into(),
+        },
+        resolver: ExtensionNegotiationResolver {
+            id: "managed-settings-v1".into(),
+            version: 1,
+            fallback: ExtensionFallbackPolicy::RejectOneSided,
+        },
+        method: Some(ExtensionMethodDescriptor {
+            name: "example/echo".into(),
+            direction: ExtensionDirection::ClientToServer,
+            http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+            legacy_fallback: false,
+        }),
+        notification: Some(ExtensionNotificationDescriptor {
+            name: "example/events".into(),
+            direction: ExtensionDirection::ClientToServer,
+            activation_proof: Some(NotificationActivationProofDescriptor::SelfContained {
+                location: NotificationActivationProofLocation::Metadata,
+                key: "com.example/proof".into(),
+            }),
+        }),
+        result_discriminator: Some("com.example/raw-result".into()),
+        routing_headers: Vec::new(),
+        stdio_correlation: None,
+    };
+    let mut other = descriptor.clone();
+    other.id = ExtensionId::parse("com.example/other").unwrap();
+    other.method.as_mut().unwrap().name = "example/other".into();
+    other.notification = None;
+    other.result_discriminator = Some("com.example/other-result".into());
+    let settings = ExtensionSettings::new(json!({"mode":"raw"})).unwrap();
+    let discovery = ClientExtensionDiscovery {
+        extensions: BTreeMap::from([
+            (id.clone(), settings.clone()),
+            (other.id.clone(), settings),
+        ]),
+    };
+    let mut registry = ExtensionDescriptorRegistry::new();
+    registry.register(descriptor).unwrap();
+    registry.register(other).unwrap();
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    let resolver_count = resolutions.clone();
+    let builder = peer
+        .client_builder()
+        .extension_registry(registry, discovery, move || {
+            let resolutions = resolver_count.clone();
+            move |descriptor: &ExtensionDescriptor,
+                  client: &ExtensionSettings,
+                  server: &ExtensionSettings| {
+                resolutions.fetch_add(1, Ordering::SeqCst);
+                if client == server {
+                    Ok(client.clone())
+                } else {
+                    Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                        descriptor.id.to_string(),
+                    ))
+                }
+            }
+        })
+        .unwrap();
+    (id, builder, resolutions)
+}
+
+fn extension_discovery(settings: Value) -> Value {
+    let mut result = discovery();
+    result["capabilities"]["extensions"] = json!({
+        "com.example/raw": settings.clone(),
+        "com.example/other": settings,
+    });
+    result
+}
+
+async fn extension_reply(stream: &mut TlsStream, content_type: &str, body: &str) {
+    stream
+        .write_all(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.write_all(body.as_bytes()).await.unwrap();
+    stream.shutdown().await.unwrap();
+}
+
+async fn extension_sse_chunk(stream: &mut TlsStream, message: &str) {
+    let event = format!("data: {message}\n\n");
+    stream
+        .write_all(format!("{:x}\r\n{event}\r\n", event.len()).as_bytes())
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
 }
 
 #[test]
@@ -1345,6 +1459,646 @@ fn resource_template_and_prompt_calls_use_the_same_authenticated_client() {
             }
         }).await;
         assert_eq!(client.cached_credential_generation(), Some(1));
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
+fn managed_extensions_authenticated_json_sse_preserve_source_and_live_progress() {
+    for use_sse in [false, true] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let (id, builder, _) = managed_extension_builder(&peer);
+            let mut client =
+                ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+            let source = r#"{"resultType":"com.example/raw-result","value":7.30e-2,"extra":{"n":1.20e+4}}"#;
+            let observed = Arc::new(AtomicUsize::new(0));
+            let mut observer = |event: &ModernHttpExtensionEvent| {
+                let ModernHttpExtensionEvent::Progress(progress) = event else {
+                    panic!("only nonterminal progress is expected by this observer");
+                };
+                assert_eq!(progress.progress.as_str(), "7.30e-2");
+                assert_eq!(progress.total.as_ref().unwrap().as_str(), "1.20e+4");
+                assert_eq!(
+                    serde_json::to_value(&progress.progress_token).unwrap(),
+                    json!("managed-extension")
+                );
+                observed.fetch_add(1, Ordering::SeqCst);
+            };
+            let (result, request_id) = Box::pin(pair(
+                client.request_final_extension_with_events(
+                    &cx,
+                    &id,
+                    "example/echo",
+                    json!({
+                        "input":"ok",
+                        "_meta":{
+                            "progressToken":"managed-extension",
+                            "io.modelcontextprotocol/clientCapabilities":{
+                                "extensions":{"com.example/raw":{"mode":"forged"}}
+                            }
+                        }
+                    }),
+                    ManagedExtensionLimits::new(4096, 16384, 4).unwrap(),
+                    &mut observer,
+                ),
+                async {
+                    peer.mcp(
+                        "server/discover",
+                        "access-one",
+                        extension_discovery(json!({"mode":"raw"})),
+                    )
+                    .await;
+                    let (mut stream, request, _) =
+                        peer.mcp_request("example/echo", "access-one").await;
+                    assert_eq!(request["params"]["input"], "ok");
+                    assert_eq!(
+                        request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"]
+                            ["extensions"]["com.example/raw"],
+                        json!({"mode":"raw"})
+                    );
+                    let response = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{source}}}"#,
+                        request["id"]
+                    );
+                    if use_sse {
+                        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                        extension_sse_chunk(
+                            &mut stream,
+                            r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"managed-extension","progress":7.30e-2,"total":1.20e+4}}"#,
+                        )
+                        .await;
+                        // The peer deliberately withholds the terminal until
+                        // the caller has observed progress from the live body.
+                        asupersync::time::timeout_at(
+                            cx.now().saturating_add_nanos(5_000_000_000),
+                            async {
+                                while observed.load(Ordering::SeqCst) == 0 {
+                                    asupersync::runtime::yield_now().await;
+                                }
+                            },
+                        )
+                        .await
+                        .expect("progress must arrive before the terminal is sent");
+                        let event = format!("data: {response}\n\n");
+                        stream
+                            .write_all(
+                                format!("{:x}\r\n{event}\r\n0\r\n\r\n", event.len()).as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        stream.shutdown().await.unwrap();
+                    } else {
+                        extension_reply(&mut stream, "application/json", &response).await;
+                    }
+                    request["id"].clone()
+                },
+            ))
+            .await;
+            let result = result.unwrap();
+            assert_eq!(serde_json::to_value(result.request_id()).unwrap(), request_id);
+            assert_eq!(result.raw_result_source(), source);
+            assert_eq!(result.result(), &serde_json::from_str::<Value>(source).unwrap());
+            assert_eq!(observed.load(Ordering::SeqCst), usize::from(use_sse));
+            assert_eq!(client.cached_credential_generation(), Some(1));
+            assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn managed_extensions_reject_one_sided_discovery_and_foreign_result_owners() {
+    for (advertised, use_sse) in [(false, false), (true, false), (true, true)] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let (id, builder, _) = managed_extension_builder(&peer);
+            let mut client =
+                ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+            let (result, ()) = Box::pin(pair(
+                client.request_final_extension(&cx, &id, "example/echo", json!({})),
+                async {
+                    peer.mcp(
+                        "server/discover",
+                        "access-one",
+                        if advertised {
+                            extension_discovery(json!({"mode":"raw"}))
+                        } else {
+                            discovery()
+                        },
+                    )
+                    .await;
+                    if advertised {
+                        let (mut stream, request, _) =
+                            peer.mcp_request("example/echo", "access-one").await;
+                        // Both owners were negotiated; the other owner's
+                        // discriminator still cannot satisfy this request.
+                        let response = format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"com.example/other-result","private":"private-extension-payload"}}}}"#,
+                            request["id"]
+                        );
+                        if use_sse {
+                            extension_reply(
+                                &mut stream,
+                                "text/event-stream",
+                                &format!("data: {response}\n\n"),
+                            )
+                            .await;
+                        } else {
+                            extension_reply(&mut stream, "application/json", &response).await;
+                        }
+                    }
+                },
+            ))
+            .await;
+            let error = result.unwrap_err();
+            if advertised {
+                assert!(matches!(
+                    error,
+                    ManagedHttpClientError::Request {
+                        code: Some(McpErrorCode::InvalidRequest)
+                    }
+                ));
+            }
+            let diagnostic = format!("{error:?} {error}");
+            for private in ["access-one", "private-extension-payload", "com.example/other-result"] {
+                assert!(!diagnostic.contains(private));
+            }
+            assert_eq!(client.cached_credential_generation(), None);
+            assert!(!session.inner.closed.is_cancel_requested());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn managed_extensions_pending_cancel_or_revocation_retires_only_owned_state() {
+    for revoke in [false, true] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let credential = session.credential(&cx).await.unwrap().credential().clone();
+            let cancellation = McpRequestCancellation::new();
+            let (id, builder, _) = managed_extension_builder(&peer);
+            let mut client =
+                ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+            let (result, mut held_socket) = Box::pin(pair(
+                client.request_final_extension_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    "example/echo",
+                    json!({}),
+                ),
+                async {
+                    peer.mcp(
+                        "server/discover",
+                        "access-one",
+                        extension_discovery(json!({"mode":"raw"})),
+                    )
+                    .await;
+                    let (mut stream, _, _) =
+                        peer.mcp_request("example/echo", "access-one").await;
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\nConnection: close\r\n\r\n{").await.unwrap();
+                    if revoke {
+                        credential.revoke();
+                    } else {
+                        cancellation.cancel();
+                    }
+                    stream // Keep the unfinished body alive until cancellation wins.
+                },
+            ))
+            .await;
+            if revoke {
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+                ));
+            }
+            assert_eq!(client.cached_credential_generation(), None);
+            assert_eq!(credential.is_revoked(), revoke);
+            assert!(!session.inner.closed.is_cancel_requested());
+            assert!(cx.checkpoint().is_ok());
+            let mut byte = [0_u8; 1];
+            let closed = asupersync::time::timeout_at(
+                cx.now().saturating_add_nanos(5_000_000_000),
+                held_socket.read(&mut byte),
+            )
+            .await
+            .expect("retirement must close the pending request's TLS connection");
+            assert!(matches!(closed, Ok(0) | Err(_)));
+            drop(held_socket);
+            peer.no_more(&cx).await;
+
+            if revoke {
+                assert!(matches!(
+                    session.credential(&cx).await,
+                    Err(OAuthSessionError::LoginRequired)
+                ));
+                peer.no_more(&cx).await;
+            } else {
+                let (_, builder, _) = managed_extension_builder(&peer);
+                let mut sibling = ManagedHttpClient::new(
+                    session.clone(),
+                    builder,
+                    Duration::from_secs(30),
+                )
+                .unwrap();
+                // Both a fresh explicit call on the cancelled owner and an
+                // independent client retain the original, unrevoked login.
+                for target in [&mut client, &mut sibling] {
+                    let (result, ()) = Box::pin(pair(
+                        target.request_final_extension(&cx, &id, "example/echo", json!({})),
+                        async {
+                            peer.mcp(
+                                "server/discover",
+                                "access-one",
+                                extension_discovery(json!({"mode":"raw"})),
+                            )
+                            .await;
+                            peer.mcp(
+                                "example/echo",
+                                "access-one",
+                                json!({"resultType":"com.example/raw-result","value":23}),
+                            )
+                            .await;
+                        },
+                    ))
+                    .await;
+                    assert_eq!(result.unwrap().result()["value"], 23);
+                    assert_eq!(target.cached_credential_generation(), Some(1));
+                }
+                peer.no_more(&cx).await;
+            }
+        });
+    }
+}
+
+#[test]
+fn managed_extensions_callback_authority_loss_discards_buffered_events_and_terminal() {
+    #[derive(Clone, Copy)]
+    enum Stop {
+        Cancel,
+        Revoke,
+        Logout,
+    }
+    for stop in [Stop::Cancel, Stop::Revoke, Stop::Logout] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let credential = session.credential(&cx).await.unwrap().credential().clone();
+            let cancellation = McpRequestCancellation::new();
+            let (id, builder, _) = managed_extension_builder(&peer);
+            let mut client =
+                ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+            let observed = Arc::new(AtomicUsize::new(0));
+            let mut observer = |event: &ModernHttpExtensionEvent| {
+                assert!(matches!(event, ModernHttpExtensionEvent::Progress(_)));
+                observed.fetch_add(1, Ordering::SeqCst);
+                match stop {
+                    Stop::Cancel => {
+                        cancellation.cancel();
+                    }
+                    Stop::Revoke => {
+                        credential.revoke();
+                    }
+                    Stop::Logout => {
+                        session.close();
+                    }
+                }
+            };
+            let (result, ()) = Box::pin(pair(
+                client.request_final_extension_with_events_and_cancellation(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    "example/echo",
+                    json!({"_meta":{"progressToken":"managed-extension"}}),
+                    ManagedExtensionLimits::new(4096, 16384, 4).unwrap(),
+                    &mut observer,
+                ),
+                async {
+                    peer.mcp(
+                        "server/discover",
+                        "access-one",
+                        extension_discovery(json!({"mode":"raw"})),
+                    )
+                    .await;
+                    let (mut stream, request, _) =
+                        peer.mcp_request("example/echo", "access-one").await;
+                    let first = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"managed-extension","progress":1}}"#;
+                    let second = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"managed-extension","progress":2}}"#;
+                    let terminal = format!(
+                        r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"com.example/raw-result","private":"withheld-terminal"}}}}"#,
+                        request["id"]
+                    );
+                    // All three frames can be ready in one native read. Host
+                    // effects during the first callback must still stop the
+                    // second callback and prevent a successful return value.
+                    extension_reply(
+                        &mut stream,
+                        "text/event-stream",
+                        &format!("data: {first}\n\ndata: {second}\n\ndata: {terminal}\n\n"),
+                    )
+                    .await;
+                },
+            ))
+            .await;
+            match stop {
+                Stop::Cancel => assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+                )),
+                Stop::Revoke => assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::LoginRequired))
+                )),
+                Stop::Logout => assert!(matches!(
+                    result,
+                    Err(ManagedHttpClientError::Session(OAuthSessionError::Closed))
+                )),
+            }
+            assert_eq!(observed.load(Ordering::SeqCst), 1);
+            assert_eq!(client.cached_credential_generation(), None);
+            assert!(cx.checkpoint().is_ok());
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn managed_extensions_preflight_and_event_budget_refuse_before_observation() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let (id, builder, _) = managed_extension_builder(&peer);
+        let mut client =
+            ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+        for parameters in [Value::Null, json!({"_meta":null})] {
+            assert!(matches!(
+                client
+                    .request_final_extension(&cx, &id, "example/echo", parameters)
+                    .await,
+                Err(ManagedHttpClientError::InvalidPolicy)
+            ));
+        }
+        let cancellation = McpRequestCancellation::new();
+        cancellation.cancel();
+        assert!(matches!(
+            client
+                .request_final_extension_with_cancellation(
+                    &cx,
+                    &cancellation,
+                    &id,
+                    "example/echo",
+                    json!({}),
+                )
+                .await,
+            Err(ManagedHttpClientError::Session(OAuthSessionError::Cancelled))
+        ));
+        peer.no_more(&cx).await;
+
+        let observed = AtomicUsize::new(0);
+        let mut observer = |_: &ModernHttpExtensionEvent| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        };
+        let (result, ()) = Box::pin(pair(
+            client.request_final_extension_with_events(
+                &cx,
+                &id,
+                "example/echo",
+                json!({"_meta":{"progressToken":"managed-extension"}}),
+                ManagedExtensionLimits::new(4096, 8192, 0).unwrap(),
+                &mut observer,
+            ),
+            async {
+                peer.mcp(
+                    "server/discover",
+                    "access-one",
+                    extension_discovery(json!({"mode":"raw"})),
+                )
+                .await;
+                let (mut stream, request, _) =
+                    peer.mcp_request("example/echo", "access-one").await;
+                let progress = r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"managed-extension","progress":1}}"#;
+                let terminal = format!(
+                    r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"com.example/raw-result","value":7}}}}"#,
+                    request["id"]
+                );
+                extension_reply(
+                    &mut stream,
+                    "text/event-stream",
+                    &format!("data: {progress}\n\ndata: {terminal}\n\n"),
+                )
+                .await;
+            },
+        ))
+        .await;
+        assert!(matches!(
+            result,
+            Err(ManagedHttpClientError::Request {
+                code: Some(McpErrorCode::InvalidRequest)
+            })
+        ));
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
+        assert!(cx.checkpoint().is_ok());
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
+fn managed_extensions_renewal_rechecks_changed_settings_without_replay() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let (id, builder, _) = managed_extension_builder(&peer);
+        let mut client =
+            ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+        let (first, ()) = Box::pin(pair(
+            client.request_final_extension(&cx, &id, "example/echo", json!({"turn":1})),
+            async {
+                peer.mcp(
+                    "server/discover",
+                    "access-one",
+                    extension_discovery(json!({"mode":"raw"})),
+                )
+                .await;
+                peer.mcp(
+                    "example/echo",
+                    "access-one",
+                    json!({"resultType":"com.example/raw-result","turn":1}),
+                )
+                .await;
+            },
+        ))
+        .await;
+        assert_eq!(first.unwrap().result()["turn"], 1);
+        assert_eq!(client.cached_credential_generation(), Some(1));
+
+        force_renewal(&session);
+        let (refused, ()) = Box::pin(pair(
+            client.request_final_extension(&cx, &id, "example/echo", json!({"turn":2})),
+            async {
+                peer.token("refresh_token", true).await;
+                peer.mcp(
+                    "server/discover",
+                    "access-two",
+                    extension_discovery(json!({"mode":"changed-after-renewal"})),
+                )
+                .await;
+            },
+        ))
+        .await;
+        assert!(matches!(refused, Err(ManagedHttpClientError::Connection)));
+        assert_eq!(client.cached_credential_generation(), None);
+        assert_eq!(session.credential(&cx).await.unwrap().generation(), 2);
+        peer.no_more(&cx).await;
+
+        // An explicit later operation may discover compatible settings under
+        // the new grant. The failed operation is never replayed or returned.
+        let (fresh, ()) = Box::pin(pair(
+            client.request_final_extension(&cx, &id, "example/echo", json!({"turn":3})),
+            async {
+                peer.mcp(
+                    "server/discover",
+                    "access-two",
+                    extension_discovery(json!({"mode":"raw"})),
+                )
+                .await;
+                let (mut stream, request, _) =
+                    peer.mcp_request("example/echo", "access-two").await;
+                assert_eq!(request["params"]["turn"], 3);
+                reply(
+                    &mut stream,
+                    200,
+                    json!({
+                        "jsonrpc":"2.0","id":request["id"],
+                        "result":{"resultType":"com.example/raw-result","turn":3}
+                    }),
+                )
+                .await;
+            },
+        ))
+        .await;
+        assert_eq!(fresh.unwrap().result()["turn"], 3);
+        assert_eq!(client.cached_credential_generation(), Some(2));
+        peer.no_more(&cx).await;
+    });
+}
+
+#[test]
+fn managed_extensions_notifications_use_fresh_proof_and_do_not_allocate_request_ids() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let session = peer.login(&cx).await;
+        let (id, builder, resolutions) = managed_extension_builder(&peer);
+        let mut client =
+            ManagedHttpClient::new(session.clone(), builder, Duration::from_secs(30)).unwrap();
+        for value in [1, 2] {
+            let before = resolutions.load(Ordering::SeqCst);
+            let (sent, ()) = Box::pin(pair(
+                client.notify_final_extension(
+                    &cx,
+                    &id,
+                    "example/events",
+                    json!({"value":value}),
+                ),
+                async {
+                    if value == 1 {
+                        peer.mcp(
+                            "server/discover",
+                            "access-one",
+                            extension_discovery(json!({"mode":"raw"})),
+                        )
+                        .await;
+                    }
+                    let (mut stream, request) = peer.next().await;
+                    assert_eq!(request.target, "/mcp");
+                    assert_eq!(request.headers["authorization"], "Bearer access-one");
+                    for name in [
+                        "mcp-protocol-version",
+                        "mcp-method",
+                        "mcp-name",
+                        "mcp-session-id",
+                    ] {
+                        assert!(!request.headers.contains_key(name));
+                    }
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    assert_eq!(
+                        body,
+                        json!({
+                            "jsonrpc":"2.0",
+                            "method":"example/events",
+                            "params":{
+                                "value":value,
+                                "_meta":{"com.example/proof":{"mode":"raw"}}
+                            }
+                        })
+                    );
+                    stream.write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+                    stream.shutdown().await.unwrap();
+                },
+            ))
+            .await;
+            sent.unwrap();
+            let after = resolutions.load(Ordering::SeqCst);
+            if value == 1 {
+                assert!(after > before);
+            } else {
+                assert_eq!(after, before + 1, "every message needs fresh compatibility proof");
+            }
+        }
+        let (result, ()) = Box::pin(pair(
+            client.request_final_extension(&cx, &id, "example/echo", json!({})),
+            async {
+                let (mut stream, request, _) =
+                    peer.mcp_request("example/echo", "access-one").await;
+                assert_eq!(request["id"], 2, "only discovery consumed an earlier request ID");
+                reply(
+                    &mut stream,
+                    200,
+                    json!({
+                        "jsonrpc":"2.0","id":request["id"],
+                        "result":{"resultType":"com.example/raw-result","value":9}
+                    }),
+                )
+                .await;
+            },
+        ))
+        .await;
+        assert_eq!(result.unwrap().result()["value"], 9);
+
+        let before = resolutions.load(Ordering::SeqCst);
+        assert!(
+            client
+                .notify_final_extension(
+                    &cx,
+                    &id,
+                    "example/events",
+                    json!({"value":3,"_meta":{"com.example/proof":{"mode":"forged"}}}),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(resolutions.load(Ordering::SeqCst), before);
+        assert_eq!(client.cached_credential_generation(), None);
+        assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
         peer.no_more(&cx).await;
     });
 }
