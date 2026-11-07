@@ -1136,6 +1136,62 @@ store. That profile also honors the native certificate provider's
 `SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
 and do not disable certificate or hostname verification.
 
+### Enterprise assertion and token-response admission (native, opt-in)
+
+Enable `enterprise-auth` to use
+`fastmcp_rust::http_auth::enterprise`. Its three modules keep independently
+configured trust, cryptographic verification, and response handling separate:
+
+- `policy::EnterpriseProfile::from_documents` admits both authorization
+  servers and both preregistered clients. It checks their exact issuers,
+  endpoints, grant declarations and confidential-client methods. OIDC and
+  ID-JAG signing authority are configured separately.
+- `verification` verifies real RS256 signatures under distinct OIDC and
+  ID-JAG key types. It checks exact audience/client/resource bindings,
+  configured tenancy, nonce, optional OIDC `at_hash`, and bounded lifetimes.
+  NumericDate fractions and exponents are evaluated exactly without floats.
+- `response` composes that verification with bounded HTTP/JSON admission.
+  OIDC code responses, ID-JAG responses and final access-token responses have
+  distinct accepted shapes. Signed scope narrowing must agree with the
+  top-level grant, and the final response must name the exact scalar resource
+  and explicit scope subset.
+
+With an already-admitted profile, independently imported ID-JAG keys, and a
+response obtained from the selected trusted endpoint:
+
+```rust
+use std::time::SystemTime;
+use fastmcp_rust::http_auth::enterprise::{
+    response::{EnterpriseResponsePolicy, EnterpriseTokenResponse},
+    verification::{ResourceTenantExpectation, TenantExpectation},
+};
+
+let admitted = profile.admit_id_jag_response(
+    EnterpriseTokenResponse { status, headers, body },
+    &id_jag_keys,
+    TenantExpectation::SingleTenant,
+    ResourceTenantExpectation::SingleTenant,
+    EnterpriseResponsePolicy::default(),
+    SystemTime::now(),
+)?;
+```
+
+The result distinguishes success, a redacted OAuth denial, and a bounded
+first-stage step-up indication. Step-up never automatically launches a browser
+or reuses an assertion. Successful owners keep compact tokens private in
+zeroizing memory and have no Clone, Debug, serialization or bearer-header
+conversion. An admitted ID-JAG owner is consumed when validating a final
+response; its original scope request, signed IdP grant and final grant remain
+separate. Missing cache-prevention headers produce bounded diagnostics, while
+conflicting or explicitly cacheable policies are rejected.
+
+These are local validation operations, not a complete enterprise sign-in
+client. They perform no network exchange and do not activate the MCP extension.
+Framework-owned OIDC acquisition, confidential credential providers, subject
+mapping, durable assertion/replay custody and deployment attestations remain
+required before activation. SAML and durable/distributed server Task stores
+remain separate incomplete extension work.
+
 ### Sender-constrained credentials: DPoP (RFC 9449), caller-driven
 
 `fastmcp_rust::http_auth::dpop` is a **public, explicit, caller-driven** API for

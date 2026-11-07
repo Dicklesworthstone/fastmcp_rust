@@ -587,6 +587,41 @@ async fn active<T>(
     .await
 }
 
+/// Reuses resource discovery's bounded challenge grammar for a Basic denial.
+/// Other schemes may coexist, but exactly one Basic challenge needs its realm.
+#[cfg(all(not(target_arch = "wasm32"), feature = "enterprise-auth"))]
+pub(crate) fn admits_one_basic_challenge(headers: &[(String, String)]) -> bool {
+    let Ok(combined) = combine_challenge_headers(headers) else {
+        return false;
+    };
+    let mut parser = ChallengeParser {
+        text: &combined,
+        offset: 0,
+        count: 0,
+    };
+    let mut basic = 0;
+    loop {
+        match parser.next() {
+            Ok(Some(challenge)) => {
+                if challenge.scheme.eq_ignore_ascii_case("Basic") {
+                    basic += 1;
+                    if basic > 1
+                        || challenge.token68
+                        || !challenge.parameters.iter().any(|(name, _)| name == "realm")
+                        || challenge.parameters.iter().any(|(name, value)| {
+                            name == "charset" && !value.eq_ignore_ascii_case("UTF-8")
+                        })
+                    {
+                        return false;
+                    }
+                }
+            }
+            Ok(None) => return basic == 1,
+            Err(_) => return false,
+        }
+    }
+}
+
 struct ParsedChallenge<'a> {
     scheme: &'a str,
     token68: bool,
