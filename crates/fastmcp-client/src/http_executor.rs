@@ -1222,10 +1222,26 @@ impl ModernHttpResponseStream {
         cx: &Cx,
         maximum_bytes: usize,
     ) -> Result<Option<ModernHttpErrorBody>, ModernHttpExecutorError> {
+        let cancellation = McpRequestCancellation::new();
+        self.read_error_body_with_cancellation(cx, &cancellation, maximum_bytes)
+            .await
+    }
+
+    /// Reads and classifies a bounded error body under one request-local
+    /// cancellation domain. A peer withholding an error payload cannot retain
+    /// the request after cancellation or affect sibling HTTP connections.
+    pub async fn read_error_body_with_cancellation(
+        self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        maximum_bytes: usize,
+    ) -> Result<Option<ModernHttpErrorBody>, ModernHttpExecutorError> {
         let Some(admission) = self.metadata().error_body_admission() else {
             return Ok(None);
         };
-        let body = self.read_to_end(cx, maximum_bytes).await?;
+        let body = self
+            .read_to_end_with_cancellation(cx, cancellation, maximum_bytes)
+            .await?;
         Ok(Some(match admission {
             ModernHttpErrorBodyAdmission::JsonRpcError => {
                 match decode_strict_jsonrpc_response(&body, maximum_bytes) {
@@ -6245,6 +6261,7 @@ impl ClientHttpConnection {
     pub(crate) async fn request_final_extension_json_with_result_source_at(
         &mut self,
         cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
         extension_id: &fastmcp_protocol::ExtensionId,
         method: &str,
         parameters: serde_json::Value,
@@ -6267,7 +6284,7 @@ impl ClientHttpConnection {
         let received = self
             .request_json_with_result_source_at_inner(
                 cx,
-                None,
+                cancellation,
                 ModernRequestAdmission::FinalExtension(method),
                 parameters,
                 request_id,
@@ -6388,13 +6405,10 @@ impl ClientHttpConnection {
                         ));
                     }
                 };
-                debug_assert!(
-                    cancellation.is_none(),
-                    "the final extension surface has no request-local cancellation entry"
-                );
                 client
                     .execute_admitted_final_extension_request(
                         cx,
+                        cancellation,
                         method,
                         parameters,
                         request_id.clone(),
@@ -6453,6 +6467,7 @@ impl ClientHttpConnection {
                     ModernHttpResponseKind::HttpFailure if response.metadata().status() == 400 => {
                         Err(Self::classify_http_bad_request(
                             cx,
+                            cancellation,
                             response,
                             request_id,
                             maximum_response_bytes,
@@ -6468,9 +6483,11 @@ impl ClientHttpConnection {
     /// Classifies a modern HTTP 400 by its bounded JSON-RPC error body. Only
     /// the exact pre-dispatch header mismatch for this request becomes
     /// [`ClientHttpConnectionError::ParameterHeaderMismatch`]; any other body,
-    /// or a body that cannot be read, keeps the generic refusal.
+    /// or a body that cannot be read, keeps the generic refusal. Cancellation
+    /// retains its own outcome even while an error body is incomplete.
     async fn classify_http_bad_request(
         cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
         response: ModernHttpResponseStream,
         request_id: RequestId,
         maximum_response_bytes: usize,
@@ -6478,10 +6495,22 @@ impl ClientHttpConnection {
         let generic = ClientHttpConnectionError::ExpectedJsonResponse {
             actual: ModernHttpResponseKind::HttpFailure,
         };
-        let Ok(Some(ModernHttpErrorBody::JsonRpcError(body))) =
-            response.read_error_body(cx, maximum_response_bytes).await
-        else {
-            return generic;
+        let body = match cancellation {
+            Some(cancellation) => {
+                response
+                    .read_error_body_with_cancellation(cx, cancellation, maximum_response_bytes)
+                    .await
+            }
+            None => response.read_error_body(cx, maximum_response_bytes).await,
+        };
+        let body = match body {
+            Ok(Some(ModernHttpErrorBody::JsonRpcError(body))) => body,
+            Err(ModernHttpExecutorError::Cancelled) => {
+                return ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::Cancelled,
+                ));
+            }
+            _ => return generic,
         };
         let header_mismatch = body
             .id
@@ -8437,11 +8466,14 @@ impl ModernHttpClient {
     async fn execute_admitted_final_extension_request(
         &self,
         cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
         method: &str,
         parameters: serde_json::Value,
         request_id: RequestId,
     ) -> Result<ModernHttpResponseStream, ModernHttpClientError> {
-        if cx.checkpoint().is_err() {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(ModernHttpClientError::Executor(
                 ModernHttpExecutorError::Cancelled,
             ));
@@ -8470,7 +8502,13 @@ impl ModernHttpClient {
             Some(request_id),
             client_extensions.as_ref(),
         )?;
-        self.execute_post_discovery_request(cx, &request).await
+        match cancellation {
+            Some(cancellation) => {
+                self.execute_post_discovery_request_with_cancellation(cx, cancellation, &request)
+                    .await
+            }
+            None => self.execute_post_discovery_request(cx, &request).await,
+        }
     }
 
     async fn request_with_cancellation(

@@ -170,6 +170,174 @@ fn typed_extension_http_client_preserves_payload_only_result() {
     );
 }
 
+struct CancellableScaleHandler(Arc<NotificationObservations>);
+
+impl fastmcp_rust::extensions::authoring::ExtensionHandler<ScaleRequest, ScaleResponse, Settings>
+    for CancellableScaleHandler
+{
+    fn handle<'a>(
+        &'a self,
+        context: ExtensionContext<'a, Settings>,
+        request: ScaleRequest,
+    ) -> fastmcp_rust::BoxFuture<'a, McpResult<ScaleResponse>> {
+        Box::pin(async move {
+            let mut guard = NotificationGuard {
+                observations: Arc::clone(&self.0),
+                completed: false,
+            };
+            self.0.started.fetch_add(1, Ordering::SeqCst);
+            if request.value == 7 {
+                std::future::pending::<()>().await;
+            }
+            asupersync::runtime::yield_now().await;
+            context.checkpoint()?;
+            self.0.completed.fetch_add(1, Ordering::SeqCst);
+            guard.completed = true;
+            Ok(ScaleResponse {
+                value: request.value * context.settings().multiplier,
+            })
+        })
+    }
+}
+
+#[test]
+fn typed_extension_http_cancellation_settles_handler_and_preserves_client() {
+    use fastmcp_rust::{McpErrorCode, McpRequestCancellation};
+    use std::future::Future;
+    use std::task::Poll;
+
+    let observations = Arc::new(NotificationObservations::default());
+    let retained = Arc::clone(&observations);
+    let runtime = RuntimeBuilder::current_thread()
+        .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().unwrap();
+        asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+            let registration = builder()
+                .typed_request(
+                    METHOD,
+                    "scale-params-v1",
+                    "scale-result-v1",
+                    CancellableScaleHandler(Arc::clone(&observations)),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let server = modern::ServerBuilder::new("cancellable-typed-result", "1.0")
+                .extension(registration)
+                .unwrap()
+                .try_build()
+                .unwrap();
+            let bound = server.bind_http(&cx, "127.0.0.1:0").await.unwrap();
+            let endpoint =
+                CanonicalHttpUrl::parse(&format!("http://{}/mcp", bound.local_addr().unwrap()))
+                    .unwrap();
+            let (ready, mut receiver) = asupersync::channel::oneshot::channel();
+            let mut serving = cx
+                .spawn(move |server_cx| async move {
+                    ready.send(&server_cx, server_cx.clone()).unwrap();
+                    bound.serve(&server_cx).await
+                })
+                .unwrap();
+            let server_cx = receiver.recv(&cx).await.unwrap();
+            let (id, descriptors, discovery) = client_configuration();
+            let mut client = modern::ClientBuilder::new()
+                .extension_registry(descriptors, discovery, || accept_settings)
+                .unwrap()
+                .connect_http_with_cx(&cx, endpoint)
+                .await
+                .unwrap();
+
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            let error = client
+                .request_final_extension_with_cancellation(
+                    &cx,
+                    &cancelled,
+                    &id,
+                    METHOD,
+                    json!({"value": 5}),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, fastmcp_rust::HttpClientError::CoreResult(error)
+                if error.code == McpErrorCode::RequestCancelled));
+            assert_eq!(observations.started.load(Ordering::SeqCst), 0);
+
+            let cancellation = McpRequestCancellation::new();
+            let mut request = Box::pin(client.request_final_extension_with_cancellation(
+                &cx,
+                &cancellation,
+                &id,
+                METHOD,
+                json!({"value": 7}),
+            ));
+            while observations.started.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    std::future::poll_fn(|task| Poll::Ready(request.as_mut().poll(task)))
+                        .await
+                        .is_pending(),
+                    "the typed handler must start before cancellation"
+                );
+                asupersync::runtime::yield_now().await;
+            }
+            cancellation.cancel();
+            let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), request)
+                .await
+                .expect("cancellation does not wait for the handler's result")
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                fastmcp_rust::HttpClientError::Connection(
+                    fastmcp_rust::ClientHttpConnectionError::Modern(
+                        fastmcp_rust::ModernHttpClientError::Executor(
+                            fastmcp_rust::ModernHttpExecutorError::Cancelled
+                        )
+                    )
+                )
+            ));
+            assert!(cx.checkpoint().is_ok());
+            let live = McpRequestCancellation::new();
+            let result = client
+                .request_final_extension_with_cancellation(
+                    &cx,
+                    &live,
+                    &id,
+                    METHOD,
+                    json!({"value": 11}),
+                )
+                .await
+                .expect("the same client remains usable with fresh request custody");
+            assert_eq!(result, json!({"value": 33}));
+            assert!(!live.is_cancel_requested());
+            asupersync::time::timeout(cx.now(), Duration::from_secs(2), async {
+                while observations.abandoned.load(Ordering::SeqCst) == 0 {
+                    asupersync::runtime::yield_now().await;
+                }
+            })
+            .await
+            .expect("disconnect settles the cancelled typed handler before listener shutdown");
+            drop(client);
+            server_cx.cancel_with(
+                asupersync::types::CancelKind::Shutdown,
+                Some("typed extension cancellation complete"),
+            );
+            assert!(matches!(
+                serving.join(&cx).await.unwrap().unwrap(),
+                fastmcp_rust::HttpServerShutdown::Quiescent
+            ));
+        })
+        .await
+        .expect("bounded typed extension cancellation and cleanup");
+    });
+    assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    assert_eq!(retained.started.load(Ordering::SeqCst), 2);
+    assert_eq!(retained.completed.load(Ordering::SeqCst), 1);
+    assert_eq!(retained.abandoned.load(Ordering::SeqCst), 1);
+}
+
 fn duplex_registration(
     calls: Arc<AtomicUsize>,
     observations: Arc<NotificationObservations>,

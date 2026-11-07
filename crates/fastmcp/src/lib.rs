@@ -5911,6 +5911,29 @@ pub mod modern {
                 .await
         }
 
+        /// Calls one negotiated extension under a request-local cancellation
+        /// domain. Cancellation covers the HTTP response headers and JSON/SSE
+        /// body, closes only this request's connection, and leaves the client
+        /// and caller context available for independent work.
+        pub async fn request_final_extension_with_cancellation(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            extension_id: &fastmcp_protocol::ExtensionId,
+            method: &str,
+            parameters: JsonValue,
+        ) -> Result<JsonValue, HttpClientError> {
+            self.inner
+                .request_final_extension_with_cancellation(
+                    cx,
+                    cancellation,
+                    extension_id,
+                    method,
+                    parameters,
+                )
+                .await
+        }
+
         /// Publishes one configured extension notification with fresh settings proof.
         /// The HTTP exchange must acknowledge notification acceptance without
         /// a JSON-RPC response. No request ID or response waiter is allocated.

@@ -16601,13 +16601,58 @@ impl HttpClient {
         method: &str,
         parameters: serde_json::Value,
     ) -> Result<serde_json::Value, HttpClientError> {
+        self.request_final_extension_with_optional_cancellation(
+            cx,
+            None,
+            extension_id,
+            method,
+            parameters,
+        )
+        .await
+    }
+
+    /// Sends one admitted extension request under a caller-owned cancellation
+    /// domain, including response-header, JSON-body and SSE waits.
+    ///
+    /// A pre-cancelled request allocates no ID and contacts no peer. Cancelling
+    /// a live exchange closes only its disposable HTTP connection; it does not
+    /// cancel the caller's context, revoke extension negotiation, or replay the
+    /// request. A later request can reuse this client with a fresh token.
+    pub async fn request_final_extension_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<serde_json::Value, HttpClientError> {
+        self.request_final_extension_with_optional_cancellation(
+            cx,
+            Some(cancellation),
+            extension_id,
+            method,
+            parameters,
+        )
+        .await
+    }
+
+    async fn request_final_extension_with_optional_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        extension_id: &fastmcp_protocol::ExtensionId,
+        method: &str,
+        parameters: serde_json::Value,
+    ) -> Result<serde_json::Value, HttpClientError> {
         // This preflight fences request-ID allocation for negative admission.
         // The HTTP execution seam repeats the same immutable registry check
         // so no ordinary core/raw request path can select its extension lane.
         self.connection
             .admit_final_extension_method(extension_id, method)
             .map_err(HttpClientError::CoreResult)?;
-        if cx.checkpoint().is_err() {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(HttpClientError::CoreResult(McpError::request_cancelled()));
         }
         let request_id = self.next_request_id()?;
@@ -16620,6 +16665,7 @@ impl HttpClient {
             self.connection
                 .request_final_extension_json_with_result_source_at(
                     cx,
+                    cancellation,
                     extension_id,
                     method,
                     parameters,
@@ -41498,6 +41544,343 @@ exec sleep 2
                 }
                 Err(error) => panic!("unexpected raw extension no-contact accept error: {error}"),
             }
+        }
+    }
+
+    #[cfg(unix)]
+    fn accept_raw_extension_http_peer(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "extension peer accept timed out");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("extension peer accept failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pending_extension_http<F: std::future::Future>(
+        pending: &mut Pin<Box<F>>,
+        ready: &mpsc::Receiver<()>,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        std::future::poll_fn(|task| {
+            assert!(
+                pending.as_mut().poll(task).is_pending(),
+                "the peer has not completed this response"
+            );
+            match ready.try_recv() {
+                Ok(()) => Poll::Ready(()),
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "extension request did not reach peer"
+                    );
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                Err(error) => panic!("extension peer stopped before request: {error}"),
+            }
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_http_pre_cancel_preserves_admission_ids_and_peer_contact() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = std::thread::spawn(move || {
+            let mut discovery = accept_raw_extension_http_peer(&listener);
+            assert_eq!(
+                read_http_cache_test_request(&mut discovery)["method"],
+                "server/discover"
+            );
+            write_http_cache_test_response(
+                &mut discovery,
+                "application/json",
+                extension_result_pair_discovery_response().as_bytes(),
+            );
+            let mut request = accept_raw_extension_http_peer(&listener);
+            let body = read_http_cache_test_request(&mut request);
+            assert_eq!(body["method"], "example/echo");
+            assert_eq!(body["id"], 2, "refused requests cannot consume an ID or post");
+            assert_eq!(body["params"]["input"], "owner-check");
+            write_http_cache_test_response(
+                &mut request,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"com.example/other-result","value":21}}"#,
+            );
+            let mut request = accept_raw_extension_http_peer(&listener);
+            let body = read_http_cache_test_request(&mut request);
+            assert_eq!(body["method"], "example/echo");
+            assert_eq!(body["id"], 3);
+            assert_eq!(body["params"]["input"], "accepted");
+            write_http_cache_test_response(
+                &mut request,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"com.example/raw-result","value":21}}"#,
+            );
+            assert_no_raw_extension_http_post(&listener);
+        });
+        http_test_runtime_block_on(async {
+            let cx = Cx::current().unwrap();
+            let (id, registry, discovery) = extension_result_pair_configuration();
+            let mut client = ClientBuilder::new()
+                .protocol_plan(http_cache_test_plan(&target))
+                .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_http_client_with_cx(&cx)
+                .await
+                .unwrap();
+            let cancelled = McpRequestCancellation::new();
+            cancelled.cancel();
+            let error = client
+                .request_final_extension_with_cancellation(
+                    &cx,
+                    &cancelled,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({"input":"cancelled"}),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                HttpClientError::CoreResult(error) if error.code == McpErrorCode::RequestCancelled
+            ));
+            assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+
+            let live = McpRequestCancellation::new();
+            for method in ["tools/list", "example/other", "example/missing"] {
+                let error = client
+                    .request_final_extension_with_cancellation(
+                        &cx,
+                        &live,
+                        &id,
+                        method,
+                        serde_json::json!({}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    HttpClientError::CoreResult(error) if error.code == McpErrorCode::InvalidParams
+                ));
+                assert_eq!(client.next_id.load(Ordering::SeqCst), 2);
+            }
+            let error = client
+                .request_final_extension_with_cancellation(
+                    &cx,
+                    &live,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({"input":"owner-check"}),
+                )
+                .await
+                .expect_err("a known result marker still belongs to its own extension");
+            assert!(matches!(
+                error,
+                HttpClientError::Connection(
+                    http_executor::ClientHttpConnectionError::FinalExtensionAdmission(error)
+                ) if error.code == McpErrorCode::InvalidRequest
+            ));
+            let result = client
+                .request_final_extension_with_cancellation(
+                    &cx,
+                    &live,
+                    &id,
+                    "example/echo",
+                    serde_json::json!({"input":"accepted"}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result["value"], 21);
+            assert_eq!(client.next_id.load(Ordering::SeqCst), 4);
+            assert!(cx.checkpoint().is_ok());
+            assert!(!live.is_cancel_requested());
+        });
+        peer.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_ext_http_cancellation_closes_pending_phases_and_preserves_siblings() {
+        for phase in ["headers", "json", "sse", "error"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let (sibling_ready, sibling_observed) = mpsc::channel();
+            let (request_ready, request_observed) = mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let mut discovery = accept_raw_extension_http_peer(&listener);
+                assert_eq!(
+                    read_http_cache_test_request(&mut discovery)["method"],
+                    "server/discover"
+                );
+                write_http_cache_test_response(
+                    &mut discovery,
+                    "application/json",
+                    extension_result_pair_discovery_response().as_bytes(),
+                );
+                let mut sibling = accept_raw_extension_http_peer(&listener);
+                let body = read_http_cache_test_request(&mut sibling);
+                assert_eq!(body["method"], "tools/list");
+                assert_eq!(body["id"], 2);
+                sibling_ready.send(()).unwrap();
+
+                let mut request = accept_raw_extension_http_peer(&listener);
+                let body = read_http_cache_test_request(&mut request);
+                assert_eq!(body["method"], "example/echo");
+                assert_eq!(body["id"], 3);
+                assert_eq!(body["params"]["input"], "pending");
+                if phase != "headers" {
+                    let (status, content_type, prefix) = match phase {
+                        "json" => (
+                            "200 OK",
+                            "application/json",
+                            r#"{"jsonrpc":"2.0","id":3,"result":"#,
+                        ),
+                        "sse" => (
+                            "200 OK",
+                            "text/event-stream",
+                            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":",
+                        ),
+                        "error" => (
+                            "400 Bad Request",
+                            "application/json",
+                            r#"{"jsonrpc":"2.0","id":3,"error":"#,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    write!(request, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{prefix}").unwrap();
+                    request.flush().unwrap();
+                }
+                request_ready.send(()).unwrap();
+                let mut byte = [0_u8; 1];
+                assert_eq!(
+                    request.read(&mut byte).unwrap(),
+                    0,
+                    "cancellation must close the {phase} exchange without another peer byte"
+                );
+                write_http_cache_test_response(
+                    &mut sibling,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                );
+                let mut followup = accept_raw_extension_http_peer(&listener);
+                let body = read_http_cache_test_request(&mut followup);
+                assert_eq!(body["method"], "example/echo");
+                assert_eq!(body["id"], 4, "no replacement POST or rediscovery is allowed");
+                assert_eq!(body["params"]["input"], "after-cancel");
+                write_http_cache_test_response(
+                    &mut followup,
+                    "application/json",
+                    br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"com.example/raw-result","value":33}}"#,
+                );
+                assert_no_raw_extension_http_post(&listener);
+            });
+            http_test_runtime_block_on(async {
+                let cx = Cx::current().unwrap();
+                asupersync::time::timeout(cx.now(), Duration::from_secs(15), async {
+                    let (id, registry, discovery) = extension_result_pair_configuration();
+                    let mut client = ClientBuilder::new()
+                        .protocol_plan(http_cache_test_plan(&target))
+                        .extension_registry(registry, discovery, || accept_raw_extension_settings)
+                        .unwrap()
+                        .connect_http_client_with_cx(&cx)
+                        .await
+                        .unwrap();
+                    let mut sibling = client
+                        .execute_core(
+                            &cx,
+                            "tools/list",
+                            serde_json::json!({}),
+                            http_owned_execution_limits(),
+                        )
+                        .unwrap();
+                    let sibling_control = sibling.control();
+                    let mut sibling_event = Box::pin(sibling.next_event(&cx));
+                    wait_for_pending_extension_http(&mut sibling_event, &sibling_observed).await;
+                    let cancellation = McpRequestCancellation::new();
+                    let mut request = Box::pin(client.request_final_extension_with_cancellation(
+                        &cx,
+                        &cancellation,
+                        &id,
+                        "example/echo",
+                        serde_json::json!({"input":"pending"}),
+                    ));
+                    wait_for_pending_extension_http(&mut request, &request_observed).await;
+                    // Poll the now-delivered partial head/body once more before
+                    // cancelling; no phase supplies a terminal response.
+                    assert!(
+                        std::future::poll_fn(|task| Poll::Ready(request.as_mut().poll(task)))
+                            .await
+                            .is_pending()
+                    );
+                    cancellation.cancel();
+                    let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), request)
+                        .await
+                        .expect("cancellation must not wait for withheld response bytes")
+                        .unwrap_err();
+                    assert!(
+                        matches!(
+                            error,
+                            HttpClientError::Connection(
+                                http_executor::ClientHttpConnectionError::Modern(
+                                    http_executor::ModernHttpClientError::Executor(
+                                        http_executor::ModernHttpExecutorError::Cancelled
+                                    )
+                                )
+                            )
+                        ),
+                        "{phase}: {error:?}"
+                    );
+                    assert!(
+                        cx.checkpoint().is_ok(),
+                        "request cancellation must not cancel Cx"
+                    );
+                    assert!(sibling_control.terminal_reason().is_none());
+                    let http_executor::ModernHttpFinalCoreEvent::Terminal(result) =
+                        sibling_event.await.unwrap().unwrap()
+                    else {
+                        panic!("the independent sibling must receive its terminal result");
+                    };
+                    let result: serde_json::Value =
+                        serde_json::from_str(&CoreResult::Final(result).encode().unwrap()).unwrap();
+                    assert_eq!(result["tools"], serde_json::json!([]));
+                    let live = McpRequestCancellation::new();
+                    let result = client
+                        .request_final_extension_with_cancellation(
+                            &cx,
+                            &live,
+                            &id,
+                            "example/echo",
+                            serde_json::json!({"input":"after-cancel"}),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(result["value"], 33);
+                    assert_eq!(client.next_id.load(Ordering::SeqCst), 5);
+                    assert!(!live.is_cancel_requested());
+                })
+                .await
+                .expect("bounded cancellation, sibling and reuse exchange");
+            });
+            peer.join().unwrap();
         }
     }
 
