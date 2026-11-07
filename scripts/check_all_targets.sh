@@ -34,8 +34,16 @@
 #   3  preflight refused (dirty tracker / moving checkout)
 #
 # USAGE
-#   scripts/check_all_targets.sh [--retries N] [--json]
+#   scripts/check_all_targets.sh [--retries N] [--json] [--dry-run]
 #       [--arm default|all-features|no-default-features|both|all]
+#       [--base <rev>] [--working-tree]
+#
+#   SOURCE: by default every arm builds the COMMITTED revision (HEAD, or
+#   --base <rev>) through `rch exec --base .. --clean-overlay --no-overlay`, so
+#   the receipt binds a revision and the live checkout is never read. Pass
+#   --working-tree for the old behaviour, which rsyncs the working copy and is
+#   therefore void if anything tracked moves during the run -- including the
+#   orchestrator's own `br` flush, which writes a TRACKED .beads/issues.jsonl.
 #
 #   `both` = default + all-features (the cheap pre-submit pair).
 #   `all`  = adds --no-default-features, which bd-yhx86 measured as a THIRD
@@ -47,6 +55,23 @@ RETRIES=3
 JSON=0
 ARM=both
 DRY=0
+# SOURCE MODE. `base` (the default) dispatches
+#   rch exec --base <rev> --clean-overlay --no-overlay
+# so the worker builds a COMMITTED revision and the working tree is never read.
+# `working-tree` is the old behaviour: plain `rch exec`, which rsyncs the live
+# checkout.
+#
+# WHY THE DEFAULT CHANGED. A receipt from working-tree mode is only bindable if
+# nothing tracked changes for the whole run, and that is unattainable here. The
+# orchestrator's own job is to close beads; `br` auto-flushes
+# .beads/issues.jsonl, which is TRACKED; so closing a bead voided the receipt of
+# the gate that exists to support closing beads. Other lanes push every few
+# minutes too -- five commits landed during one run -- and the guard voids on a
+# moved HEAD as well. I voided two consecutive receipts this way.
+#
+# Binding a revision is also the stronger claim, and it is what
+# scripts/verify_batch.sh already does.
+SOURCE_MODE=base
 
 # `${2:?msg}` would exit 1 on a missing OR empty value, reporting a usage error
 # with a code this script documents as something else. Check explicitly so every
@@ -68,6 +93,10 @@ while [ $# -gt 0 ]; do
     # by running them dispatched five multi-arm remote builds. Validate the
     # parsing without touching the fleet.
     --dry-run) DRY=1; shift ;;
+    --working-tree) SOURCE_MODE=working-tree; shift ;;
+    --base)
+      need_value --base "${2:-}"
+      BASE_OVERRIDE="$2"; shift 2 ;;
     -h|--help) sed -n '1,45p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
@@ -106,14 +135,25 @@ LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/check_all_targets.XXXXXX")
 # guard. A safety check that fails silently is worse than one that is absent.
 dirty_fingerprint() { git status --porcelain --untracked-files=no; }
 FP_BEFORE=$(dirty_fingerprint)
-if git status --porcelain --untracked-files=no -- .beads | grep -q .; then
+# Only a working-tree dispatch can be disturbed by a live checkout. In base mode
+# the worker builds from git objects, which are immutable for a given revision,
+# so a concurrent tracker write cannot change what gets compiled.
+if [ "$SOURCE_MODE" = working-tree ] &&
+   git status --porcelain --untracked-files=no -- .beads | grep -q .; then
   echo "PREFLIGHT REFUSED: .beads has tracked modifications, so the checkout is" >&2
-  echo "  probably being mutated. Let the tracker settle, then re-run." >&2
+  echo "  probably being mutated, and --working-tree rsyncs it. Let the tracker" >&2
+  echo "  settle, re-run, or use the default base mode." >&2
   echo "  (Run 'br sync --flush-only' and commit, or wait for the writer.)" >&2
   exit 3
 fi
 
 HEAD_SHA=$(git rev-parse HEAD)
+# Captured ONCE. Everything below binds this revision, so a later HEAD move
+# cannot retroactively change what any arm compiled.
+BASE=$(git rev-parse "${BASE_OVERRIDE:-HEAD}^{commit}" 2>/dev/null) || {
+  echo "--base does not resolve to a commit: ${BASE_OVERRIDE:-HEAD}" >&2
+  exit 64
+}
 TREE_SHA=$(git rev-parse 'HEAD^{tree}')
 DIRTY_RS=$(git status --porcelain --untracked-files=no -- '*.rs' | wc -l | tr -d ' ')
 
@@ -134,7 +174,12 @@ run_arm() {
     # Deliberately NOT pinning a worker: RCH sizes some commands at 8 cores and
     # a pinned 3-slot box can never satisfy that (RCH-I003 no_free_slots) even
     # with most of the fleet idle. Let the scheduler pick.
-    rch exec -- cargo check --workspace --all-targets "$@" >"$log" 2>&1
+    if [ "$SOURCE_MODE" = base ]; then
+      rch exec --base "$BASE" --clean-overlay --no-overlay -- \
+        cargo check --workspace --all-targets "$@" >"$log" 2>&1
+    else
+      rch exec -- cargo check --workspace --all-targets "$@" >"$log" 2>&1
+    fi
     # The wrapper's exit status can mask the remote one; this line is the
     # authoritative remote exit, and its ABSENCE means no verdict at all.
     remote=$(strip_ansi <"$log" | grep -oE 'Remote command finished: exit=[0-9]+' | tail -1 | grep -oE '[0-9]+$')
@@ -203,6 +248,11 @@ run_and_record() {
 
 if [ "$DRY" -eq 1 ]; then
   echo "dry run: arm selection '$ARM', retries $RETRIES, json $JSON"
+  if [ "$SOURCE_MODE" = base ]; then
+    echo "would dispatch: rch exec --base $BASE --clean-overlay --no-overlay --"
+  else
+    echo "would dispatch: rch exec --   (LIVE WORKING TREE; receipt not bindable)"
+  fi
   echo "would run:"
   { [ "$ARM" = both ] || [ "$ARM" = all ] || [ "$ARM" = default ]; } &&
     echo "  cargo check --workspace --all-targets"
@@ -246,13 +296,21 @@ for i in "${!NAMES[@]}"; do
 done
 # Explicit if, not `[ a ] && [ b ] && assign`: I flagged that precedence trap
 # in this file's own comments and should not then rely on it.
-if [ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ]; then
+#
+# A MOVED CHECKOUT ONLY VOIDS A WORKING-TREE DISPATCH. In base mode every arm
+# compiled the committed revision in $BASE, which no later edit or push can
+# alter, so the verdict still binds and movement is reported as a note rather
+# than discarding a real result. That distinction is the whole point of the
+# default source mode: the old behaviour could not tell "a tracked file that is
+# not a compile input changed" (the orchestrator flushing the bead tracker) from
+# "the source moved", and voided a green for the former.
+if [ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ] && [ "$SOURCE_MODE" = working-tree ]; then
   status=2
 fi
 
 if [ "$JSON" -eq 1 ]; then
-  printf '{"head":"%s","tree":"%s","dirty_rs":%s,"checkout_moved":%s,"arms":[' \
-    "$HEAD_SHA" "$TREE_SHA" "$DIRTY_RS" "$MOVED"
+  printf '{"head":"%s","tree":"%s","source_mode":"%s","base":"%s","dirty_rs":%s,"checkout_moved":%s,"arms":[' \
+    "$HEAD_SHA" "$TREE_SHA" "$SOURCE_MODE" "$BASE" "$DIRTY_RS" "$MOVED"
   for i in "${!NAMES[@]}"; do
     [ "$i" -gt 0 ] && printf ','
     printf '{"arm":"%s","verdict":"%s","remote_exit":"%s","members_reached":"%s","error_lines":"%s","could_not_compile":"%s","log":"%s"}' \
@@ -262,18 +320,34 @@ if [ "$JSON" -eq 1 ]; then
 else
   echo
   echo "compile gate -- HEAD $HEAD_SHA tree $TREE_SHA dirty_rs=$DIRTY_RS"
+  if [ "$SOURCE_MODE" = base ]; then
+    echo "  source: committed revision $BASE (rch --base --clean-overlay --no-overlay);"
+    echo "          the working tree was NOT read, so this receipt binds that revision."
+  else
+    echo "  source: LIVE WORKING TREE (--working-tree); this receipt binds no revision"
+    echo "          on its own and is void if anything tracked moved."
+  fi
   for i in "${!NAMES[@]}"; do
     printf '  %-13s %-5s remote_exit=%-3s members_reached=%-3s error_lines=%-3s could_not_compile=%-3s\n' \
       "${NAMES[$i]}" "${VERDICTS[$i]}" "${EXITS[$i]:--}" "${MEMBERS[$i]:--}" "${ERRS[$i]:--}" "${CNCS[$i]:--}"
     echo "                log: ${LOGS[$i]}"
   done
-  [ "$MOVED" -eq 1 ] && echo "  WARNING: the checkout moved during the run; this receipt is not bindable."
+  if [ "$MOVED" -eq 1 ]; then
+    if [ "$SOURCE_MODE" = base ]; then
+      echo "  NOTE: the checkout moved during the run (a tracked file changed or HEAD"
+      echo "        advanced). The verdicts above are UNAFFECTED: every arm compiled"
+      echo "        $BASE from git objects, which no later edit can alter."
+    else
+      echo "  WARNING: the checkout moved during the run; this receipt is not bindable."
+    fi
+  fi
   case $status in
     0) echo "  RESULT: green (every requested arm compiled)" ;;
     1) echo "  RESULT: RED -- at least one arm compiled and FAILED, with compiler"
        echo "          diagnostics to prove it. Note members_reached: cargo stops"
        echo "          scheduling after a failure, so the red set is a FLOOR, not a count." ;;
-    2) echo "  RESULT: NO VERDICT (void or moving checkout). This is NOT a red; retry." ;;
+    2) echo "  RESULT: NO VERDICT (void, or a moving checkout in --working-tree mode)."
+       echo "          This is NOT a red; retry." ;;
   esac
 fi
 
