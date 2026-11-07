@@ -1,19 +1,20 @@
 //! Enterprise-managed authorization building blocks for native clients.
 //!
 //! This module keeps IdP and resource-AS registrations, signing-key purposes and
-//! token-response stages distinct. Bounded duplicate-aware JSON admission
-//! precedes typed decoding. Assertions receive real RS256 verification; private
-//! zeroizing response owners expose no compact token or credential conversion.
+//! token-response stages distinct. The OIDC codec connects a generated GET,
+//! callback, protected code form and signed response. Bounded duplicate-aware
+//! admission precedes typed decoding; verified assertion owners retain no
+//! public compact-token or bearer conversion.
 //!
-//! These are local policy, response-validation and read-only mapping operations.
-//! They do not activate the MCP extension, acquire browser assertions, dispatch
-//! exchanges, attest a deployment, or install an MCP bearer credential.
-//! Framework-owned OIDC acquisition, confidential credential custody, durable
-//! one-use stores and deployment policy attestation remain separate work.
-//! A local subject lookup does not establish exchange provenance, a durable
-//! mapping receipt, replay reservation or authorization.
+//! These are local codecs, policy checks and read-only mapping operations.
+//! They do not activate the MCP extension, launch a browser, dispatch HTTP,
+//! attest a deployment or install an MCP credential. Durable browser-flow and
+//! replay custody, confidential credential providers and independently attested
+//! deployment/identity authority remain separate work. A local byte digest or
+//! subject lookup is not a launch, dispatch or authorization receipt.
 
 pub mod identity;
+pub mod oidc;
 pub mod policy;
 pub mod response;
 

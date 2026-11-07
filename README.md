@@ -1136,17 +1136,21 @@ store. That profile also honors the native certificate provider's
 `SSL_CERT_FILE` and `SSL_CERT_DIR` overrides; these select the trust source,
 and do not disable certificate or hostname verification.
 
-### Enterprise assertion and token-response admission (native, opt-in)
+### Enterprise authorization components (native, opt-in)
 
 Enable `enterprise-auth` to use
 `fastmcp_rust::http_auth::enterprise`. Its modules keep independently
-configured trust, cryptographic verification, response handling and local
-identity resolution separate:
+configured trust, OIDC code-flow handling, cryptographic verification,
+response admission and local identity resolution separate:
 
 - `policy::EnterpriseProfile::from_documents` admits both authorization
   servers and both preregistered clients. It checks their exact issuers,
   endpoints, grant declarations and confidential-client methods. OIDC and
   ID-JAG signing authority are configured separately.
+- `oidc::OidcCodeFlowConfiguration` admits the strict web/code/query/S256
+  registration and the original IdP permission to request `openid`. It generates
+  independent state, nonce and verifier values under the caller's capability
+  and time budget, then serializes an exact authorization GET.
 - `verification` verifies real RS256 signatures under distinct OIDC and
   ID-JAG key types. It checks exact audience/client/resource bindings,
   configured tenancy, nonce, optional OIDC `at_hash`, and bounded lifetimes.
@@ -1162,6 +1166,23 @@ identity resolution separate:
   relationships, trust domains and client-ID scope. Pairwise subject strings
   may differ; matching text never creates an account association. Lookup is
   bounded and uses an ordered index, with no create, link or update operation.
+
+The local OIDC sequence is
+`OidcCodeFlowConfiguration::prepare` →
+`PreparedOidcAuthorization::admit_callback` →
+`OidcCodeGrant::write_token_form` →
+`OidcCodeResponseAdmission::admit_token_response`. Callback admission checks
+the exact route, state, issuer and decoded parameter uniqueness. Code forms
+contain only the grant, code, redirect URI and verifier. Each stage consumes
+its owner; a partial form write cannot produce a response-admission owner.
+The final validator retains the generated nonce and selected client/tenant
+expectations, and composes them with real signed-response verification.
+
+This codec exposes the authorization URL for an external browser adapter and
+writes the code form to a caller-selected confidential sink. That sink can
+observe the code/verifier and must erase its buffers. Confidential client
+authentication and HTTP dispatch are separate; local byte digests do not
+establish launch or transport provenance.
 
 With an already-admitted profile, independently imported ID-JAG keys, and a
 response obtained from the selected trusted endpoint:
@@ -1204,8 +1225,8 @@ and the locally retained final token. The ordinary verification method keeps
 its closed claim set; actor, subject-alias, RAR and sender-constraining claims
 cannot be enabled through this policy.
 
-These are local validation operations, not a complete enterprise sign-in
-client. They perform no network exchange and do not activate the MCP extension.
+These components do not yet provide complete enterprise sign-in. They perform
+no network exchange and do not activate the MCP extension.
 The mapping table supports public and redirect-host pairwise OIDC subject
 namespaces. It rechecks the current profile, selected snapshot, signed token
 bindings and review/claim lifetimes on every lookup; results retain the exact
@@ -1213,9 +1234,9 @@ token and snapshot digests. A local snapshot digest does not establish a
 rollback-resistant policy fence or prove that responses came from one exchange.
 Guarded sector-document retrieval remains separate work.
 
-Framework-owned OIDC acquisition, confidential credential providers, attested
-mapping authority, durable assertion/replay custody and deployment attestations
-remain required before activation. SAML and durable/distributed server Task stores
+Durable browser launch/callback custody, confidential credential providers,
+the native token-exchange driver, attested mapping authority and durable
+assertion/replay protection remain required before activation. SAML and durable/distributed server Task stores
 remain separate incomplete extension work.
 
 ### Sender-constrained credentials: DPoP (RFC 9449), caller-driven
