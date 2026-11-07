@@ -1238,6 +1238,45 @@ token and snapshot digests. A local snapshot digest does not establish a
 rollback-resistant policy fence or prove that responses came from one exchange.
 Guarded sector-document retrieval remains separate work.
 
+#### Protected persistent records
+
+`fastmcp_rust::persistent::PersistentBlobStore` provides asynchronous `create`,
+`read` and `replace` operations over a configured external encryption provider,
+transactional blob store and registered restore authority. These operations use
+the caller's context and deadline and share finite operation and buffer budgets.
+
+- Creation inserts a new random record ID only if it is absent. Replacement
+  compares the complete expected revision; it never performs an unrestricted
+  upsert.
+- Every write durably prepares its restore intent before encryption. The store
+  atomically commits the exact ciphertext, revision and intent under the durable
+  restore fence, and the authority verifies the commit proof before the caller
+  receives the new revision.
+- Reads require an exact `PersistentBlobRevision` retained in trusted
+  application control state. Canonical framing, the admitted key generation,
+  ciphertext digest and authenticated record context are checked before
+  plaintext is released. Store data cannot choose a newer revision or substitute
+  its own expected context.
+- `BoundedPlaintext` owns a zeroizing allocation. Returned plaintext retains its
+  byte reservation until it is dropped or explicitly transferred to its caller.
+  Limits account for allocation capacity, including spare capacity.
+- A failed comparison returns `Conflict` only after durable evidence proves that
+  the losing operation cannot commit later and the authority settles its intent.
+  Unknown outcomes leave the deployment closed for recovery.
+
+`PersistentEnvelopeBackend` owns the complete persistent key, nonce and AEAD
+implementation. The facade accepts only canonical FMCPBOX version 1 with the
+XC20P suite and constructs typed FMCPENV authenticated context for the fixed
+protected-blob payload purpose. The encryption provider and blob store each
+have independently pinned artifact and configuration identities. No raw
+persistent key is passed into the process-ephemeral protector.
+
+Applications retain the returned revision, including across restart, and
+implement the external provider contracts for their deployment. This is a
+protected-record storage API; native enterprise sign-in, durable OIDC flow
+orchestration, key-provider qualification and epoch migration remain separate
+work.
+
 #### External replay and restore providers
 
 The replay path has three independently implemented provider boundaries:

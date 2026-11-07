@@ -411,7 +411,7 @@ pub mod core {
         draw_nonce_domain_material, draw_security_identifier, draw_websocket_mask, err, ok,
         parse_duration, sha256_bounded,
     };
-    pub use fastmcp_core::{combinator, crypto, limits, logging, uri};
+    pub use fastmcp_core::{combinator, crypto, limits, logging, persistent, restore, uri};
 }
 pub use fastmcp_derive as derive;
 /// Curated core protocol namespaces for advanced consumers.
@@ -581,6 +581,9 @@ pub use fastmcp_core::{
 
 // Module re-exports for namespaced access (`fastmcp_rust::crypto`, `fastmcp_rust::uri`).
 pub use fastmcp_core::{crypto, uri};
+
+/// External protected-record transactions and restore recovery providers.
+pub use fastmcp_core::{persistent, restore};
 
 // Re-export logging module
 pub use fastmcp_core::logging;

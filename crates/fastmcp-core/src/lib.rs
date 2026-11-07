@@ -54,6 +54,8 @@ mod limit_01_rows;
 pub mod logging;
 /// AUTH-00 B security-partition admission and non-oracular lookup.
 pub mod partition;
+/// Protected persistent blob transactions using configured external providers.
+pub mod persistent;
 /// Persistent replay aliases from named external MAC providers.
 pub mod replay;
 /// External restore-authority registration and fenced durable writes.
