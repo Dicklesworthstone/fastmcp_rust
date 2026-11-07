@@ -17822,7 +17822,6 @@ impl StdioRequestExecutor {
     /// Retains the prepared request's originating lifetime even while its
     /// future is not polled. A sibling's service turn must observe this caller's
     /// cancellation and budget without reconstructing admitted metadata.
-    #[cfg(unix)]
     fn execute_prepared_with_cancellation(
         &self,
         cx: &Cx,
@@ -20346,7 +20345,26 @@ impl Client {
         parameters: serde_json::Value,
         allow_tasks: bool,
     ) -> McpResult<StdioFinalMrtrExecution> {
-        if cx.checkpoint().is_err() {
+        self.start_yielding_final_mrtr_request_with_cancellation(
+            cx,
+            None,
+            method,
+            parameters,
+            allow_tasks,
+        )
+    }
+
+    fn start_yielding_final_mrtr_request_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        parameters: serde_json::Value,
+        allow_tasks: bool,
+    ) -> McpResult<StdioFinalMrtrExecution> {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
             return Err(McpError::request_cancelled());
         }
         self.ensure_initialized()?;
@@ -20360,7 +20378,13 @@ impl Client {
                 "Yielding final MRTR requires a modern core method",
             ));
         }
-        self.start_prepared_yielding_final_request(method, parameters, allow_tasks)
+        self.start_prepared_yielding_final_request(
+            cx,
+            cancellation,
+            method,
+            parameters,
+            allow_tasks,
+        )
     }
 
     /// Starts one final catalog page without waiting for its response.
@@ -20384,11 +20408,13 @@ impl Client {
                 "Yielding final catalog requires a modern list method",
             ));
         }
-        self.start_prepared_yielding_final_request(method, parameters, false)
+        self.start_prepared_yielding_final_request(cx, None, method, parameters, false)
     }
 
     fn start_prepared_yielding_final_request(
         &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
         method: &str,
         parameters: serde_json::Value,
         allow_tasks: bool,
@@ -20426,7 +20452,12 @@ impl Client {
         // Do not prepare the parameters again: that would re-advertise Tasks.
         // The connection owns I/O; the caller owns only this execution.
         executor.service(&self.cx)?;
-        let execution = executor.execute_prepared(&self.cx, method, parameters)?;
+        let execution = match cancellation {
+            Some(cancellation) => {
+                executor.execute_prepared_with_cancellation(cx, cancellation, method, parameters)
+            }
+            None => executor.execute_prepared(cx, method, parameters),
+        }?;
         Ok(StdioFinalMrtrExecution {
             request,
             execution,
@@ -20565,7 +20596,25 @@ impl Client {
         parameters: serde_json::Value,
         task: Option<&FinalTask>,
     ) -> McpResult<StdioFinalTaskExecution> {
-        cx.checkpoint().map_err(|_| McpError::request_cancelled())?;
+        self.start_yielding_final_task_request_with_cancellation(
+            cx, None, method, parameters, task,
+        )
+    }
+
+    #[cfg(feature = "tasks")]
+    fn start_yielding_final_task_request_with_cancellation(
+        &mut self,
+        cx: &Cx,
+        cancellation: Option<&McpRequestCancellation>,
+        method: &str,
+        parameters: serde_json::Value,
+        task: Option<&FinalTask>,
+    ) -> McpResult<StdioFinalTaskExecution> {
+        if cx.checkpoint().is_err()
+            || cancellation.is_some_and(McpRequestCancellation::is_cancel_requested)
+        {
+            return Err(McpError::request_cancelled());
+        }
         self.admit_final_tasks_method(method)?;
         let parameters = self.with_final_tasks_client_capability(parameters)?;
         let invalid = || McpError::invalid_params("Invalid final Tasks control parameters");
@@ -20602,7 +20651,28 @@ impl Client {
             }
             _ => return Err(invalid()),
         };
-        let execution = self.start_yielding_stdio_request(method, Some(parameters))?;
+        let executor = self.multiplexed_stdio_executor()?;
+        executor
+            .service(&self.cx)
+            .map_err(|error| self.terminate_connection(error))?;
+        // Keep the admitted Tasks metadata and the request's originating
+        // lifetime. Shared service must not borrow a stopped caller's context.
+        let execution = match cancellation {
+            Some(cancellation) => executor.execute_prepared_with_cancellation(
+                cx,
+                cancellation,
+                method,
+                Some(parameters),
+            ),
+            None => executor.execute_prepared(cx, method, Some(parameters)),
+        }
+        .map_err(|error| {
+            if executor.executor.terminal_error().is_some() {
+                self.terminate_connection(error)
+            } else {
+                error
+            }
+        })?;
         Ok(StdioFinalTaskExecution {
             execution,
             method,
@@ -28463,7 +28533,9 @@ impl Client {
     /// so its durable identifier is not lost. Other outcomes remain
     /// cancellation-first. Cancelling or dropping a pending call retires its
     /// request owner; the connection remains usable by sibling requests.
-    /// Dropped owners commit cancellation when the client next drives ingress,
+    /// The executor retains the caller's context and token while this future
+    /// is not polled. Dropped owners commit cancellation when the client next
+    /// drives ingress,
     /// sends a request, or closes. Writes remain bounded and synchronous.
     #[cfg(all(unix, feature = "tasks"))]
     pub async fn call_tool_final_outcome_with_cx(
@@ -28478,8 +28550,9 @@ impl Client {
         if cancellation.is_cancel_requested() || cx.checkpoint().is_err() {
             return Err(McpError::request_cancelled());
         }
-        let mut execution = self.start_yielding_final_mrtr_request(
+        let mut execution = self.start_yielding_final_mrtr_request_with_cancellation(
             cx,
+            Some(cancellation),
             "tools/call",
             serde_json::json!({"name": name, "arguments": arguments}),
             true,
@@ -28511,7 +28584,9 @@ impl Client {
     ///
     /// Each ingress turn has a bounded readiness wait; this is cooperative
     /// polling, not an asynchronous OS pipe. Cancellation retires only this
-    /// request. Completed task payloads retain their admitted JSON source.
+    /// request. The executor retains the caller's context and token while the
+    /// future is not polled. Completed task payloads retain their admitted JSON
+    /// source.
     #[cfg(all(unix, feature = "tasks"))]
     pub async fn get_task_final_with_cx(
         &mut self,
@@ -28591,7 +28666,13 @@ impl Client {
         if let Some(task) = task {
             task_wait::admit_input_retention(task)?;
         }
-        let mut request = self.start_yielding_final_task_request(cx, method, parameters, task)?;
+        let mut request = self.start_yielding_final_task_request_with_cancellation(
+            cx,
+            Some(cancellation),
+            method,
+            parameters,
+            task,
+        )?;
         loop {
             let cancelled = cancellation.is_cancel_requested() || cx.checkpoint().is_err();
             if let Some(source) =
@@ -62315,6 +62396,312 @@ IFS= read -r end
                 });
             }
         }
+    }
+
+    #[cfg(all(unix, feature = "tasks"))]
+    #[test]
+    fn clt_01_tasks_async_requests_retain_parked_caller_lifetimes() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let healthy = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            for method in ["tools/call", TASK_GET, TASK_UPDATE, TASK_CANCEL] {
+                for stop in ["active", "token", "context", "admitted-token"] {
+                    let discovery = modern_tasks_discovery_response(
+                        "tasks-origin-peer",
+                        serde_json::json!({}),
+                    );
+                    let task: FinalTask = serde_json::from_value(serde_json::json!({
+                        "taskId": "retained-task",
+                        "status": "input_required",
+                        "inputRequests": {"roots": {"method": "roots/list"}},
+                        "createdAt": "2026-07-28T12:00:00Z",
+                        "lastUpdatedAt": "2026-07-28T12:00:00Z",
+                        "ttlMs": null,
+                    }))
+                    .unwrap();
+                    let nested = r#"{"content":[],"x-number":123456789012345678901234567890,"x-ratio":1.2300e+40}"#;
+                    let result = match method {
+                        "tools/call" => r#"{"resultType":"task","taskId":"retained-task","status":"working","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null}"#.to_owned(),
+                        TASK_GET => format!(
+                            r#"{{"resultType":"complete","taskId":"retained-task","status":"completed","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"result":{nested}}}"#
+                        ),
+                        TASK_UPDATE | TASK_CANCEL => r#"{"resultType":"complete"}"#.to_owned(),
+                        _ => unreachable!(),
+                    };
+                    let script = r#"
+numeric_id() {
+    printf '%s\n' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\)[,}].*/\1/p'
+}
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r sibling || exit 11
+case "$sibling" in *'"method":"tools/list"'*) ;; *) exit 12 ;; esac
+sibling_id=$(numeric_id "$sibling")
+IFS= read -r pending || exit 13
+case "$pending" in *'"method":"'"$2"'"'*) ;; *) exit 14 ;; esac
+pending_id=$(numeric_id "$pending")
+IFS= read -r next || exit 15
+control=null
+if [ "$3" = token ] || [ "$3" = context ]; then
+    case "$next" in *'"method":"notifications/cancelled"'*) ;; *) exit 16 ;; esac
+    cancelled_id=$(printf '%s\n' "$next" | sed -n 's/.*"requestId":\([0-9][0-9]*\)[,}].*/\1/p')
+    [ "$cancelled_id" = "$pending_id" ] || exit 17
+    control=$next
+    IFS= read -r next || exit 18
+fi
+case "$next" in *'"method":"tools/list"'*) ;; *) exit 19 ;; esac
+service_id=$(numeric_id "$next")
+printf '{"jsonrpc":"2.0","id":%s,"result":%s}\n' "$pending_id" "$4"
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"sibling"}}\n' "$sibling_id"
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","observed":%s,"control":%s}}\n' "$service_id" "$pending" "$control"
+IFS= read -r fresh || exit 20
+case "$fresh" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
+fresh_id=$(numeric_id "$fresh")
+printf '{"jsonrpc":"2.0","id":%s,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private","owner":"fresh"}}\n' "$fresh_id"
+while IFS= read -r unexpected; do exit 22; done
+"#;
+                    let mut client = ClientBuilder::new()
+                        .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                        .client_info("tasks-origin-client", "1")
+                        .capabilities(ClientCapabilities {
+                            sampling: Some(SamplingCapability::default()),
+                            ..ClientCapabilities::default()
+                        })
+                        .request_timeout_policy(
+                            RequestTimeoutPolicy::new(
+                                Duration::from_secs(5),
+                                Duration::from_secs(5),
+                            )
+                            .unwrap(),
+                        )
+                        .connect_stdio_with_cx(
+                            &healthy,
+                            "sh",
+                            &[
+                                "-c",
+                                script,
+                                "tasks-origin-peer",
+                                discovery.as_str(),
+                                method,
+                                stop,
+                                &result,
+                            ],
+                        )
+                        .await
+                        .unwrap();
+                    let executor = client.multiplexed_stdio_executor().unwrap();
+                    let mut sibling = executor
+                        .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                        .unwrap();
+                    let sibling_before = executor.executor.pending_records()[0].clone();
+                    let origin = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                    let cancellation = McpRequestCancellation::new();
+                    let task_id = task.base().task_id.clone();
+                    let mut pending = Box::pin(async {
+                        match method {
+                            "tools/call" => client
+                                .call_tool_final_outcome_with_cx(
+                                    &origin,
+                                    &cancellation,
+                                    "durable-tool",
+                                    serde_json::json!({}),
+                                )
+                                .await
+                                .map(|outcome| {
+                                    let FinalToolCallOutcome::Task(created) = outcome else {
+                                        panic!("the active caller must retain the durable task");
+                                    };
+                                    serde_json::to_string(&created).unwrap()
+                                }),
+                            TASK_GET => client
+                                .get_task_final_with_cx(&origin, &cancellation, task_id.clone())
+                                .await
+                                .map(|result| serde_json::to_string(&result).unwrap()),
+                            TASK_UPDATE => client
+                                .update_task_final_with_cx(
+                                    &origin,
+                                    &cancellation,
+                                    &task,
+                                    serde_json::from_value(
+                                        serde_json::json!({"roots": {"roots": []}}),
+                                    )
+                                    .unwrap(),
+                                )
+                                .await
+                                .map(|result| serde_json::to_string(&result).unwrap()),
+                            TASK_CANCEL => client
+                                .cancel_task_final_with_cx(
+                                    &origin,
+                                    &cancellation,
+                                    task_id.clone(),
+                                )
+                                .await
+                                .map(|result| serde_json::to_string(&result).unwrap()),
+                            _ => unreachable!(),
+                        }
+                    });
+                    assert!(
+                        std::future::poll_fn(|task_cx| {
+                            std::task::Poll::Ready(pending.as_mut().poll(task_cx))
+                        })
+                        .await
+                        .is_pending(),
+                        "the peer withholds replies until a different caller sends",
+                    );
+                    let owned_id = executor
+                        .executor
+                        .pending_records()
+                        .into_iter()
+                        .find(|record| record.request_id != *sibling.request_id())
+                        .unwrap()
+                        .request_id;
+                    match stop {
+                        "active" | "admitted-token" => {}
+                        "token" => {
+                            cancellation.cancel();
+                        }
+                        "context" => {
+                            origin.set_cancel_requested(true);
+                        }
+                        _ => unreachable!(),
+                    }
+                    // Keep the owner future parked. Another caller must elect
+                    // cancellation before the withheld Task/control reply can
+                    // be admitted, without retiring its own or sibling work.
+                    let mut service = executor
+                        .clone()
+                        .execute(&healthy, "tools/list", Some(serde_json::json!({})))
+                        .unwrap();
+                    let stopped = matches!(stop, "token" | "context");
+                    let records = executor.executor.pending_records();
+                    assert_eq!(
+                        records.iter().any(|record| record.request_id == owned_id),
+                        !stopped,
+                        "parked Tasks owner: method={method}, stop={stop}",
+                    );
+                    assert_eq!(
+                        records
+                            .iter()
+                            .find(|record| record.request_id == *sibling.request_id()),
+                        Some(&sibling_before),
+                    );
+                    let events = executor.executor.take_cancellation_events();
+                    if stopped {
+                        assert_eq!(events.len(), 1);
+                        assert_eq!(events[0].request_id, owned_id);
+                        assert_eq!(events[0].reason, ExecutionTerminalReason::CallerCancelled);
+                        let terminals = executor.executor.terminal_records();
+                        assert_eq!(terminals.len(), 1);
+                        assert!(terminals[0].cancellation_committed);
+                        assert_eq!(terminals[0].cancellation_transport_attempts, 1);
+                        assert!(!terminals[0].final_delivered);
+                    } else {
+                        assert!(events.is_empty());
+                        assert!(executor.executor.terminal_records().is_empty());
+                    }
+                    executor.service(&healthy).unwrap();
+                    assert!(executor.executor.take_cancellation_events().is_empty());
+                    if stop == "admitted-token" {
+                        // Elect the peer terminal through actual sole ingress,
+                        // then cancel without allowing the owner to consume it.
+                        let deadline = Instant::now() + Duration::from_secs(5);
+                        while executor
+                            .executor
+                            .pending_records()
+                            .iter()
+                            .any(|record| record.request_id == owned_id)
+                        {
+                            assert!(Instant::now() < deadline, "Tasks result was never admitted");
+                            assert!(
+                                std::future::poll_fn(|task_cx| {
+                                    std::task::Poll::Ready(pending.as_mut().poll(task_cx))
+                                })
+                                .await
+                                .is_pending(),
+                            );
+                            asupersync::runtime::yield_now().await;
+                        }
+                        cancellation.cancel();
+                        executor.service(&healthy).unwrap();
+                        assert!(executor.executor.take_cancellation_events().is_empty());
+                    }
+                    let outcome = pending.await;
+                    if stopped || (stop == "admitted-token" && method != "tools/call") {
+                        assert_eq!(outcome.unwrap_err().code, McpErrorCode::RequestCancelled);
+                    } else {
+                        let source = outcome.unwrap();
+                        if method == "tools/call" || method == TASK_GET {
+                            let decoded: serde_json::Value =
+                                serde_json::from_str(&source).unwrap();
+                            assert_eq!(decoded["taskId"], "retained-task");
+                        }
+                        if method == TASK_GET {
+                            assert!(source.contains(nested), "{source}");
+                        }
+                    }
+                    let fresh = client
+                        .request_with_cx(&healthy, "tools/list", Some(serde_json::json!({})))
+                        .await
+                        .unwrap();
+                    assert_eq!(fresh.result.unwrap()["owner"], "fresh");
+                    assert_eq!(
+                        executor
+                            .try_take_response(&mut sibling)
+                            .unwrap()
+                            .unwrap()
+                            .result
+                            .unwrap()["owner"],
+                        "sibling",
+                    );
+                    let observed = executor
+                        .try_take_response(&mut service)
+                        .unwrap()
+                        .unwrap()
+                        .result
+                        .unwrap();
+                    if stopped {
+                        assert_eq!(
+                            observed["control"]["params"]["requestId"],
+                            serde_json::to_value(&owned_id).unwrap(),
+                        );
+                        assert!(observed["control"].get("id").is_none());
+                    } else {
+                        assert!(observed["control"].is_null());
+                    }
+                    let parameters = &observed["observed"]["params"];
+                    let metadata = &parameters["_meta"];
+                    assert_eq!(
+                        metadata[FINAL_CLIENT_INFO_META_KEY],
+                        serde_json::json!({"name": "tasks-origin-client", "version": "1"}),
+                    );
+                    let capabilities = &metadata[FINAL_CLIENT_CAPABILITIES_META_KEY];
+                    assert!(capabilities["sampling"].is_object());
+                    assert_eq!(
+                        capabilities["extensions"][fastmcp_protocol::TASKS_EXTENSION],
+                        serde_json::json!({}),
+                    );
+                    if method == TASK_UPDATE {
+                        assert_eq!(
+                            parameters["inputResponses"],
+                            serde_json::json!({"roots": {"roots": []}}),
+                        );
+                    }
+                    assert!(executor.executor.pending_records().is_empty());
+                    assert!(executor.executor.take_cancellation_events().is_empty());
+                    assert!(executor.executor.take_uncorrelated_responses().is_empty());
+                    assert!(executor.executor.terminal_error().is_none());
+                    assert!(client.is_initialized());
+                    healthy.checkpoint().unwrap();
+                    client.close_with_cx(&healthy).await.unwrap();
+                    assert!(client.child_cleanup_complete());
+                }
+            }
+        });
+        drop(healthy);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(all(unix, feature = "tasks"))]
