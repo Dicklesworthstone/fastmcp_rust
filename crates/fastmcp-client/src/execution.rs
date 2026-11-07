@@ -2609,6 +2609,25 @@ where
         self.expire_timeouts_locked(cx, &mut state, Instant::now())?;
         let message = match received {
             Ok(message) => message,
+            Err(TransportError::Cancelled) if cx.cx.checkpoint().is_err() => {
+                // A request-owned receive can stop without closing the
+                // transport. Memory ingress, for example, leaves queued
+                // frames untouched when its caller is cancelled. Retire only
+                // this waiter, just as in the pre-read checkpoint above;
+                // another live context can service the deferred control and
+                // the sibling responses. If a byte-stream transport latched
+                // itself closed after consuming a partial frame, its next
+                // operation still reports that real connection failure.
+                if let Some((request_id, _)) = waiting_owner {
+                    self.cancel_pending_locked(
+                        cx,
+                        &mut state,
+                        request_id,
+                        ExecutionTerminalReason::CallerCancelled,
+                    )?;
+                }
+                return Err(McpError::request_cancelled());
+            }
             Err(error) => {
                 let error = transport_error_to_mcp(error);
                 state.fail_all(error.clone(), ExecutionTerminalReason::ConnectionLost);
@@ -7769,6 +7788,279 @@ mod tests {
             assert_eq!(executor.take_cancellation_events().len(), 1);
             assert!(stopped.checkpoint().is_err());
             drop(next);
+        }
+    }
+
+    mod receive_interruption {
+        use super::*;
+        use fastmcp_transport::{
+            ClientTransportRecvHalf, MemoryRecvHalf, MemorySendHalf, TransportRecvHalf,
+            TransportSendHalf,
+        };
+
+        /// The hook runs only after the executor admits a transport read.
+        /// Framing, cancellation admission and queue ownership still belong
+        /// to the real memory halves, with no timing-dependent worker sleeps.
+        #[derive(Debug)]
+        struct MemoryReceiveProbe {
+            receiver: MemoryRecvHalf,
+            sender: MemorySendHalf,
+            cancel_on_receive: Option<Cx>,
+            receive_attempts: usize,
+        }
+
+        impl MemoryReceiveProbe {
+            fn begin_receive(&mut self, cx: &Cx) {
+                self.receive_attempts += 1;
+                if let Some(cancel) = self.cancel_on_receive.take() {
+                    assert!(
+                        cx.checkpoint().is_ok(),
+                        "the read must start with a live caller"
+                    );
+                    cancel.set_cancel_requested(true);
+                }
+            }
+
+            fn receive_frame(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+                self.begin_receive(cx);
+                self.receiver.recv_with_source(cx)
+            }
+        }
+
+        impl Transport for MemoryReceiveProbe {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.sender.send(cx, message)
+            }
+
+            fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                self.begin_receive(cx);
+                self.receiver.recv(cx)
+            }
+
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+                self.receiver.close(cx)?;
+                self.sender.close(cx)
+            }
+        }
+
+        fn memory_executor(
+            cx: &Cx,
+            era: ResultPeerEra,
+            retain_source: bool,
+        ) -> (
+            RequestExecutor<MemoryReceiveProbe>,
+            fastmcp_transport::memory::MemoryTransport,
+        ) {
+            let (transport, peer) =
+                fastmcp_transport::memory::create_memory_transport_pair_with_capacity(8);
+            let (receiver, sender) = transport.into_split();
+            let executor = RequestExecutor::with_source_frame_receiver(
+                MemoryReceiveProbe {
+                    receiver,
+                    sender,
+                    cancel_on_receive: Some(cx.clone()),
+                    receive_attempts: 0,
+                },
+                era,
+                retain_source.then_some(MemoryReceiveProbe::receive_frame),
+            );
+            (executor, peer)
+        }
+
+        fn complete(id: i64, text: &str) -> JsonRpcMessage {
+            response(
+                id,
+                serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": text}],
+                    "isError": false,
+                }),
+            )
+        }
+
+        #[test]
+        fn cancelled_active_memory_receive_preserves_sibling_requests() {
+            for era in [ResultPeerEra::Legacy, ResultPeerEra::Modern] {
+                for retain_source in [false, true] {
+                    for origin_is_waiter in [false, true] {
+                        let live = Cx::for_testing();
+                        let stopped = Cx::for_testing();
+                        let origin = if origin_is_waiter { &stopped } else { &live };
+                        let (executor, mut peer) = memory_executor(&stopped, era, retain_source);
+                        let mut cancelled = executor.execute(origin, request(41)).unwrap();
+                        let mut sibling = executor.execute(&live, request(42)).unwrap();
+                        for expected in [41, 42] {
+                            let JsonRpcMessage::Request(received) = peer.recv(&live).unwrap() else {
+                                panic!("the application request must reach the real peer");
+                            };
+                            assert_eq!(received.id, Some(RequestId::Number(expected)));
+                        }
+                        // This complete frame is already queued when receive
+                        // is interrupted. A later live read must consume and
+                        // discard it under the cancelled owner's tombstone.
+                        peer.send(&live, &complete(41, "late cancelled result"))
+                            .unwrap();
+                        assert_eq!(
+                            executor.wait(&stopped, &mut cancelled).unwrap_err().code,
+                            McpErrorCode::RequestCancelled
+                        );
+                        assert_eq!(executor.state.borrow().transport.receive_attempts, 1);
+                        assert_eq!(executor.pending_records().len(), 1);
+                        assert_eq!(
+                            executor.pending_records()[0].request_id,
+                            RequestId::Number(42)
+                        );
+                        assert!(executor.terminal_error().is_none());
+                        assert!(!executor.state.borrow().transport.receiver.is_closed());
+                        assert_eq!(executor.state.borrow().deferred_cancellations.len(), 1);
+
+                        let JsonRpcMessage::Response(expected) = complete(42, "sibling result")
+                        else {
+                            unreachable!();
+                        };
+                        peer.send(&live, &JsonRpcMessage::Response(expected.clone()))
+                            .unwrap();
+                        let (actual, source) = executor
+                            .wait_with_raw_result(&live, &mut sibling)
+                            .unwrap();
+                        assert_eq!(actual, expected);
+                        assert_eq!(
+                            source,
+                            retain_source.then(|| {
+                                serde_json::to_string(expected.result.as_ref().unwrap()).unwrap()
+                            })
+                        );
+                        assert_eq!(executor.state.borrow().transport.receive_attempts, 3);
+                        assert!(executor.take_uncorrelated_responses().is_empty());
+                        assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                        let JsonRpcMessage::Request(control) = peer.recv(&live).unwrap() else {
+                            panic!("a live service turn must deliver the deferred cancellation");
+                        };
+                        assert!(control.is_notification());
+                        assert_eq!(control.method, "notifications/cancelled");
+                        assert_eq!(control.params.as_ref().unwrap()["requestId"], 41);
+
+                        let mut next = executor.execute(&live, request(43)).unwrap();
+                        let JsonRpcMessage::Request(application) = peer.recv(&live).unwrap() else {
+                            panic!("the connection must admit new work after local cancellation");
+                        };
+                        assert_eq!(application.id, Some(RequestId::Number(43)));
+                        let JsonRpcMessage::Response(expected) = complete(43, "next result") else {
+                            unreachable!();
+                        };
+                        peer.send(&live, &JsonRpcMessage::Response(expected.clone()))
+                            .unwrap();
+                        assert_eq!(executor.wait(&live, &mut next).unwrap(), expected);
+                        assert_eq!(executor.take_cancellation_events().len(), 1);
+                        assert!(executor.pending_records().is_empty());
+                        assert!(executor.terminal_error().is_none());
+                        assert!(stopped.checkpoint().is_err());
+                        assert!(live.checkpoint().is_ok());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn cancelled_connection_service_receive_preserves_live_owners() {
+            for retain_source in [false, true] {
+                let live = Cx::for_testing();
+                let stopped = Cx::for_testing();
+                let (executor, mut peer) =
+                    memory_executor(&stopped, ResultPeerEra::Modern, retain_source);
+                let mut first = executor.execute(&live, request(51)).unwrap();
+                let mut second = executor.execute(&live, request(52)).unwrap();
+                assert_eq!(
+                    executor.drive(&stopped).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(executor.state.borrow().transport.receive_attempts, 1);
+                assert_eq!(executor.pending_records().len(), 2);
+                assert!(executor.terminal_error().is_none());
+                assert!(executor.take_cancellation_events().is_empty());
+                assert!(executor.state.borrow().deferred_cancellations.is_empty());
+
+                for id in [52, 51] {
+                    peer.send(&live, &complete(id, "live owner")).unwrap();
+                }
+                assert_eq!(
+                    executor.wait(&live, &mut first).unwrap().id,
+                    Some(RequestId::Number(51))
+                );
+                assert_eq!(
+                    executor.wait(&live, &mut second).unwrap().id,
+                    Some(RequestId::Number(52))
+                );
+                assert!(executor.terminal_error().is_none());
+                assert!(executor.take_cancellation_events().is_empty());
+            }
+        }
+
+        #[test]
+        fn closed_memory_receive_still_fails_siblings_when_waiter_is_cancelled() {
+            for retain_source in [false, true] {
+                let live = Cx::for_testing();
+                let stopped = Cx::for_testing();
+                let (executor, _peer) =
+                    memory_executor(&stopped, ResultPeerEra::Modern, retain_source);
+                let mut cancelled = executor.execute(&stopped, request(61)).unwrap();
+                let mut sibling = executor.execute(&live, request(62)).unwrap();
+                executor
+                    .state
+                    .borrow_mut()
+                    .transport
+                    .receiver
+                    .close(&live)
+                    .unwrap();
+                assert_eq!(
+                    executor.wait(&stopped, &mut cancelled).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(executor.state.borrow().transport.receive_attempts, 1);
+                assert!(executor.terminal_error().is_some());
+                assert_eq!(
+                    executor.terminal_records()[0].terminal_reason,
+                    ExecutionTerminalReason::ConnectionLost
+                );
+                assert!(executor.wait(&live, &mut sibling).is_err());
+                assert!(executor.pending_records().is_empty());
+                assert!(executor.state.borrow().deferred_cancellations.is_empty());
+                assert!(executor.execute(&live, request(63)).is_err());
+            }
+        }
+
+        #[test]
+        fn unattributed_receive_errors_remain_connection_failures() {
+            for retain_source in [false, true] {
+                for failure in [
+                    TransportError::Cancelled,
+                    TransportError::Io(std::io::ErrorKind::ConnectionReset.into()),
+                ] {
+                    let transport = if retain_source {
+                        ScriptedTransport::with_source_frames([Err(failure)])
+                    } else {
+                        ScriptedTransport::new([Err(failure)])
+                    };
+                    let executor = RequestExecutor::with_source_frame_receiver(
+                        transport,
+                        ResultPeerEra::Modern,
+                        retain_source.then_some(receive_scripted_source_frame),
+                    );
+                    let live = Cx::for_testing();
+                    let mut first = executor.execute(&live, request(71)).unwrap();
+                    let mut sibling = executor.execute(&live, request(72)).unwrap();
+                    assert!(executor.wait(&live, &mut first).is_err());
+                    assert!(live.checkpoint().is_ok());
+                    assert!(executor.terminal_error().is_some());
+                    assert_eq!(
+                        executor.terminal_records()[0].terminal_reason,
+                        ExecutionTerminalReason::ConnectionLost
+                    );
+                    assert!(executor.wait(&live, &mut sibling).is_err());
+                    assert!(executor.pending_records().is_empty());
+                    assert!(executor.execute(&live, request(73)).is_err());
+                }
+            }
         }
     }
 
