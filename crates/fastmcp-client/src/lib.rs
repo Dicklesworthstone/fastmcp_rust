@@ -60669,7 +60669,13 @@ while IFS= read -r unexpected; do exit 23; done
                     assert!(executor.executor.take_uncorrelated_responses().is_empty());
                     assert!(executor.executor.terminal_error().is_none());
                     assert!(healthy.checkpoint().is_ok());
-                    client.close_with_cx(&healthy).await.unwrap();
+                    // The virtual clock is frozen between caller-deadline
+                    // checks. Async process cleanup would await that clock
+                    // while the real child exits, so use bounded synchronous
+                    // cleanup after all request assertions. No callback task
+                    // may require this runtime while close blocks.
+                    assert!(client.reverse_callback_pool.tasks.lock().unwrap().is_empty());
+                    client.close().unwrap();
                     assert!(client.child_cleanup_complete());
                 }
             }
