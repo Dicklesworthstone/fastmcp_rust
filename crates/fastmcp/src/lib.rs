@@ -3474,7 +3474,7 @@ pub mod modern {
             }
         }
 
-        /// Installs modern reverse-request handlers before a WebSocket connect.
+        /// Installs modern reverse-request handlers before connection.
         ///
         /// Exact-2024 sampling/roots callbacks remain rejected on this
         /// ModernOnly builder. Use
@@ -4802,6 +4802,60 @@ pub mod modern {
         }
     }
 
+    /// A complete modern catalog traversal with every admitted page intact.
+    ///
+    /// Pages retain their typed results, cache hints, metadata, and unknown
+    /// result members. Construction publishes no partial collection on error
+    /// and never exposes the legacy result algebra through this facade.
+    #[derive(Debug)]
+    pub struct CollectedCatalog {
+        method: &'static str,
+        pages: Vec<FinalCoreResult>,
+        item_count: usize,
+    }
+
+    impl CollectedCatalog {
+        #[cfg(unix)]
+        fn from_inner(catalog: fastmcp_client::CollectedCatalog) -> McpResult<Self> {
+            let method = catalog.method();
+            let item_count = catalog.item_count();
+            let pages = catalog
+                .into_pages()
+                .into_iter()
+                .map(|page| final_stdio_mrtr_result(method, page))
+                .collect::<McpResult<Vec<_>>>()?;
+            Ok(Self {
+                method,
+                pages,
+                item_count,
+            })
+        }
+
+        /// Returns the catalog method used for every page.
+        #[must_use]
+        pub const fn method(&self) -> &'static str {
+            self.method
+        }
+
+        /// Borrows the complete modern pages in traversal order.
+        #[must_use]
+        pub fn pages(&self) -> &[FinalCoreResult] {
+            &self.pages
+        }
+
+        /// Consumes the collection without projecting away result fields.
+        #[must_use]
+        pub fn into_pages(self) -> Vec<FinalCoreResult> {
+            self.pages
+        }
+
+        /// Returns the number of catalog entries across all pages.
+        #[must_use]
+        pub const fn item_count(&self) -> usize {
+            self.item_count
+        }
+    }
+
     /// Final-only facade over a connected client.
     pub struct Client {
         inner: fastmcp_client::Client,
@@ -5087,6 +5141,178 @@ pub mod modern {
         #[must_use]
         pub fn take_final_cache_ttl_diagnostics(&mut self) -> Vec<FinalCacheTtlDiagnostic> {
             self.inner.take_final_cache_ttl_diagnostics()
+        }
+
+        /// Checks peer liveness while yielding the caller's Unix runtime.
+        #[cfg(unix)]
+        pub async fn ping_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<()> {
+            self.inner.ping_with_cx(cx, cancellation).await
+        }
+
+        /// Collects every tools page on the caller's Unix runtime.
+        ///
+        /// One absolute budget covers discovery, all pages, and the permitted
+        /// cache rebuild. Opaque cursors and complete modern results are
+        /// retained, with bounded pages, entries, and bytes. An initial cursor
+        /// is rejected; failure returns no partial catalog.
+        ///
+        /// Cancellation retires the active page. Dropping a published page
+        /// queues cancellation for the next client drive, send, or close.
+        /// Deferred discovery retains its connection-level cancellation rules.
+        /// Subprocess creation and bounded pipe writes remain synchronous.
+        #[cfg(unix)]
+        pub async fn list_all_tools_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListToolsParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_tools_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Collects complete resource pages with the bounds and cancellation
+        /// behavior of [Self::list_all_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_resources_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourcesParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_resources_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Collects complete resource-template pages with the bounds and
+        /// cancellation behavior of [Self::list_all_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_resource_templates_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListResourceTemplatesParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_resource_templates_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Collects complete prompt pages with the bounds and cancellation
+        /// behavior of [Self::list_all_tools_with_cx].
+        #[cfg(unix)]
+        pub async fn list_all_prompts_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: crate::ListPromptsParams,
+        ) -> McpResult<CollectedCatalog> {
+            CollectedCatalog::from_inner(
+                self.inner
+                    .list_all_prompts_with_cx(cx, cancellation, params)
+                    .await?,
+            )
+        }
+
+        /// Calls a tool while yielding the caller's Unix runtime.
+        ///
+        /// Installed modern reverse handlers resolve input-required results
+        /// under one operation-wide absolute budget. Without installed handlers,
+        /// the live input-required result is returned intact. Continuations
+        /// preserve the original arguments and only the latest input responses
+        /// and request state. Ordinary calls do not advertise Tasks.
+        ///
+        /// Cancellation drops pending handler work and retires the active
+        /// request; sibling requests remain usable. Dropping a published
+        /// request queues cancellation for the next drive, send, or close.
+        /// Discovery keeps its own cancellation rules. Callbacks must cooperate
+        /// with the runtime; bounded pipe writes remain synchronous.
+        #[cfg(unix)]
+        pub async fn call_tool_result_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalCoreResult> {
+            final_stdio_mrtr_result(
+                "tools/call",
+                self.inner
+                    .call_tool_with_cx(cx, cancellation, name, arguments)
+                    .await?,
+            )
+        }
+
+        /// Reads a resource with the caller-owned execution and installed
+        /// reverse-handler behavior of [Self::call_tool_result_with_cx].
+        #[cfg(unix)]
+        pub async fn read_resource_result_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            uri: &str,
+        ) -> McpResult<FinalCoreResult> {
+            final_stdio_mrtr_result(
+                "resources/read",
+                self.inner
+                    .read_resource_with_cx(cx, cancellation, uri)
+                    .await?,
+            )
+        }
+
+        /// Gets a prompt with the caller-owned execution and installed
+        /// reverse-handler behavior of [Self::call_tool_result_with_cx].
+        #[cfg(unix)]
+        pub async fn get_prompt_result_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: std::collections::HashMap<String, String>,
+        ) -> McpResult<FinalCoreResult> {
+            final_stdio_mrtr_result(
+                "prompts/get",
+                self.inner
+                    .get_prompt_with_cx(cx, cancellation, name, arguments)
+                    .await?,
+            )
+        }
+
+        /// Completes an argument through one yielding modern stdio request.
+        #[cfg(unix)]
+        pub async fn complete_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            params: CompletionParams,
+        ) -> McpResult<FinalCompletionResult> {
+            let parameters = serde_json::to_value(params).map_err(|_| {
+                McpError::invalid_params("Completion parameters could not be encoded")
+            })?;
+            match self
+                .inner
+                .request_core_with_cx(cx, cancellation, "completion/complete", parameters)
+                .await?
+            {
+                fastmcp_protocol::CoreResult::Final(FinalCoreResult::Completion {
+                    result, ..
+                }) => Ok(result.payload),
+                _ => Err(McpError::internal_error(
+                    "Modern client received a non-final completion/complete result",
+                )),
+            }
         }
 
         pub fn list_tools(&mut self, cursor: Option<&str>) -> McpResult<FinalListToolsResult> {
@@ -5812,6 +6038,132 @@ pub mod modern {
                     "Modern client received a non-final completion/complete result",
                 )),
             }
+        }
+
+        /// Opens a catalog listener while yielding during deferred discovery.
+        ///
+        /// Once opened, the client owns the listener between event waits and
+        /// ordinary requests. Call [Self::next_subscription_event_with_cx] to
+        /// drain it without occupying the caller's worker until termination.
+        #[cfg(unix)]
+        pub async fn open_subscriptions_listener_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            notifications: impl Into<SubscriptionListenRequest>,
+        ) -> McpResult<()> {
+            self.inner
+                .open_subscriptions_listener_with_cx(cx, cancellation, notifications)
+                .await
+        }
+
+        /// Waits for one catalog event on the caller's Unix runtime.
+        ///
+        /// Dropping this wait preserves the listener, queued events, and partial
+        /// frame for resumption. Explicit cancellation retires only the listener;
+        /// a failed cancellation write retains its owner and error.
+        #[cfg(unix)]
+        pub async fn next_subscription_event_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<StdioSubscriptionEvent> {
+            self.inner
+                .next_subscription_event_with_cx(cx, cancellation)
+                .await
+        }
+
+        /// Calls a Tasks-capable tool on the caller's Unix runtime.
+        ///
+        /// Complete, task, and input-required outcomes remain distinct.
+        /// Input-required is returned without automatic effects or replay.
+        /// An admitted task result survives caller cancellation so its task ID
+        /// is not lost. A task handle does not imply crash-durable storage.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn call_tool_outcome_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            name: &str,
+            arguments: JsonValue,
+        ) -> McpResult<FinalToolCallOutcome> {
+            self.inner
+                .call_tool_final_outcome_with_cx(cx, cancellation, name, arguments)
+                .await
+        }
+
+        /// Reads one task while yielding between bounded stdio receive turns.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn get_task_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalGetTaskResult> {
+            self.inner
+                .get_task_final_with_cx(cx, cancellation, task_id)
+                .await
+        }
+
+        /// Validates and supplies responses to a retained input-required task
+        /// on the caller's runtime. Invalid input is rejected before sending.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn update_task_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task: &FinalTask,
+            input_responses: FinalTaskInputResponses,
+        ) -> McpResult<FinalUpdateTaskResult> {
+            self.inner
+                .update_task_final_with_cx(cx, cancellation, task, input_responses)
+                .await
+        }
+
+        /// Requests task cancellation while yielding the caller's runtime.
+        /// Success acknowledges the request, rather than task termination.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn cancel_task_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            task_id: FinalTaskId,
+        ) -> McpResult<FinalCancelTaskResult> {
+            self.inner
+                .cancel_task_final_with_cx(cx, cancellation, task_id)
+                .await
+        }
+
+        /// Opens an official Tasks listener while yielding deferred discovery.
+        /// The client retains the listener between waits and task-control calls.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn open_final_task_subscription_listener_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+            notifications: SubscriptionFilter,
+        ) -> McpResult<()> {
+            self.inner
+                .open_final_task_subscription_listener_with_cx(
+                    cx,
+                    cancellation,
+                    notifications,
+                )
+                .await
+        }
+
+        /// Waits for one Tasks event while yielding the caller's Unix runtime.
+        /// Dropping the wait preserves the listener for resumption; explicit
+        /// cancellation retires only that listener.
+        #[cfg(all(unix, feature = "tasks"))]
+        pub async fn next_final_task_subscription_event_with_cx(
+            &mut self,
+            cx: &Cx,
+            cancellation: &McpRequestCancellation,
+        ) -> McpResult<StdioTaskSubscriptionEvent> {
+            self.inner
+                .next_final_task_subscription_event_with_cx(cx, cancellation)
+                .await
         }
 
         /// Opens and collects one typed final subscriptions listener.

@@ -934,6 +934,76 @@ portable process-tree containment or a substitute for Windows Job Objects.
 **Requirements:**
 - Rust nightly-2026-08-25 (see `rust-toolchain.toml`) for Edition 2024. The last FND-01 evidence snapshot still records `nightly-2026-07-11` until that harness is re-attested.
 
+### Caller-owned modern stdio workflows (current source tree, Unix)
+
+The modern stdio facade exposes asynchronous catalog traversal, ordinary
+content operations, completion, liveness checks, and incremental listeners.
+Each method takes the caller's `&Cx` and an explicit
+`&McpRequestCancellation`, and yields between bounded receive turns.
+
+The four `list_all_*_with_cx` methods return `modern::CollectedCatalog`.
+Its `pages()` contain complete `FinalCoreResult` values, retaining cache
+hints, metadata, unknown result members, and exact numbers. Traversal keeps
+opaque cursors intact and enforces cumulative page, item, byte, and elapsed
+limits, including the permitted cache rebuild. An error returns no partial
+collection; pass an absent initial cursor.
+
+```rust
+use fastmcp_rust::{
+    ListToolsParams,
+    modern::{Client, Cx, FinalCoreResult, McpRequestCancellation, McpResult},
+};
+
+#[cfg(unix)]
+async fn discover_and_call(
+    client: &mut Client,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+) -> McpResult<FinalCoreResult> {
+    let catalog = client
+        .list_all_tools_with_cx(cx, cancellation, ListToolsParams::default())
+        .await?;
+    eprintln!(
+        "{} tools across {} pages",
+        catalog.item_count(),
+        catalog.pages().len(),
+    );
+    client
+        .call_tool_result_with_cx(
+            cx,
+            cancellation,
+            "index_workspace",
+            serde_json::json!({"uri": "file:///workspace"}),
+        )
+        .await
+}
+```
+
+`call_tool_result_with_cx`, `read_resource_result_with_cx`, and
+`get_prompt_result_with_cx` follow installed modern reverse handlers under
+one operation-wide absolute deadline. Install those handlers with
+`ClientBuilder::modern_reverse_request_handlers`. With no modern reverse
+handlers installed, the complete `input_required` result is returned.
+`complete_with_cx` and `ping_with_cx` provide the corresponding ordinary
+completion and liveness operations.
+
+Use `open_subscriptions_listener_with_cx` and
+`next_subscription_event_with_cx` to interleave a live catalog listener
+with ordinary client requests. Dropping an event wait preserves the stream
+for resumption; explicit cancellation retires that listener.
+
+With the `tasks` feature, the facade also exposes
+`call_tool_outcome_with_cx`, `get_task_with_cx`, `update_task_with_cx`,
+`cancel_task_with_cx`, `open_final_task_subscription_listener_with_cx`,
+and `next_final_task_subscription_event_with_cx`. Tool outcomes retain
+their distinct complete, task, and input-required branches. These controls
+do not imply persistent task storage.
+
+Published request cancellation remains request-local. Deferred discovery
+keeps its own connection-level cancellation rules, and dropped request
+cancellation is flushed by the next drive, send, or close. Subprocess
+creation and bounded pipe writes retain their synchronous limits.
+
 ### Live exact stdio progress (current source tree, Unix)
 
 Modern stdio clients can observe progress while awaiting a tool, resource,
