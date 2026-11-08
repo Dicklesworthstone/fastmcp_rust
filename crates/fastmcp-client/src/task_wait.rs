@@ -1076,8 +1076,10 @@ pub(super) fn admit_task_input(
     // rather than in the shared shape check or at the server.
     //
     // AN EMPTY MAP STAYS ADMITTED, and the distinction is load-bearing rather
-    // than incidental. `managed_task_input_admission_preserves_partial_and_
-    // unknown_key_semantics` pins three cases: `{}` is admitted, a map mixing
+    // than incidental. It is pinned by
+    // managed_task_input_admission_preserves_partial_and_unknown_key_semantics
+    // (http_auth/managed/client/tasks/tests.rs), which fixes three cases: `{}`
+    // is admitted, a map mixing
     // one outstanding key with one unknown key is admitted, and a map naming
     // an outstanding key with the WRONG response kind is refused. An empty
     // map asserts nothing about any key, so it is a no-op acknowledgement;

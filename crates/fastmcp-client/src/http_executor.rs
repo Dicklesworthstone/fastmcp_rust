@@ -17618,11 +17618,17 @@ mod tests {
                     .await
                     .map(|outcome| match outcome {
                         FinalToolCallOutcome::Task(result) => serde_json::to_value(result).unwrap(),
-                        // Exhaustiveness only. Every caller of this helper
-                        // sends `public_http_tasks_success_result("tools/call")`,
-                        // which declares `resultType: "task"`, or an error body
-                        // that yields `Err` and never reaches this closure --
-                        // so neither arm below is reachable.
+                        // Exhaustiveness only. A caller reaches this closure
+                        // only on an admitted HTTP 200, and the sole body any
+                        // caller sends at 200 is
+                        // `public_http_tasks_success_result("tools/call")`,
+                        // which declares `resultType: "task"`. Every other
+                        // caller supplies a failure status or a JSON-RPC error
+                        // body, and both yield `Err`, which `.map` skips --
+                        // including the ones that send this same success
+                        // fixture at a non-200 status. So neither arm below is
+                        // reachable, and a 2602-row run confirmed the panic
+                        // never fires.
                         //
                         // They cannot be encoded either: `CompleteResult` and
                         // `InputRequiredResult` deliberately derive only
