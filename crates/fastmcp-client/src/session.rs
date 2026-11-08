@@ -125,6 +125,64 @@ impl ClientExtensionResultAdmission {
         Ok(())
     }
 
+    /// Resolves only this request's negotiated server notification owner.
+    /// The executor must still compare the capsule with its live request key.
+    pub(crate) fn admit_stream_notification(
+        &self,
+        notification: &fastmcp_protocol::JsonRpcRequest,
+        raw_params: Option<&str>,
+        expected_key: &fastmcp_protocol::CorrelationKey,
+    ) -> Option<fastmcp_protocol::StdioNotificationCorrelation> {
+        if !self.matches_notification_candidate(notification, expected_key) {
+            return None;
+        }
+        self.negotiated
+            .admit_stdio_notification(
+                &self.runtime.descriptors,
+                ProtocolEra::Modern2026,
+                &self.extension_id,
+                notification,
+                raw_params,
+            )
+            .ok()
+    }
+
+    pub(crate) fn matches_notification_candidate(
+        &self,
+        notification: &fastmcp_protocol::JsonRpcRequest,
+        expected_key: &fastmcp_protocol::CorrelationKey,
+    ) -> bool {
+        self.notification_candidate(notification).as_ref() == Some(expected_key)
+    }
+
+    fn notification_candidate(
+        &self,
+        notification: &fastmcp_protocol::JsonRpcRequest,
+    ) -> Option<fastmcp_protocol::CorrelationKey> {
+        // This scalar is only an inert candidate. Avoid revalidating and
+        // reparsing the complete payload for every same-extension waiter on a
+        // multiplexed connection; the one matching candidate must still pass
+        // the frozen negotiation, raw-token bounds and metadata checks below.
+        if notification.id.is_some() {
+            return None;
+        }
+        let descriptor = self.runtime.descriptors.descriptor(&self.extension_id)?;
+        if descriptor.notification.as_ref()?.name != notification.method {
+            return None;
+        }
+        let correlation = descriptor.stdio_correlation.as_ref()?;
+        let value = notification.params.as_ref()?.get("_meta")?.get(&correlation.metadata_key)?;
+        match value {
+            serde_json::Value::String(value)
+                if value.len() <= fastmcp_protocol::MAX_JSONRPC_STRING_ID_ENCODED_BYTES => {}
+            serde_json::Value::Number(value)
+                if value.as_str().len() <= fastmcp_protocol::MAX_RAW_JSON_NUMBER_BYTES => {}
+            _ => return None,
+        }
+        let candidate: fastmcp_protocol::RequestId = serde_json::from_value(value.clone()).ok()?;
+        candidate.correlation_key().ok()
+    }
+
     /// Validates the original result source without rewriting its payload.
     ///
     /// In particular, a schema-checked extension object that omits

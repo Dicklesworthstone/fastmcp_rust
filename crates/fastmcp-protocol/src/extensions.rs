@@ -36,6 +36,8 @@ pub const MAX_EXTENSION_ROUTING_HEADERS: usize = 32;
 pub const MAX_EXTENSION_ROUTING_HEADER_BYTES: usize = 256;
 /// Maximum notification method names owned by one stdio correlation descriptor.
 pub const MAX_STDIO_CORRELATION_METHODS: usize = 32;
+/// Maximum encoded parameter bytes retained for one correlated extension notification.
+pub const MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES: usize = 64 * 1024;
 /// Maximum encoded bytes in one self-contained notification settings proof.
 pub const MAX_NOTIFICATION_ACTIVATION_PROOF_BYTES: usize = 64 * 1024;
 
@@ -725,6 +727,36 @@ pub struct ExtensionRoutingHeaderDescriptor {
     pub name: String,
 }
 
+/// The bounded wire codec for an extension's stdio correlation metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StdioCorrelationCodec {
+    /// An exact JSON-RPC mathematical-integer or string request ID.
+    /// Numeric aliases correlate by value; strings remain distinct. The raw
+    /// token obeys the same byte and exponent limits as an envelope request ID.
+    RequestId,
+}
+
+impl StdioCorrelationCodec {
+    fn decode(self, source: &str) -> Result<crate::RequestId, ExtensionDispatchError> {
+        let Self::RequestId = self;
+        let invalid = || ExtensionDispatchError::InvalidStdioCorrelation;
+        let limit = if source.starts_with('"') {
+            crate::jsonrpc::MAX_JSONRPC_STRING_ID_ENCODED_BYTES
+        } else {
+            crate::jsonrpc::MAX_RAW_JSON_NUMBER_BYTES
+        };
+        crate::jsonrpc::admit_raw_json_document(
+            source.as_bytes(),
+            limit,
+            crate::jsonrpc::RawJsonTopLevel::AnyValue,
+        )
+        .map_err(|_| invalid())?;
+        let id: crate::RequestId = serde_json::from_str(source).map_err(|_| invalid())?;
+        id.validate().map_err(|_| invalid())?;
+        Ok(id)
+    }
+}
+
 /// A stdio notification-correlation metadata key owned by an extension.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StdioCorrelationDescriptor {
@@ -734,6 +766,56 @@ pub struct StdioCorrelationDescriptor {
     pub methods: Vec<String>,
     /// Direction required for every named notification.
     pub direction: ExtensionDirection,
+    /// Frozen bounded codec for the metadata value.
+    pub codec: StdioCorrelationCodec,
+}
+
+/// A decoded notification owner bound to one frozen per-request negotiation.
+///
+/// Only [`NegotiatedExtensionSet::admit_stdio_notification`] constructs this
+/// capsule. The receiver must additionally match its key to a currently live
+/// execution carrying that negotiation. This is not a wire-generation token:
+/// reusing an ID after retirement cannot distinguish an old peer frame from a
+/// new one. High-level clients allocate fresh IDs for the connection lifetime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StdioNotificationCorrelation {
+    request_id: crate::RequestId,
+    correlation_key: crate::CorrelationKey,
+    extension_id: ExtensionId,
+    registry_receipt: ExtensionRegistryReceipt,
+    effective_settings_fingerprint: [u8; 32],
+}
+
+impl StdioNotificationCorrelation {
+    /// The bounded request ID, preserving its admitted numeric spelling.
+    #[must_use]
+    pub const fn request_id(&self) -> &crate::RequestId {
+        &self.request_id
+    }
+
+    /// The exact key to compare with a live request's correlation key.
+    #[must_use]
+    pub const fn correlation_key(&self) -> &crate::CorrelationKey {
+        &self.correlation_key
+    }
+
+    /// The sole descriptor owner of this notification and metadata key.
+    #[must_use]
+    pub const fn extension_id(&self) -> &ExtensionId {
+        &self.extension_id
+    }
+
+    /// The frozen registry that admitted this notification.
+    #[must_use]
+    pub const fn registry_receipt(&self) -> &ExtensionRegistryReceipt {
+        &self.registry_receipt
+    }
+
+    /// The current request's resolved effective settings fingerprint.
+    #[must_use]
+    pub const fn effective_settings_fingerprint(&self) -> &[u8; 32] {
+        &self.effective_settings_fingerprint
+    }
 }
 
 /// One immutable extension descriptor.
@@ -1424,6 +1506,8 @@ where
 /// Direction-sensitive extension dispatch failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExtensionDispatchError {
+    /// The notification has no exact, bounded, descriptor-owned correlation.
+    InvalidStdioCorrelation,
     /// Extensions are excluded from an exact MCP 2024-11-05 request.
     LegacyProtocolExcluded,
     /// The request era does not match the immutable era that negotiated this set.
@@ -1464,6 +1548,9 @@ pub enum ExtensionDispatchError {
 impl fmt::Display for ExtensionDispatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidStdioCorrelation => {
+                formatter.write_str("extension stdio notification correlation is not admitted")
+            }
             Self::LegacyProtocolExcluded => {
                 formatter.write_str("extensions are excluded from exact MCP 2024-11-05")
             }
@@ -2086,6 +2173,77 @@ impl NegotiatedExtensionSet {
         Ok(descriptor)
     }
 
+    /// Admits one server notification under this request's frozen negotiation.
+    ///
+    /// `raw_params`, when available from transport admission, must be the
+    /// notification's original parameter source. It preserves encoded string
+    /// limits and exact numeric spellings. Typed producers may pass `None`;
+    /// their canonical encoding is subjected to the same bounded codec.
+    /// Unknown metadata never selects a descriptor. The caller supplies the
+    /// extension owner already retained by the live request, then compares the
+    /// returned key with that request before retaining or delivering the event.
+    pub fn admit_stdio_notification(
+        &self,
+        registry: &ExtensionDescriptorRegistry,
+        request_era: ProtocolEra,
+        capability: &ExtensionId,
+        notification: &crate::JsonRpcRequest,
+        raw_params: Option<&str>,
+    ) -> Result<StdioNotificationCorrelation, ExtensionDispatchError> {
+        let descriptor = self.admit_notification(
+            registry,
+            request_era,
+            capability,
+            &notification.method,
+            ExtensionDirection::ServerToClient,
+        )?;
+        let invalid = || ExtensionDispatchError::InvalidStdioCorrelation;
+        if notification.id.is_some() || notification.validate().is_err() {
+            return Err(invalid());
+        }
+        let correlation = descriptor.stdio_correlation.as_ref().ok_or_else(invalid)?;
+        if correlation.direction != ExtensionDirection::ServerToClient
+            || !correlation.methods.contains(&notification.method)
+        {
+            return Err(invalid());
+        }
+        let parameters = notification.params.as_ref().ok_or_else(invalid)?;
+        let encoded;
+        let source = if let Some(source) = raw_params {
+            source
+        } else {
+            encoded = bounded_stdio_notification_parameters(parameters)?;
+            &encoded
+        };
+        crate::jsonrpc::admit_raw_jsonrpc_document(
+            source.as_bytes(),
+            MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+        )
+        .map_err(|_| invalid())?;
+        let admitted: Value = serde_json::from_str(source).map_err(|_| invalid())?;
+        if &admitted != parameters {
+            return Err(invalid());
+        }
+        validate_extension_notification_metadata(parameters).map_err(|_| invalid())?;
+        #[derive(Deserialize)]
+        struct RawParameters {
+            #[serde(rename = "_meta")]
+            metadata: BTreeMap<String, Box<serde_json::value::RawValue>>,
+        }
+        let raw: RawParameters = serde_json::from_str(source).map_err(|_| invalid())?;
+        let value = raw.metadata.get(&correlation.metadata_key).ok_or_else(invalid)?;
+        let request_id = correlation.codec.decode(value.get())?;
+        let correlation_key = request_id.correlation_key().map_err(|_| invalid())?;
+        let active = self.active.get(capability).ok_or_else(invalid)?;
+        Ok(StdioNotificationCorrelation {
+            request_id,
+            correlation_key,
+            extension_id: capability.clone(),
+            registry_receipt: self.registry_receipt.clone(),
+            effective_settings_fingerprint: *active.effective_settings.fingerprint(),
+        })
+    }
+
     /// Admits a result discriminator owned by an active capability for one modern request.
     pub fn admit_result_discriminator<'a>(
         &self,
@@ -2136,6 +2294,28 @@ fn validate_dispatch_name(name: &str) -> Result<(), ExtensionDispatchError> {
         return Err(ExtensionDispatchError::NameTooLong(name.to_owned()));
     }
     Ok(())
+}
+
+fn bounded_stdio_notification_parameters(
+    parameters: &Value,
+) -> Result<String, ExtensionDispatchError> {
+    struct Buffer(Vec<u8>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("extension notification byte limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Buffer(Vec::new());
+    serde_json::to_writer(&mut buffer, parameters)
+        .map_err(|_| ExtensionDispatchError::InvalidStdioCorrelation)?;
+    String::from_utf8(buffer.0).map_err(|_| ExtensionDispatchError::InvalidStdioCorrelation)
 }
 
 fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), ExtensionRegistryError> {
@@ -2252,7 +2432,15 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
         if correlation.metadata_key.is_empty() {
             return Err(ExtensionRegistryError::MissingOwner("stdio correlation"));
         }
-        ExtensionId::parse(correlation.metadata_key.clone())?;
+        let key = ExtensionId::parse(correlation.metadata_key.clone())?;
+        if key.as_str().split_once('/').map(|(prefix, _)| prefix)
+            != descriptor.id.as_str().split_once('/').map(|(prefix, _)| prefix)
+        {
+            return Err(ExtensionRegistryError::LocalOwnershipCollision {
+                field: "stdio correlation metadata key",
+                value: correlation.metadata_key.clone(),
+            });
+        }
         if correlation.methods.is_empty()
             || correlation.methods.len() > MAX_STDIO_CORRELATION_METHODS
         {
@@ -2262,10 +2450,11 @@ fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Extension
             return Err(ExtensionRegistryError::MissingOwner("stdio notification"));
         };
         if notification.direction != correlation.direction
+            || correlation.direction != ExtensionDirection::ServerToClient
             || !correlation
                 .methods
                 .iter()
-                .any(|method| method == &notification.name)
+                .all(|method| method == &notification.name)
         {
             return Err(ExtensionRegistryError::LocalOwnershipCollision {
                 field: "stdio correlation notification",
@@ -2504,7 +2693,7 @@ fn canonical_descriptor_row(
             "notification": canonical_notification_row(descriptor.notification.as_ref()),
             "resultDiscriminator": descriptor.result_discriminator,
             "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
-            "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction))),
+            "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction), format!("{:?}", s.codec), MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)),
         });
     }
     let mut methods = descriptor
@@ -2538,7 +2727,7 @@ fn canonical_descriptor_row(
         "notification": canonical_notification_row(descriptor.notification.as_ref()),
         "resultDiscriminator": descriptor.result_discriminator,
         "routingHeaders": descriptor.routing_headers.iter().map(|h| &h.name).collect::<Vec<_>>(),
-        "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction))),
+        "stdio": descriptor.stdio_correlation.as_ref().map(|s| (&s.metadata_key, &s.methods, format!("{:?}", s.direction), format!("{:?}", s.codec), MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)),
     })
 }
 
@@ -2611,6 +2800,188 @@ mod tests {
                 key: key.to_owned(),
             });
         descriptor
+    }
+
+    fn stdio_notification_registry() -> (ExtensionDescriptorRegistry, ExtensionId) {
+        let id = ExtensionId::parse("com.example/weather").unwrap();
+        let mut extension = descriptor(
+            id.clone(),
+            "example/weather",
+            "example/weather_changed",
+            "com.example/weather_result",
+        );
+        extension.resolver.fallback = ExtensionFallbackPolicy::InactiveOnEitherPeer;
+        extension.stdio_correlation = Some(StdioCorrelationDescriptor {
+            metadata_key: "com.example/request".to_owned(),
+            methods: vec!["example/weather_changed".to_owned()],
+            direction: ExtensionDirection::ServerToClient,
+            codec: StdioCorrelationCodec::RequestId,
+        });
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry.register(extension).unwrap();
+        registry.freeze().unwrap();
+        (registry, id)
+    }
+
+    fn negotiate_stdio_notification(
+        registry: &ExtensionDescriptorRegistry,
+        id: &ExtensionId,
+        enabled: bool,
+        client_present: bool,
+        server_present: bool,
+    ) -> NegotiatedExtensionSet {
+        let settings = ExtensionSettings::new(json!({"format": "weather-v1"})).unwrap();
+        let mut local = ExtensionLocalEnablement::default();
+        if enabled {
+            local.enable(id.clone());
+        }
+        let client = ClientExtensionDiscovery {
+            extensions: if client_present {
+                BTreeMap::from([(id.clone(), settings.clone())])
+            } else {
+                BTreeMap::new()
+            },
+        };
+        let server = ServerExtensionDiscovery {
+            extensions: if server_present {
+                BTreeMap::from([(id.clone(), settings)])
+            } else {
+                BTreeMap::new()
+            },
+        };
+        let mut resolver = |_: &ExtensionDescriptor,
+                            client: &ExtensionSettings,
+                            _: &ExtensionSettings| Ok(client.clone());
+        registry
+            .negotiate(ProtocolEra::Modern2026, &local, &client, &server, &mut resolver)
+            .unwrap()
+    }
+
+    #[test]
+    fn stdio_correlation_codec_preserves_exact_ids_and_bounds() {
+        let codec = StdioCorrelationCodec::RequestId;
+        for source in ["17", "17.0", "1.7e1"] {
+            assert!(codec.decode(source).unwrap().correlates_with(&crate::RequestId::Number(17)));
+        }
+        let large = codec.decode("9007199254740993").unwrap();
+        assert!(!large.correlates_with(&codec.decode("9007199254740992").unwrap()));
+        assert!(!codec.decode(r#""17""#).unwrap().correlates_with(&codec.decode("17").unwrap()));
+        for source in ["1.25", "null", "true", "{}", "[]", "1e10001"] {
+            assert!(codec.decode(source).is_err(), "{source}");
+        }
+        let string_limit = crate::jsonrpc::MAX_JSONRPC_STRING_ID_ENCODED_BYTES;
+        assert!(codec.decode(&format!("\"{}\"", "a".repeat(string_limit - 2))).is_ok());
+        assert!(codec.decode(&format!("\"{}\"", "a".repeat(string_limit - 1))).is_err());
+        // Both decode to a short legal string; only the second raw token is
+        // over the encoded wire limit. A Value-only decoder would miss it.
+        assert!(codec.decode(&format!("\"{}\"", "\\u0061".repeat(42))).is_ok());
+        assert!(codec.decode(&format!("\"{}\"", "\\u0061".repeat(43))).is_err());
+        let number_limit = crate::jsonrpc::MAX_RAW_JSON_NUMBER_BYTES;
+        assert!(codec.decode(&format!("1{}", "0".repeat(number_limit - 1))).is_ok());
+        assert!(codec.decode(&format!("1{}", "0".repeat(number_limit))).is_err());
+    }
+
+    #[test]
+    fn stdio_correlation_requires_frozen_matching_negotiation() {
+        let (registry, id) = stdio_notification_registry();
+        let negotiated = negotiate_stdio_notification(&registry, &id, true, true, true);
+        let params = r#"{"temperature":17,"_meta":{"com.example/request":1.7e1}}"#;
+        let notification = crate::JsonRpcRequest::notification(
+            "example/weather_changed",
+            Some(serde_json::from_str(params).unwrap()),
+        );
+        for raw in [None, Some(params)] {
+            let capsule = negotiated
+                .admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &notification, raw)
+                .unwrap();
+            assert_eq!(capsule.correlation_key(), &crate::RequestId::Number(17).correlation_key().unwrap());
+            assert_eq!(capsule.extension_id(), &id);
+            assert_eq!(capsule.registry_receipt(), registry.receipt().unwrap());
+            assert_eq!(capsule.effective_settings_fingerprint(), negotiated.active(&id).unwrap().effective_settings().fingerprint());
+        }
+        for (enabled, client, server) in [(false, true, true), (true, false, true), (true, true, false)] {
+            let inactive = negotiate_stdio_notification(&registry, &id, enabled, client, server);
+            assert!(inactive.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &notification, Some(params)).is_err());
+        }
+        assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Legacy2024, &id, &notification, Some(params)).is_err());
+        let mut other_registry = ExtensionDescriptorRegistry::new();
+        let mut changed = registry.descriptor(&id).unwrap().clone();
+        changed.stdio_correlation.as_mut().unwrap().metadata_key = "com.example/other".to_owned();
+        other_registry.register(changed).unwrap();
+        other_registry.freeze().unwrap();
+        assert_ne!(registry.receipt(), other_registry.receipt());
+        assert!(matches!(negotiated.admit_stdio_notification(&other_registry, ProtocolEra::Modern2026, &id, &notification, None), Err(ExtensionDispatchError::RegistryReceiptMismatch)));
+        for malformed in [
+            json!({"_meta": {"com.example/other": 17}}),
+            json!({"_meta": {"com.example/request": null}}),
+            json!({"_meta": {"com.example/request": 17.25}}),
+            json!({"_meta": {"com.example/request": 17, "io.modelcontextprotocol/subscriptionId": null}}),
+            json!({"_meta": null}),
+            json!({"temperature": 17}),
+            json!({"_meta": {"com.example/request": 17}, "large": "x".repeat(MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)}),
+        ] {
+            let mut bad = notification.clone();
+            bad.params = Some(malformed);
+            assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &bad, None).is_err());
+        }
+        for method in ["example/other_changed", "notifications/progress"] {
+            let mut wrong = notification.clone();
+            wrong.method = method.to_owned();
+            assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &wrong, None).is_err());
+        }
+        let mut request = notification.clone();
+        request.id = Some(crate::RequestId::Number(18));
+        assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &request, None).is_err());
+        for raw in [
+            r#"{"temperature":17,"_meta":{"com.example/request":18}}"#,
+            r#"{"temperature":17,"_meta":{"com.example/request":17,"com.example/request":17}}"#,
+        ] {
+            assert!(negotiated.admit_stdio_notification(&registry, ProtocolEra::Modern2026, &id, &notification, Some(raw)).is_err());
+        }
+    }
+
+    #[test]
+    fn stdio_correlation_registration_rejects_unowned_and_colliding_fields() {
+        let (registry, id) = stdio_notification_registry();
+        let good = registry.descriptor(&id).unwrap().clone();
+        for mutation in 0..5 {
+            let mut bad = good.clone();
+            let correlation = bad.stdio_correlation.as_mut().unwrap();
+            match mutation {
+                0 => correlation.metadata_key = "org.other/request".to_owned(),
+                1 => correlation.methods.push("example/undeclared".to_owned()),
+                2 => correlation.methods.push("example/weather_changed".to_owned()),
+                3 => {
+                    correlation.direction = ExtensionDirection::ClientToServer;
+                    bad.notification.as_mut().unwrap().direction = ExtensionDirection::ClientToServer;
+                }
+                4 => {
+                    bad.notification.as_mut().unwrap().name = "notifications/progress".to_owned();
+                    correlation.methods = vec!["notifications/progress".to_owned()];
+                }
+                _ => unreachable!(),
+            }
+            assert!(ExtensionDescriptorRegistry::new().register(bad).is_err());
+        }
+        for duplicate_key in [false, true] {
+            let mut pair = ExtensionDescriptorRegistry::new();
+            pair.register(good.clone()).unwrap();
+            let mut other = good.clone();
+            other.id = ExtensionId::parse("com.example/other").unwrap();
+            other.method.as_mut().unwrap().name = "example/other".to_owned();
+            other.result_discriminator = None;
+            other.routing_headers.clear();
+            if duplicate_key {
+                other.notification.as_mut().unwrap().name = "example/other_changed".to_owned();
+                other.stdio_correlation.as_mut().unwrap().methods = vec!["example/other_changed".to_owned()];
+            } else {
+                other.stdio_correlation.as_mut().unwrap().metadata_key = "com.example/other_request".to_owned();
+            }
+            assert!(pair.register(other).is_err());
+            assert_eq!(pair.descriptors().len(), 1);
+        }
+        let mut frozen = registry.clone();
+        assert_eq!(frozen.register(good), Err(ExtensionRegistryError::Frozen));
     }
 
     #[test]

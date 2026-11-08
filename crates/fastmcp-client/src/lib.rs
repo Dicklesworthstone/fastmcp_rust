@@ -17698,8 +17698,8 @@ impl StdioRequestExecution {
         self.execution.request_id()
     }
 
-    /// Drains this execution's admitted progress notifications in arrival
-    /// order without reading the connection.
+    /// Drains this execution's admitted progress and negotiated extension
+    /// notifications in arrival order without reading the connection.
     pub fn take_stream_notifications(&mut self) -> McpResult<Vec<JsonRpcRequest>> {
         self.execution.take_stream_notifications()
     }
@@ -17930,6 +17930,15 @@ impl StdioRequestExecutor {
     /// Use [`Self::try_take_response_with_raw_result`] to retain the extension
     /// result's exact admitted JSON source. Dropping the handle requests only
     /// that execution's cancellation.
+    ///
+    /// When the frozen descriptor declares a server-to-client notification and
+    /// an exact-request-ID stdio correlation codec, matching notifications are
+    /// delivered by [`StdioRequestExecution::take_stream_notifications`]. The
+    /// metadata key must belong to this extension and name this live request;
+    /// the event cannot reset its idle deadline. This executor allocates fresh
+    /// request IDs for the connection lifetime, so late events cannot target a
+    /// later request. Low-level executors that deliberately reuse wire IDs after
+    /// tombstone expiry cannot distinguish old events from the new owner.
     pub fn execute_final_extension(
         &self,
         cx: &Cx,
@@ -18439,11 +18448,14 @@ impl StdioRequestExecutor {
 
     /// Returns whether an admitted selected-stdio notification belongs to a
     /// live request owner. Every selected-stdio ingress branch must use this
-    /// common predicate so Tasks status notifications reach their listener
-    /// instead of falling through to connection-level routing.
+    /// common predicate so Tasks and extension notifications reach their
+    /// request-owned decoder instead of falling through to connection routing.
+    /// Extension selection is only an inert ID candidate; `drive_frame` still
+    /// checks raw correlation, retained negotiation and caller lifetime.
     fn owns_selected_stdio_notification(&self, notification: &JsonRpcRequest) -> bool {
         let owns = self.owns_progress_notification(notification)
-            || self.owns_modern_subscription_cancellation(notification);
+            || self.owns_modern_subscription_cancellation(notification)
+            || self.executor.owns_extension_notification(notification);
         #[cfg(feature = "tasks")]
         let owns = owns || self.owns_task_subscription_notification(notification);
         owns
@@ -58840,6 +58852,125 @@ while IFS= read -r unexpected; do exit 31; done
             extensions: BTreeMap::from([(extension_id.clone(), settings)]),
         };
         (extension_id, registry, discovery)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clt_stdio_extension_notifications_follow_negotiated_request_owners() {
+        use fastmcp_protocol::extensions::{
+            ExtensionDescriptorRegistry, ExtensionFallbackPolicy, ExtensionNotificationDescriptor,
+            StdioCorrelationCodec, StdioCorrelationDescriptor,
+        };
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        runtime.block_on(async {
+            let (id, original, local) = raw_extension_configuration(
+                ExtensionDirection::ClientToServer,
+                ExtensionFallbackPolicy::RejectOneSided,
+            );
+            let mut descriptor = original.descriptor(&id).unwrap().clone();
+            descriptor.notification = Some(ExtensionNotificationDescriptor {
+                name: "example/events".to_owned(),
+                direction: ExtensionDirection::ServerToClient,
+                activation_proof: None,
+            });
+            descriptor.stdio_correlation = Some(StdioCorrelationDescriptor {
+                metadata_key: "com.example/request".to_owned(),
+                methods: vec!["example/events".to_owned()],
+                direction: ExtensionDirection::ServerToClient,
+                codec: StdioCorrelationCodec::RequestId,
+            });
+            let mut registry = ExtensionDescriptorRegistry::new();
+            registry.register(descriptor).unwrap();
+            let discovery = modern_raw_extension_discovery_response(
+                "extension-notification-peer",
+                Some(serde_json::json!({"mode":"raw"})),
+            );
+            let script = r#"
+IFS= read -r discover || exit 10
+printf '%s\n' "$1"
+IFS= read -r first || exit 11
+case "$first" in *'"method":"example/echo"'*'"id":2'*) ;; *) exit 12 ;; esac
+case "$first" in *'"com.example/raw":{"mode":"raw"}'*) ;; *) exit 13 ;; esac
+IFS= read -r second || exit 14
+case "$second" in *'"method":"example/echo"'*'"id":3'*) ;; *) exit 15 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"wrong-key","_meta":{"com.example/Request":2}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/other_events","params":{"value":"wrong-method","_meta":{"com.example/request":2}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"string-id","_meta":{"com.example/request":"2"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"second","_meta":{"com.example/request":3}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"first","_meta":{"com.example/request":2e0}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"owner-a","progress":1}}'
+IFS= read -r cancellation || exit 16
+case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":2'*) ;; *) exit 17 ;; esac
+IFS= read -r fresh || exit 18
+case "$fresh" in *'"method":"example/echo"'*'"id":4'*) ;; *) exit 19 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"late","_meta":{"com.example/request":2}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"second-again","_meta":{"com.example/request":3}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"example/events","params":{"value":"fresh","_meta":{"com.example/request":4}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","owner":"late"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","owner":"fresh"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","owner":"second"}}'
+while IFS= read -r unexpected; do exit 20; done
+"#;
+            let mut client = ClientBuilder::new()
+                .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
+                .request_timeout_policy(RequestTimeoutPolicy::new(Duration::from_secs(3), Duration::from_secs(5)).unwrap())
+                .extension_registry(registry, local, || accept_raw_extension_settings)
+                .unwrap()
+                .connect_stdio_with_cx(&cx, "sh", &["-c", script, "extension-notification-peer", &discovery])
+                .await
+                .unwrap();
+            let executor = client.multiplexed_stdio_executor().unwrap();
+            let cancelled = McpRequestCancellation::new();
+            let mut first = executor.execute_final_extension_with_cancellation(
+                &cx, &cancelled, &id, "example/echo",
+                serde_json::json!({"_meta":{"progressToken":"owner-a"}}),
+            ).unwrap();
+            let mut second = executor.clone().execute_final_extension(
+                &cx, &id, "example/echo", serde_json::json!({}),
+            ).unwrap();
+            assert_eq!(first.request_id(), &RequestId::Number(2));
+            assert_eq!(second.request_id(), &RequestId::Number(3));
+            let before = executor.executor.pending_records();
+            for _ in 0..5 { client.drive_multiplexed_stdio(&cx).unwrap(); }
+            assert_eq!(executor.executor.pending_records(), before, "extension events are idle-neutral");
+            client.drive_multiplexed_stdio(&cx).unwrap();
+            let first_events = first.take_stream_notifications().unwrap();
+            assert_eq!(first_events.len(), 2);
+            assert_eq!(first_events[0].method, "example/events");
+            assert_eq!(first_events[0].params.as_ref().unwrap()["value"], "first");
+            assert_eq!(first_events[1].method, "notifications/progress");
+            let second_events = second.take_stream_notifications().unwrap();
+            assert_eq!(second_events.len(), 1);
+            assert_eq!(second_events[0].params.as_ref().unwrap()["value"], "second");
+            cancelled.cancel();
+            let mut fresh = executor.execute_final_extension(
+                &cx, &id, "example/echo", serde_json::json!({}),
+            ).unwrap();
+            assert_eq!(fresh.request_id(), &RequestId::Number(4));
+            assert_eq!(client.peek_next_request_id(), 5);
+            for _ in 0..6 { client.drive_multiplexed_stdio(&cx).unwrap(); }
+            assert!(first.take_stream_notifications().unwrap().is_empty());
+            let second_events = second.take_stream_notifications().unwrap();
+            assert_eq!(second_events.len(), 1);
+            assert_eq!(second_events[0].params.as_ref().unwrap()["value"], "second-again");
+            let fresh_events = fresh.take_stream_notifications().unwrap();
+            assert_eq!(fresh_events.len(), 1);
+            assert_eq!(fresh_events[0].params.as_ref().unwrap()["value"], "fresh");
+            assert_eq!(executor.try_take_response(&mut first).unwrap_err().code, McpErrorCode::RequestCancelled);
+            assert_eq!(executor.try_take_response(&mut second).unwrap().unwrap().result.unwrap()["owner"], "second");
+            assert_eq!(executor.try_take_response(&mut fresh).unwrap().unwrap().result.unwrap()["owner"], "fresh");
+            assert!(executor.executor.pending_records().is_empty());
+            assert!(executor.executor.terminal_error().is_none());
+            assert!(cx.checkpoint().is_ok());
+            client.close_with_cx(&cx).await.unwrap();
+            assert!(client.child_cleanup_complete());
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
     #[cfg(unix)]

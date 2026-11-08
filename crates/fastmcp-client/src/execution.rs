@@ -2005,6 +2005,17 @@ where
             == 1
     }
 
+    /// Selects only an inert extension notification candidate for ingress.
+    /// The complete source frame must still pass `drive_frame`, which rechecks
+    /// caller lifetime and the frozen negotiation before queueing any event.
+    pub(crate) fn owns_extension_notification(&self, notification: &JsonRpcRequest) -> bool {
+        self.state.borrow().pending.values().any(|pending| {
+            pending.extension_result.as_ref().is_some_and(|admission| {
+                admission.matches_notification_candidate(notification, &pending.record.correlation_key)
+            })
+        })
+    }
+
     /// Returns whether a modern server cancellation names this executor's live
     /// `subscriptions/listen` owner.
     ///
@@ -2644,7 +2655,7 @@ where
                     }
                 };
                 let raw_progress_params =
-                    match progress_params_source_from_admitted_frame(&message, source) {
+                    match notification_params_source_from_admitted_frame(&message, source) {
                         Ok(raw_progress_params) => raw_progress_params,
                         Err(error) => {
                             state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
@@ -2693,7 +2704,7 @@ where
             }
         };
         let raw_progress_params =
-            match progress_params_source_from_admitted_frame(&message, &source) {
+            match notification_params_source_from_admitted_frame(&message, &source) {
                 Ok(raw_progress_params) => raw_progress_params,
                 Err(error) => {
                     state.fail_all(error.clone(), ExecutionTerminalReason::PeerProtocol);
@@ -4401,7 +4412,7 @@ where
         raw_params: Option<&str>,
     ) -> McpResult<bool> {
         if notification.method != "notifications/progress" {
-            return Ok(false);
+            return Self::route_extension_notification_locked(state, notification, raw_params);
         }
         let Some(params) = notification.params.as_ref().and_then(Value::as_object) else {
             return Ok(false);
@@ -4511,26 +4522,61 @@ where
         stream.push_back(retained);
         Ok(true)
     }
+
+    fn route_extension_notification_locked(
+        state: &mut ExecutorState<T>,
+        notification: &JsonRpcRequest,
+        raw_params: Option<&str>,
+    ) -> McpResult<bool> {
+        // A metadata value alone is never an owner. Only an explicit extension
+        // request retains the frozen descriptor and current negotiated settings
+        // that can issue this capsule. Ordinary core requests cannot acquire
+        // extension behavior from connection discovery or peer metadata.
+        let owner = state.pending.values().find_map(|pending| {
+            let admission = pending.extension_result.as_ref()?;
+            let correlation = admission.admit_stream_notification(
+                notification,
+                raw_params,
+                &pending.record.correlation_key,
+            )?;
+            (correlation.correlation_key() == &pending.record.correlation_key).then(|| {
+                (
+                    pending.record.request_id.clone(),
+                    pending.record.execution_generation,
+                )
+            })
+        });
+        let Some(owner) = owner else {
+            return Ok(false);
+        };
+        let stream = state.stream_notifications.entry(owner).or_default();
+        if stream.len() >= MAX_RETAINED_PEER_ACTIVITY {
+            return Err(McpError::internal_error("Client request stream queue is full"));
+        }
+        // Extensions have no implicit progress semantics. Retaining an event
+        // cannot extend idle/absolute bounds or change terminal selection.
+        stream.push_back(notification.clone());
+        Ok(true)
+    }
 }
 
-fn progress_params_source_from_admitted_frame(
+fn notification_params_source_from_admitted_frame(
     message: &JsonRpcMessage,
     source: &[u8],
 ) -> McpResult<Option<String>> {
-    if !matches!(message, JsonRpcMessage::Request(request)
-        if request.id.is_none() && request.method == "notifications/progress")
+    if !matches!(message, JsonRpcMessage::Request(request) if request.id.is_none())
     {
         return Ok(None);
     }
     #[derive(serde::Deserialize)]
-    struct RawProgressEnvelope {
+    struct RawNotificationEnvelope {
         #[serde(default)]
         params: Option<Box<serde_json::value::RawValue>>,
     }
     // ReceivedTransportFrame already owns duplicate-aware bounded admission;
     // this pass only retains params from that same accepted source frame.
-    let raw = serde_json::from_slice::<RawProgressEnvelope>(source).map_err(|_| {
-        McpError::invalid_request("Admitted progress frame could not retain its exact parameters")
+    let raw = serde_json::from_slice::<RawNotificationEnvelope>(source).map_err(|_| {
+        McpError::invalid_request("Admitted notification could not retain its exact parameters")
     })?;
     Ok(raw.params.map(|params| params.get().to_owned()))
 }
@@ -4748,8 +4794,10 @@ impl<T> RequestExecution<T> {
 
     /// Removes request-owned streaming notifications in peer arrival order.
     ///
-    /// Only structurally valid progress with this execution's exact token can
-    /// enter this queue; generic notifications remain executor-level activity.
+    /// Admits structurally valid progress with this execution's exact token,
+    /// and descriptor-correlated notifications for explicit negotiated extension
+    /// requests. Extension events do not reset idle deadlines. Generic or
+    /// unowned notifications remain executor-level activity.
     pub fn take_stream_notifications(&mut self) -> McpResult<Vec<JsonRpcRequest>> {
         if self.completed {
             return Err(McpError::invalid_request(
@@ -4948,6 +4996,277 @@ mod tests {
     use super::*;
     use fastmcp_protocol::ExactJsonValue;
     use fastmcp_transport::CodecError;
+
+    mod extension_notifications {
+        use super::*;
+        use crate::session::ClientExtensionRuntime;
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+            ExtensionDirection, ExtensionFallbackPolicy, ExtensionHttpEraDisposition,
+            ExtensionMethodDescriptor, ExtensionNegotiationResolver, ExtensionNotificationDescriptor,
+            ExtensionSettings, ExtensionSettingsSchema, StdioCorrelationCodec,
+            StdioCorrelationDescriptor,
+        };
+        use fastmcp_transport::memory::{
+            MemoryRecvHalf, MemorySendHalf, MemoryTransport, create_memory_transport_pair_with_capacity,
+        };
+        use fastmcp_transport::{ClientTransportRecvHalf, TransportRecvHalf, TransportSendHalf};
+        use serde_json::json;
+
+        const METHOD: &str = "example/watch";
+        const EVENT: &str = "example/change";
+        const KEY: &str = "com.example/request";
+
+        struct SplitMemory {
+            reader: MemoryRecvHalf,
+            writer: MemorySendHalf,
+        }
+
+        impl Transport for SplitMemory {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.writer.send(cx, message)
+            }
+            fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                self.reader.recv(cx)
+            }
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+                self.reader.close(cx)?;
+                self.writer.close(cx)
+            }
+        }
+
+        impl SplitMemory {
+            fn receive_frame(&mut self, cx: &Cx) -> Result<ReceivedTransportFrame, TransportError> {
+                self.reader.recv_with_source(cx)
+            }
+        }
+
+        fn admission() -> ClientExtensionResultAdmission {
+            let id = fastmcp_protocol::ExtensionId::parse("com.example/events").unwrap();
+            let mut registry = ExtensionDescriptorRegistry::new();
+            registry.register(ExtensionDescriptor {
+                id: id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: "events-client-v1".to_owned(), codec_id: "events-client-v1".to_owned(),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: "events-server-v1".to_owned(), codec_id: "events-server-v1".to_owned(),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: "events-settings-v1".to_owned(), version: 1,
+                    fallback: ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: Some(ExtensionMethodDescriptor {
+                    name: METHOD.to_owned(), direction: ExtensionDirection::ClientToServer,
+                    http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+                    legacy_fallback: false,
+                }),
+                notification: Some(ExtensionNotificationDescriptor {
+                    name: EVENT.to_owned(), direction: ExtensionDirection::ServerToClient,
+                    activation_proof: None,
+                }),
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: Some(StdioCorrelationDescriptor {
+                    metadata_key: KEY.to_owned(), methods: vec![EVENT.to_owned()],
+                    direction: ExtensionDirection::ServerToClient, codec: StdioCorrelationCodec::RequestId,
+                }),
+            }).unwrap();
+            let runtime = Arc::new(ClientExtensionRuntime::new(
+                registry,
+                ClientExtensionDiscovery { extensions: BTreeMap::from([
+                    (id.clone(), ExtensionSettings::new(json!({"version": 1})).unwrap()),
+                ]) },
+                || |_: &ExtensionDescriptor, client: &ExtensionSettings, _: &ExtensionSettings| Ok(client.clone()),
+            ).unwrap());
+            let discovery = serde_json::from_value(json!({
+                "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                "capabilities": {"extensions": {"com.example/events": {"version": 1}}},
+                "ttlMs": 0, "cacheScope": "private",
+            })).unwrap();
+            let negotiated = runtime.negotiate(&discovery).unwrap();
+            runtime.admit_request(&negotiated, &id, METHOD).unwrap()
+        }
+
+        fn pair(source: bool, era: ResultPeerEra) -> (RequestExecutor<SplitMemory>, MemoryTransport) {
+            let (transport, peer) = create_memory_transport_pair_with_capacity(64);
+            let (reader, writer) = transport.into_split();
+            (RequestExecutor::with_source_frame_receiver(
+                SplitMemory { reader, writer }, era,
+                source.then_some(SplitMemory::receive_frame),
+            ), peer)
+        }
+
+        fn start(executor: &RequestExecutor<SplitMemory>, peer: &mut MemoryTransport, cx: &Cx, id: RequestId) -> RequestExecution<SplitMemory> {
+            let request = JsonRpcRequest::new(METHOD, Some(json!({"_meta": {"progressToken": id}})), id.clone());
+            let execution = executor.execute_final_extension_with_timeout_policy(
+                cx, request, RequestTimeoutPolicy::default(), admission(),
+            ).unwrap();
+            let JsonRpcMessage::Request(sent) = peer.recv(cx).unwrap() else { panic!("request reached peer"); };
+            assert_eq!(sent.id, Some(id));
+            execution
+        }
+
+        fn event(id: Value, value: &str) -> JsonRpcMessage {
+            JsonRpcMessage::Request(JsonRpcRequest::notification(EVENT, Some(json!({
+                "value": value, "_meta": {KEY: id},
+            }))))
+        }
+
+        fn deliver(executor: &RequestExecutor<SplitMemory>, peer: &mut MemoryTransport, cx: &Cx, message: &JsonRpcMessage) {
+            peer.send(cx, message).unwrap();
+            executor.drive(cx).unwrap();
+        }
+
+        #[test]
+        fn negotiated_notifications_are_owned_and_do_not_reset_idle() {
+            for source in [false, true] {
+                let cx = Cx::for_testing();
+                let (executor, mut peer) = pair(source, ResultPeerEra::Modern);
+                let mut owners = (1..=24).map(|id| start(&executor, &mut peer, &cx, RequestId::Number(id))).collect::<Vec<_>>();
+                let mut string_owner = start(&executor, &mut peer, &cx, RequestId::String("17".to_owned()));
+                let before = executor.pending_records();
+                deliver(&executor, &mut peer, &cx, &event(serde_json::from_str("1.7e1").unwrap(), "numeric"));
+                deliver(&executor, &mut peer, &cx, &event(json!("17"), "string"));
+                assert_eq!(executor.pending_records(), before, "extension activity cannot reset deadlines");
+                for (index, owner) in owners.iter_mut().enumerate() {
+                    let events = owner.take_stream_notifications().unwrap();
+                    if index == 16 {
+                        assert_eq!(events.len(), 1);
+                        assert_eq!(events[0].params.as_ref().unwrap()["value"], "numeric");
+                    } else { assert!(events.is_empty()); }
+                }
+                assert_eq!(string_owner.take_stream_notifications().unwrap()[0].params.as_ref().unwrap()["value"], "string");
+                assert!(executor.take_notifications().is_empty());
+                let key = RequestId::Number(17).correlation_key().unwrap();
+                let old_idle = Instant::now() + Duration::from_secs(1);
+                executor.state.borrow_mut().pending.get_mut(&key).unwrap().record.idle_deadline = old_idle;
+                let progress = JsonRpcMessage::Request(JsonRpcRequest::notification("notifications/progress", Some(json!({"progressToken": 17, "progress": 1}))));
+                deliver(&executor, &mut peer, &cx, &progress);
+                assert!(executor.state.borrow().pending[&key].record.idle_deadline > old_idle);
+                assert_eq!(owners[16].take_stream_notifications().unwrap().len(), 1);
+                // A substantial event is admitted once for the exact owner,
+                // even with many same-extension waiters sharing this channel.
+                let large = "x".repeat(60 * 1024);
+                deliver(&executor, &mut peer, &cx, &event(json!(24), &large));
+                assert_eq!(owners[23].take_stream_notifications().unwrap()[0].params.as_ref().unwrap()["value"], large);
+                for id in (1..=24).rev() {
+                    deliver(&executor, &mut peer, &cx, &response(id, json!({"resultType":"complete", "owner":id})));
+                }
+                deliver(&executor, &mut peer, &cx, &JsonRpcMessage::Response(JsonRpcResponse::success(RequestId::String("17".to_owned()), json!({"resultType":"complete", "owner":"string"}))));
+                for (index, owner) in owners.iter_mut().enumerate() {
+                    assert_eq!(executor.try_take_response(owner).unwrap().unwrap().result.unwrap()["owner"], index + 1);
+                }
+                assert_eq!(executor.try_take_response(&mut string_owner).unwrap().unwrap().result.unwrap()["owner"], "string");
+                assert!(executor.pending_records().is_empty());
+                assert!(executor.terminal_error().is_none());
+            }
+        }
+
+        #[test]
+        fn rejected_notifications_cannot_acquire_request_ownership() {
+            for source in [false, true] {
+                let cx = Cx::for_testing();
+                let (executor, mut peer) = pair(source, ResultPeerEra::Modern);
+                let mut owner = start(&executor, &mut peer, &cx, RequestId::Number(17));
+                let mut ordinary = executor.execute(&cx, JsonRpcRequest::new(METHOD, Some(json!({})), 18)).unwrap();
+                peer.recv(&cx).unwrap();
+                let before = executor.pending_records();
+                for bad in [
+                    event(json!(18), "unadmitted ordinary request"),
+                    event(json!("17"), "string is not numeric"),
+                    event(json!(17.5), "fraction"),
+                    event(Value::Null, "null"),
+                    event(json!({"id":17}), "object"),
+                    event(json!(999), "no active owner"),
+                    event(json!(17), &"x".repeat(fastmcp_protocol::MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(EVENT, Some(json!({"_meta":{"com.example/Request":17}})))),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification("example/other_change", Some(json!({"_meta":{KEY:17}})))),
+                    JsonRpcMessage::Request(JsonRpcRequest::notification(EVENT, Some(json!({"_meta":{KEY:17,"io.modelcontextprotocol/subscriptionId":null}})))),
+                ] {
+                    deliver(&executor, &mut peer, &cx, &bad);
+                    assert_eq!(executor.pending_records(), before);
+                    assert!(owner.take_stream_notifications().unwrap().is_empty());
+                    assert!(ordinary.take_stream_notifications().unwrap().is_empty());
+                    assert_eq!(executor.take_notifications().len(), 1);
+                }
+                deliver(&executor, &mut peer, &cx, &event(json!(17), "accepted"));
+                assert_eq!(owner.take_stream_notifications().unwrap()[0].params.as_ref().unwrap()["value"], "accepted");
+                let string_id = "a".repeat(43);
+                let mut escaped_owner = start(&executor, &mut peer, &cx, RequestId::String(string_id.clone()));
+                let raw = format!(r#"{{"value":"escaped","_meta":{{"com.example/request":"{}"}}}}"#, "\\u0061".repeat(43));
+                let notification = JsonRpcRequest::notification_with_raw_params(EVENT, raw, 1024).unwrap();
+                deliver(&executor, &mut peer, &cx, &JsonRpcMessage::Request(notification));
+                if source {
+                    assert!(escaped_owner.take_stream_notifications().unwrap().is_empty());
+                    assert_eq!(executor.take_notifications().len(), 1);
+                } else {
+                    // Typed ingress knows only its bounded decoded string;
+                    // the original escape spelling is unavailable there.
+                    assert_eq!(escaped_owner.take_stream_notifications().unwrap().len(), 1);
+                }
+                deliver(&executor, &mut peer, &cx, &event(json!(string_id), "canonical"));
+                assert_eq!(escaped_owner.take_stream_notifications().unwrap().len(), 1);
+                assert!(executor.terminal_error().is_none());
+            }
+            let cx = Cx::for_testing();
+            let (legacy, mut peer) = pair(true, ResultPeerEra::Legacy);
+            assert!(legacy.execute_final_extension_with_timeout_policy(&cx, JsonRpcRequest::new(METHOD, Some(json!({})), 17), RequestTimeoutPolicy::default(), admission()).is_err());
+            let mut ordinary = legacy.execute(&cx, JsonRpcRequest::new(METHOD, Some(json!({})), 17)).unwrap();
+            peer.recv(&cx).unwrap();
+            deliver(&legacy, &mut peer, &cx, &event(json!(17), "legacy"));
+            assert!(ordinary.take_stream_notifications().unwrap().is_empty());
+            assert_eq!(legacy.take_notifications().len(), 1);
+        }
+
+        #[test]
+        fn retired_extension_requests_do_not_receive_late_notifications() {
+            for source in [false, true] {
+                let cx = Cx::for_testing();
+                let (executor, mut peer) = pair(source, ResultPeerEra::Modern);
+                let mut retired = start(&executor, &mut peer, &cx, RequestId::Number(1));
+                let mut sibling = start(&executor, &mut peer, &cx, RequestId::Number(2));
+                executor.cancel(&cx, &mut retired).unwrap();
+                let JsonRpcMessage::Request(control) = peer.recv(&cx).unwrap() else { panic!("cancellation reaches peer"); };
+                assert_eq!(control.method, "notifications/cancelled");
+                assert_eq!(control.params.as_ref().unwrap()["requestId"], 1);
+                assert!(executor.execute_final_extension_with_timeout_policy(&cx, JsonRpcRequest::new(METHOD, Some(json!({})), 1), RequestTimeoutPolicy::default(), admission()).is_err());
+                let mut fresh = start(&executor, &mut peer, &cx, RequestId::Number(3));
+                for id in [1, 2, 3] { deliver(&executor, &mut peer, &cx, &event(json!(id), "event")); }
+                assert!(retired.take_stream_notifications().unwrap().is_empty());
+                assert_eq!(sibling.take_stream_notifications().unwrap().len(), 1);
+                assert_eq!(fresh.take_stream_notifications().unwrap().len(), 1);
+                assert_eq!(executor.take_notifications().len(), 1, "retired notification has no request authority");
+                for id in [1, 3, 2] { deliver(&executor, &mut peer, &cx, &response(id, json!({"resultType":"complete", "owner":id}))); }
+                deliver(&executor, &mut peer, &cx, &event(json!(2), "after final"));
+                assert!(sibling.take_stream_notifications().unwrap().is_empty());
+                assert_eq!(executor.take_notifications().len(), 1, "completed request cannot regain notification ownership");
+                assert_eq!(executor.try_take_response(&mut retired).unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(executor.try_take_response(&mut sibling).unwrap().unwrap().result.unwrap()["owner"], 2);
+                assert_eq!(executor.try_take_response(&mut fresh).unwrap().unwrap().result.unwrap()["owner"], 3);
+                assert!(executor.take_uncorrelated_responses().is_empty());
+                assert!(executor.terminal_error().is_none());
+            }
+        }
+
+        #[test]
+        fn extension_notification_queue_is_bounded() {
+            let cx = Cx::for_testing();
+            let (executor, mut peer) = pair(true, ResultPeerEra::Modern);
+            let mut owner = start(&executor, &mut peer, &cx, RequestId::Number(17));
+            let before = executor.pending_records();
+            for _ in 0..MAX_RETAINED_PEER_ACTIVITY { deliver(&executor, &mut peer, &cx, &event(json!(17), "bounded")); }
+            peer.send(&cx, &event(json!(17), "overflow")).unwrap();
+            assert_eq!(executor.drive(&cx).unwrap_err().message, "Client request stream queue is full");
+            assert_eq!(executor.pending_records(), before);
+            let events = owner.take_stream_notifications().unwrap();
+            assert_eq!(events.len(), MAX_RETAINED_PEER_ACTIVITY);
+            assert!(events.iter().all(|event| event.params.as_ref().unwrap()["value"] == "bounded"));
+            deliver(&executor, &mut peer, &cx, &event(json!(17), "after drain"));
+            assert_eq!(owner.take_stream_notifications().unwrap()[0].params.as_ref().unwrap()["value"], "after drain");
+            assert!(executor.terminal_error().is_none());
+        }
+    }
 
     mod originating_caller {
         use super::*;
