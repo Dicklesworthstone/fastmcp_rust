@@ -2582,20 +2582,37 @@ fn process_cleanup_remaining(cx: &Cx, maximum: Duration) -> McpResult<Duration> 
 }
 
 async fn wait_for_process_cleanup(cx: &Cx, maximum: Duration) -> McpResult<()> {
-    let delay = process_cleanup_remaining(cx, maximum)?;
-    let mut sleep = std::pin::pin!(asupersync::time::sleep(cx.now(), delay));
+    use crate::http_auth::caller::with_caller;
+
+    // Keep both the clock and the admitted effect ceiling of the owner. A
+    // different runtime polling close must not supply its timer for cleanup.
+    let caller = with_caller(cx, || Cx::current().expect("cleanup caller is installed"));
+    let delay = process_cleanup_remaining(&caller, maximum)?;
+    if delay.is_zero() {
+        return Ok(());
+    }
+    let mut sleep = std::pin::pin!(asupersync::time::sleep(caller.now(), delay));
     std::future::poll_fn(|task_cx| {
-        // A cancelled command still owns its killed children. Mask only this
-        // timer poll so cancellation cannot turn cleanup into a busy loop.
-        // No mask or lock survives Pending; the caller's deadline still bounds us.
-        if let Some(current) = Cx::current() {
-            current.masked(|| sleep.as_mut().poll(task_cx))
-        } else {
-            sleep.as_mut().poll(task_cx)
-        }
+        with_caller(&caller, || {
+            let current = Cx::current().expect("cleanup caller is installed");
+            if !current.capabilities().time {
+                return std::task::Poll::Ready(Err(McpError::internal_error(
+                    "Process cleanup wait requires caller time capability",
+                )));
+            }
+            if current.timer_driver().is_none() {
+                return std::task::Poll::Ready(Err(McpError::internal_error(
+                    "Process cleanup wait requires caller timer driver",
+                )));
+            }
+            // A cancelled command still owns its killed children. Mask only
+            // this owner timer poll so cancellation cannot create a busy loop.
+            // No mask survives Pending; the caller's deadline still bounds us.
+            current.masked(|| sleep.as_mut().poll(task_cx)).map(Ok)
+        })
     })
-    .await;
-    process_cleanup_remaining(cx, Duration::ZERO)?;
+    .await?;
+    process_cleanup_remaining(&caller, Duration::ZERO)?;
     Ok(())
 }
 
@@ -53079,6 +53096,216 @@ exec sleep 2
     #[test]
     fn client_yielding_split_frame_request_deadline() {
         client_yielding_split_frame_probe(true);
+    }
+
+    mod process_cleanup_wait {
+        use super::*;
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::{Runtime, RuntimeBuilder};
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        fn virtual_runtime() -> (Runtime, Arc<VirtualClock>, TimerDriverHandle) {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .with_timer_driver(timer.clone())
+                .build()
+                .unwrap();
+            (runtime, clock, timer)
+        }
+
+        struct CountWake(AtomicUsize);
+
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn cancelled_owner_keeps_its_timer_and_restores_the_ambient_context() {
+            for cancelled in [false, true] {
+                let (caller_runtime, caller_clock, caller_timer) = virtual_runtime();
+                let caller = caller_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                caller.set_cancel_requested(cancelled);
+                let (ambient_runtime, ambient_clock, ambient_timer) = virtual_runtime();
+                ambient_clock.advance(100_000_000);
+                let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                ambient.set_task_type("process-cleanup-ambient");
+                let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut context = Context::from_waker(&waker);
+                let installed = Cx::set_current(Some(ambient.clone()));
+                let mut waiting =
+                    Box::pin(wait_for_process_cleanup(&caller, Duration::from_millis(5)));
+
+                assert!(waiting.as_mut().poll(&mut context).is_pending());
+                assert_eq!(caller_timer.pending_count(), 1);
+                assert_eq!(ambient_timer.pending_count(), 0);
+                assert_eq!(
+                    Cx::current().unwrap().task_type().as_deref(),
+                    Some("process-cleanup-ambient"),
+                );
+                assert_eq!(caller.checkpoint().is_err(), cancelled);
+                assert!(ambient.checkpoint().is_ok());
+                ambient_clock.advance(20_000_000);
+                assert_eq!(ambient_timer.process_timers(), 0);
+                assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+                assert!(waiting.as_mut().poll(&mut context).is_pending());
+                assert_eq!(caller.checkpoint().is_err(), cancelled);
+
+                caller_clock.advance(5_000_000);
+                assert_eq!(caller_timer.process_timers(), 1);
+                assert!(wakes.0.load(Ordering::SeqCst) > 0);
+                assert!(matches!(
+                    waiting.as_mut().poll(&mut context),
+                    Poll::Ready(Ok(()))
+                ));
+                drop(waiting);
+                assert_eq!(caller_timer.pending_count(), 0);
+                assert_eq!(ambient_timer.pending_count(), 0);
+                assert_eq!(caller.checkpoint().is_err(), cancelled);
+                assert!(ambient.checkpoint().is_ok());
+                assert_eq!(
+                    Cx::current().unwrap().task_type().as_deref(),
+                    Some("process-cleanup-ambient"),
+                );
+                drop(installed);
+                drop(caller);
+                drop(ambient);
+                assert!(caller_runtime.shutdown_timeout(Duration::from_secs(1)));
+                assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+
+        #[test]
+        fn owner_deadline_caps_cleanup_in_the_owner_clock_domain() {
+            let (caller_runtime, caller_clock, caller_timer) = virtual_runtime();
+            let caller = caller_runtime.request_cx_with_budget(
+                asupersync::Budget::INFINITE
+                    .with_deadline(caller_timer.now() + Duration::from_millis(3)),
+            );
+            let (ambient_runtime, ambient_clock, ambient_timer) = virtual_runtime();
+            ambient_clock.advance(100_000_000);
+            let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let installed = Cx::set_current(Some(ambient.clone()));
+            let mut context = Context::from_waker(Waker::noop());
+            let mut waiting =
+                Box::pin(wait_for_process_cleanup(&caller, Duration::from_millis(10)));
+
+            assert!(waiting.as_mut().poll(&mut context).is_pending());
+            assert_eq!(caller_timer.pending_count(), 1);
+            assert_eq!(ambient_timer.pending_count(), 0);
+            caller_clock.advance(3_000_000);
+            assert_eq!(caller_timer.process_timers(), 1);
+            assert!(matches!(
+                waiting.as_mut().poll(&mut context),
+                Poll::Ready(Err(error))
+                    if error.message == PROCESS_CLEANUP_CALLER_DEADLINE_ERROR
+            ));
+            drop(waiting);
+            assert_eq!(caller_timer.pending_count(), 0);
+            assert_eq!(ambient_timer.pending_count(), 0);
+            drop(installed);
+            drop(caller);
+            drop(ambient);
+            assert!(caller_runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn missing_owner_timer_cannot_borrow_an_ambient_or_fallback_driver() {
+            let (runtime, _clock, timer) = virtual_runtime();
+            let ambient = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let caller = Cx::for_testing();
+            assert!(caller.timer_driver().is_none());
+            let mut context = Context::from_waker(Waker::noop());
+            for installed_caller in [None, Some(ambient.clone())] {
+                let has_ambient = installed_caller.is_some();
+                let installed = Cx::set_current(installed_caller);
+                assert_eq!(Cx::current().is_some(), has_ambient);
+                let mut waiting =
+                    Box::pin(wait_for_process_cleanup(&caller, Duration::from_millis(5)));
+                assert!(matches!(
+                    waiting.as_mut().poll(&mut context),
+                    Poll::Ready(Err(error))
+                        if error.code == McpErrorCode::InternalError
+                            && error.message == "Process cleanup wait requires caller timer driver"
+                ));
+                assert_eq!(timer.pending_count(), 0);
+                drop(waiting);
+                drop(installed);
+            }
+            drop(ambient);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+
+        #[test]
+        fn time_authority_is_rechecked_after_cleanup_suspends() {
+            for deny_before_first_poll in [false, true] {
+                let (runtime, _clock, timer) = virtual_runtime();
+                let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let installed = Cx::set_current(Some(caller.clone()));
+                let mut context = Context::from_waker(Waker::noop());
+                let mut waiting =
+                    Box::pin(wait_for_process_cleanup(&caller, Duration::from_millis(5)));
+                if !deny_before_first_poll {
+                    assert!(waiting.as_mut().poll(&mut context).is_pending());
+                    assert_eq!(timer.pending_count(), 1);
+                }
+                let restriction =
+                    Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                assert!(matches!(
+                    waiting.as_mut().poll(&mut context),
+                    Poll::Ready(Err(error))
+                        if error.code == McpErrorCode::InternalError
+                            && error.message == "Process cleanup wait requires caller time capability"
+                ));
+                drop(waiting);
+                assert_eq!(timer.pending_count(), 0);
+                drop(restriction);
+                assert!(caller.checkpoint().is_ok());
+                drop(installed);
+                drop(caller);
+                assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            }
+        }
+
+        #[test]
+        fn zero_wait_needs_no_timer_but_preserves_deadline_precedence() {
+            let mut context = Context::from_waker(Waker::noop());
+            for expired in [false, true] {
+                let budget = if expired {
+                    asupersync::Budget::INFINITE.with_deadline(asupersync::Time::ZERO)
+                } else {
+                    asupersync::Budget::INFINITE
+                };
+                let caller = Cx::for_testing_with_budget(budget);
+                assert!(caller.timer_driver().is_none());
+                let installed = Cx::set_current(Some(caller.clone()));
+                let restriction =
+                    Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+                assert!(!Cx::current().unwrap().capabilities().time);
+                let mut waiting = Box::pin(wait_for_process_cleanup(&caller, Duration::ZERO));
+                match waiting.as_mut().poll(&mut context) {
+                    Poll::Ready(Ok(())) => assert!(!expired),
+                    Poll::Ready(Err(error)) => {
+                        assert!(expired);
+                        assert_eq!(error.message, PROCESS_CLEANUP_CALLER_DEADLINE_ERROR);
+                    }
+                    Poll::Pending => panic!("a zero cleanup wait cannot suspend"),
+                }
+                drop(waiting);
+                drop(restriction);
+                drop(installed);
+            }
+        }
     }
 
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
