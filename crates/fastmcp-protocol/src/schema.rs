@@ -24,6 +24,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::{
     any::TypeId,
+    borrow::Cow,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
@@ -217,8 +218,9 @@ impl std::error::Error for SchemaGenerationError {}
 /// type can use its `'static` instantiation without constructing a value.
 ///
 /// `#[derive(JsonSchema)]` implements this trait for application types. Built-in
-/// implementations cover JSON primitives, optional values, vectors, fixed-size
-/// arrays, sets, string-keyed maps, and owned transparent pointers. They let
+/// implementations cover JSON primitives, optional values, vectors, slices,
+/// fixed-size arrays, tuples, sets, string-keyed maps, and transparent pointers
+/// including borrowed and copy-on-write payloads. They let
 /// generic derived types accept these payloads with a `T: JsonSchemaType` bound.
 /// Integer schemas retain native bounds through 32 bits; wider signed integers
 /// omit bounds and wider unsigned integers retain only a zero minimum so the
@@ -243,6 +245,7 @@ macro_rules! impl_scalar_schema {
 
 impl_scalar_schema! {
     String => serde_json::json!({"type": "string"}),
+    str => serde_json::json!({"type": "string"}),
     char => serde_json::json!({"type": "string", "minLength": 1, "maxLength": 1}),
     bool => serde_json::json!({"type": "boolean"}),
     () => serde_json::json!({"type": "null"}),
@@ -303,6 +306,12 @@ impl<T: JsonSchemaType> JsonSchemaType for Vec<T> {
     }
 }
 
+impl<T: JsonSchemaType> JsonSchemaType for [T] {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({"type": "array", "items": context.subschema_for::<T>()})
+    }
+}
+
 impl<T: JsonSchemaType, const N: usize> JsonSchemaType for [T; N] {
     fn schema_body(context: &mut SchemaGenerator) -> Value {
         serde_json::json!({
@@ -347,9 +356,9 @@ impl<T: JsonSchemaType, S: 'static> JsonSchemaType for HashMap<String, T, S> {
 }
 
 macro_rules! impl_transparent_schema {
-    ($($wrapper:ident),* $(,)?) => {
+    ($($wrapper:ty),* $(,)?) => {
         $(
-            impl<T: JsonSchemaType> JsonSchemaType for $wrapper<T> {
+            impl<T: JsonSchemaType + ?Sized> JsonSchemaType for $wrapper {
                 fn schema_body(context: &mut SchemaGenerator) -> Value {
                     context.subschema_for::<T>()
                 }
@@ -358,7 +367,52 @@ macro_rules! impl_transparent_schema {
     };
 }
 
-impl_transparent_schema!(Box, Rc, Arc);
+impl_transparent_schema!(Box<T>, Rc<T>, Arc<T>, &'static T, &'static mut T);
+
+impl<T> JsonSchemaType for Cow<'static, T>
+where
+    T: JsonSchemaType + ToOwned + ?Sized,
+    T::Owned: 'static,
+{
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        context.subschema_for::<T>()
+    }
+}
+
+macro_rules! impl_tuple_schema {
+    ($($ty:ident),+ $(,)?) => {
+        impl<$($ty: JsonSchemaType),+> JsonSchemaType for ($($ty,)+) {
+            fn schema_body(context: &mut SchemaGenerator) -> Value {
+                let items = vec![$(context.subschema_for::<$ty>()),+];
+                let length = items.len();
+                serde_json::json!({
+                    "type": "array",
+                    "prefixItems": items,
+                    "minItems": length,
+                    "maxItems": length,
+                })
+            }
+        }
+    };
+}
+
+// Match Serde's supported tuple arities; the unit tuple is a scalar above.
+impl_tuple_schema!(A);
+impl_tuple_schema!(A, B);
+impl_tuple_schema!(A, B, C);
+impl_tuple_schema!(A, B, C, D);
+impl_tuple_schema!(A, B, C, D, E);
+impl_tuple_schema!(A, B, C, D, E, F);
+impl_tuple_schema!(A, B, C, D, E, F, G);
+impl_tuple_schema!(A, B, C, D, E, F, G, H);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J, K);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J, K, L);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+impl_tuple_schema!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
 
 #[derive(Debug)]
 struct GeneratedDefinition {
@@ -415,7 +469,7 @@ impl SchemaGenerator {
     }
 
     /// Expands a type once, returning local references for repeated occurrences.
-    pub fn subschema_for<T: JsonSchemaType>(&mut self) -> Value {
+    pub fn subschema_for<T: JsonSchemaType + ?Sized>(&mut self) -> Value {
         if self.error.is_some() {
             return Value::Bool(false);
         }

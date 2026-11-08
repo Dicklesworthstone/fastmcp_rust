@@ -7431,6 +7431,10 @@ fn integer_schemas_for_interoperability() -> serde_json::Value {
         NativeIntegerSchemas::json_schema(),
         NestedIntegerSchemas::json_schema(),
         EchoNativeIntegerArguments.definition().input_schema,
+        GenericSchemaEnvelope::<(
+            i8, i16, i32, i64, i128, isize, u8, u16, u32, u64, u128, usize,
+        )>::json_schema(),
+        GenericSchemaEnvelope::<Vec<BTreeMap<String, Option<u64>>>>::json_schema(),
     ])
 }
 
@@ -7544,6 +7548,275 @@ fn tool_native_integer_deserialization_rejects_out_of_range_before_handler_entry
             );
         }
     }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GenericSchemaEnvelope<T: fastmcp_rust::schema::JsonSchemaType> {
+    payload: T,
+}
+
+fn assert_generic_schema_round_trip<T>(
+    schema: &fastmcp_rust::schema::AdmittedSchema,
+    value: serde_json::Value,
+) where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    schema
+        .validate(&value)
+        .expect("the generic wire value validates");
+    let decoded: T = serde_json::from_value(value).expect("Serde admits the generic wire value");
+    let serialized = serde_json::to_value(&decoded).unwrap();
+    schema
+        .validate(&serialized)
+        .expect("generic Serde output validates");
+    assert_eq!(serde_json::from_value::<T>(serialized).unwrap(), decoded);
+}
+
+fn assert_generic_schema_payload<T>(valid: serde_json::Value, invalid: serde_json::Value)
+where
+    T: fastmcp_rust::schema::JsonSchemaType
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + PartialEq
+        + std::fmt::Debug,
+{
+    let schema = fastmcp_rust::schema::admit_final_schema(
+        GenericSchemaEnvelope::<T>::try_json_schema().unwrap(),
+    )
+    .unwrap();
+    assert_generic_schema_round_trip::<GenericSchemaEnvelope<T>>(
+        &schema,
+        json!({"payload": valid}),
+    );
+    let invalid = json!({"payload": invalid});
+    assert!(schema.validate(&invalid).is_err(), "{invalid}");
+    assert!(serde_json::from_value::<GenericSchemaEnvelope<T>>(invalid).is_err());
+}
+
+#[test]
+fn json_schema_generic_tuples_preserve_positions_and_lengths() {
+    assert_generic_schema_payload::<(u8,)>(json!([255]), json!([]));
+    assert_generic_schema_payload::<(u8, String)>(json!([7, "seven"]), json!(["7", "seven"]));
+    assert_generic_schema_payload::<([u8; 2], Option<u8>)>(
+        json!([[1, 2], null]),
+        json!([[1, 2, 3], null]),
+    );
+    assert_generic_schema_payload::<([u8; 2], Option<u8>)>(
+        json!([[1, 2], 255]),
+        json!([[1, 2], 256]),
+    );
+    assert_generic_schema_payload::<([u8; 2], Option<Option<u8>>)>(
+        json!([[1, 2], null]),
+        json!([[1, 2], 256]),
+    );
+    type SixteenItems = (
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+        u8,
+    );
+    let tuple = fastmcp_rust::schema::admit_final_schema(
+        GenericSchemaEnvelope::<SixteenItems>::json_schema(),
+    )
+    .unwrap();
+    let valid = json!({"payload": vec![7; 16]});
+    tuple.validate(&valid).unwrap();
+    let decoded: GenericSchemaEnvelope<SixteenItems> =
+        serde_json::from_value(valid.clone()).unwrap();
+    assert_eq!(serde_json::to_value(decoded).unwrap(), valid);
+    let invalid = json!({"payload": vec![7; 15]});
+    assert!(tuple.validate(&invalid).is_err());
+    assert!(serde_json::from_value::<GenericSchemaEnvelope<SixteenItems>>(invalid).is_err());
+}
+
+#[test]
+fn json_schema_generic_pointer_wrappers_preserve_unsized_payloads() {
+    let string = GenericSchemaEnvelope::<String>::json_schema();
+    for generated in [
+        GenericSchemaEnvelope::<Box<str>>::json_schema(),
+        GenericSchemaEnvelope::<std::rc::Rc<str>>::json_schema(),
+        GenericSchemaEnvelope::<std::sync::Arc<str>>::json_schema(),
+        GenericSchemaEnvelope::<std::borrow::Cow<'static, str>>::json_schema(),
+        GenericSchemaEnvelope::<&'static str>::json_schema(),
+        GenericSchemaEnvelope::<&'static mut str>::json_schema(),
+    ] {
+        assert_eq!(generated, string);
+    }
+    let vector = GenericSchemaEnvelope::<Vec<u8>>::json_schema();
+    for generated in [
+        GenericSchemaEnvelope::<Box<[u8]>>::json_schema(),
+        GenericSchemaEnvelope::<std::rc::Rc<[u8]>>::json_schema(),
+        GenericSchemaEnvelope::<std::sync::Arc<[u8]>>::json_schema(),
+        GenericSchemaEnvelope::<std::borrow::Cow<'static, [u8]>>::json_schema(),
+        GenericSchemaEnvelope::<&'static [u8]>::json_schema(),
+        GenericSchemaEnvelope::<&'static mut [u8]>::json_schema(),
+    ] {
+        assert_eq!(generated, vector);
+    }
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GenericSchemaNode<T: fastmcp_rust::schema::JsonSchemaType> {
+    value: T,
+    next: Option<Box<Self>>,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct RepeatedGenericSchemaValues<T: fastmcp_rust::schema::JsonSchemaType> {
+    left: T,
+    right: T,
+}
+
+#[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+struct DistinctGenericSchemaValues {
+    bytes: GenericSchemaNode<u8>,
+    text: GenericSchemaNode<String>,
+    repeated: RepeatedGenericSchemaValues<(GenericSchemaNode<u8>, String)>,
+}
+
+#[test]
+fn json_schema_generic_recursion_and_repeated_types_keep_distinct_constraints() {
+    let generated = DistinctGenericSchemaValues::try_json_schema().unwrap();
+    assert!(generated["$defs"].is_object());
+    let schema = fastmcp_rust::schema::admit_final_schema(generated).unwrap();
+    let valid = json!({
+        "bytes": {"value": 1, "next": {"value": 2}},
+        "text": {"value": "one", "next": {"value": "two"}},
+        "repeated": {
+            "left": [{"value": 1}, "one"],
+            "right": [{"value": 2}, "two"],
+        },
+    });
+    assert_generic_schema_round_trip::<DistinctGenericSchemaValues>(&schema, valid.clone());
+    for (pointer, wrong) in [
+        ("/bytes/next/value", json!(256)),
+        ("/text/next/value", json!(2)),
+        ("/repeated/right/0/value", json!(256)),
+        ("/repeated/right/1", json!(2)),
+    ] {
+        let mut invalid = valid.clone();
+        *invalid.pointer_mut(pointer).unwrap() = wrong;
+        assert!(schema.validate(&invalid).is_err(), "{pointer}");
+        assert!(serde_json::from_value::<DistinctGenericSchemaValues>(invalid).is_err());
+    }
+
+    // Reach a recursive derived type through the generic tuple and wrapper
+    // implementations, with a borrowed string schema in the other position.
+    type RecursivePayload = GenericSchemaEnvelope<(
+        Box<GenericSchemaNode<u8>>,
+        Option<std::borrow::Cow<'static, str>>,
+    )>;
+    let recursive =
+        fastmcp_rust::schema::admit_final_schema(RecursivePayload::try_json_schema().unwrap())
+            .unwrap();
+    let mut value = json!({"payload": [{"value": 1, "next": {"value": 2}}, "label"]});
+    assert_generic_schema_round_trip::<RecursivePayload>(&recursive, value.clone());
+    value["payload"][0]["next"]["value"] = json!(256);
+    assert!(recursive.validate(&value).is_err());
+    assert!(serde_json::from_value::<RecursivePayload>(value).is_err());
+}
+
+#[test]
+fn json_schema_generic_containers_share_generation_limits() {
+    type Payload = GenericSchemaEnvelope<(Box<str>, std::borrow::Cow<'static, [u8]>)>;
+    let mut generator = fastmcp_rust::schema::SchemaGenerator::with_limits(
+        fastmcp_rust::schema::SchemaGenerationLimits {
+            max_types: 2,
+            ..fastmcp_rust::schema::SchemaGenerationLimits::default()
+        },
+    );
+    let root = generator.subschema_for::<Payload>();
+    assert!(matches!(
+        generator.finish(root),
+        Err(fastmcp_rust::schema::SchemaGenerationError::TypeLimit),
+    ));
+    assert!(
+        Payload::try_json_schema().is_ok(),
+        "generation failure stays local"
+    );
+}
+
+type GenericSchemaToolResponse = GenericSchemaEnvelope<(u8, Vec<u8>)>;
+
+static GENERIC_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn generic_schema_tool_error(_kind: fastmcp_rust::ToolErrorKind) -> Option<serde_json::Value> {
+    Some(json!({"payload": [0, []]}))
+}
+
+#[tool(output_schema = GenericSchemaToolResponse, error_mapper = generic_schema_tool_error)]
+async fn echo_generic_schema(
+    ctx: &McpContext,
+    value: GenericSchemaToolResponse,
+) -> McpResult<GenericSchemaToolResponse> {
+    ctx.checkpoint()?;
+    GENERIC_SCHEMA_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(value)
+}
+
+#[test]
+fn json_schema_generic_tool_input_and_output_reach_registered_dispatch() {
+    on_caller_runtime(async {
+        let server = Server::new("generic-schema", "1.0.0")
+            .tool(EchoGenericSchema)
+            .try_build()
+            .expect("generic input, output, and mapped errors admit");
+        let connection = ModernConnection::new();
+        let valid = json!({"payload": [7, [0, 255]]});
+        let before = GENERIC_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let result = schema_bound_complete(
+            schema_bound_wire_call(
+                &server,
+                &connection,
+                "echo_generic_schema",
+                json!({"value": valid.clone()}),
+            )
+            .await,
+        );
+        assert_schema_bound_success(&result, &valid);
+        assert_eq!(
+            GENERIC_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+        );
+        for invalid in [
+            json!({"payload": [256, [0, 255]]}),
+            json!({"payload": [7, [0, 256]]}),
+            json!({"payload": [7]}),
+            json!({}),
+        ] {
+            let rejected = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_generic_schema",
+                    json!({"value": invalid}),
+                )
+                .await,
+            );
+            assert_eq!(rejected["isError"], true);
+            assert_eq!(rejected["structuredContent"], json!({"payload": [0, []]}));
+            assert_eq!(
+                GENERIC_SCHEMA_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid generic input must not reach the handler",
+            );
+        }
+    });
 }
 
 static SHAPED_SCHEMA_TOOL_CALLS: std::sync::atomic::AtomicUsize =

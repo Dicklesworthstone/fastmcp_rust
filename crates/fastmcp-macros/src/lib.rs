@@ -3924,43 +3924,15 @@ fn type_to_json_schema(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
         "char" => quote! {
             serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 1 })
         },
-        // Only publish bounds that survive JavaScript's JSON number round trip.
-        // Even exactly representable wide signed minima can stringify to decimal
-        // integers outside the Rust range. Deserialization still enforces the
-        // native limits; omitting schema bounds must not narrow accepted inputs.
-        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => quote! {
-            serde_json::json!({
-                "type": "integer",
-                "minimum": <#ty>::MIN,
-                "maximum": <#ty>::MAX,
-            })
+        // Share the JavaScript-safe native integer policy with generic
+        // payloads. Calling the body directly preserves concrete schema shapes
+        // without adding registry entries or references for primitive fields.
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+        | "u128" | "usize" => quote! {
+            <#ty as fastmcp_protocol::schema::JsonSchemaType>::schema_body(
+                __fastmcp_schema_context
+            )
         },
-        "i64" | "i128" => quote! {
-            serde_json::json!({ "type": "integer" })
-        },
-        "u64" | "u128" => quote! {
-            serde_json::json!({ "type": "integer", "minimum": 0 })
-        },
-        "isize" | "usize" => {
-            let wide_schema = if type_name == "usize" {
-                quote! { serde_json::json!({ "type": "integer", "minimum": 0 }) }
-            } else {
-                quote! { serde_json::json!({ "type": "integer" }) }
-            };
-            quote! {{
-                // Resolve pointer width in the consuming target, not on the
-                // host running this procedural macro during cross-compilation.
-                if <#ty>::BITS <= 32 {
-                    serde_json::json!({
-                        "type": "integer",
-                        "minimum": <#ty>::MIN,
-                        "maximum": <#ty>::MAX,
-                    })
-                } else {
-                    #wide_schema
-                }
-            }}
-        }
         "f32" | "f64" => quote! {
             serde_json::json!({ "type": "number" })
         },
