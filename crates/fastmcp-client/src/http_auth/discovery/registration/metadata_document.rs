@@ -339,8 +339,8 @@ impl MetadataDocumentDiscovery {
             .discovery
             .discover_resource_issuer(cx, deadline)
             .await?;
-        let configuration = issuer::discover(cx, deadline, selected, |body| {
-            self.admit_issuer(selected, body)
+        let configuration = issuer::discover(cx, deadline, selected, |kind, body| {
+            self.admit_issuer(selected, kind, body)
         })
         .await?;
         check_context(cx, deadline)?;
@@ -350,14 +350,15 @@ impl MetadataDocumentDiscovery {
     fn admit_issuer(
         &self,
         selected: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
-        let (authorization, token) = self.discovery.admit_issuer_endpoints(selected, body)?;
-        let metadata: CimdIssuerMetadata = decode_metadata(body)?;
+        let (authorization, token) = self.discovery.admit_issuer_endpoints(selected, kind, body)?;
+        let metadata: CimdIssuerMetadata = decode_metadata(kind, body)?;
         if metadata.client_id_metadata_document_supported != Some(true) {
             return Err(OAuthDiscoveryError::UnsupportedFlow);
         }
-        let revocation = self.discovery.admit_revocation_endpoint(selected, body)?;
+        let revocation = self.discovery.admit_revocation_endpoint(selected, kind, body)?;
         self.discovery.configure_client(
             selected,
             authorization,
@@ -485,6 +486,7 @@ mod tests {
         assert!(
             plan.admit_issuer(
                 &plan.discovery.issuers[0],
+                SecurityDocumentKind::AuthorizationServerMetadata,
                 &serde_json::to_vec(&issuer_document()).unwrap()
             )
             .is_ok()
@@ -671,7 +673,13 @@ mod tests {
         let plan = plan(NativeClientMetadata::new(ID, "App").unwrap(), Vec::new()).unwrap();
         let issuer = &plan.discovery.issuers[0];
         let positive = issuer_document();
-        let admit = |value: &Value| plan.admit_issuer(issuer, &serde_json::to_vec(value).unwrap());
+        let admit = |value: &Value| {
+            plan.admit_issuer(
+                issuer,
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                &serde_json::to_vec(value).unwrap(),
+            )
+        };
         assert!(admit(&positive).is_ok());
         let mut absent = positive.clone();
         absent
@@ -711,6 +719,13 @@ mod tests {
             "{},\"client_id_metadata_document_supported\":false}}",
             &source[..source.len() - 1]
         );
-        assert!(plan.admit_issuer(issuer, duplicate.as_bytes()).is_err());
+        assert!(
+            plan.admit_issuer(
+                issuer,
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                duplicate.as_bytes(),
+            )
+            .is_err()
+        );
     }
 }

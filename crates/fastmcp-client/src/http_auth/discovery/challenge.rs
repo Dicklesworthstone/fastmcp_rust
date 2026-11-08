@@ -30,7 +30,9 @@ use asupersync::time::Sleep;
 use asupersync::tls::Certificate;
 use asupersync::types::Time;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl, McpRequestCancellation};
-use fastmcp_protocol::{ClientCapabilities, FINAL_PROTOCOL_VERSION, FinalRequestMeta, RequestId};
+use fastmcp_protocol::{
+    ClientCapabilities, FINAL_PROTOCOL_VERSION, FinalRequestMeta, RequestId, SecurityDocumentKind,
+};
 
 use super::{
     OAuthDiscoveryError, OAuthDiscoveryPlan, admit_root, check_context, discovery_deadline,
@@ -386,9 +388,15 @@ impl ChallengedOAuthDiscovery {
             } else {
                 &self.metadata_roots
             };
-            let body = fetch_metadata(cx, deadline, location, roots)
-                .await?
-                .ok_or(OAuthDiscoveryError::MetadataNotFound)?;
+            let body = fetch_metadata(
+                cx,
+                deadline,
+                location,
+                roots,
+                SecurityDocumentKind::ProtectedResourceMetadata,
+            )
+            .await?
+            .ok_or(OAuthDiscoveryError::MetadataNotFound)?;
             // RFC 9728 3.3: the metadata resource must identify the ORIGINAL
             // challenged request URL, not the URL/host serving this document.
             let issuer = self.plan.select_issuer(&body)?;

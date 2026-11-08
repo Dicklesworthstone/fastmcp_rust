@@ -19,14 +19,15 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use asupersync::tls::Certificate;
 use fastmcp_core::{AccessToken, CanonicalHttpUrl};
+use fastmcp_protocol::SecurityDocumentKind;
 use serde::Deserialize;
 
 use super::super::BoundBearerCredential;
 use super::super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
 use super::super::oauth::{OAuthClient, OAuthClientConfiguration, OAuthError};
 use super::{
-    MAX_OAUTH_METADATA_BYTES, OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer,
-    decode_metadata, discovery_deadline, has, https_url, origin_of, present, validate_https,
+    OAuthDiscoveryError, OAuthDiscoveryPlan, TrustedOAuthIssuer, decode_metadata,
+    discovery_deadline, has, https_url, origin_of, present, validate_https,
 };
 
 /// Native Client ID Metadata Documents without dynamic registration writes.
@@ -209,20 +210,21 @@ impl NativeClientRegistration {
                 .ok_or(OAuthRegistrationError::InitialCredentialRejected)?;
             deadline = deadline.min(discovery_deadline(cx, remaining)?);
         }
-        let (issuer, body) = self
+        let (issuer, kind, body) = self
             .discovery
             .discover_issuer_document(cx, deadline)
             .await?;
-        self.register_from_discovery(cx, deadline, issuer, &body)
+        self.register_from_discovery(cx, deadline, issuer, kind, &body)
             .await
     }
 
     fn registration_endpoint(
         &self,
         issuer: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<(CanonicalHttpUrl, Vec<&'static str>), OAuthRegistrationError> {
-        let metadata: RegistrationEndpointMetadata = decode_metadata(body)
+        let metadata: RegistrationEndpointMetadata = decode_metadata(kind, body)
             .map_err(|_| OAuthRegistrationError::InvalidRegistrationMetadata)?;
         let endpoint = https_url(&metadata.registration_endpoint)
             .map_err(|_| OAuthRegistrationError::InvalidRegistrationMetadata)?;
@@ -258,7 +260,7 @@ impl NativeClientRegistration {
         }
         let bytes =
             serde_json::to_vec(&payload).map_err(|_| OAuthRegistrationError::InvalidPolicy)?;
-        if bytes.len() > MAX_OAUTH_METADATA_BYTES {
+        if bytes.len() > SecurityDocumentKind::ClientRegistration.byte_limit() {
             return Err(OAuthRegistrationError::InvalidPolicy);
         }
         Ok(bytes)
@@ -289,7 +291,8 @@ impl NativeClientRegistration {
         grants: &[&str],
     ) -> Result<String, OAuthRegistrationError> {
         let metadata: RegisteredMetadata =
-            decode_metadata(body).map_err(|_| OAuthRegistrationError::ResponseRejected)?;
+            decode_metadata(SecurityDocumentKind::ClientRegistration, body)
+                .map_err(|_| OAuthRegistrationError::ResponseRejected)?;
         if metadata.client_id.is_empty()
             || metadata.client_id.len() > 1024
             || metadata.client_id.chars().any(char::is_control)
@@ -481,6 +484,29 @@ mod tests {
     }
 
     #[test]
+    fn registration_response_bounds_and_unknown_duplicates_are_admitted_before_field_selection() {
+        let owner = registration();
+        let grants = ["authorization_code", "refresh_token"];
+        let source = response().to_string();
+        for (extension, accepted) in [
+            (r#""vendor":{"key":1,"other":2}"#, true),
+            (r#""vendor":1,"v\u0065ndor":2"#, false),
+            (r#""vendor":{"key":1,"k\u0065y":2}"#, false),
+        ] {
+            let body = format!("{},{extension}}}", &source[..source.len() - 1]);
+            assert_eq!(owner.admit_response(body.as_bytes(), &grants).is_ok(), accepted);
+        }
+        let mut exact = source.into_bytes();
+        exact.resize(SecurityDocumentKind::ClientRegistration.byte_limit(), b' ');
+        assert_eq!(owner.admit_response(&exact, &grants).unwrap(), "new-client");
+        exact.push(b' ');
+        assert!(matches!(
+            owner.admit_response(&exact, &grants),
+            Err(OAuthRegistrationError::ResponseRejected)
+        ));
+    }
+
+    #[test]
     fn registration_response_cannot_replace_redirects_auth_method_or_grants() {
         let owner = registration();
         for (key, value) in [
@@ -562,7 +588,7 @@ mod tests {
         assert!(
             owner
                 .admit_response(
-                    &vec![b' '; MAX_OAUTH_METADATA_BYTES + 1],
+                    &vec![b' '; SecurityDocumentKind::ClientRegistration.byte_limit() + 1],
                     &["authorization_code"]
                 )
                 .is_err()
@@ -578,14 +604,22 @@ mod tests {
             .unwrap();
         let body = br#"{"registration_endpoint":"https://separate.example/register","grant_types_supported":["authorization_code","refresh_token"]}"#;
         assert!(matches!(
-            owner.registration_endpoint(&owner.discovery.issuers[0], body),
+            owner.registration_endpoint(
+                &owner.discovery.issuers[0],
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                body,
+            ),
             Err(OAuthRegistrationError::EndpointNotTrusted)
         ));
         let owner = owner
             .with_registration_origin(url("https://separate.example/"))
             .unwrap();
         let (endpoint, grants) = owner
-            .registration_endpoint(&owner.discovery.issuers[0], body)
+            .registration_endpoint(
+                &owner.discovery.issuers[0],
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                body,
+            )
             .unwrap();
         assert_eq!(endpoint.as_str(), "https://separate.example/register");
         assert_eq!(grants, ["authorization_code", "refresh_token"]);
@@ -596,7 +630,11 @@ mod tests {
         let owner = registration();
         let body = br#"{"registration_endpoint":"https://issuer.example/register"}"#;
         let (_, grants) = owner
-            .registration_endpoint(&owner.discovery.issuers[0], body)
+            .registration_endpoint(
+                &owner.discovery.issuers[0],
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                body,
+            )
             .unwrap();
         assert_eq!(grants, ["authorization_code"]);
         for body in [
@@ -606,7 +644,14 @@ mod tests {
             br#"{"registration_endpoint":"https://issuer.example/register?q=1"}"#.as_slice(),
             br#"{"registration_endpoint":"https://issuer.example/register","registration_endpoint":"https://issuer.example/other"}"#.as_slice(),
         ] {
-            assert!(owner.registration_endpoint(&owner.discovery.issuers[0], body).is_err());
+            assert!(
+                owner.registration_endpoint(
+                    &owner.discovery.issuers[0],
+                    SecurityDocumentKind::AuthorizationServerMetadata,
+                    body,
+                )
+                .is_err()
+            );
         }
     }
 

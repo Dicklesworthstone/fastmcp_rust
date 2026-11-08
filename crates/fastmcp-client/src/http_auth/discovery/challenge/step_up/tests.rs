@@ -304,7 +304,9 @@ fn dynamic_scopes_do_not_need_to_be_advertised_but_native_trust_still_applies() 
     assert!(endpoint_plan.select_issuer(&prm).is_ok());
     let issuer = &endpoint_plan.issuers[0];
     let body = issuer_document(serde_json::json!(["unrelated-basic"]));
-    let configuration = approved.admit_issuer(issuer, &body).unwrap();
+    let configuration = approved
+        .admit_issuer(issuer, SecurityDocumentKind::AuthorizationServerMetadata, &body)
+        .unwrap();
     let expected = OAuthClientConfiguration::from_trusted_endpoints(
         "https://issuer.example",
         url("https://issuer.example/authorize"),
@@ -317,7 +319,11 @@ fn dynamic_scopes_do_not_need_to_be_advertised_but_native_trust_still_applies() 
     assert_eq!(configuration, expected);
     // The ordinary configured-scope path has NOT had its admission weakened.
     assert!(matches!(
-        approved.requested.admit_issuer(issuer, &body),
+        approved.requested.admit_issuer(
+            issuer,
+            SecurityDocumentKind::AuthorizationServerMetadata,
+            &body,
+        ),
         Err(OAuthDiscoveryError::UnsupportedScopes)
     ));
     for (field, value) in [
@@ -339,7 +345,11 @@ fn dynamic_scopes_do_not_need_to_be_advertised_but_native_trust_still_applies() 
         rejected[field] = value;
         assert!(
             approved
-                .admit_issuer(issuer, &serde_json::to_vec(&rejected).unwrap())
+                .admit_issuer(
+                    issuer,
+                    SecurityDocumentKind::AuthorizationServerMetadata,
+                    &serde_json::to_vec(&rejected).unwrap(),
+                )
                 .is_err()
         );
     }
@@ -383,7 +393,11 @@ fn issuer_revocation_and_discovery_timeout_are_preserved() {
     document["revocation_endpoint"] = serde_json::json!("https://issuer.example/revoke");
     document["revocation_endpoint_auth_methods_supported"] = serde_json::json!(["none"]);
     let configured = approved
-        .admit_issuer(issuer, &serde_json::to_vec(&document).unwrap())
+        .admit_issuer(
+            issuer,
+            SecurityDocumentKind::AuthorizationServerMetadata,
+            &serde_json::to_vec(&document).unwrap(),
+        )
         .unwrap();
     let expected = OAuthClientConfiguration::from_trusted_endpoints(
         "https://issuer.example",

@@ -12,6 +12,7 @@ use asupersync::Cx;
 use asupersync::tls::Certificate;
 use asupersync::types::Time;
 use fastmcp_core::{CanonicalHttpUrl, McpRequestCancellation};
+use fastmcp_protocol::SecurityDocumentKind;
 
 use super::super::{TrustedOAuthIssuer, issuer};
 use super::{
@@ -354,15 +355,21 @@ impl ApprovedScopeStepUp {
                 } else {
                     &self.discovery.metadata_roots
                 };
-                let body = fetch_metadata(cx, deadline, location, roots)
-                    .await?
-                    .ok_or(OAuthDiscoveryError::MetadataNotFound)?;
+                let body = fetch_metadata(
+                    cx,
+                    deadline,
+                    location,
+                    roots,
+                    SecurityDocumentKind::ProtectedResourceMetadata,
+                )
+                .await?
+                .ok_or(OAuthDiscoveryError::MetadataNotFound)?;
                 plan.select_issuer(&body)?
             } else {
                 plan.discover_resource_issuer(cx, deadline).await?
             };
-            Ok(issuer::discover(cx, deadline, selected, |body| {
-                self.admit_issuer(selected, body)
+            Ok(issuer::discover(cx, deadline, selected, |kind, body| {
+                self.admit_issuer(selected, kind, body)
             })
             .await?)
         })
@@ -373,16 +380,20 @@ impl ApprovedScopeStepUp {
     fn admit_issuer(
         &self,
         selected: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
         // Reuse the complete native-flow, exact issuer, S256, endpoint-origin,
         // resource and metadata-shape checks; only advertised scope membership
         // has a different authority. Preserve revocation and private TLS roots.
-        let (authorization, token) = self.discovery.plan.admit_issuer_endpoints(selected, body)?;
+        let (authorization, token) = self
+            .discovery
+            .plan
+            .admit_issuer_endpoints(selected, kind, body)?;
         let revocation = self
             .discovery
             .plan
-            .admit_revocation_endpoint(selected, body)?;
+            .admit_revocation_endpoint(selected, kind, body)?;
         self.requested.configure_client(
             selected,
             authorization,

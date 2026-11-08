@@ -306,6 +306,8 @@ async fn request_grant(
         return Err(ClientCredentialsError::TokenEndpointRejected);
     }
     validate_headers(&response.headers)?;
+    crate::http_auth::token_response::cache_policy(&response.headers)
+        .map_err(|_| ClientCredentialsError::InvalidToken)?;
     if !response.trailers.is_empty() {
         return Err(ClientCredentialsError::InvalidToken);
     }

@@ -27,6 +27,7 @@ use asupersync::time::Sleep;
 use asupersync::tls::{Certificate, RootCertStore};
 use asupersync::types::Time;
 use fastmcp_core::{CanonicalHttpUrl, CanonicalResourceId};
+use fastmcp_protocol::{SecurityDocumentKind, admit_security_document};
 use serde::{Deserialize, Deserializer};
 
 use super::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
@@ -41,8 +42,10 @@ pub mod issuer;
 /// Explicit RFC 7591 native-public-client registration after trusted discovery.
 pub mod registration;
 
-/// Maximum retained bytes in each resource or issuer metadata document.
-pub const MAX_OAUTH_METADATA_BYTES: usize = 64 * 1024;
+/// Maximum retained bytes in protected-resource or OAuth authorization-server
+/// metadata. OpenID-provider documents use their separate, larger central cap.
+pub const MAX_OAUTH_METADATA_BYTES: usize =
+    SecurityDocumentKind::AuthorizationServerMetadata.byte_limit();
 const MAX_ISSUERS: usize = 16;
 const MAX_ARRAY_ENTRIES: usize = 128;
 const MAX_METADATA_STRING_BYTES: usize = 4096;
@@ -440,8 +443,8 @@ impl OAuthDiscoveryPlan {
         deadline: Time,
         selected: &TrustedOAuthIssuer,
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
-        issuer::discover(cx, deadline, selected, |body| {
-            self.admit_issuer(selected, body)
+        issuer::discover(cx, deadline, selected, |kind, body| {
+            self.admit_issuer(selected, kind, body)
         })
         .await
     }
@@ -472,10 +475,16 @@ impl OAuthDiscoveryPlan {
                 failure.interrupted = Some(ResourceMetadataFailureClass::OverallDeadline);
                 break;
             }
-            let result = fetch_metadata(cx, candidate_deadline, &location, &self.resource_roots)
-                .await
-                .and_then(|body| body.ok_or(OAuthDiscoveryError::MetadataNotFound))
-                .and_then(|body| self.select_issuer(&body));
+            let result = fetch_metadata(
+                cx,
+                candidate_deadline,
+                &location,
+                &self.resource_roots,
+                SecurityDocumentKind::ProtectedResourceMetadata,
+            )
+            .await
+            .and_then(|body| body.ok_or(OAuthDiscoveryError::MetadataNotFound))
+            .and_then(|body| self.select_issuer(&body));
             // Admission is part of the candidate's allowance, not unbounded
             // work after its network timeout. A noncooperative synchronous
             // decoder cannot be preempted, but no later effect follows an overrun.
@@ -510,13 +519,13 @@ impl OAuthDiscoveryPlan {
         &self,
         cx: &Cx,
         deadline: Time,
-    ) -> Result<(&TrustedOAuthIssuer, Vec<u8>), OAuthDiscoveryError> {
+    ) -> Result<(&TrustedOAuthIssuer, SecurityDocumentKind, Vec<u8>), OAuthDiscoveryError> {
         let selected = self.discover_resource_issuer(cx, deadline).await?;
-        let body = issuer::discover(cx, deadline, selected, |body| {
-            issuer::admit_document(selected, body)
+        let (kind, body) = issuer::discover(cx, deadline, selected, |kind, body| {
+            issuer::admit_document(selected, kind, body).map(|body| (kind, body))
         })
         .await?;
-        Ok((selected, body))
+        Ok((selected, kind, body))
     }
 
     /// Resolves metadata and then drives the existing browser/PKCE/managed
@@ -539,7 +548,8 @@ impl OAuthDiscoveryPlan {
             .map_err(OAuthDiscoveryError::Login)
     }
     fn select_issuer(&self, body: &[u8]) -> Result<&TrustedOAuthIssuer, OAuthDiscoveryError> {
-        let metadata: ResourceMetadata = decode_metadata(body)?;
+        let metadata: ResourceMetadata =
+            decode_metadata(SecurityDocumentKind::ProtectedResourceMetadata, body)?;
         if metadata.signed_metadata.is_some() {
             return Err(OAuthDiscoveryError::SignedMetadataUnsupported);
         }
@@ -573,10 +583,11 @@ impl OAuthDiscoveryPlan {
     fn admit_issuer(
         &self,
         issuer: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
-        let (authorization, token) = self.admit_issuer_endpoints(issuer, body)?;
-        let revocation = self.admit_revocation_endpoint(issuer, body)?;
+        let (authorization, token) = self.admit_issuer_endpoints(issuer, kind, body)?;
+        let revocation = self.admit_revocation_endpoint(issuer, kind, body)?;
         self.configure_client(
             issuer,
             authorization,
@@ -628,9 +639,10 @@ impl OAuthDiscoveryPlan {
     fn admit_issuer_endpoints(
         &self,
         issuer: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<(CanonicalHttpUrl, CanonicalHttpUrl), OAuthDiscoveryError> {
-        let metadata: IssuerMetadata = decode_metadata(body)?;
+        let metadata: IssuerMetadata = decode_metadata(kind, body)?;
         if metadata.signed_metadata.is_some() {
             return Err(OAuthDiscoveryError::SignedMetadataUnsupported);
         }
@@ -692,9 +704,10 @@ impl OAuthDiscoveryPlan {
     fn admit_revocation_endpoint(
         &self,
         issuer: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<Option<CanonicalHttpUrl>, OAuthDiscoveryError> {
-        let metadata: IssuerMetadata = decode_metadata(body)?;
+        let metadata: IssuerMetadata = decode_metadata(kind, body)?;
         validate_optional_array(
             metadata
                 .revocation_endpoint_auth_methods_supported
@@ -929,20 +942,14 @@ struct IssuerMetadata {
     signed_metadata: Option<String>,
 }
 
-fn decode_metadata<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, OAuthDiscoveryError> {
-    if body.len() > MAX_OAUTH_METADATA_BYTES
-        || body
-            .iter()
-            .copied()
-            .find(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-            != Some(b'{')
-    {
-        return Err(OAuthDiscoveryError::InvalidMetadata);
-    }
-    // Serde's derived struct decoder also accepts positional sequences. Require
-    // the JSON object envelope first, without an intermediate Value that would
-    // collapse duplicate keys. Derived structs then reject repeated declared
-    // fields (including escaped aliases); unknown metadata remains inert.
+fn decode_metadata<T: serde::de::DeserializeOwned>(
+    kind: SecurityDocumentKind,
+    body: &[u8],
+) -> Result<T, OAuthDiscoveryError> {
+    // Admit exact source bytes before serde can discard unknown fields or
+    // collapse duplicate names inside a Value. Every nesting level shares the
+    // protocol's duplicate, number, depth and kind-specific byte limits.
+    admit_security_document(kind, body).map_err(|_| OAuthDiscoveryError::InvalidMetadata)?;
     serde_json::from_slice(body).map_err(|_| OAuthDiscoveryError::InvalidMetadata)
 }
 
@@ -1050,6 +1057,7 @@ async fn fetch_metadata(
     deadline: Time,
     url: &CanonicalHttpUrl,
     roots: &[Certificate],
+    kind: SecurityDocumentKind,
 ) -> Result<Option<Vec<u8>>, OAuthDiscoveryError> {
     check_context(cx, deadline)?;
     let mut builder = HttpClient::builder()
@@ -1057,7 +1065,7 @@ async fn fetch_metadata(
         .retry_policy(RetryPolicy::None)
         .no_proxy()
         .no_cookie_store()
-        .max_body_size(MAX_OAUTH_METADATA_BYTES)
+        .max_body_size(kind.byte_limit())
         .max_total_connections(1);
     for root in roots {
         builder = builder.add_root_certificate(root.clone());
@@ -1089,7 +1097,7 @@ async fn fetch_metadata(
         });
     }
     validate_headers(&response.headers)?;
-    if response.body.len() > MAX_OAUTH_METADATA_BYTES || !response.trailers.is_empty() {
+    if response.body.len() > kind.byte_limit() || !response.trailers.is_empty() {
         return Err(OAuthDiscoveryError::InvalidRepresentation);
     }
     Ok(Some(response.body))
@@ -1132,7 +1140,11 @@ mod tests {
         plan: &OAuthDiscoveryPlan,
         document: &serde_json::Value,
     ) -> Result<OAuthClientConfiguration, OAuthDiscoveryError> {
-        plan.admit_issuer(&plan.issuers[0], &serde_json::to_vec(document).unwrap())
+        plan.admit_issuer(
+            &plan.issuers[0],
+            SecurityDocumentKind::AuthorizationServerMetadata,
+            &serde_json::to_vec(document).unwrap(),
+        )
     }
 
     #[test]
@@ -1374,7 +1386,11 @@ mod tests {
             let encoded = serde_json::to_string(&issuer_document()).unwrap();
             let body = format!("{}{suffix}}}", &encoded[..encoded.len() - 1]);
             assert!(matches!(
-                plan.admit_issuer(&plan.issuers[0], body.as_bytes()),
+                plan.admit_issuer(
+                    &plan.issuers[0],
+                    SecurityDocumentKind::AuthorizationServerMetadata,
+                    body.as_bytes(),
+                ),
                 Err(OAuthDiscoveryError::InvalidMetadata)
             ));
         }
@@ -1395,6 +1411,107 @@ mod tests {
             plan.select_issuer(&oversized),
             Err(OAuthDiscoveryError::InvalidMetadata)
         ));
+    }
+
+    #[test]
+    fn security_document_limits_follow_the_selected_kind_before_unknown_fields_are_ignored() {
+        #[derive(Deserialize)]
+        struct IgnoredMetadata {}
+
+        for kind in [
+            SecurityDocumentKind::ProtectedResourceMetadata,
+            SecurityDocumentKind::AuthorizationServerMetadata,
+            SecurityDocumentKind::OidcProviderMetadata,
+            SecurityDocumentKind::ClientIdMetadataDocument,
+            SecurityDocumentKind::ClientRegistration,
+            SecurityDocumentKind::TokenResponse,
+        ] {
+            let mut exact = br#"{"vendor":{"array":[null,true],"number":1.25e2}}"#.to_vec();
+            exact.resize(kind.byte_limit(), b' ');
+            assert!(decode_metadata::<IgnoredMetadata>(kind, &exact).is_ok(), "{kind:?}");
+            exact.push(b' ');
+            assert!(matches!(
+                decode_metadata::<IgnoredMetadata>(kind, &exact),
+                Err(OAuthDiscoveryError::InvalidMetadata)
+            ));
+            for malformed in [
+                r#"{"vendor":1,"vendor":2}"#,
+                r#"{"vendor":1,"v\u0065ndor":2}"#,
+                r#"{"vendor":{"key":1,"k\u0065y":2}}"#,
+                r#"{"vendor":[{"key":1,"key":2}]}"#,
+                r#"{"vendor":1e10001}"#,
+                r#"[{"vendor":1}]"#,
+            ] {
+                assert!(matches!(
+                    decode_metadata::<IgnoredMetadata>(kind, malformed.as_bytes()),
+                    Err(OAuthDiscoveryError::InvalidMetadata)
+                ));
+            }
+            let deep = format!(r#"{{"vendor":{}0{}}}"#, "[".repeat(65), "]".repeat(65));
+            assert!(matches!(
+                decode_metadata::<IgnoredMetadata>(kind, deep.as_bytes()),
+                Err(OAuthDiscoveryError::InvalidMetadata)
+            ));
+        }
+    }
+
+    #[test]
+    fn resource_and_issuer_consumers_reject_unknown_duplicate_names_at_every_depth() {
+        let plan = plan();
+        let resource = json!({
+            "resource":"https://resource.example/mcp",
+            "authorization_servers":["https://issuer.example/tenant"]
+        });
+        let issuer = issuer_document();
+        for (extension, accepted) in [
+            (r#""vendor":{"key":1,"other":[null,true]}"#, true),
+            (r#""vendor":1,"v\u0065ndor":2"#, false),
+            (r#""vendor":{"key":1,"k\u0065y":2}"#, false),
+            (r#""vendor":[{"key":1,"key":2}]"#, false),
+        ] {
+            let resource = resource.to_string();
+            let resource = format!("{},{extension}}}", &resource[..resource.len() - 1]);
+            assert_eq!(plan.select_issuer(resource.as_bytes()).is_ok(), accepted);
+            let issuer = issuer.to_string();
+            let issuer = format!("{},{extension}}}", &issuer[..issuer.len() - 1]);
+            for kind in [
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                SecurityDocumentKind::OidcProviderMetadata,
+            ] {
+                assert_eq!(
+                    plan.admit_issuer(&plan.issuers[0], kind, issuer.as_bytes()).is_ok(),
+                    accepted,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_configuration_admission_preserves_oauth_and_openid_document_limits() {
+        let plan = plan();
+        for kind in [
+            SecurityDocumentKind::AuthorizationServerMetadata,
+            SecurityDocumentKind::OidcProviderMetadata,
+        ] {
+            let mut exact = serde_json::to_vec(&issuer_document()).unwrap();
+            exact.resize(kind.byte_limit(), b' ');
+            assert!(plan.admit_issuer(&plan.issuers[0], kind, &exact).is_ok());
+            if kind.byte_limit() > MAX_OAUTH_METADATA_BYTES {
+                assert!(matches!(
+                    plan.admit_issuer(
+                        &plan.issuers[0],
+                        SecurityDocumentKind::AuthorizationServerMetadata,
+                        &exact,
+                    ),
+                    Err(OAuthDiscoveryError::InvalidMetadata)
+                ));
+            }
+            exact.push(b' ');
+            assert!(matches!(
+                plan.admit_issuer(&plan.issuers[0], kind, &exact),
+                Err(OAuthDiscoveryError::InvalidMetadata)
+            ));
+        }
     }
 
     #[test]

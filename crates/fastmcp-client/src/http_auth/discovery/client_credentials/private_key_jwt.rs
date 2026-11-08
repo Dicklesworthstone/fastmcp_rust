@@ -112,7 +112,8 @@ impl PrivateKeyJwtRegistration {
             return Err(ClientCredentialsError::InvalidRegistration);
         }
         let document: RegistrationDocument =
-            decode_metadata(document).map_err(|_| ClientCredentialsError::InvalidRegistration)?;
+            decode_metadata(fastmcp_protocol::SecurityDocumentKind::ClientRegistration, document)
+                .map_err(|_| ClientCredentialsError::InvalidRegistration)?;
         validate_array(&document.grant_types)
             .map_err(|_| ClientCredentialsError::InvalidRegistration)?;
         if !has(&document.grant_types, "client_credentials")
@@ -275,6 +276,7 @@ impl PrivateKeyJwtAuthentication {
     pub(super) fn admit_metadata(
         &self,
         metadata: &MachineIssuerMetadata,
+        kind: fastmcp_protocol::SecurityDocumentKind,
         bytes: &[u8],
     ) -> Result<(), ClientCredentialsError> {
         self.check()?;
@@ -287,7 +289,7 @@ impl PrivateKeyJwtAuthentication {
         struct SigningAlgorithms {
             token_endpoint_auth_signing_alg_values_supported: Vec<String>,
         }
-        let algorithms: SigningAlgorithms = decode_metadata(bytes)
+        let algorithms: SigningAlgorithms = decode_metadata(kind, bytes)
             .map_err(|_| ClientCredentialsError::UnsupportedAuthentication)?;
         validate_array(&algorithms.token_endpoint_auth_signing_alg_values_supported)
             .map_err(|_| ClientCredentialsError::UnsupportedAuthentication)?;

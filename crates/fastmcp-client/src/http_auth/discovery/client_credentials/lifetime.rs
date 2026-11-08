@@ -16,6 +16,7 @@ use asupersync::sync::OwnedMutexGuard;
 use asupersync::time::Sleep;
 use asupersync::types::Time;
 use fastmcp_core::McpRequestCancellation;
+use fastmcp_protocol::SecurityDocumentKind;
 use serde::Deserialize;
 
 use super::{
@@ -93,10 +94,11 @@ struct RevocationMetadata {
 
 pub(super) fn admit_revocation(
     issuer: &TrustedOAuthIssuer,
+    kind: SecurityDocumentKind,
     body: &[u8],
     authentication: &MachineAuthentication,
 ) -> Result<RevocationTarget, ClientCredentialsError> {
-    let metadata: RevocationMetadata = decode_metadata(body)?;
+    let metadata: RevocationMetadata = decode_metadata(kind, body)?;
     let methods = metadata.revocation_endpoint_auth_methods_supported.as_deref();
     let algorithms = metadata
         .revocation_endpoint_auth_signing_alg_values_supported
@@ -803,7 +805,12 @@ mod logout_tests {
         ).unwrap();
         let good = br#"{"revocation_endpoint":"https://issuer.example/revoke"}"#;
         assert!(matches!(
-            admit_revocation(&issuer, good, &plan.authentication),
+            admit_revocation(
+                &issuer,
+                SecurityDocumentKind::AuthorizationServerMetadata,
+                good,
+                &plan.authentication,
+            ),
             Ok(RevocationTarget::Endpoint(_))
         ));
         for bad in [
@@ -814,9 +821,22 @@ mod logout_tests {
             r#"{"revocation_endpoint_auth_signing_alg_values_supported":["RS256"],"revocation_endpoint_auth_signing_alg_values_supported":["RS256"]}"#,
             r#"{"revocation_endpoint_auth_methods_supported":["private_key_jwt"]}"#,
         ] {
-            assert!(admit_revocation(&issuer, bad.as_bytes(), &plan.authentication).is_err());
+            assert!(
+                admit_revocation(
+                    &issuer,
+                    SecurityDocumentKind::AuthorizationServerMetadata,
+                    bad.as_bytes(),
+                    &plan.authentication,
+                )
+                .is_err()
+            );
             assert!(matches!(
-                admit_revocation(&issuer, good, &plan.authentication),
+                admit_revocation(
+                    &issuer,
+                    SecurityDocumentKind::AuthorizationServerMetadata,
+                    good,
+                    &plan.authentication,
+                ),
                 Ok(RevocationTarget::Endpoint(_))
             ));
         }

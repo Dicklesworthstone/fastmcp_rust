@@ -49,7 +49,7 @@ use fastmcp_core::{AccessToken, CanonicalHttpUrl, McpRequestCancellation};
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::{
     CoreRequest, CoreResult, FINAL_CLIENT_CAPABILITIES_META_KEY, FINAL_PROTOCOL_VERSION,
-    FinalCoreResult, RequestId, decode_strict_jsonrpc_response,
+    FinalCoreResult, RequestId, SecurityDocumentKind, decode_strict_jsonrpc_response,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -69,6 +69,7 @@ use crate::sse::SseLimits;
 /// Official opt-in identifier. Settings are exactly the empty JSON object.
 pub const CLIENT_CREDENTIALS_EXTENSION: &str = "io.modelcontextprotocol/oauth-client-credentials";
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_TOKEN_RESPONSE_BYTES: usize = SecurityDocumentKind::TokenResponse.byte_limit();
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_SECRET_GRANT_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
@@ -397,13 +398,13 @@ impl ClientCredentialsPlan {
             .map_err(|_| ClientCredentialsError::InvalidPolicy)?;
         }
         let deadline = discovery_deadline(cx, self.discovery.timeout)?;
-        let (issuer, body) = self
+        let (issuer, kind, body) = self
             .discovery
             .discover_issuer_document(cx, deadline)
             .await?;
         let token_endpoint =
-            admit_machine_issuer(&self.discovery, issuer, &body, &self.authentication)?;
-        let revocation = lifetime::admit_revocation(issuer, &body, &self.authentication)?;
+            admit_machine_issuer(&self.discovery, issuer, kind, &body, &self.authentication)?;
+        let revocation = lifetime::admit_revocation(issuer, kind, &body, &self.authentication)?;
         check_context(cx, deadline)?;
         self.authentication.check()?;
         Ok(ClientCredentialsClient {
@@ -457,11 +458,12 @@ struct MachineIssuerMetadata {
 fn admit_machine_issuer(
     plan: &OAuthDiscoveryPlan,
     issuer: &TrustedOAuthIssuer,
+    kind: SecurityDocumentKind,
     body: &[u8],
     authentication: &MachineAuthentication,
 ) -> Result<CanonicalHttpUrl, ClientCredentialsError> {
     authentication.check()?;
-    let metadata: MachineIssuerMetadata = decode_metadata(body)?;
+    let metadata: MachineIssuerMetadata = decode_metadata(kind, body)?;
     if metadata.issuer != issuer.identifier {
         return Err(OAuthDiscoveryError::IssuerMismatch.into());
     }
@@ -489,7 +491,7 @@ fn admit_machine_issuer(
     admit_scopes(&plan.scopes, metadata.scopes_supported.as_deref())?;
     #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
     if let MachineAuthentication::PrivateKeyJwt(authentication) = authentication {
-        authentication.admit_metadata(&metadata, body)?;
+        authentication.admit_metadata(&metadata, kind, body)?;
     }
     Ok(issuer.endpoint(&metadata.token_endpoint)?)
 }
@@ -768,7 +770,7 @@ fn token_transport(roots: &[Certificate]) -> HttpClient {
         .retry_policy(RetryPolicy::None)
         .no_proxy()
         .no_cookie_store()
-        .max_body_size(MAX_TOKEN_BYTES)
+        .max_body_size(MAX_TOKEN_RESPONSE_BYTES)
         .max_total_connections(1);
     for root in roots {
         builder = builder.add_root_certificate(root.clone());
@@ -832,14 +834,11 @@ fn admit_token(
     bytes: &[u8],
     started: Instant,
 ) -> Result<ServiceToken, ClientCredentialsError> {
-    if bytes.len() > MAX_TOKEN_BYTES {
-        return Err(ClientCredentialsError::InvalidToken);
-    }
     // The shared raw decoder rejects duplicate members and non-object input
     // before serde can erase their presence. Unknown members remain bounded
     // and ignored; they cannot override the recognized grant/security fields.
-    let token: TokenDocument =
-        decode_metadata(bytes).map_err(|_| ClientCredentialsError::InvalidToken)?;
+    let token: TokenDocument = decode_metadata(SecurityDocumentKind::TokenResponse, bytes)
+        .map_err(|_| ClientCredentialsError::InvalidToken)?;
     if !token.token_type.eq_ignore_ascii_case("Bearer")
         || token.access_token.len() > 16 * 1024
         || !AccessToken::is_valid_token68(&token.access_token)
@@ -1387,6 +1386,7 @@ mod tests {
             admit_machine_issuer(
                 &plan.discovery,
                 &plan.discovery.issuers[0],
+                SecurityDocumentKind::AuthorizationServerMetadata,
                 &serde_json::to_vec(&issuer()).unwrap(),
                 &plan.authentication
             )
@@ -1409,6 +1409,7 @@ mod tests {
                 admit_machine_issuer(
                     &plan.discovery,
                     &plan.discovery.issuers[0],
+                    SecurityDocumentKind::AuthorizationServerMetadata,
                     &serde_json::to_vec(&document).unwrap(),
                     &plan.authentication
                 )
@@ -1593,6 +1594,7 @@ mod tests {
                     admit_machine_issuer(
                         &selected.discovery,
                         &selected.discovery.issuers[0],
+                        SecurityDocumentKind::AuthorizationServerMetadata,
                         &bytes,
                         &selected.authentication
                     )
@@ -1728,6 +1730,7 @@ mod tests {
                 admit_machine_issuer(
                     &post.discovery,
                     &post.discovery.issuers[0],
+                    SecurityDocumentKind::AuthorizationServerMetadata,
                     &serde_json::to_vec(&document).unwrap(),
                     &post.authentication
                 )
@@ -1738,6 +1741,7 @@ mod tests {
             admit_machine_issuer(
                 &post.discovery,
                 &post.discovery.issuers[0],
+                SecurityDocumentKind::AuthorizationServerMetadata,
                 &serde_json::to_vec(&valid).unwrap(),
                 &post.authentication
             )
@@ -1884,6 +1888,10 @@ mod tests {
             r#""c\u006ef":{}"#,
             r#""error\u005furi":"secret""#,
             r#""refresh_token":null,"refresh_token":"secret""#,
+            r#""vendor":1,"v\u0065ndor":2"#,
+            r#""vendor":{"key":1,"k\u0065y":2}"#,
+            r#""vendor":[{"key":1,"key":2}]"#,
+            r#""vendor":1e10001"#,
         ] {
             let source = format!(r#"{{"access_token":"access","token_type":"Bearer",{field}}}"#);
             assert!(matches!(
@@ -1905,7 +1913,7 @@ mod tests {
     fn machine_token_byte_limit_includes_ignored_members_and_trailing_space() {
         let inner = inner();
         let mut exact = serde_json::to_vec(&valid_machine_token()).unwrap();
-        exact.resize(MAX_TOKEN_BYTES, b' ');
+        exact.resize(MAX_TOKEN_RESPONSE_BYTES, b' ');
         assert!(admit_token(&inner, &exact, Instant::now()).is_ok());
         exact.push(b' ');
         assert!(matches!(
@@ -1913,7 +1921,7 @@ mod tests {
             Err(ClientCredentialsError::InvalidToken)
         ));
         let mut oversized = valid_machine_token();
-        oversized["x-extension"] = json!("x".repeat(MAX_TOKEN_BYTES));
+        oversized["x-extension"] = json!("x".repeat(MAX_TOKEN_RESPONSE_BYTES));
         assert!(matches!(
             admit_token(
                 &inner,

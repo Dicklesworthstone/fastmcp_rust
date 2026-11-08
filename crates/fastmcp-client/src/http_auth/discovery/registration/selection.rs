@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use asupersync::http::h1::{HttpClient, Method, RedirectPolicy, RetryPolicy};
 use asupersync::types::Time;
+use fastmcp_protocol::SecurityDocumentKind;
 
 use super::super::{
-    MAX_OAUTH_METADATA_BYTES, OAuthDiscoveryError, TrustedOAuthIssuer, check_context,
-    decode_metadata, discovery_deadline, issuer, present, validate_headers, within,
+    OAuthDiscoveryError, TrustedOAuthIssuer, check_context, decode_metadata, discovery_deadline,
+    issuer, present, validate_headers, within,
 };
 use super::metadata_document::{
     MAX_NATIVE_CLIENT_ID_BYTES, MetadataDocumentDiscovery, MetadataDocumentError,
@@ -154,8 +155,10 @@ impl NativeClientRegistrationChoice {
             .discovery
             .discover_resource_issuer(cx, deadline)
             .await?;
-        let selected =
-            issuer::discover(cx, deadline, issuer, |body| self.select(issuer, body)).await?;
+        let selected = issuer::discover(cx, deadline, issuer, |kind, body| {
+            self.select(issuer, kind, body)
+        })
+        .await?;
         check_context(cx, deadline)?;
         match selected {
             Selection::Configured {
@@ -169,10 +172,10 @@ impl NativeClientRegistrationChoice {
                     configuration: *configuration,
                 },
             }),
-            Selection::Dynamic(body) => {
+            Selection::Dynamic(kind, body) => {
                 let client = self
                     .registration
-                    .register_from_discovery(cx, deadline, issuer, &body)
+                    .register_from_discovery(cx, deadline, issuer, kind, &body)
                     .await
                     .map_err(NativeClientSelectionError::Registration)?;
                 Ok(ResolvedNativeClient {
@@ -186,11 +189,12 @@ impl NativeClientRegistrationChoice {
     fn select(
         &self,
         issuer: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<Selection, OAuthDiscoveryError> {
         let discovery = &self.registration.discovery;
-        let (authorization, token) = discovery.admit_issuer_endpoints(issuer, body)?;
-        let revocation = discovery.admit_revocation_endpoint(issuer, body)?;
+        let (authorization, token) = discovery.admit_issuer_endpoints(issuer, kind, body)?;
+        let revocation = discovery.admit_revocation_endpoint(issuer, kind, body)?;
         let selected = if let Some(client_id) = self.preregistered.as_ref() {
             Some((
                 NativeClientRegistrationMethod::Preregistered,
@@ -198,7 +202,7 @@ impl NativeClientRegistrationChoice {
             ))
         } else if let Some(metadata) = self.metadata.as_ref() {
             // A malformed flag is an invalid document, never false-by-default.
-            let supports: CimdIssuerMetadata = decode_metadata(body)?;
+            let supports: CimdIssuerMetadata = decode_metadata(kind, body)?;
             (supports.client_id_metadata_document_supported == Some(true)).then_some((
                 NativeClientRegistrationMethod::MetadataDocument,
                 metadata.client_id(),
@@ -218,7 +222,7 @@ impl NativeClientRegistrationChoice {
         // Admission is candidate-local, including the separate DCR write grant.
         // A valid HTTPS token endpoint alone cannot authorize registration.
         self.registration
-            .registration_endpoint(issuer, body)
+            .registration_endpoint(issuer, kind, body)
             .map_err(|error| match error {
                 OAuthRegistrationError::EndpointNotTrusted => {
                     OAuthDiscoveryError::EndpointNotTrusted
@@ -226,7 +230,7 @@ impl NativeClientRegistrationChoice {
                 OAuthRegistrationError::Discovery(error) => error,
                 _ => OAuthDiscoveryError::InvalidMetadata,
             })?;
-        Ok(Selection::Dynamic(body.to_vec()))
+        Ok(Selection::Dynamic(kind, body.to_vec()))
     }
 }
 
@@ -235,10 +239,10 @@ enum Selection {
         method: NativeClientRegistrationMethod,
         client_id: String,
         // Boxed so `Configured` does not set this enum's size for the
-        // 24-byte `Dynamic` arm as well (bd-y2xoc, large_enum_variant).
+        // document-retaining `Dynamic` arm as well (bd-y2xoc, large_enum_variant).
         configuration: Box<OAuthClientConfiguration>,
     },
-    Dynamic(Vec<u8>),
+    Dynamic(SecurityDocumentKind, Vec<u8>),
 }
 
 /// Reusable local identity; DCR, when selected, has already happened once.
@@ -300,6 +304,7 @@ impl NativeClientRegistration {
         cx: &Cx,
         mut deadline: Time,
         issuer: &TrustedOAuthIssuer,
+        kind: SecurityDocumentKind,
         body: &[u8],
     ) -> Result<RegisteredNativeClient, OAuthRegistrationError> {
         if let Some(expiry) = self
@@ -313,9 +318,9 @@ impl NativeClientRegistration {
                 .ok_or(OAuthRegistrationError::InitialCredentialRejected)?;
             deadline = deadline.min(discovery_deadline(cx, remaining)?);
         }
-        let (authorization, token) = self.discovery.admit_issuer_endpoints(issuer, body)?;
-        let revocation = self.discovery.admit_revocation_endpoint(issuer, body)?;
-        let (endpoint, grants) = self.registration_endpoint(issuer, body)?;
+        let (authorization, token) = self.discovery.admit_issuer_endpoints(issuer, kind, body)?;
+        let revocation = self.discovery.admit_revocation_endpoint(issuer, kind, body)?;
+        let (endpoint, grants) = self.registration_endpoint(issuer, kind, body)?;
         let payload = self.request_body(&grants)?;
         let headers = self.request_headers(&endpoint)?;
         check_context(cx, deadline)?;
@@ -324,7 +329,7 @@ impl NativeClientRegistration {
             .retry_policy(RetryPolicy::None)
             .no_proxy()
             .no_cookie_store()
-            .max_body_size(MAX_OAUTH_METADATA_BYTES)
+            .max_body_size(SecurityDocumentKind::ClientRegistration.byte_limit())
             .max_total_connections(1);
         for root in &issuer.roots {
             builder = builder.add_root_certificate(root.clone());
@@ -394,6 +399,7 @@ mod tests {
     ) -> Result<Selection, OAuthDiscoveryError> {
         choice.select(
             &choice.registration.discovery.issuers[0],
+            SecurityDocumentKind::AuthorizationServerMetadata,
             &serde_json::to_vec(document).unwrap(),
         )
     }
@@ -422,12 +428,12 @@ mod tests {
                     .remove("client_id_metadata_document_supported");
             }
             assert!(
-                matches!(select(&cimd, &body).unwrap(), Selection::Dynamic(bytes) if bytes == serde_json::to_vec(&body).unwrap())
+                matches!(select(&cimd, &body).unwrap(), Selection::Dynamic(SecurityDocumentKind::AuthorizationServerMetadata, bytes) if bytes == serde_json::to_vec(&body).unwrap())
             );
         }
         assert!(matches!(
             select(&choice(), &document()).unwrap(),
-            Selection::Dynamic(_)
+            Selection::Dynamic(SecurityDocumentKind::AuthorizationServerMetadata, _)
         ));
     }
 
@@ -448,6 +454,7 @@ mod tests {
             choice
                 .select(
                     &choice.registration.discovery.issuers[0],
+                    SecurityDocumentKind::AuthorizationServerMetadata,
                     duplicate.as_bytes()
                 )
                 .is_err()

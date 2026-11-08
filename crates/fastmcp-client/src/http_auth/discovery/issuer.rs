@@ -6,6 +6,7 @@
 //! OpenID well-known locations carry OAuth metadata, not OIDC identity claims.
 
 use asupersync::{Cx, types::Time};
+use fastmcp_protocol::SecurityDocumentKind;
 use serde::Deserialize;
 
 use super::{
@@ -144,8 +145,12 @@ fn cause(error: &OAuthDiscoveryError) -> IssuerMetadataCause {
 struct Identity {
     issuer: String,
 }
-fn admit_identity(issuer: &TrustedOAuthIssuer, body: &[u8]) -> Result<(), OAuthDiscoveryError> {
-    let identity: Identity = decode_metadata(body)?;
+fn admit_identity(
+    issuer: &TrustedOAuthIssuer,
+    kind: SecurityDocumentKind,
+    body: &[u8],
+) -> Result<(), OAuthDiscoveryError> {
+    let identity: Identity = decode_metadata(kind, body)?;
     // Same admission function as TrustedOAuthIssuer::new, then exact original
     // string equality. Canonical URL equivalence is NOT issuer identity.
     https_url(&identity.issuer)?;
@@ -177,9 +182,10 @@ struct EndpointDocument {
 }
 pub(super) fn admit_document(
     issuer: &TrustedOAuthIssuer,
+    kind: SecurityDocumentKind,
     body: &[u8],
 ) -> Result<Vec<u8>, OAuthDiscoveryError> {
-    let document: EndpointDocument = decode_metadata(body)?;
+    let document: EndpointDocument = decode_metadata(kind, body)?;
     if document.signed_metadata.is_some() {
         return Err(OAuthDiscoveryError::SignedMetadataUnsupported);
     }
@@ -227,7 +233,7 @@ pub(super) async fn discover<T>(
     cx: &Cx,
     deadline: Time,
     issuer: &TrustedOAuthIssuer,
-    admit: impl Fn(&[u8]) -> Result<T, OAuthDiscoveryError>,
+    admit: impl Fn(SecurityDocumentKind, &[u8]) -> Result<T, OAuthDiscoveryError>,
 ) -> Result<T, OAuthDiscoveryError> {
     check_context(cx, deadline)?;
     let locations = issuer_metadata_urls(&issuer.url)?;
@@ -250,12 +256,20 @@ pub(super) async fn discover<T>(
             failure.interrupted = Some(IssuerMetadataFailureClass::OverallDeadline);
             break;
         }
-        let result = fetch_metadata(cx, end, &location, &issuer.roots)
+        let kind = match tag {
+            IssuerMetadataLocation::OAuthAuthorizationServer => {
+                SecurityDocumentKind::AuthorizationServerMetadata
+            }
+            IssuerMetadataLocation::OpenIdInserted | IssuerMetadataLocation::OpenIdAppended => {
+                SecurityDocumentKind::OidcProviderMetadata
+            }
+        };
+        let result = fetch_metadata(cx, end, &location, &issuer.roots, kind)
             .await
             .and_then(|body| body.ok_or(OAuthDiscoveryError::MetadataNotFound))
             .and_then(|body| {
-                admit_identity(issuer, &body)?;
-                admit(&body)
+                admit_identity(issuer, kind, &body)?;
+                admit(kind, &body)
             });
         // Synchronous admission is bounded input but cannot be preempted. Do
         // not publish its result if that work overran the reserved deadline.
@@ -287,6 +301,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const OAUTH: SecurityDocumentKind = SecurityDocumentKind::AuthorizationServerMetadata;
+
     fn issuer() -> TrustedOAuthIssuer {
         TrustedOAuthIssuer::new("https://issuer.example/tenant/").unwrap()
     }
@@ -295,7 +311,8 @@ mod tests {
     fn identity_requires_valid_exact_issuer_not_canonical_equivalence() {
         let selected = issuer();
         assert!(
-            admit_identity(&selected, br#"{"issuer":"https://issuer.example/tenant/"}"#).is_ok()
+            admit_identity(&selected, OAUTH, br#"{"issuer":"https://issuer.example/tenant/"}"#)
+                .is_ok()
         );
         for other in [
             "https://issuer.example/tenant",
@@ -303,7 +320,7 @@ mod tests {
             "https://issuer.example:443/tenant/",
         ] {
             assert!(matches!(
-                admit_identity(&selected, json!({"issuer":other}).to_string().as_bytes()),
+                admit_identity(&selected, OAUTH, json!({"issuer":other}).to_string().as_bytes()),
                 Err(OAuthDiscoveryError::IssuerMismatch)
             ));
         }
@@ -314,7 +331,7 @@ mod tests {
             "https://issuer.example/tenant/#x",
         ] {
             assert!(matches!(
-                admit_identity(&selected, json!({"issuer":invalid}).to_string().as_bytes()),
+                admit_identity(&selected, OAUTH, json!({"issuer":invalid}).to_string().as_bytes()),
                 Err(OAuthDiscoveryError::InvalidMetadata)
             ));
         }
@@ -329,7 +346,7 @@ mod tests {
             "{}",
         ] {
             assert!(matches!(
-                admit_identity(&issuer(), body.as_bytes()),
+                admit_identity(&issuer(), OAUTH, body.as_bytes()),
                 Err(OAuthDiscoveryError::InvalidMetadata)
             ));
         }
@@ -338,16 +355,16 @@ mod tests {
     #[test]
     fn generic_endpoint_profile_admits_machine_metadata_without_browser_fields() {
         let body = br#"{"issuer":"https://issuer.example/tenant/","token_endpoint":"https://issuer.example/token","grant_types_supported":["client_credentials"],"x-exact":1.20e+4}"#;
-        assert_eq!(admit_document(&issuer(), body).unwrap(), body);
+        assert_eq!(admit_document(&issuer(), OAUTH, body).unwrap(), body);
         let other = br#"{"token_endpoint":"https://elsewhere.example/token"}"#;
         assert!(matches!(
-            admit_document(&issuer(), other),
+            admit_document(&issuer(), OAUTH, other),
             Err(OAuthDiscoveryError::EndpointNotTrusted)
         ));
         let trusted = issuer()
             .with_endpoint_origin(super::super::https_url("https://elsewhere.example/").unwrap())
             .unwrap();
-        assert_eq!(admit_document(&trusted, other).unwrap(), other);
+        assert_eq!(admit_document(&trusted, OAUTH, other).unwrap(), other);
     }
 
     #[test]
@@ -359,11 +376,11 @@ mod tests {
             r#"{"token_endpoint":"https://issuer.example/token","token_endpoint":"https://issuer.example/token"}"#,
         ] {
             assert!(matches!(
-                admit_document(&issuer(), body.as_bytes()),
+                admit_document(&issuer(), OAUTH, body.as_bytes()),
                 Err(OAuthDiscoveryError::InvalidMetadata)
             ));
         }
-        assert!(matches!(admit_document(&issuer(), br#"{"token_endpoint":"https://issuer.example/token","signed_metadata":"unverified"}"#), Err(OAuthDiscoveryError::SignedMetadataUnsupported)));
+        assert!(matches!(admit_document(&issuer(), OAUTH, br#"{"token_endpoint":"https://issuer.example/token","signed_metadata":"unverified"}"#), Err(OAuthDiscoveryError::SignedMetadataUnsupported)));
     }
 
     #[test]

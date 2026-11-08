@@ -84,6 +84,7 @@ fn admit(
     super::super::admit_machine_issuer(
         &plan.discovery,
         &plan.discovery.issuers[0],
+        fastmcp_protocol::SecurityDocumentKind::AuthorizationServerMetadata,
         &serde_json::to_vec(document).unwrap(),
         &plan.authentication,
     )
@@ -352,7 +353,10 @@ fn revocation_jwt_metadata_requires_its_own_method_algorithm_and_registration() 
         "revocation_endpoint_auth_signing_alg_values_supported":["RS256"]
     });
     let admit = |value: &Value| admit_revocation(
-        &plan.discovery.issuers[0], &serde_json::to_vec(value).unwrap(), &plan.authentication,
+        &plan.discovery.issuers[0],
+        fastmcp_protocol::SecurityDocumentKind::AuthorizationServerMetadata,
+        &serde_json::to_vec(value).unwrap(),
+        &plan.authentication,
     );
     assert!(matches!(admit(&good), Ok(RevocationTarget::Endpoint(_))));
     let mut default_basic = good.clone();
@@ -368,6 +372,7 @@ fn revocation_jwt_metadata_requires_its_own_method_algorithm_and_registration() 
     assert!(matches!(
         admit_revocation(
             &missing_registration.discovery.issuers[0],
+            fastmcp_protocol::SecurityDocumentKind::AuthorizationServerMetadata,
             &serde_json::to_vec(&good).unwrap(),
             &missing_registration.authentication,
         ),
