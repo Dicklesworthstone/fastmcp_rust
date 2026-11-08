@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer};
 
 use super::{BoundBearerCredential, CanonicalHttpUrl, DeviceAuthorizationClient, DeviceAuthorizationError as Error, DeviceOAuthCredentials, DeviceVerification};
 
-pub(super) const MAX_RESPONSE_BYTES: usize = 16 * 1024;
+pub(super) const MAX_RESPONSE_BYTES: usize = SecurityDocumentKind::TokenResponse.byte_limit();
 const MAX_FORM_BYTES: usize = 32 * 1024;
 
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
@@ -49,17 +49,50 @@ struct TokenResponse {
     #[serde(default, deserialize_with = "present")]
     scope: Option<String>,
     #[serde(default, deserialize_with = "present")]
+    resource: Option<String>,
+    #[serde(default, deserialize_with = "present")]
     error: Option<String>,
+    // This public-client grant has no OIDC, token-exchange or sender-bound
+    // profile. These members carry authority, unlike harmless unknown fields;
+    // reject their presence before admitting any credential, even when null.
+    #[serde(default, rename = "id_token", deserialize_with = "reject_token_member")]
+    _id_token: (),
+    #[serde(default, rename = "issued_token_type", deserialize_with = "reject_token_member")]
+    _issued_token_type: (),
+    #[serde(default, rename = "cnf", deserialize_with = "reject_token_member")]
+    _confirmation: (),
+    #[serde(default, rename = "error_description", deserialize_with = "reject_token_member")]
+    _error_description: (),
+    #[serde(default, rename = "error_uri", deserialize_with = "reject_token_member")]
+    _error_uri: (),
 }
 
 #[derive(Deserialize)]
 struct ErrorResponse {
     error: String,
     // A success payload cannot be laundered into permission to poll again.
-    #[serde(default, deserialize_with = "optional_secret")]
-    access_token: Option<SecretString>,
-    #[serde(default, deserialize_with = "optional_secret")]
-    refresh_token: Option<SecretString>,
+    #[serde(default, rename = "access_token", deserialize_with = "reject_token_member")]
+    _access_token: (),
+    #[serde(default, rename = "refresh_token", deserialize_with = "reject_token_member")]
+    _refresh_token: (),
+    #[serde(default, rename = "token_type", deserialize_with = "reject_token_member")]
+    _token_type: (),
+    #[serde(default, rename = "expires_in", deserialize_with = "reject_token_member")]
+    _expires_in: (),
+    #[serde(default, rename = "scope", deserialize_with = "reject_token_member")]
+    _scope: (),
+    #[serde(default, rename = "resource", deserialize_with = "reject_token_member")]
+    _resource: (),
+    #[serde(default, rename = "id_token", deserialize_with = "reject_token_member")]
+    _id_token: (),
+    #[serde(default, rename = "issued_token_type", deserialize_with = "reject_token_member")]
+    _issued_token_type: (),
+    #[serde(default, rename = "cnf", deserialize_with = "reject_token_member")]
+    _confirmation: (),
+}
+
+fn reject_token_member<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom("incompatible device token response member"))
 }
 
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Error> {
@@ -127,7 +160,6 @@ pub(super) fn poll_response(status: u16, body: &[u8]) -> Result<PollResponse, Er
     if status == 200 { return Ok(PollResponse::Token); }
     if status != 400 { return Err(Error::EndpointRejected { status }); }
     let response: ErrorResponse = decode(body)?;
-    if response.access_token.is_some() || response.refresh_token.is_some() { return Err(Error::InvalidResponse); }
     match response.error.as_str() {
         "authorization_pending" => Ok(PollResponse::Pending),
         "slow_down" => Ok(PollResponse::SlowDown),
@@ -155,6 +187,7 @@ pub(super) fn credentials(client: &DeviceAuthorizationClient, ceiling: &[String]
     if response.error.is_some() || !response.token_type.eq_ignore_ascii_case("Bearer")
         || response.expires_in == Some(0)
         || response.refresh_token.as_ref().is_some_and(|token| !opaque(token.as_str(), 4096))
+        || response.resource.as_ref().is_some_and(|resource| resource != client.resource.as_str())
     {
         return Err(Error::InvalidResponse);
     }
@@ -196,7 +229,9 @@ pub(super) fn headers(headers: &[(String, String)]) -> Result<(), Error> {
             return Err(Error::InvalidResponse);
         }
     }
-    Ok(())
+    super::super::token_response::cache_policy(headers)
+        .map(|_| ())
+        .map_err(|_| Error::InvalidResponse)
 }
 
 pub(super) fn form(fields: &[(&str, &str)]) -> Result<Vec<u8>, Error> {
@@ -310,10 +345,8 @@ impl DeviceAuthorizationClient {
                 status: response.status,
             });
         }
-        let overlay: RefreshResponseOverlay = decode(&response.body)?;
-        if overlay.id_token.is_some() || overlay.issued_token_type.is_some() {
-            return Err(Error::InvalidResponse);
-        }
+        // Initial acquisition and refresh share the same closed bearer-profile
+        // admission, including resource binding and forbidden response members.
         let replacement = credentials(self, &grant.scopes, &response.body, started)?;
         let successor = replacement
             .refresh_token
@@ -332,16 +365,6 @@ impl DeviceAuthorizationClient {
         *grant = replacement;
         Ok(())
     }
-}
-
-// Presence-aware overlays reject an unnegotiated identity/token-exchange
-// profile even when its extra member is null. Values are never retained.
-#[derive(Deserialize)]
-struct RefreshResponseOverlay {
-    #[serde(default, deserialize_with = "present")]
-    id_token: Option<serde::de::IgnoredAny>,
-    #[serde(default, deserialize_with = "present")]
-    issued_token_type: Option<serde::de::IgnoredAny>,
 }
 
 struct RefreshRetirement(fastmcp_core::McpRequestCancellation);
@@ -610,6 +633,45 @@ mod refresh_tests {
                 assert_eq!(once(retry.as_mut()), Poll::Ready(Err(Error::AccessDenied)));
                 drop(retry);
                 assert_eq!(seen.lock().unwrap().len(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn refresh_profile_rejection_retires_the_old_family_without_replay() {
+        runtime(|cx, _| {
+            let client = client();
+            let cancellation = McpRequestCancellation::new();
+            for (field, value) in [
+                ("id_token", Value::Null),
+                ("issued_token_type", json!("urn:ietf:params:oauth:token-type:id-jag")),
+                ("cnf", json!({"jkt": "foreign-key"})),
+                ("error_description", json!("not a successful grant")),
+                ("error_uri", Value::Null),
+                ("resource", json!("https://resource.example/other")),
+                ("resource", Value::Null),
+            ] {
+                let mut grant = seed(&client);
+                let original_expiry = grant.expires_at();
+                let old = grant.bearer_credential().clone();
+                let mut body = token("refresh-after");
+                body[field] = value;
+                let mut script = Script::new([reply(200, body), reply(200, token("must-not-be-used"))]);
+                let seen = Arc::clone(&script.seen);
+                let mut future =
+                    Box::pin(client.refresh_using(cx, &cancellation, &mut grant, &mut script));
+                assert_eq!(once(future.as_mut()), Poll::Ready(Err(Error::InvalidResponse)));
+                drop(future);
+                assert!(old.is_revoked());
+                assert!(grant.bearer_credential().is_revoked());
+                assert_eq!(grant.expires_at(), original_expiry);
+                assert!(!grant.has_refresh_token());
+                let mut retry =
+                    Box::pin(client.refresh_using(cx, &cancellation, &mut grant, &mut script));
+                assert_eq!(once(retry.as_mut()), Poll::Ready(Err(Error::AccessDenied)));
+                drop(retry);
+                assert_eq!(seen.lock().unwrap().len(), 1);
+                assert_eq!(script.replies.len(), 1);
             }
         });
     }
@@ -958,7 +1020,19 @@ mod refresh_tests {
                 .unwrap();
             runtime.block_on(async {
                 let cx = asupersync::Cx::current().unwrap();
-                for successor in [Some("refresh-after"), Some("refresh-before"), None] {
+                for (successor, extra, cache_control, accepted) in [
+                    (Some("refresh-after"), None, "no-store", true),
+                    (Some("refresh-before"), None, "no-store", false),
+                    (None, None, "no-store", false),
+                    (Some("refresh-after"), Some(("id_token", Value::Null)), "no-store", false),
+                    (Some("refresh-after"), Some(("cnf", json!({"jkt": "foreign-key"}))), "no-store", false),
+                    (Some("refresh-after"), Some(("error_description", json!("denied"))), "no-store", false),
+                    (Some("refresh-after"), Some(("resource", json!("https://resource.example/other"))), "no-store", false),
+                    (Some("refresh-after"), Some(("resource", json!("https://resource.example/mcp"))), "no-store", true),
+                    (Some("refresh-after"), Some(("provider_hint", json!({"trace": "ignored"}))), "no-store", true),
+                    (Some("refresh-after"), None, "public, max-age=60", false),
+                    (Some("refresh-after"), None, "no-store, max-age=0", false),
+                ] {
                     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                     let address = listener.local_addr().unwrap();
                     let mut configured = client();
@@ -989,9 +1063,12 @@ mod refresh_tests {
                         if successor.is_none() {
                             response.as_object_mut().unwrap().remove("refresh_token");
                         }
+                        if let Some((field, value)) = extra {
+                            response[field] = value;
+                        }
                         let body = serde_json::to_string(&response).unwrap();
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: {cache_control}\r\nConnection: close\r\n\r\n{body}",
                             body.len()
                         );
                         tls.write_all(response.as_bytes()).await.unwrap();
@@ -1003,7 +1080,7 @@ mod refresh_tests {
                         async { Ok(pair(server, application).await) },
                     ).await.unwrap();
                     assert!(old.is_revoked());
-                    if successor == Some("refresh-after") {
+                    if accepted {
                         assert_eq!(outcome, Ok(()));
                         assert_eq!(grant.scopes(), ["read"]);
                         assert!(grant.has_refresh_token());

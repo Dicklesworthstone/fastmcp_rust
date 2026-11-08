@@ -145,6 +145,96 @@ fn token_admission_bounds_scope_expiry_and_exact_resource() {
 }
 
 #[test]
+fn token_response_keeps_bearer_extensions_but_refuses_other_grant_profiles() {
+    let client = client();
+    let started = Instant::now();
+    let mut admitted = token();
+    admitted["resource"] = json!(client.resource().as_str());
+    admitted["provider_hint"] = json!({"trace": ["bounded", "ignored"]});
+    let grant = wire::credentials(&client, &client.scopes, &bytes(&admitted), started).unwrap();
+    assert_eq!(grant.scopes(), ["read"]);
+    assert_eq!(grant.expires_at(), started + Duration::from_secs(60));
+    assert_eq!(
+        grant.bearer_credential().authorization_for_target(client.resource()),
+        Some("Bearer access-secret".to_owned()),
+    );
+    for field in ["id_token", "issued_token_type", "cnf", "error_description", "error_uri"] {
+        for value in [Value::Null, json!("untrusted-value"), json!({"jkt": "foreign-key"})] {
+            let mut poisoned = admitted.clone();
+            poisoned[field] = value;
+            assert_eq!(
+                wire::credentials(&client, &client.scopes, &bytes(&poisoned), started).err(),
+                Some(Error::InvalidResponse),
+                "incompatible member {field} must not produce an ordinary bearer grant",
+            );
+        }
+    }
+    for resource in [Value::Null, json!(7), json!("https://resource.example/other")] {
+        let mut poisoned = admitted.clone();
+        poisoned["resource"] = resource;
+        assert_eq!(
+            wire::credentials(&client, &client.scopes, &bytes(&poisoned), started).err(),
+            Some(Error::InvalidResponse),
+        );
+    }
+}
+
+#[test]
+fn pending_errors_cannot_carry_success_or_identity_members() {
+    for error in ["authorization_pending", "slow_down"] {
+        let ordinary = json!({
+            "error": error,
+            "error_description": "Awaiting user approval",
+            "provider_hint": {"trace": "ignored"},
+        });
+        assert!(wire::poll_response(400, &bytes(&ordinary)).is_ok());
+        for field in [
+            "access_token", "refresh_token", "token_type", "expires_in", "scope",
+            "resource", "id_token", "issued_token_type", "cnf",
+        ] {
+            for value in [Value::Null, json!("unexpected"), json!({"jkt": "foreign-key"})] {
+                let mut mixed = ordinary.clone();
+                mixed[field] = value;
+                assert_eq!(
+                    wire::poll_response(400, &bytes(&mixed)),
+                    Err(Error::InvalidResponse),
+                    "mixed {field} must not authorize another device-code poll",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn production_loop_refuses_profile_confusion_without_credential_or_extra_poll() {
+    let mut identity = token();
+    identity["id_token"] = Value::Null;
+    let mut foreign_resource = token();
+    foreign_resource["resource"] = json!("https://resource.example/other");
+    let mixed_pending = json!({"error": "authorization_pending", "token_type": "Bearer"});
+    for response in [reply(200, identity), reply(200, foreign_resource), reply(400, mixed_pending)] {
+        runtime(|cx, clock, _| {
+            let client = client();
+            let cancellation = McpRequestCancellation::new();
+            let mut script = Script::new([reply(200, device()), response, reply(200, token())]);
+            let seen = Arc::clone(&script.seen);
+            let presentations = AtomicUsize::new(0);
+            let mut run = Box::pin(client.authorize_using(cx, &cancellation, |prompt| {
+                presentations.fetch_add(1, Ordering::SeqCst);
+                verify(prompt)
+            }, &mut script));
+            assert!(once(run.as_mut()).is_pending());
+            advance(clock, 2);
+            assert!(matches!(once(run.as_mut()), Poll::Ready(Err(Error::InvalidResponse))));
+            drop(run);
+            assert_eq!(presentations.load(Ordering::SeqCst), 1);
+            assert_eq!(seen.lock().unwrap().len(), 2);
+            assert_eq!(script.responses.len(), 1, "no retry consumes the queued valid response");
+        });
+    }
+}
+
+#[test]
 fn only_explicit_pending_and_slow_down_on_http_400_permit_polling() {
     assert_eq!(wire::poll_response(400, br#"{"error":"authorization_pending"}"#).unwrap(), wire::PollResponse::Pending);
     assert_eq!(wire::poll_response(400, br#"{"error":"slow_down"}"#).unwrap(), wire::PollResponse::SlowDown);
@@ -170,6 +260,27 @@ fn response_headers_reject_duplicate_media_type_and_compression() {
     assert!(wire::headers(&[("Content-Type".into(), "application/json; charset=\"UTF-8\"".into())]).is_ok());
     for headers in [vec![], vec![("Content-Type".into(), "text/html".into())], vec![("Content-Type".into(), "application/json".into()), ("content-type".into(), "application/json".into())], vec![("Content-Type".into(), "application/json".into()), ("Content-Encoding".into(), "gzip".into())]] {
         assert_eq!(wire::headers(&headers), Err(Error::InvalidResponse));
+    }
+}
+
+#[test]
+fn response_cache_policy_preserves_compatible_peers_and_refuses_shared_storage() {
+    let base = vec![("Content-Type".to_owned(), "application/json".to_owned())];
+    assert!(wire::headers(&base).is_ok(), "missing no-store alone is diagnostic");
+    let mut protected = base.clone();
+    protected.extend([
+        ("Cache-Control".to_owned(), "no-store".to_owned()),
+        ("cache-control".to_owned(), "private, no-cache, NO-STORE".to_owned()),
+        ("Pragma".to_owned(), "no-cache".to_owned()),
+    ]);
+    assert!(wire::headers(&protected).is_ok());
+    for value in [
+        "public", "max-age=0", "s-maxage=60", "immutable", "no-store=false",
+        "no-cache=\"access_token\"", "extension=a, extension=b", "bad=\"unterminated",
+    ] {
+        let mut poisoned = protected.clone();
+        poisoned.push(("CACHE-CONTROL".to_owned(), value.to_owned()));
+        assert_eq!(wire::headers(&poisoned), Err(Error::InvalidResponse), "{value}");
     }
 }
 
