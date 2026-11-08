@@ -681,7 +681,24 @@ fn stale_revision_and_cancelled_store_preserve_grants_and_provider_state() {
 
 #[test]
 fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narrowing() {
-    for successor in [Some("rotated-refresh"), Some("refresh-one"), None, Some("")] {
+    for (successor, extension, accepted) in [
+        (Some("rotated-refresh"), None, true),
+        (Some("refresh-one"), None, false),
+        (None, None, false),
+        (Some(""), None, false),
+        (Some("rotated-refresh"), Some(r#""vendor":null"#), true),
+        (Some("rotated-refresh"), Some(r#""id_token":null"#), false),
+        (
+            Some("rotated-refresh"),
+            Some(r#""error_description":null"#),
+            false,
+        ),
+        (
+            Some("rotated-refresh"),
+            Some(r#""vendor":{"label":1,"l\u0061bel":2}"#),
+            false,
+        ),
+    ] {
         asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
             let cx = Cx::current().unwrap();
             let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
@@ -733,6 +750,11 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
                     body["refresh_token"] = serde_json::json!(successor);
                 }
                 let body = serde_json::to_string(&body).unwrap();
+                let body = if let Some(extension) = extension {
+                    format!("{},{extension}}}", body.strip_suffix('}').unwrap())
+                } else {
+                    body
+                };
                 let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 tls.write_all(reply.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
                 tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
@@ -741,7 +763,7 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
             let (server, result) =
                 Box::pin(native::pair(server, client.refresh_grant(&cx, grant))).await;
             assert_eq!(server, Ok(()));
-            if successor == Some("rotated-refresh") {
+            if accepted {
                 let credentials = result.unwrap();
                 assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer resumed-access".to_owned()));
                 assert_eq!(credentials.refresh_token.as_deref(), Some("rotated-refresh"));
@@ -752,7 +774,14 @@ fn persisted_grant_reopen_renews_over_native_https_with_rotation_and_scope_narro
             }
             let mut task = std::task::Context::from_waker(std::task::Waker::noop());
             assert!(listener.poll_accept(&mut task).is_pending(), "a consumed stored grant cannot be replayed");
-            drop(fixture);
+            // Neither a valid successor nor an untrusted response can put the
+            // consumed persistent handoff back into its original slot.
+            let client_for_store = client.clone();
+            let storage_cx = cx.clone();
+            std::thread::spawn(move || {
+                let mut store = fixture.open(&storage_cx, &client_for_store).unwrap();
+                assert!(store.take_refresh(&storage_cx, &fixture.authorization).unwrap().is_none());
+            }).join().unwrap();
         });
     }
 }

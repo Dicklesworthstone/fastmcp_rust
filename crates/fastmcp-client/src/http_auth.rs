@@ -27,6 +27,7 @@ use std::time::Instant;
 use fastmcp_core::{AccessToken, McpRequestCancellation};
 
 pub(crate) mod caller;
+pub(crate) mod token_response;
 
 /// Explicit device-code sign-in for headless native public clients.
 #[cfg(not(target_arch = "wasm32"))]

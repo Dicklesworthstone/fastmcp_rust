@@ -1,7 +1,5 @@
 //! Bounded HTTP/JSON admission shared by all three enterprise token stages.
 
-use std::collections::BTreeMap;
-
 use asupersync::security::SecretString;
 use fastmcp_protocol::{SecurityDocumentKind, admit_security_document};
 use serde::{Deserialize, Deserializer};
@@ -11,10 +9,10 @@ use super::{
     EnterpriseResponseError as Error, EnterpriseTokenResponse, EnterpriseTokenResponseStage,
 };
 use crate::http_auth::discovery::challenge::admits_one_basic_challenge;
+use crate::http_auth::token_response::cache_policy;
 
 const MAX_HEADER_FIELDS: usize = 64;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
-const MAX_DIRECTIVES: usize = 32;
 
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
     T::deserialize(d).map(Some)
@@ -197,8 +195,6 @@ fn headers(
     let mut bytes = 0usize;
     let mut content_type = None;
     let mut content_encoding = false;
-    let mut cache = String::new();
-    let mut pragma = String::new();
     for (name, value) in fields {
         bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(value.len()))
             .ok_or(Error::InvalidHeaders)?;
@@ -217,12 +213,6 @@ fn headers(
                 return Err(Error::InvalidHeaders);
             }
             content_encoding = true;
-        } else if name.eq_ignore_ascii_case("cache-control") {
-            if !cache.is_empty() { cache.push(','); }
-            cache.push_str(value);
-        } else if name.eq_ignore_ascii_case("pragma") {
-            if !pragma.is_empty() { pragma.push(','); }
-            pragma.push_str(value);
         }
     }
     let mut media = content_type.ok_or(Error::InvalidHeaders)?.split(';');
@@ -238,79 +228,11 @@ fn headers(
             return Err(Error::InvalidHeaders);
         }
     }
-    let cache = directives(&cache)?;
-    let pragma = directives(&pragma)?;
-    for prohibited in ["public", "max-age", "s-maxage", "immutable", "stale-while-revalidate", "stale-if-error"] {
-        if cache.contains_key(prohibited) { return Err(Error::InvalidCachePolicy); }
-    }
-    for (name, values) in [("no-store", &cache), ("no-cache", &cache), ("no-cache", &pragma)] {
-        if values.get(name).is_some_and(Option::is_some) { return Err(Error::InvalidCachePolicy); }
-    }
+    let cache = cache_policy(fields).map_err(|_| Error::InvalidCachePolicy)?;
     Ok(EnterpriseCacheDiagnostics {
-        missing_no_store: !cache.contains_key("no-store"),
-        missing_pragma_no_cache: stage != EnterpriseTokenResponseStage::OidcCode && !pragma.contains_key("no-cache"),
+        missing_no_store: cache.missing_no_store,
+        missing_pragma_no_cache: stage != EnterpriseTokenResponseStage::OidcCode && cache.missing_pragma_no_cache,
     })
-}
-
-// Combine field lines first, preserve quoted commas and reject conflicting
-// duplicate directives. Admission never grants permission to cache a response.
-fn directives(source: &str) -> Result<BTreeMap<String, Option<String>>, Error> {
-    let bytes = source.as_bytes();
-    let mut at = 0;
-    let mut count = 0;
-    let mut result = BTreeMap::new();
-    while at < bytes.len() {
-        while bytes.get(at).is_some_and(|b| matches!(b, b' ' | b'\t' | b',')) { at += 1; }
-        if at == bytes.len() { break; }
-        count += 1;
-        if count > MAX_DIRECTIVES { return Err(Error::InvalidCachePolicy); }
-        let start = at;
-        while bytes.get(at).is_some_and(|b| token_byte(*b)) { at += 1; }
-        if at == start { return Err(Error::InvalidCachePolicy); }
-        let name = source[start..at].to_ascii_lowercase();
-        while bytes.get(at).is_some_and(|b| matches!(b, b' ' | b'\t')) { at += 1; }
-        let value = if bytes.get(at) == Some(&b'=') {
-            at += 1;
-            while bytes.get(at).is_some_and(|b| matches!(b, b' ' | b'\t')) { at += 1; }
-            let mut value = String::new();
-            if bytes.get(at) == Some(&b'"') {
-                at += 1;
-                loop {
-                    let byte = *bytes.get(at).ok_or(Error::InvalidCachePolicy)?;
-                    at += 1;
-                    match byte {
-                        b'"' => break,
-                        b'\\' => {
-                            let escaped = *bytes.get(at).ok_or(Error::InvalidCachePolicy)?;
-                            if !(0x20..=0x7e).contains(&escaped) && escaped != b'\t' {
-                                return Err(Error::InvalidCachePolicy);
-                            }
-                            at += 1;
-                            value.push(char::from(escaped));
-                        }
-                        b'\t' | 0x20..=0x21 | 0x23..=0x5b | 0x5d..=0x7e => value.push(char::from(byte)),
-                        _ => return Err(Error::InvalidCachePolicy),
-                    }
-                }
-            } else {
-                let start = at;
-                while bytes.get(at).is_some_and(|b| token_byte(*b)) { at += 1; }
-                if at == start { return Err(Error::InvalidCachePolicy); }
-                value.push_str(&source[start..at]);
-            }
-            Some(value)
-        } else {
-            None
-        };
-        while bytes.get(at).is_some_and(|b| matches!(b, b' ' | b'\t')) { at += 1; }
-        if at < bytes.len() && bytes[at] != b',' { return Err(Error::InvalidCachePolicy); }
-        if let Some(previous) = result.get(&name) {
-            if previous != &value { return Err(Error::InvalidCachePolicy); }
-        } else {
-            result.insert(name, value);
-        }
-    }
-    Ok(result)
 }
 
 #[cfg(test)]
@@ -418,6 +340,8 @@ mod tests {
         let mut fields = vec![("Content-Type".into(), "application/json; charset=\"UTF-8\"".into())];
         let missing = headers(&fields, EnterpriseTokenResponseStage::IdJag).unwrap();
         assert!(missing.missing_no_store && missing.missing_pragma_no_cache);
+        let oidc_missing = headers(&fields, EnterpriseTokenResponseStage::OidcCode).unwrap();
+        assert!(oidc_missing.missing_no_store && !oidc_missing.missing_pragma_no_cache);
         fields.extend([
             ("Cache-Control".into(), "private, extension=\"a,b\"".into()),
             ("Cache-Control".into(), "no-store, NO-STORE".into()),

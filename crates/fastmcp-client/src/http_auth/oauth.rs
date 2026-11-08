@@ -32,6 +32,7 @@ use fastmcp_core::crypto::{
 use fastmcp_core::{
     AccessToken, CanonicalResourceId, CanonicalResourceIdPolicy, McpRequestCancellation,
 };
+use fastmcp_protocol::{SecurityDocumentKind, admit_security_document};
 use serde::{Deserialize, Deserializer};
 
 use super::{BoundBearerCredential, CanonicalHttpUrl};
@@ -48,7 +49,7 @@ const MAX_CALLBACK_BYTES: usize = 16 * 1024;
 const MAX_CALLBACK_CONNECTIONS: usize = 32;
 const MAX_FORM_FIELDS: usize = 32;
 const MAX_CODE_BYTES: usize = 4096;
-const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+const MAX_TOKEN_RESPONSE_BYTES: usize = SecurityDocumentKind::TokenResponse.byte_limit();
 const MAX_FORM_BYTES: usize = 64 * 1024;
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1087,6 +1088,7 @@ fn pkce_challenge(verifier: &str) -> Result<String, OAuthError> {
 }
 
 fn validate_token_headers(headers: &[(String, String)]) -> Result<(), OAuthError> {
+    super::token_response::cache_policy(headers).map_err(|_| OAuthError::InvalidTokenResponse)?;
     let mut content_type = None;
     let mut encoding = false;
     for (name, value) in headers {
@@ -1148,6 +1150,33 @@ struct TokenResponse {
     resource: Option<String>,
     #[serde(default, deserialize_with = "present")]
     error: Option<String>,
+    // These members belong to an error or a separately negotiated identity,
+    // token-exchange, or sender-constrained profile. Their presence is not an
+    // ignorable OAuth extension, even when the supplied value is null.
+    #[serde(default, rename = "id_token", deserialize_with = "reject_token_member")]
+    _id_token: (),
+    #[serde(
+        default,
+        rename = "issued_token_type",
+        deserialize_with = "reject_token_member"
+    )]
+    _issued_token_type: (),
+    #[serde(default, rename = "cnf", deserialize_with = "reject_token_member")]
+    _confirmation: (),
+    #[serde(
+        default,
+        rename = "error_description",
+        deserialize_with = "reject_token_member"
+    )]
+    _error_description: (),
+    #[serde(default, rename = "error_uri", deserialize_with = "reject_token_member")]
+    _error_uri: (),
+}
+
+fn reject_token_member<'de, D: Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "unsupported ordinary OAuth token response member",
+    ))
 }
 
 // OAuthClientConfiguration admits only the native public `none` profile.
@@ -1177,9 +1206,11 @@ fn admit_token_response(
     bytes: &[u8],
     started: Instant,
 ) -> Result<OAuthCredentials, OAuthError> {
-    if bytes.len() > MAX_TOKEN_RESPONSE_BYTES {
-        return Err(OAuthError::InvalidTokenResponse);
-    }
+    // Every code and refresh consumer, including a resumed persistent grant,
+    // shares the bounded object/duplicate/depth/number admission boundary.
+    // Serde alone would ignore ambiguity inside unknown extension members.
+    admit_security_document(SecurityDocumentKind::TokenResponse, bytes)
+        .map_err(|_| OAuthError::InvalidTokenResponse)?;
     let response: TokenResponse =
         serde_json::from_slice(bytes).map_err(|_| OAuthError::InvalidTokenResponse)?;
     if !response.token_type.eq_ignore_ascii_case("Bearer")
@@ -1378,6 +1409,125 @@ mod tests {
         }
     }
 
+    fn ordinary_token_response(extension: &str) -> String {
+        format!(
+            r#"{{"access_token":"access-two","token_type":"Bearer","expires_in":120,"refresh_token":"refresh-two","scope":"tools:read",{extension}}}"#
+        )
+    }
+
+    #[test]
+    fn ordinary_token_admission_rejects_presence_of_incompatible_profile_and_error_members() {
+        let configuration = config();
+        for member in [
+            "id_token",
+            "issued_token_type",
+            "cnf",
+            "error",
+            "error_description",
+            "error_uri",
+        ] {
+            for value in ["null", r#""peer-secret""#, "{}", "[]", "0"] {
+                // The value is harmless as an unknown OAuth extension. Only
+                // its field name changes the success/profile interpretation.
+                let ordinary = ordinary_token_response(&format!(r#""vendor":{value}"#));
+                let grant = admit_token_response(
+                    &configuration,
+                    &configuration.scopes,
+                    ordinary.as_bytes(),
+                    Instant::now(),
+                )
+                .unwrap();
+                assert_eq!(grant.scopes(), ["tools:read"]);
+                assert_eq!(grant.refresh_token.as_deref(), Some("refresh-two"));
+                assert_eq!(
+                    grant
+                        .access
+                        .authorization_for_target(&configuration.resource)
+                        .as_deref(),
+                    Some("Bearer access-two")
+                );
+
+                let poisoned = ordinary_token_response(&format!(r#""{member}":{value}"#));
+                let error = admit_token_response(
+                    &configuration,
+                    &configuration.scopes,
+                    poisoned.as_bytes(),
+                    Instant::now(),
+                )
+                .err()
+                .unwrap();
+                assert_eq!(error, OAuthError::InvalidTokenResponse, "{member}");
+                assert!(!format!("{error:?} {error}").contains("peer-secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_token_admission_applies_shared_bounds_before_ignoring_extensions() {
+        let configuration = config();
+        let accepted = ordinary_token_response(r#""vendor":{"label":1,"other":[true,null]}"#);
+        assert!(
+            admit_token_response(
+                &configuration,
+                &configuration.scopes,
+                accepted.as_bytes(),
+                Instant::now(),
+            )
+            .is_ok()
+        );
+
+        let nesting = fastmcp_protocol::jsonrpc::MAX_RAW_JSON_NESTING_DEPTH + 1;
+        for extension in [
+            r#""vendor":1,"v\u0065ndor":2"#.to_owned(),
+            r#""vendor":{"label":1,"l\u0061bel":2}"#.to_owned(),
+            r#""vendor":1e10001"#.to_owned(),
+            format!(
+                r#""vendor":{}0{}"#,
+                "[".repeat(nesting),
+                "]".repeat(nesting)
+            ),
+        ] {
+            let response = ordinary_token_response(&extension);
+            assert_eq!(
+                admit_token_response(
+                    &configuration,
+                    &configuration.scopes,
+                    response.as_bytes(),
+                    Instant::now(),
+                )
+                .err(),
+                Some(OAuthError::InvalidTokenResponse)
+            );
+        }
+
+        let empty = ordinary_token_response(r#""vendor":"""#);
+        let padding = "x".repeat(MAX_TOKEN_RESPONSE_BYTES - empty.len());
+        let mut at_limit = ordinary_token_response(&format!(r#""vendor":"{padding}""#));
+        assert_eq!(at_limit.len(), MAX_TOKEN_RESPONSE_BYTES);
+        assert!(
+            admit_token_response(
+                &configuration,
+                &configuration.scopes,
+                at_limit.as_bytes(),
+                Instant::now(),
+            )
+            .is_ok()
+        );
+        // A trailing space preserves the JSON document and changes only its
+        // byte count. The native HTTP cap uses this same central bound.
+        at_limit.push(' ');
+        assert_eq!(
+            admit_token_response(
+                &configuration,
+                &configuration.scopes,
+                at_limit.as_bytes(),
+                Instant::now(),
+            )
+            .err(),
+            Some(OAuthError::InvalidTokenResponse)
+        );
+    }
+
     #[test]
     fn native_configuration_rejects_cleartext_endpoints_and_scope_ambiguity() {
         let template = config();
@@ -1424,6 +1574,21 @@ mod tests {
             "application/json; charset=utf-8".to_owned(),
         )];
         assert!(validate_token_headers(&valid).is_ok());
+        let mut safe_cache = valid.clone();
+        safe_cache.extend([
+            ("Cache-Control".to_owned(), "no-store".to_owned()),
+            ("cache-control".to_owned(), "private".to_owned()),
+            ("Pragma".to_owned(), "no-cache".to_owned()),
+        ]);
+        assert!(validate_token_headers(&safe_cache).is_ok());
+        for directive in ["public", "max-age=0", "no-store=1", "vendor=\"unterminated"] {
+            let mut unsafe_cache = safe_cache.clone();
+            unsafe_cache[2].1 = directive.to_owned();
+            assert_eq!(
+                validate_token_headers(&unsafe_cache),
+                Err(OAuthError::InvalidTokenResponse)
+            );
+        }
         let mut duplicate = valid.clone();
         duplicate.push(("content-type".to_owned(), "application/json".to_owned()));
         assert!(validate_token_headers(&duplicate).is_err());
@@ -2063,6 +2228,167 @@ mod tests {
             assert_eq!(server, Ok(()));
             assert_eq!(application, Ok(()));
         });
+    }
+
+    fn native_token_admission_probe(refresh: bool) {
+        for (extension, cacheable, accepted) in [
+            (r#""vendor":null"#, false, true),
+            (r#""id_token":null"#, false, false),
+            (
+                r#""issued_token_type":"urn:ietf:params:oauth:token-type:id-jag""#,
+                false,
+                false,
+            ),
+            (r#""cnf":{}"#, false, false),
+            (r#""error_description":null"#, false, false),
+            (r#""error_uri":"https://issuer.example/error""#, false, false),
+            (r#""vendor":{"label":1,"l\u0061bel":2}"#, false, false),
+            (r#""vendor":null"#, true, false),
+        ] {
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+                    let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+                    let mut configuration = config()
+                        .with_extra_root_certificate(test_root())
+                        .unwrap();
+                    configuration.token_endpoint =
+                        url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                    let client = OAuthClient::new(configuration.clone());
+                    let acceptor = test_acceptor();
+                    let server = within(&cx, deadline, async {
+                        let (socket, _) = listener
+                            .accept()
+                            .await
+                            .map_err(|_| OAuthError::TransportFailed)?;
+                        let mut tls = acceptor
+                            .accept(socket)
+                            .await
+                            .map_err(|_| OAuthError::TransportFailed)?;
+                        let (head, form) = read_token_request(&mut tls).await?;
+                        assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                        assert_eq!(form["client_id"], "native-client");
+                        assert_eq!(form["resource"], configuration.resource.as_str());
+                        if refresh {
+                            assert_eq!(form["grant_type"], "refresh_token");
+                            assert_eq!(form["refresh_token"], "refresh-one");
+                        } else {
+                            assert_eq!(form["grant_type"], "authorization_code");
+                            assert_eq!(form["code"], "issued-code");
+                            assert!(form.contains_key("code_verifier"));
+                        }
+                        let body = ordinary_token_response(extension);
+                        let unsafe_cache = if cacheable {
+                            "Cache-Control: public, max-age=60\r\n"
+                        } else {
+                            ""
+                        };
+                        let reply = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n{unsafe_cache}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        tls.write_all(reply.as_bytes())
+                            .await
+                            .map_err(|_| OAuthError::TransportFailed)?;
+                        tls.shutdown()
+                            .await
+                            .map_err(|_| OAuthError::TransportFailed)?;
+                        Ok(())
+                    });
+                    let application = async {
+                        if refresh {
+                            let mut credentials = renewable_grant(&configuration);
+                            let original = credentials.bearer_credential().clone();
+                            let expiry_before = credentials.expires_at();
+                            let scopes_before = credentials.scopes().to_vec();
+                            let result = Box::pin(client.refresh(&cx, &mut credentials)).await;
+                            if accepted {
+                                assert_eq!(result, Ok(()));
+                                assert_eq!(
+                                    credentials.refresh_token.as_deref(),
+                                    Some("refresh-two")
+                                );
+                                assert_eq!(credentials.scopes(), ["tools:read"]);
+                                assert_eq!(
+                                    credentials
+                                        .access
+                                        .authorization_for_target(&configuration.resource)
+                                        .as_deref(),
+                                    Some("Bearer access-two")
+                                );
+                                assert!(!original.is_revoked());
+                                assert_eq!(original.expires_at(), Some(expiry_before));
+                            } else {
+                                assert_eq!(result, Err(OAuthError::InvalidTokenResponse));
+                                assert!(original.is_revoked());
+                                assert!(
+                                    original.authorization_for_target(&configuration.resource).is_none()
+                                );
+                                assert!(
+                                    credentials
+                                        .access
+                                        .authorization_for_target(&configuration.resource)
+                                        .is_none()
+                                );
+                                assert!(!credentials.has_refresh_token());
+                                assert_eq!(credentials.expires_at(), expiry_before);
+                                assert_eq!(credentials.scopes(), scopes_before.as_slice());
+                                assert_eq!(
+                                    Box::pin(client.refresh(&cx, &mut credentials)).await,
+                                    Err(OAuthError::RefreshUnavailable)
+                                );
+                            }
+                        } else {
+                            let caller = &cx;
+                            let result = Box::pin(client.authorize(
+                                &cx,
+                                |authorization| async move {
+                                    send_callback(caller, authorization).await.map(|_| ())
+                                },
+                            ))
+                            .await;
+                            if accepted {
+                                let credentials = result.unwrap();
+                                assert_eq!(
+                                    credentials.refresh_token.as_deref(),
+                                    Some("refresh-two")
+                                );
+                                assert_eq!(credentials.scopes(), ["tools:read"]);
+                                assert_eq!(
+                                    credentials
+                                        .access
+                                        .authorization_for_target(&configuration.resource)
+                                        .as_deref(),
+                                    Some("Bearer access-two")
+                                );
+                            } else {
+                                assert_eq!(result.err(), Some(OAuthError::InvalidTokenResponse));
+                            }
+                        }
+                        assert!(cx.checkpoint().is_ok());
+                        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                        assert!(
+                            listener.poll_accept(&mut task).is_pending(),
+                            "a token response cannot authorize automatic replay"
+                        );
+                    };
+                    let (server, ()) = Box::pin(pair(server, application)).await;
+                    assert_eq!(server, Ok(()));
+                });
+        }
+    }
+
+    #[test]
+    fn native_https_code_exchange_rejects_cross_profile_token_responses() {
+        native_token_admission_probe(false);
+    }
+
+    #[test]
+    fn native_https_refresh_rejects_cross_profile_responses_and_quarantines_family() {
+        native_token_admission_probe(true);
     }
 
     #[test]
