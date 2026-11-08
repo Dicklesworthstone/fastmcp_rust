@@ -3197,8 +3197,9 @@ pub enum ModernHttpFinalCoreListenError {
     Request(ModernHttpClientError),
     /// The response did not use the required SSE body lane or could not be read.
     Executor(ModernHttpExecutorError),
-    /// The POST returned an HTTP failure or a notification-only acknowledgement.
-    /// No body payload is promoted to a protocol result and no retry is attempted.
+    /// The POST returned an HTTP failure without an admitted, correlated
+    /// JSON-RPC error, or a notification-only acknowledgement. No body payload
+    /// is promoted to a successful protocol result and no retry is attempted.
     UnexpectedHttpStatus { status: u16 },
     /// An SSE event was not one strictly admitted JSON-RPC object.
     JsonRpcAdmission(JsonRpcAdmissionError),
@@ -3366,6 +3367,48 @@ async fn listener_from_json_tasks_tool_call(
         tasks_result_negotiated: true,
         terminal_received: false,
     })
+}
+
+/// Preserves the protocol errors carried by the canonical modern HTTP error
+/// statuses without turning an HTTP failure into a successful RPC result.
+/// Authentication challenges, rate limits and server failures retain their
+/// HTTP outcome; only a post-discovery 400/404 can enter this error-body lane.
+async fn classify_owned_http_failure(
+    cx: &Cx,
+    response: ModernHttpResponseStream,
+    expected_id: RequestId,
+    maximum_response_bytes: usize,
+) -> ModernHttpFinalCoreListenError {
+    let status = response.metadata().status();
+    let generic = ModernHttpFinalCoreListenError::UnexpectedHttpStatus { status };
+    if !matches!(status, 400 | 404) {
+        return generic;
+    }
+    let response = match response.read_error_body(cx, maximum_response_bytes).await {
+        Ok(Some(ModernHttpErrorBody::JsonRpcError(response))) => response,
+        Err(error) => return ModernHttpFinalCoreListenError::Executor(error),
+        Ok(None | Some(ModernHttpErrorBody::Opaque(_))) => return generic,
+    };
+    // Strict response admission allows either a result or an error. A result
+    // on an HTTP failure never becomes a terminal success, even when its ID
+    // and result discriminator would otherwise be valid for this request.
+    let Some(error) = response.error else {
+        return generic;
+    };
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|response_id| response_id.correlates_with(&expected_id))
+    {
+        return ModernHttpFinalCoreListenError::ResponseIdMismatch {
+            expected: expected_id,
+            actual: response.id,
+        };
+    }
+    ModernHttpFinalCoreListenError::RemoteError {
+        code: error.code,
+        message: error.message,
+    }
 }
 
 fn decode_final_core_terminal(
@@ -8622,9 +8665,13 @@ impl ModernHttpClient {
                     ModernHttpResponseKind::HttpFailure
                         | ModernHttpResponseKind::EmptyAcknowledgement
                 ) {
-                    return Err(ModernHttpFinalCoreListenError::UnexpectedHttpStatus {
-                        status: response.metadata().status(),
-                    });
+                    return Err(classify_owned_http_failure(
+                        &owner_cx,
+                        response,
+                        expected_id,
+                        limits.max_event_bytes(),
+                    )
+                    .await);
                 }
                 if matches!(response.metadata().kind(), ModernHttpResponseKind::Json) {
                     let maximum_bytes = limits.max_event_bytes();
@@ -8738,9 +8785,13 @@ impl ModernHttpClient {
                     }
                     ModernHttpResponseKind::HttpFailure
                     | ModernHttpResponseKind::EmptyAcknowledgement => {
-                        Err(ModernHttpFinalCoreListenError::UnexpectedHttpStatus {
-                            status: response.metadata().status(),
-                        })
+                        Err(classify_owned_http_failure(
+                            &owner_cx,
+                            response,
+                            expected_id,
+                            limits.max_event_bytes(),
+                        )
+                        .await)
                     }
                 }
             }
@@ -15414,6 +15465,511 @@ mod tests {
 
     fn modern_discovery_body() -> &'static [u8] {
         br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
+    }
+
+    fn owned_http_error_test_builder(target: &str) -> ClientBuilder {
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+            ExtensionDirection, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+            ExtensionMethodDescriptor, ExtensionNegotiationError, ExtensionNegotiationResolver,
+            ExtensionSettings, ExtensionSettingsSchema,
+        };
+        let id = ExtensionId::parse("com.example/errors").unwrap();
+        let mut registry = ExtensionDescriptorRegistry::new();
+        registry
+            .register(ExtensionDescriptor {
+                id: id.clone(),
+                client_settings: ExtensionSettingsSchema {
+                    schema_id: "error-client-v1".to_owned(),
+                    codec_id: "error-client-v1".to_owned(),
+                },
+                server_settings: ExtensionSettingsSchema {
+                    schema_id: "error-server-v1".to_owned(),
+                    codec_id: "error-server-v1".to_owned(),
+                },
+                resolver: ExtensionNegotiationResolver {
+                    id: "error-settings-v1".to_owned(),
+                    version: 1,
+                    fallback: ExtensionFallbackPolicy::RejectOneSided,
+                },
+                method: Some(ExtensionMethodDescriptor {
+                    name: "example/failure".to_owned(),
+                    direction: ExtensionDirection::ClientToServer,
+                    http_era_disposition: Some(ExtensionHttpEraDisposition::ModernExclusive),
+                    legacy_fallback: false,
+                }),
+                notification: None,
+                result_discriminator: None,
+                routing_headers: Vec::new(),
+                stdio_correlation: None,
+            })
+            .unwrap();
+        ClientBuilder::new()
+            .protocol_plan(plan(
+                target,
+                "http://127.0.0.1:9/unused-sse",
+                "http://127.0.0.1:9/unused-messages",
+                ProtocolPolicy::ModernOnly,
+            ))
+            .request_timeout_policy(
+                crate::RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(3))
+                    .unwrap(),
+            )
+            .extension_registry(
+                registry,
+                ClientExtensionDiscovery {
+                    extensions: BTreeMap::from([(
+                        id,
+                        ExtensionSettings::new(serde_json::json!({})).unwrap(),
+                    )]),
+                },
+                || {
+                    |descriptor: &ExtensionDescriptor,
+                     client: &ExtensionSettings,
+                     server: &ExtensionSettings| {
+                        if client.clone().into_value() == server.clone().into_value() {
+                            Ok(client.clone())
+                        } else {
+                            Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                                descriptor.id.to_string(),
+                            ))
+                        }
+                    }
+                },
+            )
+            .unwrap()
+    }
+
+    fn respond_owned_http_error_discovery(listener: &TcpListener) {
+        let mut stream = accept_notification_test_peer(listener);
+        let request: serde_json::Value =
+            serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+        assert_eq!(request["method"], SERVER_DISCOVER);
+        assert_eq!(request["id"], 1);
+        write_response(
+            &mut stream,
+            200,
+            "application/json",
+            br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"com.example/errors":{}}},"ttlMs":0,"cacheScope":"private"}}"#,
+        );
+    }
+
+    enum OwnedHttpErrorTestExecution {
+        Core(super::ModernHttpRequestExecution),
+        Extension(super::ModernHttpExtensionExecution),
+    }
+
+    impl OwnedHttpErrorTestExecution {
+        fn prepare(
+            client: &crate::HttpClient,
+            cx: &Cx,
+            extension: bool,
+            maximum_bytes: usize,
+            policy: crate::RequestTimeoutPolicy,
+        ) -> Self {
+            let limits = SseLimits::new(maximum_bytes, maximum_bytes, 8).unwrap();
+            if extension {
+                Self::Extension(
+                    client
+                        .execute_final_extension_with_timeout_policy(
+                            cx,
+                            &fastmcp_protocol::ExtensionId::parse("com.example/errors").unwrap(),
+                            "example/failure",
+                            serde_json::json!({}),
+                            limits,
+                            policy,
+                        )
+                        .unwrap(),
+                )
+            } else {
+                Self::Core(
+                    client
+                        .execute_core_with_timeout_policy(
+                            cx,
+                            "tools/list",
+                            serde_json::json!({}),
+                            limits,
+                            policy,
+                        )
+                        .unwrap(),
+                )
+            }
+        }
+
+        fn control(&self) -> super::ModernHttpRequestControl {
+            match self {
+                Self::Core(execution) => execution.control(),
+                Self::Extension(execution) => execution.control(),
+            }
+        }
+
+        async fn next_event(
+            &mut self,
+            cx: &Cx,
+        ) -> Result<Option<()>, ModernHttpFinalCoreListenError> {
+            match self {
+                Self::Core(execution) => execution
+                    .next_event(cx)
+                    .await
+                    .map(|event| event.map(|_| ())),
+                Self::Extension(execution) => execution
+                    .next_event(cx)
+                    .await
+                    .map(|event| event.map(|_| ())),
+            }
+        }
+    }
+
+    fn owned_http_failure_case(
+        extension: bool,
+        status: u16,
+        content_type: &'static str,
+        body: &'static [u8],
+        maximum_bytes: usize,
+    ) -> ModernHttpFinalCoreListenError {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let peer = thread::spawn(move || {
+            respond_owned_http_error_discovery(&listener);
+            let mut stream = accept_notification_test_peer(&listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["id"], 2);
+            assert_eq!(
+                request["method"],
+                if extension {
+                    "example/failure"
+                } else {
+                    "tools/list"
+                }
+            );
+            write_response(&mut stream, status, content_type, body);
+            assert_sse_peer_closed(&mut stream);
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        let error = runtime_block_on(async {
+            let cx = Cx::current().expect("owned HTTP error test uses its caller runtime");
+            let client = owned_http_error_test_builder(&target)
+                .connect_http_client_with_cx(&cx)
+                .await
+                .unwrap();
+            let mut execution = OwnedHttpErrorTestExecution::prepare(
+                &client,
+                &cx,
+                extension,
+                maximum_bytes,
+                crate::RequestTimeoutPolicy::default(),
+            );
+            let control = execution.control();
+            let error = execution.next_event(&cx).await.expect_err("HTTP failure");
+            assert!(execution.next_event(&cx).await.unwrap().is_none());
+            assert!(control.terminal_reason().is_some());
+            assert!(
+                !control.cancel(),
+                "a terminal error cannot be cancelled again"
+            );
+            assert!(control.take_cancellation_event().is_none());
+            if let OwnedHttpErrorTestExecution::Extension(execution) = &execution {
+                assert!(execution.raw_result_source().is_none());
+            }
+            assert!(cx.checkpoint().is_ok());
+            error
+        });
+        peer.join().unwrap();
+        error
+    }
+
+    #[test]
+    fn owned_http_errors_preserve_canonical_rpc_errors() {
+        for extension in [false, true] {
+            for (status, content_type, body, expected_code, expected_message) in [
+                (
+                    400,
+                    "application/json",
+                    &br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32021,"message":"Required client capability is missing","data":{"requiredCapabilities":{"roots":{}}}}}"#[..],
+                    -32_021,
+                    "Required client capability is missing",
+                ),
+                (
+                    404,
+                    "Application/JSON; Charset=UTF-8",
+                    &br#"{"jsonrpc":"2.0","id":2e0,"error":{"code":-32601,"message":"Method not found"}}"#[..],
+                    -32_601,
+                    "Method not found",
+                ),
+            ] {
+                let error = owned_http_failure_case(extension, status, content_type, body, 4_096);
+                assert!(matches!(
+                    error,
+                    ModernHttpFinalCoreListenError::RemoteError { code, message }
+                        if code.as_i32() == Some(expected_code) && message == expected_message
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_errors_reject_foreign_response_ids() {
+        for extension in [false, true] {
+            for body in [
+                &br#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}"#[..],
+                &br#"{"jsonrpc":"2.0","id":"2","error":{"code":-32601,"message":"Method not found"}}"#[..],
+                &br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#[..],
+            ] {
+                let error = owned_http_failure_case(extension, 404, "application/json", body, 4_096);
+                assert!(matches!(
+                    error,
+                    ModernHttpFinalCoreListenError::ResponseIdMismatch {
+                        expected: RequestId::Number(2),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_errors_require_declared_json_and_error_only_envelopes() {
+        const ERROR: &[u8] =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for extension in [false, true] {
+            for (content_type, body) in [
+                ("text/plain", ERROR),
+                ("application/json; charset=iso-8859-1", ERROR),
+                ("application/json\r\nContent-Type: application/json", ERROR),
+                ("application/json", &b"{incomplete"[..]),
+                ("application/json", &b"\xef\xbb\xbf{}"[..]),
+                (
+                    "application/json",
+                    &br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#[..],
+                ),
+                (
+                    "application/json",
+                    &br#"{"jsonrpc":"2.0","id":2,"result":{},"error":{"code":-32601,"message":"Method not found"}}"#[..],
+                ),
+            ] {
+                let error = owned_http_failure_case(extension, 400, content_type, body, 4_096);
+                assert!(matches!(
+                    error,
+                    ModernHttpFinalCoreListenError::UnexpectedHttpStatus { status: 400 }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_errors_preserve_authentication_and_transport_statuses() {
+        const ERROR: &[u8] =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for extension in [false, true] {
+            for status in [401, 403, 429, 500, 503] {
+                let error = owned_http_failure_case(
+                    extension,
+                    status,
+                    "application/json\r\nWWW-Authenticate: Bearer realm=\"mcp\"",
+                    ERROR,
+                    4_096,
+                );
+                assert!(matches!(
+                    error,
+                    ModernHttpFinalCoreListenError::UnexpectedHttpStatus { status: actual }
+                        if actual == status
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_errors_enforce_the_exact_response_body_bound() {
+        const ERROR: &[u8] =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for extension in [false, true] {
+            assert!(matches!(
+                owned_http_failure_case(extension, 404, "application/json", ERROR, ERROR.len()),
+                ModernHttpFinalCoreListenError::RemoteError { .. }
+            ));
+            for content_type in ["application/json", "text/plain"] {
+                let error =
+                    owned_http_failure_case(extension, 404, content_type, ERROR, ERROR.len() - 1);
+                assert!(matches!(
+                    error,
+                    ModernHttpFinalCoreListenError::Executor(
+                        ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes }
+                    ) if maximum_bytes == ERROR.len() - 1
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_error_body_cancellation_and_timeout_preserve_siblings() {
+        use crate::RequestTimeoutSource::{Absolute, Idle};
+
+        for extension in [false, true] {
+            for timeout in [None, Some(Idle), Some(Absolute)] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let (ready, wait_ready) = mpsc::channel();
+                let peer = thread::spawn(move || {
+                    respond_owned_http_error_discovery(&listener);
+                    let mut pending = None;
+                    let mut sibling = None;
+                    for _ in 0..2 {
+                        let mut stream = accept_notification_test_peer(&listener);
+                        let request: serde_json::Value =
+                            serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+                        if request["id"] == 2 {
+                            assert!(pending.is_none(), "one POST owns the failing request");
+                            assert_eq!(
+                                request["method"],
+                                if extension {
+                                    "example/failure"
+                                } else {
+                                    "tools/list"
+                                }
+                            );
+                            stream.write_all(
+                                b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                            ).unwrap();
+                            stream.flush().unwrap();
+                            let _ = ready.send(());
+                            pending = Some(stream);
+                        } else {
+                            assert!(sibling.is_none(), "one POST owns the sibling request");
+                            assert_eq!(request["id"], 3);
+                            assert_eq!(request["method"], "tools/list");
+                            sibling = Some(stream);
+                        }
+                    }
+                    let mut pending = pending.unwrap();
+                    let mut sibling = sibling.unwrap();
+                    // The sibling is already waiting for its own response
+                    // when cancellation/timeout closes the incomplete error.
+                    assert_sse_peer_closed(&mut pending);
+                    write_response(
+                        &mut sibling,
+                        200,
+                        "application/json",
+                        br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                    );
+                    assert_sse_peer_closed(&mut sibling);
+                    assert!(matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    ));
+                });
+                runtime_block_on(async {
+                    let cx = Cx::current().expect("owned error bodies use their caller runtime");
+                    let client = owned_http_error_test_builder(&target)
+                        .connect_http_client_with_cx(&cx)
+                        .await
+                        .unwrap();
+                    let policy = match timeout {
+                        Some(Idle) => crate::RequestTimeoutPolicy::new(
+                            Duration::from_millis(100),
+                            Duration::from_secs(1),
+                        )
+                        .unwrap(),
+                        Some(Absolute) => crate::RequestTimeoutPolicy::new(
+                            Duration::from_secs(1),
+                            Duration::from_millis(100),
+                        )
+                        .unwrap(),
+                        None => crate::RequestTimeoutPolicy::default(),
+                    };
+                    let mut pending = OwnedHttpErrorTestExecution::prepare(
+                        &client, &cx, extension, 4_096, policy,
+                    );
+                    let mut sibling = client
+                        .execute_core(
+                            &cx,
+                            "tools/list",
+                            serde_json::json!({}),
+                            SseLimits::new(4_096, 4_096, 8).unwrap(),
+                        )
+                        .unwrap();
+                    let control = pending.control();
+                    let cancel_control = control.clone();
+                    let canceller = timeout.is_none().then(|| {
+                        thread::spawn(move || {
+                            wait_ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                            thread::sleep(Duration::from_millis(25));
+                            assert!(cancel_control.cancel());
+                        })
+                    });
+                    let (failure, success) = {
+                        let mut failed_wait = std::pin::pin!(pending.next_event(&cx));
+                        let mut sibling_wait = std::pin::pin!(sibling.next_event(&cx));
+                        let mut failure = None;
+                        let mut success = None;
+                        std::future::poll_fn(|task_cx| {
+                            if failure.is_none()
+                                && let Poll::Ready(result) = failed_wait.as_mut().poll(task_cx)
+                            {
+                                failure = Some(result);
+                            }
+                            if success.is_none()
+                                && let Poll::Ready(result) = sibling_wait.as_mut().poll(task_cx)
+                            {
+                                success = Some(result);
+                            }
+                            if failure.is_some() && success.is_some() {
+                                Poll::Ready((failure.take().unwrap(), success.take().unwrap()))
+                            } else {
+                                Poll::Pending
+                            }
+                        })
+                        .await
+                    };
+                    let error = failure.expect_err("incomplete HTTP error must be interrupted");
+                    let expected_reason = if let Some(expected_source) = timeout {
+                        assert!(matches!(
+                            error,
+                            ModernHttpFinalCoreListenError::Executor(
+                                ModernHttpExecutorError::Timeout(source)
+                            ) if source == expected_source
+                        ));
+                        match expected_source {
+                            Idle => crate::ExecutionTerminalReason::IdleTimeout,
+                            Absolute => crate::ExecutionTerminalReason::AbsoluteTimeout,
+                        }
+                    } else {
+                        assert!(matches!(
+                            error,
+                            ModernHttpFinalCoreListenError::CallerCancelled {
+                                request_id: RequestId::Number(2),
+                            }
+                        ));
+                        crate::ExecutionTerminalReason::CallerCancelled
+                    };
+                    assert_eq!(control.terminal_reason(), Some(expected_reason));
+                    assert_eq!(
+                        control.take_cancellation_event().unwrap().reason,
+                        expected_reason
+                    );
+                    assert!(control.take_cancellation_event().is_none());
+                    assert!(!control.cancel());
+                    assert!(pending.next_event(&cx).await.unwrap().is_none());
+                    assert!(matches!(
+                        success.unwrap(),
+                        Some(ModernHttpFinalCoreEvent::Terminal(
+                            FinalCoreResult::ToolsList { .. }
+                        ))
+                    ));
+                    assert!(sibling.next_event(&cx).await.unwrap().is_none());
+                    assert!(cx.checkpoint().is_ok());
+                    if let Some(canceller) = canceller {
+                        canceller.join().unwrap();
+                    }
+                });
+                peer.join().unwrap();
+            }
+        }
     }
 
     #[cfg(feature = "tasks")]
