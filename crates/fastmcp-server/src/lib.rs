@@ -5386,6 +5386,42 @@ struct FinalSubscriptionEntry {
 struct FinalSubscriptionResourceAdmission {
     context: McpContext,
     bindings: Vec<Arc<ResourceSubscriptionBinding>>,
+    #[cfg(feature = "tasks")]
+    task_access: Option<FinalSubscriptionTaskAdmission>,
+}
+
+/// Retains the exact Task incarnations admitted by this listen across the
+/// transport mailbox and pending writes. Admission at the producer callback
+/// cannot authorize a later delivery after the original operation is revoked.
+#[cfg(feature = "tasks")]
+struct FinalSubscriptionTaskAdmission {
+    runtime: FinalTaskRuntime,
+    tasks: Arc<BTreeMap<fastmcp_protocol::FinalTaskId, FinalTaskAccessMetadata>>,
+}
+
+#[cfg(feature = "tasks")]
+impl FinalSubscriptionTaskAdmission {
+    fn allows(&self, context: &McpContext, notification: &JsonRpcRequest) -> bool {
+        if notification.method != fastmcp_protocol::TASK_STATUS_NOTIFICATION {
+            return true;
+        }
+        let Some(task_id) = notification
+            .params
+            .as_ref()
+            .and_then(|params| params.get("taskId"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|task_id| fastmcp_protocol::FinalTaskId::parse(task_id).ok())
+        else {
+            return false;
+        };
+        // An already-queued status may have been followed by another valid
+        // transition. Preserve that event's place in the stream while checking
+        // current grants and the immutable creation generation, not equality
+        // with the newest payload. Reclaimed/recreated IDs never inherit it.
+        self.tasks
+            .get(&task_id)
+            .is_some_and(|admitted| self.runtime.task_access_is_current(context, admitted))
+    }
 }
 
 struct FinalSubscriptionTransportAdmission {
@@ -5475,7 +5511,16 @@ impl FinalSubscriptionTransportAdmission {
                     _ => false,
                 }
             } else {
-                true
+                #[cfg(feature = "tasks")]
+                {
+                    self.resources.task_access.as_ref().is_none_or(|admission| {
+                        admission.allows(&self.resources.context, notification)
+                    })
+                }
+                #[cfg(not(feature = "tasks"))]
+                {
+                    true
+                }
             };
         if !allowed {
             self.refused.store(true, Ordering::Release);
@@ -15719,6 +15764,8 @@ impl Server {
             Some(FinalSubscriptionResourceAdmission {
                 context: request_ctx.clone(),
                 bindings,
+                #[cfg(feature = "tasks")]
+                task_access: None,
             }),
         )?;
         Ok(SubscriptionListenHandle { _lease: lease })
@@ -17895,6 +17942,13 @@ impl Server {
             Some(FinalSubscriptionResourceAdmission {
                 context: request_ctx.clone(),
                 bindings: resource_bindings,
+                #[cfg(feature = "tasks")]
+                task_access: task_access_revalidation.as_ref().map(|(runtime, tasks)| {
+                    FinalSubscriptionTaskAdmission {
+                        runtime: runtime.clone(),
+                        tasks: Arc::clone(tasks),
+                    }
+                }),
             }),
         )?;
 
@@ -41860,6 +41914,8 @@ mod lib_unit_tests {
                     Some(FinalSubscriptionResourceAdmission {
                         context: context.clone(),
                         bindings,
+                        #[cfg(feature = "tasks")]
+                        task_access: None,
                     }),
                 )
                 .unwrap();
@@ -42163,6 +42219,8 @@ mod lib_unit_tests {
                         Some(FinalSubscriptionResourceAdmission {
                             context: ctx.clone(),
                             bindings,
+                            #[cfg(feature = "tasks")]
+                            task_access: None,
                         }),
                     )
                     .unwrap();
@@ -54015,6 +54073,8 @@ mod lib_unit_tests {
             resources: Arc::new(FinalSubscriptionResourceAdmission {
                 context: context.clone(),
                 bindings: Vec::new(),
+                #[cfg(feature = "tasks")]
+                task_access: None,
             }),
             refused: AtomicBool::new(false),
         });

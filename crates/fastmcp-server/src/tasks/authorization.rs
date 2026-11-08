@@ -634,6 +634,7 @@ mod http_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestHttpEndpoint;
     use crate::http_admission::security::scope_policy::request::ScopeRequestPolicy;
     use crate::http_admission::security::scope_policy::request::operation::{
         OperationScopePolicy, ScopedOperation,
@@ -774,6 +775,15 @@ mod tests {
             self.inner
                 .replace_task_if_current(expected, task, notification)
         }
+        fn replace_task_and_clear_input_if_current(
+            &self,
+            expected: &FinalTaskSnapshot,
+            task: FinalTask,
+            notification: FinalTaskStatusNotification,
+        ) -> McpResult<Option<FinalTaskSnapshot>> {
+            self.inner
+                .replace_task_and_clear_input_if_current(expected, task, notification)
+        }
         fn replace_task_and_clear_input_for_handoff_if_current(
             &self,
             expected: &FinalTaskSnapshot,
@@ -830,7 +840,13 @@ mod tests {
     }
 
     fn fixture() -> (Arc<ProbeStore>, FinalTaskRuntime, FinalTaskId, Arc<()>) {
-        let store = Arc::new(ProbeStore::new());
+        fixture_with_store(ProbeStore::new())
+    }
+
+    fn fixture_with_store(
+        store: ProbeStore,
+    ) -> (Arc<ProbeStore>, FinalTaskRuntime, FinalTaskId, Arc<()>) {
+        let store = Arc::new(store);
         let runtime = FinalTaskRuntime::new(
             store.clone(),
             FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
@@ -1652,6 +1668,433 @@ mod tests {
             executor.shutdown_timeout(StdDuration::from_secs(2)),
             "the authorization executor quiesced"
         );
+    }
+
+    fn subscription_executor() -> asupersync::runtime::Runtime {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(asupersync::time::TimerDriverHandle::with_virtual_clock(
+                Arc::new(asupersync::time::VirtualClock::new()),
+            ))
+            .build()
+            .unwrap()
+    }
+
+    struct TaskHttpOutbox {
+        context: McpContext,
+        response: crate::ServerHttpSseResponse,
+        _listening: Pin<Box<dyn Future<Output = McpResult<()>>>>,
+        _session: crate::DualEraHttpSession,
+    }
+
+    /// Runs the real listen admission and producer into the transport's SSE
+    /// mailbox. Keep dispatch parked so authority changes occur strictly after
+    /// enqueue and before any periodic subscription revalidation can run.
+    fn task_http_outbox(
+        endpoint: &crate::ServerHttpEndpoint,
+        cx: &Cx,
+        task_id: &FinalTaskId,
+        request_id: i64,
+    ) -> TaskHttpOutbox {
+        let mut context = McpContext::new(cx.clone(), u64::try_from(request_id).unwrap())
+            .with_auth(context(&["invoke", "manage", "sensitive"]).auth().unwrap());
+        #[cfg(feature = "legacy-2024-11-05")]
+        let transport = endpoint.transport_endpoint("http://legacy.test").unwrap();
+        #[cfg(not(feature = "legacy-2024-11-05"))]
+        let transport = endpoint.transport_endpoint().unwrap();
+        let mut session = transport.open_session().unwrap();
+        let mut notifications = fastmcp_protocol::SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(&mut notifications, vec![task_id.clone()])
+            .unwrap();
+        let request = fastmcp_protocol::JsonRpcRequest::new(
+            "subscriptions/listen",
+            Some(serde_json::json!({
+                "_meta": parameters(task_id)["_meta"], "notifications": notifications,
+            })),
+            request_id,
+        );
+        let http_request = fastmcp_transport::http::HttpRequest::new(
+            fastmcp_transport::http::HttpMethod::Post,
+            "/mcp",
+        )
+        .with_header("content-type", "application/json")
+        .with_header("accept", "text/event-stream")
+        .with_header("mcp-protocol-version", FINAL_PROTOCOL_VERSION)
+        .with_header("mcp-method", "subscriptions/listen")
+        .with_body(serde_json::to_vec(&request).unwrap());
+        let crate::DualEraHttpEndpointResponse::ModernSse(inner) =
+            session.handle(cx, http_request).unwrap()
+        else {
+            panic!("a Task listen must use the real SSE transport mailbox");
+        };
+        let sender = inner.sender();
+        let cancellation = sender.request_cancellation();
+        context = context.with_request_cancellation(cancellation.clone());
+        let delivery = Arc::new(crate::FinalSubscriptionTerminalDelivery::default());
+        delivery.subscription_request.store(true, Ordering::Release);
+        let sender_cx = cx.clone();
+        let notifications: crate::NotificationSender = Arc::new(move |notification| {
+            if crate::final_subscription_terminal_notification(&notification) {
+                sender
+                    .send_subscription_cancellation(&sender_cx, notification)
+                    .unwrap();
+            } else {
+                sender.send_notification(&sender_cx, notification).unwrap();
+            }
+        });
+        let server = Arc::clone(&endpoint.server);
+        let dispatch_context = context.clone();
+        let dispatch_cancellation = cancellation.clone();
+        let dispatch_delivery = Arc::clone(&delivery);
+        let mut listening = Box::pin(async move {
+            server
+                .dispatch_final_subscriptions_listen(
+                    &dispatch_context,
+                    &request,
+                    Some(u64::try_from(request_id).unwrap()),
+                    dispatch_cancellation,
+                    Some(dispatch_delivery),
+                    notifications,
+                )
+                .await
+        });
+        let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(listening.as_mut().poll(&mut poll).is_pending());
+        let response = crate::ServerHttpSseResponse::new(inner, cancellation, delivery);
+        let acknowledgement = response.pop_event().unwrap().unwrap();
+        assert!(matches!(
+            crate::subscription_sse_message(&acknowledgement),
+            Some(fastmcp_protocol::JsonRpcMessage::Request(notification))
+                if crate::final_subscription_acknowledgement_notification(&notification)
+        ));
+        TaskHttpOutbox {
+            context,
+            response,
+            _listening: listening,
+            _session: session,
+        }
+    }
+
+    fn enqueue_task_status(
+        endpoint: &crate::ServerHttpEndpoint,
+        store: &ProbeStore,
+        task_id: &FinalTaskId,
+    ) -> usize {
+        endpoint
+            .server
+            .final_subscriptions
+            .publish_owned_task(
+                store.inner.latest_notification(task_id).unwrap(),
+                task_request_principal(&context(&["invoke", "manage", "sensitive"])).unwrap(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn task_subscription_http_outbox_revalidates_authority_after_enqueue() {
+        const RESULT_SOURCE: &str = r#"{"x-first":1.20e+4,"content":[{"type":"text","text":"private \u0061"}],"x-zero":-0}"#;
+        let executor = subscription_executor();
+        let cx = executor.request_cx_with_budget(asupersync::Budget::INFINITE);
+        for change in 0..5 {
+            let (store, runtime, id, registration) = fixture();
+            let mut registration = Some(registration);
+            let policy = Arc::new(RevocablePolicy(AtomicBool::new(false)));
+            runtime.install_access_authorizer(policy.clone()).unwrap();
+            let endpoint = crate::Server::new("task-outbox-authority", "1")
+                .final_tasks(runtime.clone())
+                .unwrap()
+                .test_http_endpoint("http://legacy.test")
+                .unwrap();
+            let outbox = task_http_outbox(&endpoint, &cx, &id, 81);
+            runtime
+                .complete_task(&id, serde_json::from_str(RESULT_SOURCE).unwrap(), None)
+                .unwrap();
+            let payload_reads = store.payload_reads.load(Ordering::SeqCst);
+            match change {
+                1 => policy.0.store(true, Ordering::Release),
+                2 => assert!(outbox.context.disable_tool("sensitive-tool")),
+                3 => drop(registration.take()),
+                4 => store.metadata_supported.store(false, Ordering::Release),
+                _ => {}
+            }
+            let observed = outbox.response.pop_event();
+            if change == 0 {
+                let event = observed.unwrap().unwrap();
+                assert!(matches!(
+                    crate::subscription_sse_message(&event),
+                    Some(fastmcp_protocol::JsonRpcMessage::Request(notification))
+                        if notification.method == fastmcp_protocol::TASK_STATUS_NOTIFICATION
+                            && notification.params.as_ref().unwrap()["taskId"] == id.as_str()
+                            && notification.params.as_ref().unwrap()["status"] == "completed"
+                ));
+                let envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                    serde_json::from_str(&event.data).unwrap();
+                let params: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                    serde_json::from_str(envelope["params"].get()).unwrap();
+                assert_eq!(params["result"].get(), RESULT_SOURCE);
+                assert!(!outbox.response.is_finished());
+                assert!(outbox.response.pop_event().unwrap().is_none());
+            } else {
+                assert!(
+                    !matches!(observed, Ok(Some(_))),
+                    "revoked Task data escaped"
+                );
+                assert!(outbox.response.is_finished());
+                policy.0.store(false, Ordering::Release);
+                store.metadata_supported.store(true, Ordering::Release);
+                assert!(!matches!(outbox.response.pop_event(), Ok(Some(_))));
+                assert!(
+                    endpoint
+                        .server
+                        .final_subscriptions
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .is_empty()
+                );
+            }
+            assert_eq!(store.payload_reads.load(Ordering::SeqCst), payload_reads);
+            assert!(!store.inner.is_cancellation_requested(&id).unwrap());
+        }
+        assert!(executor.shutdown_timeout(StdDuration::from_secs(2)));
+    }
+
+    #[test]
+    fn task_subscription_http_outbox_rejects_recreated_id_and_accepts_fresh_listen() {
+        let executor = subscription_executor();
+        let cx = executor.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let clock = Arc::clone(&now);
+        let mut probe = ProbeStore::new();
+        probe.inner =
+            InMemoryFinalTaskStore::with_clock(4, Arc::new(move || *clock.lock().unwrap()))
+                .unwrap();
+        let (store, runtime, id, registration) = fixture_with_store(probe);
+        let original = store.inner.get_task_snapshot(&id).unwrap().unwrap();
+        let endpoint = crate::Server::new("task-outbox-incarnation", "1")
+            .final_tasks(runtime.clone())
+            .unwrap()
+            .test_http_endpoint("http://legacy.test")
+            .unwrap();
+        let old = task_http_outbox(&endpoint, &cx, &id, 86);
+        runtime
+            .complete_task(
+                &id,
+                serde_json::from_str(r#"{"content":[{"type":"text","text":"old result"}]}"#)
+                    .unwrap(),
+                None,
+            )
+            .unwrap();
+        *now.lock().unwrap() += StdDuration::from_secs(61);
+        // Keep the owner, registration, task ID and original wire value;
+        // only the store's immutable insertion generation changes.
+        store
+            .inner
+            .create_task_with_operation(
+                original.task().clone(),
+                final_task_notification(original.task()),
+                work(),
+                original.authenticated_principal(),
+                FinalTaskOperation::for_tool("sensitive-tool", &registration).unwrap(),
+            )
+            .unwrap();
+        let current = store.inner.get_task_snapshot(&id).unwrap().unwrap();
+        assert_ne!(
+            current.creation_generation(),
+            original.creation_generation()
+        );
+        assert!(!matches!(old.response.pop_event(), Ok(Some(_))));
+        assert!(old.response.is_finished());
+        let fresh = task_http_outbox(&endpoint, &cx, &id, 87);
+        assert_eq!(enqueue_task_status(&endpoint, &store, &id), 1);
+        let event = fresh.response.pop_event().unwrap().unwrap();
+        assert!(matches!(
+            crate::subscription_sse_message(&event),
+            Some(fastmcp_protocol::JsonRpcMessage::Request(notification))
+                if notification.params.as_ref().unwrap()["taskId"] == id.as_str()
+                    && notification.params.as_ref().unwrap()["status"] == "working"
+        ));
+        assert!(!fresh.response.is_finished());
+        assert!(!store.inner.is_cancellation_requested(&id).unwrap());
+        drop(old);
+        drop(fresh);
+        assert!(executor.shutdown_timeout(StdDuration::from_secs(2)));
+    }
+
+    #[test]
+    fn task_subscription_http_outbox_isolates_revocation_and_keeps_queued_transitions() {
+        let executor = subscription_executor();
+        let cx = executor.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (store, runtime, id, _registration) = fixture();
+        let endpoint = crate::Server::new("task-outbox-siblings", "1")
+            .final_tasks(runtime)
+            .unwrap()
+            .test_http_endpoint("http://legacy.test")
+            .unwrap();
+        let first = task_http_outbox(&endpoint, &cx, &id, 82);
+        let sibling = task_http_outbox(&endpoint, &cx, &id, 83);
+        assert_eq!(enqueue_task_status(&endpoint, &store, &id), 2);
+        let mut latest = store.inner.get_task(&id).unwrap().unwrap();
+        let FinalTask::Working(base) = &mut latest else {
+            panic!("fixture task must be working");
+        };
+        base.status_message = Some("newer progress".to_owned());
+        store
+            .inner
+            .replace_task(latest.clone(), final_task_notification(&latest))
+            .unwrap();
+        assert!(first.context.disable_tool("sensitive-tool"));
+        assert!(!matches!(first.response.pop_event(), Ok(Some(_))));
+        let old = sibling.response.pop_event().unwrap().unwrap();
+        let Some(fastmcp_protocol::JsonRpcMessage::Request(old)) =
+            crate::subscription_sse_message(&old)
+        else {
+            panic!("the authorized sibling must retain its queued status");
+        };
+        assert!(old.params.as_ref().unwrap().get("statusMessage").is_none());
+        assert!(!sibling.response.is_finished());
+        assert_eq!(enqueue_task_status(&endpoint, &store, &id), 1);
+        let latest = sibling.response.pop_event().unwrap().unwrap();
+        let Some(fastmcp_protocol::JsonRpcMessage::Request(latest)) =
+            crate::subscription_sse_message(&latest)
+        else {
+            panic!("the authorized sibling must receive later progress");
+        };
+        assert_eq!(
+            latest.params.as_ref().unwrap()["statusMessage"],
+            "newer progress"
+        );
+        assert!(!store.inner.is_cancellation_requested(&id).unwrap());
+        drop(first);
+        drop(sibling);
+        assert!(executor.shutdown_timeout(StdDuration::from_secs(2)));
+    }
+
+    #[test]
+    fn task_subscription_http_outbox_refusal_preserves_elected_terminal() {
+        let executor = subscription_executor();
+        let cx = executor.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (store, runtime, id, _registration) = fixture();
+        let policy = Arc::new(RevocablePolicy(AtomicBool::new(false)));
+        runtime.install_access_authorizer(policy.clone()).unwrap();
+        let endpoint = crate::Server::new("task-outbox-terminal", "1")
+            .final_tasks(runtime)
+            .unwrap()
+            .test_http_endpoint("http://legacy.test")
+            .unwrap();
+        let outbox = task_http_outbox(&endpoint, &cx, &id, 84);
+        assert_eq!(enqueue_task_status(&endpoint, &store, &id), 1);
+        assert_eq!(endpoint.server.terminate_subscription_streams(), 1);
+        policy.0.store(true, Ordering::Release);
+        let terminal = outbox.response.pop_event().unwrap().unwrap();
+        assert!(matches!(
+            crate::subscription_sse_message(&terminal),
+            Some(fastmcp_protocol::JsonRpcMessage::Request(notification))
+                if crate::final_subscription_terminal_notification(&notification)
+                    && notification.params.as_ref().unwrap()["requestId"] == 84
+        ));
+        assert!(!matches!(outbox.response.pop_event(), Ok(Some(_))));
+        assert!(!store.inner.is_cancellation_requested(&id).unwrap());
+        drop(outbox);
+        assert!(executor.shutdown_timeout(StdDuration::from_secs(2)));
+    }
+
+    #[derive(Default)]
+    struct TaskWriteControl {
+        bytes: Mutex<Vec<u8>>,
+        permitted_bytes: AtomicUsize,
+        polls: AtomicUsize,
+    }
+
+    struct TaskWriteProbe(Arc<TaskWriteControl>);
+
+    impl asupersync::io::AsyncWrite for TaskWriteProbe {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            input: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.0.polls.fetch_add(1, Ordering::AcqRel);
+            let mut bytes = self.0.bytes.lock().unwrap();
+            let available = self
+                .0
+                .permitted_bytes
+                .load(Ordering::Acquire)
+                .saturating_sub(bytes.len());
+            if available == 0 {
+                return std::task::Poll::Pending;
+            }
+            let count = available.min(input.len());
+            bytes.extend_from_slice(&input[..count]);
+            std::task::Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            task: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(task)
+        }
+    }
+
+    #[test]
+    fn task_subscription_http_write_revalidates_after_partial_write_backpressure() {
+        let executor = subscription_executor();
+        let cx = executor.request_cx_with_budget(asupersync::Budget::INFINITE);
+        for revoked in [false, true] {
+            let (store, runtime, id, _registration) = fixture();
+            let policy = Arc::new(RevocablePolicy(AtomicBool::new(false)));
+            runtime.install_access_authorizer(policy.clone()).unwrap();
+            let endpoint = crate::Server::new("task-pending-write", "1")
+                .final_tasks(runtime)
+                .unwrap()
+                .test_http_endpoint("http://legacy.test")
+                .unwrap();
+            let outbox = task_http_outbox(&endpoint, &cx, &id, 85);
+            assert_eq!(enqueue_task_status(&endpoint, &store, &id), 1);
+            let event = outbox.response.pop_event().unwrap().unwrap();
+            let encoded = event.to_bytes().unwrap();
+            let parts = [encoded.as_slice()];
+            let control = Arc::new(TaskWriteControl::default());
+            control.permitted_bytes.store(4, Ordering::Release);
+            let mut writer = TaskWriteProbe(Arc::clone(&control));
+            let mut write = Box::pin(crate::guard_subscription_sse_write(
+                &outbox.response.terminal_delivery,
+                &event,
+                crate::write_http_response_parts(&mut writer, &parts),
+            ));
+            let mut poll = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(write.as_mut().poll(&mut poll).is_pending());
+            assert_eq!(control.bytes.lock().unwrap().as_slice(), &encoded[..4]);
+            let polls = control.polls.load(Ordering::Acquire);
+            policy.0.store(revoked, Ordering::Release);
+            control
+                .permitted_bytes
+                .store(encoded.len(), Ordering::Release);
+            assert_eq!(
+                write.as_mut().poll(&mut poll),
+                std::task::Poll::Ready(if revoked { Err(()) } else { Ok(()) })
+            );
+            if revoked {
+                assert_eq!(control.polls.load(Ordering::Acquire), polls);
+                assert_eq!(control.bytes.lock().unwrap().as_slice(), &encoded[..4]);
+                assert!(outbox.response.terminal_delivery.is_settled());
+                assert_eq!(endpoint.server.terminate_subscription_streams(), 0);
+                assert!(!matches!(outbox.response.pop_event(), Ok(Some(_))));
+            } else {
+                assert_eq!(control.bytes.lock().unwrap().as_slice(), encoded.as_slice());
+                assert!(!outbox.response.is_finished());
+            }
+        }
+        assert!(executor.shutdown_timeout(StdDuration::from_secs(2)));
     }
 
     #[test]
