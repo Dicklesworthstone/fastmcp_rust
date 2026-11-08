@@ -6389,6 +6389,174 @@ mod internally_tagged_newtypes {
     }
 }
 
+mod generic_builtin_schemas {
+    use super::*;
+    use fastmcp_rust::schema::{JsonSchemaType, admit_final_schema};
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct Envelope<T: JsonSchemaType> {
+        value: T,
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    struct Node<T: JsonSchemaType> {
+        value: T,
+        children: Vec<Self>,
+    }
+
+    type Request = Envelope<BTreeMap<String, Vec<Node<Option<u8>>>>>;
+
+    fn valid_request() -> serde_json::Value {
+        json!({
+            "value": {
+                "root": [{
+                    "value": 255,
+                    "children": [{"value": null, "children": []}],
+                }],
+                "empty": [],
+            },
+        })
+    }
+
+    fn invalid_requests() -> Vec<serde_json::Value> {
+        [
+            ("/value", json!([])),
+            ("/value/root", json!({})),
+            ("/value/root/0/value", json!(256)),
+            ("/value/root/0/children/0/value", json!("bad")),
+        ]
+        .into_iter()
+        .map(|(path, replacement)| {
+            let mut invalid = valid_request();
+            *invalid.pointer_mut(path).expect("the fixture path exists") = replacement;
+            invalid
+        })
+        .collect()
+    }
+
+    #[test]
+    fn json_schema_generic_builtin_payloads_preserve_scalar_and_recursive_constraints() {
+        let text = admit_final_schema(Envelope::<String>::try_json_schema().unwrap()).unwrap();
+        text.validate(&json!({"value": "text"})).unwrap();
+        assert!(text.validate(&json!({"value": 0})).is_err());
+
+        let integer = admit_final_schema(Envelope::<u64>::try_json_schema().unwrap()).unwrap();
+        let endpoint = json!({"value": u64::MAX});
+        integer.validate(&endpoint).unwrap();
+        assert!(serde_json::from_value::<Envelope<u64>>(endpoint).is_ok());
+        let negative = json!({"value": -1});
+        assert!(integer.validate(&negative).is_err());
+        assert!(serde_json::from_value::<Envelope<u64>>(negative).is_err());
+        // Wide native maxima are omitted from the interoperable schema, but
+        // instantiating a generic payload must retain Serde's native range.
+        let above = json!({"value": u128::from(u64::MAX) + 1});
+        integer.validate(&above).unwrap();
+        assert!(serde_json::from_value::<Envelope<u64>>(above).is_err());
+
+        let schema = admit_final_schema(Request::try_json_schema().unwrap()).unwrap();
+        assert!(schema.schema()["$defs"].is_object());
+        let valid = valid_request();
+        schema.validate(&valid).unwrap();
+        let decoded: Request = serde_json::from_value(valid).unwrap();
+        schema
+            .validate(&serde_json::to_value(decoded).unwrap())
+            .unwrap();
+        for invalid in invalid_requests() {
+            assert!(schema.validate(&invalid).is_err(), "{invalid}");
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn json_schema_generic_builtin_integers_match_concrete_interoperable_schemas() {
+        let concrete = NativeIntegerSchemas::json_schema();
+        macro_rules! check {
+            ($ty:ty, $field:literal) => {{
+                let generic = Envelope::<$ty>::try_json_schema().unwrap();
+                assert_eq!(
+                    generic["properties"]["value"],
+                    concrete["properties"][$field]
+                );
+                assert!(has_safe_integer_bounds(&generic));
+                assert_eq!(round_trip_binary64_numbers(&generic), generic);
+            }};
+        }
+        check!(i8, "i8_value");
+        check!(i16, "i16_value");
+        check!(i32, "i32_value");
+        check!(i64, "i64_value");
+        check!(i128, "i128_value");
+        check!(isize, "isize_value");
+        check!(u8, "u8_value");
+        check!(u16, "u16_value");
+        check!(u32, "u32_value");
+        check!(u64, "u64_value");
+        check!(u128, "u128_value");
+        check!(usize, "usize_value");
+    }
+
+    static TOOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[tool]
+    fn echo_generic_builtin_schema(value: Request) -> McpResult<String> {
+        TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        serde_json::to_string(&value).map_err(McpError::from)
+    }
+
+    #[test]
+    fn json_schema_generic_builtin_inputs_reach_registered_modern_dispatch() {
+        on_caller_runtime(async {
+            let server = Server::new("generic-builtin-schema", "1.0.0")
+                .tool(EchoGenericBuiltinSchema)
+                .try_build()
+                .expect("generic collection and recursive input schemas admit");
+            let connection = ModernConnection::new();
+            let valid = valid_request();
+            let expected: Request = serde_json::from_value(valid.clone()).unwrap();
+            let before = TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_generic_builtin_schema",
+                    json!({"value": valid}),
+                )
+                .await,
+            );
+            assert_ne!(result["isError"], json!(true));
+            let actual: Request =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1
+            );
+
+            for invalid in invalid_requests() {
+                let response = schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "echo_generic_builtin_schema",
+                    json!({"value": invalid}),
+                )
+                .await;
+                assert!(
+                    response.error.is_some()
+                        || response
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result["isError"] == json!(true))
+                );
+                assert_eq!(
+                    TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                    before + 1,
+                    "invalid generic payloads cannot enter the registered handler",
+                );
+            }
+        });
+    }
+}
+
 fn serde_schema_default_retry_limit() -> u32 {
     3
 }

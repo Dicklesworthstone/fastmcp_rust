@@ -25,10 +25,12 @@ use serde_json::Value;
 use std::{
     any::TypeId,
     cmp::Ordering,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     io::{self, Write},
     marker::PhantomData,
+    rc::Rc,
+    sync::Arc,
 };
 
 mod flatten;
@@ -207,16 +209,156 @@ impl fmt::Display for SchemaGenerationError {
 
 impl std::error::Error for SchemaGenerationError {}
 
-/// The context-aware implementation emitted by `#[derive(JsonSchema)]`.
+/// A context-aware schema for a Rust type's JSON representation.
 ///
 /// Nested derived types must use [`SchemaGenerator::subschema_for`] with the
 /// same context so recursive and repeated occurrences share local definitions.
 /// Exact Rust type identity requires a `'static` type instantiation. A borrowed
 /// type can use its `'static` instantiation without constructing a value.
+///
+/// `#[derive(JsonSchema)]` implements this trait for application types. Built-in
+/// implementations cover JSON primitives, optional values, vectors, fixed-size
+/// arrays, sets, string-keyed maps, and owned transparent pointers. They let
+/// generic derived types accept these payloads with a `T: JsonSchemaType` bound.
+/// Integer schemas retain native bounds through 32 bits; wider signed integers
+/// omit bounds and wider unsigned integers retain only a zero minimum so the
+/// schema survives JavaScript JSON round trips. Pointer-sized integers follow
+/// the consuming target's width. Rust deserialization enforces the native range.
 pub trait JsonSchemaType: 'static {
     /// Builds this type's schema body within the current document.
     fn schema_body(context: &mut SchemaGenerator) -> Value;
 }
+
+macro_rules! impl_scalar_schema {
+    ($($ty:ty => $schema:expr),* $(,)?) => {
+        $(
+            impl JsonSchemaType for $ty {
+                fn schema_body(_context: &mut SchemaGenerator) -> Value {
+                    $schema
+                }
+            }
+        )*
+    };
+}
+
+impl_scalar_schema! {
+    String => serde_json::json!({"type": "string"}),
+    char => serde_json::json!({"type": "string", "minLength": 1, "maxLength": 1}),
+    bool => serde_json::json!({"type": "boolean"}),
+    () => serde_json::json!({"type": "null"}),
+    f32 => serde_json::json!({"type": "number"}),
+    f64 => serde_json::json!({"type": "number"}),
+    Value => serde_json::json!({}),
+}
+
+macro_rules! impl_integer_schema {
+    ($wide_schema:expr; $($ty:ty),* $(,)?) => {
+        $(
+            impl JsonSchemaType for $ty {
+                fn schema_body(_context: &mut SchemaGenerator) -> Value {
+                    // Use the consuming target's width, including isize/usize.
+                    // Wide bounds can change value in a JavaScript JSON round
+                    // trip; Serde remains responsible for the native range.
+                    if <$ty>::BITS <= 32 {
+                        serde_json::json!({
+                            "type": "integer",
+                            "minimum": <$ty>::MIN,
+                            "maximum": <$ty>::MAX,
+                        })
+                    } else {
+                        $wide_schema
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_integer_schema!(serde_json::json!({"type": "integer"}); i8, i16, i32, i64, i128, isize);
+impl_integer_schema!(serde_json::json!({"type": "integer", "minimum": 0}); u8, u16, u32, u64, u128, usize);
+
+impl<T: JsonSchemaType> JsonSchemaType for Option<T> {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        let mut inner = context.subschema_for::<T>();
+        // Preserve every payload constraint, including schemas that already
+        // accept null. A dialect without its own resource belongs on the new
+        // root; identified resources retain their original scope in the arm.
+        let dialect = inner
+            .as_object_mut()
+            .filter(|schema| !schema.contains_key("$id"))
+            .and_then(|schema| schema.remove("$schema"));
+        let mut schema = serde_json::json!({
+            "anyOf": [inner, {"type": "null"}],
+        });
+        if let Some(dialect) = dialect {
+            schema["$schema"] = dialect;
+        }
+        schema
+    }
+}
+
+impl<T: JsonSchemaType> JsonSchemaType for Vec<T> {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({"type": "array", "items": context.subschema_for::<T>()})
+    }
+}
+
+impl<T: JsonSchemaType, const N: usize> JsonSchemaType for [T; N] {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({
+            "type": "array",
+            "items": context.subschema_for::<T>(),
+            "minItems": N,
+            "maxItems": N,
+        })
+    }
+}
+
+impl<T: JsonSchemaType> JsonSchemaType for BTreeSet<T> {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({
+            "type": "array",
+            "items": context.subschema_for::<T>(),
+            "uniqueItems": true,
+        })
+    }
+}
+
+impl<T: JsonSchemaType, S: 'static> JsonSchemaType for HashSet<T, S> {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({
+            "type": "array",
+            "items": context.subschema_for::<T>(),
+            "uniqueItems": true,
+        })
+    }
+}
+
+impl<T: JsonSchemaType> JsonSchemaType for BTreeMap<String, T> {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({"type": "object", "additionalProperties": context.subschema_for::<T>()})
+    }
+}
+
+impl<T: JsonSchemaType, S: 'static> JsonSchemaType for HashMap<String, T, S> {
+    fn schema_body(context: &mut SchemaGenerator) -> Value {
+        serde_json::json!({"type": "object", "additionalProperties": context.subschema_for::<T>()})
+    }
+}
+
+macro_rules! impl_transparent_schema {
+    ($($wrapper:ident),* $(,)?) => {
+        $(
+            impl<T: JsonSchemaType> JsonSchemaType for $wrapper<T> {
+                fn schema_body(context: &mut SchemaGenerator) -> Value {
+                    context.subschema_for::<T>()
+                }
+            }
+        )*
+    };
+}
+
+impl_transparent_schema!(Box, Rc, Arc);
 
 #[derive(Debug)]
 struct GeneratedDefinition {
@@ -5846,6 +5988,287 @@ mod tests {
         let mut context = SchemaGenerator::with_limits(limits);
         let root = context.subschema_for::<T>();
         context.finish(root)
+    }
+
+    fn assert_builtin_validation<T: JsonSchemaType>(accepted: &[Value], rejected: &[Value]) {
+        let schema = generate_test_schema::<T>(SchemaGenerationLimits::default())
+            .expect("built-in types generate a complete schema");
+        let admitted = admit_final_schema(schema).expect("built-in schemas admit");
+        for value in accepted {
+            assert!(
+                admitted.validate(value).is_ok(),
+                "{} must accept {value}",
+                std::any::type_name::<T>(),
+            );
+        }
+        for value in rejected {
+            assert!(
+                admitted.validate(value).is_err(),
+                "{} must reject {value}",
+                std::any::type_name::<T>(),
+            );
+        }
+    }
+
+    #[test]
+    fn schema_generation_builtin_scalars_enforce_json_representations() {
+        assert_builtin_validation::<String>(&[json!(""), json!("hello")], &[json!(0), json!(null)]);
+        assert_builtin_validation::<char>(
+            &[json!('a'), json!('🦀')],
+            &[json!(""), json!("ab"), json!("e\u{301}"), json!(null)],
+        );
+        assert_builtin_validation::<bool>(&[json!(true), json!(false)], &[json!(0), json!("true")]);
+        assert_builtin_validation::<()>(&[json!(())], &[json!([]), json!({}), json!(false)]);
+        assert_builtin_validation::<f32>(
+            &[json!(0.0_f32), json!(-1.5_f32), json!(f32::MAX)],
+            &[json!("1.5"), json!(null), json!(false)],
+        );
+        assert_builtin_validation::<f64>(
+            &[json!(0.0_f64), json!(-1.5_f64), json!(f64::MAX)],
+            &[json!("1.5"), json!(null), json!(false)],
+        );
+        assert_builtin_validation::<Value>(
+            &[
+                json!(null),
+                json!(true),
+                json!(12),
+                json!("text"),
+                json!([]),
+                json!({}),
+            ],
+            &[],
+        );
+    }
+
+    #[test]
+    fn schema_generation_builtin_integers_keep_interoperable_bounds() {
+        macro_rules! check {
+            ($ty:ty, $below:expr, $above:expr, $minimum:expr, $maximum:expr) => {{
+                let schema = generate_test_schema::<$ty>(SchemaGenerationLimits::default())
+                    .expect("integer schemas generate");
+                assert_eq!(schema.get("minimum").is_some(), $minimum);
+                assert_eq!(schema.get("maximum").is_some(), $maximum);
+                let mut accepted = vec![json!(<$ty>::MIN), json!(<$ty>::MAX), json!(0)];
+                let mut rejected = vec![json!(1.5), json!("0")];
+                // An omitted wide bound intentionally leaves these native
+                // neighbors admissible to JSON Schema. The generated handler's
+                // Serde extraction still rejects values outside the Rust range.
+                for (value, constrained) in [
+                    (
+                        serde_json::from_str($below).expect("exact lower neighbor"),
+                        $minimum,
+                    ),
+                    (
+                        serde_json::from_str($above).expect("exact upper neighbor"),
+                        $maximum,
+                    ),
+                ] {
+                    if constrained {
+                        rejected.push(value);
+                    } else {
+                        accepted.push(value);
+                    }
+                }
+                assert_builtin_validation::<$ty>(&accepted, &rejected);
+            }};
+        }
+        check!(i8, "-129", "128", true, true);
+        check!(i16, "-32769", "32768", true, true);
+        check!(i32, "-2147483649", "2147483648", true, true);
+        check!(
+            i64,
+            "-9223372036854775809",
+            "9223372036854775808",
+            false,
+            false
+        );
+        check!(
+            i128,
+            "-170141183460469231731687303715884105729",
+            "170141183460469231731687303715884105728",
+            false,
+            false
+        );
+        check!(
+            isize,
+            &(isize::MIN as i128 - 1).to_string(),
+            &(isize::MAX as i128 + 1).to_string(),
+            isize::BITS <= 32,
+            isize::BITS <= 32
+        );
+        check!(u8, "-1", "256", true, true);
+        check!(u16, "-1", "65536", true, true);
+        check!(u32, "-1", "4294967296", true, true);
+        check!(u64, "-1", "18446744073709551616", true, false);
+        check!(
+            u128,
+            "-1",
+            "340282366920938463463374607431768211456",
+            true,
+            false
+        );
+        check!(
+            usize,
+            "-1",
+            &(usize::MAX as u128 + 1).to_string(),
+            true,
+            usize::BITS <= 32
+        );
+    }
+
+    #[test]
+    fn schema_generation_builtin_collections_preserve_item_and_length_constraints() {
+        assert_builtin_validation::<Vec<u16>>(
+            &[json!([]), json!([0, 65535])],
+            &[json!([65536]), json!([null]), json!({})],
+        );
+        assert_builtin_validation::<[bool; 2]>(
+            &[json!([true, false])],
+            &[json!([true]), json!([true, false, true]), json!([true, 0])],
+        );
+        assert_builtin_validation::<[u8; 0]>(&[json!([])], &[json!([0])]);
+        assert_builtin_validation::<BTreeSet<u8>>(
+            &[json!([]), json!([0, 255])],
+            &[json!([0, 0]), json!([256]), json!(["0"])],
+        );
+        assert_builtin_validation::<HashSet<String>>(
+            &[json!([]), json!(["a", "b"])],
+            &[json!(["a", "a"]), json!([1]), json!({})],
+        );
+        type CustomHasher = std::hash::BuildHasherDefault<std::hash::DefaultHasher>;
+        assert_builtin_validation::<HashSet<u8, CustomHasher>>(
+            &[json!([1, 2])],
+            &[json!([1, 1]), json!([256])],
+        );
+        assert_builtin_validation::<BTreeMap<String, Vec<u8>>>(
+            &[json!({}), json!({"first": [0, 255], "empty": []})],
+            &[json!({"first": [256]}), json!({"first": "bad"}), json!([])],
+        );
+        assert_builtin_validation::<HashMap<String, Option<u16>, CustomHasher>>(
+            &[json!({}), json!({"first": 65535, "second": null})],
+            &[json!({"first": 65536}), json!({"first": false}), json!([])],
+        );
+    }
+
+    #[test]
+    fn schema_generation_builtin_optional_and_pointer_payloads_keep_constraints() {
+        struct Choice;
+        impl JsonSchemaType for Choice {
+            fn schema_body(_context: &mut SchemaGenerator) -> Value {
+                json!({"type": "string", "enum": ["allowed"]})
+            }
+        }
+        assert_builtin_validation::<Option<Choice>>(
+            &[json!("allowed"), json!(null)],
+            &[json!("denied"), json!(0)],
+        );
+        assert_builtin_validation::<Option<()>>(&[json!(null)], &[json!(false)]);
+        assert_builtin_validation::<Option<Option<String>>>(
+            &[json!(null), json!("text")],
+            &[json!(0)],
+        );
+        assert_builtin_validation::<Box<Vec<Option<u8>>>>(
+            &[json!([]), json!([null, 255])],
+            &[json!([256]), json!([false]), json!(null)],
+        );
+        assert_builtin_validation::<Rc<String>>(&[json!("text")], &[json!(false)]);
+        assert_builtin_validation::<Arc<Option<u8>>>(
+            &[json!(null), json!(255)],
+            &[json!(256), json!(false)],
+        );
+    }
+
+    #[test]
+    fn schema_generation_builtin_option_preserves_dialect_and_resource_scopes() {
+        struct RootDialect;
+        impl JsonSchemaType for RootDialect {
+            fn schema_body(_context: &mut SchemaGenerator) -> Value {
+                json!({"$schema": FINAL_JSON_SCHEMA_DIALECT, "const": "allowed"})
+            }
+        }
+        let root = generate_test_schema::<Option<RootDialect>>(SchemaGenerationLimits::default())
+            .expect("the optional wrapper carries the root dialect");
+        assert_eq!(root["$schema"], FINAL_JSON_SCHEMA_DIALECT);
+        assert!(root["anyOf"][0].get("$schema").is_none());
+        assert_builtin_validation::<Option<RootDialect>>(
+            &[json!(null), json!("allowed")],
+            &[json!("denied")],
+        );
+
+        struct LocalResource;
+        impl JsonSchemaType for LocalResource {
+            fn schema_body(context: &mut SchemaGenerator) -> Value {
+                context.inline_schema(json!({
+                    "$id": "https://example.test/optional-choice",
+                    "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                    "$defs": {"choice": {"const": "allowed"}},
+                    "$ref": "#/$defs/choice",
+                }))
+            }
+        }
+        let root = generate_test_schema::<Option<LocalResource>>(SchemaGenerationLimits::default())
+            .expect("the payload keeps its local resource");
+        assert!(root.get("$schema").is_none());
+        assert_eq!(root["anyOf"][0]["$schema"], FINAL_JSON_SCHEMA_DIALECT);
+        assert_eq!(
+            root["anyOf"][0]["$id"],
+            "https://example.test/optional-choice"
+        );
+        assert_builtin_validation::<Option<LocalResource>>(
+            &[json!(null), json!("allowed")],
+            &[json!("denied"), json!(false)],
+        );
+    }
+
+    #[test]
+    fn schema_generation_builtin_containers_share_recursive_definitions_and_limits() {
+        struct CollectionNode;
+        impl JsonSchemaType for CollectionNode {
+            fn schema_body(context: &mut SchemaGenerator) -> Value {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "children": context.subschema_for::<BTreeMap<String, Vec<Box<Self>>>>(),
+                    },
+                    "required": ["children"],
+                })
+            }
+        }
+        let schema = generate_test_schema::<CollectionNode>(SchemaGenerationLimits::default())
+            .expect("collection wrappers share recursive type identity");
+        assert_eq!(
+            schema["properties"]["children"]["additionalProperties"]["items"]["$ref"],
+            "#/$defs/type_0",
+        );
+        assert_builtin_validation::<CollectionNode>(
+            &[json!({"children": {"branch": [{"children": {}}]}})],
+            &[
+                json!({"children": {"branch": [{"children": []}]}}),
+                json!({"children": {"branch": [false]}}),
+            ],
+        );
+        for (limits, expected) in [
+            (
+                SchemaGenerationLimits {
+                    max_types: 3,
+                    ..SchemaGenerationLimits::default()
+                },
+                SchemaGenerationError::TypeLimit,
+            ),
+            (
+                SchemaGenerationLimits {
+                    max_depth: 3,
+                    ..SchemaGenerationLimits::default()
+                },
+                SchemaGenerationError::DepthLimit,
+            ),
+        ] {
+            assert_eq!(
+                generate_test_schema::<CollectionNode>(limits),
+                Err(expected)
+            );
+        }
+        assert!(generate_test_schema::<CollectionNode>(SchemaGenerationLimits::default()).is_ok());
     }
 
     #[test]
