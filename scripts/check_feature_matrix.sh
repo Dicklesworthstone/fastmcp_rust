@@ -59,7 +59,8 @@
 #   0  every probe compiled
 #   1  at least one probe produced compiler diagnostics (a real red)
 #   2  at least one probe produced NO verdict (timeout, or a nonzero exit with
-#      zero diagnostics) and nothing was red -- retry, do not report a failure
+#      zero diagnostics), and nothing was red or malformed -- retry, do not
+#      report a failure
 #   3  at least one probe was MALFORMED (a cargo invocation error, e.g. a
 #      package name that is not a workspace member) and nothing was red.
 #      Nothing was measured; fix the probe, do not retry it unchanged.
@@ -180,12 +181,20 @@ while read -r crate feature; do
   # the harness. It gets its own state and its own exit code.
   invalid=$(grep -cE '^error: (cannot specify features|no such package|package ID specification|failed to (parse|load|read) manifest|current package believes)' "$log" || true)
 
+  # The displayed cause must be a CAUSE. Taking the first `^error: ` line
+  # verbatim can surface cargo's "could not compile" summary instead, which
+  # names the crate and tells the reader nothing about why.
+  first_cause() {
+    grep -E '^error: ' "$log" | grep -vE 'could not compile|test failed' \
+      | head -1 | cut -c1-72
+  }
+
   if [ "$invalid" -gt 0 ]; then
     state=invalid; bad=$((bad + 1))
-    codes=$(grep -m1 -E '^error: ' "$log" | cut -c1-72)
+    codes=$(first_cause)
   elif [ "$errors" -gt 0 ] || [ "$uncoded" -gt 0 ]; then
     state=red; red=$((red + 1))
-    [ -n "$codes" ] || codes=$(grep -m1 -E '^error: ' "$log" | cut -c1-72)
+    [ -n "$codes" ] || codes=$(first_cause)
   elif [ "$rc" -eq 124 ]; then
     state=void; void=$((void + 1)); codes=timeout
   elif [ "$rc" -ne 0 ]; then
