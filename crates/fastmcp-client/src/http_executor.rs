@@ -17618,12 +17618,28 @@ mod tests {
                     .await
                     .map(|outcome| match outcome {
                         FinalToolCallOutcome::Task(result) => serde_json::to_value(result).unwrap(),
-                        FinalToolCallOutcome::Complete(result) => {
-                            serde_json::to_value(result).unwrap()
-                        }
-                        FinalToolCallOutcome::InputRequired(result) => {
-                            serde_json::to_value(result).unwrap()
-                        }
+                        // Exhaustiveness only. Every caller of this helper
+                        // sends `public_http_tasks_success_result("tools/call")`,
+                        // which declares `resultType: "task"`, or an error body
+                        // that yields `Err` and never reaches this closure --
+                        // so neither arm below is reachable.
+                        //
+                        // They cannot be encoded either: `CompleteResult` and
+                        // `InputRequiredResult` deliberately derive only
+                        // Debug + Clone, because serde would re-emit exact JSON
+                        // numbers in a different form, and `CompleteResultPayload`
+                        // is decode-only -- there is no API that re-emits a typed
+                        // complete payload's own members. Encoding meta and
+                        // extras alone (the house idiom for the wire paths) would
+                        // silently drop the payload and break this test's
+                        // round-trip equality in a way that is hard to read.
+                        // Fail loudly and name what a new fixture would owe.
+                        FinalToolCallOutcome::Complete(_)
+                        | FinalToolCallOutcome::InputRequired(_) => panic!(
+                            "the tools/call fixture declares resultType \"task\"; a complete \
+                             or input-required outcome means the fixture changed and needs a \
+                             faithful encoding, which the protocol does not yet expose"
+                        ),
                     }),
                 "tasks/get" => connection
                     .get_task_final(&cx, RequestId::Number(2), task_id, maximum_bytes)

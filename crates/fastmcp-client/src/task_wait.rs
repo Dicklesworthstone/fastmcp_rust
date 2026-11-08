@@ -1061,6 +1061,38 @@ pub(super) fn admit_task_input(
             "Task input responses do not match the outstanding input request types",
         )
     })?;
+    // `validate_responses` is a SHAPE check and documents that it ignores
+    // unknown keys on purpose: a partial update may acknowledge a subset of
+    // outstanding requests, and the server owns which keys stay live. That
+    // tolerance is correct whenever at least one key matches, and it must be
+    // preserved -- it has twenty call sites and pinned verdict tests.
+    //
+    // A NON-EMPTY map naming no outstanding key at all is the different case
+    // it leaves open. Such a map can satisfy nothing, so admitting it spends a
+    // round trip for a server-side `Ignored`, and the caller believed it was
+    // answering something. `update_task_final` documents that phase and
+    // response kinds are checked "before allocating an ID or publishing
+    // bytes", so the refusal belongs here, in the client's local pre-flight,
+    // rather than in the shared shape check or at the server.
+    //
+    // AN EMPTY MAP STAYS ADMITTED, and the distinction is load-bearing rather
+    // than incidental. `managed_task_input_admission_preserves_partial_and_
+    // unknown_key_semantics` pins three cases: `{}` is admitted, a map mixing
+    // one outstanding key with one unknown key is admitted, and a map naming
+    // an outstanding key with the WRONG response kind is refused. An empty
+    // map asserts nothing about any key, so it is a no-op acknowledgement;
+    // only a non-empty map that answers nothing is a caller error. An earlier
+    // revision of this guard omitted the emptiness test and broke that pinned
+    // case, which is why the condition is spelled out here.
+    if !input_responses.is_empty()
+        && !input_responses
+            .keys()
+            .any(|key| input_requests.contains_key(key))
+    {
+        return Err(McpError::invalid_params(
+            "Task input responses name no outstanding input request",
+        ));
+    }
     admit_input_retention(task)
 }
 
