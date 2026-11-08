@@ -1213,6 +1213,12 @@ async fn wait_for_mrtr_operation<T, E>(
 where
     E: From<McpError>,
 {
+    use crate::http_auth::caller::with_caller;
+
+    // Preserve the admitted effect ceiling across polls without borrowing an
+    // unrelated host's identity, cancellation, budget or timer driver.
+    let caller = with_caller(cx, || Cx::current().expect("MRTR caller is installed"));
+    let cx = &caller;
     let mut operation = std::pin::pin!(operation);
     let mut cancelled = std::pin::pin!(async {
         match cancellation {
@@ -1220,31 +1226,53 @@ where
             None => std::future::pending::<()>().await,
         }
     });
-    let mut wake = Box::pin(asupersync::time::sleep(
-        cx.now(),
-        REVERSE_CALLBACK_POLL_SLICE,
-    ));
+    let mut wake = None;
     std::future::poll_fn(|task_cx| {
-        if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
-            return std::task::Poll::Ready(Err(error.into()));
-        }
-        if cancelled.as_mut().poll(task_cx).is_ready() {
-            return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
-        }
-        let result = operation.as_mut().poll(task_cx);
-        // A callback may cancel its owner or finish after the deadline in
-        // this same poll. Its late result must never authorize another RPC.
-        if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
-            return std::task::Poll::Ready(Err(error.into()));
-        }
-        if result.is_pending() && wake.as_mut().poll(task_cx).is_ready() {
-            wake.set(asupersync::time::sleep(
-                cx.now(),
-                REVERSE_CALLBACK_POLL_SLICE,
-            ));
-            task_cx.waker().wake_by_ref();
-        }
-        result
+        with_caller(cx, || {
+            if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
+                return std::task::Poll::Ready(Err(error.into()));
+            }
+            if cancelled.as_mut().poll(task_cx).is_ready() {
+                return std::task::Poll::Ready(Err(McpError::request_cancelled().into()));
+            }
+            let result = operation.as_mut().poll(task_cx);
+            // A callback may cancel its owner or finish after the deadline in
+            // this same poll. Its late result must never authorize another RPC.
+            if let Err(error) = check_mrtr_operation(cx, cancellation, deadline) {
+                return std::task::Poll::Ready(Err(error.into()));
+            }
+            if result.is_pending() {
+                let current = Cx::current().expect("MRTR caller is installed");
+                if !current.capabilities().time {
+                    return std::task::Poll::Ready(Err(McpError::internal_error(
+                        "MRTR operation wait requires caller time capability",
+                    )
+                    .into()));
+                }
+                if current.timer_driver().is_none() {
+                    return std::task::Poll::Ready(Err(McpError::internal_error(
+                        "MRTR operation wait requires caller timer driver",
+                    )
+                    .into()));
+                }
+                // Ready operations need no timer. Pending work must never
+                // register with Sleep's fallback or an ambient host's driver.
+                let wake = wake.get_or_insert_with(|| {
+                    Box::pin(asupersync::time::sleep(
+                        cx.now(),
+                        REVERSE_CALLBACK_POLL_SLICE,
+                    ))
+                });
+                if wake.as_mut().poll(task_cx).is_ready() {
+                    wake.set(asupersync::time::sleep(
+                        cx.now(),
+                        REVERSE_CALLBACK_POLL_SLICE,
+                    ));
+                    task_cx.waker().wake_by_ref();
+                }
+            }
+            result
+        })
     })
     .await
 }
@@ -28736,6 +28764,221 @@ mod tests {
     #[cfg(feature = "legacy-2024-11-05")]
     use crate::http_executor::ModernHttpConnectOutcome;
     use fastmcp_core::block_on;
+
+    #[test]
+    fn mrtr_operation_watchdog_uses_only_the_explicit_callers_timer() {
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct CountWake(AtomicUsize);
+        impl Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let caller_clock = Arc::new(VirtualClock::new());
+        let caller_timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&caller_clock));
+        let caller_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(caller_timer.clone())
+            .build()
+            .unwrap();
+        let caller = caller_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let ambient_clock = Arc::new(VirtualClock::new());
+        let ambient_timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&ambient_clock));
+        let ambient_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(ambient_timer.clone())
+            .build()
+            .unwrap();
+        let ambient = ambient_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let cancellation = McpRequestCancellation::new();
+        let mut waiting = Box::pin(wait_for_mrtr_operation(
+            &caller,
+            Some(&cancellation),
+            Instant::now() + Duration::from_secs(60),
+            std::future::pending::<McpResult<()>>(),
+        ));
+        let wakes = Arc::new(CountWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        let installed = Cx::set_current(Some(ambient.clone()));
+
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(caller_timer.pending_count(), 1);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+        ambient_clock.advance(20_000_000);
+        assert_eq!(ambient_timer.process_timers(), 0);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        caller_clock.advance(10_000_000);
+        assert_eq!(caller_timer.process_timers(), 1);
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        drop(waiting);
+        assert_eq!(caller_timer.pending_count(), 0);
+
+        // A fresh operation must wake on cancellation before its watchdog
+        // fires, without advancing either runtime's clock again.
+        wakes.0.store(0, Ordering::SeqCst);
+        let mut waiting = Box::pin(wait_for_mrtr_operation(
+            &caller,
+            Some(&cancellation),
+            Instant::now() + Duration::from_secs(60),
+            std::future::pending::<McpResult<()>>(),
+        ));
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(caller_timer.pending_count(), 1);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        cancellation.cancel();
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            Poll::Ready(Err(error)) if error.code == McpErrorCode::RequestCancelled
+        ));
+        drop(waiting);
+        assert_eq!(caller_timer.pending_count(), 0);
+        assert_eq!(ambient_timer.pending_count(), 0);
+        assert!(caller.checkpoint().is_ok());
+        assert!(ambient.checkpoint().is_ok());
+        drop(installed);
+        drop(caller);
+        drop(ambient);
+        assert!(caller_runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(ambient_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn mrtr_operation_requires_a_caller_timer_only_for_pending_work() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::RuntimeBuilder;
+        use std::task::{Context, Poll, Waker};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let ambient = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let timer = ambient.timer_driver().unwrap();
+        let caller = Cx::for_testing();
+        assert!(caller.timer_driver().is_none());
+        let installed = Cx::set_current(Some(ambient.clone()));
+        let mut context = Context::from_waker(Waker::noop());
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        let mut ready = Box::pin(wait_for_mrtr_operation(
+            &caller,
+            None,
+            deadline,
+            std::future::ready(McpResult::Ok(42)),
+        ));
+        assert!(matches!(
+            ready.as_mut().poll(&mut context),
+            Poll::Ready(Ok(42))
+        ));
+        drop(ready);
+
+        let mut pending = Box::pin(wait_for_mrtr_operation(
+            &caller,
+            None,
+            deadline,
+            std::future::pending::<McpResult<()>>(),
+        ));
+        assert!(matches!(
+            pending.as_mut().poll(&mut context),
+            Poll::Ready(Err(error))
+                if error.code == McpErrorCode::InternalError
+                    && error.message == "MRTR operation wait requires caller timer driver"
+        ));
+        drop(pending);
+        assert_eq!(timer.pending_count(), 0);
+
+        let restricted = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+        let mut denied = Box::pin(wait_for_mrtr_operation(
+            &ambient,
+            None,
+            deadline,
+            std::future::pending::<McpResult<()>>(),
+        ));
+        assert!(matches!(
+            denied.as_mut().poll(&mut context),
+            Poll::Ready(Err(error))
+                if error.code == McpErrorCode::InternalError
+                    && error.message == "MRTR operation wait requires caller time capability"
+        ));
+        drop(denied);
+        drop(restricted);
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+        assert!(caller.checkpoint().is_ok());
+        assert!(ambient.checkpoint().is_ok());
+        drop(installed);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn mrtr_operation_retains_its_admitted_effect_ceiling_across_polls() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::RuntimeBuilder;
+        use std::task::{Context, Poll, Waker};
+
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let timer = caller.timer_driver().unwrap();
+        let ambient = Cx::for_testing();
+        let installed = Cx::set_current(Some(ambient.clone()));
+        let restricted = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+        let mut polls = 0;
+        let operation = std::future::poll_fn(|_| {
+            let current = Cx::current().unwrap();
+            assert_eq!(current.task_id(), caller.task_id());
+            assert!(!current.capabilities().io);
+            assert!(current.capabilities().time);
+            polls += 1;
+            if polls == 1 {
+                Poll::Pending
+            } else {
+                Poll::Ready(McpResult::Ok(42))
+            }
+        });
+        let mut waiting = Box::pin(wait_for_mrtr_operation(
+            &caller,
+            None,
+            Instant::now() + Duration::from_secs(60),
+            operation,
+        ));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        assert_eq!(timer.pending_count(), 1);
+        assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+        assert!(!Cx::current().unwrap().capabilities().io);
+        drop(restricted);
+        assert!(Cx::current().unwrap().capabilities().io);
+
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context),
+            Poll::Ready(Ok(42))
+        ));
+        drop(waiting);
+        assert_eq!(polls, 2);
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+        assert!(Cx::current().unwrap().capabilities().io);
+        drop(installed);
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
     // bd-mrtr-01-b-otqd: automatic resolver coverage is an all-input barrier.
     mod mrtr_handler_preflight {
         use super::*;
@@ -63648,6 +63891,10 @@ exit 0
             .blocking_threads(0, 0)
             .build()
             .unwrap();
+        // The operation has an independent cancellation identity while keeping
+        // the application's timer driver. A standalone test Cx cannot drive
+        // pending MRTR callbacks and would fail before this probe's subject.
+        let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         runtime.block_on(async move {
             let root = Cx::current().unwrap();
             let sibling_root = root.clone();
@@ -63658,7 +63905,8 @@ exit 0
                 let probe_clock = Instant::now();
                 let last_callback_ns = Arc::new(AtomicU64::new(0));
                 let worker = std::thread::current().id();
-                let caller = Cx::for_request();
+                assert!(caller.timer_driver().is_some());
+                assert_ne!(caller.task_id(), connection_cx.task_id());
                 let cancellation = McpRequestCancellation::new();
                 let handlers = if matches!(mode, "no-handler" | "legacy") {
                     ReverseRequestHandlers::new()

@@ -1729,11 +1729,68 @@ mod tests {
     }
 
     #[test]
+    fn pending_input_cannot_borrow_an_unrelated_ambient_timer() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let ambient = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let cx = Cx::for_testing();
+        assert!(ambient.timer_driver().is_some());
+        assert!(cx.timer_driver().is_none());
+        let cancellation = McpRequestCancellation::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let disposed = Arc::clone(&drops);
+        let handlers = ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
+            Box::pin(PendingInput {
+                cancellation: local,
+                drops: Arc::clone(&disposed),
+            })
+        });
+        let snapshot = task(json!({"one":{"method":"roots/list"}}));
+        let retention = InputRetention::new(&cx, &snapshot).unwrap();
+        let request = serde_json::from_value(json!({"method":"roots/list"})).unwrap();
+        let mut future = Box::pin(resolve_one(
+            &cx,
+            &cancellation,
+            &retention,
+            &handlers,
+            "one",
+            request,
+        ));
+        let installed = Cx::set_current(Some(ambient.clone()));
+        let Poll::Ready(Err(error)) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("a pending callback must retain its own caller's timer authority");
+        };
+        assert_eq!(error.code, fastmcp_core::McpErrorCode::InternalError);
+        assert_eq!(
+            error.message,
+            "MRTR callback wait requires caller timer driver"
+        );
+        drop(future);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(!cancellation.is_cancel_requested());
+        assert!(cx.checkpoint().is_ok());
+        assert!(ambient.checkpoint().is_ok());
+        assert_eq!(Cx::current().unwrap().task_id(), ambient.task_id());
+        drop(installed);
+        drop(ambient);
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
     fn pending_first_input_does_not_block_its_sibling_and_replies_keep_their_keys() {
         use asupersync::channel::oneshot;
         use std::sync::Mutex;
 
-        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let cancellation = McpRequestCancellation::new();
         let (sender, receiver) = oneshot::channel::<()>();
         let sender = Mutex::new(Some(sender));
@@ -1802,6 +1859,9 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert!(cx.checkpoint().is_ok());
+        drop(batch);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(1)));
     }
 
     #[test]
@@ -1809,7 +1869,11 @@ mod tests {
         use std::sync::Mutex;
 
         for failure in 0..3 {
-            let cx = Cx::for_testing();
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             let cancellation = McpRequestCancellation::new();
             let tokens = Arc::new(Mutex::new(Vec::new()));
             let observed = Arc::clone(&tokens);
@@ -1817,8 +1881,8 @@ mod tests {
             let disposed = Arc::clone(&drops);
             let calls = Arc::new(AtomicUsize::new(0));
             let called = Arc::clone(&calls);
-            let handlers = ReverseRequestHandlers::new().with_modern_roots_list(
-                move |_, local, _| {
+            let handlers =
+                ReverseRequestHandlers::new().with_modern_roots_list(move |_, local, _| {
                     observed.lock().unwrap().push(local.clone());
                     match called.fetch_add(1, Ordering::SeqCst) {
                         0 => Box::pin(async { Ok(FinalEmbeddedRootsListResult { roots: vec![] }) }),
@@ -1838,8 +1902,7 @@ mod tests {
                         },
                         _ => panic!("later callback ran after a terminal batch failure"),
                     }
-                },
-            );
+                });
             let mut budget = PayloadBudget(1024);
             let snapshot = task(serde_json::to_value(root_inputs(&["a", "b", "c", "d"])).unwrap());
             let retention = InputRetention::new(&cx, &snapshot).unwrap();
@@ -1869,6 +1932,8 @@ mod tests {
             );
             assert!(!cancellation.is_cancel_requested());
             assert!(cx.checkpoint().is_ok());
+            drop(cx);
+            assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(1)));
         }
     }
 
@@ -1876,7 +1941,11 @@ mod tests {
     fn abandoning_a_parallel_batch_cancels_every_started_callback_before_disposal() {
         use std::sync::Mutex;
 
-        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let cancellation = McpRequestCancellation::new();
         let tokens = Arc::new(Mutex::new(Vec::new()));
         let observed = Arc::clone(&tokens);
@@ -1920,13 +1989,19 @@ mod tests {
         assert!(!cancellation.is_cancel_requested());
         assert_eq!(budget.0, 4096);
         assert!(cx.checkpoint().is_ok());
+        drop(cx);
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(1)));
     }
 
     #[test]
     fn ready_sibling_cancellation_stops_other_inputs_in_the_same_poll() {
         use std::sync::Mutex;
 
-        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let cancellation = McpRequestCancellation::new();
         let cancel = cancellation.clone();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1977,6 +2052,8 @@ mod tests {
         );
         assert_eq!(budget.0, 4096);
         assert!(cx.checkpoint().is_ok());
+        drop(cx);
+        assert!(runtime.shutdown_timeout(std::time::Duration::from_secs(1)));
     }
 
     #[test]
