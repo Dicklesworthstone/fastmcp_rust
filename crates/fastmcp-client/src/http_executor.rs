@@ -6439,7 +6439,9 @@ impl ClientHttpConnection {
     /// This is the ordinary high-level request surface for callers that do
     /// not need to retain a modern streaming response. It binds the response
     /// ID to `request_id` in both eras. Modern request-scoped SSE remains
-    /// available through [`Self::request`].
+    /// available through [`Self::request`]. Canonical modern HTTP 400/404
+    /// responses retain their complete correlated JSON-RPC error, including
+    /// its data, while opaque HTTP failures remain connection errors.
     pub async fn request_json(
         &mut self,
         cx: &Cx,
@@ -6785,15 +6787,20 @@ impl ClientHttpConnection {
                         )
                         .await
                     }
-                    ModernHttpResponseKind::HttpFailure if response.metadata().status() == 400 => {
-                        Err(Self::classify_http_bad_request(
+                    ModernHttpResponseKind::HttpFailure
+                        if matches!(response.metadata().status(), 400 | 404) =>
+                    {
+                        Self::admit_http_error_response(
                             cx,
                             cancellation,
                             response,
                             request_id,
                             maximum_response_bytes,
                         )
-                        .await)
+                        .await
+                        .map(|(response, receipt)| {
+                            (response, None, receipt, Vec::new(), Vec::new())
+                        })
                     }
                     actual => Err(ClientHttpConnectionError::ExpectedJsonResponse { actual }),
                 }
@@ -6801,21 +6808,24 @@ impl ClientHttpConnection {
         }
     }
 
-    /// Classifies a modern HTTP 400 by its bounded JSON-RPC error body. Only
-    /// the exact pre-dispatch header mismatch for this request becomes
-    /// [`ClientHttpConnectionError::ParameterHeaderMismatch`]; any other body,
-    /// or a body that cannot be read, keeps the generic refusal. Cancellation
-    /// retains its own outcome even while an error body is incomplete.
-    async fn classify_http_bad_request(
+    /// Admits a canonical HTTP 400/404 error without discarding its data or
+    /// mistaking a result-bearing failure for an RPC success. Only the exact
+    /// HTTP 400 pre-dispatch header mismatch retains the separate repair
+    /// outcome. Body limits, cancellation and deadlines keep their typed errors.
+    async fn admit_http_error_response(
         cx: &Cx,
         cancellation: Option<&McpRequestCancellation>,
         response: ModernHttpResponseStream,
         request_id: RequestId,
         maximum_response_bytes: usize,
-    ) -> ClientHttpConnectionError {
+    ) -> Result<(JsonRpcResponse, Instant), ClientHttpConnectionError> {
         let generic = ClientHttpConnectionError::ExpectedJsonResponse {
             actual: ModernHttpResponseKind::HttpFailure,
         };
+        let status = response.metadata().status();
+        if !matches!(status, 400 | 404) {
+            return Err(generic);
+        }
         let body = match cancellation {
             Some(cancellation) => {
                 response
@@ -6824,30 +6834,34 @@ impl ClientHttpConnection {
             }
             None => response.read_error_body(cx, maximum_response_bytes).await,
         };
-        let body = match body {
-            Ok(Some(ModernHttpErrorBody::JsonRpcError(body))) => body,
-            Err(ModernHttpExecutorError::Cancelled) => {
-                return ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
-                    ModernHttpExecutorError::Cancelled,
-                ));
-            }
-            _ => return generic,
+        let body = body.map_err(|error| {
+            ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(error))
+        })?;
+        let receipt = Instant::now();
+        let Some(ModernHttpErrorBody::JsonRpcError(body)) = body else {
+            return Err(generic);
         };
-        let header_mismatch = body
+        let Some(error) = body.error.as_ref() else {
+            return Err(generic);
+        };
+        if !body
             .id
             .as_ref()
             .is_some_and(|id| id.correlates_with(&request_id))
-            && body.result.is_none()
-            && body.error.as_ref().is_some_and(|error| {
-                error.code.as_i32() == Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
-                    && error.message == fastmcp_protocol::HEADER_MISMATCH_MESSAGE
-                    && error.data.is_none()
+        {
+            return Err(ClientHttpConnectionError::ResponseIdMismatch {
+                expected: request_id,
+                actual: body.id,
             });
-        if header_mismatch {
-            ClientHttpConnectionError::ParameterHeaderMismatch { request_id }
-        } else {
-            generic
         }
+        if status == 400
+            && error.code.as_i32() == Some(fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE)
+            && error.message == fastmcp_protocol::HEADER_MISMATCH_MESSAGE
+            && error.data.is_none()
+        {
+            return Err(ClientHttpConnectionError::ParameterHeaderMismatch { request_id });
+        }
+        Ok((body, receipt))
     }
 
     pub(crate) async fn drain_modern_sse_json_response(
@@ -15963,6 +15977,404 @@ mod tests {
                     ));
                     assert!(sibling.next_event(&cx).await.unwrap().is_none());
                     assert!(cx.checkpoint().is_ok());
+                    if let Some(canceller) = canceller {
+                        canceller.join().unwrap();
+                    }
+                });
+                peer.join().unwrap();
+            }
+        }
+    }
+
+    fn collected_http_error_peer(
+        extension: bool,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let mut wire = format!(
+            "HTTP/1.1 {status} Test Response\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(body);
+        let peer = thread::spawn(move || {
+            respond_owned_http_error_discovery(&listener);
+            let mut stream = accept_notification_test_peer(&listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["id"], 2);
+            assert_eq!(
+                request["method"],
+                if extension {
+                    "example/failure"
+                } else {
+                    "tools/list"
+                }
+            );
+            // One write avoids racing early status-only refusal between the
+            // response head and its deliberately untrusted body.
+            stream.write_all(&wire).unwrap();
+            stream.flush().unwrap();
+            assert_sse_peer_closed(&mut stream);
+            assert!(matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        });
+        (target, peer)
+    }
+
+    fn collected_http_error_response(
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<(JsonRpcResponse, Option<String>), ClientHttpConnectionError> {
+        let (target, peer) = collected_http_error_peer(false, status, content_type, body);
+        let response = runtime_block_on(async {
+            let cx = Cx::current().expect("collected HTTP errors use their caller runtime");
+            let mut client = owned_http_error_test_builder(&target)
+                .connect_http_client_with_cx(&cx)
+                .await
+                .unwrap();
+            let response = client
+                .connection
+                .request_json_with_result_source(
+                    &cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    RequestId::Number(2),
+                    maximum_bytes,
+                )
+                .await;
+            assert!(cx.checkpoint().is_ok());
+            response
+        });
+        peer.join().unwrap();
+        response
+    }
+
+    #[test]
+    fn collected_http_errors_preserve_full_public_core_and_extension_errors() {
+        for extension in [false, true] {
+            for (status, code, message) in [
+                (400, -32_021, "Required client capability is missing"),
+                (404, -32_601, "Method not found"),
+            ] {
+                let data = serde_json::json!({
+                    "requiredCapabilities": {"roots": {}},
+                    "detail": {"available": false, "paths": ["a", "b"]}
+                });
+                let body = serde_json::json!({
+                    "jsonrpc": "2.0", "id": 2,
+                    "error": {"code": code, "message": message, "data": data}
+                })
+                .to_string();
+                let (target, peer) = collected_http_error_peer(
+                    extension,
+                    status,
+                    "Application/JSON; Charset=UTF-8",
+                    body.as_bytes(),
+                );
+                runtime_block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let mut client = owned_http_error_test_builder(&target)
+                        .connect_http_client_with_cx(&cx)
+                        .await
+                        .unwrap();
+                    let outcome = if extension {
+                        client
+                            .request_final_extension(
+                                &cx,
+                                &fastmcp_protocol::ExtensionId::parse("com.example/errors")
+                                    .unwrap(),
+                                "example/failure",
+                                serde_json::json!({}),
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        client
+                            .request_final_core(&cx, "tools/list", serde_json::json!({}))
+                            .await
+                            .map(|_| ())
+                    };
+                    let crate::HttpClientError::CoreResult(error) = outcome.unwrap_err() else {
+                        panic!("a correlated HTTP error retains its protocol error");
+                    };
+                    assert_eq!(i32::from(error.code), code);
+                    assert_eq!(error.message, message);
+                    assert_eq!(error.data, Some(data));
+                    assert!(cx.checkpoint().is_ok());
+                });
+                peer.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn collected_http_errors_return_error_envelopes_without_result_source() {
+        let body = br#"{"jsonrpc":"2.0","id":2e0,"error":{"code":123456789012345678901234567890,"message":"Exact remote error","data":[7.30e-2,{"detail":"retained"}]}}"#;
+        for status in [400, 404] {
+            let (response, source) =
+                collected_http_error_response(status, "application/json", body, body.len())
+                    .unwrap();
+            assert!(response.id.unwrap().correlates_with(&RequestId::Number(2)));
+            assert!(response.result.is_none());
+            assert!(source.is_none());
+            let error = response.error.unwrap();
+            assert_eq!(error.code.as_str(), "123456789012345678901234567890");
+            assert_eq!(error.message, "Exact remote error");
+            let data = error.data.as_ref().unwrap();
+            assert_eq!(data[0].to_string(), "7.30e-2");
+            assert_eq!(data[1]["detail"], "retained");
+            let local = crate::json_rpc_error_to_mcp(error);
+            assert_eq!(local.code, fastmcp_core::McpErrorCode::InternalError);
+            let diagnostic = local.data.unwrap();
+            assert_eq!(
+                diagnostic["jsonrpcErrorCode"].to_string(),
+                "123456789012345678901234567890"
+            );
+            assert_eq!(diagnostic["jsonrpcErrorData"][0].to_string(), "7.30e-2");
+            assert_eq!(diagnostic["jsonrpcErrorData"][1]["detail"], "retained");
+        }
+    }
+
+    #[test]
+    fn collected_http_errors_reject_foreign_ids_and_non_error_bodies() {
+        for id in [
+            serde_json::json!(3),
+            serde_json::json!("2"),
+            serde_json::Value::Null,
+        ] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": "Method not found"}
+            })
+            .to_string();
+            assert!(matches!(
+                collected_http_error_response(404, "application/json", body.as_bytes(), 4_096),
+                Err(ClientHttpConnectionError::ResponseIdMismatch {
+                    expected: RequestId::Number(2),
+                    ..
+                })
+            ));
+        }
+        const ERROR: &[u8] =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for (status, content_type, body) in [
+            (400, "text/plain", ERROR),
+            (404, "application/json; charset=iso-8859-1", ERROR),
+            (400, "application/json", &b"{malformed"[..]),
+            (401, "application/json", ERROR),
+            (403, "application/json", ERROR),
+            (429, "application/json", ERROR),
+            (500, "application/json", ERROR),
+            (
+                404,
+                "application/json",
+                &br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#[..],
+            ),
+            (
+                400,
+                "application/json",
+                &br#"{"jsonrpc":"2.0","id":2,"result":{},"error":{"code":-32601,"message":"Method not found"}}"#[..],
+            ),
+        ] {
+            assert!(matches!(
+                collected_http_error_response(status, content_type, body, 4_096),
+                Err(ClientHttpConnectionError::ExpectedJsonResponse {
+                    actual: ModernHttpResponseKind::HttpFailure,
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn collected_http_errors_keep_parameter_header_repair_exact() {
+        for variant in 0..5 {
+            let mut error = serde_json::json!({
+                "code": fastmcp_protocol::HEADER_MISMATCH_ERROR_CODE,
+                "message": fastmcp_protocol::HEADER_MISMATCH_MESSAGE,
+            });
+            let status = if variant == 1 { 404 } else { 400 };
+            match variant {
+                2 => error["code"] = serde_json::json!(-32601),
+                3 => error["message"] = serde_json::json!("Application error"),
+                4 => error["data"] = serde_json::json!({"handlerReached": true}),
+                _ => {}
+            }
+            let body = serde_json::json!({"jsonrpc": "2.0", "id": 2, "error": error}).to_string();
+            let outcome =
+                collected_http_error_response(status, "application/json", body.as_bytes(), 4_096);
+            if variant == 0 {
+                assert!(matches!(
+                    outcome,
+                    Err(ClientHttpConnectionError::ParameterHeaderMismatch {
+                        request_id: RequestId::Number(2),
+                    })
+                ));
+            } else {
+                let (response, source) = outcome.unwrap();
+                assert!(source.is_none());
+                assert_eq!(
+                    serde_json::to_value(response.error.unwrap()).unwrap(),
+                    error
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collected_http_errors_preserve_response_body_limits() {
+        const ERROR: &[u8] =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for status in [400, 404] {
+            assert!(
+                collected_http_error_response(status, "application/json", ERROR, ERROR.len())
+                    .is_ok()
+            );
+            for content_type in ["application/json", "text/plain"] {
+                assert!(matches!(
+                    collected_http_error_response(status, content_type, ERROR, ERROR.len() - 1),
+                    Err(ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+                        ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes }
+                    ))) if maximum_bytes == ERROR.len() - 1
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn collected_http_error_body_interruptions_preserve_the_client() {
+        use crate::RequestTimeoutSource::{Absolute, Idle};
+
+        for extension in [false, true] {
+            for timeout in [None, Some(Idle), Some(Absolute)] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let (ready, wait_ready) = mpsc::channel();
+                let peer = thread::spawn(move || {
+                    respond_owned_http_error_discovery(&listener);
+                    let mut pending = accept_notification_test_peer(&listener);
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_request(&mut pending).body).unwrap();
+                    assert_eq!(request["id"], 2);
+                    assert_eq!(
+                        request["method"],
+                        if extension {
+                            "example/failure"
+                        } else {
+                            "tools/list"
+                        }
+                    );
+                    pending.write_all(
+                        b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                    ).unwrap();
+                    pending.flush().unwrap();
+                    let _ = ready.send(());
+                    assert_sse_peer_closed(&mut pending);
+
+                    let mut healthy = accept_notification_test_peer(&listener);
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&read_request(&mut healthy).body).unwrap();
+                    assert_eq!(request["id"], 3, "no replacement POST or rediscovery");
+                    assert_eq!(request["method"], "tools/list");
+                    write_response(
+                        &mut healthy,
+                        200,
+                        "application/json",
+                        br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+                    );
+                    assert_sse_peer_closed(&mut healthy);
+                    assert!(matches!(
+                        listener.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    ));
+                });
+                runtime_block_on(async {
+                    let cx = Cx::current().unwrap();
+                    let policy = match timeout {
+                        Some(Idle) => crate::RequestTimeoutPolicy::new(
+                            Duration::from_millis(100),
+                            Duration::from_secs(1),
+                        )
+                        .unwrap(),
+                        Some(Absolute) => crate::RequestTimeoutPolicy::new(
+                            Duration::from_secs(1),
+                            Duration::from_millis(100),
+                        )
+                        .unwrap(),
+                        None => crate::RequestTimeoutPolicy::new(
+                            Duration::from_secs(2),
+                            Duration::from_secs(3),
+                        )
+                        .unwrap(),
+                    };
+                    let mut client = owned_http_error_test_builder(&target)
+                        .request_timeout_policy(policy)
+                        .connect_http_client_with_cx(&cx)
+                        .await
+                        .unwrap();
+                    let cancellation = fastmcp_core::McpRequestCancellation::new();
+                    let cancel_for_thread = cancellation.clone();
+                    let canceller = timeout.is_none().then(|| {
+                        thread::spawn(move || {
+                            wait_ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                            thread::sleep(Duration::from_millis(25));
+                            assert!(cancel_for_thread.cancel());
+                        })
+                    });
+                    let outcome = if extension {
+                        client
+                            .request_final_extension_with_cancellation(
+                                &cx,
+                                &cancellation,
+                                &fastmcp_protocol::ExtensionId::parse("com.example/errors")
+                                    .unwrap(),
+                                "example/failure",
+                                serde_json::json!({}),
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        client
+                            .request_final_core_with_cancellation(
+                                &cx,
+                                &cancellation,
+                                "tools/list",
+                                serde_json::json!({}),
+                            )
+                            .await
+                            .map(|_| ())
+                    };
+                    let crate::HttpClientError::Connection(ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::Executor(error),
+                    )) = outcome.unwrap_err()
+                    else {
+                        panic!("error-body interruption must retain its transport cause");
+                    };
+                    if let Some(expected_source) = timeout {
+                        assert!(matches!(
+                            error,
+                            ModernHttpExecutorError::Timeout(source) if source == expected_source
+                        ));
+                    } else {
+                        assert!(matches!(error, ModernHttpExecutorError::Cancelled));
+                    }
+                    assert!(cx.checkpoint().is_ok());
+                    assert!(matches!(
+                        client
+                            .request_final_core(&cx, "tools/list", serde_json::json!({}))
+                            .await
+                            .unwrap(),
+                        CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                    ));
                     if let Some(canceller) = canceller {
                         canceller.join().unwrap();
                     }
