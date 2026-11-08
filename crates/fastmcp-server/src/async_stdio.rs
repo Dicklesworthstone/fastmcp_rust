@@ -4325,6 +4325,8 @@ mod tests {
                         Some(FinalSubscriptionResourceAdmission {
                             context: ctx.clone(),
                             bindings,
+                            #[cfg(feature = "tasks")]
+                            task_access: None,
                         }),
                     )
                     .unwrap();
