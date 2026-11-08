@@ -141,6 +141,10 @@ where
 {
     marker: ProgressMarker,
     send_fn: F,
+    // Serialize callback delivery with terminal election, independently of
+    // the staging state. A callback may report newer progress through the
+    // same request context; it must never run while holding `state`.
+    emission: Mutex<()>,
     state: Mutex<FinalProgressRuntimeState>,
 }
 
@@ -177,6 +181,7 @@ where
         Self {
             marker,
             send_fn,
+            emission: Mutex::new(()),
             state: Mutex::new(FinalProgressRuntimeState::default()),
         }
     }
@@ -199,14 +204,21 @@ where
     /// Returns `true` only when a queued notification was committed to the
     /// callback. Cancellation and finalization discard no additional frames.
     pub(crate) fn flush_pending(&self) -> bool {
-        let mut state = self
-            .state
+        let _emission = self
+            .emission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.phase != FinalProgressRuntimePhase::Open {
-            return false;
-        }
-        self.emit_pending_locked(&mut state)
+        let notification = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.phase != FinalProgressRuntimePhase::Open {
+                return false;
+            }
+            state.pending.take()
+        };
+        self.emit_pending(notification)
     }
 
     /// Claims this runtime's terminal side of the final-progress race.
@@ -215,15 +227,22 @@ where
     /// request owner writes the JSON-RPC terminal response. Returns `false`
     /// when cancellation had already won.
     pub(crate) fn finalize(&self) -> bool {
-        let mut state = self
-            .state
+        let _emission = self
+            .emission
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.phase != FinalProgressRuntimePhase::Open {
-            return false;
-        }
-        state.phase = FinalProgressRuntimePhase::Finalizing;
-        self.emit_pending_locked(&mut state);
+        let notification = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.phase != FinalProgressRuntimePhase::Open {
+                return false;
+            }
+            state.phase = FinalProgressRuntimePhase::Finalizing;
+            state.pending.take()
+        };
+        self.emit_pending(notification);
         true
     }
 
@@ -231,6 +250,10 @@ where
     ///
     /// Returns `true` only when cancellation won before finalization.
     pub(crate) fn cancel(&self) -> bool {
+        let _emission = self
+            .emission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut state = self
             .state
             .lock()
@@ -292,8 +315,11 @@ where
         state.pending = Some(notification);
     }
 
-    fn emit_pending_locked(&self, state: &mut FinalProgressRuntimeState) -> bool {
-        let Some(notification) = state.pending.take() else {
+    /// The caller owns `emission`, but no staging-state guard. A callback's
+    /// reentrant report replaces only the pending slot for a future rate tick
+    /// or finalization; it cannot recursively dispatch another callback.
+    fn emit_pending(&self, notification: Option<JsonRpcRequest>) -> bool {
+        let Some(notification) = notification else {
             return false;
         };
         if crate::catch_extension_unwind(|| (self.send_fn)(notification)).is_err() {
@@ -4972,6 +4998,178 @@ mod tests {
                 .is_empty(),
             "cancellation differs only in winning the terminal race"
         );
+    }
+
+    #[test]
+    fn final_progress_callback_can_report_again_without_reentrant_delivery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let context = Arc::new(Mutex::new(std::sync::Weak::<McpContext>::new()));
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let reporters = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(FinalProgressRuntime::new(
+            ProgressMarker::from("reentrant-progress"),
+            {
+                let context = Arc::clone(&context);
+                let sent = Arc::clone(&sent);
+                let completed = Arc::clone(&completed);
+                let reporters = Arc::clone(&reporters);
+                move |notification: JsonRpcRequest| {
+                    let first = notification.params.as_ref().unwrap()["progress"] == 1;
+                    sent.lock().unwrap().push(notification);
+                    let context = context.lock().unwrap().upgrade().unwrap();
+                    let (finished, completion) = std::sync::mpsc::sync_channel(1);
+                    // A bounded callback-owned probe makes the old lock
+                    // inversion fail without hanging the test process. This
+                    // work must finish while its callback is still active.
+                    let reporter = std::thread::spawn(move || {
+                        if first {
+                            for value in [2, 4, 3] {
+                                context.report_progress_exact(
+                                    value.into(),
+                                    None,
+                                    Some("callback update"),
+                                );
+                            }
+                        } else {
+                            context.report_progress(5.0, Some("after finalization"));
+                        }
+                        let _ = finished.send(());
+                    });
+                    reporters.lock().unwrap().push(reporter);
+                    if completion.recv_timeout(Duration::from_secs(2)).is_ok() {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            },
+        ));
+        let retained = Arc::new(
+            McpContext::new(Cx::for_testing(), 510)
+                .with_progress_reporter(Arc::clone(&runtime).into_reporter()),
+        );
+        *context.lock().unwrap() = Arc::downgrade(&retained);
+        retained.report_progress(1.0, Some("initial"));
+
+        assert!(runtime.flush_pending());
+        for reporter in reporters.lock().unwrap().drain(..) {
+            reporter.join().unwrap();
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(runtime.finalize());
+        for reporter in reporters.lock().unwrap().drain(..) {
+            reporter.join().unwrap();
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+        retained.report_progress(6.0, Some("after terminal"));
+        assert!(!runtime.flush_pending());
+        assert!(!runtime.cancel());
+        let progress: Vec<_> = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|notification| notification.params.as_ref().unwrap()["progress"].clone())
+            .collect();
+        assert_eq!(progress, vec![serde_json::json!(1), serde_json::json!(4)]);
+    }
+
+    #[test]
+    fn final_progress_terminal_election_waits_for_in_flight_callback() {
+        for cancel in [false, true] {
+            let (entered, entry) = std::sync::mpsc::sync_channel(1);
+            let (release, released) = std::sync::mpsc::sync_channel(1);
+            let released = Mutex::new(released);
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let runtime = Arc::new(FinalProgressRuntime::new(
+                ProgressMarker::from("progress-terminal-race"),
+                {
+                    let sent = Arc::clone(&sent);
+                    move |notification: JsonRpcRequest| {
+                        let progress = notification.params.as_ref().unwrap()["progress"].clone();
+                        if progress == 1 {
+                            let _ = entered.send(());
+                            released
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(3))
+                                .unwrap();
+                        }
+                        sent.lock().unwrap().push(progress);
+                    }
+                },
+            ));
+            runtime.send_progress(1.0, None, None);
+            let flushing = {
+                let runtime = Arc::clone(&runtime);
+                std::thread::spawn(move || runtime.flush_pending())
+            };
+            entry.recv_timeout(Duration::from_secs(2)).unwrap();
+            let (reported, report) = std::sync::mpsc::sync_channel(1);
+            let reporting = {
+                let runtime = Arc::clone(&runtime);
+                std::thread::spawn(move || {
+                    runtime.send_progress(2.0, None, None);
+                    let _ = reported.send(());
+                })
+            };
+            let reported_while_callback_active =
+                report.recv_timeout(Duration::from_secs(1)).is_ok();
+            let (elected, election) = std::sync::mpsc::sync_channel(1);
+            let terminal = {
+                let runtime = Arc::clone(&runtime);
+                std::thread::spawn(move || {
+                    let won = if cancel {
+                        runtime.cancel()
+                    } else {
+                        runtime.finalize()
+                    };
+                    let _ = elected.send(won);
+                })
+            };
+            let early_terminal = election.recv_timeout(Duration::from_millis(20)).ok();
+            let _ = release.send(());
+            assert!(flushing.join().unwrap());
+            reporting.join().unwrap();
+            terminal.join().unwrap();
+            assert!(reported_while_callback_active);
+            assert_eq!(early_terminal, None);
+            assert_eq!(election.recv_timeout(Duration::from_secs(1)), Ok(true));
+            runtime.send_progress(3.0, None, None);
+            assert!(!runtime.flush_pending());
+            assert!(!runtime.finalize());
+            assert!(!runtime.cancel());
+            assert_eq!(
+                *sent.lock().unwrap(),
+                if cancel {
+                    vec![serde_json::json!(1)]
+                } else {
+                    vec![serde_json::json!(1), serde_json::json!(2)]
+                },
+                "only the terminal winner differs; no notification follows settlement"
+            );
+        }
+    }
+
+    #[test]
+    fn final_progress_callback_panic_releases_emission_for_terminal_settlement() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let runtime =
+            FinalProgressRuntime::new(ProgressMarker::from("progress-panic-settlement"), |_| {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("progress callback panic canary");
+                }
+            });
+        runtime.send_progress(1.0, None, None);
+        assert!(runtime.flush_pending());
+        runtime.send_progress(2.0, None, None);
+        assert!(runtime.finalize());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        runtime.send_progress(3.0, None, None);
+        assert!(!runtime.flush_pending());
+        assert!(!runtime.cancel());
     }
 
     #[test]

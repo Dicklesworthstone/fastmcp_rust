@@ -40366,6 +40366,160 @@ mod lib_unit_tests {
         }
     }
 
+    struct ReentrantProgressTool {
+        inner: LiveModernControlledTool,
+        contexts: Arc<Mutex<HashMap<u64, McpContext>>>,
+    }
+
+    impl ToolHandler for ReentrantProgressTool {
+        fn definition(&self) -> Tool {
+            self.inner.definition()
+        }
+
+        fn call(&self, ctx: &McpContext, arguments: serde_json::Value) -> McpResult<Vec<Content>> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(ctx.request_id(), ctx.clone());
+            self.inner.call(ctx, arguments)
+        }
+
+        fn call_final_outcome_async_in_request<'a>(
+            &'a self,
+            ctx: &'a McpContext,
+            request_cx: &'a Cx,
+            arguments: serde_json::Value,
+        ) -> BoxFuture<'a, fastmcp_core::McpOutcome<FinalToolOutcome>> {
+            self.contexts
+                .lock()
+                .unwrap()
+                .insert(ctx.request_id(), ctx.clone());
+            self.inner
+                .call_final_outcome_async_in_request(ctx, request_cx, arguments)
+        }
+    }
+
+    const REENTRANT_PROGRESS_FIRST: i64 = 57_121;
+    const REENTRANT_PROGRESS_SIBLING: i64 = 57_122;
+
+    struct ReentrantProgressRecv {
+        phase: usize,
+        cancel_first: bool,
+        control: Arc<LiveModernControl>,
+        responses: Arc<LiveModernResponses>,
+    }
+
+    impl TransportRecvHalf for ReentrantProgressRecv {
+        fn recv(&mut self, _cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+            let phase = self.phase;
+            self.phase += 1;
+            match phase {
+                0 => Ok(modern_discovery_opening_request()),
+                1 | 2 => {
+                    let (id, marker) = if phase == 1 {
+                        (REENTRANT_PROGRESS_FIRST, "reentrant-first")
+                    } else {
+                        (REENTRANT_PROGRESS_SIBLING, "reentrant-sibling")
+                    };
+                    let JsonRpcMessage::Request(mut request) =
+                        modern_controlled_tool_progress_request(id)
+                    else {
+                        unreachable!("the fixture constructs a request")
+                    };
+                    request.params.as_mut().unwrap()["_meta"]["progressToken"] =
+                        serde_json::json!(marker);
+                    Ok(JsonRpcMessage::Request(request))
+                }
+                3 => {
+                    if !self.control.wait_for_started(2, Duration::from_secs(3)) {
+                        return Err(TransportError::Timeout);
+                    }
+                    let first_finished = if self.cancel_first {
+                        self.control.wait_for_cancellation(
+                            REENTRANT_PROGRESS_FIRST as u64,
+                            Duration::from_secs(3),
+                        )
+                    } else {
+                        self.responses
+                            .wait_for_responses(&[REENTRANT_PROGRESS_FIRST], Duration::from_secs(3))
+                    };
+                    if !first_finished
+                        || !self.responses.wait_for_responses(
+                            &[REENTRANT_PROGRESS_SIBLING],
+                            Duration::from_secs(3),
+                        )
+                    {
+                        return Err(TransportError::Timeout);
+                    }
+                    Err(TransportError::Closed)
+                }
+                _ => Err(TransportError::Closed),
+            }
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    struct ReentrantProgressSend {
+        cancel_first: bool,
+        contexts: Arc<Mutex<HashMap<u64, McpContext>>>,
+        control: Arc<LiveModernControl>,
+        responses: Arc<LiveModernResponses>,
+        reporters: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    }
+
+    impl TransportSendHalf for ReentrantProgressSend {
+        fn send(&mut self, _cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+            self.responses.record(message.clone());
+            let JsonRpcMessage::Request(notification) = message else {
+                return Ok(());
+            };
+            if notification.method != "notifications/progress" {
+                return Ok(());
+            }
+            let params = notification.params.as_ref().unwrap();
+            if params["progress"] != 12_000 {
+                return Ok(());
+            }
+            let id = match params["progressToken"].as_str() {
+                Some("reentrant-first") => REENTRANT_PROGRESS_FIRST as u64,
+                Some("reentrant-sibling") => REENTRANT_PROGRESS_SIBLING as u64,
+                _ => return Err(TransportError::Timeout),
+            };
+            let context = self.contexts.lock().unwrap().get(&id).unwrap().clone();
+            let reporter_context = context.clone();
+            let (finished, completion) = sync_channel(1);
+            let reporter = std::thread::spawn(move || {
+                for value in [12_001, 12_003, 12_002] {
+                    reporter_context.report_progress_exact(
+                        value.into(),
+                        None,
+                        Some("reentrant transport callback"),
+                    );
+                }
+                let _ = finished.send(());
+            });
+            self.reporters.lock().unwrap().push(reporter);
+            // The feedback must finish while send is active. On a regression
+            // the bounded error releases the old progress mutex, allowing the
+            // reporter to settle before the harness joins it.
+            completion
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|_| TransportError::Timeout)?;
+            if self.cancel_first && id == REENTRANT_PROGRESS_FIRST as u64 {
+                context.request_cancellation().cancel();
+            }
+            self.control.release(id);
+            Ok(())
+        }
+
+        fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
     #[derive(Default)]
     struct LiveModernNotificationControl {
         started: Mutex<bool>,
@@ -59544,6 +59698,109 @@ mod lib_unit_tests {
             progress.0 < log_index && log_index < response_index,
             "the rate-flushed progress must precede the final log and terminal response"
         );
+    }
+
+    #[test]
+    fn public_split_transport_progress_callback_reentry_preserves_terminal_order_and_siblings() {
+        for cancel_first in [false, true] {
+            let contexts = Arc::new(Mutex::new(HashMap::new()));
+            let control = Arc::new(LiveModernControl::default());
+            let responses = Arc::new(LiveModernResponses::default());
+            let reporters = Arc::new(Mutex::new(Vec::new()));
+            let server = Server::new("reentrant-progress-transport", "1.0.0")
+                .protocol_policy(build_default_protocol_policy())
+                .expect("the build's default policy must be available")
+                .tool(ReentrantProgressTool {
+                    inner: LiveModernControlledTool {
+                        control: Arc::clone(&control),
+                    },
+                    contexts: Arc::clone(&contexts),
+                })
+                .build();
+            let result = run_live_split_transport(
+                Duration::from_secs(10),
+                server,
+                ReentrantProgressRecv {
+                    phase: 0,
+                    cancel_first,
+                    control: Arc::clone(&control),
+                    responses: Arc::clone(&responses),
+                },
+                ReentrantProgressSend {
+                    cancel_first,
+                    contexts: Arc::clone(&contexts),
+                    control: Arc::clone(&control),
+                    responses: Arc::clone(&responses),
+                    reporters: Arc::clone(&reporters),
+                },
+            );
+            for reporter in reporters.lock().unwrap().drain(..) {
+                reporter.join().unwrap();
+            }
+            assert!(result.is_ok(), "{result:?}");
+            assert_eq!(
+                control.was_cancelled(REENTRANT_PROGRESS_FIRST as u64),
+                cancel_first
+            );
+            assert!(!control.was_cancelled(REENTRANT_PROGRESS_SIBLING as u64));
+            let messages = responses.messages();
+            for (id, marker) in [
+                (REENTRANT_PROGRESS_FIRST, "reentrant-first"),
+                (REENTRANT_PROGRESS_SIBLING, "reentrant-sibling"),
+            ] {
+                let progress: Vec<_> = messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| match message {
+                        JsonRpcMessage::Request(notification)
+                            if notification.method == "notifications/progress"
+                                && notification
+                                    .params
+                                    .as_ref()
+                                    .is_some_and(|params| params["progressToken"] == marker) =>
+                        {
+                            Some((
+                                index,
+                                notification.params.as_ref().unwrap()["progress"].clone(),
+                            ))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                let cancelled = cancel_first && id == REENTRANT_PROGRESS_FIRST;
+                assert_eq!(
+                    progress
+                        .iter()
+                        .map(|(_, value)| value.clone())
+                        .collect::<Vec<_>>(),
+                    if cancelled {
+                        vec![serde_json::json!(12_000)]
+                    } else {
+                        vec![serde_json::json!(12_000), serde_json::json!(12_003)]
+                    },
+                    "reentrant updates coalesce per request and cancellation drops only its slot"
+                );
+                if !cancelled {
+                    let terminal = messages
+                        .iter()
+                        .position(|message| {
+                            matches!(
+                                message,
+                                JsonRpcMessage::Response(response)
+                                    if response.id == Some(id.into()) && response.error.is_none()
+                            )
+                        })
+                        .expect("the uncancelled request completes through the public transport");
+                    assert!(progress.last().unwrap().0 < terminal);
+                    assert_eq!(responses.response_count(id), 1);
+                }
+            }
+            let before = responses.messages().len();
+            for context in contexts.lock().unwrap().values() {
+                context.report_progress(20_000.0, Some("retained after transport settlement"));
+            }
+            assert_eq!(responses.messages().len(), before);
+        }
     }
 
     #[test]
