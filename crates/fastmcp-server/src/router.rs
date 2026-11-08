@@ -3387,6 +3387,7 @@ impl Router {
             template,
             crate::DuplicateBehavior::Replace,
             false,
+            None,
         ) {
             log::warn!(
                 target: "fastmcp_rust::router",
@@ -3407,7 +3408,36 @@ impl Router {
         template: ResourceTemplate,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_resource_template_registration_with_behavior(template, behavior, true)
+        self.add_resource_template_registration_with_behavior(template, behavior, true, None)
+    }
+
+    /// Registers an exact final template for catalog listing and completion.
+    ///
+    /// Every bounded RFC 6570 template is eligible. A definition alone does not
+    /// install a resource reader or reserve a reverse-match route. Replacing
+    /// the metadata of an existing reader retains that reader and its routing
+    /// and URI-use admission. Exact final metadata is preserved without a
+    /// synthetic handler or a lossy legacy round trip.
+    pub fn add_final_resource_template_with_behavior(
+        &mut self,
+        definition: FinalResourceTemplate,
+        behavior: crate::DuplicateBehavior,
+    ) -> McpResult<()> {
+        let template = ResourceTemplate {
+            uri_template: definition.uri_template.clone(),
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            mime_type: definition.mime_type.clone(),
+            icon: None,
+            version: None,
+            tags: Vec::new(),
+        };
+        self.add_resource_template_registration_with_behavior(
+            template,
+            behavior,
+            true,
+            Some(definition),
+        )
     }
 
     /// Adds an exact-2024-only resource template with duplicate handling.
@@ -3416,7 +3446,7 @@ impl Router {
         template: ResourceTemplate,
         behavior: crate::DuplicateBehavior,
     ) -> Result<(), McpError> {
-        self.add_resource_template_registration_with_behavior(template, behavior, false)
+        self.add_resource_template_registration_with_behavior(template, behavior, false, None)
     }
 
     fn add_resource_template_registration_with_behavior(
@@ -3424,6 +3454,7 @@ impl Router {
         template: ResourceTemplate,
         behavior: crate::DuplicateBehavior,
         admit_final: bool,
+        exact_final_definition: Option<FinalResourceTemplate>,
     ) -> Result<(), McpError> {
         let key = template.uri_template.clone();
         let existed = self.resource_templates.contains_key(&key);
@@ -3452,31 +3483,61 @@ impl Router {
             }
         }
 
-        let legacy_matcher = match admit_legacy_resource_template(&key) {
-            Ok(matcher) => Some(matcher),
-            Err(error) if !admit_final => return Err(error),
-            Err(_) => None,
+        let retained_reader = self
+            .resource_templates
+            .get(&key)
+            .filter(|entry| entry.handler.is_some());
+        let uri_use_policy = retained_reader
+            .map_or_else(ResourceUriUsePolicy::server_mediated, |entry| {
+                entry.uri_use_policy
+            });
+        let legacy_enabled = retained_reader.is_none_or(|entry| entry.legacy_enabled);
+        if admit_final && retained_reader.is_some_and(|entry| entry.final_definition.is_none()) {
+            return Err(McpError::invalid_params(
+                "template metadata cannot enable a legacy-only reader in the final era",
+            ));
+        }
+        if !admit_final && !legacy_enabled {
+            return Err(McpError::invalid_params(
+                "template metadata cannot enable a final-only reader in the legacy era",
+            ));
+        }
+        let legacy_matcher = if legacy_enabled {
+            match admit_legacy_resource_template(&key) {
+                Ok(matcher) => Some(matcher),
+                Err(error) if !admit_final => return Err(error),
+                Err(_) => None,
+            }
+        } else {
+            None
         };
-        let (matcher, specificity) = if admit_final {
+        let (matcher, specificity) = if admit_final && retained_reader.is_some() {
             let (matcher, specificity) = admit_resource_template(&key)?;
             self.reject_final_template_collisions(&matcher, Some(key.as_str()))?;
             (Some(matcher), specificity)
+        } else if admit_final {
+            let (_, specificity) = admit_resource_template_catalog(&key)?;
+            (None, specificity)
         } else {
             let matcher = legacy_matcher.as_ref().ok_or_else(|| {
                 McpError::internal_error("exact-2024 resource template admission lost its matcher")
             })?;
             (None, matcher.specificity())
         };
-        let uri_use_policy = ResourceUriUsePolicy::server_mediated();
-        let final_definition = admit_final
-            .then(|| {
-                admit_final_resource_template_definition::<dyn ResourceHandler>(
-                    None,
-                    &template,
-                    uri_use_policy,
-                )
-            })
-            .transpose()?;
+        let final_definition = if let Some(definition) = exact_final_definition {
+            admit_final_resource_template_uri(uri_use_policy, &definition.uri_template)?;
+            Some(definition)
+        } else {
+            admit_final
+                .then(|| {
+                    admit_final_resource_template_definition::<dyn ResourceHandler>(
+                        None,
+                        &template,
+                        uri_use_policy,
+                    )
+                })
+                .transpose()?
+        };
         if existed {
             self.legacy_resource_template_completion_handlers
                 .remove(&key);
@@ -7883,12 +7944,24 @@ impl Router {
             };
             let final_enabled =
                 Self::prefix_preserves_keys(prefix) && entry.final_definition.is_some();
-            let (matcher, specificity) = if final_enabled {
+            let (matcher, specificity) = if final_enabled && mounted_handler.is_some() {
                 match admit_resource_template(&mounted_uri_template) {
                     Ok((matcher, specificity)) => (Some(matcher), specificity),
                     Err(error) => {
                         result.errors.push(format!(
                             "Mount rejected resource template; template_key={}; code={:?}",
+                            safe_log_label(&mounted_uri_template),
+                            error.code
+                        ));
+                        continue;
+                    }
+                }
+            } else if final_enabled {
+                match admit_resource_template_catalog(&mounted_uri_template) {
+                    Ok((_, specificity)) => (None, specificity),
+                    Err(error) => {
+                        result.errors.push(format!(
+                            "Mount rejected resource template catalog; template_key={}; code={:?}",
                             safe_log_label(&mounted_uri_template),
                             error.code
                         ));
@@ -7988,12 +8061,24 @@ impl Router {
                 };
                 let final_enabled =
                     Self::prefix_preserves_keys(prefix) && entry.final_definition.is_some();
-                let (matcher, specificity) = if final_enabled {
+                let (matcher, specificity) = if final_enabled && mounted_handler.is_some() {
                     match admit_resource_template(&mounted_uri_template) {
                         Ok((matcher, specificity)) => (Some(matcher), specificity),
                         Err(error) => {
                             result.errors.push(format!(
                                 "Mount rejected resource template; template_key={}; code={:?}",
+                                safe_log_label(&mounted_uri_template),
+                                error.code
+                            ));
+                            continue;
+                        }
+                    }
+                } else if final_enabled {
+                    match admit_resource_template_catalog(&mounted_uri_template) {
+                        Ok((_, specificity)) => (None, specificity),
+                        Err(error) => {
+                            result.errors.push(format!(
+                                "Mount rejected resource template catalog; template_key={}; code={:?}",
                                 safe_log_label(&mounted_uri_template),
                                 error.code
                             ));
@@ -8591,14 +8676,22 @@ const fn legacy_hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-/// Parses a resource template with the canonical RFC 6570 implementation and
-/// admits only templates the protocol can reverse-match exactly for routing.
-fn admit_resource_template(
+/// Admits the full bounded RFC 6570 grammar for catalog and completion use.
+/// Advertising a template does not grant a reader or require inverse matching.
+fn admit_resource_template_catalog(
     source: &str,
-) -> McpResult<(ReversibleResourceTemplate, (usize, usize, usize))> {
+) -> McpResult<(fastmcp_protocol::UriTemplate, (usize, usize, usize))> {
     let template = fastmcp_protocol::UriTemplate::parse(source)
         .map_err(|_| McpError::invalid_params("resource template is not valid RFC 6570"))?;
     let specificity = resource_template_specificity(&template);
+    Ok((template, specificity))
+}
+
+/// Requires exact reversible matching before installing a resource reader.
+fn admit_resource_template(
+    source: &str,
+) -> McpResult<(ReversibleResourceTemplate, (usize, usize, usize))> {
+    let (template, specificity) = admit_resource_template_catalog(source)?;
     let matcher = template
         .compile_reversible()
         .map_err(|_| McpError::invalid_params("resource template cannot be matched reversibly"))?;
@@ -13578,6 +13671,87 @@ mod router_tests {
         }
     }
 
+    struct RoutedTemplateResource {
+        template: ResourceTemplate,
+        client_direct_https: bool,
+    }
+
+    impl RoutedTemplateResource {
+        fn new(uri_template: &str, marker: &str) -> Self {
+            Self {
+                template: marked_template(uri_template, marker),
+                client_direct_https: false,
+            }
+        }
+    }
+
+    impl ResourceHandler for RoutedTemplateResource {
+        fn definition(&self) -> Resource {
+            Resource {
+                uri: "mcp://template-reader".to_owned(),
+                name: self.template.name.clone(),
+                description: None,
+                mime_type: Some("text/plain".to_owned()),
+                icon: None,
+                version: None,
+                tags: Vec::new(),
+            }
+        }
+
+        fn template(&self) -> Option<ResourceTemplate> {
+            Some(self.template.clone())
+        }
+
+        fn final_client_direct_https(&self) -> bool {
+            self.client_direct_https
+        }
+
+        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<ResourceContent>> {
+            unreachable!("the template reader requires the exact requested URI")
+        }
+
+        fn read_with_uri(
+            &self,
+            _ctx: &McpContext,
+            uri: &str,
+            _params: &UriParams,
+        ) -> McpResult<Vec<ResourceContent>> {
+            Ok(vec![ResourceContent {
+                uri: uri.to_owned(),
+                mime_type: Some("text/plain".to_owned()),
+                text: Some(format!("reader:{}", self.template.name)),
+                blob: None,
+            }])
+        }
+    }
+
+    fn exact_catalog_template(uri_template: &str, marker: &str) -> FinalResourceTemplate {
+        serde_json::from_value(serde_json::json!({
+            "uriTemplate": uri_template,
+            "name": marker,
+            "title": "Catalog title",
+            "description": "Catalog-only template",
+            "mimeType": "text/plain",
+            "icons": [{
+                "src": "https://example.test/catalog.svg",
+                "mimeType": "image/svg+xml",
+                "sizes": ["32x32"],
+                "com.example/icon": {"retained": true},
+            }],
+            "annotations": {"audience": ["assistant"], "priority": 0.5},
+            "_meta": {"com.example/template": marker},
+        }))
+        .expect("the final catalog fixture uses valid RFC 6570 and metadata")
+    }
+
+    fn template_catalog_request(method: &str, mut params: serde_json::Value) -> JsonRpcRequest {
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        JsonRpcRequest::new(method, Some(params), 29_100_i64)
+    }
+
     fn marked_router(marker: &str) -> Router {
         let mut router = Router::new();
         router
@@ -14735,6 +14909,394 @@ mod router_tests {
                 .name,
             "incoming"
         );
+    }
+
+    #[test]
+    fn final_template_catalog_supports_full_rfc6570_and_completion_without_read_routes() {
+        let cases = [
+            ("mcp://catalog/{query:3}", "query", "mcp://catalog/sta"),
+            (
+                "mcp://catalog/{first}{second}",
+                "first",
+                "mcp://catalog/staging",
+            ),
+            (
+                "mcp://catalog/{first,second}",
+                "first",
+                "mcp://catalog/staging,testing",
+            ),
+            (
+                "mcp://catalog/search{?values*}",
+                "values",
+                "mcp://catalog/search?values=sta",
+            ),
+        ];
+        let mut router = Router::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut definitions = Vec::new();
+        for (source, _, _) in cases {
+            let definition = exact_catalog_template(source, "catalog-template");
+            router
+                .add_final_resource_template_with_behavior(
+                    definition.clone(),
+                    crate::DuplicateBehavior::Error,
+                )
+                .expect("catalogs accept full RFC 6570 without an inverse matcher");
+            router.add_resource_template_completion_handler(
+                source,
+                CountingCompletion {
+                    final_calls: Arc::clone(&calls),
+                },
+            );
+            assert!(router.resource_templates[source].handler.is_none());
+            assert!(router.resource_templates[source].matcher.is_none());
+            definitions.push(definition);
+        }
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let context = request_context(&cx, 29_100, Budget::INFINITE, &state);
+        let list_request =
+            template_catalog_request("resources/templates/list", serde_json::json!({}));
+        let listed = block_on(router.dispatch_stateless(&context, &list_request))
+            .expect("the real final listing emits every advertised template");
+        assert_eq!(listed["resultType"], "complete");
+        assert_eq!(
+            listed["resourceTemplates"],
+            serde_json::to_value(&definitions).unwrap()
+        );
+        let revision = router.final_catalog_revision;
+
+        for (index, (source, argument, expanded)) in cases.into_iter().enumerate() {
+            let completion = template_catalog_request(
+                COMPLETION_COMPLETE,
+                serde_json::json!({
+                    "ref": {"type": "ref/resource", "uri": source},
+                    "argument": {"name": argument, "value": "sta"},
+                }),
+            );
+            let completed = block_on(router.dispatch_stateless(&context, &completion))
+                .expect("full grammar variables remain eligible completion targets");
+            assert_eq!(
+                completed["completion"]["values"],
+                serde_json::json!(["staging"])
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+            let mut unknown_argument = completion.clone();
+            unknown_argument.params.as_mut().unwrap()["argument"]["name"] =
+                serde_json::json!("undeclared");
+            let rejected = block_on(router.dispatch_stateless(&context, &unknown_argument))
+                .expect_err("changing only the argument name refuses before provider entry");
+            assert_eq!(rejected.code, McpErrorCode::InvalidParams);
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+
+            let missing = block_on(router.dispatch_stateless(
+                &context,
+                &template_catalog_request("resources/read", serde_json::json!({"uri": expanded})),
+            ))
+            .expect_err("a catalog entry does not fabricate a resource reader");
+            assert_eq!(missing.code, McpErrorCode::InvalidParams);
+            assert_eq!(missing.message, "Resource not found");
+            assert_eq!(
+                missing.data.as_ref().and_then(|data| data.get("uri")),
+                Some(&serde_json::json!(expanded))
+            );
+            assert!(!router.resource_exists(expanded));
+
+            if index < 3 {
+                let error = router
+                    .add_resource_with_behavior(
+                        RoutedTemplateResource::new(source, "reader"),
+                        crate::DuplicateBehavior::Replace,
+                    )
+                    .expect_err("the same non-injective template cannot become a reader");
+                assert_eq!(error.code, McpErrorCode::InvalidParams);
+                assert_eq!(router.final_catalog_revision, revision);
+                assert!(router.resource_templates[source].handler.is_none());
+            }
+        }
+
+        let mut malformed = definitions[0].clone();
+        malformed.uri_template.push('{');
+        let malformed_error = router
+            .add_final_resource_template_with_behavior(malformed, crate::DuplicateBehavior::Replace)
+            .expect_err("one unmatched brace still fails bounded grammar admission");
+        assert_eq!(malformed_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(router.final_catalog_revision, revision);
+        assert_eq!(
+            block_on(router.dispatch_stateless(&context, &list_request)).unwrap()["resourceTemplates"],
+            listed["resourceTemplates"],
+            "failed reader or syntax admission changes no catalog metadata or ordering",
+        );
+
+        let connection = ModernConnection::new();
+        let denied = InboundRequestContext::with_modern_connection(
+            cx,
+            29_100,
+            InboundRequestTransport::Stdio,
+            &connection,
+        )
+        .request_context();
+        assert!(denied.disable_resource(cases[0].0));
+        let hidden = block_on(router.dispatch_stateless(
+            &denied,
+            &template_catalog_request(
+                COMPLETION_COMPLETE,
+                serde_json::json!({
+                    "ref": {"type": "ref/resource", "uri": cases[0].0},
+                    "argument": {"name": cases[0].1, "value": "sta"},
+                }),
+            ),
+        ))
+        .expect_err("catalog-only completion retains request visibility admission");
+        assert_eq!(hidden.code, McpErrorCode::InvalidParams);
+        assert_eq!(calls.load(Ordering::SeqCst), cases.len());
+    }
+
+    #[test]
+    fn final_template_catalog_replacement_preserves_reader_and_uri_authority() {
+        const SOURCE: &str = "mcp://catalog/{query:3}";
+        let mut router = Router::new();
+        let original = exact_catalog_template(SOURCE, "original");
+        router
+            .add_final_resource_template_with_behavior(
+                original.clone(),
+                crate::DuplicateBehavior::Error,
+            )
+            .unwrap();
+        let revision = router.final_catalog_revision;
+        for behavior in [
+            crate::DuplicateBehavior::Ignore,
+            crate::DuplicateBehavior::Warn,
+            crate::DuplicateBehavior::Error,
+        ] {
+            let result = router.add_final_resource_template_with_behavior(
+                exact_catalog_template(SOURCE, "replacement"),
+                behavior,
+            );
+            assert_eq!(result.is_err(), behavior == crate::DuplicateBehavior::Error);
+            assert_eq!(router.final_catalog_revision, revision);
+            assert_eq!(
+                serde_json::to_value(
+                    router.resource_templates[SOURCE]
+                        .final_definition
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&original).unwrap(),
+            );
+        }
+        router
+            .add_resource_with_behavior(
+                NamedResource::new("mcp://catalog/sta"),
+                crate::DuplicateBehavior::Error,
+            )
+            .expect("a catalog-only language does not shadow an exact reader");
+
+        const READER: &str = "mcp://reader/{id}";
+        router
+            .add_final_resource_with_behavior(
+                RoutedTemplateResource::new(READER, "original-reader"),
+                crate::DuplicateBehavior::Error,
+            )
+            .unwrap();
+        assert!(!router.resource_templates[READER].legacy_enabled);
+        let calls = Arc::new(AtomicUsize::new(0));
+        router.add_resource_template_completion_handler(
+            READER,
+            CountingCompletion {
+                final_calls: Arc::clone(&calls),
+            },
+        );
+        let metadata = exact_catalog_template(READER, "new-metadata");
+        router
+            .add_final_resource_template_with_behavior(
+                metadata.clone(),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect("metadata replacement retains the real reader");
+        let retained = &router.resource_templates[READER];
+        assert!(retained.handler.is_some());
+        assert!(retained.matcher.is_some());
+        assert!(
+            !retained.legacy_enabled,
+            "metadata cannot activate another execution era"
+        );
+        assert!(
+            !router
+                .final_resource_template_completion_handlers
+                .contains_key(READER)
+        );
+        assert_eq!(
+            serde_json::to_value(retained.final_definition.as_ref().unwrap()).unwrap(),
+            serde_json::to_value(metadata).unwrap()
+        );
+
+        let cx = Cx::for_testing();
+        let state = SessionState::new();
+        let context = request_context(&cx, 29_100, Budget::INFINITE, &state);
+        for (uri, text) in [
+            ("mcp://reader/42", "reader:original-reader"),
+            ("mcp://catalog/sta", "content"),
+        ] {
+            let read = block_on(router.dispatch_stateless(
+                &context,
+                &template_catalog_request("resources/read", serde_json::json!({"uri": uri})),
+            ))
+            .expect("catalog metadata cannot replace or hide an admitted reader");
+            assert_eq!(read["contents"][0]["text"], text);
+        }
+        let revision = router.final_catalog_revision;
+        let legacy_error = router
+            .add_legacy_resource_template_with_behavior(
+                marked_template(READER, "legacy-metadata"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("catalog metadata cannot enable a final-only reader for legacy dispatch");
+        assert_eq!(legacy_error.code, McpErrorCode::InvalidParams);
+        assert_eq!(router.final_catalog_revision, revision);
+
+        let mut legacy = Router::new();
+        legacy
+            .add_legacy_resource_with_behavior(
+                RoutedTemplateResource::new(READER, "legacy-reader"),
+                crate::DuplicateBehavior::Error,
+            )
+            .unwrap();
+        let revision = legacy.final_catalog_revision;
+        let original = serde_json::to_value(legacy.resource_templates()).unwrap();
+        let promotion = legacy
+            .add_final_resource_template_with_behavior(
+                exact_catalog_template(READER, "final-metadata"),
+                crate::DuplicateBehavior::Replace,
+            )
+            .expect_err("catalog metadata cannot promote a legacy-only reader to final dispatch");
+        assert_eq!(promotion.code, McpErrorCode::InvalidParams);
+        assert_eq!(legacy.final_catalog_revision, revision);
+        assert_eq!(
+            serde_json::to_value(legacy.resource_templates()).unwrap(),
+            original
+        );
+        assert!(
+            legacy
+                .resolve_resource_for_era("mcp://reader/42", Some(ProtocolEra::Legacy2024))
+                .is_some()
+        );
+        assert!(
+            legacy
+                .resolve_resource_for_era("mcp://reader/42", Some(ProtocolEra::Modern2026))
+                .is_none()
+        );
+
+        const HTTPS: &str = "https://example.test/catalog/{id}";
+        let mut web = Router::new();
+        let unreviewed = web
+            .add_final_resource_template_with_behavior(
+                exact_catalog_template(HTTPS, "unreviewed"),
+                crate::DuplicateBehavior::Error,
+            )
+            .expect_err("catalog admission cannot invent a client-direct HTTPS declaration");
+        assert_eq!(unreviewed.code, McpErrorCode::InvalidParams);
+        assert_eq!(web.resource_templates_count(), 0);
+        let mut declared = RoutedTemplateResource::new(HTTPS, "declared");
+        declared.client_direct_https = true;
+        web.add_final_resource_with_behavior(declared, crate::DuplicateBehavior::Error)
+            .unwrap();
+        let policy = web.resource_templates[HTTPS].uri_use_policy;
+        web.add_final_resource_template_with_behavior(
+            exact_catalog_template(HTTPS, "updated"),
+            crate::DuplicateBehavior::Replace,
+        )
+        .expect("a retained reader retains its explicit client-direct declaration");
+        assert_eq!(web.resource_templates[HTTPS].uri_use_policy, policy);
+        let listed = block_on(web.dispatch_stateless(
+            &context,
+            &template_catalog_request("resources/templates/list", serde_json::json!({})),
+        ))
+        .unwrap();
+        assert_eq!(listed["resourceTemplates"][0]["name"], "updated");
+        let denied = block_on(web.dispatch_stateless(
+            &context,
+            &template_catalog_request(
+                "resources/read",
+                serde_json::json!({"uri": "https://example.test/catalog/42"}),
+            ),
+        ))
+        .expect_err("client-direct declaration does not grant an MCP HTTPS read");
+        assert_eq!(denied.code, McpErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn final_template_catalog_mount_retains_completion_without_creating_read_routes() {
+        const SOURCE: &str = "mcp://catalog/{query:3}";
+        for (prefix, namespaced) in [(None, false), (Some(""), false), (Some("mounted"), true)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut child = Router::new();
+            let definition = exact_catalog_template(SOURCE, "mounted-template");
+            child
+                .add_final_resource_template_with_behavior(
+                    definition.clone(),
+                    crate::DuplicateBehavior::Error,
+                )
+                .unwrap();
+            child.add_resource_template_completion_handler(
+                SOURCE,
+                CountingCompletion {
+                    final_calls: Arc::clone(&calls),
+                },
+            );
+            let mut parent = Router::new();
+            parent
+                .add_resource_with_behavior(
+                    NamedResource::new("mcp://catalog/sta"),
+                    crate::DuplicateBehavior::Error,
+                )
+                .unwrap();
+            let mounted = if namespaced {
+                parent.mount_namespaced_with_behavior(
+                    child,
+                    prefix,
+                    crate::DuplicateBehavior::Error,
+                )
+            } else {
+                parent.mount_resources_with_behavior(child, prefix, crate::DuplicateBehavior::Error)
+            };
+            assert!(mounted.is_success(), "{prefix:?}: {:?}", mounted.errors);
+            assert_eq!(mounted.resource_templates, 1);
+            assert!(parent.resource_templates[SOURCE].handler.is_none());
+            assert!(parent.resource_templates[SOURCE].matcher.is_none());
+            assert_eq!(
+                serde_json::to_value(
+                    parent.resource_templates[SOURCE]
+                        .final_definition
+                        .as_ref()
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(definition).unwrap()
+            );
+            let cx = Cx::for_testing();
+            let state = SessionState::new();
+            let context = request_context(&cx, 29_100, Budget::INFINITE, &state);
+            let completed = block_on(parent.dispatch_stateless(
+                &context,
+                &template_catalog_request(
+                    COMPLETION_COMPLETE,
+                    serde_json::json!({
+                        "ref": {"type": "ref/resource", "uri": SOURCE},
+                        "argument": {"name": "query", "value": "sta"},
+                    }),
+                ),
+            ))
+            .expect("the mounted full-grammar completion provider is reachable");
+            assert_eq!(
+                completed["completion"]["values"],
+                serde_json::json!(["staging"])
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert!(parent.resource_exists("mcp://catalog/sta"));
+            assert!(!parent.resource_exists("mcp://catalog/oth"));
+        }
     }
 
     // ── resource_exists / resolve_resource ──────────────────────────────
@@ -20222,8 +20784,8 @@ mod router_tests {
     fn final_resource_registration_rejects_template_language_collisions_atomically() {
         let mut template_router = Router::new();
         template_router
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{first}", "first"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{first}", "first"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the first reversible template is admitted");
@@ -20231,8 +20793,8 @@ mod router_tests {
             .expect("the admitted template catalog serializes");
 
         let error = template_router
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{second}", "second"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{second}", "second"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect_err("renaming only the capture must not create a tie-broken route");
@@ -20253,8 +20815,8 @@ mod router_tests {
             .expect("the exact final resource is admitted");
         let exact_count = exact_router.resources_count();
         let error = exact_router
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{id}", "template"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{id}", "template"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect_err("a template cannot shadow an exact final resource");
@@ -20264,8 +20826,8 @@ mod router_tests {
 
         let mut reverse_router = Router::new();
         reverse_router
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{id}", "template"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{id}", "template"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the reversible template is admitted before the planted exact collision");
@@ -20288,14 +20850,14 @@ mod router_tests {
 
         let mut disjoint_router = Router::new();
         disjoint_router
-            .add_resource_template_with_behavior(
-                marked_template("mcp://alpha/{id}", "alpha"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://alpha/{id}", "alpha"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("a disjoint template is admitted");
         disjoint_router
-            .add_resource_template_with_behavior(
-                marked_template("mcp://beta/{id}", "beta"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://beta/{id}", "beta"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("a template with a conflicting literal prefix remains independent");
@@ -20317,8 +20879,8 @@ mod router_tests {
             .expect("the exact destination catalog serializes");
         let mut template_source = Router::new();
         template_source
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{id}", "mounted-template"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{id}", "mounted-template"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the independently admitted source template is valid");
@@ -20335,8 +20897,8 @@ mod router_tests {
 
         let mut template_destination = Router::new();
         template_destination
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{id}", "destination-template"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{id}", "destination-template"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the final template is admitted before mounting");
@@ -20362,8 +20924,8 @@ mod router_tests {
 
         let mut first_template_destination = Router::new();
         first_template_destination
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{first}", "first-template"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{first}", "first-template"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the first final template is admitted");
@@ -20371,8 +20933,8 @@ mod router_tests {
             .expect("the first template destination catalog serializes");
         let mut second_template_source = Router::new();
         second_template_source
-            .add_resource_template_with_behavior(
-                marked_template("mcp://resource/{second}", "second-template"),
+            .add_resource_with_behavior(
+                RoutedTemplateResource::new("mcp://resource/{second}", "second-template"),
                 crate::DuplicateBehavior::Replace,
             )
             .expect("the independently admitted second template is valid");
@@ -20403,8 +20965,8 @@ mod router_tests {
                 .expect("the destination catalog serializes before the mount");
             let mut source = Router::new();
             source
-                .add_resource_template_with_behavior(
-                    marked_template("mcp://resource/{id}", "one-variable-template"),
+                .add_resource_with_behavior(
+                    RoutedTemplateResource::new("mcp://resource/{id}", "one-variable-template"),
                     crate::DuplicateBehavior::Replace,
                 )
                 .expect("the source one-variable final template is admitted");
@@ -20433,8 +20995,11 @@ mod router_tests {
 
             let mut template_destination = Router::new();
             template_destination
-                .add_resource_template_with_behavior(
-                    marked_template("mcp://resource/{id}", "one-variable-destination-template"),
+                .add_resource_with_behavior(
+                    RoutedTemplateResource::new(
+                        "mcp://resource/{id}",
+                        "one-variable-destination-template",
+                    ),
                     crate::DuplicateBehavior::Replace,
                 )
                 .expect("the destination one-variable final template is admitted");
@@ -20478,15 +21043,15 @@ mod router_tests {
         for prefix in [None, Some("")] {
             let mut destination = Router::new();
             destination
-                .add_resource_template_with_behavior(
-                    marked_template("mcp://alpha/{id}", "destination-disjoint"),
+                .add_resource_with_behavior(
+                    RoutedTemplateResource::new("mcp://alpha/{id}", "destination-disjoint"),
                     crate::DuplicateBehavior::Replace,
                 )
                 .expect("the destination disjoint final template is admitted");
             let mut source = Router::new();
             source
-                .add_resource_template_with_behavior(
-                    marked_template("mcp://beta/{id}", "source-disjoint"),
+                .add_resource_with_behavior(
+                    RoutedTemplateResource::new("mcp://beta/{id}", "source-disjoint"),
                     crate::DuplicateBehavior::Replace,
                 )
                 .expect("the source disjoint final template is admitted");

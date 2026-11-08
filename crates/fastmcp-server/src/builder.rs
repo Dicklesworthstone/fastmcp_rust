@@ -19,8 +19,8 @@ use fastmcp_protocol::extensions::{
 use fastmcp_protocol::protocol_policy::ProtocolEra;
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 use fastmcp_protocol::{
-    LoggingCapability, PromptsCapability, ResourceTemplate, ResourcesCapability,
-    ServerCapabilities, ServerExtensionDiscovery, ServerInfo, ToolsCapability,
+    FinalResourceTemplate, LoggingCapability, PromptsCapability, ResourceTemplate,
+    ResourcesCapability, ServerCapabilities, ServerExtensionDiscovery, ServerInfo, ToolsCapability,
 };
 use log::{Level, LevelFilter};
 
@@ -1275,6 +1275,24 @@ impl ServerBuilder {
         match self
             .router
             .add_resource_template_with_behavior(template, self.on_duplicate)
+        {
+            Ok(()) => self.advertise_legacy_resource_subscriptions(),
+            Err(error) => self.refuse(RegistrationKind::ResourceTemplate, name, error),
+        }
+        self
+    }
+
+    /// Registers an exact final catalog template without installing a reader.
+    ///
+    /// Full RFC 6570 templates, including forms that cannot be reverse-matched,
+    /// can be listed and used by a registered completion provider. Replacing
+    /// metadata retains any existing reader and its admission requirements.
+    #[must_use]
+    pub fn final_resource_template(mut self, template: FinalResourceTemplate) -> Self {
+        let name = template.uri_template.clone();
+        match self
+            .router
+            .add_final_resource_template_with_behavior(template, self.on_duplicate)
         {
             Ok(()) => self.advertise_legacy_resource_subscriptions(),
             Err(error) => self.refuse(RegistrationKind::ResourceTemplate, name, error),
@@ -5463,6 +5481,87 @@ mod tests {
             .resource_template(template)
             .build();
         assert!(server.capabilities().resources.is_some());
+    }
+
+    #[test]
+    fn builder_final_template_catalog_lists_exact_metadata_without_a_reader() {
+        let definition: FinalResourceTemplate = serde_json::from_value(serde_json::json!({
+            "uriTemplate": "mcp://catalog/{query:3}",
+            "name": "catalog-search",
+            "title": "Search catalog",
+            "icons": [{"src": "https://example.test/search.svg", "sizes": ["32x32"]}],
+            "annotations": {"audience": ["assistant"], "priority": 0.5},
+            "_meta": {"com.example/catalog": {"retained": true}},
+        }))
+        .unwrap();
+        let server = ServerBuilder::try_new_with_fixed_protocol_policy(
+            "catalog",
+            "1.0",
+            ProtocolPolicy::ModernOnly,
+        )
+        .unwrap()
+        .final_resource_template(definition.clone())
+        .try_build()
+        .expect("a prefix modifier is valid for listing without a reader");
+        let connection = crate::ModernConnection::new();
+        for (id, method, mut params) in [
+            (551_u64, "resources/templates/list", serde_json::json!({})),
+            (
+                552_u64,
+                "resources/read",
+                serde_json::json!({"uri": "mcp://catalog/sta"}),
+            ),
+        ] {
+            params["_meta"] = serde_json::json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+            });
+            let inbound = crate::InboundRequestContext::with_modern_connection(
+                asupersync::Cx::for_testing(),
+                id,
+                crate::InboundRequestTransport::Memory,
+                &connection,
+            );
+            let request = fastmcp_protocol::JsonRpcRequest::new(
+                method,
+                Some(params),
+                i64::try_from(id).expect("fixed catalog test request IDs fit i64"),
+            );
+            let response = fastmcp_core::block_on(server.dispatch_stateless(&inbound, &request))
+                .expect("the public server dispatch returns the final response");
+            if method == "resources/templates/list" {
+                assert!(response.error.is_none(), "{:?}", response.error);
+                let result = response.result.unwrap();
+                assert_eq!(result["resultType"], "complete");
+                assert_eq!(
+                    result["resourceTemplates"],
+                    serde_json::json!([definition.clone()])
+                );
+            } else {
+                assert!(response.result.is_none());
+                let error = response
+                    .error
+                    .expect("a catalog must not install a synthetic reader");
+                assert_eq!(error.code.as_i32(), Some(-32602));
+                assert_eq!(error.message, "Resource not found");
+            }
+        }
+
+        let mut malformed = definition.clone();
+        malformed.uri_template.push('{');
+        let refused = refused_registrations(
+            ServerBuilder::new("catalog", "1.0").final_resource_template(malformed),
+        );
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].kind, RegistrationKind::ResourceTemplate);
+        let duplicates = refused_registrations(
+            ServerBuilder::new("catalog", "1.0")
+                .on_duplicate(DuplicateBehavior::Error)
+                .final_resource_template(definition.clone())
+                .final_resource_template(definition),
+        );
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(duplicates[0].kind, RegistrationKind::ResourceTemplate);
     }
 
     // ── Middleware ──────────────────────────────────────────────────

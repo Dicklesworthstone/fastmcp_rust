@@ -2177,57 +2177,6 @@ pub mod auto {
         inner: fastmcp_server::ServerBuilder,
     }
 
-    /// Bridges an exact final template into the shared Auto registration path.
-    struct ResourceTemplateRegistration {
-        definition: crate::FinalResourceTemplate,
-    }
-
-    impl ResourceTemplateRegistration {
-        fn new(definition: crate::FinalResourceTemplate) -> Self {
-            Self { definition }
-        }
-
-        fn legacy_template(&self) -> crate::ResourceTemplate {
-            crate::ResourceTemplate {
-                uri_template: self.definition.uri_template.clone(),
-                name: self.definition.name.clone(),
-                description: self.definition.description.clone(),
-                mime_type: self.definition.mime_type.clone(),
-                icon: None,
-                version: None,
-                tags: Vec::new(),
-            }
-        }
-    }
-
-    impl crate::ResourceHandler for ResourceTemplateRegistration {
-        fn definition(&self) -> crate::Resource {
-            crate::Resource {
-                uri: self.definition.uri_template.clone(),
-                name: self.definition.name.clone(),
-                description: self.definition.description.clone(),
-                mime_type: self.definition.mime_type.clone(),
-                icon: None,
-                version: None,
-                tags: Vec::new(),
-            }
-        }
-
-        fn template(&self) -> Option<crate::ResourceTemplate> {
-            Some(self.legacy_template())
-        }
-
-        fn final_template_definition(&self) -> Option<crate::FinalResourceTemplate> {
-            Some(self.definition.clone())
-        }
-
-        fn read(&self, _ctx: &crate::McpContext) -> McpResult<Vec<crate::ResourceContent>> {
-            Err(McpError::invalid_request(
-                "resource template registration does not provide resource content",
-            ))
-        }
-    }
-
     impl ServerBuilder {
         /// Creates a builder permanently pinned to the supported Auto policy.
         #[must_use]
@@ -2549,14 +2498,13 @@ pub mod auto {
             }
         }
 
-        /// Registers one exact final template and derives its exact-2024 view
-        /// only for a legacy connection selected by Auto admission.
+        /// Registers a full RFC 6570 catalog/completion template without a reader.
+        /// A compatible exact-2024 view is used only for a legacy connection
+        /// selected by Auto admission.
         #[must_use]
         pub fn resource_template(self, template: crate::FinalResourceTemplate) -> Self {
             Self {
-                inner: self
-                    .inner
-                    .resource(ResourceTemplateRegistration::new(template)),
+                inner: self.inner.final_resource_template(template),
             }
         }
 
@@ -7866,58 +7814,6 @@ pub mod modern {
         )
     }
 
-    /// Internal registration bridge that lets the router retain an exact final
-    /// template while satisfying its concrete template matcher contract.
-    struct FinalResourceTemplateRegistration {
-        definition: FinalResourceTemplate,
-    }
-
-    impl FinalResourceTemplateRegistration {
-        fn new(definition: FinalResourceTemplate) -> Self {
-            Self { definition }
-        }
-
-        fn legacy_template(&self) -> fastmcp_protocol::ResourceTemplate {
-            fastmcp_protocol::ResourceTemplate {
-                uri_template: self.definition.uri_template.clone(),
-                name: self.definition.name.clone(),
-                description: self.definition.description.clone(),
-                mime_type: self.definition.mime_type.clone(),
-                icon: None,
-                version: None,
-                tags: Vec::new(),
-            }
-        }
-    }
-
-    impl ResourceHandler for FinalResourceTemplateRegistration {
-        fn definition(&self) -> fastmcp_protocol::Resource {
-            fastmcp_protocol::Resource {
-                uri: self.definition.uri_template.clone(),
-                name: self.definition.name.clone(),
-                description: self.definition.description.clone(),
-                mime_type: self.definition.mime_type.clone(),
-                icon: None,
-                version: None,
-                tags: Vec::new(),
-            }
-        }
-
-        fn template(&self) -> Option<fastmcp_protocol::ResourceTemplate> {
-            Some(self.legacy_template())
-        }
-
-        fn final_template_definition(&self) -> Option<FinalResourceTemplate> {
-            Some(self.definition.clone())
-        }
-
-        fn read(&self, _ctx: &McpContext) -> McpResult<Vec<fastmcp_protocol::ResourceContent>> {
-            Err(McpError::invalid_request(
-                "resource template registration does not provide resource content",
-            ))
-        }
-    }
-
     /// Final-only facade over the underlying server builder.
     pub struct ServerBuilder {
         inner: fastmcp_server::ServerBuilder,
@@ -8269,16 +8165,15 @@ pub mod modern {
             }
         }
 
-        /// Registers one exact final resource template for final discovery.
+        /// Registers one exact final resource template for listing and completion.
         ///
-        /// The template remains exact through router admission; no
-        /// legacy-shaped template is accepted or exposed by this facade.
+        /// Full bounded RFC 6570 syntax is accepted without installing a reader.
+        /// Real template readers must separately pass reversible-route admission.
+        /// The exact final metadata is retained through registration and mounting.
         #[must_use]
         pub fn resource_template(self, template: FinalResourceTemplate) -> Self {
             Self {
-                inner: self
-                    .inner
-                    .resource(FinalResourceTemplateRegistration::new(template)),
+                inner: self.inner.final_resource_template(template),
             }
         }
 
@@ -13810,6 +13705,56 @@ mod tests {
     }
 
     #[test]
+    fn facade_template_catalog_accepts_full_rfc6570_and_rejects_malformed_syntax() {
+        let definition: super::FinalResourceTemplate = serde_json::from_value(serde_json::json!({
+            "uriTemplate": "mcp://facade/{first}{second}{?filters*}",
+            "name": "facade-catalog",
+            "title": "Facade catalog",
+            "_meta": {"com.example/catalog": {"retained": true}},
+        }))
+        .unwrap();
+        let child = super::modern::server_builder("child", "1.0")
+            .resource_template(definition.clone())
+            .try_build()
+            .expect("the modern facade accepts advertised non-reversible templates");
+        let mounted = super::modern::server_builder("parent", "1.0")
+            .mount(child, Some("catalog"))
+            .try_build()
+            .expect("namespaced facade mounting preserves advertised template identities");
+        let discovery = serde_json::to_value(mounted.server_discovery().unwrap()).unwrap();
+        assert!(discovery["capabilities"]["resources"].is_object());
+
+        let mut malformed = definition.clone();
+        malformed.uri_template.push('{');
+        assert!(
+            super::modern::server_builder("invalid", "1.0")
+                .resource_template(malformed.clone())
+                .try_build()
+                .is_err()
+        );
+
+        #[cfg(feature = "legacy-2024-11-05")]
+        {
+            let child = super::auto::server_builder("child", "1.0")
+                .resource_template(definition)
+                .try_build()
+                .expect("the Auto facade retains the modern full-grammar catalog");
+            let mounted = super::auto::server_builder("parent", "1.0")
+                .mount(child, Some("catalog"))
+                .try_build()
+                .expect("Auto facade mounting does not require a reverse matcher");
+            let discovery = serde_json::to_value(mounted.server_discovery().unwrap()).unwrap();
+            assert!(discovery["capabilities"]["resources"].is_object());
+            assert!(
+                super::auto::server_builder("invalid", "1.0")
+                    .resource_template(malformed)
+                    .try_build()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     #[cfg(feature = "legacy-2024-11-05")]
     fn modern_facade_server_builder_forwards_target_completion_providers() {
         use std::collections::HashMap;
@@ -13883,7 +13828,7 @@ mod tests {
             "the modern facade forwards an admitted prompt-specific provider"
         );
 
-        let template_uri = "mcp://facade/{id}";
+        let template_uri = "mcp://facade/{id:3}";
         let template_server = modern::server_builder("facade", "1.0")
             .resource_template(super::FinalResourceTemplate {
                 uri_template: template_uri.to_owned(),
