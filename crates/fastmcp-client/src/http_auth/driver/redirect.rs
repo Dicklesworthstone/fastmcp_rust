@@ -25,8 +25,9 @@ use asupersync::time::Sleep;
 use asupersync::tls::{Certificate, RootCertStore};
 use asupersync::types::Time;
 
-use super::check_lifetime;
+use super::{check_lifetime, require_timer};
 use crate::http_auth::CanonicalHttpUrl;
+use crate::http_auth::caller::with_caller;
 use crate::http_auth::oauth::OAuthError;
 
 const MAX_QUERY_BYTES: usize = 16 * 1024;
@@ -106,15 +107,12 @@ impl RedirectAuthorizationDriver {
     /// No form is submitted, no grant is invented, and no token is handled.
     /// The callback's 200/400 receipt is left to native OAuth to interpret.
     pub async fn drive(&self, cx: &Cx, authorization: CanonicalHttpUrl) -> Result<(), OAuthError> {
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.timer_driver().is_none() {
-            return Err(OAuthError::RuntimeTimerUnavailable);
-        }
-        if !cx.capabilities().io {
-            return Err(OAuthError::RuntimeCapabilityUnavailable);
-        }
+        with_caller(cx, || {
+            if cx.checkpoint().is_err() {
+                return Err(OAuthError::Cancelled);
+            }
+            require_front_channel_effects(cx)
+        })?;
         let binding = CallbackBinding::new(&self.endpoint, &authorization)?;
         let nanos =
             u64::try_from(self.timeout.as_nanos()).map_err(|_| OAuthError::InvalidConfiguration)?;
@@ -318,35 +316,50 @@ fn decode(source: &str) -> Result<String, OAuthError> {
     String::from_utf8(decoded).map_err(|_| OAuthError::BrowserLaunchFailed)
 }
 
+// The direct public driver and every resumed poll use the same effective
+// caller scope; owning broad drivers does not override a host restriction.
+fn require_front_channel_effects(cx: &Cx) -> Result<(), OAuthError> {
+    require_timer(cx)?;
+    if !Cx::current().is_some_and(|active| active.capabilities().io) {
+        return Err(OAuthError::RuntimeCapabilityUnavailable);
+    }
+    Ok(())
+}
+
 async fn bounded<T>(
     cx: &Cx,
     deadline: Time,
     future: impl Future<Output = Result<T, OAuthError>>,
 ) -> Result<T, OAuthError> {
     let mut future = std::pin::pin!(future);
-    let sleep = {
-        let _caller = Cx::set_current(Some(cx.clone()));
-        Sleep::new(deadline)
-    };
+    let sleep = with_caller(cx, || {
+        check_lifetime(cx, deadline)?;
+        require_front_channel_effects(cx)?;
+        Ok::<_, OAuthError>(Sleep::new(deadline))
+    })?;
     let mut sleep = std::pin::pin!(sleep);
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     poll_fn(|task| {
-        if let Err(error) = check_lifetime(cx, deadline) {
-            return Poll::Ready(Err(error));
-        }
-        let _caller = Cx::set_current(Some(cx.clone()));
-        if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(OAuthError::Cancelled));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(OAuthError::TimedOut));
-        }
-        let result = future.as_mut().poll(task);
-        if let Err(error) = check_lifetime(cx, deadline) {
-            return Poll::Ready(Err(error));
-        }
-        result
+        with_caller(cx, || {
+            if let Err(error) = check_lifetime(cx, deadline) {
+                return Poll::Ready(Err(error));
+            }
+            if let Err(error) = require_front_channel_effects(cx) {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthError::Cancelled));
+            }
+            if sleep.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthError::TimedOut));
+            }
+            let result = future.as_mut().poll(task);
+            if let Err(error) = check_lifetime(cx, deadline) {
+                return Poll::Ready(Err(error));
+            }
+            result
+        })
     })
     .await
 }
@@ -518,6 +531,7 @@ mod live_tests {
     use super::*;
     use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionPolicy};
     use crate::http_auth::oauth::{OAuthClient, OAuthClientConfiguration};
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
     use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use asupersync::net::{TcpListener, TcpStream};
     use asupersync::runtime::{RuntimeBuilder, reactor::create_reactor};
@@ -535,6 +549,48 @@ mod live_tests {
 
     fn root() -> Certificate {
         Certificate::from_pem(ROOT).unwrap().remove(0)
+    }
+
+    fn held_effects(cx: &Cx, mask: CapMask) -> Cx {
+        let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(mask);
+        Cx::current().unwrap()
+    }
+
+    fn poll_under_ambient<F: Future>(
+        future: std::pin::Pin<&mut F>,
+        task: &mut std::task::Context<'_>,
+        ambient: &Cx,
+    ) -> Poll<F::Output> {
+        let _ambient = Cx::set_current(Some(ambient.clone()));
+        let before = Cx::current().unwrap();
+        let effects = before.capabilities();
+        let depth = Cx::restriction_depth();
+        let result = future.poll(task);
+        let after = Cx::current().unwrap();
+        let after_effects = after.capabilities();
+        assert_eq!(after.task_id(), before.task_id());
+        assert_eq!(after.region_id(), before.region_id());
+        assert_eq!(after.budget(), before.budget());
+        assert_eq!(
+            [
+                after_effects.spawn,
+                after_effects.time,
+                after_effects.entropy,
+                after_effects.io,
+                after_effects.remote
+            ],
+            [
+                effects.spawn,
+                effects.time,
+                effects.entropy,
+                effects.io,
+                effects.remote
+            ],
+        );
+        assert_eq!(after.is_cancel_requested(), before.is_cancel_requested());
+        assert_eq!(Cx::restriction_depth(), depth);
+        result
     }
 
     fn run(future: impl Future<Output = ()>) {
@@ -792,6 +848,145 @@ mod live_tests {
                 "an extra request was sent after terminal authorization"
             );
         }
+    }
+
+    #[test]
+    fn direct_redirect_driver_refuses_effect_denial_before_connecting() {
+        run(async {
+            let healthy = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let driver = peer.driver();
+            let callback = format!(
+                "http://{}/oauth/callback",
+                peer.listener.local_addr().unwrap()
+            );
+            let authorization = url(&format!(
+                "{}/authorize?client_id=native&response_type=code&code_challenge_method=S256&code_challenge=challenge&state=bound-state&redirect_uri={}",
+                peer.issuer(),
+                encode(&callback),
+            ));
+            let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+            foreign.set_cancel_requested(true);
+            for (mask, expected) in [
+                (
+                    CapSet::<true, true, true, false, true>::MASK,
+                    OAuthError::RuntimeCapabilityUnavailable,
+                ),
+                (
+                    CapSet::<true, false, true, true, true>::MASK,
+                    OAuthError::RuntimeTimerUnavailable,
+                ),
+            ] {
+                for restrict_explicit in [false, true] {
+                    let caller = held_effects(
+                        &healthy,
+                        if restrict_explicit {
+                            mask
+                        } else {
+                            CapMask::all()
+                        },
+                    );
+                    let ambient = held_effects(
+                        &foreign,
+                        if restrict_explicit {
+                            CapMask::all()
+                        } else {
+                            mask
+                        },
+                    );
+                    let mut request = Box::pin(driver.drive(&caller, authorization.clone()));
+                    let result =
+                        poll_fn(|task| poll_under_ambient(request.as_mut(), task, &ambient)).await;
+                    assert_eq!(result, Err(expected));
+                    assert!(!caller.is_cancel_requested());
+                    let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(peer.listener.poll_accept(&mut task).is_pending());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn direct_redirect_driver_rechecks_a_pending_network_poll() {
+        for (mask, expected) in [
+            (
+                CapSet::<true, true, true, false, true>::MASK,
+                OAuthError::RuntimeCapabilityUnavailable,
+            ),
+            (
+                CapSet::<true, false, true, true, true>::MASK,
+                OAuthError::RuntimeTimerUnavailable,
+            ),
+        ] {
+            run(async {
+                let healthy = Cx::current().unwrap();
+                let peer = Peer::new().await;
+                let driver = peer.driver();
+                let callback = format!(
+                    "http://{}/oauth/callback",
+                    peer.listener.local_addr().unwrap()
+                );
+                let authorization = url(&format!(
+                    "{}/authorize?client_id=native&response_type=code&code_challenge_method=S256&code_challenge=challenge&state=bound-state&redirect_uri={}",
+                    peer.issuer(),
+                    encode(&callback),
+                ));
+                let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+                foreign.set_cancel_requested(true);
+                let mut request = Box::pin(driver.drive(&healthy, authorization));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(poll_under_ambient(request.as_mut(), &mut task, &foreign).is_pending());
+                let ambient = held_effects(&foreign, mask);
+                assert_eq!(
+                    poll_under_ambient(request.as_mut(), &mut task, &ambient),
+                    Poll::Ready(Err(expected)),
+                );
+                drop(request);
+                assert!(!healthy.is_cancel_requested());
+            });
+        }
+    }
+
+    #[test]
+    fn native_tls_authorization_preserves_a_restricted_foreign_ambient_scope() {
+        run(async {
+            let healthy = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let client = peer.client();
+            let driver = peer.driver();
+            let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+            foreign.set_cancel_requested(true);
+            let ambient = held_effects(&foreign, CapSet::<false, true, true, true, false>::MASK);
+            let mut login = Box::pin(client.authorize_with_browser_driver(
+                &healthy,
+                Duration::from_secs(5),
+                |authorization| {
+                    let current = Cx::current().unwrap();
+                    assert_eq!(current.task_id(), healthy.task_id());
+                    assert_eq!(current.budget(), healthy.budget());
+                    assert!(current.timer_driver().is_some());
+                    assert!(!current.is_cancel_requested());
+                    assert!(!current.capabilities().spawn);
+                    assert!(!current.capabilities().remote);
+                    driver.drive(&healthy, authorization)
+                },
+            ));
+            let authorization = poll_fn(|task| poll_under_ambient(login.as_mut(), task, &ambient));
+            let (grant, requests) =
+                Box::pin(pair(authorization, peer.serve(Mode::Success(302)))).await;
+            let grant = grant.unwrap();
+            assert_eq!(requests, 2);
+            assert!(grant.has_refresh_token());
+            assert_eq!(
+                grant
+                    .bearer_credential()
+                    .authorization_for_target(&url("https://resource.example/mcp")),
+                Some("Bearer wire-access".to_owned()),
+            );
+            assert!(!healthy.is_cancel_requested());
+            assert!(foreign.is_cancel_requested());
+            peer.assert_no_more_connections(&healthy).await;
+        });
     }
 
     #[test]

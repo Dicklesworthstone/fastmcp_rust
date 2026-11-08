@@ -405,9 +405,15 @@ impl OAuthClient {
         F: Future<Output = Result<(), OAuthError>>,
     {
         let deadline = operation_deadline(cx, self.configuration.authorization_timeout)?;
-        if !cx.capabilities().entropy {
-            return Err(OAuthError::RuntimeCapabilityUnavailable);
-        }
+        // The supplied caller owns identity and drivers; it cannot restore an
+        // effect that the surrounding host scope has withheld. Draw all pending
+        // secrets before binding a listener, under that same effective ceiling.
+        let attempt = with_caller(cx, || {
+            if !Cx::current().is_some_and(|active| active.capabilities().entropy) {
+                return Err(OAuthError::RuntimeCapabilityUnavailable);
+            }
+            AuthorizationAttempt::new()
+        })?;
         let listener = within(cx, deadline, bind_loopback()).await?;
         let address = listener
             .local_addr()
@@ -416,7 +422,6 @@ impl OAuthClient {
             return Err(OAuthError::CallbackBindFailed);
         }
         let redirect_uri = format!("http://{address}{CALLBACK_PATH}");
-        let attempt = AuthorizationAttempt::new()?;
         let authorization_url = attempt.authorization_url(&self.configuration, &redirect_uri)?;
         within(cx, deadline, async {
             launch_browser(authorization_url)
@@ -760,31 +765,42 @@ async fn bind_loopback() -> Result<TcpListener, OAuthError> {
 }
 
 fn operation_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthError> {
-    if cx.checkpoint().is_err() {
-        return Err(OAuthError::Cancelled);
-    }
-    if !cx.capabilities().io {
+    with_caller(cx, || {
+        if cx.checkpoint().is_err() {
+            return Err(OAuthError::Cancelled);
+        }
+        require_native_effects(cx)?;
+        let nanos =
+            u64::try_from(timeout.as_nanos()).map_err(|_| OAuthError::InvalidConfiguration)?;
+        let end = cx
+            .now()
+            .as_nanos()
+            .checked_add(nanos)
+            .ok_or(OAuthError::InvalidConfiguration)?;
+        let end = cx
+            .budget()
+            .deadline
+            .map_or(Time::from_nanos(end), |parent| {
+                parent.min(Time::from_nanos(end))
+            });
+        if cx.now() >= end {
+            return Err(OAuthError::TimedOut);
+        }
+        Ok(end)
+    })
+}
+
+// Call only inside with_caller: the ambient ceiling has already been applied,
+// while the explicit caller still supplies the timer and cancellation domain.
+fn require_native_effects(cx: &Cx) -> Result<(), OAuthError> {
+    let active = Cx::current().ok_or(OAuthError::RuntimeCapabilityUnavailable)?;
+    if !active.capabilities().io {
         return Err(OAuthError::RuntimeCapabilityUnavailable);
     }
-    if cx.timer_driver().is_none() {
+    if !active.capabilities().time || cx.timer_driver().is_none() {
         return Err(OAuthError::RuntimeTimerUnavailable);
     }
-    let nanos = u64::try_from(timeout.as_nanos()).map_err(|_| OAuthError::InvalidConfiguration)?;
-    let end = cx
-        .now()
-        .as_nanos()
-        .checked_add(nanos)
-        .ok_or(OAuthError::InvalidConfiguration)?;
-    let end = cx
-        .budget()
-        .deadline
-        .map_or(Time::from_nanos(end), |parent| {
-            parent.min(Time::from_nanos(end))
-        });
-    if cx.now() >= end {
-        return Err(OAuthError::TimedOut);
-    }
-    Ok(end)
+    Ok(())
 }
 
 async fn within<T>(
@@ -797,34 +813,50 @@ async fn within<T>(
         .deadline
         .map_or(deadline, |parent| parent.min(deadline));
     let mut future = std::pin::pin!(future);
-    let sleep = with_caller(cx, || Sleep::new(deadline));
+    let sleep = with_caller(cx, || {
+        if cx.checkpoint().is_err() {
+            return Err(OAuthError::Cancelled);
+        }
+        if cx.now() >= deadline {
+            return Err(OAuthError::TimedOut);
+        }
+        require_native_effects(cx)?;
+        Ok::<_, OAuthError>(Sleep::new(deadline))
+    })?;
     let mut sleep = std::pin::pin!(sleep);
     // A pending cancel-correct receive registers a cancellation wake even when
     // the socket or the host's browser future has no traffic of its own.
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
-    poll_fn(|task| with_caller(cx, || {
-        if cx.checkpoint().is_err() {
-            return Poll::Ready(Err(OAuthError::Cancelled));
-        }
-        if cx.now() >= deadline {
-            return Poll::Ready(Err(OAuthError::TimedOut));
-        }
-        if cancelled.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(OAuthError::Cancelled));
-        }
-        if sleep.as_mut().poll(task).is_ready() {
-            return Poll::Ready(Err(OAuthError::TimedOut));
-        }
-        let result = future.as_mut().poll(task);
-        if cx.checkpoint().is_err() {
-            return Poll::Ready(Err(OAuthError::Cancelled));
-        }
-        if cx.now() >= deadline {
-            return Poll::Ready(Err(OAuthError::TimedOut));
-        }
-        result
-    }))
+    poll_fn(|task| {
+        with_caller(cx, || {
+            if cx.checkpoint().is_err() {
+                return Poll::Ready(Err(OAuthError::Cancelled));
+            }
+            if cx.now() >= deadline {
+                return Poll::Ready(Err(OAuthError::TimedOut));
+            }
+            // Recheck every poll: a suspended flow may resume under a stricter host
+            // scope. Refuse before polling a socket, timer, or browser future there.
+            if let Err(error) = require_native_effects(cx) {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthError::Cancelled));
+            }
+            if sleep.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(OAuthError::TimedOut));
+            }
+            let result = future.as_mut().poll(task);
+            if cx.checkpoint().is_err() {
+                return Poll::Ready(Err(OAuthError::Cancelled));
+            }
+            if cx.now() >= deadline {
+                return Poll::Ready(Err(OAuthError::TimedOut));
+            }
+            result
+        })
+    })
     .await
 }
 
@@ -1403,6 +1435,37 @@ fn admit_token_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+
+    fn held_effects(cx: &Cx, mask: CapMask) -> Cx {
+        let _caller = Cx::set_current(Some(cx.clone()));
+        let _restriction = Cx::push_restriction(mask);
+        Cx::current().unwrap()
+    }
+
+    fn effect_row(cx: &Cx) -> [bool; 5] {
+        let c = cx.capabilities();
+        [c.spawn, c.time, c.entropy, c.io, c.remote]
+    }
+
+    fn poll_under_ambient<F: Future>(
+        future: std::pin::Pin<&mut F>,
+        task: &mut std::task::Context<'_>,
+        ambient: &Cx,
+    ) -> Poll<F::Output> {
+        let _ambient = Cx::set_current(Some(ambient.clone()));
+        let before = Cx::current().unwrap();
+        let depth = Cx::restriction_depth();
+        let result = future.poll(task);
+        let after = Cx::current().unwrap();
+        assert_eq!(after.task_id(), before.task_id());
+        assert_eq!(after.region_id(), before.region_id());
+        assert_eq!(after.budget(), before.budget());
+        assert_eq!(effect_row(&after), effect_row(&before));
+        assert_eq!(after.is_cancel_requested(), before.is_cancel_requested());
+        assert_eq!(Cx::restriction_depth(), depth);
+        result
+    }
 
     fn url(value: &str) -> CanonicalHttpUrl {
         CanonicalHttpUrl::parse(value).unwrap()
@@ -1418,6 +1481,174 @@ mod tests {
             vec!["tools:read".to_owned(), "tools:write".to_owned()],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn native_authorization_obeys_effect_ceilings_before_browser_launch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let healthy = Cx::current().unwrap();
+                // Its identity, cancellation, budget and absent drivers are not
+                // substitutes for the explicit caller's authority and lifetime.
+                let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+                foreign.set_cancel_requested(true);
+                let client = OAuthClient::new(config());
+                for (mask, expected, launches) in [
+                    (
+                        CapSet::<true, true, true, false, true>::MASK,
+                        OAuthError::RuntimeCapabilityUnavailable,
+                        0,
+                    ),
+                    (
+                        CapSet::<true, false, true, true, true>::MASK,
+                        OAuthError::RuntimeTimerUnavailable,
+                        0,
+                    ),
+                    (
+                        CapSet::<true, true, false, true, true>::MASK,
+                        OAuthError::RuntimeCapabilityUnavailable,
+                        0,
+                    ),
+                    (
+                        CapSet::<false, true, true, true, false>::MASK,
+                        OAuthError::BrowserLaunchFailed,
+                        1,
+                    ),
+                    (CapMask::all(), OAuthError::BrowserLaunchFailed, 1),
+                ] {
+                    for restrict_explicit in [false, true] {
+                        let caller = held_effects(
+                            &healthy,
+                            if restrict_explicit {
+                                mask
+                            } else {
+                                CapMask::all()
+                            },
+                        );
+                        let ambient = held_effects(
+                            &foreign,
+                            if restrict_explicit {
+                                CapMask::all()
+                            } else {
+                                mask
+                            },
+                        );
+                        let started = AtomicUsize::new(0);
+                        let expected_effects = effect_row(&held_effects(&healthy, mask));
+                        let mut login = Box::pin(client.authorize(&caller, |authorization| {
+                            let current = Cx::current().unwrap();
+                            assert_eq!(current.task_id(), caller.task_id());
+                            assert_eq!(current.budget(), caller.budget());
+                            assert!(current.timer_driver().is_some());
+                            assert!(!current.is_cancel_requested());
+                            assert_eq!(effect_row(&current), expected_effects);
+                            assert_eq!(authorization.scheme(), "https");
+                            started.fetch_add(1, Ordering::SeqCst);
+                            async {
+                                let _nested = Cx::push_restriction(
+                                    CapSet::<true, true, true, true, false>::MASK,
+                                );
+                                assert!(!Cx::current().unwrap().capabilities().remote);
+                                Err(OAuthError::BrowserLaunchFailed)
+                            }
+                        }));
+                        let result =
+                            poll_fn(|task| poll_under_ambient(login.as_mut(), task, &ambient))
+                                .await;
+                        assert_eq!(result.err(), Some(expected));
+                        assert_eq!(started.load(Ordering::SeqCst), launches);
+                        assert!(!caller.is_cancel_requested());
+                        assert!(foreign.is_cancel_requested());
+                    }
+                }
+            });
+    }
+
+    #[test]
+    fn native_pending_browser_rechecks_effects_and_preserves_caller_cancellation() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BrowserDrop(Arc<AtomicUsize>);
+        impl Drop for BrowserDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+            foreign.set_cancel_requested(true);
+            for stop in ["io", "time", "cancel", "deadline"] {
+                let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+                let client = OAuthClient::new(
+                    config()
+                        .with_authorization_timeout(Duration::from_secs(1))
+                        .unwrap(),
+                );
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let owned = BrowserDrop(Arc::clone(&drops));
+                let mut login = Box::pin(client.authorize(&caller, |_| {
+                    let polls = Arc::clone(&polls);
+                    async move {
+                        let _owned = owned;
+                        poll_fn(|_| {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            Poll::<Result<(), OAuthError>>::Pending
+                        })
+                        .await
+                    }
+                }));
+                let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+                assert!(poll_under_ambient(login.as_mut(), &mut task, &foreign).is_pending());
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(drops.load(Ordering::SeqCst), 0);
+                let (mask, expected) = match stop {
+                    "io" => (
+                        CapSet::<true, true, true, false, true>::MASK,
+                        OAuthError::RuntimeCapabilityUnavailable,
+                    ),
+                    "time" => (
+                        CapSet::<true, false, true, true, true>::MASK,
+                        OAuthError::RuntimeTimerUnavailable,
+                    ),
+                    "cancel" => {
+                        caller.set_cancel_requested(true);
+                        (CapMask::all(), OAuthError::Cancelled)
+                    }
+                    "deadline" => {
+                        clock.advance(1_000_000_000);
+                        (CapMask::all(), OAuthError::TimedOut)
+                    }
+                    _ => unreachable!(),
+                };
+                let ambient = held_effects(&foreign, mask);
+                let Poll::Ready(result) = poll_under_ambient(login.as_mut(), &mut task, &ambient)
+                else {
+                    panic!("{stop} must retire the pending native flow without another event");
+                };
+                assert_eq!(result.err(), Some(expected));
+                drop(login);
+                assert_eq!(polls.load(Ordering::SeqCst), 1, "{stop}");
+                assert_eq!(drops.load(Ordering::SeqCst), 1, "{stop}");
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(caller.is_cancel_requested(), stop == "cancel");
+            }
+        });
     }
 
     fn wire(attempt: &AuthorizationAttempt, issuer: &str, extra: &str) -> Vec<u8> {
@@ -2277,6 +2508,118 @@ mod tests {
             br#"{"access_token":"access-one","token_type":"Bearer","expires_in":3600,"refresh_token":"refresh-one"}"#,
             Instant::now(),
         ).unwrap()
+    }
+
+    #[test]
+    fn native_refresh_effect_refusal_preserves_custody_and_allowed_tls_rotation() {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .with_reactor(asupersync::runtime::reactor::create_reactor().unwrap())
+            .build()
+            .unwrap()
+            .block_on(async {
+                let healthy = Cx::current().unwrap();
+                let deadline = operation_deadline(&healthy, Duration::from_secs(10)).unwrap();
+                let listener = within(&healthy, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint =
+                    url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let mut grant = renewable_grant(&configuration);
+                let original = grant.access.clone();
+                let expiry = grant.expires_at;
+                let scopes = grant.scopes.clone();
+                let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+                foreign.set_cancel_requested(true);
+
+                for (mask, expected) in [
+                    (
+                        CapSet::<true, true, true, false, true>::MASK,
+                        OAuthError::RuntimeCapabilityUnavailable,
+                    ),
+                    (
+                        CapSet::<true, false, true, true, true>::MASK,
+                        OAuthError::RuntimeTimerUnavailable,
+                    ),
+                ] {
+                    for restrict_explicit in [false, true] {
+                        let caller = held_effects(
+                            &healthy,
+                            if restrict_explicit { mask } else { CapMask::all() },
+                        );
+                        let ambient = held_effects(
+                            &foreign,
+                            if restrict_explicit { CapMask::all() } else { mask },
+                        );
+                        let mut refresh = Box::pin(client.refresh(&caller, &mut grant));
+                        let result = poll_fn(|task| {
+                            poll_under_ambient(refresh.as_mut(), task, &ambient)
+                        })
+                        .await;
+                        drop(refresh);
+                        assert_eq!(result, Err(expected));
+                        assert_eq!(grant.refresh_token.as_deref(), Some("refresh-one"));
+                        assert_eq!(grant.expires_at, expiry);
+                        assert_eq!(grant.scopes, scopes);
+                        assert_eq!(grant.configuration, configuration);
+                        assert!(!original.is_revoked());
+                        assert_eq!(
+                            grant.access.authorization_for_target(&configuration.resource),
+                            Some("Bearer access-one".to_owned()),
+                        );
+                        assert_listener_drained(&listener);
+                    }
+                }
+
+                // The same unconsumed grant can still rotate over the real TLS
+                // endpoint. Only the ambient I/O/time allowance changes.
+                let ambient = held_effects(
+                    &foreign,
+                    CapSet::<false, true, true, true, false>::MASK,
+                );
+                let acceptor = test_acceptor();
+                let server = within(&healthy, deadline, async {
+                    let (socket, _) = listener
+                        .accept()
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor
+                        .accept(socket)
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    let (head, fields) = read_token_request(&mut tls).await?;
+                    assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                    assert_eq!(fields["grant_type"], "refresh_token");
+                    assert_eq!(fields["refresh_token"], "refresh-one");
+                    assert_eq!(fields["resource"], configuration.resource.as_str());
+                    let body = r#"{"access_token":"access-two","token_type":"Bearer","expires_in":120,"refresh_token":"refresh-two","scope":"tools:read"}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    tls.write_all(response.as_bytes())
+                        .await
+                        .map_err(|_| OAuthError::TransportFailed)?;
+                    tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                    Ok(())
+                });
+                let mut refresh = Box::pin(client.refresh(&healthy, &mut grant));
+                let refreshing = poll_fn(|task| {
+                    poll_under_ambient(refresh.as_mut(), task, &ambient)
+                });
+                let (result, served) = Box::pin(pair(refreshing, server)).await;
+                drop(refresh);
+                assert_eq!(served, Ok(()));
+                assert_eq!(result, Ok(()));
+                assert_eq!(grant.refresh_token.as_deref(), Some("refresh-two"));
+                assert_eq!(grant.scopes, ["tools:read".to_owned()]);
+                assert_eq!(
+                    grant.access.authorization_for_target(&configuration.resource),
+                    Some("Bearer access-two".to_owned()),
+                );
+                assert!(!original.is_revoked());
+                assert!(!healthy.is_cancel_requested());
+                assert_listener_drained(&listener);
+            });
     }
 
     #[test]
