@@ -286,8 +286,6 @@ fn sch_02_a_positive() {
         property(&root, "labels").get("additionalProperties"),
         Some(&json!({
             "type": "integer",
-            "minimum": i64::MIN,
-            "maximum": i64::MAX,
         })),
         "HashMap<String, i64> must carry its value schema"
     );

@@ -3924,14 +3924,43 @@ fn type_to_json_schema(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
         "char" => quote! {
             serde_json::json!({ "type": "string", "minLength": 1, "maxLength": 1 })
         },
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
-        | "usize" => quote! {
+        // Only publish bounds that survive JavaScript's JSON number round trip.
+        // Even exactly representable wide signed minima can stringify to decimal
+        // integers outside the Rust range. Deserialization still enforces the
+        // native limits; omitting schema bounds must not narrow accepted inputs.
+        "i8" | "i16" | "i32" | "u8" | "u16" | "u32" => quote! {
             serde_json::json!({
                 "type": "integer",
                 "minimum": <#ty>::MIN,
                 "maximum": <#ty>::MAX,
             })
         },
+        "i64" | "i128" => quote! {
+            serde_json::json!({ "type": "integer" })
+        },
+        "u64" | "u128" => quote! {
+            serde_json::json!({ "type": "integer", "minimum": 0 })
+        },
+        "isize" | "usize" => {
+            let wide_schema = if type_name == "usize" {
+                quote! { serde_json::json!({ "type": "integer", "minimum": 0 }) }
+            } else {
+                quote! { serde_json::json!({ "type": "integer" }) }
+            };
+            quote! {{
+                // Resolve pointer width in the consuming target, not on the
+                // host running this procedural macro during cross-compilation.
+                if <#ty>::BITS <= 32 {
+                    serde_json::json!({
+                        "type": "integer",
+                        "minimum": <#ty>::MIN,
+                        "maximum": <#ty>::MAX,
+                    })
+                } else {
+                    #wide_schema
+                }
+            }}
+        }
         "f32" | "f64" => quote! {
             serde_json::json!({ "type": "number" })
         },
@@ -6400,7 +6429,10 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// # Supported Types
 ///
 /// - `String` → `"string"`; `char` → a string of exactly one codepoint
-/// - `i8`..`i128`, `u8`..`u128`, `isize`, `usize` → `"integer"` with native bounds
+/// - Integer types → `"integer"`, with native bounds through 32 bits; wider signed
+///   integers omit bounds and wider unsigned integers retain only `minimum: 0`
+///   for JavaScript JSON interoperability. `isize`/`usize` follow the target width.
+///   Rust deserialization still enforces each type's full native range.
 /// - `f32`, `f64` → `"number"`
 /// - `bool` → `"boolean"`
 /// - `Option<T>` → nullable schema; built-ins keep compact type unions while

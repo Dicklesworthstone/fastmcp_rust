@@ -5006,13 +5006,17 @@ fn json_schema_untagged_overlapping_integer_and_null_branches_follow_serde() {
     for invalid in [
         json!(0.5),
         json!(true),
-        json!(u64::MAX),
         json!(["left", "false"]),
         json!({"label": 7}),
         json!({"label": "ready", "extra": 1}),
     ] {
         assert_enum_schema_rejects::<UntaggedOverlappingSchema>(&schema, invalid);
     }
+    // The interoperable i64 schema omits unsafe bounds; Serde still selects
+    // only alternatives whose native Rust ranges can represent this value.
+    let outside_rust_range = json!(u64::MAX);
+    schema.validate(&outside_rust_range).unwrap();
+    assert!(serde_json::from_value::<UntaggedOverlappingSchema>(outside_rust_range).is_err());
 }
 
 #[test]
@@ -6960,31 +6964,33 @@ fn native_integer_schema_cases() -> Vec<NativeIntegerSchemaCase> {
 }
 
 #[test]
-fn json_schema_native_integer_bounds_are_exact() {
+fn json_schema_native_integer_bounds_are_interoperable() {
     let schema = NativeIntegerSchemas::json_schema();
     for case in native_integer_schema_cases() {
         let admitted =
             fastmcp_rust::schema::admit_final_schema(schema["properties"][case.name].clone())
                 .unwrap();
-        assert_eq!(admitted.schema()["minimum"], case.minimum);
-        assert_eq!(admitted.schema()["maximum"], case.maximum);
+        let expected = match case.name {
+            "i64_value" | "i128_value" => json!({"type": "integer"}),
+            "u64_value" | "u128_value" => json!({"type": "integer", "minimum": 0}),
+            "isize_value" if isize::BITS > 32 => json!({"type": "integer"}),
+            "usize_value" if usize::BITS > 32 => json!({"type": "integer", "minimum": 0}),
+            _ => json!({
+                "type": "integer", "minimum": case.minimum, "maximum": case.maximum,
+            }),
+        };
+        assert_eq!(*admitted.schema(), expected, "{}", case.name);
+        // Removing an unsafe schema bound must not clamp valid native inputs
+        // to JavaScript's safe-integer range.
         for value in [case.minimum, case.maximum] {
             admitted.validate(&value).unwrap();
             assert!((case.accepts)(value));
         }
     }
-    assert_eq!(
-        schema["properties"]["i128_value"]["minimum"].to_string(),
-        "-170141183460469231731687303715884105728"
-    );
-    assert_eq!(
-        schema["properties"]["u128_value"]["maximum"].to_string(),
-        "340282366920938463463374607431768211455"
-    );
 }
 
 #[test]
-fn json_schema_native_integer_bounds_reject_neighboring_values() {
+fn json_schema_native_integer_ranges_remain_enforced_by_serde() {
     let schema = NativeIntegerSchemas::json_schema();
     for case in native_integer_schema_cases() {
         let admitted =
@@ -6992,13 +6998,216 @@ fn json_schema_native_integer_bounds_reject_neighboring_values() {
                 .unwrap();
         admitted.validate(&case.minimum).unwrap();
         admitted.validate(&case.maximum).unwrap();
-        for value in [case.below, case.above] {
-            assert!(
+        for (keyword, value) in [("minimum", case.below), ("maximum", case.above)] {
+            assert_eq!(
                 admitted.validate(&value).is_err(),
-                "{} accepts {value}",
-                case.name
+                admitted.schema().get(keyword).is_some(),
+                "{}: only published {keyword} constraints reject {value}",
+                case.name,
             );
-            assert!(!(case.accepts)(value));
+            assert!(
+                !(case.accepts)(value),
+                "{}: Rust still checks {keyword}",
+                case.name,
+            );
+        }
+    }
+}
+
+#[derive(JsonSchema)]
+struct NestedIntegerSchemas {
+    signed: Vec<Option<i64>>,
+    unsigned: HashMap<String, Vec<u128>>,
+    tuples: [(i128, u32); 2],
+    pointers: BTreeMap<String, (isize, usize)>,
+    wrapped: Box<u64>,
+}
+
+#[test]
+fn json_schema_nested_integer_bounds_follow_the_element_type() {
+    let schema = NestedIntegerSchemas::json_schema();
+    let props = &schema["properties"];
+    assert_eq!(
+        props["signed"]["items"],
+        json!({"type": ["integer", "null"]}),
+    );
+    assert_eq!(
+        props["unsigned"]["additionalProperties"]["items"],
+        json!({"type": "integer", "minimum": 0}),
+    );
+    assert_eq!(props["tuples"]["minItems"], 2);
+    assert_eq!(props["tuples"]["maxItems"], 2);
+    assert_eq!(
+        props["tuples"]["items"]["prefixItems"],
+        json!([
+            {"type": "integer"},
+            {"type": "integer", "minimum": 0, "maximum": u32::MAX},
+        ]),
+    );
+    let native = NativeIntegerSchemas::json_schema();
+    let pointers = &props["pointers"]["additionalProperties"]["prefixItems"];
+    assert_eq!(pointers[0], native["properties"]["isize_value"]);
+    assert_eq!(pointers[1], native["properties"]["usize_value"]);
+    assert_eq!(props["wrapped"], json!({"type": "integer", "minimum": 0}));
+}
+
+const MAX_SAFE_JSON_INTEGER: i64 = 9_007_199_254_740_991;
+
+fn has_safe_integer_bounds(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(properties) => properties.iter().all(|(key, value)| {
+            (!matches!(key.as_str(), "minimum" | "maximum")
+                || value.as_i64().is_some_and(|bound| {
+                    (-MAX_SAFE_JSON_INTEGER..=MAX_SAFE_JSON_INTEGER).contains(&bound)
+                }))
+                && has_safe_integer_bounds(value)
+        }),
+        serde_json::Value::Array(values) => values.iter().all(has_safe_integer_bounds),
+        _ => true,
+    }
+}
+
+fn round_trip_binary64_numbers(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Number(number) => {
+            // JavaScript parses JSON numbers as binary64. Converting back to
+            // an integer is exact only after checking the safe-integer range.
+            let parsed: f64 = number.to_string().parse().unwrap();
+            assert!(parsed.is_finite() && parsed.fract() == 0.0);
+            assert!(
+                (-MAX_SAFE_JSON_INTEGER as f64..=MAX_SAFE_JSON_INTEGER as f64).contains(&parsed)
+            );
+            json!(parsed as i64)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(round_trip_binary64_numbers).collect())
+        }
+        serde_json::Value::Object(properties) => serde_json::Value::Object(
+            properties
+                .iter()
+                .map(|(key, value)| (key.clone(), round_trip_binary64_numbers(value)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn integer_schemas_for_interoperability() -> serde_json::Value {
+    json!([
+        NativeIntegerSchemas::json_schema(),
+        NestedIntegerSchemas::json_schema(),
+        EchoNativeIntegerArguments.definition().input_schema,
+    ])
+}
+
+#[test]
+fn json_schema_integer_bounds_survive_binary64_json_round_trip() {
+    let generated = integer_schemas_for_interoperability();
+    assert!(has_safe_integer_bounds(&generated));
+    let binary64 = round_trip_binary64_numbers(&generated);
+    let serialized = serde_json::to_string(&binary64).unwrap();
+    let reparsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(reparsed, generated);
+    assert!(has_safe_integer_bounds(&reparsed));
+
+    // These are the original defect, including the exactly representable
+    // i64::MIN whose decimal spelling can still change in JSON.stringify.
+    for unsafe_bound in [
+        json!(i64::MIN),
+        json!(i64::MAX),
+        json!(u64::MAX),
+        json!(i128::MIN),
+        json!(i128::MAX),
+        json!(u128::MAX),
+    ] {
+        let mut unsafe_schema = generated.clone();
+        unsafe_schema[0]["properties"]["i64_value"]["minimum"] = unsafe_bound;
+        assert!(!has_safe_integer_bounds(&unsafe_schema));
+    }
+}
+
+#[test]
+#[ignore = "requires Node.js; run explicitly with --ignored --exact"]
+fn json_schema_integer_bounds_survive_javascript_json_round_trip() {
+    let generated = integer_schemas_for_interoperability();
+    assert!(has_safe_integer_bounds(&generated));
+    let output = std::process::Command::new("node")
+        .args([
+            "-e",
+            "process.stdout.write(JSON.stringify(JSON.parse(process.argv[1])))",
+        ])
+        .arg(generated.to_string())
+        .output()
+        .expect("Node.js is required for this explicit interoperability test");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let reparsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reparsed, generated);
+    assert!(has_safe_integer_bounds(&reparsed));
+}
+
+static NATIVE_INTEGER_TOOL_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[tool]
+fn echo_native_integer_arguments(
+    i8_value: i8,
+    i16_value: i16,
+    i32_value: i32,
+    i64_value: i64,
+    i128_value: i128,
+    isize_value: isize,
+    u8_value: u8,
+    u16_value: u16,
+    u32_value: u32,
+    u64_value: u64,
+    u128_value: u128,
+    usize_value: usize,
+) -> String {
+    NATIVE_INTEGER_TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    json!({
+        "i8_value": i8_value, "i16_value": i16_value, "i32_value": i32_value,
+        "i64_value": i64_value, "i128_value": i128_value, "isize_value": isize_value,
+        "u8_value": u8_value, "u16_value": u16_value, "u32_value": u32_value,
+        "u64_value": u64_value, "u128_value": u128_value, "usize_value": usize_value,
+    })
+    .to_string()
+}
+
+#[test]
+fn tool_native_integer_deserialization_rejects_out_of_range_before_handler_entry() {
+    let handler = EchoNativeIntegerArguments;
+    let ctx = test_ctx();
+    assert_eq!(
+        handler.definition().input_schema["properties"],
+        NativeIntegerSchemas::json_schema()["properties"],
+    );
+    let mut arguments = json!({});
+    for case in native_integer_schema_cases() {
+        arguments[case.name] = json!(0);
+    }
+    for case in native_integer_schema_cases() {
+        for value in [case.minimum, case.maximum] {
+            let mut valid = arguments.clone();
+            valid[case.name] = value;
+            let content = handler.call(&ctx, valid.clone()).unwrap();
+            let actual: serde_json::Value = serde_json::from_str(expect_text(&content[0])).unwrap();
+            assert_eq!(actual, valid);
+        }
+        let before = NATIVE_INTEGER_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        for value in [case.below, case.above] {
+            let mut invalid = arguments.clone();
+            invalid[case.name] = value;
+            assert!(handler.call(&ctx, invalid).is_err(), "{}", case.name);
+            assert_eq!(
+                NATIVE_INTEGER_TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "{}: rejected input must not enter the handler",
+                case.name,
+            );
         }
     }
 }
