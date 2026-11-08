@@ -6557,6 +6557,172 @@ mod generic_builtin_schemas {
     }
 }
 
+mod alias_schema_providers {
+    use super::*;
+    use fastmcp_rust::schema::{JsonSchemaType, SchemaGenerator, admit_final_schema};
+
+    type Count = u8;
+    type Bytes = Vec<u8>;
+    type Children = Vec<AliasNode>;
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct AliasNode {
+        value: u8,
+        children: Children,
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct TraitOnlyNode {
+        value: u8,
+        children: Vec<Self>,
+    }
+
+    impl JsonSchemaType for TraitOnlyNode {
+        fn schema_body(context: &mut SchemaGenerator) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": context.subschema_for::<u8>(),
+                    "children": context.subschema_for::<Vec<Self>>(),
+                },
+                "required": ["value", "children"],
+                "additionalProperties": false,
+            })
+        }
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct InherentOnly(bool);
+
+    impl InherentOnly {
+        fn json_schema() -> serde_json::Value {
+            json!({"type": "boolean"})
+        }
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    struct BothProviders(u8);
+
+    impl BothProviders {
+        fn json_schema() -> serde_json::Value {
+            panic!("context-aware dispatch must not invoke the inherent fallback")
+        }
+    }
+
+    impl JsonSchemaType for BothProviders {
+        fn schema_body(context: &mut SchemaGenerator) -> serde_json::Value {
+            context.subschema_for::<u8>()
+        }
+    }
+
+    #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct Arguments {
+        count: Count,
+        bytes: Bytes,
+        node: TraitOnlyNode,
+        alias_tree: AliasNode,
+        manual: InherentOnly,
+        both: BothProviders,
+    }
+
+    fn valid_arguments() -> serde_json::Value {
+        json!({
+            "count": 255,
+            "bytes": [0, 255],
+            "node": {"value": 1, "children": [{"value": 2, "children": []}]},
+            "alias_tree": {"value": 3, "children": [{"value": 4, "children": []}]},
+            "manual": true,
+            "both": 255,
+        })
+    }
+
+    fn invalid_arguments() -> Vec<serde_json::Value> {
+        [
+            ("/count", json!(256)),
+            ("/bytes/1", json!(256)),
+            ("/node/children/0/value", json!(false)),
+            ("/alias_tree/children/0/value", json!(256)),
+            ("/manual", json!(1)),
+            ("/both", json!(256)),
+        ]
+        .into_iter()
+        .map(|(path, wrong)| {
+            let mut invalid = valid_arguments();
+            *invalid.pointer_mut(path).unwrap() = wrong;
+            invalid
+        })
+        .collect()
+    }
+
+    #[test]
+    fn json_schema_alias_and_trait_only_fields_preserve_recursive_constraints() {
+        let schema = admit_final_schema(Arguments::try_json_schema().unwrap()).unwrap();
+        assert!(schema.schema()["$defs"].is_object());
+        let valid = valid_arguments();
+        schema.validate(&valid).unwrap();
+        let decoded: Arguments = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), valid);
+        for invalid in invalid_arguments() {
+            assert!(schema.validate(&invalid).is_err(), "{invalid}");
+            assert!(serde_json::from_value::<Arguments>(invalid).is_err());
+        }
+    }
+
+    static TOOL_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    #[tool]
+    fn echo_alias_schema_providers(
+        count: Count,
+        bytes: Bytes,
+        node: TraitOnlyNode,
+        alias_tree: AliasNode,
+        manual: InherentOnly,
+        both: BothProviders,
+    ) -> McpResult<String> {
+        TOOL_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        serde_json::to_string(&Arguments {
+            count,
+            bytes,
+            node,
+            alias_tree,
+            manual,
+            both,
+        })
+        .map_err(McpError::from)
+    }
+
+    #[test]
+    fn tool_alias_and_trait_only_arguments_reject_invalid_values_before_handler_entry() {
+        let handler = EchoAliasSchemaProviders;
+        let schema = admit_final_schema(handler.definition().input_schema).unwrap();
+        assert!(schema.schema()["$defs"].is_object());
+        let context = test_ctx();
+        let valid = valid_arguments();
+        schema.validate(&valid).unwrap();
+        let before = TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst);
+        let content = handler.call(&context, valid.clone()).unwrap();
+        let actual: serde_json::Value = serde_json::from_str(expect_text(&content[0])).unwrap();
+        assert_eq!(actual, valid);
+        assert_eq!(
+            TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1
+        );
+
+        for invalid in invalid_arguments() {
+            assert!(schema.validate(&invalid).is_err(), "{invalid}");
+            assert!(handler.call(&context, invalid).is_err());
+            assert_eq!(
+                TOOL_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                before + 1,
+                "invalid alias or trait-only payloads cannot invoke the handler",
+            );
+        }
+    }
+}
+
 fn serde_schema_default_retry_limit() -> u32 {
     3
 }

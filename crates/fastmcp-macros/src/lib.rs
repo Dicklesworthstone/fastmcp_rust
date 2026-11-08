@@ -4102,6 +4102,9 @@ fn type_to_json_schema(ty: &Type, generic_params: &[Ident]) -> TokenStream2 {
             // those types need not implement the generated context hook.
             quote! {{
                 use fastmcp_protocol::schema::DispatchSchema as _;
+                // Inherent providers take precedence and do not need this import.
+                #[allow(unused_imports)]
+                use fastmcp_protocol::schema::SchemaTypeFallback as _;
                 (&fastmcp_protocol::schema::SchemaTypeDispatch::<#ty>::new()).schema(
                     __fastmcp_schema_context,
                     || <#ty>::json_schema(),

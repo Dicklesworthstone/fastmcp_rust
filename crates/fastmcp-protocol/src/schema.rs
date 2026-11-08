@@ -872,6 +872,32 @@ impl<T> Default for SchemaTypeDispatch<T> {
     }
 }
 
+/// Keeps generated fallback closures well-typed for trait-backed schema providers.
+///
+/// Autoref dispatch ignores the fallback for [`JsonSchemaType`] implementations,
+/// but Rust still checks its method call. This trait supplies that method for
+/// aliases and handwritten trait implementations without changing the active
+/// generation context. An inherent `json_schema` method takes precedence at
+/// the fallback call site.
+#[doc(hidden)]
+pub trait SchemaTypeFallback: JsonSchemaType {
+    /// Generates a bounded standalone schema when called directly.
+    ///
+    /// # Panics
+    /// Panics if generation fails, matching the derive's convenience method.
+    fn json_schema() -> Value;
+}
+
+impl<T: JsonSchemaType> SchemaTypeFallback for T {
+    fn json_schema() -> Value {
+        let mut context = SchemaGenerator::new();
+        let root = context.subschema_for::<T>();
+        context
+            .finish(root)
+            .expect("FastMCP JSON Schema generation exceeds generation limits")
+    }
+}
+
 /// Selects a context-aware derived implementation or a handwritten fallback.
 pub trait DispatchSchema {
     /// Resolves a schema within the caller's current generation operation.
@@ -6463,6 +6489,138 @@ mod tests {
         assert_eq!(
             failed.finish(json!({})),
             Err(SchemaGenerationError::TypeLimit)
+        );
+    }
+
+    #[test]
+    fn schema_generation_trait_only_and_alias_dispatch_share_definitions_and_limits() {
+        type Bytes = Vec<u8>;
+        type Count = u8;
+        type Nodes = Vec<GeneratedNode>;
+        macro_rules! schema_for {
+            ($ty:ty, $context:expr) => {{
+                use super::DispatchSchema as _;
+                #[allow(unused_imports)]
+                use super::SchemaTypeFallback as _;
+                (&SchemaTypeDispatch::<$ty>::new()).schema($context, || <$ty>::json_schema())
+            }};
+        }
+        let mut context = SchemaGenerator::new();
+        let first = schema_for!(GeneratedNode, &mut context);
+        let second = schema_for!(GeneratedNode, &mut context);
+        let bytes = schema_for!(Bytes, &mut context);
+        let repeated_bytes = schema_for!(Bytes, &mut context);
+        let count = schema_for!(Count, &mut context);
+        let nodes = schema_for!(Nodes, &mut context);
+        assert_eq!(second, json!({"$ref": "#/$defs/type_0"}));
+        assert_eq!(repeated_bytes, json!({"$ref": "#/$defs/type_1"}));
+        assert_eq!(count, json!({"$ref": "#/$defs/type_2"}));
+        assert_eq!(nodes["items"], json!({"$ref": "#/$defs/type_0"}));
+        let schema = context
+            .finish(json!({
+                "type": "object",
+                "properties": {
+                    "first": first,
+                    "second": second,
+                    "bytes": bytes,
+                    "repeated": repeated_bytes,
+                    "count": count,
+                    "nodes": nodes,
+                },
+                "required": ["first", "second", "bytes", "repeated", "count", "nodes"],
+            }))
+            .expect("all providers share one reference namespace");
+        assert_eq!(schema["$defs"].as_object().unwrap().len(), 3);
+        let admitted = admit_final_schema(schema).unwrap();
+        let valid = json!({
+            "first": {"value": 1, "next": {"value": 2, "next": null}},
+            "second": {"value": 3, "next": null},
+            "bytes": [0, 255],
+            "repeated": [1],
+            "count": 255,
+            "nodes": [{"value": 4, "next": {"value": 5, "next": null}}],
+        });
+        admitted.validate(&valid).unwrap();
+        for (path, wrong) in [
+            ("/first/next/value", json!(false)),
+            ("/second/value", json!(false)),
+            ("/bytes/1", json!(256)),
+            ("/repeated/0", json!(256)),
+            ("/count", json!(256)),
+            ("/nodes/0/next/value", json!(false)),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(path).unwrap() = wrong;
+            assert!(admitted.validate(&invalid).is_err(), "{path}");
+        }
+
+        let mut limited = SchemaGenerator::with_limits(SchemaGenerationLimits {
+            max_types: 0,
+            ..SchemaGenerationLimits::default()
+        });
+        let root = schema_for!(Nodes, &mut limited);
+        assert_eq!(limited.finish(root), Err(SchemaGenerationError::TypeLimit));
+        assert_eq!(
+            <GeneratedText as SchemaTypeFallback>::json_schema(),
+            json!({"type": "string"})
+        );
+    }
+
+    #[test]
+    #[deny(unused_imports)]
+    fn schema_generation_fallback_import_preserves_inherent_provider_precedence() {
+        struct InherentOnly;
+        impl InherentOnly {
+            fn json_schema() -> Value {
+                json!({"type": "boolean"})
+            }
+        }
+        struct BothProviders;
+        impl BothProviders {
+            fn json_schema() -> Value {
+                panic!("context-aware dispatch must not invoke the inherent fallback")
+            }
+        }
+        impl JsonSchemaType for BothProviders {
+            fn schema_body(context: &mut SchemaGenerator) -> Value {
+                context.subschema_for::<u8>()
+            }
+        }
+        let mut context = SchemaGenerator::new();
+        let handwritten = {
+            use super::DispatchSchema as _;
+            #[allow(unused_imports)]
+            use super::SchemaTypeFallback as _;
+            (&SchemaTypeDispatch::<InherentOnly>::new())
+                .schema(&mut context, InherentOnly::json_schema)
+        };
+        let context_aware = {
+            use super::DispatchSchema as _;
+            #[allow(unused_imports)]
+            use super::SchemaTypeFallback as _;
+            (&SchemaTypeDispatch::<BothProviders>::new())
+                .schema(&mut context, BothProviders::json_schema)
+        };
+        let schema = context
+            .finish(json!({
+                "type": "object",
+                "properties": {"manual": handwritten, "both": context_aware},
+                "required": ["manual", "both"],
+            }))
+            .unwrap();
+        let admitted = admit_final_schema(schema).unwrap();
+        admitted
+            .validate(&json!({"manual": true, "both": 255}))
+            .unwrap();
+        assert!(
+            admitted
+                .validate(&json!({"manual": 1, "both": 255}))
+                .is_err()
+        );
+        assert!(
+            admitted
+                .validate(&json!({"manual": true, "both": 256}))
+                .is_err()
         );
     }
 
