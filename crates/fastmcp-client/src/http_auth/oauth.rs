@@ -2080,7 +2080,7 @@ mod tests {
             .is_ok()
         );
 
-        let nesting = fastmcp_protocol::jsonrpc::MAX_RAW_JSON_NESTING_DEPTH + 1;
+        let nesting = fastmcp_protocol::MAX_RAW_JSON_NESTING_DEPTH + 1;
         for extension in [
             r#""vendor":1,"v\u0065ndor":2"#.to_owned(),
             r#""vendor":{"label":1,"l\u0061bel":2}"#.to_owned(),

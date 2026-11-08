@@ -1167,7 +1167,7 @@ mod tests {
                     params["uri"] = serde_json::json!("file:///aged.txt");
                 }
                 let request = CoreRequest::decode(
-                    fastmcp_protocol::ProtocolEra::Modern2026,
+                    fastmcp_protocol::protocol_policy::ProtocolEra::Modern2026,
                     method,
                     Some(&params),
                 )

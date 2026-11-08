@@ -8212,6 +8212,16 @@ mod tests {
             )
         }
 
+        fn assert_request(actual: JsonRpcMessage, expected: JsonRpcRequest) {
+            let JsonRpcMessage::Request(actual) = actual else {
+                panic!("the peer must receive a request or notification");
+            };
+            assert_eq!(
+                serde_json::to_string(&actual).unwrap(),
+                serde_json::to_string(&expected).unwrap()
+            );
+        }
+
         fn application_send<T: Transport>(
             executor: &RequestExecutor<T>,
             cx: &Cx,
@@ -8276,7 +8286,7 @@ mod tests {
             let mut first = executor.execute(&live, request(1)).unwrap();
             let mut second = executor.execute(&live, request(2)).unwrap();
             for id in [1, 2] {
-                assert_eq!(peer.recv(&live).unwrap(), JsonRpcMessage::Request(request(id)));
+                assert_request(peer.recv(&live).unwrap(), request(id));
             }
             let before = pending(&executor);
             executor.state.borrow_mut().transport.cancel_next = true;
@@ -8308,7 +8318,7 @@ mod tests {
             // cancellation control or generation may have been allocated.
             let mut next = executor.execute(&live, request(3)).unwrap();
             assert_eq!(next.generation(), 3);
-            assert_eq!(peer.recv(&live).unwrap(), JsonRpcMessage::Request(request(3)));
+            assert_request(peer.recv(&live).unwrap(), request(3));
             peer.send(&live, &JsonRpcMessage::Response(complete(3)))
                 .unwrap();
             assert_eq!(executor.wait(&live, &mut next).unwrap(), complete(3));
@@ -8411,15 +8421,11 @@ mod tests {
                     .filter(|line| !line.is_empty())
                     .map(|line| serde_json::from_slice::<JsonRpcMessage>(line).unwrap())
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    written,
-                    vec![
-                        JsonRpcMessage::Request(request(1)),
-                        JsonRpcMessage::Request(request(2)),
-                        JsonRpcMessage::Request(request(3)),
-                        JsonRpcMessage::Request(notification()),
-                    ]
-                );
+                let expected = [request(1), request(2), request(3), notification()];
+                assert_eq!(written.len(), expected.len());
+                for (actual, expected) in written.into_iter().zip(expected) {
+                    assert_request(actual, expected);
+                }
                 assert!(executor.take_cancellation_events().is_empty());
                 assert!(executor.take_uncorrelated_responses().is_empty());
             }
@@ -8485,19 +8491,16 @@ mod tests {
                     assert!(executor.try_take_response(&mut second).is_err());
                     assert!(application_send(&executor, &live, as_notification).is_err());
                     for id in [1, 2] {
-                        assert_eq!(
-                            peer.recv(&live).unwrap(),
-                            JsonRpcMessage::Request(request(id))
-                        );
+                        assert_request(peer.recv(&live).unwrap(), request(id));
                     }
                     if publish {
-                        assert_eq!(
+                        assert_request(
                             peer.recv(&live).unwrap(),
-                            JsonRpcMessage::Request(if as_notification {
+                            if as_notification {
                                 notification()
                             } else {
                                 request(3)
-                            })
+                            },
                         );
                     }
                     assert_memory_empty(&mut peer, &live);
@@ -8668,15 +8671,15 @@ mod tests {
                 assert!(executor.try_take_response(&mut first).is_err());
                 assert!(executor.try_take_response(&mut second).is_err());
                 for id in [1, 2] {
-                    assert_eq!(peer.recv(&live).unwrap(), JsonRpcMessage::Request(request(id)));
+                    assert_request(peer.recv(&live).unwrap(), request(id));
                 }
-                assert_eq!(
+                assert_request(
                     peer.recv(&live).unwrap(),
-                    JsonRpcMessage::Request(if as_notification {
+                    if as_notification {
                         notification()
                     } else {
                         request(3)
-                    })
+                    },
                 );
                 let replayed = Cell::new(false);
                 assert!(
