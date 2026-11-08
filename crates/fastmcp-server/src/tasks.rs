@@ -6604,11 +6604,14 @@ pub type FinalTaskSupervisorFuture<'a> = Pin<Box<dyn Future<Output = McpResult<(
 /// idempotent. They cannot construct or clone the runner, inspect its queue,
 /// or bypass the durable handoff. Once `tasks/cancel` wins for an elected
 /// handoff, the runner wakes it and records terminal cancellation under the
-/// same fence. A supervisor can record a custom cancellation status only if
-/// it observes and honours that winner before the runner's next poll boundary
-/// while the exact elected dispatch lease remains valid. A backend that refuses
-/// renewal stops further application polling immediately, including this final
-/// cancellation window; the framework still attempts fenced retirement.
+/// same fence. An already-started supervisor has a bounded 10 ms grace period
+/// to observe that winner and finish cooperative cleanup, including waking from
+/// an asynchronous wait. The grace period is not renewed by application polls
+/// or lease heartbeats. The attempt and retention deadlines remain authoritative,
+/// and a backend that refuses renewal stops application polling immediately.
+/// When the supervisor returns or the grace period ends, the framework attempts
+/// fenced retirement. Cancellation before the supervisor starts grants no
+/// application work.
 /// The runner cancels and closes the attempt region before releasing its
 /// execution reservation, including descendants spawned through the supplied
 /// `Cx`. Descendants must cooperate with cancellation for close to complete.
@@ -6631,6 +6634,9 @@ pub trait ApplicationTaskSupervisor: Send + Sync {
 const MAX_FINAL_TASK_RECOVERY_HANDOFFS_PER_SCAN: usize = 64;
 const MAX_FINAL_TASK_RECOVERY_CAS_RETRIES: usize = 64;
 const FINAL_TASK_RECOVERY_WAKE_INTERVAL: StdDuration = StdDuration::from_secs(1);
+/// Bound cooperative supervisor cleanup independently of its pending future or
+/// lease heartbeat. A poll count cannot provide a window for an awaited timer.
+const FINAL_TASK_CANCELLATION_GRACE_PERIOD: StdDuration = StdDuration::from_millis(10);
 pub(crate) const DEFAULT_CONCURRENT_TASK_HANDOFFS: usize = 32;
 pub(crate) const MAX_CONCURRENT_TASK_HANDOFFS: usize = 256;
 
@@ -9934,8 +9940,15 @@ impl FinalTaskHandoffExecutor {
         if guard.retire_if_execution_authorization_lost()? {
             return Ok(());
         }
+        if guard.retire_if_cancellation_requested()? {
+            return Ok(());
+        }
         guard.ensure_live_dispatch_for_application()?;
         let mut supervisor = self.supervisor.resume(cx, handoff);
+        let mut supervisor_started = false;
+        // Keep this timer across lease heartbeats. Resetting it at every
+        // heartbeat would let a pending callback postpone cancellation forever.
+        let mut cancellation_grace: Option<Pin<Box<asupersync::time::Sleep>>> = None;
         loop {
             // The application callback is allowed to be pending for longer
             // than one lease interval. The attempt context is nevertheless
@@ -9951,31 +9964,18 @@ impl FinalTaskHandoffExecutor {
                 guard.disarm();
                 return Ok(());
             }
-            if guard.retire_if_cancellation_requested()? {
-                return Ok(());
-            }
             if guard.retire_if_execution_authorization_lost()? {
                 return Ok(());
             }
             let backend_heartbeat_interval = guard.bounded_heartbeat_interval()?;
-            let heartbeat_interval = cx.budget().deadline.map_or(
-                backend_heartbeat_interval,
-                |deadline| {
-                    backend_heartbeat_interval.min(StdDuration::from_nanos(
-                        deadline.duration_since(cx.now()),
-                    ))
-                },
-            );
+            let heartbeat_interval =
+                cx.budget()
+                    .deadline
+                    .map_or(backend_heartbeat_interval, |deadline| {
+                        backend_heartbeat_interval
+                            .min(StdDuration::from_nanos(deadline.duration_since(cx.now())))
+                    });
             let mut heartbeat = Box::pin(asupersync::time::sleep(cx.now(), heartbeat_interval));
-            // While its exact dispatch lease remains live, the supervisor is
-            // promised one poll boundary to observe and honour cancellation.
-            // Electing the winner on the same turn it first becomes visible
-            // makes that window
-            // unsatisfiable, so the first observation arms this flag, wakes
-            // this future, and yields; the next turn elects the winner if the
-            // supervisor still has not finished. Exactly one extra boundary is
-            // granted, so the runner remains the authority.
-            let mut cancellation_boundary_granted = false;
             let completed = std::future::poll_fn(|task_context| {
                 if let Err(error) = cx.checkpoint() {
                     return std::task::Poll::Ready(Some(Err(McpError::internal_error(
@@ -10003,14 +10003,36 @@ impl FinalTaskHandoffExecutor {
                     return std::task::Poll::Ready(Some(Err(error)));
                 }
                 cancellation_wake.register_waker(task_context.waker());
-                // Poll the supervisor before electing the cancellation winner.
-                // The documented contract gives a supervisor exactly one poll
-                // boundary to observe and honour `tasks/cancel`; checking the
-                // winner first consumed that boundary and dropped the
-                // supervisor future unpolled, so the promised window could
-                // never be satisfied. The runner remains the authority:
-                // `retire_if_cancellation_requested` below still records
-                // terminal cancellation when the supervisor declines.
+                if !supervisor_started {
+                    match guard.is_cancellation_requested() {
+                        Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
+                        Ok(false) => {}
+                        Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                    }
+                }
+                if cancellation_grace.is_none() {
+                    match guard.is_cancellation_requested() {
+                        Ok(true) => {
+                            cancellation_grace = Some(Box::pin(asupersync::time::sleep(
+                                cx.now(),
+                                FINAL_TASK_CANCELLATION_GRACE_PERIOD,
+                            )));
+                        }
+                        Ok(false) => {}
+                        Err(error) => return std::task::Poll::Ready(Some(Err(error))),
+                    }
+                }
+                // The grace deadline wins before another application poll,
+                // including a simultaneously-ready late success. On grace
+                // expiry the future is dropped below before the runner
+                // publishes terminal cancellation.
+                if cancellation_grace
+                    .as_mut()
+                    .is_some_and(|grace| grace.as_mut().poll(task_context).is_ready())
+                {
+                    return std::task::Poll::Ready(Some(Ok(())));
+                }
+                supervisor_started = true;
                 if let std::task::Poll::Ready(result) = supervisor.as_mut().poll(task_context) {
                     match guard.retire_if_execution_authorization_lost() {
                         Ok(true) => return std::task::Poll::Ready(Some(Ok(()))),
@@ -10037,19 +10059,21 @@ impl FinalTaskHandoffExecutor {
                 if guard.is_authoritatively_expired() {
                     return std::task::Poll::Ready(None);
                 }
-                // The supervisor declined this boundary, so the runner elects
-                // the cancellation winner and records terminal cancellation --
-                // but only after granting the one promised boundary above.
+                // A parked supervisor cannot observe cancellation merely by
+                // being polled twice in the same instant: its awaited timer or
+                // I/O may still be pending. Allow actual asynchronous progress,
+                // but keep an independent deadline for an uncooperative future.
                 match guard.is_cancellation_requested() {
                     Ok(true) => {
-                        if cancellation_boundary_granted {
-                            return std::task::Poll::Ready(Some(Ok(())));
+                        if cancellation_grace.is_none() {
+                            cancellation_grace = Some(Box::pin(asupersync::time::sleep(
+                                cx.now(),
+                                FINAL_TASK_CANCELLATION_GRACE_PERIOD,
+                            )));
+                            // Register the new timer and offer one immediate
+                            // cooperative poll without repeatedly self-waking.
+                            task_context.waker().wake_by_ref();
                         }
-                        // Schedule the promised final poll even when the
-                        // application future has no timer or other wakeup.
-                        cancellation_boundary_granted = true;
-                        task_context.waker().wake_by_ref();
-                        return std::task::Poll::Pending;
                     }
                     Ok(false) => {}
                     Err(error) => return std::task::Poll::Ready(Some(Err(error))),
@@ -10070,9 +10094,6 @@ impl FinalTaskHandoffExecutor {
                     guard.disarm();
                     return Ok(());
                 }
-                if guard.retire_if_cancellation_requested()? {
-                    return Ok(());
-                }
                 if !guard.renew()? {
                     if guard.retire_if_execution_expired()? {
                         return Ok(());
@@ -10087,6 +10108,7 @@ impl FinalTaskHandoffExecutor {
                 }
                 continue;
             };
+            drop(supervisor);
             if let Err(error) = result {
                 if guard.is_authoritatively_expired() {
                     guard.disarm();
@@ -13259,6 +13281,62 @@ mod tests {
                 })?;
                 let _handoff = handoff;
                 std::future::pending::<McpResult<()>>().await
+            })
+        }
+    }
+
+    /// Models an application parked on a real asynchronous wait when
+    /// cancellation arrives, rather than a future that can see every poll.
+    struct SleepingCancellationFinalTaskSupervisor {
+        started: Sender<()>,
+        delay: StdDuration,
+        honors_cancellation: bool,
+        cleanup: Arc<AtomicUsize>,
+        completion_effects: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl ApplicationTaskSupervisor for SleepingCancellationFinalTaskSupervisor {
+        fn resume<'a>(
+            &'a self,
+            cx: &'a Cx,
+            handoff: FinalTaskSupervisorHandoff,
+        ) -> FinalTaskSupervisorFuture<'a> {
+            Box::pin(async move {
+                let _lifetime = RetentionExpiryDropFlag(Arc::clone(&self.dropped));
+                self.started.try_send(()).map_err(|_| {
+                    McpError::internal_error("sleeping supervisor lost its start notification")
+                })?;
+                loop {
+                    if self.honors_cancellation {
+                        let requested = match &handoff {
+                            FinalTaskSupervisorHandoff::Initial(initial) => {
+                                initial.is_cancellation_requested()
+                            }
+                            FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                                accepted.is_cancellation_requested()
+                            }
+                        }?;
+                        if requested {
+                            self.cleanup.fetch_add(1, AtomicOrdering::SeqCst);
+                            let status = Some("sleeping supervisor cleaned up".to_owned());
+                            match handoff {
+                                FinalTaskSupervisorHandoff::Initial(initial) => {
+                                    initial.honor_cancellation(status)?;
+                                }
+                                FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                                    accepted.honor_cancellation(status)?;
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    asupersync::time::sleep(cx.now(), self.delay).await;
+                    if !self.honors_cancellation {
+                        self.completion_effects.fetch_add(1, AtomicOrdering::SeqCst);
+                        return complete_final_task_handoff(handoff);
+                    }
+                }
             })
         }
     }
@@ -27220,12 +27298,26 @@ mod tests {
             runtime_for_task
                 .cancel_task(&task_id_for_task)
                 .expect("tasks/cancel commits cancellation and wakes the elected handoff");
+            let mut sibling = cx
+                .spawn(move |sibling_cx| async move {
+                    asupersync::time::sleep(sibling_cx.now(), StdDuration::from_millis(1)).await;
+                    assert!(matches!(
+                        runtime_for_task.get_task(&task_id_for_task).unwrap().task,
+                        FinalTask::Working(_)
+                    ));
+                    assert!(runtime_for_task
+                        .is_cancellation_requested(&task_id_for_task)
+                        .unwrap());
+                })
+                .expect("cancellation grace must allow unrelated work to progress");
             assert!(matches!(supervisor.join(&cx).await, Ok(Ok(()))));
+            sibling.join(&cx).await.unwrap();
         });
 
         assert_eq!(
-            report.now_nanos, 0,
-            "the durable task cancellation wakes the parked supervisor without waiting for a heartbeat"
+            report.now_nanos,
+            FINAL_TASK_CANCELLATION_GRACE_PERIOD.as_nanos() as u64,
+            "a permanently pending supervisor retires at the fixed grace deadline, before its lease heartbeat"
         );
         assert!(matches!(
             runtime
@@ -27247,6 +27339,301 @@ mod tests {
                 .is_none(),
             "changing only the cancellation winner prevents the paired retained input from replaying"
         );
+    }
+
+    #[test]
+    fn task_03_final_sleeping_supervisor_observes_cancellation_before_retirement() {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let runtime = final_task_runtime(Arc::clone(&store), Arc::new(AtomicBool::new(false)));
+        let input_responses: FinalTaskInputResponses =
+            serde_json::from_value(serde_json::json!({"roots": {"roots": []}})).unwrap();
+        let task_id = create_accepted_final_input(&runtime, input_responses);
+        let accepted = runtime.take_accepted_input(&task_id).unwrap().unwrap();
+        let (started, mut started_receiver) = mpsc::channel(1);
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let completion_effects = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SleepingCancellationFinalTaskSupervisor {
+                    started,
+                    delay: StdDuration::from_millis(1),
+                    honors_cancellation: true,
+                    cleanup: Arc::clone(&cleanup),
+                    completion_effects: Arc::clone(&completion_effects),
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+        let runtime_for_task = runtime.clone();
+        let task_id_for_task = task_id.clone();
+
+        let ((), report) = asupersync::lab::run_async_under_lab(0x71_08, move |cx| async move {
+            let mut supervisor = cx
+                .spawn(move |supervisor_cx| async move {
+                    runner
+                        .resume_handoff(
+                            &supervisor_cx,
+                            FinalTaskSupervisorHandoff::Resumed(accepted),
+                        )
+                        .await
+                })
+                .unwrap();
+            started_receiver.recv(&cx).await.unwrap();
+            runtime_for_task.cancel_task(&task_id_for_task).unwrap();
+            assert!(matches!(supervisor.join(&cx).await, Ok(Ok(()))));
+        });
+
+        assert_eq!(report.now_nanos, 1_000_000);
+        assert_eq!(cleanup.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(completion_effects.load(AtomicOrdering::SeqCst), 0);
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        assert!(matches!(
+            runtime.get_task(&task_id).unwrap().task,
+            FinalTask::Cancelled(base)
+                if base.status_message.as_deref() == Some("sleeping supervisor cleaned up")
+        ));
+        assert!(!runtime.is_cancellation_requested(&task_id).unwrap());
+        assert!(runtime.recover_accepted_input().unwrap().is_none());
+        assert_eq!(store.active_task_count(), 0);
+    }
+
+    fn check_delayed_supervisor_completion_after_cancellation(cancel: bool) {
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_at_cancellation = Arc::new(AtomicBool::new(false));
+        let dropped_for_notification = Arc::clone(&dropped);
+        let cancellation_notification = Arc::clone(&dropped_at_cancellation);
+        // Several heartbeats occur before the grace deadline. None may reset
+        // the cancellation timer or prematurely retire cooperative work.
+        let runtime = FinalTaskRuntime::new(
+            Arc::new(FastHeartbeatProbeStore {
+                inner: Arc::clone(&store),
+                heartbeat: StdDuration::from_millis(1),
+                reject_cancelled_renewal: false,
+            }),
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(move |notification| {
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) {
+                    cancellation_notification.store(
+                        dropped_for_notification.load(AtomicOrdering::SeqCst),
+                        AtomicOrdering::SeqCst,
+                    );
+                }
+            }),
+        );
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let initial = runtime.recover_initial_work().unwrap().unwrap();
+        let (started, mut started_receiver) = mpsc::channel(1);
+        let cleanup = Arc::new(AtomicUsize::new(0));
+        let completion_effects = Arc::new(AtomicUsize::new(0));
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(SleepingCancellationFinalTaskSupervisor {
+                    started,
+                    // Equal deadlines make the cancellation priority explicit:
+                    // the business effect must not receive one final poll.
+                    delay: FINAL_TASK_CANCELLATION_GRACE_PERIOD,
+                    honors_cancellation: false,
+                    cleanup: Arc::clone(&cleanup),
+                    completion_effects: Arc::clone(&completion_effects),
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+        let runtime_for_task = runtime.clone();
+        let task_id_for_task = task_id.clone();
+        let effects_for_task = Arc::clone(&completion_effects);
+        let dropped_for_task = Arc::clone(&dropped);
+
+        let (settled_nanos, _) =
+            asupersync::lab::run_async_under_lab(0x71_09, move |cx| async move {
+                let started_at = cx.now();
+                let mut supervisor = cx
+                    .spawn(move |supervisor_cx| async move {
+                        runner
+                            .resume_handoff(
+                                &supervisor_cx,
+                                FinalTaskSupervisorHandoff::Initial(initial),
+                            )
+                            .await
+                    })
+                    .unwrap();
+                started_receiver.recv(&cx).await.unwrap();
+                if cancel {
+                    runtime_for_task.cancel_task(&task_id_for_task).unwrap();
+                }
+                let joined = asupersync::time::timeout(
+                    cx.now(),
+                    StdDuration::from_millis(50),
+                    supervisor.join(&cx),
+                )
+                .await
+                .expect("cancellation grace cannot be renewed by lease heartbeats");
+                assert!(matches!(joined, Ok(Ok(()))));
+                let settled_nanos = cx.now().duration_since(started_at);
+                assert!(dropped_for_task.load(AtomicOrdering::SeqCst));
+                assert_eq!(
+                    effects_for_task.load(AtomicOrdering::SeqCst),
+                    usize::from(!cancel)
+                );
+                asupersync::time::sleep(cx.now(), FINAL_TASK_CANCELLATION_GRACE_PERIOD).await;
+                assert_eq!(
+                    effects_for_task.load(AtomicOrdering::SeqCst),
+                    usize::from(!cancel),
+                    "retirement cannot leave application work running after the terminal result"
+                );
+                settled_nanos
+            });
+
+        assert_eq!(
+            settled_nanos,
+            FINAL_TASK_CANCELLATION_GRACE_PERIOD.as_nanos() as u64
+        );
+        assert_eq!(cleanup.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            completion_effects.load(AtomicOrdering::SeqCst),
+            usize::from(!cancel)
+        );
+        let terminal = runtime.get_task(&task_id).unwrap().task;
+        if cancel {
+            assert!(matches!(terminal, FinalTask::Cancelled(_)));
+            assert!(
+                dropped_at_cancellation.load(AtomicOrdering::SeqCst),
+                "the runner drops late application work before publishing terminal cancellation"
+            );
+        } else {
+            assert!(matches!(terminal, FinalTask::Completed { .. }));
+        }
+        assert!(!runtime.is_cancellation_requested(&task_id).unwrap());
+        assert!(runtime.recover_initial_work().unwrap().is_none());
+        assert_eq!(store.active_task_count(), 0);
+    }
+
+    #[test]
+    fn task_03_final_cancellation_grace_stops_late_success_across_heartbeats() {
+        check_delayed_supervisor_completion_after_cancellation(true);
+    }
+
+    #[test]
+    fn task_03_final_delayed_success_without_cancellation_completes() {
+        check_delayed_supervisor_completion_after_cancellation(false);
+    }
+
+    #[test]
+    fn task_03_final_constructor_cancellation_drops_future_before_terminal_notification() {
+        struct CancelInConstructorSupervisor {
+            runtime: FinalTaskRuntime,
+            polls: Arc<AtomicUsize>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        struct UnpolledCancellationFuture {
+            _handoff: FinalTaskSupervisorHandoff,
+            polls: Arc<AtomicUsize>,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Future for UnpolledCancellationFuture {
+            type Output = McpResult<()>;
+
+            fn poll(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                self.polls.fetch_add(1, AtomicOrdering::SeqCst);
+                std::task::Poll::Ready(Err(McpError::internal_error(
+                    "a callback cancelled before its first poll must never execute",
+                )))
+            }
+        }
+
+        impl Drop for UnpolledCancellationFuture {
+            fn drop(&mut self) {
+                self.dropped.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+
+        impl ApplicationTaskSupervisor for CancelInConstructorSupervisor {
+            fn resume<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                handoff: FinalTaskSupervisorHandoff,
+            ) -> FinalTaskSupervisorFuture<'a> {
+                self.runtime
+                    .cancel_task(final_task_handoff_task_id(&handoff))
+                    .unwrap();
+                Box::pin(UnpolledCancellationFuture {
+                    _handoff: handoff,
+                    polls: Arc::clone(&self.polls),
+                    dropped: Arc::clone(&self.dropped),
+                })
+            }
+        }
+
+        let store = Arc::new(InMemoryFinalTaskStore::default());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_at_cancellation = Arc::new(AtomicBool::new(false));
+        let dropped_for_notification = Arc::clone(&dropped);
+        let cancellation_notification = Arc::clone(&dropped_at_cancellation);
+        let runtime = FinalTaskRuntime::new(
+            store.clone(),
+            FinalTaskRuntimeConfig::new(60_000, None).unwrap(),
+            Arc::new(move |notification| {
+                if matches!(notification.params.task, FinalTask::Cancelled(_)) {
+                    cancellation_notification.store(
+                        dropped_for_notification.load(AtomicOrdering::SeqCst),
+                        AtomicOrdering::SeqCst,
+                    );
+                }
+            }),
+        );
+        let task_id = create_final_task_state_fixture(&runtime, None)
+            .task
+            .base()
+            .task_id
+            .clone();
+        let initial = runtime.recover_initial_work().unwrap().unwrap();
+        let runner = runtime
+            .install_task_service(
+                1,
+                Arc::new(CancelInConstructorSupervisor {
+                    runtime: runtime.clone(),
+                    polls: Arc::clone(&polls),
+                    dropped: Arc::clone(&dropped),
+                }),
+            )
+            .unwrap();
+
+        let ((), report) = asupersync::lab::run_async_under_lab(0x71_10, move |cx| async move {
+            runner
+                .resume_handoff(&cx, FinalTaskSupervisorHandoff::Initial(initial))
+                .await
+                .unwrap();
+            assert!(cx.checkpoint().is_ok());
+        });
+
+        assert_eq!(report.now_nanos, 0);
+        assert_eq!(polls.load(AtomicOrdering::SeqCst), 0);
+        assert!(dropped.load(AtomicOrdering::SeqCst));
+        assert!(
+            dropped_at_cancellation.load(AtomicOrdering::SeqCst),
+            "constructor cancellation disposes of the unpolled future before publishing its terminal result"
+        );
+        assert!(matches!(
+            runtime.get_task(&task_id).unwrap().task,
+            FinalTask::Cancelled(_)
+        ));
+        assert!(!runtime.is_cancellation_requested(&task_id).unwrap());
+        assert!(runtime.recover_initial_work().unwrap().is_none());
+        assert_eq!(store.active_task_count(), 0);
     }
 
     #[test]
