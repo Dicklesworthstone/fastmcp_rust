@@ -7685,6 +7685,14 @@ pub enum ModernHttpClientError {    /// A public constructor selected a protocol
     RequestEncodingFailed,
     /// The native executor rejected or failed the HTTP exchange.
     Executor(ModernHttpExecutorError),
+    /// A typed finite operation received neither a successful JSON response nor
+    /// an admitted canonical HTTP 400/404 JSON-RPC error.
+    UnexpectedHttpResponse {
+        /// HTTP status retained from the response head.
+        status: u16,
+        /// Body lane selected before any response-body bytes were consumed.
+        kind: ModernHttpResponseKind,
+    },
     /// The immutable-plan classifier rejected the disposable probe.
     Negotiation(ClientHttpNegotiationError),
     /// The peer returned a recognized JSON-RPC error to `server/discover`.
@@ -7754,6 +7762,8 @@ pub enum ModernHttpClientError {    /// A public constructor selected a protocol
         code: JsonInteger,
         /// Server-provided JSON-RPC message.
         message: String,
+        /// Optional server-provided JSON-RPC error data.
+        data: Option<serde_json::Value>,
     },
     /// A successful official Tasks lifecycle response did not contain a
     /// lossless result payload.
@@ -7779,7 +7789,14 @@ pub enum ModernHttpClientError {    /// A public constructor selected a protocol
         actual: Option<RequestId>,
     },
     /// The server returned a JSON-RPC error for the tool call.
-    RemoteError { code: JsonInteger, message: String },
+    RemoteError {
+        /// Exact server-provided JSON-RPC code.
+        code: JsonInteger,
+        /// Server-provided JSON-RPC message.
+        message: String,
+        /// Optional server-provided JSON-RPC error data.
+        data: Option<serde_json::Value>,
+    },
     /// The response contradicted the final typed core result contract.
     TypedResult(CoreDispatchError),
     /// The decoded response was not one final `tools/call` result branch.
@@ -7838,6 +7855,10 @@ impl fmt::Display for ModernHttpClientError {
                 formatter.write_str("modern MCP request encoding failed")
             }
             Self::Executor(error) => error.fmt(formatter),
+            Self::UnexpectedHttpResponse { status, kind } => write!(
+                formatter,
+                "typed modern HTTP request received unsupported status {status} and body kind {kind:?}"
+            ),
             Self::Negotiation(error) => error.fmt(formatter),
             Self::DiscoveryRejected { code, message, .. } => {
                 write!(
@@ -7899,6 +7920,7 @@ impl fmt::Display for ModernHttpClientError {
                 method,
                 code,
                 message,
+                ..
             } => write!(
                 formatter,
                 "final HTTP {method} failed with JSON-RPC {code}: {message}"
@@ -7924,7 +7946,7 @@ impl fmt::Display for ModernHttpClientError {
                 formatter,
                 "final HTTP tools/call response ID {actual:?} did not match request {expected:?}"
             ),
-            Self::RemoteError { code, message } => {
+            Self::RemoteError { code, message, .. } => {
                 write!(
                     formatter,
                     "final HTTP tools/call failed with JSON-RPC {code}: {message}"
@@ -7965,6 +7987,7 @@ impl std::error::Error for ModernHttpClientError {
             | Self::ExtensionNotificationNotAdmitted
             | Self::NotificationAcknowledgementInvalid { .. }
             | Self::RequestEncodingFailed
+            | Self::UnexpectedHttpResponse { .. }
             | Self::DiscoveryRejected { .. }
             | Self::InvalidDiscoveryResponse
             | Self::DiscoveryDoesNotAdvertiseModernProtocol
@@ -7987,6 +8010,131 @@ impl std::error::Error for ModernHttpClientError {
             Self::TasksGetIdMismatch { .. } => None,
         }
     }
+}
+
+#[cfg(feature = "tasks")]
+#[derive(Debug)]
+enum TypedHttpResponseAdmissionError {
+    UnexpectedHttpResponse {
+        status: u16,
+        kind: ModernHttpResponseKind,
+    },
+    JsonRpc(JsonRpcAdmissionError),
+    ResponseIdMismatch {
+        expected: RequestId,
+        actual: Option<RequestId>,
+    },
+}
+
+/// Admits the finite typed body lane before reading any response bytes.
+/// Match the owned and collected request policy: only canonical HTTP 400/404
+/// responses with an admitted JSON media type can supply a protocol error.
+#[cfg(feature = "tasks")]
+fn admit_typed_http_response_head(
+    metadata: &ModernHttpResponseMetadata,
+) -> Result<(), TypedHttpResponseAdmissionError> {
+    if metadata.kind() == ModernHttpResponseKind::Json
+        || (metadata.kind() == ModernHttpResponseKind::HttpFailure
+            && matches!(metadata.status(), 400 | 404)
+            && metadata.error_body_admission() == Some(ModernHttpErrorBodyAdmission::JsonRpcError))
+    {
+        return Ok(());
+    }
+    Err(TypedHttpResponseAdmissionError::UnexpectedHttpResponse {
+        status: metadata.status(),
+        kind: metadata.kind(),
+    })
+}
+
+/// Decodes a bounded, correlated response without allowing a failure body to
+/// promote itself to success. Invalid canonical error bodies retain their HTTP
+/// outcome; malformed successful JSON keeps its strict admission diagnostic.
+#[cfg(feature = "tasks")]
+fn admit_typed_http_jsonrpc_response(
+    metadata: &ModernHttpResponseMetadata,
+    body: &[u8],
+    expected_id: &RequestId,
+    maximum_response_bytes: usize,
+) -> Result<(JsonRpcResponse, Option<String>), TypedHttpResponseAdmissionError> {
+    admit_typed_http_response_head(metadata)?;
+    let http_failure = metadata.kind() == ModernHttpResponseKind::HttpFailure;
+    let admission =
+        decode_strict_jsonrpc_response(body, maximum_response_bytes).map_err(|error| {
+            if http_failure {
+                TypedHttpResponseAdmissionError::UnexpectedHttpResponse {
+                    status: metadata.status(),
+                    kind: metadata.kind(),
+                }
+            } else {
+                TypedHttpResponseAdmissionError::JsonRpc(error)
+            }
+        })?;
+    let (response, result_source) = admission.into_parts();
+    if http_failure && response.error.is_none() {
+        return Err(TypedHttpResponseAdmissionError::UnexpectedHttpResponse {
+            status: metadata.status(),
+            kind: metadata.kind(),
+        });
+    }
+    if !response
+        .id
+        .as_ref()
+        .is_some_and(|id| id.correlates_with(expected_id))
+    {
+        return Err(TypedHttpResponseAdmissionError::ResponseIdMismatch {
+            expected: expected_id.clone(),
+            actual: response.id,
+        });
+    }
+    Ok((response, result_source))
+}
+
+#[cfg(feature = "tasks")]
+fn typed_http_response_error(
+    error: TypedHttpResponseAdmissionError,
+    task_method: Option<&'static str>,
+) -> ModernHttpClientError {
+    match error {
+        TypedHttpResponseAdmissionError::UnexpectedHttpResponse { status, kind } => {
+            ModernHttpClientError::UnexpectedHttpResponse { status, kind }
+        }
+        TypedHttpResponseAdmissionError::JsonRpc(error) => match task_method {
+            Some(method) => ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error },
+            None => ModernHttpClientError::InvalidJsonRpcResponse(error),
+        },
+        TypedHttpResponseAdmissionError::ResponseIdMismatch { expected, actual } => {
+            match task_method {
+                Some(method) => ModernHttpClientError::TasksResponseIdMismatch {
+                    method,
+                    expected,
+                    actual,
+                },
+                None => ModernHttpClientError::ResponseIdMismatch { expected, actual },
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tasks")]
+async fn read_typed_http_jsonrpc_response(
+    cx: &Cx,
+    response: ModernHttpResponseStream,
+    expected_id: &RequestId,
+    maximum_response_bytes: usize,
+    task_method: Option<&'static str>,
+) -> Result<(JsonRpcResponse, Option<String>), ModernHttpClientError> {
+    let metadata = response.metadata().clone();
+    admit_typed_http_response_head(&metadata)
+        .map_err(|error| typed_http_response_error(error, task_method))?;
+    // Keep the existing request-owned body reader: it enforces the caller's
+    // byte budget, cancellation, deadlines, and credential-reflection refusal
+    // before any decoded peer message or data can be exposed.
+    let body = response
+        .read_to_end(cx, maximum_response_bytes)
+        .await
+        .map_err(ModernHttpClientError::Executor)?;
+    admit_typed_http_jsonrpc_response(&metadata, &body, expected_id, maximum_response_bytes)
+        .map_err(|error| typed_http_response_error(error, task_method))
 }
 
 impl ModernHttpClient {
@@ -9614,37 +9762,19 @@ impl ModernHttpClient {
             false,
         )?;
         let response = self.execute_post_discovery_request(cx, &request).await?;
-        let body = response
-            .read_to_end(cx, maximum_response_bytes)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
-        let message = decode_strict_jsonrpc_message(&body, maximum_response_bytes)
-            .map_err(ModernHttpClientError::InvalidJsonRpcResponse)?;
-        let JsonRpcMessage::Response(response) = message else {
-            return Err(ModernHttpClientError::UnexpectedToolCallResult);
-        };
-        let admission = decode_strict_jsonrpc_response(&body, maximum_response_bytes)
-            .map_err(ModernHttpClientError::InvalidJsonRpcResponse)?;
-        if admission.response() != &response {
-            return Err(ModernHttpClientError::InvalidJsonRpcResponse(
-                JsonRpcAdmissionError::InvalidEnvelope,
-            ));
-        }
-        let (_, result_source) = admission.into_parts();
-        if !response
-            .id
-            .as_ref()
-            .is_some_and(|response_id| response_id.correlates_with(&request_id))
-        {
-            return Err(ModernHttpClientError::ResponseIdMismatch {
-                expected: request_id,
-                actual: response.id,
-            });
-        }
-        if let Some(error) = response.error.as_ref() {
+        let (mut response, result_source) = read_typed_http_jsonrpc_response(
+            cx,
+            response,
+            &request_id,
+            maximum_response_bytes,
+            None,
+        )
+        .await?;
+        if let Some(error) = response.error.take() {
             return Err(ModernHttpClientError::RemoteError {
-                code: error.code.clone(),
-                message: error.message.clone(),
+                code: error.code,
+                message: error.message,
+                data: error.data,
             });
         }
         let result_source = result_source
@@ -9976,49 +10106,22 @@ impl ModernHttpClient {
             &client_extensions,
         )?;
         let response = self.execute_post_discovery_request(cx, &request).await?;
-        let body = response
-            .read_to_end(cx, maximum_response_bytes)
-            .await
-            .map_err(ModernHttpClientError::Executor)?;
-        let message =
-            decode_strict_jsonrpc_message(&body, maximum_response_bytes).map_err(|error| {
-                ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error }
-            })?;
-        let JsonRpcMessage::Response(response) = message else {
-            return Err(ModernHttpClientError::InvalidTasksJsonRpcResponse {
-                method,
-                error: JsonRpcAdmissionError::InvalidEnvelope,
-            });
-        };
-        let admission =
-            decode_strict_jsonrpc_response(&body, maximum_response_bytes).map_err(|error| {
-                ModernHttpClientError::InvalidTasksJsonRpcResponse { method, error }
-            })?;
-        if admission.response() != &response {
-            return Err(ModernHttpClientError::InvalidTasksJsonRpcResponse {
-                method,
-                error: JsonRpcAdmissionError::InvalidEnvelope,
-            });
-        }
-        if !response
-            .id
-            .as_ref()
-            .is_some_and(|response_id| response_id.correlates_with(&request_id))
-        {
-            return Err(ModernHttpClientError::TasksResponseIdMismatch {
-                method,
-                expected: request_id,
-                actual: response.id,
-            });
-        }
-        if let Some(error) = response.error.as_ref() {
+        let (mut response, result_source) = read_typed_http_jsonrpc_response(
+            cx,
+            response,
+            &request_id,
+            maximum_response_bytes,
+            Some(method),
+        )
+        .await?;
+        if let Some(error) = response.error.take() {
             return Err(ModernHttpClientError::TasksRemoteError {
                 method,
-                code: error.code.clone(),
-                message: error.message.clone(),
+                code: error.code,
+                message: error.message,
+                data: error.data,
             });
         }
-        let (_, result_source) = admission.into_parts();
         let result_source = result_source
             .as_deref()
             .ok_or(ModernHttpClientError::TasksResultMissing { method })?;
@@ -17205,6 +17308,589 @@ mod tests {
             .join()
             .expect("Tasks lifecycle HTTP server must join");
         result
+    }
+
+    #[cfg(feature = "tasks")]
+    fn typed_http_tasks_metadata(
+        status: u16,
+        kind: ModernHttpResponseKind,
+        error_body: Option<super::ModernHttpErrorBodyAdmission>,
+    ) -> super::ModernHttpResponseMetadata {
+        super::ModernHttpResponseMetadata {
+            status,
+            kind,
+            error_body,
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn typed_http_tasks_admission_preserves_success_and_exact_result_source() {
+        let metadata = typed_http_tasks_metadata(200, ModernHttpResponseKind::Json, None);
+        let body = br#"{"jsonrpc":"2.0","id":2e0,"result":{"number":7.30e-2}}"#;
+        super::admit_typed_http_response_head(&metadata).unwrap();
+        let (response, source) = super::admit_typed_http_jsonrpc_response(
+            &metadata,
+            body,
+            &RequestId::Number(2),
+            body.len(),
+        )
+        .unwrap();
+        assert!(response.error.is_none());
+        assert_eq!(response.result.unwrap()["number"].to_string(), "7.30e-2");
+        assert_eq!(source.as_deref(), Some(r#"{"number":7.30e-2}"#));
+        assert!(matches!(
+            super::admit_typed_http_jsonrpc_response(
+                &metadata,
+                body,
+                &RequestId::Number(2),
+                body.len() - 1,
+            ),
+            Err(super::TypedHttpResponseAdmissionError::JsonRpc(_))
+        ));
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn typed_http_tasks_admission_rejects_status_or_media_promotion() {
+        use super::{ModernHttpErrorBodyAdmission, TypedHttpResponseAdmissionError};
+        const SUCCESS: &[u8] = br#"{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete"}}"#;
+        for status in [400, 404, 401, 403, 429, 500] {
+            let metadata = typed_http_tasks_metadata(
+                status,
+                ModernHttpResponseKind::HttpFailure,
+                Some(ModernHttpErrorBodyAdmission::JsonRpcError),
+            );
+            assert!(matches!(
+                super::admit_typed_http_jsonrpc_response(
+                    &metadata,
+                    SUCCESS,
+                    &RequestId::Number(2),
+                    SUCCESS.len(),
+                ),
+                Err(TypedHttpResponseAdmissionError::UnexpectedHttpResponse { status: actual, .. })
+                    if actual == status
+            ));
+            if status != 400 && status != 404 {
+                assert!(super::admit_typed_http_response_head(&metadata).is_err());
+            }
+        }
+        for metadata in [
+            typed_http_tasks_metadata(200, ModernHttpResponseKind::Sse, None),
+            typed_http_tasks_metadata(202, ModernHttpResponseKind::EmptyAcknowledgement, None),
+            typed_http_tasks_metadata(
+                400,
+                ModernHttpResponseKind::HttpFailure,
+                Some(ModernHttpErrorBodyAdmission::Opaque),
+            ),
+            typed_http_tasks_metadata(
+                404,
+                ModernHttpResponseKind::HttpFailure,
+                Some(ModernHttpErrorBodyAdmission::Opaque),
+            ),
+        ] {
+            assert!(matches!(
+                super::admit_typed_http_response_head(&metadata),
+                Err(TypedHttpResponseAdmissionError::UnexpectedHttpResponse { .. })
+            ));
+            assert!(
+                super::admit_typed_http_jsonrpc_response(
+                    &metadata,
+                    SUCCESS,
+                    &RequestId::Number(2),
+                    SUCCESS.len(),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn typed_http_tasks_admission_preserves_canonical_error_payloads() {
+        const ERROR: &[u8] = br#"{"jsonrpc":"2.0","id":2e0,"error":{"code":-32601,"message":"Method not found","data":{"number":1.20e+4,"wide":123456789012345678901234567890}}}"#;
+        for status in [400, 404] {
+            let metadata = typed_http_tasks_metadata(
+                status,
+                ModernHttpResponseKind::HttpFailure,
+                Some(super::ModernHttpErrorBodyAdmission::JsonRpcError),
+            );
+            let (response, source) = super::admit_typed_http_jsonrpc_response(
+                &metadata,
+                ERROR,
+                &RequestId::Number(2),
+                ERROR.len(),
+            )
+            .unwrap();
+            assert!(response.result.is_none());
+            assert!(source.is_none());
+            let error = response.error.unwrap();
+            assert_eq!(error.code.as_i32(), Some(-32_601));
+            assert_eq!(error.message, "Method not found");
+            let data = error.data.unwrap();
+            assert_eq!(data["number"].to_string(), "1.20e+4");
+            assert_eq!(data["wide"].to_string(), "123456789012345678901234567890");
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn typed_http_tasks_admission_rejects_ambiguous_or_malformed_errors() {
+        let metadata = typed_http_tasks_metadata(
+            400,
+            ModernHttpResponseKind::HttpFailure,
+            Some(super::ModernHttpErrorBodyAdmission::JsonRpcError),
+        );
+        for body in [
+            &b"{incomplete"[..],
+            &b"\xff"[..],
+            &b"\xef\xbb\xbf{}"[..],
+            &br#"{"jsonrpc":"2.0","id":2,"result":{},"error":{"code":-32601,"message":"untrusted"}}"#[..],
+            &br#"{"jsonrpc":"2.0","id":2,"id":2,"error":{"code":-32601,"message":"untrusted"}}"#[..],
+            &br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"untrusted","message":"duplicate"}}"#[..],
+            &br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"untrusted"}}"#[..],
+            &br#"[{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"untrusted"}}]"#[..],
+        ] {
+            let error = super::admit_typed_http_jsonrpc_response(
+                &metadata,
+                body,
+                &RequestId::Number(2),
+                body.len(),
+            )
+            .unwrap_err();
+            assert!(!format!("{error:?}").contains("untrusted"));
+            assert!(matches!(
+                error,
+                super::TypedHttpResponseAdmissionError::UnexpectedHttpResponse { status: 400, .. }
+            ));
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn typed_http_tasks_admission_correlates_errors_before_exposing_data() {
+        let metadata = typed_http_tasks_metadata(
+            404,
+            ModernHttpResponseKind::HttpFailure,
+            Some(super::ModernHttpErrorBodyAdmission::JsonRpcError),
+        );
+        for id_field in [r#""id":3,"#, r#""id":"2","#, ""] {
+            let body = format!(
+                r#"{{"jsonrpc":"2.0",{id_field}"error":{{"code":-32601,"message":"foreign-message","data":{{"secret":"foreign-data"}}}}}}"#
+            );
+            let error = super::admit_typed_http_jsonrpc_response(
+                &metadata,
+                body.as_bytes(),
+                &RequestId::Number(2),
+                body.len(),
+            )
+            .unwrap_err();
+            assert!(!format!("{error:?}").contains("foreign-"));
+            assert!(matches!(
+                error,
+                super::TypedHttpResponseAdmissionError::ResponseIdMismatch {
+                    expected: RequestId::Number(2),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    fn public_http_tasks_success_result(method: &str) -> serde_json::Value {
+        match method {
+            "tools/call" | "tasks/get" => {
+                let mut result = serde_json::json!({
+                    "resultType": if method == "tools/call" { "task" } else { "complete" },
+                    "taskId": "task-73",
+                    "status": if method == "tools/call" { "working" } else { "input_required" },
+                    "createdAt": "2026-07-28T12:00:00.000Z",
+                    "lastUpdatedAt": "2026-07-28T12:00:00.000Z",
+                    "ttlMs": null,
+                });
+                if method == "tasks/get" {
+                    result["inputRequests"] = serde_json::json!({});
+                }
+                result
+            }
+            "tasks/update" | "tasks/cancel" => serde_json::json!({"resultType": "complete"}),
+            _ => panic!("unexpected Tasks fixture method"),
+        }
+    }
+
+    /// Sends one public Tasks operation after discovery. The peer stays open
+    /// until the caller finishes so an implicit replay is observable.
+    #[cfg(feature = "tasks")]
+    fn run_public_http_tasks_response(
+        method: &'static str,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        maximum_bytes: usize,
+    ) -> Result<serde_json::Value, ClientHttpConnectionError> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let content_type_header = if content_type.is_empty() {
+            String::new()
+        } else {
+            format!("Content-Type: {content_type}\r\n")
+        };
+        let mut wire = format!(
+            "HTTP/1.1 {status} Test Response\r\n{content_type_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len(),
+        )
+        .into_bytes();
+        wire.extend_from_slice(body);
+        let (finished, wait_finished) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let mut probe = accept_notification_test_peer(&listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut probe).body).unwrap();
+            assert_eq!(request["method"], "server/discover");
+            write_response(
+                &mut probe,
+                200,
+                "application/json",
+                &modern_tasks_discovery_body(),
+            );
+
+            let mut stream = accept_notification_test_peer(&listener);
+            let request = read_request(&mut stream);
+            if method == "tools/call" {
+                assert!(request.head.contains("Mcp-Name: durable-tool\r\n"));
+                let request: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(request["id"], 2);
+                assert_eq!(request["method"], method);
+                assert_eq!(
+                    request["params"]["arguments"],
+                    serde_json::json!({"work": 73})
+                );
+            } else {
+                let request = assert_public_http_tasks_lifecycle_request(request, method, 2);
+                assert_eq!(request["params"]["taskId"], "task-73");
+            }
+            // A single write also permits immediate refusal after the head.
+            stream.write_all(&wire).unwrap();
+            stream.flush().unwrap();
+            assert_sse_peer_closed(&mut stream);
+            let mut requests = 2;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((_replayed, _)) => requests += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(error) => panic!("Tasks response peer failed: {error}"),
+                }
+                if wait_finished.try_recv().is_ok() {
+                    return requests;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Tasks response caller did not finish"
+                );
+                thread::yield_now();
+            }
+        });
+        let result = runtime_block_on(async {
+            let cx = Cx::current().expect("Tasks response test uses its caller runtime");
+            let connection = ClientBuilder::new()
+                .client_info("public-http-client", "1.0.0")
+                .protocol_plan(plan(
+                    &target,
+                    "http://127.0.0.1:9/legacy-sse",
+                    "http://127.0.0.1:9/legacy-message",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .connect_http_with_cx(&cx)
+                .await
+                .unwrap();
+            let task_id = fastmcp_protocol::FinalTaskId::parse("task-73").unwrap();
+            let response = match method {
+                "tools/call" => connection
+                    .call_tool_final_outcome(
+                        &cx,
+                        RequestId::Number(2),
+                        "durable-tool",
+                        serde_json::json!({"work": 73}),
+                        maximum_bytes,
+                    )
+                    .await
+                    .map(|outcome| match outcome {
+                        FinalToolCallOutcome::Task(result) => serde_json::to_value(result).unwrap(),
+                        FinalToolCallOutcome::Complete(result) => {
+                            serde_json::to_value(result).unwrap()
+                        }
+                        FinalToolCallOutcome::InputRequired(result) => {
+                            serde_json::to_value(result).unwrap()
+                        }
+                    }),
+                "tasks/get" => connection
+                    .get_task_final(&cx, RequestId::Number(2), task_id, maximum_bytes)
+                    .await
+                    .map(|result| serde_json::to_value(result).unwrap()),
+                "tasks/update" => {
+                    let retained: fastmcp_protocol::tasks_extension::GetTaskResult =
+                        serde_json::from_value(public_http_tasks_success_result("tasks/get"))
+                            .unwrap();
+                    connection
+                        .update_task_final(
+                            &cx,
+                            RequestId::Number(2),
+                            &retained.task,
+                            BTreeMap::new(),
+                            maximum_bytes,
+                        )
+                        .await
+                        .map(|result| serde_json::to_value(result).unwrap())
+                }
+                "tasks/cancel" => connection
+                    .cancel_task_final(&cx, RequestId::Number(2), task_id, maximum_bytes)
+                    .await
+                    .map(|result| serde_json::to_value(result).unwrap()),
+                _ => unreachable!("fixture only sends Tasks methods"),
+            };
+            assert!(cx.checkpoint().is_ok());
+            response
+        });
+        finished.send(()).unwrap();
+        assert_eq!(
+            peer.join().unwrap(),
+            2,
+            "one discovery and one operation; no replay"
+        );
+        result
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_finite_results_require_success_status() {
+        for method in ["tools/call", "tasks/get", "tasks/update", "tasks/cancel"] {
+            let result = public_http_tasks_success_result(method);
+            let body = serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": result}).to_string();
+            assert_eq!(
+                run_public_http_tasks_response(
+                    method,
+                    200,
+                    "application/json",
+                    body.as_bytes(),
+                    4_096,
+                )
+                .expect("the typed result is admitted on HTTP 200"),
+                result,
+            );
+            for status in [400, 404, 401, 403, 429, 500] {
+                let maximum_bytes = if matches!(status, 400 | 404) {
+                    4_096
+                } else {
+                    0
+                };
+                let error = run_public_http_tasks_response(
+                    method,
+                    status,
+                    "application/json",
+                    body.as_bytes(),
+                    maximum_bytes,
+                )
+                .expect_err("a result body cannot promote HTTP failure to success");
+                assert!(
+                    matches!(
+                        error,
+                        ClientHttpConnectionError::Modern(
+                            ModernHttpClientError::UnexpectedHttpResponse {
+                                status: actual,
+                                kind: ModernHttpResponseKind::HttpFailure,
+                            }
+                        ) if actual == status
+                    ),
+                    "{method}: {status}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_finite_response_heads_reject_before_body_collection() {
+        for method in ["tools/call", "tasks/get"] {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "result": public_http_tasks_success_result(method),
+            })
+            .to_string();
+            for (status, content_type, kind) in [
+                (200, "text/event-stream", ModernHttpResponseKind::Sse),
+                (202, "", ModernHttpResponseKind::EmptyAcknowledgement),
+            ] {
+                let error = run_public_http_tasks_response(
+                    method,
+                    status,
+                    content_type,
+                    body.as_bytes(),
+                    0,
+                )
+                .expect_err("these heads cannot own a finite JSON result");
+                assert!(
+                    matches!(
+                        error,
+                        ClientHttpConnectionError::Modern(
+                            ModernHttpClientError::UnexpectedHttpResponse {
+                                status: actual_status,
+                                kind: actual_kind,
+                            }
+                        ) if actual_status == status && actual_kind == kind
+                    ),
+                    "a zero body budget would fail if collection preceded head admission"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_finite_errors_preserve_correlated_code_message_and_data() {
+        const DATA: &str = r#"{"numbers":[7.30e-2,1.20e+4,123456789012345678901234567890],"detail":"tasks-error-data"}"#;
+        for method in ["tools/call", "tasks/get", "tasks/update", "tasks/cancel"] {
+            for (status, code, message) in [
+                (200, -32_021, "Required client capability is missing"),
+                (400, -32_021, "Required client capability is missing"),
+                (404, -32_601, "Method not found"),
+            ] {
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":2e0,"error":{{"code":{code},"message":"{message}","data":{DATA}}}}}"#
+                );
+                let error = run_public_http_tasks_response(
+                    method,
+                    status,
+                    "Application/JSON; Charset=UTF-8",
+                    body.as_bytes(),
+                    4_096,
+                )
+                .expect_err("the correlated error remains an error");
+                let (actual_code, actual_message, data) = match error {
+                    ClientHttpConnectionError::Modern(ModernHttpClientError::RemoteError {
+                        code,
+                        message,
+                        data,
+                    }) if method == "tools/call" => (code, message, data),
+                    ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::TasksRemoteError {
+                            method: actual,
+                            code,
+                            message,
+                            data,
+                        },
+                    ) if actual == method => (code, message, data),
+                    error => panic!("{method}: unexpected error {error:?}"),
+                };
+                assert_eq!(actual_code.as_i32(), Some(code));
+                assert_eq!(actual_message, message);
+                let data = data.expect("remote error data survives the typed adapter");
+                assert_eq!(
+                    data,
+                    serde_json::from_str::<serde_json::Value>(DATA).unwrap()
+                );
+                for (number, expected) in data["numbers"].as_array().unwrap().iter().zip([
+                    "7.30e-2",
+                    "1.20e+4",
+                    "123456789012345678901234567890",
+                ]) {
+                    assert_eq!(number.to_string(), expected);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_finite_errors_refuse_foreign_or_untrusted_payloads() {
+        const ERROR: &[u8] = br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"untrusted-peer-message","data":{"secret":"untrusted-peer-data"}}}"#;
+        for method in ["tools/call", "tasks/get"] {
+            for (content_type, body) in [
+                ("text/plain", ERROR),
+                ("application/json; charset=iso-8859-1", ERROR),
+                ("application/json", &b"{incomplete"[..]),
+                (
+                    "application/json",
+                    &br#"{"jsonrpc":"2.0","id":2,"result":{},"error":{"code":-32601,"message":"untrusted-peer-message"}}"#[..],
+                ),
+                (
+                    "application/json",
+                    &br#"{"jsonrpc":"2.0","id":2,"id":2,"error":{"code":-32601,"message":"untrusted-peer-message"}}"#[..],
+                ),
+            ] {
+                let error = run_public_http_tasks_response(method, 400, content_type, body, 4_096)
+                    .expect_err("untrusted failure bodies must not become RPC errors");
+                assert!(!format!("{error:?}").contains("untrusted-peer"));
+                assert!(matches!(
+                    error,
+                    ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::UnexpectedHttpResponse {
+                            status: 400,
+                            kind: ModernHttpResponseKind::HttpFailure,
+                        }
+                    )
+                ));
+            }
+            let body = br#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"foreign-peer-message","data":{"secret":"foreign-peer-data"}}}"#;
+            let error =
+                run_public_http_tasks_response(method, 404, "application/json", body, 4_096)
+                    .expect_err("an error must correlate before its payload is exposed");
+            assert!(!format!("{error:?}").contains("foreign-peer"));
+            match (method, error) {
+                (
+                    "tools/call",
+                    ClientHttpConnectionError::Modern(ModernHttpClientError::ResponseIdMismatch {
+                        expected: RequestId::Number(2),
+                        actual: Some(RequestId::Number(3)),
+                    }),
+                )
+                | (
+                    "tasks/get",
+                    ClientHttpConnectionError::Modern(
+                        ModernHttpClientError::TasksResponseIdMismatch {
+                            method: "tasks/get",
+                            expected: RequestId::Number(2),
+                            actual: Some(RequestId::Number(3)),
+                        },
+                    ),
+                ) => {}
+                (_, error) => panic!("{method}: foreign response used the wrong error {error:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn public_http_tasks_finite_error_bodies_keep_the_exact_byte_limit() {
+        const ERROR: &[u8] =
+            br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for method in ["tools/call", "tasks/get"] {
+            let exact =
+                run_public_http_tasks_response(method, 404, "application/json", ERROR, ERROR.len())
+                    .expect_err("the exact-bound error body must be admitted as a remote error");
+            assert!(matches!(
+                exact,
+                ClientHttpConnectionError::Modern(
+                    ModernHttpClientError::RemoteError { .. }
+                        | ModernHttpClientError::TasksRemoteError { .. }
+                )
+            ));
+            let error = run_public_http_tasks_response(
+                method,
+                404,
+                "application/json",
+                ERROR,
+                ERROR.len() - 1,
+            )
+            .expect_err("the same body one byte over budget must fail bounded collection");
+            assert!(matches!(
+                error,
+                ClientHttpConnectionError::Modern(ModernHttpClientError::Executor(
+                    ModernHttpExecutorError::ResponseBodyTooLarge { maximum_bytes },
+                )) if maximum_bytes == ERROR.len() - 1
+            ));
+        }
     }
 
     /// Executes two independent final `tasks/get` POSTs after discovery.
