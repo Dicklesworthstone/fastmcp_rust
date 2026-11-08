@@ -64,7 +64,7 @@ use fastmcp_protocol::JsonRpcMessage;
 
 use crate::{
     ClientTransportRecvHalf, Codec, ReceivedTransportFrame, Transport, TransportError,
-    TransportRecvHalf, TransportSendHalf,
+    TransportRecvHalf, TransportSendError, TransportSendHalf,
 };
 
 /// Default timeout for recv operations when polling for cancellation.
@@ -301,6 +301,19 @@ impl MemoryTransport {
 impl Transport for MemoryTransport {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         send_memory_message(&mut self.sender, &self.codec, &mut self.closed, cx, message)
+    }
+
+    fn send_with_commit_status(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportSendError> {
+        // Both checkpoints precede the atomic try_send. Successful queue
+        // publication has no later checkpoint and cannot become cancellation.
+        match self.send(cx, message) {
+            Err(TransportError::Cancelled) => Err(TransportSendError::CancelledBeforeCommit),
+            result => result.map_err(TransportSendError::Uncertain),
+        }
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {

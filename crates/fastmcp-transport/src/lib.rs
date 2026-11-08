@@ -176,6 +176,23 @@ pub trait Transport {
     /// or the request has been cancelled.
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError>;
 
+    /// Sends one message while retaining any proven pre-commit cancellation.
+    ///
+    /// The default makes no publication guarantee, including when `send`
+    /// returns [`TransportError::Cancelled`] and the caller is stopped. An
+    /// implementation may return [`TransportSendError::CancelledBeforeCommit`]
+    /// only when it knows that no bytes or message were published and that
+    /// cancellation left the transport reusable. A partial write, a failed
+    /// flush, or cancellation observed after publication must remain
+    /// [`TransportSendError::Uncertain`].
+    fn send_with_commit_status(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportSendError> {
+        self.send(cx, message).map_err(TransportSendError::Uncertain)
+    }
+
     /// Receive the next JSON-RPC message from this transport.
     ///
     /// # Cancel-Safety
@@ -313,6 +330,39 @@ pub trait TransportSendHalf: Send {
 
     /// Closes the send half.
     fn close(&mut self, cx: &Cx) -> Result<(), TransportError>;
+}
+
+/// Publication provenance for one synchronous message send failure.
+///
+/// Cancellation alone is not evidence that a message was unsent. Transports
+/// opt into the stronger variant only at their actual reservation or atomic
+/// publication boundary; ordinary and custom `Transport::send` implementations
+/// retain the conservative default.
+#[derive(Debug)]
+pub enum TransportSendError {
+    /// Cancellation refused this message before any bytes or message were
+    /// published, leaving the transport available to another live caller.
+    CancelledBeforeCommit,
+    /// An ordinary transport failure with no additional publication guarantee.
+    Uncertain(TransportError),
+}
+
+impl std::fmt::Display for TransportSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CancelledBeforeCommit => write!(f, "Request cancelled before send commit"),
+            Self::Uncertain(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl std::error::Error for TransportSendError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CancelledBeforeCommit => None,
+            Self::Uncertain(error) => Some(error),
+        }
+    }
 }
 
 /// Transport error types.

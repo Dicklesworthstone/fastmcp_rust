@@ -810,7 +810,7 @@ impl ReverseRequestHandlers {
 use fastmcp_transport::websocket::{AsyncWsClientRecvHalf, AsyncWsClientSendHalf};
 use fastmcp_transport::{
     ClientTransportRecvHalf, ReceivedTransportFrame, StdioRecvHalf, StdioSendHalf, StdioTransport,
-    Transport, TransportError, TransportRecvHalf, TransportSendHalf,
+    Transport, TransportError, TransportRecvHalf, TransportSendError, TransportSendHalf,
 };
 
 use crate::cache::{FinalCachePageLookup, final_cache_hints};
@@ -12311,6 +12311,32 @@ type SelectedStdioTransport = NegotiatedClientIo<SharedStdioRecv, SharedStdioSen
 impl Transport for SelectedStdioTransport {
     fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
         self.sender.send(cx, message)
+    }
+
+    fn send_with_commit_status(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportSendError> {
+        let (mut sender, deadline) =
+            lock_child_sender(&self.sender.0).map_err(TransportSendError::Uncertain)?;
+        // Keep reservation provenance separate from the bounded native commit.
+        // Lock, partial-write and commit failures never acquire this exemption.
+        let permit = sender.reserve_send(cx).map_err(|error| match error {
+            TransportError::Cancelled => TransportSendError::CancelledBeforeCommit,
+            error => TransportSendError::Uncertain(error),
+        })?;
+        #[cfg(unix)]
+        {
+            permit
+                .send_until(message, deadline)
+                .map_err(TransportSendError::Uncertain)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = deadline;
+            permit.send(message).map_err(TransportSendError::Uncertain)
+        }
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {

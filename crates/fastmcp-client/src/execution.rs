@@ -47,7 +47,7 @@ use fastmcp_protocol::{
     FinalSubscriptionsAcknowledgedNotificationParams, FinalSubscriptionsListenParams,
     SubscriptionFilter,
 };
-use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError};
+use fastmcp_transport::{ReceivedTransportFrame, Transport, TransportError, TransportSendError};
 use serde_json::Value;
 
 use crate::session::ClientExtensionResultAdmission;
@@ -1726,7 +1726,7 @@ where
             ExecutionTimeoutPolicy::Request(timeout_policy),
             Some(cancellation.clone()),
             None,
-            |_, _, message| commit(message),
+            |_, _, message| commit(message).map_err(TransportSendError::Uncertain),
         )
     }
 
@@ -1755,7 +1755,7 @@ where
             ExecutionTimeoutPolicy::Request(timeout_policy),
             Some(cancellation.clone()),
             Some(admission),
-            |_, _, message| commit(message),
+            |_, _, message| commit(message).map_err(TransportSendError::Uncertain),
         )
     }
 
@@ -1791,7 +1791,7 @@ where
             ExecutionTimeoutPolicy::Subscription(timeout_policy),
             Some(cancellation.clone()),
             None,
-            |_, _, message| commit(message),
+            |_, _, message| commit(message).map_err(TransportSendError::Uncertain),
         )
     }
 
@@ -1804,7 +1804,7 @@ where
             None,
             notification,
             false,
-            |transport, cx, message| transport.send(cx, message),
+            |transport, cx, message| transport.send_with_commit_status(cx, message),
         )?
         .then_some(())
         .ok_or_else(|| {
@@ -1827,7 +1827,7 @@ where
             Some(cancellation),
             notification,
             true,
-            |_, _, message| commit(message),
+            |_, _, message| commit(message).map_err(TransportSendError::Uncertain),
         )
     }
 
@@ -1837,7 +1837,7 @@ where
         cancellation: Option<&McpRequestCancellation>,
         notification: JsonRpcRequest,
         external_writes: bool,
-        commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportError>,
+        commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportSendError>,
     ) -> McpResult<bool> {
         let turn = ExecutionTurn::new(cx);
         let cx = &turn;
@@ -1896,7 +1896,7 @@ where
             cx,
             &JsonRpcMessage::Request(notification),
         )
-        .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
+        .map_err(|error| self.handle_application_send_error_locked(cx.cx, &mut state, error))?;
         Ok(true)
     }
 
@@ -2198,7 +2198,7 @@ where
             timeout_policy,
             request_cancellation.cloned(),
             extension_result,
-            |transport, cx, message| transport.send(cx, message),
+            |transport, cx, message| transport.send_with_commit_status(cx, message),
         )?
         .ok_or_else(|| McpError::internal_error("Synchronous executor deferred its own send"))
     }
@@ -2210,7 +2210,7 @@ where
         timeout_policy: ExecutionTimeoutPolicy,
         request_cancellation: Option<McpRequestCancellation>,
         extension_result: Option<ClientExtensionResultAdmission>,
-        commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportError>,
+        commit: impl FnOnce(&mut T, &Cx, &JsonRpcMessage) -> Result<(), TransportSendError>,
     ) -> McpResult<Option<RequestExecution<T>>> {
         let turn = ExecutionTurn::new(cx);
         let cx = &turn;
@@ -2317,7 +2317,7 @@ where
             return Err(McpError::request_cancelled());
         }
         commit(&mut state.transport, cx, &message)
-            .map_err(|error| self.handle_send_error_locked(&mut state, error))?;
+            .map_err(|error| self.handle_application_send_error_locked(cx.cx, &mut state, error))?;
         state.next_generation = generation;
 
         let committed_at = Instant::now();
@@ -3562,6 +3562,28 @@ where
             .uncorrelated_responses
             .drain(..)
             .collect()
+    }
+
+    fn handle_application_send_error_locked(
+        &self,
+        cx: &Cx,
+        state: &mut ExecutorState<T>,
+        error: TransportSendError,
+    ) -> McpError {
+        match error {
+            // This provenance comes from the transport's actual publication
+            // boundary, not from re-reading cancellation after an uncertain
+            // write. No new owner/generation was committed, and live siblings
+            // keep their exact pending state. Reverse/control sends retain
+            // their independent failure policy.
+            TransportSendError::CancelledBeforeCommit if cx.checkpoint().is_err() => {
+                McpError::request_cancelled()
+            }
+            TransportSendError::CancelledBeforeCommit => {
+                self.handle_send_error_locked(state, TransportError::Cancelled)
+            }
+            TransportSendError::Uncertain(error) => self.handle_send_error_locked(state, error),
+        }
     }
 
     fn handle_send_error_locked(
@@ -7788,6 +7810,567 @@ mod tests {
             assert_eq!(executor.take_cancellation_events().len(), 1);
             assert!(stopped.checkpoint().is_err());
             drop(next);
+        }
+    }
+
+    mod send_admission {
+        use super::*;
+        use fastmcp_transport::StdioTransport;
+        use fastmcp_transport::memory::{
+            MemoryTransport, create_memory_transport_pair_with_capacity,
+        };
+        use std::future::Future;
+        use std::io::{self, Cursor, Write};
+        use std::pin::pin;
+        use std::task::{Context, Waker};
+
+        /// Stop only after executor admission, immediately before the real
+        /// transport's reservation. The wrapper forwards publication provenance
+        /// from that transport rather than manufacturing an unsent result.
+        struct SendAdmissionProbe<T> {
+            inner: T,
+            cancel_next: bool,
+            attempts: usize,
+        }
+
+        impl<T> SendAdmissionProbe<T> {
+            fn new(inner: T) -> Self {
+                Self {
+                    inner,
+                    cancel_next: false,
+                    attempts: 0,
+                }
+            }
+
+            fn begin_send(&mut self, cx: &Cx) {
+                self.attempts += 1;
+                if std::mem::take(&mut self.cancel_next) {
+                    assert!(cx.checkpoint().is_ok(), "the admitted caller starts live");
+                    cx.set_cancel_requested(true);
+                }
+            }
+        }
+
+        impl<T: Transport> Transport for SendAdmissionProbe<T> {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                self.begin_send(cx);
+                self.inner.send(cx, message)
+            }
+
+            fn send_with_commit_status(
+                &mut self,
+                cx: &Cx,
+                message: &JsonRpcMessage,
+            ) -> Result<(), TransportSendError> {
+                self.begin_send(cx);
+                self.inner.send_with_commit_status(cx, message)
+            }
+
+            fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                self.inner.recv(cx)
+            }
+
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+                self.inner.close(cx)
+            }
+        }
+
+        fn notification() -> JsonRpcRequest {
+            JsonRpcRequest::notification(
+                "example/changed",
+                Some(serde_json::json!({"value": 37})),
+            )
+        }
+
+        fn complete(id: i64) -> JsonRpcResponse {
+            JsonRpcResponse::success(
+                RequestId::Number(id),
+                serde_json::json!({
+                    "resultType": "complete",
+                    "content": [{"type": "text", "text": format!("owner-{id}")}],
+                    "isError": false,
+                }),
+            )
+        }
+
+        fn application_send<T: Transport>(
+            executor: &RequestExecutor<T>,
+            cx: &Cx,
+            as_notification: bool,
+        ) -> McpResult<()> {
+            if as_notification {
+                executor.send_notification(cx, notification())
+            } else {
+                executor.execute(cx, request(3)).map(drop)
+            }
+        }
+
+        fn pending<T: Transport>(executor: &RequestExecutor<T>) -> Vec<PendingRequestRecord> {
+            let mut records = executor.pending_records();
+            records.sort_by_key(|record| record.execution_generation);
+            records
+        }
+
+        fn assert_uncommitted<T: Transport>(
+            executor: &RequestExecutor<T>,
+            before: &[PendingRequestRecord],
+        ) {
+            assert_eq!(pending(executor).as_slice(), before);
+            let state = executor.state.borrow();
+            assert_eq!(state.next_generation, 2);
+            assert!(state.terminal_error.is_none());
+            assert!(state.completed.is_empty());
+            assert!(state.terminal_records.is_empty());
+            assert!(state.tombstones.is_empty());
+            assert!(state.cancellation_events.is_empty());
+            assert_eq!(state.deferred_control_count(), 0);
+        }
+
+        fn assert_connection_failed<T: Transport>(executor: &RequestExecutor<T>) {
+            assert!(executor.terminal_error().is_some());
+            assert!(executor.pending_records().is_empty());
+            let records = executor.terminal_records();
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().all(|record| {
+                record.terminal_reason == ExecutionTerminalReason::ConnectionLost
+            }));
+            assert_eq!(executor.state.borrow().next_generation, 2);
+        }
+
+        fn assert_memory_empty(peer: &mut MemoryTransport, cx: &Cx) {
+            let mut receive = pin!(peer.recv_async(cx));
+            assert!(
+                receive
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending(),
+                "an unsent frame must not reach the peer"
+            );
+        }
+
+        fn memory_admission_preserves_siblings(as_notification: bool, era: ProtocolEra) {
+            let live = Cx::for_testing();
+            let stopped = Cx::for_testing();
+            let (transport, mut peer) = create_memory_transport_pair_with_capacity(8);
+            let executor =
+                RequestExecutor::with_protocol_era(SendAdmissionProbe::new(transport), era);
+            let mut first = executor.execute(&live, request(1)).unwrap();
+            let mut second = executor.execute(&live, request(2)).unwrap();
+            for id in [1, 2] {
+                assert_eq!(peer.recv(&live).unwrap(), JsonRpcMessage::Request(request(id)));
+            }
+            let before = pending(&executor);
+            executor.state.borrow_mut().transport.cancel_next = true;
+            assert_eq!(
+                application_send(&executor, &stopped, as_notification)
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            assert!(stopped.checkpoint().is_err());
+            assert!(live.checkpoint().is_ok());
+            assert_uncommitted(&executor, &before);
+            assert_eq!(executor.state.borrow().transport.attempts, 3);
+            assert!(!executor.state.borrow().transport.inner.is_closed());
+            assert_memory_empty(&mut peer, &live);
+
+            // Receive in the opposite order to prove exact sibling ownership,
+            // including the result parked while the other caller drives ingress.
+            for id in [2, 1] {
+                peer.send(&live, &JsonRpcMessage::Response(complete(id)))
+                    .unwrap();
+            }
+            assert_eq!(executor.wait(&live, &mut first).unwrap(), complete(1));
+            assert_eq!(executor.wait(&live, &mut second).unwrap(), complete(2));
+            assert!(executor.take_uncorrelated_responses().is_empty());
+            assert!(executor.take_cancellation_events().is_empty());
+
+            // Reuse the refused request's id: no pending owner, tombstone,
+            // cancellation control or generation may have been allocated.
+            let mut next = executor.execute(&live, request(3)).unwrap();
+            assert_eq!(next.generation(), 3);
+            assert_eq!(peer.recv(&live).unwrap(), JsonRpcMessage::Request(request(3)));
+            peer.send(&live, &JsonRpcMessage::Response(complete(3)))
+                .unwrap();
+            assert_eq!(executor.wait(&live, &mut next).unwrap(), complete(3));
+            assert_memory_empty(&mut peer, &live);
+        }
+
+        #[test]
+        fn cancelled_memory_notification_admission_preserves_siblings() {
+            memory_admission_preserves_siblings(true, ProtocolEra::Modern2026);
+        }
+
+        #[test]
+        fn cancelled_memory_request_admission_preserves_siblings() {
+            for era in [ProtocolEra::Legacy2024, ProtocolEra::Modern2026] {
+                memory_admission_preserves_siblings(false, era);
+            }
+        }
+
+        #[derive(Default)]
+        struct WriteObservation {
+            bytes: Vec<u8>,
+            partial_failure: Option<(usize, Cx)>,
+            failed: bool,
+        }
+
+        #[derive(Clone, Default)]
+        struct ObservedWriter(Arc<Mutex<WriteObservation>>);
+
+        impl Write for ObservedWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut observation = self.0.lock().unwrap();
+                if observation.failed {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                if let Some((prefix, cancel)) = observation.partial_failure.take() {
+                    let written = prefix.min(bytes.len());
+                    observation.bytes.extend_from_slice(&bytes[..written]);
+                    observation.failed = true;
+                    cancel.set_cancel_requested(true);
+                    return Ok(written);
+                }
+                observation.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                if self.0.lock().unwrap().failed {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn stdio_responses() -> Cursor<Vec<u8>> {
+            let mut bytes = Vec::new();
+            for id in [2, 1, 3] {
+                bytes.extend(serde_json::to_vec(&complete(id)).unwrap());
+                bytes.push(b'\n');
+            }
+            Cursor::new(bytes)
+        }
+
+        #[test]
+        fn cancelled_stdio_reservation_preserves_siblings_and_later_writes() {
+            for as_notification in [false, true] {
+                let live = Cx::for_testing();
+                let stopped = Cx::for_testing();
+                let writer = ObservedWriter::default();
+                let transport = StdioTransport::new(stdio_responses(), writer.clone());
+                let executor = RequestExecutor::with_protocol_era(
+                    SendAdmissionProbe::new(transport),
+                    ProtocolEra::Modern2026,
+                );
+                let mut first = executor.execute(&live, request(1)).unwrap();
+                let mut second = executor.execute(&live, request(2)).unwrap();
+                let before = pending(&executor);
+                let original_bytes = writer.0.lock().unwrap().bytes.clone();
+                executor.state.borrow_mut().transport.cancel_next = true;
+                assert_eq!(
+                    application_send(&executor, &stopped, as_notification)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert!(stopped.checkpoint().is_err());
+                assert_uncommitted(&executor, &before);
+                assert_eq!(writer.0.lock().unwrap().bytes, original_bytes);
+                assert!(!executor.state.borrow().transport.inner.is_closed());
+                assert_eq!(executor.wait(&live, &mut first).unwrap(), complete(1));
+                assert_eq!(executor.wait(&live, &mut second).unwrap(), complete(2));
+
+                let mut next = executor.execute(&live, request(3)).unwrap();
+                assert_eq!(next.generation(), 3);
+                assert_eq!(executor.wait(&live, &mut next).unwrap(), complete(3));
+                executor.send_notification(&live, notification()).unwrap();
+                let bytes = writer.0.lock().unwrap().bytes.clone();
+                let written = bytes
+                    .split(|byte| *byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_slice::<JsonRpcMessage>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    written,
+                    vec![
+                        JsonRpcMessage::Request(request(1)),
+                        JsonRpcMessage::Request(request(2)),
+                        JsonRpcMessage::Request(request(3)),
+                        JsonRpcMessage::Request(notification()),
+                    ]
+                );
+                assert!(executor.take_cancellation_events().is_empty());
+                assert!(executor.take_uncorrelated_responses().is_empty());
+            }
+        }
+
+        /// Deliberately implements only the original trait entrypoint. Its
+        /// Cancelled error has no publication proof, even if Cx is stopped.
+        struct UnclassifiedCancellation {
+            inner: MemoryTransport,
+            next_failure: Option<(bool, bool)>,
+        }
+
+        impl Transport for UnclassifiedCancellation {
+            fn send(&mut self, cx: &Cx, message: &JsonRpcMessage) -> Result<(), TransportError> {
+                let Some((publish, stop)) = self.next_failure.take() else {
+                    return self.inner.send(cx, message);
+                };
+                if publish {
+                    self.inner.send(cx, message)?;
+                }
+                if stop {
+                    cx.set_cancel_requested(true);
+                }
+                Err(TransportError::Cancelled)
+            }
+
+            fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
+                self.inner.recv(cx)
+            }
+
+            fn close(&mut self, cx: &Cx) -> Result<(), TransportError> {
+                self.inner.close(cx)
+            }
+        }
+
+        #[test]
+        fn uncertain_cancelled_send_stays_fatal_before_and_after_publication() {
+            for as_notification in [false, true] {
+                for (publish, stop) in [(false, false), (false, true), (true, true)] {
+                    let live = Cx::for_testing();
+                    let caller = Cx::for_testing();
+                    let (inner, mut peer) = create_memory_transport_pair_with_capacity(8);
+                    let executor = RequestExecutor::with_protocol_era(
+                        UnclassifiedCancellation {
+                            inner,
+                            next_failure: None,
+                        },
+                        ProtocolEra::Modern2026,
+                    );
+                    let mut first = executor.execute(&live, request(1)).unwrap();
+                    let mut second = executor.execute(&live, request(2)).unwrap();
+                    executor.state.borrow_mut().transport.next_failure = Some((publish, stop));
+                    assert_eq!(
+                        application_send(&executor, &caller, as_notification)
+                            .unwrap_err()
+                            .code,
+                        McpErrorCode::RequestCancelled
+                    );
+                    assert_eq!(caller.checkpoint().is_err(), stop);
+                    assert!(live.checkpoint().is_ok());
+                    assert_connection_failed(&executor);
+                    assert!(executor.try_take_response(&mut first).is_err());
+                    assert!(executor.try_take_response(&mut second).is_err());
+                    assert!(application_send(&executor, &live, as_notification).is_err());
+                    for id in [1, 2] {
+                        assert_eq!(
+                            peer.recv(&live).unwrap(),
+                            JsonRpcMessage::Request(request(id))
+                        );
+                    }
+                    if publish {
+                        assert_eq!(
+                            peer.recv(&live).unwrap(),
+                            JsonRpcMessage::Request(if as_notification {
+                                notification()
+                            } else {
+                                request(3)
+                            })
+                        );
+                    }
+                    assert_memory_empty(&mut peer, &live);
+                }
+            }
+        }
+
+        #[test]
+        fn cancelled_caller_does_not_hide_a_closed_memory_sender() {
+            for as_notification in [false, true] {
+                let live = Cx::for_testing();
+                let stopped = Cx::for_testing();
+                let (transport, _peer) = create_memory_transport_pair_with_capacity(8);
+                let executor = RequestExecutor::with_protocol_era(
+                    SendAdmissionProbe::new(transport),
+                    ProtocolEra::Modern2026,
+                );
+                let mut first = executor.execute(&live, request(1)).unwrap();
+                let mut second = executor.execute(&live, request(2)).unwrap();
+                {
+                    let mut state = executor.state.borrow_mut();
+                    state.transport.inner.close(&live).unwrap();
+                    state.transport.cancel_next = true;
+                }
+                assert_ne!(
+                    application_send(&executor, &stopped, as_notification)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert!(stopped.checkpoint().is_err());
+                assert_connection_failed(&executor);
+                assert!(executor.try_take_response(&mut first).is_err());
+                assert!(executor.try_take_response(&mut second).is_err());
+            }
+        }
+
+        #[test]
+        fn cancellation_during_partial_stdio_commit_remains_connection_fatal() {
+            for as_notification in [false, true] {
+                let live = Cx::for_testing();
+                let stopped = Cx::for_testing();
+                let writer = ObservedWriter::default();
+                let transport = StdioTransport::new(stdio_responses(), writer.clone());
+                let executor =
+                    RequestExecutor::with_protocol_era(transport, ProtocolEra::Modern2026);
+                let mut first = executor.execute(&live, request(1)).unwrap();
+                let mut second = executor.execute(&live, request(2)).unwrap();
+                let original = writer.0.lock().unwrap().bytes.clone();
+                writer.0.lock().unwrap().partial_failure = Some((7, stopped.clone()));
+                assert_ne!(
+                    application_send(&executor, &stopped, as_notification)
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert!(stopped.checkpoint().is_err());
+                assert!(executor.state.borrow().transport.is_closed());
+                let bytes = writer.0.lock().unwrap().bytes.clone();
+                assert_eq!(bytes.len(), original.len() + 7);
+                assert_eq!(&bytes[..original.len()], original.as_slice());
+                assert_connection_failed(&executor);
+                assert!(executor.try_take_response(&mut first).is_err());
+                assert!(executor.try_take_response(&mut second).is_err());
+                assert!(application_send(&executor, &live, as_notification).is_err());
+                assert_eq!(writer.0.lock().unwrap().bytes, bytes);
+            }
+        }
+
+        #[test]
+        fn uncommitted_send_receipt_requires_a_stopped_underlying_caller() {
+            for as_notification in [false, true] {
+                let live = Cx::for_testing();
+                let executor = RequestExecutor::with_protocol_era(
+                    ScriptedTransport::new([]),
+                    ProtocolEra::Modern2026,
+                );
+                let mut first = executor.execute(&live, request(1)).unwrap();
+                let mut second = executor.execute(&live, request(2)).unwrap();
+                // An inconsistent adapter receipt alone cannot authorize the
+                // local-cancellation branch while the actual caller is live.
+                let result = if as_notification {
+                    executor
+                        .send_notification_with_commit(
+                            &live,
+                            None,
+                            notification(),
+                            false,
+                            |_, _, _| Err(TransportSendError::CancelledBeforeCommit),
+                        )
+                        .map(drop)
+                } else {
+                    executor
+                        .execute_with_commit(
+                            &live,
+                            request(3),
+                            ExecutionTimeoutPolicy::Request(RequestTimeoutPolicy::default()),
+                            None,
+                            None,
+                            |_, _, _| Err(TransportSendError::CancelledBeforeCommit),
+                        )
+                        .map(drop)
+                };
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert!(live.checkpoint().is_ok());
+                assert_connection_failed(&executor);
+                assert!(executor.try_take_response(&mut first).is_err());
+                assert!(executor.try_take_response(&mut second).is_err());
+                assert_eq!(executor.state.borrow().transport.sent.len(), 2);
+            }
+        }
+
+        #[test]
+        fn external_commit_cancellation_after_publication_remains_fatal() {
+            for as_notification in [false, true] {
+                let live = Cx::for_testing();
+                let caller = Cx::for_testing();
+                let cancellation = McpRequestCancellation::new();
+                let (mut sender, mut peer) = create_memory_transport_pair_with_capacity(8);
+                let executor = RequestExecutor::with_external_driver(
+                    ScriptedTransport::new([]),
+                    ProtocolEra::Modern2026,
+                );
+                let mut first = executor
+                    .execute_external(
+                        &live,
+                        &cancellation,
+                        request(1),
+                        RequestTimeoutPolicy::default(),
+                        |message| sender.send(&live, message),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let mut second = executor
+                    .execute_external(
+                        &live,
+                        &cancellation,
+                        request(2),
+                        RequestTimeoutPolicy::default(),
+                        |message| sender.send(&live, message),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let commit = |message: &JsonRpcMessage| {
+                    sender.send(&caller, message)?;
+                    caller.set_cancel_requested(true);
+                    Err(TransportError::Cancelled)
+                };
+                let result = if as_notification {
+                    executor
+                        .send_external_notification(&caller, &cancellation, notification(), commit)
+                        .map(drop)
+                } else {
+                    executor
+                        .execute_external(
+                            &caller,
+                            &cancellation,
+                            request(3),
+                            RequestTimeoutPolicy::default(),
+                            commit,
+                        )
+                        .map(drop)
+                };
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert!(caller.checkpoint().is_err());
+                assert!(live.checkpoint().is_ok());
+                assert_connection_failed(&executor);
+                assert!(executor.try_take_response(&mut first).is_err());
+                assert!(executor.try_take_response(&mut second).is_err());
+                for id in [1, 2] {
+                    assert_eq!(peer.recv(&live).unwrap(), JsonRpcMessage::Request(request(id)));
+                }
+                assert_eq!(
+                    peer.recv(&live).unwrap(),
+                    JsonRpcMessage::Request(if as_notification {
+                        notification()
+                    } else {
+                        request(3)
+                    })
+                );
+                let replayed = Cell::new(false);
+                assert!(
+                    executor
+                        .send_external_notification(&live, &cancellation, notification(), |_| {
+                            replayed.set(true);
+                            Ok(())
+                        })
+                        .is_err()
+                );
+                assert!(!replayed.get());
+                assert_memory_empty(&mut peer, &live);
+            }
         }
     }
 

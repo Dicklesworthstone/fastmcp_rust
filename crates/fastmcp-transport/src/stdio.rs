@@ -66,7 +66,7 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use crate::async_io::{AsyncLineReader, AsyncStdout, BoundedLineReadError};
 use crate::{
     ClientTransportRecvHalf, Codec, CodecError, ReceivedTransportFrame, SendPermit, Transport,
-    TransportError, TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
+    TransportError, TransportRecvHalf, TransportSendError, TransportSendHalf, TwoPhaseTransport,
 };
 
 mod asynchronous;
@@ -914,6 +914,21 @@ impl<R: Read, W: Write> Transport for StdioTransport<R, W> {
         self.write_message(message)
     }
 
+    fn send_with_commit_status(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportSendError> {
+        // Only the reservation can prove cancellation preceded publication.
+        // Once a permit exists, even a cancellation-shaped commit failure
+        // must retain the ordinary uncertain-write disposition.
+        let permit = TwoPhaseTransport::reserve_send(self, cx).map_err(|error| match error {
+            TransportError::Cancelled => TransportSendError::CancelledBeforeCommit,
+            error => TransportSendError::Uncertain(error),
+        })?;
+        permit.send(message).map_err(TransportSendError::Uncertain)
+    }
+
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {
         self.recv_with_completion(cx).map(|(message, _)| message)
     }
@@ -1541,6 +1556,21 @@ impl Transport for AsyncStdioTransport {
         // The checkpoint above admits one complete frame commit. Every commit
         // error is terminal because the NDJSON frame may be partial.
         self.write_encoded(&bytes)
+    }
+
+    fn send_with_commit_status(
+        &mut self,
+        cx: &Cx,
+        message: &JsonRpcMessage,
+    ) -> Result<(), TransportSendError> {
+        // This is the synchronous process-stdio implementation. Only its
+        // reservation may grant pre-commit provenance; the asynchronous I/O
+        // form does not implement Transport and has different commit rules.
+        let permit = TwoPhaseTransport::reserve_send(self, cx).map_err(|error| match error {
+            TransportError::Cancelled => TransportSendError::CancelledBeforeCommit,
+            error => TransportSendError::Uncertain(error),
+        })?;
+        permit.send(message).map_err(TransportSendError::Uncertain)
     }
 
     fn recv(&mut self, cx: &Cx) -> Result<JsonRpcMessage, TransportError> {

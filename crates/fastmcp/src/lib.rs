@@ -873,7 +873,7 @@ pub use fastmcp_transport::{
     ModernSseLimits, ModernSseParseError, ReceivedTransportFrame, SendPermit, StdioTransport,
     StreamableHttpRequestCancellation, StreamableHttpRequestResponseStream,
     StreamableHttpResponseStream, StreamableHttpTransport, Transport, TransportError,
-    TransportRecvHalf, TransportSendHalf, TwoPhaseTransport,
+    TransportRecvHalf, TransportSendError, TransportSendHalf, TwoPhaseTransport,
 };
 
 /// Direct transport APIs exposed by the facade.
