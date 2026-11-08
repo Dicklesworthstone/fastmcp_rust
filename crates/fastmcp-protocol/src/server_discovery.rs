@@ -18,7 +18,7 @@ use serde_json::{Value, value::RawValue};
 
 use crate::common_types::{Implementation, OpenMetadata};
 use crate::result::{
-    CacheTtl, ExactJsonObject, FinalResultMetadataRole, encode_exact_object,
+    CacheTtl, ExactJsonObject, ExactJsonValue, FinalResultMetadataRole, encode_exact_object,
     parse_exact_result_object, validate_final_result_metadata_entries,
 };
 use crate::{
@@ -760,6 +760,30 @@ impl ServerDiscoverResult {
     pub const fn cache_hints(&self) -> &DiscoveryCacheHints {
         &self.cache_hints
     }
+
+    /// Caps the advertised cache lifetime without changing its scope.
+    ///
+    /// Caches use this when replaying an aged result so a downstream consumer
+    /// cannot restart the original lifetime. The cap never increases the
+    /// admitted TTL, and exact peer members other than `ttlMs` remain intact.
+    pub fn cap_cache_ttl_ms(&mut self, remaining_ttl_ms: u64) {
+        if self
+            .cache_hints
+            .ttl_ms
+            .try_as_millis()
+            .is_ok_and(|current| current <= remaining_ttl_ms)
+        {
+            return;
+        }
+        self.cache_hints.ttl_ms = CacheTtl::milliseconds(remaining_ttl_ms);
+        if let Some(exact_ttl) = self
+            .exact_peer_result
+            .as_mut()
+            .and_then(|result| result.get_mut("ttlMs"))
+        {
+            *exact_ttl = ExactJsonValue::Number(remaining_ttl_ms.to_string());
+        }
+    }
 }
 
 impl Serialize for ServerDiscoverResult {
@@ -1158,6 +1182,64 @@ mod tests {
             source,
             "top-level and nested schema-open member order and number lexemes replay exactly"
         );
+    }
+
+    #[test]
+    fn discovery_cache_ttl_cap_preserves_exact_peer_data_and_never_renews() {
+        let source = r#"{"com.example/top":{"second":1.20e+4,"first":0e0},"cacheScope":"public","_meta":{"io.modelcontextprotocol/futureResultMetadata":{"later":1.20e+4,"earlier":0e0}},"capabilities":{"tools":{"listChanged":true}},"ttlMs":100,"supportedVersions":["2026-07-28"],"resultType":"complete"}"#;
+        let mut result = serde_json::from_str::<ServerDiscoverResult>(source).unwrap();
+        result.cap_cache_ttl_ms(200);
+        assert_eq!(serde_json::to_string(&result).unwrap(), source);
+
+        result.cap_cache_ttl_ms(25);
+        assert_eq!(result.cache_hints().ttl_ms().try_as_millis(), Ok(25));
+        assert!(result.cache_hints().is_public());
+        let aged = source.replace("\"ttlMs\":100", "\"ttlMs\":25");
+        assert_eq!(serde_json::to_string(&result).unwrap(), aged);
+        result.cap_cache_ttl_ms(99);
+        assert_eq!(serde_json::to_string(&result).unwrap(), aged);
+
+        result.cap_cache_ttl_ms(0);
+        assert_eq!(
+            serde_json::to_string(&result).unwrap(),
+            source.replace("\"ttlMs\":100", "\"ttlMs\":0")
+        );
+        let decoded: ServerDiscoverResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(decoded.cache_hints().ttl_ms().try_as_millis(), Ok(0));
+        assert!(decoded.cache_hints().is_public());
+    }
+
+    #[test]
+    fn discovery_cache_ttl_cap_handles_local_and_unbounded_peer_hints() {
+        let mut local = ServerDiscoverResult::new(
+            fully_installed_capabilities(),
+            ServerInfo {
+                name: "aged-discovery".to_owned(),
+                version: "1".to_owned(),
+            },
+            None,
+            DiscoveryCacheHints::private_ttl_ms(100),
+        );
+        local.cap_cache_ttl_ms(50);
+        assert_eq!(local.cache_hints().ttl_ms().try_as_millis(), Ok(50));
+        assert!(!local.cache_hints().is_public());
+        assert_eq!(serde_json::to_value(&local).unwrap()["ttlMs"], 50);
+
+        let source = r#"{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":18446744073709551616,"cacheScope":"private"}"#;
+        let mut peer = serde_json::from_str::<ServerDiscoverResult>(source).unwrap();
+        peer.cap_cache_ttl_ms(50);
+        assert_eq!(peer.cache_hints().ttl_ms().try_as_millis(), Ok(50));
+        assert_eq!(
+            serde_json::to_string(&peer).unwrap(),
+            source.replace("18446744073709551616", "50")
+        );
+
+        let small_source = source.replace("18446744073709551616", "0.000000000000000000001e21");
+        let mut small = serde_json::from_str::<ServerDiscoverResult>(&small_source).unwrap();
+        small.cap_cache_ttl_ms(50);
+        assert_eq!(small.cache_hints().ttl_ms().try_as_millis(), Ok(1));
+        assert_eq!(serde_json::to_string(&small).unwrap(), small_source);
     }
 
     #[test]

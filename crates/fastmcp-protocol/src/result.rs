@@ -83,6 +83,15 @@ impl ExactJsonObject {
             .map(|member| &member.value)
     }
 
+    /// Updates a selected typed member without rebuilding unrelated exact
+    /// values through a lossy JSON representation.
+    pub(crate) fn get_mut(&mut self, name: &str) -> Option<&mut ExactJsonValue> {
+        self.members
+            .iter_mut()
+            .find(|member| member.name == name)
+            .map(|member| &mut member.value)
+    }
+
     fn take(&mut self, name: &str) -> Option<ExactJsonValue> {
         self.members
             .iter()
@@ -908,7 +917,11 @@ fn cache_ttl_runtime_millis(lexeme: &str) -> Result<u64, CacheTtlConversionError
         .map_err(|_| CacheTtlConversionError::RuntimeOutOfRange)?;
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let digits = format!("{whole}{fraction}");
-    if !digits.bytes().any(|byte| matches!(byte, b'1'..=b'9')) {
+    // Leading mantissa zeroes carry no magnitude. Strip them before the
+    // checked decimal shift so a small exponent-form integer cannot appear
+    // out of range solely because its original fraction had many zeroes.
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
         return Ok(0);
     }
 
@@ -2365,6 +2378,33 @@ mod tests {
             serde_json::from_str::<CacheTtl>("18446744073709551616.5").is_err(),
             "changing only the unbounded integer TTL to a fraction violates the final integer schema"
         );
+    }
+
+    #[test]
+    fn cache_ttl_runtime_conversion_uses_magnitude_not_mantissa_length() {
+        for (source, expected) in [
+            ("0.000000000000000000001e21", 1),
+            ("0.000000000000000000001e23", 100),
+            ("0.00000000000000000000100e21", 1),
+            ("0.18446744073709551615e20", u64::MAX),
+            ("0.00018446744073709551615e23", u64::MAX),
+        ] {
+            let ttl: CacheTtl = serde_json::from_str(source).unwrap();
+            assert_eq!(ttl.try_as_millis(), Ok(expected), "{source}");
+            assert_eq!(serde_json::to_string(&ttl).unwrap(), source);
+        }
+        for source in [
+            "0.18446744073709551616e20",
+            "0.00018446744073709551616e23",
+            "0.000000000000000000001e41",
+        ] {
+            let ttl: CacheTtl = serde_json::from_str(source).unwrap();
+            assert_eq!(
+                ttl.try_as_millis(),
+                Err(CacheTtlConversionError::RuntimeOutOfRange),
+                "{source}"
+            );
+        }
     }
 
     #[test]

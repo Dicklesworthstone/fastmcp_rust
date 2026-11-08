@@ -320,6 +320,9 @@ impl From<&FinalCacheResultSet> for FinalCacheGenerationSet {
 
 /// A bounded cache of exact final complete results.
 ///
+/// Cache hits preserve admitted result data and advertise only their remaining
+/// whole-millisecond lifetime, so forwarding a hit cannot renew its freshness.
+///
 /// Peer `public` hints are retained as data but do not weaken the supplied
 /// [`CachePartitionKey`]. Cross-principal reuse requires a separately
 /// revisioned trust policy and is intentionally not inferred from peer data.
@@ -426,6 +429,10 @@ impl FinalResultCache {
     }
 
     /// Looks up one complete result at the supplied monotonic instant.
+    ///
+    /// The returned `ttlMs` is capped by the entry's remaining lifetime. A
+    /// fresh result with less than one millisecond left has a zero TTL and
+    /// therefore cannot be retained by a downstream cache.
     pub fn lookup_at(&mut self, key: &FinalCacheKey, now: Instant) -> FinalCacheLookup {
         match self.lookup_page_at(key, now) {
             FinalCachePageLookup::Fresh(page) => FinalCacheLookup::Fresh(page.result),
@@ -473,7 +480,14 @@ impl FinalResultCache {
         }
 
         // Do not clone a potentially large result only to discard it on a miss.
-        let result = entry.result.clone();
+        let mut result = entry.result.clone();
+        // Round down so millisecond quantization cannot extend the remaining
+        // lifetime at lookup. Clamp a caller-supplied instant before receipt
+        // so even that cannot renew the original TTL.
+        let remaining_ms = expires_at
+            .saturating_duration_since(now.max(entry.receipt))
+            .as_millis();
+        cap_final_cache_ttl_ms(&mut result, u64::try_from(remaining_ms).unwrap_or(0));
         let scope = entry.scope;
         self.stats.hits = self.stats.hits.saturating_add(1);
         FinalCachePageLookup::Fresh(Box::new(FinalCachePage {
@@ -733,6 +747,38 @@ fn final_catalog_proves_cursor(
         _ => return false,
     };
     accepted_cursor == Some(cursor) || next_cursor == Some(cursor)
+}
+
+fn cap_final_cache_ttl_ms(result: &mut CoreResult, remaining_ttl_ms: u64) {
+    let CoreResult::Final(result) = result else {
+        return;
+    };
+    let ttl = match result {
+        FinalCoreResult::Discover(result) => {
+            result.cap_cache_ttl_ms(remaining_ttl_ms);
+            return;
+        }
+        FinalCoreResult::ToolsList { result, .. } => &mut result.payload.ttl_ms,
+        FinalCoreResult::ResourcesList { result, .. } => &mut result.payload.ttl_ms,
+        FinalCoreResult::ResourceTemplatesList { result, .. } => &mut result.payload.ttl_ms,
+        FinalCoreResult::ResourcesRead { result, .. } => &mut result.payload.ttl_ms,
+        FinalCoreResult::PromptsList { result, .. } => &mut result.payload.ttl_ms,
+        FinalCoreResult::Completion { .. }
+        | FinalCoreResult::ToolsCall { .. }
+        | FinalCoreResult::ToolsCallInputRequired { .. }
+        | FinalCoreResult::ResourcesReadInputRequired { .. }
+        | FinalCoreResult::PromptsGet { .. }
+        | FinalCoreResult::PromptsGetInputRequired { .. }
+        | FinalCoreResult::SubscriptionsListen { .. } => return,
+        #[cfg(feature = "tasks")]
+        FinalCoreResult::ToolsCallTask { .. } => return,
+    };
+    if !ttl
+        .try_as_millis()
+        .is_ok_and(|current| current <= remaining_ttl_ms)
+    {
+        *ttl = CacheTtl::milliseconds(remaining_ttl_ms);
+    }
 }
 
 pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheScope)> {
@@ -1073,6 +1119,166 @@ mod tests {
             FinalCacheLookup::Miss(FinalCacheMiss::Stale)
         ));
         assert_eq!(cache.stats().stale, 1);
+    }
+
+    #[test]
+    fn cache_hits_age_every_cacheable_result_without_changing_peer_data() {
+        let fixtures = [
+            (
+                "server/discover",
+                FinalCacheResultSet::ServerDiscovery,
+                r#""supportedVersions":["2026-07-28"],"capabilities":{}"#,
+            ),
+            (
+                "tools/list",
+                FinalCacheResultSet::Tools,
+                r#""tools":[],"nextCursor":"page-2""#,
+            ),
+            (
+                "resources/list",
+                FinalCacheResultSet::Resources,
+                r#""resources":[],"nextCursor":"page-2""#,
+            ),
+            (
+                "resources/templates/list",
+                FinalCacheResultSet::ResourceTemplates,
+                r#""resourceTemplates":[],"nextCursor":"page-2""#,
+            ),
+            (
+                "resources/read",
+                FinalCacheResultSet::Resource("file:///aged.txt".to_owned()),
+                r#""contents":[]"#,
+            ),
+            (
+                "prompts/list",
+                FinalCacheResultSet::Prompts,
+                r#""prompts":[],"nextCursor":"page-2""#,
+            ),
+        ];
+        for scope in ["private", "public"] {
+            for (method, result_set, payload) in &fixtures {
+                let mut params = serde_json::json!({
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {}
+                    }
+                });
+                if *method == "resources/read" {
+                    params["uri"] = serde_json::json!("file:///aged.txt");
+                }
+                let request = CoreRequest::decode(
+                    fastmcp_protocol::ProtocolEra::Modern2026,
+                    method,
+                    Some(&params),
+                )
+                .unwrap();
+                let result = request
+                    .decode_result(&format!(
+                        r#"{{"resultType":"complete",{payload},"ttlMs":100,"cacheScope":"{scope}","x-retained":{{"later":1.20e+4,"earlier":-0,"huge":9007199254740993123456789}},"_meta":{{"com.example/cache-test":{{"second":0e0,"first":1.20e+4}}}}}}"#
+                    ))
+                    .unwrap();
+                let original = result.encode().unwrap();
+                let mut cache_key = key("credential-a", None);
+                cache_key.method = (*method).to_owned();
+                cache_key.result_set = result_set.clone();
+                let mut cache = FinalResultCache::default();
+                let receipt = Instant::now();
+                let generation = cache.begin_fetch(result_set);
+                assert_eq!(
+                    cache.insert_if_current_at(cache_key.clone(), generation, result, receipt),
+                    FinalCacheInsert::Stored
+                );
+
+                // Out-of-order test instants also prove hits do not overwrite
+                // the retained source or compound age across later lookups.
+                for (at, remaining_ms) in [
+                    (receipt, 100),
+                    (receipt + Duration::from_millis(75), 25),
+                    (receipt + Duration::from_millis(10), 90),
+                    (receipt - Duration::from_millis(1), 100),
+                    (receipt + Duration::from_micros(99_500), 0),
+                ] {
+                    let FinalCachePageLookup::Fresh(page) = cache.lookup_page_at(&cache_key, at)
+                    else {
+                        panic!("{method} must stay usable until its original expiry");
+                    };
+                    assert_eq!(page.generation, generation);
+                    assert_eq!(
+                        page.scope,
+                        if scope == "public" {
+                            CacheScope::Public
+                        } else {
+                            CacheScope::Private
+                        }
+                    );
+                    assert_eq!(
+                        page.result.encode().unwrap(),
+                        original.replace("\"ttlMs\":100", &format!("\"ttlMs\":{remaining_ms}")),
+                        "{method}: only the selected typed lifetime may change"
+                    );
+                }
+                assert_eq!(cache.entries[&cache_key].result.encode().unwrap(), original);
+                assert!(matches!(
+                    cache.lookup_at(&cache_key, receipt + Duration::from_millis(100)),
+                    FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn forwarding_cache_hits_cannot_restart_cursor_page_freshness() {
+        let cache_key = key("credential-a", Some("opaque-page-2"));
+        let receipt = Instant::now();
+        let mut upstream = FinalResultCache::default();
+        let generation = upstream.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            upstream.insert_if_current_at(
+                cache_key.clone(),
+                generation,
+                tools_result(100, "private", Some(r#""nextCursor":"page-3""#)),
+                receipt,
+            ),
+            FinalCacheInsert::Stored
+        );
+        let forwarded_at = receipt + Duration::from_millis(75);
+        let FinalCacheLookup::Fresh(hit) = upstream.lookup_at(&cache_key, forwarded_at) else {
+            panic!("the original page is still fresh at forwarding");
+        };
+        let mut downstream = FinalResultCache::default();
+        let downstream_generation = downstream.begin_fetch(cache_key.result_set());
+        assert_eq!(
+            downstream.insert_if_current_at(
+                cache_key.clone(),
+                downstream_generation,
+                hit,
+                forwarded_at,
+            ),
+            FinalCacheInsert::Stored
+        );
+        assert!(matches!(
+            downstream.lookup_at(&cache_key, receipt + Duration::from_millis(99)),
+            FinalCacheLookup::Fresh(_)
+        ));
+        assert!(matches!(
+            downstream.lookup_at(&cache_key, receipt + Duration::from_millis(100)),
+            FinalCacheLookup::Miss(FinalCacheMiss::Stale)
+        ));
+
+        let submillisecond_at = receipt + Duration::from_micros(99_500);
+        let FinalCacheLookup::Fresh(hit) = upstream.lookup_at(&cache_key, submillisecond_at) else {
+            panic!("the local page still has a submillisecond of validity");
+        };
+        assert_eq!(
+            downstream.insert_if_current_at(
+                cache_key,
+                downstream_generation,
+                hit,
+                submillisecond_at,
+            ),
+            FinalCacheInsert::ImmediatelyStale,
+            "rounding must never extend downstream freshness"
+        );
     }
 
     #[test]
@@ -1516,11 +1722,12 @@ mod tests {
             .expect("complete resource result with an unknown number is admitted");
         let expected = result.encode().expect("complete result re-encodes");
         let generation = cache.begin_fetch(resource_key.result_set());
+        let receipt = Instant::now();
         assert_eq!(
-            cache.insert_if_current(resource_key.clone(), generation, result),
+            cache.insert_if_current_at(resource_key.clone(), generation, result, receipt),
             FinalCacheInsert::Stored
         );
-        let FinalCacheLookup::Fresh(replayed) = cache.lookup(&resource_key) else {
+        let FinalCacheLookup::Fresh(replayed) = cache.lookup_at(&resource_key, receipt) else {
             panic!("fresh cached resource result expected");
         };
         assert_eq!(
