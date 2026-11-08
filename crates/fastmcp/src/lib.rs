@@ -188,7 +188,7 @@ pub mod __private {
         pub use fastmcp_server::extensions::authoring::{
             ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
             ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
-            ExtensionRegistration,
+            ExtensionRegistration, ExtensionRequestNotification,
         };
     }
 
@@ -760,7 +760,8 @@ pub use fastmcp_protocol::extensions::{
     MAX_EXTENSION_SETTINGS_NESTING, MAX_EXTENSION_SETTINGS_VALUE_BYTES,
     MAX_STDIO_CORRELATION_METHODS, NegotiatedExtension, NegotiatedExtensionSet,
     NotificationActivationProofDescriptor, NotificationActivationProofLocation,
-    ServerExtensionDiscovery, StdioCorrelationDescriptor,
+    ServerExtensionDiscovery, StdioCorrelationCodec, StdioCorrelationDescriptor,
+    StdioNotificationCorrelation,
 };
 
 #[cfg(feature = "apps")]
@@ -3043,7 +3044,8 @@ pub mod modern {
         MAX_EXTENSION_SETTINGS_NESTING, MAX_EXTENSION_SETTINGS_VALUE_BYTES,
         MAX_STDIO_CORRELATION_METHODS, NegotiatedExtension, NegotiatedExtensionSet,
         NotificationActivationProofDescriptor, NotificationActivationProofLocation,
-        ServerExtensionDiscovery, StdioCorrelationDescriptor,
+        ServerExtensionDiscovery, StdioCorrelationCodec, StdioCorrelationDescriptor,
+        StdioNotificationCorrelation,
     };
     pub use fastmcp_protocol::methods::Final2026Peer;
     pub use fastmcp_protocol::protocol_policy::MODERN_PROTOCOL_VERSION;
@@ -3108,13 +3110,14 @@ pub mod modern {
         /// Install a registration with [`super::ServerBuilder::extension`].
         /// Its context exposes negotiated settings and cancellation observation,
         /// and cannot grant access to the runtime, credentials, or raw ingress.
-        /// This surface supports typed client-to-server requests and notifications.
+        /// This surface supports typed client-to-server requests/notifications and
+        /// request-owned server notifications on modern stdio and memory transports.
         #[cfg(feature = "extension-authoring")]
         pub mod authoring {
             pub use fastmcp_server::extensions::authoring::{
                 ExtensionBuilder, ExtensionContext, ExtensionDescriptor, ExtensionHandler,
                 ExtensionNotification, ExtensionNotificationContext, ExtensionNotificationHandler,
-                ExtensionRegistration,
+                ExtensionRegistration, ExtensionRequestNotification,
             };
         }
 
@@ -3134,7 +3137,8 @@ pub mod modern {
             MAX_EXTENSION_SETTINGS_NESTING, MAX_EXTENSION_SETTINGS_VALUE_BYTES,
             MAX_STDIO_CORRELATION_METHODS, NegotiatedExtension, NegotiatedExtensionSet,
             NotificationActivationProofDescriptor, NotificationActivationProofLocation,
-            ServerExtensionDiscovery, StdioCorrelationDescriptor,
+            ServerExtensionDiscovery, StdioCorrelationCodec, StdioCorrelationDescriptor,
+            StdioNotificationCorrelation,
         };
 
         #[cfg(feature = "apps")]

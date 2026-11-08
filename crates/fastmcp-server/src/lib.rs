@@ -16369,6 +16369,88 @@ impl Server {
         }))
     }
 
+    #[cfg(feature = "extension-authoring")]
+    fn attach_request_extension_notification_sender(
+        &self,
+        context: McpContext,
+        request: &JsonRpcRequest,
+        admission: Option<&ServerExtensionRequestAdmission>,
+        transport: InboundRequestTransport,
+        cancellation: McpRequestCancellation,
+        sender: NotificationSender,
+    ) -> McpContext {
+        if !matches!(transport, InboundRequestTransport::Stdio | InboundRequestTransport::Memory) {
+            return context;
+        }
+        let Some(admission) = admission else { return context; };
+        let Some(runtime) = self.extension_runtime.as_ref() else { return context; };
+        let Some(schema) = runtime.handlers.request_notification_schema(&admission.extension_id) else {
+            return context;
+        };
+        let Some(descriptor) = runtime.handlers.descriptor_registry().descriptor(&admission.extension_id) else {
+            return context;
+        };
+        let Some(notification) = descriptor.notification.as_ref() else { return context; };
+        let Some(correlation) = descriptor.stdio_correlation.as_ref() else { return context; };
+        let Some(request_id) = request.id.clone() else { return context; };
+        let Ok(owner_key) = request_id.correlation_key() else { return context; };
+        let method = notification.name.clone();
+        let metadata_key = correlation.metadata_key.clone();
+        let extension_id = admission.extension_id.clone();
+        let negotiated = admission.negotiated.clone();
+        let runtime = Arc::clone(runtime);
+        // Capture the unmodified context so the installed callback never owns
+        // itself. Its request lease and cancellation remain shared with dispatch.
+        let frame_context = context.clone();
+        context.with_request_extension_notification_sender(Arc::new(move |mut parameters| {
+            frame_context.ensure_live()?;
+            if cancellation.is_cancel_requested() || cancellation.is_finalizing() {
+                return Err(McpError::request_cancelled());
+            }
+            if !parameters.is_object()
+                || parameters.as_object().is_some_and(|object| object.contains_key("_meta"))
+            {
+                return Err(McpError::invalid_params(
+                    "Extension notification parameters must be an object without framework metadata",
+                ));
+            }
+            schema.validate(&parameters).map_err(|_| {
+                McpError::invalid_params("Extension notification does not satisfy its registered schema")
+            })?;
+            let wire_id = serde_json::to_value(&request_id).map_err(|_| {
+                McpError::internal_error("Extension notification correlation could not be encoded")
+            })?;
+            parameters.as_object_mut().expect("object checked above").insert(
+                "_meta".to_owned(),
+                serde_json::Value::Object(serde_json::Map::from_iter([(metadata_key.clone(), wire_id)])),
+            );
+            let notification = JsonRpcRequest::notification(method.clone(), Some(parameters));
+            let capsule = negotiated.admit_stdio_notification(
+                runtime.handlers.descriptor_registry(),
+                ProtocolEra::Modern2026,
+                &extension_id,
+                &notification,
+                None,
+            ).map_err(|_| McpError::invalid_params(
+                "Extension notification is outside its admitted request contract",
+            ))?;
+            if capsule.correlation_key() != &owner_key {
+                return Err(McpError::invalid_request("Extension notification owner mismatch"));
+            }
+            // Serialization and schema validation can run application code.
+            // Recheck immediately before entering the transport's bounded,
+            // request-owned output gate. That gate performs the final race check.
+            frame_context.ensure_live()?;
+            if cancellation.is_cancel_requested() || cancellation.is_finalizing() {
+                return Err(McpError::request_cancelled());
+            }
+            catch_extension_unwind(|| sender(notification))
+                .map_err(|_| extension_panic_error("request_extension_notification_sender"))?;
+            frame_context.ensure_live()?;
+            Ok(())
+        }))
+    }
+
     fn validate_extension_middleware_response(
         &self,
         admission: Option<&ServerExtensionRequestAdmission>,
@@ -17367,6 +17449,17 @@ impl Server {
                 Ok(admission) => (admission, None),
                 Err(error) => (None, Some(Err(error))),
             };
+        #[cfg(feature = "extension-authoring")]
+        {
+            request_ctx = self.attach_request_extension_notification_sender(
+                request_ctx,
+                &request,
+                extension_admission.as_ref(),
+                inbound.transport(),
+                request_cancellation.clone(),
+                Arc::clone(&notification_sender),
+            );
+        }
         for middleware in self.middleware.iter() {
             if middleware_result.is_some() {
                 break;

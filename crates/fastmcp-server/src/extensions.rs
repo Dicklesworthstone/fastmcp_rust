@@ -599,6 +599,9 @@ pub struct ExtensionHandlerRegistry {
     descriptor_registry: ExtensionDescriptorRegistry,
     handlers: BTreeMap<ExtensionHandlerKey, Box<dyn ErasedExtensionHandler>>,
     notification_handlers: BTreeMap<ExtensionHandlerKey, RegisteredNotificationHandler>,
+    #[cfg(feature = "extension-authoring")]
+    request_notification_schemas:
+        BTreeMap<ExtensionId, std::sync::Arc<fastmcp_protocol::schema::AdmittedSchema>>,
     server_metadata: BTreeMap<ExtensionId, ExtensionSettings>,
     frozen: bool,
 }
@@ -611,6 +614,8 @@ impl ExtensionHandlerRegistry {
             descriptor_registry,
             handlers: BTreeMap::new(),
             notification_handlers: BTreeMap::new(),
+            #[cfg(feature = "extension-authoring")]
+            request_notification_schemas: BTreeMap::new(),
             server_metadata: BTreeMap::new(),
             frozen: false,
         }
@@ -620,6 +625,37 @@ impl ExtensionHandlerRegistry {
     #[must_use]
     pub const fn descriptor_registry(&self) -> &ExtensionDescriptorRegistry {
         &self.descriptor_registry
+    }
+
+    #[cfg(feature = "extension-authoring")]
+    pub(crate) fn register_request_notification_schema(
+        &mut self,
+        extension_id: ExtensionId,
+        schema: std::sync::Arc<fastmcp_protocol::schema::AdmittedSchema>,
+    ) -> McpResult<()> {
+        if self.frozen
+            || self.request_notification_schemas.contains_key(&extension_id)
+            || self.descriptor_registry.descriptor(&extension_id).is_none_or(|descriptor| {
+                descriptor.stdio_correlation.is_none()
+                    || descriptor.notification.as_ref().is_none_or(|notification| {
+                        notification.direction != ExtensionDirection::ServerToClient
+                    })
+            })
+        {
+            return Err(McpError::invalid_params(
+                "Request notification schema has no available descriptor owner",
+            ));
+        }
+        self.request_notification_schemas.insert(extension_id, schema);
+        Ok(())
+    }
+
+    #[cfg(feature = "extension-authoring")]
+    pub(crate) fn request_notification_schema(
+        &self,
+        extension_id: &ExtensionId,
+    ) -> Option<std::sync::Arc<fastmcp_protocol::schema::AdmittedSchema>> {
+        self.frozen.then(|| self.request_notification_schemas.get(extension_id).cloned()).flatten()
     }
 
     /// Returns the mutable descriptor registry before handler freeze.

@@ -25,7 +25,8 @@ use fastmcp_protocol::extensions::{
     ExtensionSettingsCompatibilityResolver, ExtensionSettingsSchema,
     MAX_EXTENSION_MEMBER_NAME_BYTES, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES, NegotiatedExtension,
     NotificationActivationProofDescriptor, NotificationActivationProofLocation,
-    ServerExtensionDiscovery,
+    ServerExtensionDiscovery, StdioCorrelationCodec, StdioCorrelationDescriptor,
+    MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
 };
 use fastmcp_protocol::schema::{
     AdmittedSchema, JsonSchemaType, MAX_SCHEMA_INSTANCE_BYTES, SchemaGenerator, admit_final_schema,
@@ -154,6 +155,43 @@ impl ExtensionNotification {
     }
 }
 
+/// One typed server-to-client notification owned by an admitted request.
+///
+/// The framework stamps the exact request ID into the registered metadata key.
+/// This declaration neither creates a subscription nor grants a broadcast sink.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtensionRequestNotification {
+    name: String,
+    parameter_schema_id: String,
+    correlation_metadata_key: String,
+}
+
+impl ExtensionRequestNotification {
+    /// Exact extension-owned notification method.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Identity of the compiled application-parameter schema.
+    #[must_use]
+    pub fn parameter_schema_id(&self) -> &str {
+        &self.parameter_schema_id
+    }
+
+    /// Framework-owned metadata member carrying the exact originating ID.
+    #[must_use]
+    pub fn correlation_metadata_key(&self) -> &str {
+        &self.correlation_metadata_key
+    }
+
+    /// Notifications travel from the server to the requesting client.
+    #[must_use]
+    pub const fn direction(&self) -> ExtensionDirection {
+        ExtensionDirection::ServerToClient
+    }
+}
+
 /// The sealed, immutable declaration supplied to an extension handler.
 ///
 /// Construction belongs to [`ExtensionBuilder`]. Its ordered method entries and
@@ -167,6 +205,7 @@ pub struct ExtensionDescriptor {
     server_settings_schema_id: String,
     methods: Vec<ExtensionMethod>,
     notification: Option<ExtensionNotification>,
+    request_notification: Option<ExtensionRequestNotification>,
 }
 
 impl ExtensionDescriptor {
@@ -206,6 +245,12 @@ impl ExtensionDescriptor {
     #[must_use]
     pub const fn notification(&self) -> Option<&ExtensionNotification> {
         self.notification.as_ref()
+    }
+
+    /// The optional request-owned server-to-client notification declaration.
+    #[must_use]
+    pub const fn request_notification(&self) -> Option<&ExtensionRequestNotification> {
+        self.request_notification.as_ref()
     }
 }
 
@@ -265,6 +310,26 @@ impl<Settings> ExtensionContext<'_, Settings> {
     #[must_use]
     pub const fn settings(&self) -> &Settings {
         self.settings
+    }
+
+    /// Emits this extension's registered typed notification for this request.
+    ///
+    /// Available on modern stdio and memory transports only. Parameters must
+    /// satisfy the installed schema and cannot contain `_meta`; the framework
+    /// supplies the immutable method, metadata key and exact originating ID.
+    /// Cancellation, request completion or missing bilateral negotiation closes
+    /// this capability. Emission uses the transport's bounded output queue;
+    /// success acknowledges submission, never peer delivery or a replay promise.
+    pub fn notify<Notification: Serialize>(&self, parameters: &Notification) -> McpResult<()> {
+        ensure_live(self.context)?;
+        if self.descriptor.request_notification.is_none() {
+            return Err(McpError::invalid_request(
+                "This extension has no request notification declaration",
+            ));
+        }
+        let value = encode_value(parameters, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)
+            .map_err(|_| McpError::invalid_params("Extension notification exceeds its byte budget"))?;
+        self.context.emit_request_extension_notification(value)
     }
 
     /// Exact admitted method name.
@@ -503,6 +568,7 @@ pub struct ExtensionBuilder<ClientSettings, ServerSettings, Settings> {
     schema_identities: BTreeMap<String, [u8; 32]>,
     pending: Vec<PendingMethod>,
     pending_notification: Option<PendingNotification>,
+    request_notification_schema: Option<CompiledSchema>,
     marker: PhantomData<fn(ClientSettings, ServerSettings) -> Settings>,
 }
 
@@ -597,6 +663,7 @@ where
                 server_settings_schema_id,
                 methods: Vec::new(),
                 notification: None,
+                request_notification: None,
             },
             server_settings,
             resolve,
@@ -607,6 +674,7 @@ where
             schema_identities,
             pending: Vec::new(),
             pending_notification: None,
+            request_notification_schema: None,
             marker: PhantomData,
         })
     }
@@ -653,10 +721,24 @@ impl<ClientSettings, ServerSettings, Settings>
                 .descriptor
                 .notification
                 .as_ref()
-                .map(ExtensionNotification::protocol_notification),
+                .map(ExtensionNotification::protocol_notification)
+                .or_else(|| self.descriptor.request_notification.as_ref().map(|notification| {
+                    ExtensionNotificationDescriptor {
+                        name: notification.name.clone(),
+                        direction: ExtensionDirection::ServerToClient,
+                        activation_proof: None,
+                    }
+                })),
             result_discriminator: None,
             routing_headers: Vec::new(),
-            stdio_correlation: None,
+            stdio_correlation: self.descriptor.request_notification.as_ref().map(|notification| {
+                StdioCorrelationDescriptor {
+                    metadata_key: notification.correlation_metadata_key.clone(),
+                    methods: vec![notification.name.clone()],
+                    direction: ExtensionDirection::ServerToClient,
+                    codec: StdioCorrelationCodec::RequestId,
+                }
+            }),
         };
         let mut descriptors = ExtensionDescriptorRegistry::new();
         descriptors.register(protocol.clone()).map_err(|_| {
@@ -704,6 +786,9 @@ impl<ClientSettings, ServerSettings, Settings>
                     McpError::invalid_params("extension notification registration was rejected")
                 })?;
         }
+        if let Some(schema) = self.request_notification_schema {
+            handlers.register_request_notification_schema(descriptor.id.clone(), schema.admitted)?;
+        }
         let discovery = ServerExtensionDiscovery {
             extensions: BTreeMap::from([(descriptor.id.clone(), self.server_settings)]),
         };
@@ -724,7 +809,8 @@ impl<ClientSettings, ServerSettings, Settings>
         parameter_schema_id: String,
         result_schema_id: String,
     ) -> McpResult<(ExtensionMethod, CompiledSchema, CompiledSchema, usize)> {
-        if self.pending.len() + usize::from(self.pending_notification.is_some())
+        if self.pending.len() + usize::from(self.descriptor.notification.is_some()
+            || self.descriptor.request_notification.is_some())
             >= MAX_AUTHORING_METHODS
         {
             return Err(McpError::invalid_params("extension method budget exceeded"));
@@ -750,6 +836,8 @@ impl<ClientSettings, ServerSettings, Settings>
                 .descriptor
                 .notification
                 .as_ref()
+                .is_some_and(|entry| entry.name == method)
+            || self.descriptor.request_notification.as_ref()
                 .is_some_and(|entry| entry.name == method)
         {
             return Err(McpError::invalid_params(
@@ -803,7 +891,7 @@ impl<ClientSettings, ServerSettings, Settings>
         parameter_schema_id: String,
         activation_metadata_key: String,
     ) -> McpResult<(ExtensionNotification, CompiledSchema, usize)> {
-        if self.pending_notification.is_some() {
+        if self.descriptor.notification.is_some() || self.descriptor.request_notification.is_some() {
             return Err(McpError::invalid_params(
                 "extension authoring supports one notification per descriptor",
             ));
@@ -903,7 +991,22 @@ impl<ClientSettings, ServerSettings, Settings>
             methods,
             notification,
         );
-        let bytes = encode_bytes(&subject, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)?;
+        let bytes = if let Some((notification, schema)) = self.descriptor.request_notification
+            .as_ref().zip(self.request_notification_schema.as_ref())
+        {
+            encode_bytes(&(
+                subject,
+                "request-notification-v1",
+                notification.name.as_str(),
+                notification.parameter_schema_id.as_str(),
+                notification.correlation_metadata_key.as_str(),
+                "request-id",
+                schema.digest,
+            ), MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)?
+        } else {
+            // Preserve the existing fingerprint for descriptors without this capability.
+            encode_bytes(&subject, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)?
+        };
         sha256_bounded(&bytes, MAX_EXTENSION_REGISTRY_CANONICAL_BYTES)
             .map(|digest| digest.into_bytes())
             .map_err(|_| {
@@ -917,6 +1020,46 @@ impl<ClientSettings, ServerSettings, Settings>
 where
     Settings: DeserializeOwned + Send + Sync + 'static,
 {
+    /// Declares one typed server notification emitted during this extension's requests.
+    ///
+    /// Install at least one request handler and call [`ExtensionContext::notify`]
+    /// from that handler. Modern stdio and memory dispatch retain the admitted
+    /// bilateral settings and exact request ID; callers cannot supply a method,
+    /// correlation key or destination. Parameters must be an object satisfying
+    /// `Notification`'s schema and must not contain `_meta`.
+    ///
+    /// The registry currently supports one notification per extension, so this
+    /// declaration is mutually exclusive with a client-to-server notification.
+    /// HTTP, WebSocket and subscription publication are not enabled by it.
+    pub fn typed_request_notification<Notification>(
+        mut self,
+        method: impl Into<String>,
+        parameter_schema_id: impl Into<String>,
+        correlation_metadata_key: impl Into<String>,
+    ) -> McpResult<Self>
+    where
+        Notification: Serialize + JsonSchemaType,
+    {
+        let (notification, schema, total) = self.prepare_notification::<Notification>(
+            method.into(),
+            parameter_schema_id.into(),
+            correlation_metadata_key.into(),
+        )?;
+        retain_schema_identity(
+            &mut self.schema_identities,
+            &notification.parameter_schema_id,
+            schema.digest,
+        )?;
+        self.descriptor.request_notification = Some(ExtensionRequestNotification {
+            name: notification.name,
+            parameter_schema_id: notification.parameter_schema_id,
+            correlation_metadata_key: notification.activation_metadata_key,
+        });
+        self.request_notification_schema = Some(schema);
+        self.schema_bytes = total;
+        Ok(self)
+    }
+
     /// Registers an asynchronous typed request and its exact schema identities.
     ///
     /// Framework `_meta` is admitted by the normal protocol path and removed

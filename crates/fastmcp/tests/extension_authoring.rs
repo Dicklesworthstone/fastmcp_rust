@@ -7,6 +7,9 @@
 #[path = "extension_authoring/result_client.rs"]
 mod result_client;
 
+#[path = "extension_authoring/request_notifications.rs"]
+mod request_notifications;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

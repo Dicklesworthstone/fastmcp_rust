@@ -15,7 +15,7 @@ use asupersync::{Budget, Cx, Outcome, RegionId, TaskId, Time};
 #[cfg(test)]
 use asupersync::time::wall_now;
 
-use crate::{AuthContext, SessionState};
+use crate::{AuthContext, McpError, McpResult, SessionState};
 
 const REQUEST_LEASE_UNMANAGED: u8 = 0;
 const REQUEST_LEASE_ACTIVE: u8 = 1;
@@ -1603,6 +1603,10 @@ pub struct McpContext {
     server_capabilities: Option<ServerCapabilityInfo>,
     /// Optional log sender for `notifications/message`.
     log_sender: Option<Arc<dyn NotificationSender>>,
+    /// Framework-installed payload sink for one admitted extension request.
+    /// The sink owns its immutable method, correlation key and exact wire ID.
+    request_extension_notification_sender:
+        Option<Arc<dyn Fn(serde_json::Value) -> McpResult<()> + Send + Sync>>,
     /// Minimum severity the connected client asked to receive.
     ///
     /// `None` means the client has not sent `logging/setLevel`; MCP forbids
@@ -1848,6 +1852,7 @@ impl McpContext {
             client_implementation: None,
             server_capabilities: None,
             log_sender: None,
+            request_extension_notification_sender: None,
             min_log_level: None,
             resource_subscriptions: None,
             catalog_publisher: None,
@@ -1896,6 +1901,7 @@ impl McpContext {
             client_implementation: None,
             server_capabilities: None,
             log_sender: None,
+            request_extension_notification_sender: None,
             min_log_level: None,
             resource_subscriptions: None,
             catalog_publisher: None,
@@ -1945,6 +1951,7 @@ impl McpContext {
             client_implementation: None,
             server_capabilities: None,
             log_sender: None,
+            request_extension_notification_sender: None,
             min_log_level: None,
             resource_subscriptions: None,
             catalog_publisher: None,
@@ -1998,6 +2005,7 @@ impl McpContext {
             client_implementation: None,
             server_capabilities: None,
             log_sender: None,
+            request_extension_notification_sender: None,
             min_log_level: None,
             resource_subscriptions: None,
             catalog_publisher: None,
@@ -2021,6 +2029,37 @@ impl McpContext {
     pub fn with_log_sender(mut self, sender: Arc<dyn NotificationSender>) -> Self {
         self.log_sender = Some(sender);
         self
+    }
+
+    /// Installs the framework's fixed notification payload sink for this request.
+    /// The server, rather than application parameters, owns its method and ID.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_request_extension_notification_sender(
+        mut self,
+        sender: Arc<dyn Fn(serde_json::Value) -> McpResult<()> + Send + Sync>,
+    ) -> Self {
+        self.request_extension_notification_sender = Some(sender);
+        self
+    }
+
+    /// Emits through the installed request-owned extension capability.
+    /// This hidden component seam grants no choice of method, key or request ID.
+    #[doc(hidden)]
+    pub fn emit_request_extension_notification(
+        &self,
+        parameters: serde_json::Value,
+    ) -> McpResult<()> {
+        self.ensure_live()?;
+        let sender = self.request_extension_notification_sender.as_ref().ok_or_else(|| {
+            McpError::invalid_request("Request-owned extension notifications are unavailable")
+        })?;
+        // A streamed notification must never be replayed through response caching.
+        // Mark before calling the sink because it can fail after publication.
+        self.note_notification_emission();
+        sender(parameters)?;
+        self.ensure_live()?;
+        Ok(())
     }
 
     /// Sets the client-selected minimum log level for this request.
@@ -4610,6 +4649,35 @@ mod tests {
         let ctx = McpContext::new(cx, 42);
 
         assert_eq!(ctx.request_id(), 42);
+    }
+
+    #[test]
+    fn request_extension_notification_sink_closes_with_its_request_lease() {
+        for cancel in [false, true] {
+            let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let capture = Arc::clone(&delivered);
+            let cancellation = McpRequestCancellation::new();
+            let context = McpContext::new(Cx::for_testing(), 42)
+                .with_request_cancellation(cancellation.clone())
+                .with_request_extension_notification_sender(Arc::new(move |_| {
+                    capture.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }));
+            let (context, lease) = context.begin_request_scope().unwrap();
+            let retained = context.clone();
+            context.emit_request_extension_notification(serde_json::json!({"value": 1})).unwrap();
+            assert!(context.response_has_notifications());
+            assert_eq!(delivered.load(Ordering::SeqCst), 1);
+            if cancel {
+                cancellation.cancel();
+                assert!(retained.emit_request_extension_notification(serde_json::json!({"value": 2})).is_err());
+            }
+            drop(lease);
+            assert!(retained.emit_request_extension_notification(serde_json::json!({"value": 2})).is_err());
+            assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        }
+        assert!(McpContext::new(Cx::for_testing(), 1)
+            .emit_request_extension_notification(serde_json::json!({})).is_err());
     }
 
     #[test]
