@@ -1,9 +1,11 @@
-//! Interactive OAuth authorization for explicitly configured native public clients.
+//! Interactive OAuth authorization for explicitly configured public clients.
 //!
 //! The caller supplies trusted issuer/endpoint configuration and the browser
 //! launcher. The driver binds an IP-literal loopback listener *before* invoking
 //! that launcher, admits one issuer- and state-bound callback, and redeems its
-//! code with S256 PKCE over HTTPS. It creates no runtime or background task.
+//! code with S256 PKCE over HTTPS. Hosts with an independently registered HTTPS
+//! callback can instead supply a driver that returns their raw callback URL.
+//! Both paths create no runtime or background task.
 //!
 //! This is the preregistered public-client slice of AUTH-07, not discovery,
 //! dynamic registration or OIDC authentication. The Linux `persistence` adapter
@@ -35,6 +37,7 @@ use fastmcp_core::{
 use fastmcp_protocol::{SecurityDocumentKind, admit_security_document};
 use serde::{Deserialize, Deserializer};
 
+use super::caller::with_caller;
 use super::{BoundBearerCredential, CanonicalHttpUrl};
 
 /// Anchored refresh-grant custody and native renewal after a Linux file reopen.
@@ -123,10 +126,12 @@ pub(crate) fn endpoint_resource_policy(resource: &CanonicalHttpUrl) -> Canonical
     }
 }
 
-/// Immutable, administrator-supplied configuration for an RFC 8252 native
-/// public client. The registration must allow the `/oauth/callback` path on
-/// an IP-literal loopback URI with an ephemeral port. The authorization server
-/// must return RFC 9207 `iss` on both successful and unsuccessful callbacks.
+/// Immutable, administrator-supplied configuration for a public OAuth client.
+/// Native loopback authorization requires registration of `/oauth/callback`
+/// on an IP-literal loopback URI with an ephemeral port. Host-owned redirect
+/// authorization requires its separately registered exact HTTPS callback.
+/// The authorization server must return RFC 9207 `iss` on both successful and
+/// unsuccessful callbacks. Neither path authenticates a confidential client.
 ///
 /// This constructor does not establish trust in URLs obtained from a peer.
 /// Discovery and registration must be validated before constructing this value.
@@ -431,12 +436,79 @@ impl OAuthClient {
         // A callback can authorize only one POST. Close the listener before
         // redemption; neither a duplicate callback nor a network error retries it.
         drop(listener);
+        self.redeem_authorization_code(cx, deadline, attempt, &redirect_uri, code)
+            .await
+    }
+
+    /// Authorizes through one host-owned HTTPS callback route, without binding
+    /// a loopback listener or installing a web framework.
+    ///
+    /// The host must independently register `redirect_uri` for this exact
+    /// public client. It must be HTTPS, query/fragment-free and contain no
+    /// userinfo; redirects to a different spelling, origin or path are refused.
+    /// The driver receives the framework's state/S256/resource-bound launch URL
+    /// once and returns the raw absolute callback URL received on that route.
+    /// A web handler can deliver that URL through a channel owned by its driver
+    /// future. Do not normalize, reconstruct, log or persist the callback or
+    /// launch URL; the driver is part of the host's trusted computing base.
+    ///
+    /// One deadline covers the driver wait and code redemption. The caller's
+    /// cancellation, a driver error or dropping this future discards the pending
+    /// state and PKCE verifier. The host must keep its wait/registration cleanup
+    /// owned by the returned future. A callback is consumed once: only exact
+    /// route, state, issuer and code admission permit one token POST, and no
+    /// transport failure, redirect or rejected response replays it. Success is
+    /// returned only after ordinary issuer/resource-bound token admission.
+    pub async fn authorize_with_redirect_driver<D, F>(
+        &self,
+        cx: &Cx,
+        redirect_uri: CanonicalHttpUrl,
+        driver: D,
+    ) -> Result<OAuthCredentials, OAuthError>
+    where
+        D: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<String, OAuthError>>,
+    {
+        validate_host_redirect(&redirect_uri)?;
+        let (deadline, attempt, authorization_url) = with_caller(cx, || {
+            let caller = Cx::current().ok_or(OAuthError::RuntimeCapabilityUnavailable)?;
+            if !caller.capabilities().time {
+                return Err(OAuthError::RuntimeTimerUnavailable);
+            }
+            let deadline = operation_deadline(&caller, self.configuration.authorization_timeout)?;
+            if !caller.capabilities().entropy {
+                return Err(OAuthError::RuntimeCapabilityUnavailable);
+            }
+            let attempt = AuthorizationAttempt::new()?;
+            let authorization_url =
+                attempt.authorization_url(&self.configuration, redirect_uri.as_str())?;
+            Ok((deadline, attempt, authorization_url))
+        })?;
+        let callback = within(cx, deadline, async { driver(authorization_url).await }).await?;
+        let code = admit_host_redirect_callback(
+            &callback,
+            &redirect_uri,
+            &attempt,
+            &self.configuration.issuer,
+        )?;
+        self.redeem_authorization_code(cx, deadline, attempt, redirect_uri.as_str(), code)
+            .await
+    }
+
+    async fn redeem_authorization_code(
+        &self,
+        cx: &Cx,
+        deadline: Time,
+        attempt: AuthorizationAttempt,
+        redirect_uri: &str,
+        code: String,
+    ) -> Result<OAuthCredentials, OAuthError> {
         let verifier = attempt.verifier();
         let body = encode_form(&[
             ("grant_type", "authorization_code"),
             ("client_id", &self.configuration.client_id),
             ("code", &code),
-            ("redirect_uri", &redirect_uri),
+            ("redirect_uri", redirect_uri),
             ("code_verifier", &verifier),
             ("resource", self.configuration.resource.as_str()),
         ])?;
@@ -725,24 +797,19 @@ async fn within<T>(
         .deadline
         .map_or(deadline, |parent| parent.min(deadline));
     let mut future = std::pin::pin!(future);
-    let sleep = {
-        let _caller = Cx::set_current(Some(cx.clone()));
-        Sleep::new(deadline)
-    };
+    let sleep = with_caller(cx, || Sleep::new(deadline));
     let mut sleep = std::pin::pin!(sleep);
     // A pending cancel-correct receive registers a cancellation wake even when
     // the socket or the host's browser future has no traffic of its own.
     let (_sender, mut receiver) = oneshot::channel::<()>();
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
-    poll_fn(|task| {
+    poll_fn(|task| with_caller(cx, || {
         if cx.checkpoint().is_err() {
             return Poll::Ready(Err(OAuthError::Cancelled));
         }
         if cx.now() >= deadline {
             return Poll::Ready(Err(OAuthError::TimedOut));
         }
-        // Install the caller only for this poll, never across an await/yield.
-        let _caller = Cx::set_current(Some(cx.clone()));
         if cancelled.as_mut().poll(task).is_ready() {
             return Poll::Ready(Err(OAuthError::Cancelled));
         }
@@ -757,8 +824,63 @@ async fn within<T>(
             return Poll::Ready(Err(OAuthError::TimedOut));
         }
         result
-    })
+    }))
     .await
+}
+
+fn validate_host_redirect(redirect_uri: &CanonicalHttpUrl) -> Result<(), OAuthError> {
+    if redirect_uri.scheme() != "https"
+        || redirect_uri.has_userinfo()
+        || redirect_uri.query().is_some()
+        || redirect_uri.fragment().is_some()
+        || redirect_uri.as_str().len() > MAX_CODE_BYTES
+    {
+        return Err(OAuthError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+fn admit_host_redirect_callback(
+    callback: &str,
+    redirect_uri: &CanonicalHttpUrl,
+    attempt: &AuthorizationAttempt,
+    issuer: &str,
+) -> Result<String, OAuthError> {
+    if callback.len() > MAX_CALLBACK_BYTES
+        || callback.bytes().any(|byte| !(0x21..=0x7e).contains(&byte))
+        || callback.contains('#')
+    {
+        return Err(OAuthError::CallbackRejected);
+    }
+    let query = callback
+        .strip_prefix(redirect_uri.as_str())
+        .and_then(|suffix| suffix.strip_prefix('?'))
+        .ok_or(OAuthError::CallbackRejected)?;
+    // Unknown response parameters are ignored only after bounded strict form
+    // admission. Repeated unknown names remain inert; known names, including
+    // escaped aliases and incompatible credential-bearing responses, are singletons.
+    let fields = decode_form_fields(query, |name| {
+        matches!(
+            name,
+            "state" | "iss" | "code" | "error" | "error_description" | "error_uri"
+                | "access_token" | "refresh_token" | "id_token" | "token_type"
+                | "client_secret" | "client_assertion"
+        )
+    })?;
+    if [
+        "access_token", "refresh_token", "id_token", "token_type", "client_secret",
+        "client_assertion",
+    ]
+    .iter()
+    .any(|name| fields.contains_key(*name))
+    {
+        return Err(OAuthError::CallbackRejected);
+    }
+    let code = admit_callback_fields(&fields, attempt, issuer)?;
+    if fields.contains_key("error_description") || fields.contains_key("error_uri") {
+        return Err(OAuthError::CallbackRejected);
+    }
+    Ok(code)
 }
 
 async fn wait_for_code(
@@ -882,6 +1004,14 @@ fn admit_callback(
         return Err(OAuthError::CallbackRejected);
     }
     let fields = decode_form(query)?;
+    admit_callback_fields(&fields, attempt, issuer)
+}
+
+fn admit_callback_fields(
+    fields: &BTreeMap<String, String>,
+    attempt: &AuthorizationAttempt,
+    issuer: &str,
+) -> Result<String, OAuthError> {
     if !fields
         .get("state")
         .is_some_and(|state| attempt.accepts_state(state))
@@ -969,6 +1099,13 @@ fn encode_form(fields: &[(&str, &str)]) -> Result<String, OAuthError> {
 }
 
 fn decode_form(query: &str) -> Result<BTreeMap<String, String>, OAuthError> {
+    decode_form_fields(query, |_| true)
+}
+
+fn decode_form_fields(
+    query: &str,
+    retain: impl Fn(&str) -> bool,
+) -> Result<BTreeMap<String, String>, OAuthError> {
     if query.len() > MAX_CALLBACK_BYTES {
         return Err(OAuthError::CallbackRejected);
     }
@@ -983,8 +1120,10 @@ fn decode_form(query: &str) -> Result<BTreeMap<String, String>, OAuthError> {
         if key.is_empty()
             || key.len() > 128
             || value.len() > MAX_CODE_BYTES
-            || fields.insert(key, value).is_some()
         {
+            return Err(OAuthError::CallbackRejected);
+        }
+        if retain(&key) && fields.insert(key, value).is_some() {
             return Err(OAuthError::CallbackRejected);
         }
     }
@@ -1290,6 +1429,240 @@ mod tests {
         .unwrap();
         format!("GET {CALLBACK_PATH}?{query}{extra} HTTP/1.1\r\nHost: 127.0.0.1:43210\r\n\r\n")
             .into_bytes()
+    }
+
+    fn host_callback(authorization: &CanonicalHttpUrl, issuer: &str) -> String {
+        let fields = decode_form(authorization.query().unwrap()).unwrap();
+        format!(
+            "{}?{}",
+            fields["redirect_uri"],
+            encode_form(&[
+                ("state", &fields["state"]),
+                ("iss", issuer),
+                ("code", "host-issued-code"),
+            ])
+            .unwrap()
+        )
+    }
+
+    #[test]
+    fn host_https_redirect_callback_requires_exact_route_state_issuer_and_code() {
+        let configuration = config();
+        let attempt = AuthorizationAttempt::new().unwrap();
+        let redirect = url("https://app.example/oauth/return");
+        let authorization = attempt
+            .authorization_url(&configuration, redirect.as_str())
+            .unwrap();
+        let callback = host_callback(&authorization, &configuration.issuer);
+        let admit = |callback: &str| {
+            admit_host_redirect_callback(callback, &redirect, &attempt, &configuration.issuer)
+        };
+        assert_eq!(admit(&callback), Ok("host-issued-code".to_owned()));
+        assert_eq!(
+            admit(&format!("{callback}&vendor=one&v%65ndor=two")),
+            Ok("host-issued-code".to_owned())
+        );
+        for suffix in [
+            "&code=other", "&co%64e=other", "&st%61te=other", "&iss=other",
+            "&error=access_denied", "&error_description=private", "&error_uri=private",
+            "&access_token=private", "&refresh_token=private", "&id_token=",
+            "&token_type=Bearer", "&client_secret=private", "&client_assertion=private",
+            "&unknown=%ff", "&unknown=%", "&unknown=%00", "#fragment",
+        ] {
+            assert_eq!(admit(&format!("{callback}{suffix}")), Err(OAuthError::CallbackRejected));
+        }
+        for (from, to) in [
+            ("https://app.example/", "https://other.example/"),
+            ("/oauth/return?", "/oauth/return/other?"),
+            ("/oauth/return?", "/oauth/%72eturn?"),
+            ("host-issued-code", ""),
+            ("host-issued-code", "private code"),
+        ] {
+            assert_eq!(admit(&callback.replace(from, to)), Err(OAuthError::CallbackRejected));
+        }
+        let other = AuthorizationAttempt::new().unwrap();
+        assert_eq!(
+            admit_host_redirect_callback(&callback, &redirect, &other, &configuration.issuer),
+            Err(OAuthError::CallbackRejected)
+        );
+        let denied = callback.replace("code=host-issued-code", "error=access_denied&error_description=private");
+        assert_eq!(admit(&denied), Err(OAuthError::AuthorizationDenied));
+        assert_eq!(
+            admit_host_redirect_callback(&denied, &redirect, &attempt, "https://other.example"),
+            Err(OAuthError::IssuerMismatch)
+        );
+        // Repeated unknown fields remain inert, but still consume the exact
+        // aggregate byte bound even when every individual value is admissible.
+        let mut bounded = callback.clone();
+        while MAX_CALLBACK_BYTES - bounded.len() > MAX_CODE_BYTES + 3 {
+            bounded.push_str("&x=");
+            bounded.push_str(&"a".repeat(MAX_CODE_BYTES));
+        }
+        let padding = MAX_CALLBACK_BYTES - bounded.len() - 3;
+        bounded.push_str("&x=");
+        bounded.push_str(&"a".repeat(padding));
+        assert_eq!(bounded.len(), MAX_CALLBACK_BYTES);
+        assert!(admit(&bounded).is_ok());
+        bounded.push('a');
+        assert_eq!(admit(&bounded), Err(OAuthError::CallbackRejected));
+        assert!(!format!("{}", OAuthError::CallbackRejected).contains("private"));
+    }
+
+    #[test]
+    fn host_https_redirect_refuses_invalid_routes_before_invoking_driver() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let client = OAuthClient::new(config());
+        let calls = AtomicUsize::new(0);
+        let mut task = std::task::Context::from_waker(std::task::Waker::noop());
+        for redirect in [
+            "http://app.example/oauth/return".to_owned(),
+            "http://127.0.0.1/oauth/return".to_owned(),
+            "https://user@app.example/oauth/return".to_owned(),
+            "https://app.example/oauth/return?fixed=value".to_owned(),
+            "https://app.example/oauth/return#fragment".to_owned(),
+            format!("https://app.example/{}", "a".repeat(MAX_CODE_BYTES)),
+        ] {
+            let mut flow = Box::pin(client.authorize_with_redirect_driver(&cx, url(&redirect), |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(OAuthError::AuthorizationDenied))
+            }));
+            assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(OAuthError::InvalidConfiguration))));
+        }
+        for ambient in [false, true] {
+            for (mask, expected) in [
+                (CapSet::<true, false, true, true, true>::MASK, OAuthError::RuntimeTimerUnavailable),
+                (CapSet::<true, true, false, true, true>::MASK, OAuthError::RuntimeCapabilityUnavailable),
+                (CapSet::<true, true, true, false, true>::MASK, OAuthError::RuntimeCapabilityUnavailable),
+            ] {
+                let restricted = {
+                    let _caller = Cx::set_current(Some(cx.clone()));
+                    let _mask = Cx::push_restriction(mask);
+                    Cx::current().unwrap()
+                };
+                let caller = if ambient { &cx } else { &restricted };
+                let _ambient = Cx::set_current(Some(if ambient { restricted.clone() } else { cx.clone() }));
+                let before = Cx::current().unwrap().capabilities();
+                let mut flow = Box::pin(client.authorize_with_redirect_driver(
+                    caller, url("https://app.example/oauth/return"), |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Err(OAuthError::AuthorizationDenied))
+                    },
+                ));
+                assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected));
+                let after = Cx::current().unwrap().capabilities();
+                assert_eq!((before.time, before.entropy, before.io), (after.time, after.entropy, after.io));
+            }
+        }
+        for (caller, expected) in [
+            (Cx::for_testing(), OAuthError::RuntimeTimerUnavailable),
+            ({ let stopped = runtime.request_cx_with_budget(asupersync::Budget::INFINITE); stopped.set_cancel_requested(true); stopped }, OAuthError::Cancelled),
+        ] {
+            let mut flow = Box::pin(client.authorize_with_redirect_driver(
+                &caller, url("https://app.example/oauth/return"), |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(OAuthError::AuthorizationDenied))
+                },
+            ));
+            assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // A foreign stopped ambient caller limits effects only. It cannot
+        // replace the supplied healthy caller's identity, clock or lifetime.
+        let foreign = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        foreign.set_cancel_requested(true);
+        {
+            let _ambient = Cx::set_current(Some(foreign));
+            let _mask = Cx::push_restriction(CapSet::<false, true, true, true, true>::MASK);
+            let mut flow = Box::pin(client.authorize_with_redirect_driver(
+                &cx, url("https://app.example/oauth/return"), |_| async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let active = Cx::current().unwrap();
+                    assert!(!active.capabilities().spawn);
+                    assert_eq!(active.task_id(), cx.task_id());
+                    assert_eq!(active.region_id(), cx.region_id());
+                    assert_eq!(active.budget(), cx.budget());
+                    assert!(!active.is_cancel_requested());
+                    Err(OAuthError::AuthorizationDenied)
+                },
+            ));
+            assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(OAuthError::AuthorizationDenied))));
+            assert!(Cx::current().unwrap().is_cancel_requested());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn host_https_redirect_driver_cancellation_deadline_and_drop_release_pending_flow() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        struct Owned(Arc<AtomicUsize>);
+        impl Drop for Owned {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) { self.wake_by_ref(); }
+            fn wake_by_ref(self: &Arc<Self>) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        for mode in 0..3 {
+            let clock = Arc::new(VirtualClock::new());
+            let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0).with_timer_driver(timer.clone()).build().unwrap();
+            let caller = runtime.request_cx_with_budget(
+                asupersync::Budget::INFINITE.with_deadline(Time::from_nanos(1_000_000_000)),
+            );
+            let token_peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            token_peer.set_nonblocking(true).unwrap();
+            let mut configuration = config();
+            configuration.token_endpoint = url(&format!("https://{}/token", token_peer.local_addr().unwrap()));
+            let client = OAuthClient::new(configuration);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let owned = Owned(Arc::clone(&drops));
+            let calls = AtomicUsize::new(0);
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let mut task = Context::from_waker(&waker);
+            let mut flow = Box::pin(client.authorize_with_redirect_driver(
+                &caller, url("https://app.example/oauth/return"), |_| async {
+                    let _owned = owned;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<Result<String, OAuthError>>().await
+                },
+            ));
+            assert!(flow.as_mut().poll(&mut task).is_pending());
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            assert_eq!(timer.pending_count(), 1);
+            let before = wakes.0.load(Ordering::SeqCst);
+            if mode == 0 {
+                caller.set_cancel_requested(true);
+            } else if mode == 1 {
+                clock.advance(1_000_000_000);
+                assert!(timer.process_timers() > 0);
+            }
+            if mode != 2 {
+                assert!(wakes.0.load(Ordering::SeqCst) > before);
+                let expected = if mode == 0 { OAuthError::Cancelled } else { OAuthError::TimedOut };
+                assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected));
+            }
+            drop(flow);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert!(matches!(token_peer.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
     }
 
     #[test]
@@ -2228,6 +2601,220 @@ mod tests {
             assert_eq!(server, Ok(()));
             assert_eq!(application, Ok(()));
         });
+    }
+
+    #[test]
+    fn host_https_redirect_callback_rejection_prevents_token_dispatch() {
+        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+            let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+            let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+            configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+            let client = OAuthClient::new(configuration.clone());
+            let redirect = url("https://app.example/oauth/return");
+            let retained = std::sync::Mutex::new(None::<String>);
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            for case in 0..12 {
+                let result = within(&cx, deadline, client.authorize_with_redirect_driver(
+                    &cx, redirect.clone(), |authorization| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let valid = host_callback(&authorization, &configuration.issuer);
+                        if case == 0 { *retained.lock().unwrap() = Some(valid.clone()); }
+                        let changed = match case {
+                            0 => valid.replace("state=", "state=wrong"),
+                            1 => host_callback(&authorization, "https://other.example"),
+                            2 => valid.replace("/oauth/return?", "/oauth/return/other?"),
+                            3 => format!("{valid}&co%64e=other"),
+                            4 => format!("{valid}&error=access_denied"),
+                            5 => format!("{valid}&error_description=private-canary"),
+                            6 => format!("{valid}&id_token=private-canary"),
+                            7 => format!("{valid}&unknown=%ff"),
+                            8 => format!("{valid}#fragment"),
+                            9 => format!("{valid}&unknown={}", "a".repeat(MAX_CALLBACK_BYTES)),
+                            10 => retained.lock().unwrap().clone().unwrap(),
+                            _ => return std::future::ready(Err(OAuthError::AuthorizationDenied)),
+                        };
+                        std::future::ready(Ok(changed))
+                    },
+                )).await;
+                let expected = match case {
+                    1 => OAuthError::IssuerMismatch,
+                    11 => OAuthError::AuthorizationDenied,
+                    _ => OAuthError::CallbackRejected,
+                };
+                assert!(matches!(result, Err(error) if error == expected), "callback case {case}");
+                assert_listener_drained(&listener);
+            }
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 12);
+        });
+    }
+
+    #[test]
+    fn host_https_redirect_authorization_and_refresh_use_the_bound_pkce_flow() {
+        asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap().block_on(async {
+            let cx = Cx::current().unwrap();
+            let deadline = operation_deadline(&cx, Duration::from_secs(20)).unwrap();
+            let listener = within(&cx, deadline, bind_loopback()).await.unwrap();
+            let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+            configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+            let client = OAuthClient::new(configuration.clone());
+            let redirect = url("https://app.example/oauth/return");
+            let observed = std::sync::Mutex::new(None::<BTreeMap<String, String>>);
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let acceptor = test_acceptor();
+            let server = async {
+                for index in 0..2 {
+                    let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor.accept(socket).await.map_err(|_| OAuthError::TransportFailed)?;
+                    let (head, form) = read_token_request(&mut tls).await?;
+                    assert!(head.starts_with("POST /token HTTP/1.1\r\n"));
+                    assert!(!head.to_ascii_lowercase().contains("authorization:"));
+                    assert!(!head.to_ascii_lowercase().contains("cookie:"));
+                    assert_eq!(form["client_id"], "native-client");
+                    assert_eq!(form["resource"], configuration.resource.as_str());
+                    let body = if index == 0 {
+                        assert_eq!(form.len(), 6);
+                        assert_eq!(form["grant_type"], "authorization_code");
+                        assert_eq!(form["code"], "host-issued-code");
+                        assert_eq!(form["redirect_uri"], redirect.as_str());
+                        let launch = observed.lock().unwrap();
+                        assert_eq!(pkce_challenge(&form["code_verifier"]).unwrap(), launch.as_ref().unwrap()["code_challenge"]);
+                        r#"{"access_token":"host-access-one","token_type":"Bearer","expires_in":600,"refresh_token":"host-refresh-one"}"#
+                    } else {
+                        assert_eq!(form["grant_type"], "refresh_token");
+                        assert_eq!(form["refresh_token"], "host-refresh-one");
+                        assert_eq!(form["scope"], "tools:read tools:write");
+                        assert!(!form.contains_key("code_verifier"));
+                        assert!(!form.contains_key("redirect_uri"));
+                        r#"{"access_token":"host-access-two","token_type":"Bearer","expires_in":300,"refresh_token":"host-refresh-two","scope":"tools:read"}"#
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+                    tls.write_all(response.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
+                    tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                }
+                Ok::<_, OAuthError>(())
+            };
+            let application = async {
+                let mut credentials = client.authorize_with_redirect_driver(&cx, redirect.clone(), |authorization| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let fields = decode_form(authorization.query().unwrap()).unwrap();
+                    assert_eq!(fields["response_type"], "code");
+                    assert_eq!(fields["code_challenge_method"], "S256");
+                    assert_eq!(fields["redirect_uri"], redirect.as_str());
+                    assert_eq!(fields["client_id"], configuration.client_id);
+                    assert_eq!(fields["resource"], configuration.resource.as_str());
+                    assert_eq!(fields["scope"], "tools:read tools:write");
+                    assert!(!fields.contains_key("code_verifier"));
+                    *observed.lock().unwrap() = Some(fields);
+                    std::future::ready(Ok(format!("{}&vendor=one&v%65ndor=two", host_callback(&authorization, &configuration.issuer))))
+                }).await?;
+                let original = credentials.bearer_credential().clone();
+                let original_expiry = original.expires_at();
+                assert_eq!(original.authorization_for_target(&configuration.resource), Some("Bearer host-access-one".to_owned()));
+                client.refresh(&cx, &mut credentials).await?;
+                assert!(!original.is_revoked());
+                assert_eq!(original.expires_at(), original_expiry);
+                assert_eq!(original.authorization_for_target(&configuration.resource), Some("Bearer host-access-one".to_owned()));
+                assert_eq!(credentials.access.authorization_for_target(&configuration.resource), Some("Bearer host-access-two".to_owned()));
+                assert_eq!(credentials.refresh_token.as_deref(), Some("host-refresh-two"));
+                assert_eq!(credentials.scopes, ["tools:read".to_owned()]);
+                Ok::<_, OAuthError>(())
+            };
+            let (server, application) = within(&cx, deadline, async { Ok(Box::pin(pair(server, application)).await) }).await.unwrap();
+            assert_eq!(server, Ok(()));
+            assert_eq!(application, Ok(()));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_listener_drained(&listener);
+        });
+    }
+
+    #[test]
+    fn host_https_redirect_redemption_failure_and_interruption_never_replay() {
+        for mode in 0..5 {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build().unwrap();
+            let caller = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            runtime.block_on(async {
+                let healthy = Cx::current().unwrap();
+                let deadline = operation_deadline(&healthy, Duration::from_secs(20)).unwrap();
+                let listener = within(&healthy, deadline, bind_loopback()).await.unwrap();
+                let mut configuration = config().with_extra_root_certificate(test_root()).unwrap();
+                configuration.token_endpoint = url(&format!("https://{}/token", listener.local_addr().unwrap()));
+                let client = OAuthClient::new(configuration.clone());
+                let redirect = url("https://app.example/oauth/return");
+                let retained = std::sync::Mutex::new(None::<String>);
+                let posts = std::sync::atomic::AtomicUsize::new(0);
+                let acceptor = test_acceptor();
+                let (sent, mut received) = oneshot::channel::<()>();
+                let server = async {
+                    let (socket, _) = listener.accept().await.map_err(|_| OAuthError::TransportFailed)?;
+                    let mut tls = acceptor.accept(socket).await.map_err(|_| OAuthError::TransportFailed)?;
+                    let (_, form) = read_token_request(&mut tls).await?;
+                    posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    assert_eq!(form["grant_type"], "authorization_code");
+                    assert_eq!(form["code"], "host-issued-code");
+                    assert_eq!(form["redirect_uri"], redirect.as_str());
+                    if mode == 1 {
+                        let response = format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", configuration.token_endpoint.as_str());
+                        tls.write_all(response.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
+                        tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                    } else if mode == 2 {
+                        let body = r#"{"access_token":"private-canary","token_type":"Bearer","id_token":null}"#;
+                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{body}", body.len());
+                        tls.write_all(response.as_bytes()).await.map_err(|_| OAuthError::TransportFailed)?;
+                        tls.shutdown().await.map_err(|_| OAuthError::TransportFailed)?;
+                    } else if mode >= 3 {
+                        if mode == 3 { caller.set_cancel_requested(true); }
+                        else { sent.send(&healthy, ()).map_err(|_| OAuthError::TransportFailed)?; }
+                        // A quiet, already-written exchange must release its
+                        // owned connection on cancellation or caller drop.
+                        let mut byte = [0];
+                        assert!(!matches!(tls.read(&mut byte).await, Ok(count) if count > 0));
+                    }
+                    Ok::<_, OAuthError>(())
+                };
+                let application = async {
+                    let mut flow = Box::pin(client.authorize_with_redirect_driver(&caller, redirect.clone(), |authorization| {
+                        let callback = host_callback(&authorization, &configuration.issuer);
+                        *retained.lock().unwrap() = Some(callback.clone());
+                        std::future::ready(Ok(callback))
+                    }));
+                    if mode == 4 {
+                        let mut signal = std::pin::pin!(received.recv(&healthy));
+                        poll_fn(|task| {
+                            if let Poll::Ready(result) = signal.as_mut().poll(task) {
+                                assert!(result.is_ok());
+                                return Poll::Ready(());
+                            }
+                            assert!(flow.as_mut().poll(task).is_pending(), "quiet redemption completed without a reply");
+                            Poll::Pending
+                        }).await;
+                        drop(flow);
+                        None
+                    } else {
+                        Some(flow.await)
+                    }
+                };
+                let (server, result) = within(&healthy, deadline, async { Ok(Box::pin(pair(server, application)).await) }).await.unwrap();
+                assert_eq!(server, Ok(()));
+                let expected = match mode {
+                    0 => Some(OAuthError::TransportFailed),
+                    1 => Some(OAuthError::TokenEndpointRejected),
+                    2 => Some(OAuthError::InvalidTokenResponse),
+                    3 => Some(OAuthError::Cancelled),
+                    _ => None,
+                };
+                assert_eq!(result.map(|result| result.err().expect("no credentials from a failed redemption")), expected);
+                assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_listener_drained(&listener);
+                let callback = retained.lock().unwrap().take().unwrap();
+                let replay = client.authorize_with_redirect_driver(&healthy, redirect.clone(), |_| std::future::ready(Ok(callback))).await;
+                assert!(matches!(replay, Err(OAuthError::CallbackRejected)));
+                assert_listener_drained(&listener);
+            });
+            drop(caller);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
     }
 
     fn native_token_admission_probe(refresh: bool) {

@@ -516,6 +516,86 @@ fn public_discovery_fallbacks_feed_managed_pkce_login_and_private_resource_post(
 }
 
 #[test]
+fn host_https_redirect_managed_session_executes_one_protected_request() {
+    run(async {
+        let cx = Cx::current().unwrap();
+        let peer = Peer::new().await;
+        let issuer = peer.issuer();
+        let resource = peer.resource();
+        let redirect = url("https://app.example/oauth/return");
+        let configuration = OAuthClientConfiguration::from_trusted_endpoints(
+            &issuer,
+            url(&format!("{}/authorize", peer.origin())),
+            url(&format!("{}/token", peer.origin())),
+            url(&resource),
+            "registered-host-client",
+            vec!["tools:read".to_owned()],
+        )
+        .unwrap()
+        .with_extra_root_certificate(root())
+        .unwrap()
+        .with_resource_root_certificate(root())
+        .unwrap();
+        let launches = AtomicUsize::new(0);
+        let server = async {
+            let (mut tls, body) = peer.request("POST", "/token").await;
+            let fields = form(std::str::from_utf8(&body).unwrap());
+            assert_eq!(fields.len(), 6);
+            assert_eq!(fields["grant_type"], "authorization_code");
+            assert_eq!(fields["client_id"], "registered-host-client");
+            assert_eq!(fields["resource"], resource);
+            assert_eq!(fields["redirect_uri"], redirect.as_str());
+            assert_eq!(fields["code"], "host-managed-code");
+            assert_eq!(fields["code_verifier"].len(), 64);
+            reply(
+                &mut tls, 200,
+                r#"{"access_token":"host-managed-access","token_type":"Bearer","expires_in":300,"refresh_token":"host-managed-refresh","scope":"tools:read"}"#,
+            ).await;
+            let (mut tls, body) = peer.request_with_authorization(
+                "POST", "/mcp", Some("Bearer host-managed-access"),
+            ).await;
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["method"], "tools/list");
+            reply(&mut tls, 200, r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#).await;
+        };
+        let application = async {
+            let session = ManagedOAuthSession::authorize_with_redirect_driver(
+                &cx,
+                OAuthClient::new(configuration),
+                OAuthSessionPolicy::default(),
+                redirect.clone(),
+                |authorization| {
+                    launches.fetch_add(1, Ordering::SeqCst);
+                    let launch = form(authorization.query().unwrap());
+                    assert_eq!(launch["redirect_uri"], redirect.as_str());
+                    assert_eq!(launch["client_id"], "registered-host-client");
+                    assert_eq!(launch["resource"], resource);
+                    assert_eq!(launch["code_challenge_method"], "S256");
+                    std::future::ready(Ok(format!(
+                        "{}?state={}&iss={}&code=host-managed-code&vendor=one&vendor=two",
+                        redirect.as_str(), encode_component(&launch["state"]), encode_component(&issuer),
+                    )))
+                },
+            ).await.unwrap();
+            let request = ModernHttpRequest::new(
+                resource.clone(),
+                br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#.to_vec(),
+                "2026-07-28", "tools/list", None,
+            ).unwrap();
+            let response = session.clone().execute(&cx, &request).await.unwrap();
+            assert_eq!(response.credential_generation(), 1);
+            let body = response.read_to_end(&cx, 4096).await.unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["result"]["tools"], json!([]));
+            assert_eq!(session.credential(&cx).await.unwrap().generation(), 1);
+            session.close();
+        };
+        Box::pin(pair(server, application)).await;
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(*peer.paths.lock().unwrap(), ["/token", "/mcp"]);
+        peer.assert_no_extra_connections();
+    });
+}
+
+#[test]
 fn private_resource_trust_executes_only_the_exact_https_endpoint() {
     run(async {
         let cx = Cx::current().unwrap();

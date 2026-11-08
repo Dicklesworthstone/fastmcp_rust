@@ -311,6 +311,32 @@ impl ManagedOAuthSession {
         Ok(Self::from_admitted_credentials(client, policy, credentials))
     }
 
+    /// Creates a rotating-grant session through a host-owned registered HTTPS
+    /// callback instead of a native loopback listener. The driver returns the
+    /// raw absolute callback URL; only the client's state/issuer/code admission
+    /// and successful HTTPS redemption can install credentials in this session.
+    ///
+    /// The callback route and driver follow
+    /// [`OAuthClient::authorize_with_redirect_driver`]. This creates no runtime,
+    /// browser, listener, web framework or persistent pending-flow store.
+    pub async fn authorize_with_redirect_driver<D, F>(
+        cx: &Cx,
+        client: OAuthClient,
+        policy: OAuthSessionPolicy,
+        redirect_uri: CanonicalHttpUrl,
+        driver: D,
+    ) -> Result<Self, OAuthSessionError>
+    where
+        D: FnOnce(CanonicalHttpUrl) -> F,
+        F: Future<Output = Result<String, OAuthError>>,
+    {
+        let credentials = client
+            .authorize_with_redirect_driver(cx, redirect_uri, driver)
+            .await
+            .map_err(OAuthSessionError::OAuth)?;
+        Ok(Self::from_admitted_credentials(client, policy, credentials))
+    }
+
     /// Adopts an exclusively owned, native-admitted OAuth grant without another
     /// browser login or token exchange. This Linux persistence integration
     /// checks the exact immutable client configuration, revocation and original
