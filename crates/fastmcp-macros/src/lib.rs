@@ -4197,6 +4197,8 @@ struct ToolAttrs {
     apps_ui: Option<ToolAppsUi>,
     tags: Vec<String>,
     defaults: HashMap<String, Lit>,
+    /// Complete input schema expression; typed argument decoding is unchanged.
+    input_schema: Option<syn::Expr>,
     /// Output schema as a JSON literal or type name
     output_schema: Option<syn::Expr>,
     /// Maps both framework-authored tool error kinds into the output schema.
@@ -4350,6 +4352,7 @@ impl Parse for ToolAttrs {
         let mut apps_ui = None;
         let mut tags = Vec::new();
         let mut defaults: HashMap<String, Lit> = HashMap::new();
+        let mut input_schema = None;
         let mut output_schema = None;
         let mut error_mapper = None;
         let mut version = None;
@@ -4444,6 +4447,15 @@ impl Parse for ToolAttrs {
                         }
                     }
                 }
+                "input_schema" => {
+                    if input_schema.is_some() {
+                        return Err(syn::Error::new(ident.span(), "duplicate input_schema"));
+                    }
+                    input.parse::<Token![=]>()?;
+                    let expr: syn::Expr = input.parse()?;
+                    validate_input_schema_expr(&expr)?;
+                    input_schema = Some(expr);
+                }
                 "output_schema" => {
                     input.parse::<Token![=]>()?;
                     // Accept any expression (json!(...), type name, etc.)
@@ -4518,6 +4530,7 @@ impl Parse for ToolAttrs {
             apps_ui,
             tags,
             defaults,
+            input_schema,
             output_schema,
             error_mapper,
             version,
@@ -4697,6 +4710,149 @@ fn validate_output_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
     }
 
     Ok(())
+}
+
+/// Rejects input roots whose literal form cannot be a JSON object. Expressions
+/// that compute a schema are admitted by the router, including its separate
+/// requirement that an input schema declare `type: "object"`.
+fn validate_input_schema_expr(schema_expr: &syn::Expr) -> syn::Result<()> {
+    fn non_object_literal(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Lit(_) | syn::Expr::Array(_) => true,
+            syn::Expr::Paren(paren) => non_object_literal(&paren.expr),
+            syn::Expr::Group(group) => non_object_literal(&group.expr),
+            syn::Expr::Unary(unary) => non_object_literal(&unary.expr),
+            _ => false,
+        }
+    }
+
+    let mut root = schema_expr;
+    loop {
+        match root {
+            syn::Expr::Paren(paren) => root = &paren.expr,
+            syn::Expr::Group(group) => root = &group.expr,
+            _ => break,
+        }
+    }
+    let invalid = if let syn::Expr::Macro(expr_macro) = root
+        && expr_macro
+            .mac
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "json")
+    {
+        syn::parse2::<syn::Expr>(expr_macro.mac.tokens.clone()).is_ok_and(|expr| {
+            non_object_literal(&expr)
+                || matches!(&expr, syn::Expr::Path(path) if path.path.is_ident("null"))
+        })
+    } else {
+        non_object_literal(root)
+    };
+    if invalid {
+        return Err(syn::Error::new_spanned(
+            schema_expr,
+            "input_schema must be a JSON object; use a schema with type \"object\"",
+        ));
+    }
+    Ok(())
+}
+
+type ToolSchemaParameter<'a> = (&'a Ident, &'a Type, Option<String>, Option<Lit>);
+
+fn generate_tool_input_schema_override(
+    fn_name: &Ident,
+    schema_expr: &syn::Expr,
+    serde_json: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    // Relative paths belong to the declaration site, not the generated child
+    // module. Keep the exact value for admission by the existing router.
+    let helper = format_ident!("__fastmcp_tool_input_schema_{}", fn_name);
+    (
+        quote! {
+            #[doc(hidden)]
+            fn #helper() -> #serde_json::Value {
+                #schema_expr
+            }
+        },
+        quote! { super::#helper() },
+    )
+}
+
+/// Builds the definition's input schema. An explicit document bypasses Rust
+/// type inference entirely and retains its own root references and annotations.
+/// The existing router admission validates that document before publication.
+fn generate_tool_input_schema(
+    fn_name: &Ident,
+    override_expr: Option<&syn::Expr>,
+    params: &[ToolSchemaParameter<'_>],
+    required_params: &[String],
+    serde_json: &TokenStream2,
+) -> (TokenStream2, TokenStream2) {
+    if let Some(schema_expr) = override_expr {
+        return generate_tool_input_schema_override(fn_name, schema_expr, serde_json);
+    }
+
+    let property_entries: Vec<TokenStream2> = params
+        .iter()
+        .map(|(name, ty, doc, default_expr)| {
+            let name_str = name.to_string();
+            // Handler parameters name concrete types rather than generic
+            // parameters belonging to a deriving item.
+            let schema = type_to_json_schema(ty, &[]);
+            let default_insert = default_expr.as_ref().map_or_else(
+                || quote! {},
+                |lit| {
+                    quote! {
+                        obj.insert("default".to_string(), serde_json::json!(#lit));
+                    }
+                },
+            );
+            match (doc.as_ref(), default_expr.as_ref()) {
+                (None, None) => quote! {
+                    (#name_str.to_string(), #schema)
+                },
+                (Some(desc), _) => quote! {
+                    (#name_str.to_string(), {
+                        let mut s = #schema;
+                        if let Some(obj) = s.as_object_mut() {
+                            obj.insert("description".to_string(), serde_json::json!(#desc));
+                            #default_insert
+                        }
+                        s
+                    })
+                },
+                (None, Some(_)) => quote! {
+                    (#name_str.to_string(), {
+                        let mut s = #schema;
+                        if let Some(obj) = s.as_object_mut() {
+                            #default_insert
+                        }
+                        s
+                    })
+                },
+            }
+        })
+        .collect();
+    (
+        TokenStream2::new(),
+        quote! {
+            {
+                let mut schema_context = fastmcp_protocol::schema::SchemaGenerator::new();
+                let properties: std::collections::BTreeMap<String, serde_json::Value> = {
+                    let __fastmcp_schema_context = &mut schema_context;
+                    vec![#(#property_entries),*].into_iter().collect()
+                };
+                let required: Vec<String> = vec![#(#required_params.to_string()),*];
+                schema_context.finish(serde_json::json!({
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                })).expect("FastMCP tool input schema exceeds generation limits")
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -4888,6 +5044,143 @@ mod schema_bound_tool_expansion_tests {
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tool_input_schema_override_tests {
+    use super::{ToolAttrs, generate_tool_input_schema, validate_input_schema_expr};
+    use quote::quote;
+
+    #[test]
+    fn tool_input_schema_parsing_preserves_defaults_and_output_metadata() {
+        let attrs = syn::parse_str::<ToolAttrs>(
+            r#"input_schema = self::arguments_schema(), defaults(limit = 3), output_schema = Response, error_mapper = errors::map"#,
+        )
+        .expect("input and output overrides are independent");
+        assert!(attrs.input_schema.is_some());
+        assert!(attrs.output_schema.is_some());
+        assert!(attrs.error_mapper.is_some());
+        assert!(attrs.defaults.contains_key("limit"));
+        assert!(
+            syn::parse_str::<ToolAttrs>("input_schema = first(), input_schema = second()")
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate input_schema")
+        );
+        for malformed in ["input_schema", "input_schema =", "input_schema()"] {
+            assert!(
+                syn::parse_str::<ToolAttrs>(malformed).is_err(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn tool_input_schema_literal_non_object_roots_fail_during_expansion() {
+        for source in [
+            "true",
+            "false",
+            "serde_json::json!(true)",
+            "(serde_json::json!(false))",
+            "serde_json::json!(null)",
+            "serde_json::json!(3)",
+            "serde_json::json!(-3)",
+            "serde_json::json!(\"object\")",
+            "serde_json::json!([])",
+        ] {
+            let expr: syn::Expr = syn::parse_str(source).unwrap();
+            let error = validate_input_schema_expr(&expr)
+                .expect_err("a literal non-object cannot be an MCP input schema");
+            assert_eq!(
+                error.to_string(),
+                "input_schema must be a JSON object; use a schema with type \"object\"",
+                "{source}",
+            );
+        }
+    }
+
+    #[test]
+    fn tool_input_schema_dynamic_documents_are_left_for_registration() {
+        for source in [
+            r##"serde_json::json!({"type": "object", "$defs": {"n": {"type": "integer"}}, "properties": {"n": {"$ref": "#/$defs/n"}}})"##,
+            "self::arguments_schema()",
+            "super::arguments_schema()",
+            "CUSTOM_SCHEMA.clone()",
+            "serde_json::Value::Bool(false)",
+        ] {
+            let expr: syn::Expr = syn::parse_str(source).unwrap();
+            validate_input_schema_expr(&expr).expect("registration admits the computed value");
+        }
+    }
+
+    #[test]
+    fn tool_input_schema_override_bypasses_foreign_type_inference_at_caller_scope() {
+        let function = syn::parse_quote!(lookup);
+        let parameter = syn::parse_quote!(address);
+        let ty = syn::parse_quote!(std::net::IpAddr);
+        let expr = syn::parse_quote!(self::arguments_schema());
+        let (helper, definition) = generate_tool_input_schema(
+            &function,
+            Some(&expr),
+            &[(&parameter, &ty, None, None)],
+            &["address".to_owned()],
+            &quote!(::serde_json),
+        );
+        let helper: syn::ItemFn = syn::parse2(helper).expect("caller helper is valid Rust");
+        let definition: syn::Expr =
+            syn::parse2(definition).expect("definition expression is valid");
+        let helper_body = &helper.block;
+        assert_eq!(
+            quote!(#helper_body).to_string(),
+            quote!({ self::arguments_schema() }).to_string(),
+        );
+        assert_eq!(
+            quote!(#definition).to_string(),
+            quote!(super::__fastmcp_tool_input_schema_lookup()).to_string(),
+        );
+        let emitted = quote!(#helper #definition).to_string();
+        assert!(!emitted.contains("IpAddr"), "{emitted}");
+        assert!(!emitted.contains("JsonSchema"), "{emitted}");
+        assert!(!emitted.contains("SchemaGenerator"), "{emitted}");
+    }
+
+    #[test]
+    fn tool_input_schema_inference_keeps_existing_metadata_without_override() {
+        let function = syn::parse_quote!(lookup);
+        let parameter = syn::parse_quote!(limit);
+        let ty = syn::parse_quote!(u16);
+        let default = syn::parse_quote!(3);
+        let (helper, definition) = generate_tool_input_schema(
+            &function,
+            None,
+            &[(
+                &parameter,
+                &ty,
+                Some("Requested count".to_owned()),
+                Some(default),
+            )],
+            &[],
+            &quote!(::serde_json),
+        );
+        assert!(helper.is_empty());
+        syn::parse2::<syn::Expr>(definition.clone()).expect("inferred schema remains a Rust block");
+        let emitted = definition.to_string();
+        for preserved in [
+            "SchemaGenerator",
+            "schema_body",
+            "u16",
+            "Requested count",
+            "default",
+            "required",
+            "draft/2020-12/schema",
+        ] {
+            assert!(
+                emitted.contains(preserved),
+                "missing {preserved}: {emitted}"
+            );
+        }
+    }
+}
+
 /// Defines a tool handler.
 ///
 /// The function signature should be:
@@ -4901,6 +5194,13 @@ mod schema_bound_tool_expansion_tests {
 /// - `description` - Tool description (default: doc comment)
 /// - `tags` - List of tool tags for filtering (`tags = ["api", "read"]`)
 /// - `icon` - Icon source URL or data URI (`icon = "https://example.com/icon.png"`)
+/// - `input_schema` - A `serde_json::Value` expression supplying the complete
+///   argument schema. It must be an object schema with `type: "object"`.
+///   Registration validates its references, limits, and header annotations.
+///   The expression resolves beside the original function and replaces inferred
+///   properties, descriptions, and defaults; Rust argument decoding and declared
+///   parameter defaults still apply. No `JsonSchema` provider is required for
+///   parameter types when this override is present.
 /// - `output_schema` - An inline JSON object, or a bare return type path with
 ///   `json_schema()`. Ordinary return values must implement `Serialize` and
 ///   become final `structuredContent` with a matching JSON text block. Explicit
@@ -5205,50 +5505,13 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
-    // Generate JSON schema for input
-    let property_entries: Vec<TokenStream2> = params
-        .iter()
-        .map(|(name, ty, doc, default_expr)| {
-            let name_str = name.to_string();
-            // A handler parameter names a concrete type: there is no deriving
-            // item here whose generic parameters could be in scope.
-            let schema = type_to_json_schema(ty, &[]);
-
-            let default_insert = default_expr.as_ref().map_or_else(
-                || quote! {},
-                |lit| {
-                    quote! {
-                        obj.insert("default".to_string(), serde_json::json!(#lit));
-                    }
-                },
-            );
-
-            match (doc.as_ref(), default_expr.as_ref()) {
-                (None, None) => quote! {
-                    (#name_str.to_string(), #schema)
-                },
-                (Some(desc), _) => quote! {
-                    (#name_str.to_string(), {
-                        let mut s = #schema;
-                        if let Some(obj) = s.as_object_mut() {
-                            obj.insert("description".to_string(), serde_json::json!(#desc));
-                            #default_insert
-                        }
-                        s
-                    })
-                },
-                (None, Some(_)) => quote! {
-                    (#name_str.to_string(), {
-                        let mut s = #schema;
-                        if let Some(obj) = s.as_object_mut() {
-                            #default_insert
-                        }
-                        s
-                    })
-                },
-            }
-        })
-        .collect();
+    let (input_schema_helper, input_schema_value) = generate_tool_input_schema(
+        fn_name,
+        attrs.input_schema.as_ref(),
+        &params,
+        &required_params,
+        &serde_json,
+    );
 
     // Generate parameter extraction code
     let mut param_extractions: Vec<TokenStream2> = Vec::new();
@@ -5393,6 +5656,8 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
         // Keep the original function
         #input_fn
 
+        #input_schema_helper
+
         #error_mapper_helper
 
         /// Handler for the #fn_name tool.
@@ -5409,19 +5674,7 @@ pub fn tool(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             impl fastmcp_server::ToolHandler for #handler_name {
                 fn definition(&self) -> fastmcp_protocol::Tool {
-                    let mut schema_context = fastmcp_protocol::schema::SchemaGenerator::new();
-                    let properties: std::collections::BTreeMap<String, serde_json::Value> = {
-                        let __fastmcp_schema_context = &mut schema_context;
-                        vec![#(#property_entries),*].into_iter().collect()
-                    };
-
-                    let required: Vec<String> = vec![#(#required_params.to_string()),*];
-                    let input_schema = schema_context.finish(serde_json::json!({
-                        "$schema": "https://json-schema.org/draft/2020-12/schema",
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    })).expect("FastMCP tool input schema exceeds generation limits");
+                    let input_schema = #input_schema_value;
 
                     fastmcp_protocol::Tool {
                         name: #tool_name.to_string(),
@@ -6423,6 +6676,10 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 /// - `#[json_schema(rename = "...")]` - Rename the field in the schema
 /// - `#[json_schema(skip)]` - Skip this field
+/// - `#[json_schema(schema = expression)]` - Replace one field's schema with a
+///   `serde_json::Value` expression evaluated in the type's module and generic
+///   scope. This supports custom field wire conversions without requiring the
+///   Rust field type to implement a schema provider.
 ///
 /// Symmetric Serde `rename`, `rename_all`, `rename_all_fields`, and `skip`
 /// attributes are also honored. Serde field/container defaults permit omitted
@@ -6440,8 +6697,8 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// schema. Adjacent tagging supports every payload form. Untagged
 /// enums and trailing `#[serde(untagged)]` variants use `anyOf` so overlapping
 /// alternatives remain valid. Enum aliases, catch-all variants, flattened
-/// fields, and custom wire conversions require an explicit schema and produce
-/// diagnostics instead of silently advertising the Rust field layout.
+/// fields, and container/variant wire conversions require an explicit schema
+/// and produce diagnostics instead of silently advertising the Rust layout.
 /// Serde transparent structs preserve their one payload's schema, including
 /// named wrappers, skipped local fields, and `PhantomData` markers. The same
 /// field must be the payload in both wire directions. Named structs support
@@ -6451,7 +6708,15 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Nested object flattening is supported without a following catch-all map.
 /// Optional flattened fields, closed flattened objects, collisions, recursive
 /// flatten expansion, and nested catch-all maps require an explicit schema.
-/// Aliases and custom wire conversions also require an explicit schema.
+/// Field `serde(with)`, `serialize_with`, and `deserialize_with` conversions
+/// require a field schema override. The supplied schema owns all value
+/// constraints, including nullability; field names, documentation, and whether
+/// a property is required are still derived separately. A named `Option` field
+/// with a custom deserializer is required unless Serde supplies a field or
+/// container default. Overrides cannot be combined with skipped/flattened
+/// fields or internally tagged newtype payloads, and are not accepted on
+/// containers or variants. Object and boolean overrides use the same bounded
+/// schema validation and resource/reference admission as handwritten providers.
 ///
 /// Recursive and repeated derived types share bounded local `$defs` in each
 /// generated document. `Box`, `Rc`, `Arc`, and `Cow` retain their payload's
@@ -6463,13 +6728,17 @@ pub fn prompt(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `Borrowed::<'static>::json_schema()` without constructing a borrowed value.
 #[proc_macro_derive(JsonSchema, attributes(json_schema, serde))]
 pub fn derive_json_schema(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as syn::DeriveInput);
+    let mut input = parse_macro_input!(input as syn::DeriveInput);
     let serde_json = match serde_json_crate_path() {
         Ok(path) => path,
         Err(error) => return error.to_compile_error().into(),
     };
     let protocol = match schema_protocol_crate_path() {
         Ok(path) => path,
+        Err(error) => return error.to_compile_error().into(),
+    };
+    let schema_overrides = match lift_schema_override_expressions(&mut input) {
+        Ok(overrides) => overrides,
         Err(error) => return error.to_compile_error().into(),
     };
 
@@ -6482,6 +6751,28 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
         .predicates
         .push(syn::parse_quote!(Self: 'static));
     let (schema_impl_generics, _, schema_where_clause) = schema_generics.split_for_impl();
+    let override_helpers = if schema_overrides.is_empty() {
+        quote! {}
+    } else {
+        let methods = schema_overrides.iter().map(|(method, expression)| {
+            quote! {
+                #[doc(hidden)]
+                fn #method() -> #serde_json::Value
+                where
+                    Self: 'static,
+                {
+                    #expression
+                }
+            }
+        });
+        quote! {
+            // Keep expressions beside the caller type: self:: and super:: must
+            // retain their original module meaning, including generic scopes.
+            impl #impl_generics #name #ty_generics #where_clause {
+                #(#methods)*
+            }
+        }
+    };
 
     // Extract type-level doc comments for schema description
     let type_description = extract_doc_comments(&input.attrs);
@@ -6553,6 +6844,8 @@ pub fn derive_json_schema(input: TokenStream) -> TokenStream {
     };
 
     let expanded = quote! {
+        #override_helpers
+
         #[doc(hidden)]
         #[allow(non_snake_case)]
         mod #impl_module {
@@ -6723,6 +7016,7 @@ struct SchemaSerdeAttrs {
     skip_serializing: bool,
     skip_deserializing: bool,
     skip_serializing_if: bool,
+    custom_deserializer: bool,
     deny_unknown_fields: bool,
     tag: Option<String>,
     content: Option<String>,
@@ -6770,6 +7064,10 @@ impl SchemaSerdeAttrs {
                     skip_deserializing = true;
                 } else if entry.path().is_ident("skip_serializing_if") {
                     result.skip_serializing_if = true;
+                } else if entry.path().is_ident("with")
+                    || entry.path().is_ident("deserialize_with")
+                {
+                    result.custom_deserializer = true;
                 } else if entry.path().is_ident("deny_unknown_fields") {
                     result.deny_unknown_fields = true;
                 } else if entry.path().is_ident("tag") {
@@ -6839,10 +7137,18 @@ fn schema_serde_string(meta: &Meta) -> syn::Result<String> {
 /// or flattens it. These forms need an explicit schema until their wire
 /// representation can be inferred without weakening validation.
 fn validate_enum_schema_attributes(attrs: &[Attribute]) -> syn::Result<()> {
+    validate_enum_schema_attributes_at(attrs, false)
+}
+
+fn validate_enum_schema_attributes_at(attrs: &[Attribute], field: bool) -> syn::Result<()> {
+    let json_attrs = validate_schema_override_attributes(attrs, field)?;
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
         let entries =
             attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
         for entry in entries {
+            if field && json_attrs.schema.is_some() && is_schema_field_converter(&entry) {
+                continue;
+            }
             if [
                 "flatten",
                 "other",
@@ -6879,10 +7185,14 @@ fn validate_enum_schema_attributes(attrs: &[Attribute]) -> syn::Result<()> {
 /// layout. These conversions need an explicit provider until their wire
 /// shape can be inferred without losing constraints or changing acceptance.
 fn validate_struct_schema_attributes(attrs: &[Attribute], container: bool) -> syn::Result<()> {
+    let json_attrs = validate_schema_override_attributes(attrs, !container)?;
     for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
         let entries =
             attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
         for entry in entries {
+            if !container && json_attrs.schema.is_some() && is_schema_field_converter(&entry) {
+                continue;
+            }
             if let Some(name) = [
                 "alias",
                 "with",
@@ -6989,6 +7299,7 @@ fn generate_struct_schema(
         return generate_transparent_struct_schema(data, type_desc_tokens, generic_params);
     }
     for field in &data.fields {
+        validate_schema_override_attributes(&field.attrs, true)?;
         let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
         if !attrs.skip && !has_json_schema_attr(&field.attrs, "skip") {
             validate_struct_schema_attributes(&field.attrs, false)?;
@@ -7011,6 +7322,7 @@ fn generate_transparent_struct_schema(
     let mut serialized = None;
     let mut deserialized = None;
     for (index, field) in data.fields.iter().enumerate() {
+        let json_attrs = validate_schema_override_attributes(&field.attrs, true)?;
         let attrs = SchemaSerdeAttrs::parse_with_directional_skips(&field.attrs, true)?;
         // Match Serde's transparent field election: PhantomData never carries
         // the wire value, even without an explicit skip. Parentheses/groups do
@@ -7024,6 +7336,12 @@ fn generate_transparent_struct_schema(
             }
         }
         if type_last_segment(ty).is_some_and(|segment| segment.ident == "PhantomData") {
+            if json_attrs.schema.is_some() {
+                return Err(syn::Error::new_spanned(
+                    field,
+                    "json_schema(schema) cannot be applied to a non-payload PhantomData field of a transparent struct",
+                ));
+            }
             continue;
         }
         let in_serialized = !attrs.skip_serializing;
@@ -7067,7 +7385,7 @@ fn generate_transparent_struct_schema(
             "JsonSchema serde(transparent) requires the same payload in both wire directions; implement json_schema() explicitly",
         ));
     }
-    let payload_schema = type_to_json_schema(&payload.ty, generic_params);
+    let payload_schema = field_to_json_schema(payload, generic_params)?;
     Ok(quote! {
         {
             let mut schema = #payload_schema;
@@ -7182,6 +7500,7 @@ fn generate_fields_schema(
             let mut catch_all_seen = false;
 
             for field in &fields.named {
+                validate_schema_override_attributes(&field.attrs, true)?;
                 let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
                 // Check for skip attribute
                 if has_json_schema_attr(&field.attrs, "skip") || field_attrs.skip {
@@ -7237,8 +7556,9 @@ fn generate_fields_schema(
 
                 // Generate schema for this field's type
                 let field_type = &field.ty;
-                let is_optional =
-                    is_option_type(field_type) || field_attrs.default || serde_attrs.default;
+                let is_optional = (is_option_type(field_type) && !field_attrs.custom_deserializer)
+                    || field_attrs.default
+                    || serde_attrs.default;
                 if field_attrs.skip_serializing_if && !is_optional {
                     return Err(syn::Error::new_spanned(
                         field,
@@ -7247,7 +7567,7 @@ fn generate_fields_schema(
                 }
 
                 // Generate the base schema
-                let field_schema = type_to_json_schema(field_type, generic_params);
+                let field_schema = field_to_json_schema(field, generic_params)?;
 
                 // Add description if available
                 let property_value = if let Some(desc) = &field_doc {
@@ -7328,6 +7648,7 @@ fn generate_fields_schema(
             let mut item_schemas = Vec::new();
             let mut min_items = 0;
             for field in &fields.unnamed {
+                validate_schema_override_attributes(&field.attrs, true)?;
                 let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
                 if field_attrs.skip || has_json_schema_attr(&field.attrs, "skip") {
                     if fields.unnamed.len() == 1 {
@@ -7344,7 +7665,7 @@ fn generate_fields_schema(
                         "JsonSchema cannot represent conditional tuple positions; implement json_schema() explicitly",
                     ));
                 }
-                item_schemas.push(type_to_json_schema(&field.ty, generic_params));
+                item_schemas.push(field_to_json_schema(field, generic_params)?);
                 if !field_attrs.default && !serde_attrs.default {
                     min_items = item_schemas.len();
                 }
@@ -7435,7 +7756,20 @@ fn generate_enum_schema(
     let variants = data
         .variants
         .iter()
-        .map(|variant| Ok((variant, SchemaSerdeAttrs::parse(&variant.attrs)?)))
+        .map(|variant| {
+            let json_attrs = validate_schema_override_attributes(&variant.attrs, false)?;
+            let serde_attrs = SchemaSerdeAttrs::parse(&variant.attrs)?;
+            for field in &variant.fields {
+                let field_attrs = validate_schema_override_attributes(&field.attrs, true)?;
+                if (json_attrs.skip || serde_attrs.skip) && field_attrs.schema.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "json_schema(schema) cannot be applied to a field of a skipped variant",
+                    ));
+                }
+            }
+            Ok((variant, serde_attrs))
+        })
         .collect::<syn::Result<Vec<_>>>()?;
     let variants: Vec<_> = variants
         .into_iter()
@@ -7482,7 +7816,7 @@ fn generate_enum_schema(
         for field in &variant.fields {
             let field_attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
             if !field_attrs.skip && !has_json_schema_attr(&field.attrs, "skip") {
-                validate_enum_schema_attributes(&field.attrs)?;
+                validate_enum_schema_attributes_at(&field.attrs, true)?;
                 if field_attrs.tag.is_some()
                     || field_attrs.content.is_some()
                     || field_attrs.untagged
@@ -7593,6 +7927,12 @@ fn generate_enum_variant_schema(
             syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
                 let field = &fields.unnamed[0];
                 let attrs = SchemaSerdeAttrs::parse(&field.attrs)?;
+                if SchemaJsonAttrs::parse(&field.attrs)?.schema.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        field,
+                        "json_schema(schema) cannot replace an internally tagged newtype payload; use adjacent tagging or implement json_schema() explicitly",
+                    ));
+                }
                 if payload_attrs.deny_unknown_fields {
                     return Err(syn::Error::new_spanned(
                         variant,
@@ -7727,53 +8067,407 @@ fn generate_enum_variant_schema(
     }
 }
 
-/// Checks if a field has a specific json_schema attribute.
-fn has_json_schema_attr(attrs: &[Attribute], attr_name: &str) -> bool {
-    for attr in attrs {
-        if attr.path().is_ident("json_schema") {
-            if let Meta::List(meta_list) = &attr.meta {
-                if let Ok(nested) = meta_list.parse_args::<Ident>() {
-                    if nested == attr_name {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
+#[derive(Default)]
+struct SchemaJsonAttrs {
+    rename: Option<String>,
+    skip: bool,
+    flatten: bool,
+    schema: Option<syn::Expr>,
 }
 
-/// Gets the rename value from json_schema attribute if present.
-fn get_json_schema_rename(attrs: &[Attribute]) -> Option<String> {
-    for attr in attrs {
-        if attr.path().is_ident("json_schema") {
-            if let Meta::List(meta_list) = &attr.meta {
-                // Parse as ident = "value"
-                let result: syn::Result<(Ident, LitStr)> =
-                    meta_list.parse_args_with(|input: ParseStream| {
-                        let ident: Ident = input.parse()?;
-                        let _: Token![=] = input.parse()?;
-                        let lit: LitStr = input.parse()?;
-                        Ok((ident, lit))
-                    });
-
-                if let Ok((ident, lit)) = result {
-                    if ident == "rename" {
-                        return Some(lit.value());
+impl SchemaJsonAttrs {
+    fn parse(attrs: &[Attribute]) -> syn::Result<Self> {
+        let mut result = Self::default();
+        for attr in attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("json_schema"))
+        {
+            let entries = attr.parse_args_with(
+                syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated,
+            )?;
+            if entries.is_empty() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "expected a json_schema attribute argument",
+                ));
+            }
+            for entry in entries {
+                if entry.path().is_ident("schema") {
+                    if result.schema.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "duplicate json_schema(schema) override",
+                        ));
                     }
+                    let Meta::NameValue(value) = entry else {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected json_schema(schema = <serde_json::Value expression>)",
+                        ));
+                    };
+                    result.schema = Some(value.value);
+                } else if entry.path().is_ident("rename") {
+                    if result.rename.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "duplicate json_schema(rename) attribute",
+                        ));
+                    }
+                    if let Meta::NameValue(value) = &entry
+                        && let syn::Expr::Lit(value) = &value.value
+                        && let Lit::Str(value) = &value.lit
+                    {
+                        result.rename = Some(value.value());
+                    } else {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected json_schema(rename = \"name\")",
+                        ));
+                    }
+                } else if entry.path().is_ident("skip") {
+                    if !matches!(entry, Meta::Path(_)) || result.skip {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected one bare json_schema(skip) attribute",
+                        ));
+                    }
+                    result.skip = true;
+                } else if entry.path().is_ident("flatten") {
+                    // Retain the existing actionable unsupported-flatten
+                    // diagnostic instead of treating it as an unknown option.
+                    if !matches!(entry, Meta::Path(_)) || result.flatten {
+                        return Err(syn::Error::new_spanned(
+                            entry,
+                            "expected one bare json_schema(flatten) attribute",
+                        ));
+                    }
+                    result.flatten = true;
+                } else {
+                    return Err(syn::Error::new_spanned(
+                        entry,
+                        "unsupported json_schema attribute; expected rename, skip, or schema",
+                    ));
                 }
             }
         }
+        Ok(result)
     }
-    None
+}
+
+fn is_schema_field_converter(entry: &Meta) -> bool {
+    ["with", "serialize_with", "deserialize_with"]
+        .iter()
+        .any(|name| entry.path().is_ident(name))
+}
+
+/// An override replaces one wire value, never field election or object
+/// composition. Reject combinations that would otherwise ignore the value.
+fn validate_schema_override_attributes(
+    attrs: &[Attribute],
+    field: bool,
+) -> syn::Result<SchemaJsonAttrs> {
+    let json_attrs = SchemaJsonAttrs::parse(attrs)?;
+    let Some(schema) = &json_attrs.schema else {
+        return Ok(json_attrs);
+    };
+    if !field {
+        return Err(syn::Error::new_spanned(
+            schema,
+            "json_schema(schema) overrides are supported only on fields, not containers or variants",
+        ));
+    }
+    if json_attrs.skip {
+        return Err(syn::Error::new_spanned(
+            schema,
+            "json_schema(schema) cannot be combined with a skipped field",
+        ));
+    }
+    if json_attrs.flatten {
+        return Err(syn::Error::new_spanned(
+            schema,
+            "json_schema(schema) cannot be combined with a flattened field",
+        ));
+    }
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        let entries =
+            attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        for entry in entries {
+            if ["skip", "skip_serializing", "skip_deserializing"]
+                .iter()
+                .any(|name| entry.path().is_ident(name))
+            {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    "json_schema(schema) cannot be combined with a skipped field",
+                ));
+            }
+            if entry.path().is_ident("flatten") {
+                return Err(syn::Error::new_spanned(
+                    entry,
+                    "json_schema(schema) cannot be combined with a flattened field",
+                ));
+            }
+        }
+    }
+    Ok(json_attrs)
+}
+
+/// Move user expressions into caller-scope inherent methods. Generated schema
+/// bodies live in a child module, where a raw self:: or super:: path would refer
+/// to a different module. Rewriting only the parsed helper attribute leaves
+/// Serde's original field definition and deserialization untouched.
+fn lift_schema_override_expressions(
+    input: &mut syn::DeriveInput,
+) -> syn::Result<Vec<(Ident, syn::Expr)>> {
+    validate_schema_override_attributes(&input.attrs, false)?;
+    let mut overrides = Vec::new();
+    match &mut input.data {
+        syn::Data::Struct(data) => {
+            for field in &mut data.fields {
+                lift_field_schema_override(field, &mut overrides)?;
+            }
+        }
+        syn::Data::Enum(data) => {
+            for variant in &mut data.variants {
+                let json_attrs = validate_schema_override_attributes(&variant.attrs, false)?;
+                let serde_attrs = SchemaSerdeAttrs::parse(&variant.attrs)?;
+                for field in &mut variant.fields {
+                    if (json_attrs.skip || serde_attrs.skip)
+                        && SchemaJsonAttrs::parse(&field.attrs)?.schema.is_some()
+                    {
+                        return Err(syn::Error::new_spanned(
+                            field,
+                            "json_schema(schema) cannot be applied to a field of a skipped variant",
+                        ));
+                    }
+                    lift_field_schema_override(field, &mut overrides)?;
+                }
+            }
+        }
+        syn::Data::Union(_) => {}
+    }
+    Ok(overrides)
+}
+
+fn lift_field_schema_override(
+    field: &mut syn::Field,
+    overrides: &mut Vec<(Ident, syn::Expr)>,
+) -> syn::Result<()> {
+    if validate_schema_override_attributes(&field.attrs, true)?
+        .schema
+        .is_none()
+    {
+        return Ok(());
+    }
+    let method = format_ident!("__fastmcp_schema_override_{}", overrides.len());
+    for attr in field
+        .attrs
+        .iter_mut()
+        .filter(|attr| attr.path().is_ident("json_schema"))
+    {
+        let mut entries =
+            attr.parse_args_with(syn::punctuated::Punctuated::<Meta, Token![,]>::parse_terminated)?;
+        for entry in &mut entries {
+            if let Meta::NameValue(value) = entry
+                && value.path.is_ident("schema")
+            {
+                let expression =
+                    std::mem::replace(&mut value.value, syn::parse_quote! { Self::#method() });
+                overrides.push((method.clone(), expression));
+            }
+        }
+        if let Meta::List(list) = &mut attr.meta {
+            list.tokens = quote! { #entries };
+        }
+    }
+    Ok(())
+}
+
+fn field_to_json_schema(field: &syn::Field, generic_params: &[Ident]) -> syn::Result<TokenStream2> {
+    let attrs = SchemaJsonAttrs::parse(&field.attrs)?;
+    Ok(if let Some(schema) = attrs.schema {
+        quote! { __fastmcp_schema_context.inline_schema(#schema) }
+    } else {
+        type_to_json_schema(&field.ty, generic_params)
+    })
+}
+
+/// Attribute syntax and placement are checked before these read-only lookups.
+fn has_json_schema_attr(attrs: &[Attribute], attr_name: &str) -> bool {
+    SchemaJsonAttrs::parse(attrs).is_ok_and(|attrs| match attr_name {
+        "skip" => attrs.skip,
+        "flatten" => attrs.flatten,
+        _ => false,
+    })
+}
+
+fn get_json_schema_rename(attrs: &[Attribute]) -> Option<String> {
+    SchemaJsonAttrs::parse(attrs).ok()?.rename
 }
 
 #[cfg(test)]
 mod serde_schema_tests {
     use super::{
-        SchemaRenameRule, SchemaSerdeAttrs, generate_enum_schema, generate_struct_schema,
-        validate_enum_schema_attributes, validate_struct_schema_attributes,
+        SchemaJsonAttrs, SchemaRenameRule, SchemaSerdeAttrs, generate_enum_schema,
+        generate_struct_schema, validate_enum_schema_attributes, validate_struct_schema_attributes,
     };
+
+    #[test]
+    fn schema_override_attributes_reject_malformed_and_duplicate_arguments() {
+        for attributes in [
+            vec![syn::parse_quote! { #[json_schema] }],
+            vec![syn::parse_quote! { #[json_schema()] }],
+            vec![syn::parse_quote! { #[json_schema(schema)] }],
+            vec![syn::parse_quote! { #[json_schema(schema(value))] }],
+            vec![syn::parse_quote! { #[json_schema(schema =)] }],
+            vec![syn::parse_quote! { #[json_schema(schema = first(), schema = second())] }],
+            vec![
+                syn::parse_quote! { #[json_schema(schema = first())] },
+                syn::parse_quote! { #[json_schema(schema = second())] },
+            ],
+            vec![syn::parse_quote! { #[json_schema(scehma = value())] }],
+            vec![syn::parse_quote! { #[json_schema(rename = 7, schema = value())] }],
+            vec![syn::parse_quote! { #[json_schema(skip = true, schema = value())] }],
+        ] {
+            assert!(
+                SchemaJsonAttrs::parse(&attributes).is_err(),
+                "malformed schema attributes must not be ignored"
+            );
+        }
+        let attributes: Vec<syn::Attribute> = vec![syn::parse_quote! {
+            #[json_schema(rename = "wire_name", schema = self::provider::<T, N>())]
+        }];
+        let parsed = SchemaJsonAttrs::parse(&attributes).expect("expression and rename supported");
+        assert_eq!(parsed.rename.as_deref(), Some("wire_name"));
+        assert!(parsed.schema.is_some());
+    }
+
+    #[test]
+    fn schema_override_struct_placement_and_composition_are_explicit() {
+        for (input, expected) in [
+            (
+                syn::parse_quote! {
+                    #[json_schema(schema = supplied())] struct Invalid { value: u64 }
+                },
+                "only on fields, not containers or variants",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid { #[json_schema(skip, schema = supplied())] value: u64 }
+                },
+                "cannot be combined with a skipped field",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid {
+                        #[serde(skip)] #[json_schema(schema = supplied())] value: u64
+                    }
+                },
+                "cannot be combined with a skipped field",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid {
+                        #[serde(flatten)] #[json_schema(schema = supplied())] value: Payload
+                    }
+                },
+                "cannot be combined with a flattened field",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(transparent)] struct Invalid {
+                        value: String,
+                        #[json_schema(schema = supplied())] marker: std::marker::PhantomData<u8>,
+                    }
+                },
+                "non-payload PhantomData field",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid {
+                        #[serde(alias = "alternate")] #[json_schema(schema = supplied())] value: u64
+                    }
+                },
+                "cannot infer serde(alias)",
+            ),
+            (
+                syn::parse_quote! {
+                    struct Invalid {
+                        #[serde(rename(serialize = "out", deserialize = "in"))]
+                        #[json_schema(schema = supplied())] value: u64
+                    }
+                },
+                "identical serialize and deserialize names",
+            ),
+        ] {
+            let error = struct_representation_error(input);
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn schema_override_enum_placement_and_composition_are_explicit() {
+        for (input, expected) in [
+            (
+                syn::parse_quote! {
+                    #[json_schema(schema = supplied())] enum Invalid { Value(u64) }
+                },
+                "only on fields, not containers or variants",
+            ),
+            (
+                syn::parse_quote! {
+                    enum Invalid { #[json_schema(schema = supplied())] Value(u64) }
+                },
+                "only on fields, not containers or variants",
+            ),
+            (
+                syn::parse_quote! {
+                    enum Invalid {
+                        #[serde(skip)] #[json_schema(schema = supplied())] Hidden(u64),
+                        Visible,
+                    }
+                },
+                "only on fields, not containers or variants",
+            ),
+            (
+                syn::parse_quote! {
+                    enum Invalid {
+                        #[serde(skip)] Hidden(#[json_schema(schema = supplied())] u64),
+                        Visible,
+                    }
+                },
+                "field of a skipped variant",
+            ),
+            (
+                syn::parse_quote! {
+                    enum Invalid {
+                        Value(#[serde(skip)] #[json_schema(schema = supplied())] u64),
+                    }
+                },
+                "cannot be combined with a skipped field",
+            ),
+            (
+                syn::parse_quote! {
+                    enum Invalid {
+                        Value {
+                            #[serde(flatten)] #[json_schema(schema = supplied())] value: Payload,
+                        },
+                    }
+                },
+                "cannot be combined with a flattened field",
+            ),
+            (
+                syn::parse_quote! {
+                    #[serde(tag = "kind")]
+                    enum Invalid { Value(#[json_schema(schema = supplied())] Payload) }
+                },
+                "cannot replace an internally tagged newtype payload",
+            ),
+        ] {
+            let error = enum_representation_error(input);
+            assert!(error.contains(expected), "{error}");
+        }
+    }
 
     fn struct_representation_error(input: syn::DeriveInput) -> String {
         let attrs = SchemaSerdeAttrs::parse(&input.attrs).expect("valid attribute syntax");

@@ -7075,6 +7075,701 @@ fn json_schema_serde_names_and_defaults_reach_registered_modern_tool() {
     });
 }
 
+mod schema_override_fields {
+    use fastmcp_rust::{JsonSchema, schema};
+    use serde::{Deserialize, Serialize};
+    use serde_json::{Value, json};
+
+    fn decimal_schema() -> Value {
+        json!({"type": "string", "pattern": "^[0-9]+$"})
+    }
+
+    fn optional_decimal_schema() -> Value {
+        json!({"anyOf": [decimal_schema(), {"type": "null"}]})
+    }
+
+    mod decimal {
+        pub(super) fn parse<E: serde::de::Error>(text: &str) -> Result<u64, E> {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(E::custom("expected decimal digits"));
+            }
+            text.parse().map_err(E::custom)
+        }
+
+        pub fn serialize<S: serde::Serializer>(
+            value: &u64,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            serializer.serialize_str(&value.to_string())
+        }
+
+        pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<u64, D::Error> {
+            let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+            parse(&text)
+        }
+    }
+
+    mod optional_decimal {
+        pub fn serialize<S: serde::Serializer>(
+            value: &Option<u64>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            match value {
+                Some(value) => serializer.serialize_some(&value.to_string()),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<u64>, D::Error> {
+            <Option<String> as serde::Deserialize>::deserialize(deserializer)?
+                .map(|text| super::decimal::parse(&text))
+                .transpose()
+        }
+    }
+
+    fn admitted<T: schema::JsonSchemaType>() -> schema::AdmittedSchema {
+        let mut generator = schema::SchemaGenerator::new();
+        let root = generator.subschema_for::<T>();
+        schema::admit_final_schema(generator.finish(root).unwrap()).unwrap()
+    }
+
+    fn assert_wire_case<T>(valid: Value, invalid: Value)
+    where
+        T: schema::JsonSchemaType
+            + Serialize
+            + serde::de::DeserializeOwned
+            + PartialEq
+            + std::fmt::Debug,
+    {
+        let schema = admitted::<T>();
+        schema.validate(&valid).unwrap();
+        let decoded: T = serde_json::from_value(valid).unwrap();
+        let serialized = serde_json::to_value(&decoded).unwrap();
+        schema.validate(&serialized).unwrap();
+        assert_eq!(serde_json::from_value::<T>(serialized).unwrap(), decoded);
+        assert!(schema.validate(&invalid).is_err(), "{invalid}");
+        assert!(serde_json::from_value::<T>(invalid).is_err());
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    struct DecimalRecord {
+        /// Exact decimal amount.
+        #[serde(rename = "amount", with = "decimal")]
+        #[json_schema(rename = "amount", schema = self::decimal_schema())]
+        rust_amount: u64,
+        enabled: bool,
+    }
+
+    #[test]
+    fn field_overrides_match_custom_serde_and_keep_native_ranges() {
+        let generated = DecimalRecord::try_json_schema().unwrap();
+        assert_eq!(generated["properties"]["amount"]["type"], "string");
+        assert_eq!(
+            generated["properties"]["amount"]["description"],
+            "Exact decimal amount."
+        );
+        assert_eq!(
+            generated["properties"]["enabled"],
+            json!({"type": "boolean"})
+        );
+        for amount in [0, u64::MAX] {
+            assert_wire_case::<DecimalRecord>(
+                json!({"amount": amount.to_string(), "enabled": true}),
+                json!({"amount": amount, "enabled": true}),
+            );
+        }
+        assert_wire_case::<DecimalRecord>(
+            json!({"amount": "7", "enabled": false}),
+            json!({"amount": "+7", "enabled": false}),
+        );
+        let overflow = json!({"amount": "18446744073709551616", "enabled": true});
+        admitted::<DecimalRecord>().validate(&overflow).unwrap();
+        assert!(serde_json::from_value::<DecimalRecord>(overflow).is_err());
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct RequiredOptional {
+        #[serde(
+            serialize_with = "optional_decimal::serialize",
+            deserialize_with = "optional_decimal::deserialize"
+        )]
+        #[json_schema(schema = optional_decimal_schema())]
+        amount: Option<u64>,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct DefaultOptional {
+        #[serde(default, with = "optional_decimal")]
+        #[json_schema(schema = optional_decimal_schema())]
+        amount: Option<u64>,
+    }
+
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(default)]
+    struct ContainerDefaultOptional {
+        #[serde(with = "optional_decimal")]
+        #[json_schema(schema = optional_decimal_schema())]
+        amount: Option<u64>,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct SerializeOptional {
+        #[serde(serialize_with = "serde::Serialize::serialize")]
+        #[json_schema(schema = json!({"type": ["integer", "null"], "minimum": 0}))]
+        amount: Option<u64>,
+    }
+
+    #[test]
+    fn field_overrides_preserve_custom_option_presence_and_defaults() {
+        assert_eq!(
+            RequiredOptional::json_schema()["required"],
+            json!(["amount"])
+        );
+        assert_wire_case::<RequiredOptional>(json!({"amount": null}), json!({}));
+        assert_wire_case::<RequiredOptional>(json!({"amount": "7"}), json!({"amount": 7}));
+        assert_wire_case::<DefaultOptional>(json!({}), json!({"amount": 7}));
+        assert_wire_case::<ContainerDefaultOptional>(json!({}), json!({"amount": 7}));
+        assert_wire_case::<SerializeOptional>(json!({}), json!({"amount": false}));
+        assert_wire_case::<SerializeOptional>(json!({"amount": 7}), json!({"amount": "7"}));
+        assert_eq!(DefaultOptional::json_schema()["required"], json!([]));
+        assert_eq!(
+            ContainerDefaultOptional::json_schema()["required"],
+            json!([])
+        );
+        assert_eq!(SerializeOptional::json_schema()["required"], json!([]));
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct DecimalNewtype(
+        #[serde(with = "decimal")]
+        #[json_schema(schema = decimal_schema())]
+        u64,
+    );
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct DecimalTuple(
+        #[serde(with = "decimal")]
+        #[json_schema(schema = decimal_schema())]
+        u64,
+        bool,
+    );
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(transparent)]
+    struct TransparentDecimal {
+        #[serde(with = "decimal")]
+        #[json_schema(schema = decimal_schema())]
+        value: u64,
+        #[serde(skip)]
+        local: (),
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(tag = "kind", content = "payload")]
+    enum TaggedDecimal {
+        Value(
+            #[serde(with = "decimal")]
+            #[json_schema(schema = decimal_schema())]
+            u64,
+        ),
+        Pair(
+            #[serde(with = "decimal")]
+            #[json_schema(schema = decimal_schema())]
+            u64,
+            bool,
+        ),
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(tag = "kind")]
+    enum InternalDecimal {
+        Value {
+            #[serde(with = "decimal")]
+            #[json_schema(schema = decimal_schema())]
+            value: u64,
+        },
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    enum ExternalDecimal {
+        Value(
+            #[serde(with = "decimal")]
+            #[json_schema(schema = decimal_schema())]
+            u64,
+        ),
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(untagged)]
+    enum UntaggedDecimal {
+        Value(
+            #[serde(with = "decimal")]
+            #[json_schema(schema = decimal_schema())]
+            u64,
+        ),
+    }
+
+    #[test]
+    fn field_overrides_cover_tuple_transparent_and_tagged_payloads() {
+        assert_wire_case::<DecimalNewtype>(json!("7"), json!(7));
+        assert_wire_case::<DecimalTuple>(json!(["7", true]), json!([7, true]));
+        assert_wire_case::<TransparentDecimal>(json!("7"), json!({"value": "7"}));
+        assert_wire_case::<TaggedDecimal>(
+            json!({"kind": "Value", "payload": "7"}),
+            json!({"kind": "Value", "payload": 7}),
+        );
+        assert_wire_case::<TaggedDecimal>(
+            json!({"kind": "Pair", "payload": ["7", true]}),
+            json!({"kind": "Pair", "payload": ["7"]}),
+        );
+        assert_wire_case::<InternalDecimal>(
+            json!({"kind": "Value", "value": "7"}),
+            json!({"kind": "Value", "value": 7}),
+        );
+        assert_wire_case::<ExternalDecimal>(json!({"Value": "7"}), json!({"Value": 7}));
+        assert_wire_case::<UntaggedDecimal>(json!("7"), json!(7));
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    #[serde(tag = "kind", content = "payload")]
+    enum AdjacentOptional {
+        Value(
+            #[serde(with = "optional_decimal")]
+            #[json_schema(schema = optional_decimal_schema())]
+            Option<u64>,
+        ),
+    }
+
+    #[test]
+    fn field_overrides_preserve_adjacent_optional_content_omission() {
+        // Serde's missing-content path uses the Option payload itself, not
+        // the field converter used when the content member is present.
+        assert_wire_case::<AdjacentOptional>(
+            json!({"kind": "Value"}),
+            json!({"kind": "Value", "payload": 7}),
+        );
+        assert_wire_case::<AdjacentOptional>(
+            json!({"kind": "Value", "payload": "7"}),
+            json!({"kind": "Value", "payload": "bad"}),
+        );
+        assert_eq!(
+            serde_json::from_value::<AdjacentOptional>(json!({"kind": "Value"})).unwrap(),
+            AdjacentOptional::Value(None),
+        );
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct ConcreteAddress {
+        #[json_schema(schema = json!({"type": "string"}))]
+        address: std::net::IpAddr,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct GenericAddress<T, const MIN: usize> {
+        #[json_schema(schema = Self::wire_schema())]
+        address: T,
+    }
+
+    impl<T, const MIN: usize> GenericAddress<T, MIN> {
+        fn wire_schema() -> Value {
+            let _ = std::mem::size_of::<T>();
+            json!({"type": "string", "minLength": MIN})
+        }
+    }
+
+    #[derive(JsonSchema)]
+    struct BorrowedSchemaPayload<'a>(&'a str);
+
+    #[derive(JsonSchema)]
+    struct BorrowedOverride<'a> {
+        #[json_schema(schema = BorrowedSchemaPayload::<'a>::json_schema())]
+        value: &'a str,
+    }
+
+    fn parent_schema() -> Value {
+        json!({"type": "integer", "const": 7})
+    }
+
+    mod relative_scope {
+        use fastmcp_rust::JsonSchema;
+        use serde::{Deserialize, Serialize};
+        use serde_json::{Value, json};
+
+        fn local_schema() -> Value {
+            json!({"type": "string"})
+        }
+
+        fn parent_schema() -> Value {
+            json!(false)
+        }
+
+        #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+        pub(super) struct RelativeFields {
+            #[json_schema(schema = self::local_schema())]
+            local: String,
+            #[json_schema(schema = super::parent_schema())]
+            parent: u8,
+        }
+    }
+
+    #[test]
+    fn field_overrides_bypass_schema_traits_and_keep_caller_scope() {
+        assert_wire_case::<ConcreteAddress>(json!({"address": "127.0.0.1"}), json!({"address": 7}));
+        assert_wire_case::<GenericAddress<std::net::IpAddr, 3>>(
+            json!({"address": "::1"}),
+            json!({"address": 7}),
+        );
+        let generic = GenericAddress::<std::net::IpAddr, 3>::json_schema();
+        assert_eq!(generic["properties"]["address"]["minLength"], 3);
+        assert_wire_case::<relative_scope::RelativeFields>(
+            json!({"local": "work", "parent": 7}),
+            json!({"local": 7, "parent": 7}),
+        );
+        assert!(
+            admitted::<relative_scope::RelativeFields>()
+                .validate(&json!({"local": "work", "parent": 8}))
+                .is_err()
+        );
+        let borrowed =
+            schema::admit_final_schema(BorrowedOverride::<'static>::try_json_schema().unwrap())
+                .unwrap();
+        borrowed.validate(&json!({"value": "borrowed"})).unwrap();
+        assert!(borrowed.validate(&json!({"value": 7})).is_err());
+    }
+
+    fn scoped_label_schema() -> Value {
+        json!({
+            "$id": "urn:fastmcp:test:field-override-label",
+            "$defs": {"label": {"type": "string", "pattern": "^label:"}},
+            "$ref": "#/$defs/label",
+        })
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct Link {
+        value: u8,
+        next: Option<Box<Link>>,
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+    struct ScopedRecord {
+        /// Label within its own schema resource.
+        #[json_schema(schema = scoped_label_schema())]
+        label: String,
+        link: Link,
+    }
+
+    #[derive(JsonSchema)]
+    struct UnscopedRecord {
+        #[json_schema(schema = json!({
+            "$defs": {"label": {"type": "string"}},
+            "$ref": "#/$defs/label",
+        }))]
+        label: String,
+    }
+
+    #[test]
+    fn field_overrides_preserve_scoped_refs_beside_generated_recursion() {
+        let generated = ScopedRecord::try_json_schema().unwrap();
+        assert!(generated["$defs"].is_object());
+        assert_eq!(generated["properties"]["label"]["$ref"], "#/$defs/label");
+        assert_eq!(
+            generated["properties"]["label"]["$id"],
+            "urn:fastmcp:test:field-override-label",
+        );
+        assert_wire_case::<ScopedRecord>(
+            json!({"label": "label:work", "link": {"value": 7, "next": {"value": 8}}}),
+            json!({"label": 7, "link": {"value": 7}}),
+        );
+        assert!(
+            admitted::<ScopedRecord>()
+                .validate(&json!({"label": "work", "link": {"value": 7}}))
+                .is_err()
+        );
+        assert!(
+            admitted::<ScopedRecord>()
+                .validate(&json!({"label": "label:work", "link": {"value": 256}}))
+                .is_err()
+        );
+        assert!(matches!(
+            UnscopedRecord::try_json_schema(),
+            Err(schema::SchemaGenerationError::ReferenceResourceBoundary),
+        ));
+    }
+
+    fn invalid_schema() -> Value {
+        json!({"type": "string", "minLength": "one"})
+    }
+
+    #[derive(JsonSchema)]
+    struct InvalidOverride {
+        #[json_schema(schema = invalid_schema())]
+        value: String,
+    }
+
+    #[derive(JsonSchema)]
+    struct BooleanOverrides {
+        #[json_schema(schema = json!(true))]
+        accept: Value,
+        #[json_schema(schema = json!(false))]
+        reject: Value,
+    }
+
+    #[test]
+    fn field_overrides_use_existing_admission_and_generation_limits() {
+        assert!(matches!(
+            InvalidOverride::try_json_schema(),
+            Err(schema::SchemaGenerationError::InvalidSchema(_)),
+        ));
+        let boolean = BooleanOverrides::try_json_schema().unwrap();
+        assert_eq!(boolean["properties"]["accept"], true);
+        assert_eq!(boolean["properties"]["reject"], false);
+        assert!(
+            schema::admit_final_schema(boolean)
+                .unwrap()
+                .validate(&json!({"accept": 7, "reject": 7}))
+                .is_err()
+        );
+
+        let mut generator = schema::SchemaGenerator::with_limits(schema::SchemaGenerationLimits {
+            max_nodes: 4,
+            ..schema::SchemaGenerationLimits::default()
+        });
+        let root = generator.subschema_for::<ScopedRecord>();
+        assert!(matches!(
+            generator.finish(root),
+            Err(schema::SchemaGenerationError::NodeLimit)
+        ));
+        assert!(
+            ScopedRecord::try_json_schema().is_ok(),
+            "failure stays local to its generator"
+        );
+    }
+}
+
+fn schema_override_tool_input_schema() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "$defs": {"address": {"type": "string", "minLength": 1}},
+        "properties": {
+            "address": {"$ref": "#/$defs/address"},
+            "count": {"type": "integer", "minimum": 0},
+            "attempts": {"type": "integer", "default": 7},
+        },
+        "required": ["address", "count"],
+        "additionalProperties": false,
+    })
+}
+
+mod schema_override_tools {
+    use super::*;
+
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    // This shadow makes a wrongly relocated super:: expression observable.
+    fn schema_override_tool_input_schema() -> serde_json::Value {
+        json!(false)
+    }
+
+    #[tool(
+        input_schema = super::schema_override_tool_input_schema(),
+        defaults(attempts = 7)
+    )]
+    async fn explicit_foreign_input(
+        ctx: &McpContext,
+        address: std::net::IpAddr,
+        count: u64,
+        attempts: u8,
+    ) -> McpResult<String> {
+        ctx.checkpoint()?;
+        CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(format!("{address}|{count}|{attempts}"))
+    }
+
+    fn local_input_schema() -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {"value": {"type": "integer", "minimum": 1}},
+            "required": ["value"],
+            "additionalProperties": false,
+        })
+    }
+
+    #[tool(input_schema = self::local_input_schema())]
+    fn explicit_local_input(value: u8) -> McpResult<String> {
+        Ok(value.to_string())
+    }
+
+    #[test]
+    fn tool_input_overrides_keep_foreign_types_scope_defaults_and_strict_deserialization() {
+        assert_eq!(
+            ExplicitForeignInput.definition().input_schema,
+            super::schema_override_tool_input_schema(),
+        );
+        assert_eq!(
+            ExplicitLocalInput.definition().input_schema,
+            local_input_schema()
+        );
+        on_caller_runtime(async {
+            let server = Server::new("explicit-input-schema", "1.0.0")
+                .tool(ExplicitForeignInput)
+                .tool(ExplicitLocalInput)
+                .try_build()
+                .expect("explicit input schemas admit without schema traits on IpAddr");
+            let connection = ModernConnection::new();
+            let valid = json!({"address": "::1", "count": u64::MAX});
+            let before = CALLS.load(std::sync::atomic::Ordering::SeqCst);
+            let result = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "explicit_foreign_input",
+                    valid.clone(),
+                )
+                .await,
+            );
+            assert_ne!(result["isError"], json!(true));
+            assert_eq!(result["content"][0]["text"], format!("::1|{}|7", u64::MAX));
+            assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+
+            let schema = fastmcp_rust::schema::admit_final_schema(
+                super::schema_override_tool_input_schema(),
+            )
+            .unwrap();
+            for (field, value, schema_accepts) in [
+                ("address", json!("not-an-address"), true),
+                ("count", json!(u128::from(u64::MAX) + 1), true),
+                ("attempts", json!(256), true),
+                ("address", json!(7), false),
+            ] {
+                let mut invalid = valid.clone();
+                invalid[field] = value;
+                assert_eq!(schema.validate(&invalid).is_ok(), schema_accepts);
+                let response =
+                    schema_bound_wire_call(&server, &connection, "explicit_foreign_input", invalid)
+                        .await;
+                assert!(
+                    response.error.is_some()
+                        || response
+                            .result
+                            .as_ref()
+                            .is_some_and(|result| result["isError"] == json!(true))
+                );
+                assert_eq!(
+                    CALLS.load(std::sync::atomic::Ordering::SeqCst),
+                    before + 1,
+                    "an explicit schema never bypasses Rust argument deserialization",
+                );
+            }
+            let local = schema_bound_complete(
+                schema_bound_wire_call(
+                    &server,
+                    &connection,
+                    "explicit_local_input",
+                    json!({"value": 1}),
+                )
+                .await,
+            );
+            assert_eq!(local["content"][0]["text"], "1");
+        });
+    }
+
+    fn invalid_input_schema(kind: &str) -> serde_json::Value {
+        match kind {
+            "boolean" => json!(true),
+            "root" => json!({"type": "array"}),
+            "reference" => json!({
+                "type": "object",
+                "properties": {"address": {"$ref": "#/$defs/missing"}},
+            }),
+            "keyword" => json!({
+                "type": "object",
+                "properties": {"address": {"type": "string", "minLength": "one"}},
+            }),
+            "dialect" => json!({"type": "object", "$schema": "https://example.invalid/schema"}),
+            "header" => json!({
+                "type": "object",
+                "properties": {"address": {"type": "string", "x-mcp-header": "Address"}},
+            }),
+            "bytes" => {
+                let maximum = fastmcp_rust::schema::MAX_SCHEMA_DOCUMENT_BYTES;
+                json!({"type": "object", "description": "x".repeat(maximum + 1)})
+            }
+            _ => unreachable!("known invalid input schema fixture"),
+        }
+    }
+
+    #[tool(input_schema = invalid_input_schema("boolean"))]
+    fn invalid_override_boolean(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[tool(input_schema = invalid_input_schema("root"))]
+    fn invalid_override_root(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[tool(input_schema = invalid_input_schema("reference"))]
+    fn invalid_override_reference(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[tool(input_schema = invalid_input_schema("keyword"))]
+    fn invalid_override_keyword(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[tool(input_schema = invalid_input_schema("dialect"))]
+    fn invalid_override_dialect(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[tool(input_schema = invalid_input_schema("header"))]
+    fn invalid_override_header(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[tool(input_schema = invalid_input_schema("bytes"))]
+    fn invalid_override_bytes(address: std::net::IpAddr) -> McpResult<String> {
+        Ok(address.to_string())
+    }
+
+    #[test]
+    fn tool_input_overrides_keep_registration_admission_and_catalog_atomicity() {
+        let mut router = fastmcp_rust::Router::new();
+        router.add_tool(ExplicitForeignInput).unwrap();
+        let before = serde_json::to_value(router.tools()).unwrap();
+        assert_eq!(InvalidOverrideBoolean.definition().input_schema, true);
+        macro_rules! reject {
+            ($handler:ident) => {{
+                let name = $handler.definition().name;
+                let error = router
+                    .add_tool($handler)
+                    .expect_err("a computed override still needs registration admission");
+                assert_eq!(error.code, fastmcp_rust::McpErrorCode::InternalError);
+                assert_eq!(serde_json::to_value(router.tools()).unwrap(), before);
+                assert!(router.get_tool(&name).is_none());
+                error
+            }};
+        }
+        reject!(InvalidOverrideBoolean);
+        reject!(InvalidOverrideRoot);
+        reject!(InvalidOverrideReference);
+        reject!(InvalidOverrideKeyword);
+        reject!(InvalidOverrideDialect);
+        let header = reject!(InvalidOverrideHeader);
+        assert!(header.message.contains("NonSensitiveHeaderExposure"));
+        reject!(InvalidOverrideBytes);
+        assert!(router.get_tool("explicit_foreign_input").is_some());
+    }
+}
+
 const SHAPED_SCHEMA_ARRAY_WIDTH: usize = 2;
 
 #[derive(Debug, PartialEq, serde::Serialize, serde::Deserialize, JsonSchema)]
