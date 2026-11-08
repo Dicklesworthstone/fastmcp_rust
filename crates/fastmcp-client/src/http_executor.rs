@@ -3026,6 +3026,7 @@ fn decode_final_extension_terminal(
         return Err(ModernHttpFinalCoreListenError::RemoteError {
             code: error.code,
             message: error.message,
+            data: error.data,
         });
     }
     let raw_result_source = raw_result_source.ok_or_else(|| {
@@ -3218,6 +3219,8 @@ pub enum ModernHttpFinalCoreListenError {
         code: JsonInteger,
         /// Server-provided JSON-RPC message.
         message: String,
+        /// Optional structured JSON-RPC error data supplied by the server.
+        data: Option<serde_json::Value>,
     },
     /// The terminal result contradicted the selected final core method.
     TerminalResult(CoreDispatchError),
@@ -3264,7 +3267,7 @@ impl fmt::Display for ModernHttpFinalCoreListenError {
                 formatter,
                 "final core response ID {actual:?} did not match request {expected:?}"
             ),
-            Self::RemoteError { code, message } => write!(
+            Self::RemoteError { code, message, .. } => write!(
                 formatter,
                 "final core request failed with JSON-RPC {code}: {message}"
             ),
@@ -3408,12 +3411,13 @@ async fn classify_owned_http_failure(
     ModernHttpFinalCoreListenError::RemoteError {
         code: error.code,
         message: error.message,
+        data: error.data,
     }
 }
 
 fn decode_final_core_terminal(
     core_request: &CoreRequest,
-    response: JsonRpcResponse,
+    mut response: JsonRpcResponse,
     result_source: Option<&str>,
     expected_id: RequestId,
     tasks_result_negotiated: bool,
@@ -3430,10 +3434,11 @@ fn decode_final_core_terminal(
             actual: response.id,
         });
     }
-    if let Some(error) = response.error.as_ref() {
+    if let Some(error) = response.error.take() {
         return Err(ModernHttpFinalCoreListenError::RemoteError {
-            code: error.code.clone(),
-            message: error.message.clone(),
+            code: error.code,
+            message: error.message,
+            data: error.data,
         });
     }
     let result_source = result_source.ok_or_else(|| {
@@ -15638,12 +15643,13 @@ mod tests {
         extension: bool,
         status: u16,
         content_type: &'static str,
-        body: &'static [u8],
+        body: &[u8],
         maximum_bytes: usize,
     ) -> ModernHttpFinalCoreListenError {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let body = body.to_vec();
         let peer = thread::spawn(move || {
             respond_owned_http_error_discovery(&listener);
             let mut stream = accept_notification_test_peer(&listener);
@@ -15658,7 +15664,7 @@ mod tests {
                     "tools/list"
                 }
             );
-            write_response(&mut stream, status, content_type, body);
+            write_response(&mut stream, status, content_type, &body);
             assert_sse_peer_closed(&mut stream);
             assert!(matches!(
                 listener.accept(),
@@ -15719,8 +15725,116 @@ mod tests {
                 let error = owned_http_failure_case(extension, status, content_type, body, 4_096);
                 assert!(matches!(
                     error,
-                    ModernHttpFinalCoreListenError::RemoteError { code, message }
+                    ModernHttpFinalCoreListenError::RemoteError { code, message, .. }
                         if code.as_i32() == Some(expected_code) && message == expected_message
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_errors_retain_data_across_response_lanes() {
+        for extension in [false, true] {
+            for (status, content_type) in [
+                (200, "application/json"),
+                (200, "text/event-stream"),
+                (400, "application/json"),
+                (404, "application/json"),
+            ] {
+                for data_source in [
+                    Some(
+                        r#"{"requiredCapabilities":{"roots":{}},"numbers":[7.30e-2,1.20e+4,123456789012345678901234567890],"detail":"owned-error-data"}"#,
+                    ),
+                    Some(r#"[7.30e-2,1.20e+4,123456789012345678901234567890]"#),
+                    None,
+                ] {
+                    let data_field = data_source
+                        .map_or_else(String::new, |source| format!(r#","data":{source}"#));
+                    let message = format!(
+                        r#"{{"jsonrpc":"2.0","id":2,"error":{{"code":-32021,"message":"Required client capability is missing"{data_field}}}}}"#
+                    );
+                    let body = if content_type == "text/event-stream" {
+                        format!("data: {message}\n\n")
+                    } else {
+                        message
+                    };
+                    let error = owned_http_failure_case(
+                        extension,
+                        status,
+                        content_type,
+                        body.as_bytes(),
+                        4_096,
+                    );
+                    assert_eq!(
+                        error.to_string(),
+                        "final core request failed with JSON-RPC -32021: Required client capability is missing"
+                    );
+                    let ModernHttpFinalCoreListenError::RemoteError {
+                        code,
+                        message,
+                        data,
+                    } = error
+                    else {
+                        panic!("a correlated error must retain its protocol payload");
+                    };
+                    assert_eq!(code.as_i32(), Some(-32_021));
+                    assert_eq!(message, "Required client capability is missing");
+                    let expected_data = data_source
+                        .map(|source| serde_json::from_str::<serde_json::Value>(source).unwrap());
+                    assert_eq!(data, expected_data);
+                    if let Some(data) = data {
+                        let numbers = if data.is_object() {
+                            assert_eq!(
+                                data["requiredCapabilities"],
+                                serde_json::json!({ "roots": {} })
+                            );
+                            data["numbers"].as_array().unwrap()
+                        } else {
+                            data.as_array().unwrap()
+                        };
+                        assert_eq!(numbers.len(), 3);
+                        for (actual, expected) in numbers.iter().zip([
+                            "7.30e-2",
+                            "1.20e+4",
+                            "123456789012345678901234567890",
+                        ]) {
+                            assert_eq!(actual.to_string(), expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn owned_http_errors_reject_foreign_data_before_exposure() {
+        const ERROR: &str = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found","data":{"detail":"foreign-error-data"}}}"#;
+        for extension in [false, true] {
+            for (status, content_type) in [
+                (200, "application/json"),
+                (200, "text/event-stream"),
+                (400, "application/json"),
+                (404, "application/json"),
+            ] {
+                let body = if content_type == "text/event-stream" {
+                    format!("data: {ERROR}\n\n")
+                } else {
+                    ERROR.to_owned()
+                };
+                let error = owned_http_failure_case(
+                    extension,
+                    status,
+                    content_type,
+                    body.as_bytes(),
+                    4_096,
+                );
+                assert!(!format!("{error:?}").contains("foreign-error-data"));
+                assert!(matches!(
+                    error,
+                    ModernHttpFinalCoreListenError::ResponseIdMismatch {
+                        expected: RequestId::Number(2),
+                        actual: Some(RequestId::Number(3)),
+                    }
                 ));
             }
         }
