@@ -44,7 +44,7 @@
 # USAGE
 #   scripts/check_all_targets.sh [--retries N] [--json] [--dry-run]
 #       [--arm default|all-features|no-default-features|both|all]
-#       [--base <rev>] [--working-tree]
+#       [--base <rev>] [--working-tree] [--local] [--local-timeout-sec N]
 #
 #   SOURCE: by default every arm builds the COMMITTED revision (HEAD, or
 #   --base <rev>) through `rch exec --base .. --clean-overlay --no-overlay`, so
@@ -52,6 +52,25 @@
 #   --working-tree for the old behaviour, which rsyncs the working copy and is
 #   therefore void if anything tracked moves during the run -- including the
 #   orchestrator's own `br` flush, which writes a TRACKED .beads/issues.jsonl.
+#
+#   --local RUNS THE ARMS ON THIS MACHINE instead of dispatching them. Both
+#   other modes go through `rch exec`, so when RCH cannot resolve a toolchain
+#   the gate has no way to run AT ALL -- which is the state bd-09nja measures:
+#   a hardcoded 5s version probe against a toolchain on an exFAT/FSKit
+#   userspace volume where `cargo --version` has been seen to exceed 90s. A
+#   gate that cannot run is indistinguishable from a gate that passes, so
+#   --local is the fallback that keeps a verdict obtainable.
+#
+#   WHAT --local COSTS, stated so nobody reads it as equivalent:
+#     - it reads the LIVE WORKING TREE, so like --working-tree it binds no
+#       revision and is void if the checkout moves;
+#     - it compiles on this machine, which is the thing RCH exists to avoid.
+#       Use it to get unblocked, never for the receipt that closes a bead;
+#     - it shares ONE build-directory lock with every other local cargo on
+#       this CARGO_TARGET_DIR (bd-6allt), so it can spend its entire budget
+#       waiting instead of compiling. That is reported as a VOID with the lock
+#       named, not as a red.
+#   The bound is --local-timeout-sec (default 1800). Exceeding it is a void.
 #
 #   PICK THE MODE FOR THE JOB; the difference is a cold cache, not a detail.
 #   `--clean-overlay` builds in a per-pairing directory on the worker --
@@ -119,7 +138,29 @@ DRY=0
 #
 # Binding a revision is also the stronger claim, and it is what
 # scripts/verify_batch.sh already does.
+# `local` is the third mode: no dispatch at all, the arms run here. See the
+# --local paragraph in the header for why it exists and what it gives up.
 SOURCE_MODE=base
+# Which source-mode flag was passed, so that giving two DIFFERENT ones is
+# refused rather than silently honouring whichever came last. Records the flag
+# NAME, not a count: a count cannot tell `--local --local` (harmless) from
+# `--local --working-tree` (a contradiction), and would report the first as
+# the second.
+MODE_FLAG_SEEN=""
+
+# Bound for --local only. A local arm has no remote deadline to stop it, and
+# the shared build-directory lock (bd-6allt) can hold it indefinitely WITHOUT
+# compiling anything, so an unbounded local run is a hang. Exceeding this is a
+# VOID and never a red: `timeout` exits 124 having produced zero compiler
+# diagnostics, which is exactly the condition the verdict logic below already
+# classifies as stopped-rather-than-failed.
+LOCAL_TIMEOUT_SEC=1800
+# `timeout` is coreutils and is not guaranteed wherever this runs: on this
+# Darwin host it is /opt/homebrew/bin/timeout and /usr/bin/timeout DOES NOT
+# EXIST, which silently voided an earlier probe of mine that hardcoded the
+# absolute path. Resolve it by name, and run unbounded if it is absent rather
+# than refusing to run at all.
+TIMEOUT_BIN=$(command -v timeout 2>/dev/null || true)
 
 # `${2:?msg}` would exit 1 on a missing OR empty value, reporting a usage error
 # with a code this script documents as something else. Check explicitly so every
@@ -129,6 +170,18 @@ need_value() {
     echo "$1 needs a non-empty value" >&2
     exit 64
   fi
+}
+
+# Selects a source mode, refusing a second DIFFERENT one and naming both flags
+# in the message so the error describes what was actually passed.
+set_mode() {
+  if [ -n "$MODE_FLAG_SEEN" ] && [ "$MODE_FLAG_SEEN" != "$1" ]; then
+    echo "--$MODE_FLAG_SEEN and --$1 are mutually exclusive: they are different" >&2
+    echo "  answers to the same question (what an arm compiles, and where)." >&2
+    exit 64
+  fi
+  MODE_FLAG_SEEN="$1"
+  SOURCE_MODE="$1"
 }
 
 while [ $# -gt 0 ]; do
@@ -141,11 +194,18 @@ while [ $# -gt 0 ]; do
     # by running them dispatched five multi-arm remote builds. Validate the
     # parsing without touching the fleet.
     --dry-run) DRY=1; shift ;;
-    --working-tree) SOURCE_MODE=working-tree; shift ;;
+    --working-tree) set_mode working-tree; shift ;;
+    --local) set_mode local; shift ;;
+    --local-timeout-sec) need_value "$@"; LOCAL_TIMEOUT_SEC="$2"; shift 2 ;;
     --base)
       need_value --base "${2:-}"
       BASE_OVERRIDE="$2"; shift 2 ;;
-    -h|--help) sed -n '1,45p' "$0"; exit 0 ;;
+    # Print the whole leading comment block instead of a fixed line count. The
+    # previous `sed -n '1,45p'` stopped mid-synopsis, so --arm, --base and
+    # --working-tree were invisible on the one surface whose job is to document
+    # them. Stopping at the first non-comment line cannot drift as the header
+    # grows.
+    -h|--help) awk '/^[^#]/{exit} {print}' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
 done
@@ -162,6 +222,19 @@ case "$RETRIES" in
   ''|*[!0-9]*) echo "--retries must be a positive integer, got '$RETRIES'" >&2; exit 64 ;;
   0)           echo "--retries must be at least 1" >&2; exit 64 ;;
 esac
+case "$LOCAL_TIMEOUT_SEC" in
+  ''|*[!0-9]*) echo "--local-timeout-sec must be a positive integer, got '$LOCAL_TIMEOUT_SEC'" >&2
+               exit 64 ;;
+  0)           echo "--local-timeout-sec must be at least 1" >&2; exit 64 ;;
+esac
+# --base names a COMMITTED revision for a worker to check out. A local arm
+# compiles the checkout in place and cannot honour it, and accepting a flag
+# whose meaning is then dropped is worse than refusing it.
+if [ "$SOURCE_MODE" = local ] && [ -n "${BASE_OVERRIDE:-}" ]; then
+  echo "--base cannot be combined with --local: a local arm compiles the live" >&2
+  echo "  checkout, so it cannot build an arbitrary committed revision." >&2
+  exit 64
+fi
 
 ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git repository" >&2; exit 64; }
 cd "$ROOT" || exit 64
@@ -224,7 +297,7 @@ strip_ansi() { sed 's/\x1b\[[0-9;]*m//g'; }
 # verdict is green | red | void.
 run_arm() {
   local label="$1"; shift
-  local try log remote members errors cnc
+  local try log remote members errors cnc lockwait
   for try in $(seq 1 "$RETRIES"); do
     log="$LOGDIR/${label}.$try.log"
     # Progress to STDERR only. run_arm's STDOUT is the tab-separated verdict
@@ -247,15 +320,37 @@ run_arm() {
     # still does, it just reports more of why. members_reached also becomes a
     # truer figure, because cargo no longer stops scheduling at the first
     # failure.
-    if [ "$SOURCE_MODE" = base ]; then
+    if [ "$SOURCE_MODE" = local ]; then
+      # RCH_SHIM_LOCAL_IDE=1 is the documented escape for a genuinely local
+      # run: `cargo` on PATH may be an RCH shim that would offload, and this
+      # mode exists precisely for when offloading cannot work.
+      # CARGO_TERM_COLOR=never because this log is PARSED, not just read, and
+      # a local run is the one case where we control cargo's environment.
+      if [ -n "$TIMEOUT_BIN" ]; then
+        RCH_SHIM_LOCAL_IDE=1 CARGO_TERM_COLOR=never "$TIMEOUT_BIN" "$LOCAL_TIMEOUT_SEC" \
+          cargo check --workspace --all-targets --keep-going "$@" >"$log" 2>&1
+      else
+        RCH_SHIM_LOCAL_IDE=1 CARGO_TERM_COLOR=never \
+          cargo check --workspace --all-targets --keep-going "$@" >"$log" 2>&1
+      fi
+      # Captured IMMEDIATELY. There is no wrapper line to parse in this mode,
+      # so this status IS the verdict input, and any command placed in between
+      # would overwrite it.
+      remote=$?
+    elif [ "$SOURCE_MODE" = base ]; then
       rch exec --base "$BASE" --clean-overlay --no-overlay -- \
         cargo check --workspace --all-targets --keep-going "$@" >"$log" 2>&1
     else
       rch exec -- cargo check --workspace --all-targets --keep-going "$@" >"$log" 2>&1
     fi
     # The wrapper's exit status can mask the remote one; this line is the
-    # authoritative remote exit, and its ABSENCE means no verdict at all.
-    remote=$(strip_ansi <"$log" | grep -oE 'Remote command finished: exit=[0-9]+' | tail -1 | grep -oE '[0-9]+$')
+    # authoritative remote exit, and its ABSENCE means no verdict at all. A
+    # local arm has no wrapper and so no such line: its status was captured
+    # above, and parsing here would overwrite it with an empty string and
+    # misreport a real verdict as "no verdict at all".
+    if [ "$SOURCE_MODE" != local ]; then
+      remote=$(strip_ansi <"$log" | grep -oE 'Remote command finished: exit=[0-9]+' | tail -1 | grep -oE '[0-9]+$')
+    fi
     if [ -n "${remote:-}" ]; then
       members=$(strip_ansi <"$log" | grep -oE 'Checking fastmcp[a-z-]*' | sort -u | wc -l | tr -d ' ')
       errors=$(strip_ansi <"$log" | grep -cE '^error' || true)
@@ -292,7 +387,28 @@ run_arm() {
         printf 'red\t%s\t%s\t%s\t%s\t%s\n' "$remote" "$members" "$errors" "$cnc" "$log"
         return 0
       fi
-      echo "  $label: try $try exited $remote with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void); retrying on a fresh worker draw" >&2
+      # Name the cause when the log states it. Waiting out the shared
+      # build-directory lock and being killed at a deadline are both voids,
+      # but they are DIFFERENT voids with different remedies, and an
+      # else-branch must never name a cause it did not test.
+      # Counted through strip_ansi, matching the phrase WITHOUT the status
+      # word, and deliberately not `grep -q`:
+      #   - cargo STYLES "Blocking" and emits a reset between it and
+      #     "waiting", so a grep for the full phrase misses on a colored log,
+      #     and every other grep in this function already strips ANSI;
+      #   - `grep -q` exits at the first match, which can SIGPIPE the sed
+      #     upstream of it, and under `pipefail` the pipeline would then
+      #     report 141 ON A SUCCESSFUL MATCH -- inverting the test. `grep -c`
+      #     reads to EOF, which is the idiom the lines above already use.
+      lockwait=$(strip_ansi <"$log" | grep -c 'waiting for file lock' || true)
+      lockwait=${lockwait:-0}
+      if [ "$members" -eq 0 ] && [ "$lockwait" -gt 0 ]; then
+        echo "  $label: try $try is a LOCK void -- it compiled NOTHING and waited for the exclusive build-directory lock on ${CARGO_TARGET_DIR:-the default target dir} (bd-6allt). Exit $remote, 0 members reached." >&2
+      elif [ "$remote" -eq 124 ]; then
+        echo "  $label: try $try was KILLED at the ${LOCAL_TIMEOUT_SEC}s --local bound with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void)." >&2
+      else
+        echo "  $label: try $try exited $remote with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void); retrying on a fresh worker draw" >&2
+      fi
       continue
     fi
     echo "  $label: try $try produced no verdict at all, no remote exit line (void), retrying" >&2
@@ -459,6 +575,13 @@ if [ "$DRY" -eq 1 ]; then
   echo "dry run: arm selection '$ARM', retries $RETRIES, json $JSON"
   if [ "$SOURCE_MODE" = base ]; then
     echo "would dispatch: rch exec --base $BASE --clean-overlay --no-overlay --"
+  elif [ "$SOURCE_MODE" = local ]; then
+    if [ -n "$TIMEOUT_BIN" ]; then
+      echo "would run LOCALLY (no dispatch), bounded at ${LOCAL_TIMEOUT_SEC}s by $TIMEOUT_BIN"
+    else
+      echo "would run LOCALLY (no dispatch), UNBOUNDED -- no 'timeout' binary on PATH"
+    fi
+    echo "                env RCH_SHIM_LOCAL_IDE=1   (LIVE WORKING TREE; receipt not bindable)"
   else
     echo "would dispatch: rch exec --   (LIVE WORKING TREE; receipt not bindable)"
   fi
@@ -478,9 +601,23 @@ fi
 # than the one asked. Same principle that moved usage validation ahead of the
 # preflight earlier in this file.
 #
-# Only a working-tree dispatch can be disturbed by a live checkout. In base mode
-# the worker builds from git objects, which are immutable for a given revision,
-# so a concurrent tracker write cannot change what gets compiled.
+# WORKING-TREE ONLY, and --local is deliberately exempt.
+#
+# This refusal exists because --working-tree RSYNCS THE WHOLE CHECKOUT, so a
+# tracked file being rewritten mid-transfer can produce an inconsistent remote
+# copy no matter what that file is. .beads/issues.jsonl is tracked and the
+# orchestrator writes it constantly, which is the signal used here.
+#
+# Neither other mode can be hurt by that. In base mode the worker builds from
+# git objects, immutable for a given revision. And --local compiles the tree IN
+# PLACE with no transfer at all, so a .beads write -- which is not a compile
+# input -- cannot change a single thing cargo reads.
+#
+# Extending this test to --local (which I did, and a live run caught) would
+# inherit a refusal whose own reason does not apply, and would make the mode
+# unusable precisely when it is needed: .beads is dirty here almost always.
+# What DOES threaten a local arm is .rs movement during the run, and the
+# post-run MOVED check already covers that for every non-base mode.
 if [ "$SOURCE_MODE" = working-tree ] &&
    git status --porcelain --untracked-files=no -- .beads | grep -q .; then
   echo "PREFLIGHT REFUSED: .beads has tracked modifications, so the checkout is" >&2
@@ -531,7 +668,7 @@ done
 # default source mode: the old behaviour could not tell "a tracked file that is
 # not a compile input changed" (the orchestrator flushing the bead tracker) from
 # "the source moved", and voided a green for the former.
-if [ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ] && [ "$SOURCE_MODE" = working-tree ]; then
+if [ "$MOVED" -eq 1 ] && [ "$status" -eq 0 ] && [ "$SOURCE_MODE" != base ]; then
   status=2
 fi
 
@@ -559,6 +696,10 @@ else
   if [ "$SOURCE_MODE" = base ]; then
     echo "  source: committed revision $BASE (rch --base --clean-overlay --no-overlay);"
     echo "          the working tree was NOT read, so this receipt binds that revision."
+  elif [ "$SOURCE_MODE" = local ]; then
+    echo "  source: LIVE WORKING TREE, compiled ON THIS MACHINE (--local). This receipt"
+    echo "          binds no revision, was not produced on the verification lane, and"
+    echo "          must NOT be used to close a bead -- it is an unblocking check only."
   else
     echo "  source: LIVE WORKING TREE (--working-tree); this receipt binds no revision"
     echo "          on its own and is void if anything tracked moved."
@@ -592,8 +733,8 @@ else
     1) echo "  RESULT: RED -- at least one arm compiled and FAILED, with compiler"
        echo "          diagnostics to prove it. Note members_reached: cargo stops"
        echo "          scheduling after a failure, so the red set is a FLOOR, not a count." ;;
-    2) echo "  RESULT: NO VERDICT (void, or a moving checkout in --working-tree mode)."
-       echo "          This is NOT a red; retry." ;;
+    2) echo "  RESULT: NO VERDICT (void: stopped rather than failed, or a checkout that"
+       echo "          moved under a live-tree mode). This is NOT a red; retry." ;;
   esac
 fi
 
