@@ -36,7 +36,7 @@
 # it manufactures both false reds and -- worse -- false greens.
 #
 # EXIT CODES
-#   0  both arms GREEN
+#   0  every REQUESTED arm GREEN (one, two or three, per --arm)
 #   1  an arm compiled and FAILED (a real red)
 #   2  no verdict could be obtained (void) -- NOT a red, retry later
 #   3  preflight refused (dirty tracker / moving checkout)
@@ -71,6 +71,10 @@
 #       waiting instead of compiling. That is reported as a VOID with the lock
 #       named, not as a red.
 #   The bound is --local-timeout-sec (default 1800). Exceeding it is a void.
+#   Retries still apply, but there is no fresh worker to draw: a local retry
+#   only helps if the cause was transient, so --retries 1 is usually right.
+#   In --json the `remote_exit` field carries the LOCAL exit status in this
+#   mode (there is no remote); the text receipt relabels it `local_exit`.
 #
 #   PICK THE MODE FOR THE JOB; the difference is a cold cache, not a detail.
 #   `--clean-overlay` builds in a per-pairing directory on the worker --
@@ -161,6 +165,13 @@ LOCAL_TIMEOUT_SEC=1800
 # absolute path. Resolve it by name, and run unbounded if it is absent rather
 # than refusing to run at all.
 TIMEOUT_BIN=$(command -v timeout 2>/dev/null || true)
+
+# Bound for the gated-target census, which execs `cargo metadata`. "Compiles
+# nothing" is NOT "returns quickly": exec'ing cargo on the FSKit toolchain
+# volume has been measured above 90s (bd-09nja), and the census runs BEFORE any
+# arm, so unbounded it can hang the entire gate while producing nothing. It is
+# pure reporting and must never be able to do that.
+CENSUS_TIMEOUT_SEC=120
 
 # `${2:?msg}` would exit 1 on a missing OR empty value, reporting a usage error
 # with a code this script documents as something else. Check explicitly so every
@@ -402,10 +413,25 @@ run_arm() {
       #     reads to EOF, which is the idiom the lines above already use.
       lockwait=$(strip_ansi <"$log" | grep -c 'waiting for file lock' || true)
       lockwait=${lockwait:-0}
-      if [ "$members" -eq 0 ] && [ "$lockwait" -gt 0 ]; then
+      if [ "$members" -eq 0 ] && [ "$lockwait" -gt 0 ] && [ "$SOURCE_MODE" = local ]; then
         echo "  $label: try $try is a LOCK void -- it compiled NOTHING and waited for the exclusive build-directory lock on ${CARGO_TARGET_DIR:-the default target dir} (bd-6allt). Exit $remote, 0 members reached." >&2
-      elif [ "$remote" -eq 124 ]; then
+      # A WORKER can block on its own build-directory lock too, and that lock
+      # is not this machine's: naming the local CARGO_TARGET_DIR for it, or
+      # citing bd-6allt, would attribute a remote contention to a local path.
+      elif [ "$members" -eq 0 ] && [ "$lockwait" -gt 0 ]; then
+        echo "  $label: try $try is a LOCK void ON THE WORKER -- it compiled NOTHING and waited for a build-directory lock in the remote build dir (NOT this machine's CARGO_TARGET_DIR). Exit $remote, 0 members reached; retrying on a fresh worker draw." >&2
+      # The 124 branch is MODE-GUARDED, and guarded on TIMEOUT_BIN too. A
+      # REMOTE command can also exit 124 -- from a deadline on the worker that
+      # has nothing to do with --local-timeout-sec -- and attributing that to
+      # our own bound would name a cause we did not test. With no `timeout`
+      # binary there is no local bound at all, so a local 124 is then cargo's
+      # own status and falls through to the generic branch.
+      elif [ "$SOURCE_MODE" = local ] && [ -n "$TIMEOUT_BIN" ] && [ "$remote" -eq 124 ]; then
         echo "  $label: try $try was KILLED at the ${LOCAL_TIMEOUT_SEC}s --local bound with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void)." >&2
+      elif [ "$SOURCE_MODE" = local ]; then
+        # No worker draw to retry into: a local retry only helps if the cause
+        # was transient. A contended lock may clear; a slow filesystem will not.
+        echo "  $label: try $try exited $remote with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void). Retrying LOCALLY, which only helps if the cause was transient." >&2
       else
         echo "  $label: try $try exited $remote with ZERO compiler diagnostics after reaching $members member(s) -- stopped, not failed (void); retrying on a fresh worker draw" >&2
       fi
@@ -704,9 +730,18 @@ else
     echo "  source: LIVE WORKING TREE (--working-tree); this receipt binds no revision"
     echo "          on its own and is void if anything tracked moved."
   fi
+  # There is no remote in --local mode, so the column carrying the
+  # authoritative exit status is relabelled rather than claiming an origin it
+  # does not have. The JSON key stays `remote_exit` for any consumer; the
+  # header records that it holds the local status in this mode.
+  if [ "$SOURCE_MODE" = local ]; then
+    EXIT_LABEL=local_exit
+  else
+    EXIT_LABEL=remote_exit
+  fi
   for i in "${!NAMES[@]}"; do
-    printf '  %-13s %-5s remote_exit=%-3s members_reached=%-3s error_lines=%-3s could_not_compile=%-3s\n' \
-      "${NAMES[$i]}" "${VERDICTS[$i]}" "${EXITS[$i]:--}" "${MEMBERS[$i]:--}" "${ERRS[$i]:--}" "${CNCS[$i]:--}"
+    printf '  %-13s %-5s %s=%-3s members_reached=%-3s error_lines=%-3s could_not_compile=%-3s\n' \
+      "${NAMES[$i]}" "${VERDICTS[$i]}" "$EXIT_LABEL" "${EXITS[$i]:--}" "${MEMBERS[$i]:--}" "${ERRS[$i]:--}" "${CNCS[$i]:--}"
     echo "                log: ${LOGS[$i]}"
   done
   if [ "$MOVED" -eq 1 ]; then
