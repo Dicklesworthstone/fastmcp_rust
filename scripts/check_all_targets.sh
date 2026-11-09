@@ -488,13 +488,35 @@ gated_target_census() {
   [ -d "$LOGDIR" ] || return 0
   local meta="$LOGDIR/cargo-metadata.json"
   local out="$LOGDIR/gated-targets.txt"
+  local census_rc
   # `cargo metadata` resolves manifests and compiles nothing, but cargo in this
   # repository is RCH-hooked, so the census is pinned local: a remote dispatch
   # for a manifest read would cost a slot and could come back void.
-  if ! RCH_SHIM_LOCAL_IDE=1 cargo metadata --no-deps --format-version 1 \
-         >"$meta" 2>"$LOGDIR/cargo-metadata.err"; then
-    echo "  note: gated-target census unavailable (cargo metadata failed; see" >&2
-    echo "        $LOGDIR/cargo-metadata.err). The gate is unaffected." >&2
+  #
+  # BOUNDED by CENSUS_TIMEOUT_SEC. Measured 2026-11-09: an unbounded census ate
+  # a 120s harness budget on its own and the gate never reached an arm or
+  # printed a receipt, which made a reporting step look like a hung gate.
+  if [ -n "$TIMEOUT_BIN" ]; then
+    RCH_SHIM_LOCAL_IDE=1 "$TIMEOUT_BIN" "$CENSUS_TIMEOUT_SEC" \
+      cargo metadata --no-deps --format-version 1 \
+        >"$meta" 2>"$LOGDIR/cargo-metadata.err"
+    census_rc=$?
+  else
+    RCH_SHIM_LOCAL_IDE=1 cargo metadata --no-deps --format-version 1 \
+      >"$meta" 2>"$LOGDIR/cargo-metadata.err"
+    census_rc=$?
+  fi
+  if [ "$census_rc" -ne 0 ]; then
+    # Name the cause only when it was tested: 124 is the bound, and only if a
+    # bound was actually applied.
+    if [ "$census_rc" -eq 124 ] && [ -n "$TIMEOUT_BIN" ]; then
+      echo "  note: gated-target census unavailable -- cargo metadata exceeded" >&2
+      echo "        ${CENSUS_TIMEOUT_SEC}s (bd-09nja). The gate is unaffected, but its green" >&2
+      echo "        cannot be read as full target coverage; see blind spot 4 above." >&2
+    else
+      echo "  note: gated-target census unavailable (cargo metadata failed, rc=$census_rc;" >&2
+      echo "        see $LOGDIR/cargo-metadata.err). The gate is unaffected." >&2
+    fi
     return 0
   fi
   local line
