@@ -646,7 +646,20 @@ mod tests {
         let mut auth = fastmcp_core::AuthContext::with_subject("same-owner")
             .with_session_owner(Sha256Digest::from_bytes([17; 32]));
         auth.scopes = scopes.iter().map(|scope| (*scope).to_owned()).collect();
-        McpContext::new(Cx::for_testing(), 1).with_auth(auth)
+        // `with_state`, NOT `McpContext::new`: three tests in this module call
+        // `disable_tool` as SETUP and assert it succeeded, and `disable_tool`
+        // is documented to return `false` when session state is unavailable --
+        // `McpContext::new` leaves `state: None` (context.rs:1835). That
+        // contract is pinned on both sides by fastmcp-core's own tests,
+        // `test_mcp_context_disable_enable_tool` (with_state -> true) and
+        // `test_mcp_context_enable_disable_no_state` (new -> false), and it
+        // predates this helper by eight months (5e9086c9, 2026-03-07, versus
+        // 5a1252bc, 2026-11-05). So the stateless constructor made the setup
+        // line fail and the authorization assertions AFTER it never ran at
+        // all. This is a fixture repair that makes the module stricter by
+        // letting those assertions execute; it relaxes nothing.
+        McpContext::with_state(Cx::for_testing(), 1, fastmcp_core::SessionState::new())
+            .with_auth(auth)
     }
 
     fn policy() -> OperationScopePolicy {
@@ -1696,8 +1709,17 @@ mod tests {
         task_id: &FinalTaskId,
         request_id: i64,
     ) -> TaskHttpOutbox {
-        let mut context = McpContext::new(cx.clone(), u64::try_from(request_id).unwrap())
-            .with_auth(context(&["invoke", "manage", "sensitive"]).auth().unwrap());
+        // `with_state` for the same reason as the `context()` helper above:
+        // two outbox tests call `outbox.context.disable_tool(..)` as setup and
+        // assert it succeeded, and that returns `false` without session state.
+        // This helper builds its own McpContext rather than reusing
+        // `context()`, so it needs the same constructor.
+        let mut context = McpContext::with_state(
+            cx.clone(),
+            u64::try_from(request_id).unwrap(),
+            fastmcp_core::SessionState::new(),
+        )
+        .with_auth(context(&["invoke", "manage", "sensitive"]).auth().unwrap());
         #[cfg(feature = "legacy-2024-11-05")]
         let transport = endpoint.transport_endpoint("http://legacy.test").unwrap();
         #[cfg(not(feature = "legacy-2024-11-05"))]

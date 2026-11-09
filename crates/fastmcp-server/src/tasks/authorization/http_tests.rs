@@ -265,7 +265,20 @@ fn secured_http_shared_scope_policy_rechecks_original_task_grants() {
                         .task_execution_authorizer(execution.clone())
                         .auth_provider(TokenAuthProvider::new(verifier))
                         .tool(ScopedTaskTool)
-                        .test_http_endpoint("https://service.example")
+                        // `http://`, not `https://`: this argument is the
+                        // LEGACY 2024-11-05 origin, and that lane is
+                        // plaintext-only, so `into_http_endpoint` refuses a
+                        // TLS scheme with InvalidConfiguration whenever the
+                        // `legacy-2024-11-05` feature is on -- which it is by
+                        // default. Without that feature the argument is
+                        // discarded, so an https value made this test pass in
+                        // one feature lane and fail in the other, defeating
+                        // the whole point of the TestHttpEndpoint helper
+                        // ("a modern test names an origin once and runs in
+                        // both feature lanes"). The modern endpoint's own
+                        // origin is the separate https HttpSecurityPolicy
+                        // value below, which is correct and unchanged.
+                        .test_http_endpoint("http://service.example")
                         .unwrap();
                     let security = HttpSecurityPolicy::new(
                         HttpEndpointConfig::new(
