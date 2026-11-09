@@ -339,7 +339,11 @@ GATED_SKIP_ALLFEAT="?"
 GATED_SKIP_NODEFAULT="?"
 
 gated_target_census() {
-  [ "$LOGDIR" != "(none; dry run creates no directory)" ] || return 0
+  # This runs BEFORE the dry-run block, so the guard is what keeps `--dry-run`
+  # output unchanged. Testing for the directory rather than for the dry-run
+  # placeholder string deliberately: the placeholder is defined ~150 lines away
+  # and a later edit to its wording would silently re-enable the census here.
+  [ -d "$LOGDIR" ] || return 0
   local meta="$LOGDIR/cargo-metadata.json"
   local out="$LOGDIR/gated-targets.txt"
   # `cargo metadata` resolves manifests and compiles nothing, but cargo in this
