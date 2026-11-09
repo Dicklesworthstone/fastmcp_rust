@@ -9,7 +9,7 @@
 # plus two more on 2026-11-02 found by hand -- one of which was the SHIPPED
 # `fastmcp` CLI binary, broken for three days.
 #
-# THREE BLIND SPOTS IT CLOSES, each measured rather than assumed:
+# FOUR BLIND SPOTS IT CLOSES, each measured rather than assumed:
 #   1. A lib-test target is invisible to every dependent. fastmcp-client's
 #      library compiled while its test target was broken, so ordinary work
 #      never surfaced it.
@@ -19,6 +19,14 @@
 #   3. Cargo stops scheduling new units after a failure, so a red run
 #      UNDERSTATES the red set. This script therefore reports how many
 #      workspace members were actually reached, not just an exit code.
+#   4. `--all-targets` DOES NOT MEAN EVERY TARGET. A target whose
+#      `required-features` the arm does not enable is SILENTLY SKIPPED and
+#      cargo still exits 0. Measured at 8c5b77d4: 178 targets, 39 with
+#      `required-features`, of which the DEFAULT arm skips 34 and
+#      `--no-default-features` skips all 39; `--all-features` skips none. The
+#      script now reports that per arm, so a green can never be mistaken for
+#      full target coverage. See `gated_target_census` below -- it is pure
+#      reporting and cannot change a verdict or an exit code.
 #
 # AND THE THING THAT MAKES A REMOTE GATE TRUSTWORTHY: a VOID IS NOT A RED.
 # RCH's own telemetry reports a 43-44% command success rate. A dispatch that
@@ -297,6 +305,134 @@ run_arm() {
   return 0
 }
 
+# ----------------------------------------------------------------------------
+# A FOURTH BLIND SPOT: `--all-targets` DOES NOT MEAN EVERY TARGET.
+#
+# A target carrying `required-features` that the arm does not enable is not an
+# error and not a warning -- cargo SILENTLY SKIPS it and still exits 0. So a
+# green arm says nothing about those targets, and this gate could not tell you
+# which ones it had not looked at. Measured on this workspace at 8c5b77d4:
+# 178 targets, 39 with `required-features`, of which the DEFAULT arm skips 34
+# and `--no-default-features` skips all 39. `--all-features` skips none.
+#
+# That is the same class as bd-tt7d8 (two Tasks test targets that "have never
+# run and currently cannot", because without the flag cargo skipped them and
+# with it the library did not build) and bd-cwoxa (752 rows that existed only
+# behind the `tasks` gate). The information was always in the manifests and
+# nothing surfaced it.
+#
+# THIS IS PURE REPORTING AND MUST STAY THAT WAY. It never changes an arm's
+# verdict or this script's exit code: a census failure would otherwise turn a
+# working gate into a broken one, which is strictly worse than no census. If
+# `cargo metadata` cannot run, the census is reported as unavailable and the
+# gate proceeds.
+#
+# The skip lists are an UPPER BOUND. Cross-member feature unification can
+# enable a package's feature because another member asked for it, so a target
+# listed here may in fact be built. Overstating what was NOT checked is the
+# safe direction for a coverage report.
+GATED_CENSUS_FILE=""
+GATED_TOTAL_TARGETS="?"
+GATED_WITH_REQFEAT="?"
+GATED_SKIP_DEFAULT="?"
+GATED_SKIP_ALLFEAT="?"
+GATED_SKIP_NODEFAULT="?"
+
+gated_target_census() {
+  [ "$LOGDIR" != "(none; dry run creates no directory)" ] || return 0
+  local meta="$LOGDIR/cargo-metadata.json"
+  local out="$LOGDIR/gated-targets.txt"
+  # `cargo metadata` resolves manifests and compiles nothing, but cargo in this
+  # repository is RCH-hooked, so the census is pinned local: a remote dispatch
+  # for a manifest read would cost a slot and could come back void.
+  if ! RCH_SHIM_LOCAL_IDE=1 cargo metadata --no-deps --format-version 1 \
+         >"$meta" 2>"$LOGDIR/cargo-metadata.err"; then
+    echo "  note: gated-target census unavailable (cargo metadata failed; see" >&2
+    echo "        $LOGDIR/cargo-metadata.err). The gate is unaffected." >&2
+    return 0
+  fi
+  local line
+  # ONE invocation: it writes the per-target detail file AND prints the five
+  # counts on stdout, so the summary never recomputes them from a second copy
+  # of this logic.
+  line=$(python3 - "$meta" "$out" <<'CENSUS'
+import json
+import sys
+
+metadata = json.load(open(sys.argv[1]))
+
+
+def closure(features, seeds):
+    """Resolve a feature name set through this package's own feature table.
+
+    Only same-package names are followed: a `dep/feature` entry enables a
+    feature on a DEPENDENCY and can never satisfy this package's own
+    `required-features`, so including it would understate the skip set.
+    """
+    seen = set()
+    stack = list(seeds)
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for implied in features.get(name, []):
+            if "/" not in implied and implied not in seen:
+                stack.append(implied)
+    return seen
+
+
+rows = []
+total = 0
+for package in metadata["packages"]:
+    features = package.get("features") or {}
+    default = closure(features, features.get("default", []))
+    every = set(features)
+    for target in package.get("targets") or []:
+        total += 1
+        required = set(target.get("required-features") or [])
+        if not required:
+            continue
+        rows.append(
+            {
+                "package": package["name"],
+                "target": target["name"],
+                "kind": ",".join(target.get("kind") or []),
+                "required": sorted(required),
+                "default": not required.issubset(default),
+                "all-features": not required.issubset(every),
+                "no-default-features": True,
+            }
+        )
+
+arms = ("default", "all-features", "no-default-features")
+with open(sys.argv[2], "w") as handle:
+    handle.write(
+        f"{total} workspace targets; {len(rows)} carry required-features.\n"
+        "S = cargo silently skips this target in that arm and still exits 0.\n"
+        "Upper bound: cross-member feature unification may enable more.\n\n"
+        f"{'package':18} {'target':34} {'kind':8} def all nod  required-features\n"
+    )
+    for row in sorted(rows, key=lambda r: (r["package"], r["target"])):
+        flags = " ".join(
+            " S " if row[arm] else " . " for arm in arms
+        )
+        handle.write(
+            f"{row['package']:18} {row['target'][:34]:34} {row['kind'][:8]:8} "
+            f"{flags}  {','.join(row['required'])}\n"
+        )
+
+counts = {arm: sum(1 for row in rows if row[arm]) for arm in arms}
+print(total, len(rows), counts["default"], counts["all-features"],
+      counts["no-default-features"])
+CENSUS
+) || return 0
+  [ -n "${line:-}" ] || return 0
+  read -r GATED_TOTAL_TARGETS GATED_WITH_REQFEAT GATED_SKIP_DEFAULT \
+          GATED_SKIP_ALLFEAT GATED_SKIP_NODEFAULT <<<"$line"
+  GATED_CENSUS_FILE="$out"
+}
+
 declare -a NAMES=() VERDICTS=() EXITS=() MEMBERS=() ERRS=() CNCS=() LOGS=()
 record() {
   NAMES+=("$1"); VERDICTS+=("$2"); EXITS+=("$3")
@@ -310,6 +446,10 @@ run_and_record() {
   IFS=$'\t' read -r v e m er c l <<<"$line"
   record "$name" "$v" "$e" "$m" "$er" "$c" "$l"
 }
+
+# Taken before any dispatch so it is reported even when every arm comes back
+# void. It reads manifests only and cannot affect a verdict.
+gated_target_census
 
 if [ "$DRY" -eq 1 ]; then
   echo "dry run: arm selection '$ARM', retries $RETRIES, json $JSON"
@@ -399,7 +539,13 @@ if [ "$JSON" -eq 1 ]; then
     printf '{"arm":"%s","verdict":"%s","remote_exit":"%s","members_reached":"%s","error_lines":"%s","could_not_compile":"%s","log":"%s"}' \
       "${NAMES[$i]}" "${VERDICTS[$i]}" "${EXITS[$i]}" "${MEMBERS[$i]}" "${ERRS[$i]}" "${CNCS[$i]}" "${LOGS[$i]}"
   done
-  printf '],"exit":%s}\n' "$status"
+  printf '],"gated_targets":{"workspace_targets":"%s","with_required_features":"%s"' \
+    "$GATED_TOTAL_TARGETS" "$GATED_WITH_REQFEAT"
+  printf ',"skipped_default":"%s","skipped_all_features":"%s"' \
+    "$GATED_SKIP_DEFAULT" "$GATED_SKIP_ALLFEAT"
+  printf ',"skipped_no_default_features":"%s","detail":"%s"}' \
+    "$GATED_SKIP_NODEFAULT" "$GATED_CENSUS_FILE"
+  printf ',"exit":%s}\n' "$status"
 else
   echo
   echo "compile gate -- HEAD $HEAD_SHA tree $TREE_SHA dirty_rs=$DIRTY_RS"
@@ -426,6 +572,16 @@ else
     else
       echo "  WARNING: the checkout moved during the run; this receipt is not bindable."
     fi
+  fi
+  if [ -n "$GATED_CENSUS_FILE" ]; then
+    echo "  gated targets: $GATED_WITH_REQFEAT of $GATED_TOTAL_TARGETS workspace targets carry"
+    echo "          required-features, and cargo SKIPS such a target SILENTLY while still"
+    echo "          exiting 0. Skipped per arm: default=$GATED_SKIP_DEFAULT"
+    echo "          all-features=$GATED_SKIP_ALLFEAT no-default-features=$GATED_SKIP_NODEFAULT"
+    echo "          So a green arm is not a statement about those targets. Only the"
+    echo "          all-features arm covers them; run it before reading any green here"
+    echo "          as full target coverage."
+    echo "          per-target detail: $GATED_CENSUS_FILE"
   fi
   case $status in
     0) echo "  RESULT: green (every requested arm compiled)" ;;
