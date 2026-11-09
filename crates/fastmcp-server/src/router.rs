@@ -98,6 +98,18 @@ enum LegacyToolDispatchResult {
 
 #[derive(Clone, Copy)]
 enum LegacyToolResultMode {
+    /// Selected only by the MCP 2024-11-05 `tools/call` path, whose sole
+    /// caller is inside `#[cfg(feature = "legacy-2024-11-05")]
+    /// dispatch_legacy_2024` (lib.rs). `legacy-2024-11-05` is a DEFAULT
+    /// feature, so the default build does construct this variant; it is the
+    /// no-legacy profiles -- `--no-default-features`, and the facade, which
+    /// disables dependency defaults and forwards the feature explicitly --
+    /// that do not, and there rustc reported the variant as never
+    /// constructed (bd-yhx86). `LegacyToolDispatchResult::Application` is a
+    /// different enum and stays ungated: the handler-error path at the
+    /// bottom of `dispatch_legacy_tools_call_in_request` constructs it
+    /// unconditionally.
+    #[cfg(feature = "legacy-2024-11-05")]
     Application,
     Exact,
 }
@@ -5785,6 +5797,12 @@ impl Router {
         }
     }
 
+    /// MCP 2024-11-05 `tools/call` entry point. Its only caller is the
+    /// `legacy-2024-11-05`-gated `dispatch_legacy_2024`, so without this gate
+    /// the no-legacy profiles carry an uncallable method and rustc reports it
+    /// as never used (bd-yhx86). The feature is default-on, so this changes
+    /// nothing for the default build.
+    #[cfg(feature = "legacy-2024-11-05")]
     pub(crate) async fn handle_application_tools_call_in_request(
         &self,
         request_ctx: &McpContext,
@@ -5899,6 +5917,10 @@ impl Router {
             |child_cx| {
                 Box::pin(async move {
                     match result_mode {
+                        // Gated with the variant it matches. Without the
+                        // legacy feature the enum holds only `Exact`, so the
+                        // remaining arm is still exhaustive.
+                        #[cfg(feature = "legacy-2024-11-05")]
                         LegacyToolResultMode::Application => handler
                             .call_async_in_request(handler_ctx, child_cx, arguments)
                             .await
