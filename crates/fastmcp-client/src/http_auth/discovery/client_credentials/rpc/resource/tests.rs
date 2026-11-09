@@ -251,7 +251,15 @@ fn machine_resource_public_cache_hit_uses_current_custody_without_callbacks() {
         .unwrap();
         assert!(read.is_cache_hit() && read.is_complete());
         assert_eq!(read.credential_generation(), 1);
-        assert_eq!(read.result().encode().unwrap(), encoded);
+        // A cache hit ages ttlMs by design (edd54180), so `encoded` -- captured
+        // before priming -- cannot equal the replay byte for byte. Isolate that
+        // member and keep the exact comparison for everything else, which is
+        // what proves the stored result and its exact unknown members survived.
+        crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+            &encoded,
+            &read.result().encode().unwrap(),
+            "a public cache hit replays the stored result under current custody",
+        );
     });
 }
 

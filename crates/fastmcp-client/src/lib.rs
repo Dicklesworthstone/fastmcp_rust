@@ -49469,10 +49469,13 @@ exec sleep 2
                 parameters,
             ))
             .expect("an unrelated rejection cannot force the original query back onto the wire");
-            assert_eq!(
-                replay.encode().unwrap(),
-                first.encode().unwrap(),
-                "{dimension}"
+            // ttlMs ages on every cache hit by design (edd54180), so the
+            // replay can never re-encode byte-identically to the original.
+            // Isolate that member; everything else still compares exactly.
+            crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                &first.encode().unwrap(),
+                &replay.encode().unwrap(),
+                dimension,
             );
             assert_eq!(
                 client.next_id.load(Ordering::Relaxed),
@@ -67488,10 +67491,15 @@ exec sleep 2
             .list_tools_typed(None)
             .expect("fresh final cache hit avoids a second peer request");
 
-        assert_eq!(
-            first.encode().expect("first complete result re-encodes"),
-            second.encode().expect("cached complete result re-encodes"),
-            "the cached result retains unknown members and their exact number spelling"
+        // A cache hit ages ttlMs by design (edd54180), so comparing whole
+        // encodings died on that member and never reached the unknown-member
+        // and exact-number-spelling property this test exists for. The helper
+        // isolates ttlMs, asserts it aged downward, and keeps the rest of the
+        // comparison byte-exact.
+        crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+            &first.encode().expect("first complete result re-encodes"),
+            &second.encode().expect("cached complete result re-encodes"),
+            "the cached result retains unknown members and their exact number spelling",
         );
         assert_eq!(client.final_result_cache_stats().hits, 1);
         assert_eq!(client.final_result_cache_stats().fills, 1);
@@ -67824,10 +67832,13 @@ exec sleep 2
             let replay = client
                 .list_tools_typed_with_params(parameters)
                 .expect("the refused variation preserves the cached first page");
-            assert_eq!(
-                replay.encode().unwrap(),
-                first.encode().unwrap(),
-                "{dimension}"
+            // Same reason as the HTTP sibling above: ttlMs ages on a cache hit
+            // by design (edd54180), so it is isolated and the rest of the
+            // encoding still has to match byte for byte.
+            crate::cache::assert_replay_preserves_everything_but_aged_ttl(
+                &first.encode().unwrap(),
+                &replay.encode().unwrap(),
+                dimension,
             );
             let replay_stats = client.final_result_cache_stats();
             assert_eq!(replay_stats.hits, rejected_stats.hits + 1, "{dimension}");

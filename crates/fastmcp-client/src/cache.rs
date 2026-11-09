@@ -824,6 +824,69 @@ pub(crate) fn final_cache_hints(result: &CoreResult) -> Option<(CacheTtl, CacheS
     }
 }
 
+/// Asserts that a cache-hit replay re-encodes identically to the original
+/// result except for the one member a cache hit is DESIGNED to change.
+///
+/// `edd54180` (2026-11-07, "fix(cache): propagate remaining freshness when
+/// replaying results") ages `ttlMs` on every cache hit. So an exact
+/// comparison of the two encodings cannot hold at all: the aged value is a
+/// function of real elapsed milliseconds, and no constant satisfies it. The
+/// assertions that compare whole encodings predate that decision -- the oldest
+/// is `0f23cc2a`, 2026-10-22, sixteen days earlier -- and they were dying on
+/// `ttlMs` before reaching the property they exist for, which is that the
+/// stored result, its unknown members and their exact number spelling all
+/// survive a replay. This helper restores that coverage and adds the aging
+/// relation as its own assertion, so it checks strictly more than the exact
+/// comparison did.
+///
+/// Both TTLs are read out of the encodings themselves and each side is
+/// required to carry exactly one `ttlMs` member, so the rewrite below
+/// substitutes a located value rather than guessing at a pattern, and a
+/// payload with a nested `ttlMs` or a non-integer spelling fails loudly here
+/// instead of silently comparing the wrong bytes.
+#[cfg(test)]
+pub(crate) fn assert_replay_preserves_everything_but_aged_ttl(
+    original_encoded: &str,
+    replay_encoded: &str,
+    context: &str,
+) {
+    const MEMBER: &str = "\"ttlMs\":";
+
+    let locate = |encoded: &str, side: &str| -> (usize, usize, u64) {
+        assert_eq!(
+            encoded.matches(MEMBER).count(),
+            1,
+            "{context}: {side} must carry exactly one ttlMs member for this \
+             comparison to isolate it: {encoded}",
+        );
+        let start = encoded.find(MEMBER).expect("the member was just counted") + MEMBER.len();
+        let digits = encoded[start..]
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(encoded.len() - start);
+        let millis = encoded[start..start + digits]
+            .parse::<u64>()
+            .unwrap_or_else(|error| {
+                panic!("{context}: {side} ttlMs is not a plain integer ({error}): {encoded}")
+            });
+        (start, digits, millis)
+    };
+
+    let (original_start, original_digits, original_millis) =
+        locate(original_encoded, "the original");
+    let (_, _, replay_millis) = locate(replay_encoded, "the replay");
+    assert!(
+        replay_millis <= original_millis,
+        "{context}: a cache hit ages ttlMs downward, never upward \
+         (original {original_millis}ms, replay {replay_millis}ms)",
+    );
+
+    let mut normalized = String::with_capacity(original_encoded.len());
+    normalized.push_str(&original_encoded[..original_start]);
+    normalized.push_str(&replay_millis.to_string());
+    normalized.push_str(&original_encoded[original_start + original_digits..]);
+    assert_eq!(normalized, replay_encoded, "{context}");
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
