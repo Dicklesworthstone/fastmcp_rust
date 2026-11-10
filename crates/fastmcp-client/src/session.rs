@@ -125,6 +125,46 @@ impl ClientExtensionResultAdmission {
         Ok(())
     }
 
+    /// Admits a server notification on this request's owned HTTP response.
+    ///
+    /// The response stream supplies correlation. Its frozen negotiation still
+    /// supplies the extension owner, direction, and bilateral settings; peer
+    /// metadata cannot widen that authority or select another extension.
+    pub(crate) fn admit_http_stream_notification(
+        &self,
+        notification: &fastmcp_protocol::JsonRpcRequest,
+        raw_params: Option<&str>,
+    ) -> McpResult<()> {
+        use fastmcp_protocol::extensions::validate_extension_notification_metadata;
+
+        let refused =
+            || McpError::invalid_request("Peer HTTP extension notification is not admitted");
+        if !notification.is_notification() || notification.validate().is_err() {
+            return Err(refused());
+        }
+        self.negotiated
+            .admit_notification(
+                &self.runtime.descriptors,
+                ProtocolEra::Modern2026,
+                &self.extension_id,
+                &notification.method,
+                ExtensionDirection::ServerToClient,
+            )
+            .map_err(|_| refused())?;
+        match (notification.params.as_ref(), raw_params) {
+            (None, None) => Ok(()),
+            (Some(parameters), Some(source)) => {
+                let admitted: serde_json::Value =
+                    serde_json::from_str(source).map_err(|_| refused())?;
+                if &admitted != parameters {
+                    return Err(refused());
+                }
+                validate_extension_notification_metadata(parameters).map_err(|_| refused())
+            }
+            _ => Err(refused()),
+        }
+    }
+
     /// Resolves only this request's negotiated server notification owner.
     /// The executor must still compare the capsule with its live request key.
     pub(crate) fn admit_stream_notification(

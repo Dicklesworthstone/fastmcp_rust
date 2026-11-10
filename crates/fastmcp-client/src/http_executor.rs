@@ -1949,6 +1949,16 @@ pub enum ModernHttpExtensionEvent {
     Progress(FinalProgressNotificationParams),
     /// Another final server notification admitted by its declared direction.
     Notification(ServerNotification),
+    /// A server notification owned by this request's negotiated extension.
+    ExtensionNotification {
+        /// The admitted envelope and materialized parameters.
+        notification: JsonRpcRequest,
+        /// Exact parameter source, preserving member order and number lexemes.
+        ///
+        /// Absent only when the peer omitted `params`. The response stream
+        /// owns correlation; no stdio correlation metadata is required.
+        raw_params: Option<String>,
+    },
     /// The one result admitted by this request's frozen extension authority.
     Terminal(serde_json::Value),
 }
@@ -1956,6 +1966,10 @@ pub enum ModernHttpExtensionEvent {
 enum ModernHttpOwnedEvent {
     Progress(FinalProgressNotificationParams),
     Notification(ServerNotification),
+    ExtensionNotification {
+        notification: JsonRpcRequest,
+        raw_params: Option<String>,
+    },
     CoreTerminal(FinalCoreResult),
     ExtensionTerminal {
         result: serde_json::Value,
@@ -2256,7 +2270,8 @@ impl ModernHttpRequestExecution {
                 ModernHttpOwnedEvent::CoreTerminal(terminal) => {
                     Ok(ModernHttpFinalCoreEvent::Terminal(terminal))
                 }
-                ModernHttpOwnedEvent::ExtensionTerminal { .. } => {
+                ModernHttpOwnedEvent::ExtensionTerminal { .. }
+                | ModernHttpOwnedEvent::ExtensionNotification { .. } => {
                     Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult)
                 }
             })
@@ -2496,6 +2511,13 @@ impl ModernHttpExtensionExecution {
             ModernHttpOwnedEvent::Notification(notification) => {
                 ModernHttpExtensionEvent::Notification(notification)
             }
+            ModernHttpOwnedEvent::ExtensionNotification {
+                notification,
+                raw_params,
+            } => ModernHttpExtensionEvent::ExtensionNotification {
+                notification,
+                raw_params,
+            },
             ModernHttpOwnedEvent::ExtensionTerminal {
                 result,
                 raw_result_source,
@@ -3046,7 +3068,9 @@ impl ModernHttpExtensionListener {
         if !matches!(
             result,
             Ok(Some(
-                ModernHttpOwnedEvent::Progress(_) | ModernHttpOwnedEvent::Notification(_)
+                ModernHttpOwnedEvent::Progress(_)
+                    | ModernHttpOwnedEvent::Notification(_)
+                    | ModernHttpOwnedEvent::ExtensionNotification { .. }
             ))
         ) {
             self.stream.close();
@@ -3077,6 +3101,27 @@ impl ModernHttpExtensionListener {
             )
             .map(Some),
             JsonRpcMessage::Request(request) => {
+                if final_2026_07_28_method(&request.method).is_none() {
+                    // Strict envelope admission above already bounded and
+                    // duplicate-checked this frame. Retain its exact params,
+                    // including explicit null, before checking the frozen owner.
+                    let mut envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                        serde_json::from_slice(event.as_bytes()).map_err(|_| {
+                            ModernHttpFinalCoreListenError::ExtensionAdmission(
+                                McpError::invalid_request(
+                                    "Peer HTTP extension notification is not admitted",
+                                ),
+                            )
+                        })?;
+                    let raw_params = envelope.remove("params").map(|raw| raw.get().to_owned());
+                    self.admission
+                        .admit_http_stream_notification(&request, raw_params.as_deref())
+                        .map_err(ModernHttpFinalCoreListenError::ExtensionAdmission)?;
+                    return Ok(Some(ModernHttpOwnedEvent::ExtensionNotification {
+                        notification: request,
+                        raw_params,
+                    }));
+                }
                 let notification =
                     decode_final_http_server_notification(&request, event.as_bytes())?;
                 Ok(Some(match notification {
@@ -15717,6 +15762,382 @@ mod tests {
 
     fn modern_discovery_body() -> &'static [u8] {
         br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
+    }
+
+    mod extension_response_notifications {
+        use super::*;
+        use std::future::Future;
+
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+            ExtensionDirection, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+            ExtensionMethodDescriptor, ExtensionNegotiationError, ExtensionNegotiationResolver,
+            ExtensionNotificationDescriptor, ExtensionSettings, ExtensionSettingsSchema,
+        };
+
+        use super::super::{ModernHttpExtensionEvent, ModernHttpExtensionExecution};
+
+        const OWNER: &str = "com.example/stream-events";
+        const FOREIGN: &str = "com.example/foreign-events";
+        const METHOD: &str = "example/watch";
+        const EVENT: &str = "example/changed";
+        const FOREIGN_EVENT: &str = "example/foreign-changed";
+        const EXACT_PARAMS: &str = r#"{ "fraction":7.30e-2, "integer":123456789012345678901234567890, "extra":{"z":1.20e+4,"a":2}, "_meta":{"com.example/note":"kept"} }"#;
+        const EXACT_RESULT: &str =
+            r#"{ "resultType":"complete", "value":7.30e-2, "extra":{"z":2,"a":1} }"#;
+
+        fn builder(target: &str, direction: ExtensionDirection) -> ClientBuilder {
+            let mut registry = ExtensionDescriptorRegistry::new();
+            let mut extensions = BTreeMap::new();
+            for (owner, method, notification) in [
+                (OWNER, METHOD, EVENT),
+                (FOREIGN, "example/foreign-watch", FOREIGN_EVENT),
+            ] {
+                let id = ExtensionId::parse(owner).unwrap();
+                registry
+                    .register(ExtensionDescriptor {
+                        id: id.clone(),
+                        client_settings: ExtensionSettingsSchema {
+                            schema_id: "stream-client-v1".to_owned(),
+                            codec_id: "stream-client-v1".to_owned(),
+                        },
+                        server_settings: ExtensionSettingsSchema {
+                            schema_id: "stream-server-v1".to_owned(),
+                            codec_id: "stream-server-v1".to_owned(),
+                        },
+                        resolver: ExtensionNegotiationResolver {
+                            id: "stream-settings-v1".to_owned(),
+                            version: 1,
+                            fallback: ExtensionFallbackPolicy::RejectOneSided,
+                        },
+                        method: Some(ExtensionMethodDescriptor {
+                            name: method.to_owned(),
+                            direction: ExtensionDirection::ClientToServer,
+                            http_era_disposition: Some(
+                                ExtensionHttpEraDisposition::ModernExclusive,
+                            ),
+                            legacy_fallback: false,
+                        }),
+                        notification: Some(ExtensionNotificationDescriptor {
+                            name: notification.to_owned(),
+                            direction,
+                            activation_proof: None,
+                        }),
+                        result_discriminator: None,
+                        routing_headers: Vec::new(),
+                        stdio_correlation: None,
+                    })
+                    .unwrap();
+                extensions.insert(id, ExtensionSettings::new(serde_json::json!({})).unwrap());
+            }
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    target,
+                    "http://127.0.0.1:9/unused-sse",
+                    "http://127.0.0.1:9/unused-messages",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .request_timeout_policy(
+                    crate::RequestTimeoutPolicy::new(
+                        Duration::from_secs(2),
+                        Duration::from_secs(3),
+                    )
+                    .unwrap(),
+                )
+                .extension_registry(registry, ClientExtensionDiscovery { extensions }, || {
+                    |descriptor: &ExtensionDescriptor,
+                     client: &ExtensionSettings,
+                     server: &ExtensionSettings| {
+                        if client.clone().into_value() == server.clone().into_value() {
+                            Ok(client.clone())
+                        } else {
+                            Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                                descriptor.id.to_string(),
+                            ))
+                        }
+                    }
+                })
+                .unwrap()
+        }
+
+        fn discovery(listener: &TcpListener) {
+            let mut stream = accept_notification_test_peer(listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["method"], SERVER_DISCOVER);
+            assert_eq!(request["id"], 1);
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"com.example/stream-events":{},"com.example/foreign-events":{}}},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+        }
+
+        fn prepare(client: &crate::HttpClient, cx: &Cx) -> ModernHttpExtensionExecution {
+            client
+                .execute_final_extension(
+                    cx,
+                    &ExtensionId::parse(OWNER).unwrap(),
+                    METHOD,
+                    serde_json::json!({}),
+                    SseLimits::new(4_096, 4_096, 32).unwrap(),
+                )
+                .unwrap()
+        }
+
+        fn accept_request(listener: &TcpListener) -> TcpStream {
+            let mut stream = accept_notification_test_peer(listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["method"], METHOD);
+            assert_eq!(request["id"], 2);
+            begin_chunked_sse(&mut stream);
+            stream
+        }
+
+        fn send_record(stream: &mut TcpStream, message: &str) {
+            write_chunked_sse_event(stream, &format!("data: {message}\n\n"));
+        }
+
+        fn serve_sibling(listener: &TcpListener) {
+            let mut stream = accept_notification_test_peer(listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["method"], "tools/list");
+            assert_eq!(request["id"], 3);
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+            assert_sse_peer_closed(&mut stream);
+        }
+
+        async fn assert_sibling(client: &crate::HttpClient, cx: &Cx) {
+            let mut sibling = client
+                .execute_core(
+                    cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    SseLimits::new(4_096, 4_096, 32).unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                sibling.next_event(cx).await.unwrap(),
+                Some(ModernHttpFinalCoreEvent::Terminal(
+                    FinalCoreResult::ToolsList { .. }
+                ))
+            ));
+            assert!(sibling.next_event(cx).await.unwrap().is_none());
+            assert!(cx.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn owned_http_extension_notifications_preserve_exact_parameters_and_terminal() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = thread::spawn(move || {
+                discovery(&listener);
+                let mut stream = accept_request(&listener);
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","method":"{EVENT}","params":{EXACT_PARAMS}}}"#),
+                );
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","method":"{EVENT}"}}"#),
+                );
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","id":2,"result":{EXACT_RESULT}}}"#),
+                );
+                assert_sse_peer_closed(&mut stream);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().expect("extension stream uses its caller runtime");
+                let client = builder(&target, ExtensionDirection::ServerToClient)
+                    .connect_http_client_with_cx(&cx)
+                    .await
+                    .unwrap();
+                let mut execution = prepare(&client, &cx);
+                let control = execution.control();
+                let Some(ModernHttpExtensionEvent::ExtensionNotification {
+                    notification,
+                    raw_params,
+                }) = execution.next_event(&cx).await.unwrap()
+                else {
+                    panic!("the registered owner must receive its live notification");
+                };
+                assert_eq!(notification.method, EVENT);
+                assert!(notification.is_notification());
+                assert_eq!(raw_params.as_deref(), Some(EXACT_PARAMS));
+                assert_eq!(
+                    notification.params.as_ref().unwrap()["fraction"]
+                        .as_number()
+                        .unwrap()
+                        .as_str(),
+                    "7.30e-2"
+                );
+                assert_eq!(control.terminal_reason(), None);
+                let Some(ModernHttpExtensionEvent::ExtensionNotification {
+                    notification,
+                    raw_params,
+                }) = execution.next_event(&cx).await.unwrap()
+                else {
+                    panic!("an admitted parameterless notification must remain nonterminal");
+                };
+                assert!(notification.params.is_none());
+                assert!(raw_params.is_none());
+                let Some(ModernHttpExtensionEvent::Terminal(result)) =
+                    execution.next_event(&cx).await.unwrap()
+                else {
+                    panic!("extension notifications must leave the terminal response live");
+                };
+                assert_eq!(result["value"].as_number().unwrap().as_str(), "7.30e-2");
+                assert_eq!(execution.raw_result_source(), Some(EXACT_RESULT));
+                assert_eq!(
+                    control.terminal_reason(),
+                    Some(crate::ExecutionTerminalReason::FinalResponse)
+                );
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert!(!control.cancel());
+                assert!(control.take_cancellation_event().is_none());
+                assert!(cx.checkpoint().is_ok());
+            });
+            peer.join().unwrap();
+        }
+
+        #[test]
+        fn owned_http_extension_notifications_reject_foreign_authority_and_preserve_siblings() {
+            let cases = [
+                (
+                    ExtensionDirection::ServerToClient,
+                    FOREIGN_EVENT,
+                    r#","params":{}"#,
+                ),
+                (
+                    ExtensionDirection::ServerToClient,
+                    "example/unknown",
+                    r#","params":{}"#,
+                ),
+                (ExtensionDirection::ClientToServer, EVENT, r#","params":{}"#),
+                (
+                    ExtensionDirection::ServerToClient,
+                    EVENT,
+                    r#","id":9,"params":{}"#,
+                ),
+                (
+                    ExtensionDirection::ServerToClient,
+                    EVENT,
+                    r#","params":{"_meta":[]}"#,
+                ),
+                (
+                    ExtensionDirection::ServerToClient,
+                    EVENT,
+                    r#","params":null"#,
+                ),
+                (ExtensionDirection::ServerToClient, EVENT, r#","params":[]"#),
+            ];
+            for (direction, method, members) in cases {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let peer = thread::spawn(move || {
+                    discovery(&listener);
+                    let mut stream = accept_request(&listener);
+                    send_record(
+                        &mut stream,
+                        &format!(r#"{{"jsonrpc":"2.0","method":"{method}"{members}}}"#),
+                    );
+                    assert_sse_peer_closed(&mut stream);
+                    serve_sibling(&listener);
+                });
+                runtime_block_on(async {
+                    let cx = Cx::current().expect("extension refusal uses its caller runtime");
+                    let client = builder(&target, direction)
+                        .connect_http_client_with_cx(&cx)
+                        .await
+                        .unwrap();
+                    let mut execution = prepare(&client, &cx);
+                    let control = execution.control();
+                    assert!(
+                        matches!(
+                            execution.next_event(&cx).await,
+                            Err(ModernHttpFinalCoreListenError::ExtensionAdmission(_))
+                        ),
+                        "notification must stay within its frozen owner: {method}{members}"
+                    );
+                    assert_eq!(
+                        control.terminal_reason(),
+                        Some(crate::ExecutionTerminalReason::PeerProtocol)
+                    );
+                    assert!(execution.raw_result_source().is_none());
+                    assert!(execution.next_event(&cx).await.unwrap().is_none());
+                    assert!(control.take_cancellation_event().is_none());
+                    assert!(!control.cancel());
+                    assert_sibling(&client, &cx).await;
+                });
+                peer.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn owned_http_extension_notification_cancellation_releases_only_its_stream() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = thread::spawn(move || {
+                discovery(&listener);
+                let mut stream = accept_request(&listener);
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","method":"{EVENT}","params":{{}}}}"#),
+                );
+                assert_sse_peer_closed(&mut stream);
+                serve_sibling(&listener);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().expect("extension cancellation uses its caller runtime");
+                let client = builder(&target, ExtensionDirection::ServerToClient)
+                    .connect_http_client_with_cx(&cx)
+                    .await
+                    .unwrap();
+                let mut execution = prepare(&client, &cx);
+                let control = execution.control();
+                assert!(matches!(
+                    execution.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpExtensionEvent::ExtensionNotification { .. })
+                ));
+                {
+                    let mut pending = std::pin::pin!(execution.next_event(&cx));
+                    std::future::poll_fn(|task_cx| {
+                        assert!(pending.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(control.cancel());
+                assert!(!control.cancel());
+                assert!(matches!(
+                    execution.next_event(&cx).await,
+                    Err(ModernHttpFinalCoreListenError::CallerCancelled {
+                        request_id: RequestId::Number(2),
+                    })
+                ));
+                assert_eq!(
+                    control.take_cancellation_event().unwrap().reason,
+                    crate::ExecutionTerminalReason::CallerCancelled
+                );
+                assert!(control.take_cancellation_event().is_none());
+                assert!(execution.raw_result_source().is_none());
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert_sibling(&client, &cx).await;
+            });
+            peer.join().unwrap();
+        }
     }
 
     fn owned_http_error_test_builder(target: &str) -> ClientBuilder {

@@ -262,6 +262,31 @@ impl ExtensionRequest<'_> {
                     // results without filling an inaccessible shared queue.
                     client.final_result_cache.invalidate_notification(notification);
                 }
+                ModernHttpExtensionEvent::ExtensionNotification {
+                    notification,
+                    raw_params,
+                } => {
+                    #[derive(Serialize)]
+                    struct NotificationWire<'a> {
+                        jsonrpc: &'a str,
+                        method: &'a str,
+                        #[serde(skip_serializing_if = "Option::is_none")]
+                        params: Option<&'a serde_json::value::RawValue>,
+                    }
+                    // Charge the exact retained params before invoking user
+                    // code. Re-encoding Value would undercount whitespace and
+                    // replace numeric source spellings in this byte budget.
+                    let params = raw_params
+                        .as_deref()
+                        .map(serde_json::from_str::<&serde_json::value::RawValue>)
+                        .transpose()
+                        .map_err(|_| refusal("Invalid managed extension notification"))?;
+                    budget.charge_notification(&NotificationWire {
+                        jsonrpc: notification.jsonrpc.as_ref(),
+                        method: &notification.method,
+                        params,
+                    })?;
+                }
                 ModernHttpExtensionEvent::Terminal(_) => {}
             }
             if let ModernHttpExtensionEvent::Terminal(result) = event {
