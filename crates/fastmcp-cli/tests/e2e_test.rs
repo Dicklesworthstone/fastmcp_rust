@@ -1887,6 +1887,26 @@ fn run_http_operation_fixture(
     response_body: &str,
     json: bool,
 ) -> (Output, Vec<serde_json::Value>) {
+    run_http_operation_fixture_with_resume(
+        command,
+        target,
+        arguments,
+        response_member,
+        response_body,
+        json,
+        None,
+    )
+}
+
+fn run_http_operation_fixture_with_resume(
+    command: &str,
+    target: &str,
+    arguments: Option<&str>,
+    response_member: &str,
+    response_body: &str,
+    json: bool,
+    resume: Option<(&str, &str)>,
+) -> (Output, Vec<serde_json::Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind operation HTTP fixture");
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let method = operation_method(command);
@@ -1961,6 +1981,14 @@ fn run_http_operation_fixture(
     if json {
         args.push("--json");
     }
+    if let Some((result_path, responses_path)) = resume {
+        args.extend([
+            "--resume-result-file",
+            result_path,
+            "--input-responses-file",
+            responses_path,
+        ]);
+    }
     let output = run_cli(&args);
     finished.send(()).expect("operation observer remains alive");
     wait_for_loopback_fixture(fixture, "single operation HTTP fixture");
@@ -1970,6 +1998,510 @@ fn run_http_operation_fixture(
 const OPERATION_CALL_RESULT: &str = r#"{"resultType":"complete","content":[{"type":"text","text":"echoed"}],"com.example/exact":{"negativeZero":-0,"decimal":1.2300,"large":9007199254740993}}"#;
 const OPERATION_READ_RESULT: &str = r#"{"resultType":"complete","contents":[{"uri":"demo://status","mimeType":"text/plain","text":"healthy"}],"ttlMs":0,"cacheScope":"private"}"#;
 const OPERATION_PROMPT_RESULT: &str = r#"{"resultType":"complete","messages":[{"role":"user","content":{"type":"text","text":"Hello Ada"}}]}"#;
+
+#[cfg(target_os = "linux")]
+fn operation_json_file(bytes: &[u8]) -> (std::fs::File, String) {
+    use std::os::fd::AsRawFd as _;
+    let mut file = std::fs::File::from(
+        rustix::fs::memfd_create("fastmcp-operation-input", rustix::fs::MemfdFlags::CLOEXEC)
+            .expect("anonymous regular operation file"),
+    );
+    file.write_all(bytes).expect("write operation JSON file");
+    let path = format!("/proc/{}/fd/{}", std::process::id(), file.as_raw_fd());
+    (file, path)
+}
+
+#[cfg(target_os = "linux")]
+const OPERATION_INPUT_REQUIRED: &str = r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"},"approval":{"method":"elicitation/create","params":{"mode":"form","message":"Review operation","requestedSchema":{"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"]}}}},"requestState":"opaque-state-\u0000-\u4e00-\n"}"#;
+#[cfg(target_os = "linux")]
+const OPERATION_INPUT_REMAINING: &str = r#"{"resultType":"input_required","inputRequests":{"approval":{"method":"elicitation/create","params":{"mode":"form","message":"Review operation","requestedSchema":{"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"]}}}},"requestState":"rotated-state-\u0000-\ud83d\udd10"}"#;
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_http_resume_preserves_state_and_partial_answers() {
+    for (command, target, arguments, complete) in [
+        (
+            "call",
+            "echo",
+            Some(r#"{"message":"original"}"#),
+            OPERATION_CALL_RESULT,
+        ),
+        ("read", "demo://status", None, OPERATION_READ_RESULT),
+        (
+            "prompt",
+            "greeting",
+            Some(r#"{"name":"Ada"}"#),
+            OPERATION_PROMPT_RESULT,
+        ),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (finished, finish) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let fixture = spawn_loopback_fixture_with_deadline(
+            "explicit operation resume",
+            Duration::from_secs(20),
+            move |deadline| {
+                let mut wire = Vec::new();
+                let first: serde_json::Value =
+                    serde_json::from_str(OPERATION_INPUT_REQUIRED).unwrap();
+                let remaining: serde_json::Value =
+                    serde_json::from_str(OPERATION_INPUT_REMAINING).unwrap();
+                for (round, result) in [
+                    OPERATION_INPUT_REQUIRED,
+                    OPERATION_INPUT_REMAINING,
+                    complete,
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut stream =
+                        accept_h1_fixture_connection(&listener, deadline, "resume discovery");
+                    let (_, request) = read_h1_json_request(&mut stream, deadline);
+                    assert_eq!(request["method"], "server/discover");
+                    assert_eq!(
+                        request["params"]["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+                        serde_json::json!({"roots": {}, "sampling": {}, "elicitation": {"form": {}, "url": {}}})
+                    );
+                    write_h1_json_response(
+                        &mut stream,
+                        deadline,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{{"tools":{{}},"resources":{{}},"prompts":{{}}}},"ttlMs":0,"cacheScope":"private"}}}}"#,
+                            request["id"],
+                        ),
+                    );
+                    wire.push(request);
+                    drop(stream);
+                    let mut stream = accept_h1_fixture_connection(
+                        &listener,
+                        deadline,
+                        "explicit resume request",
+                    );
+                    let (_, request) = read_h1_json_request(&mut stream, deadline);
+                    assert_eq!(request["method"], operation_method(command));
+                    let params = &request["params"];
+                    assert_eq!(
+                        params[if command == "read" { "uri" } else { "name" }],
+                        target
+                    );
+                    assert_eq!(
+                        params["_meta"]["io.modelcontextprotocol/clientCapabilities"],
+                        serde_json::json!({"roots": {}, "sampling": {}, "elicitation": {"form": {}, "url": {}}})
+                    );
+                    if let Some(arguments) = arguments {
+                        assert_eq!(
+                            params["arguments"],
+                            serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+                        );
+                    } else {
+                        assert!(params.get("arguments").is_none());
+                    }
+                    match round {
+                        0 => {
+                            assert!(params.get("requestState").is_none());
+                            assert!(params.get("inputResponses").is_none());
+                        }
+                        1 => {
+                            assert_eq!(params["requestState"], first["requestState"]);
+                            assert_eq!(
+                                params["inputResponses"],
+                                serde_json::json!({"roots": {"roots": []}})
+                            );
+                        }
+                        2 => {
+                            assert_eq!(params["requestState"], remaining["requestState"]);
+                            assert_eq!(
+                                params["inputResponses"],
+                                serde_json::json!({"approval": {"action": "accept", "content": {"approved": true}}})
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    write_h1_json_response(
+                        &mut stream,
+                        deadline,
+                        &format!(
+                            r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
+                            request["id"],
+                        ),
+                    );
+                    wire.push(request);
+                }
+                loop {
+                    let done = finish.try_recv().is_ok();
+                    match listener.accept() {
+                        Ok(_) => panic!("explicit continuation must not trigger another action"),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("resume replay observer failed: {error}"),
+                    }
+                    if done {
+                        break;
+                    }
+                    std::thread::park_timeout(fixture_wait(deadline, "observe no resume replay"));
+                }
+                sent.send(wire).unwrap();
+            },
+        );
+        let mut base = vec![
+            command,
+            target,
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--json",
+            "--timeout",
+            "5",
+            "--input-capability",
+            "roots",
+            "--input-capability",
+            "elicitation-form",
+            "--input-capability",
+            "elicitation-url",
+            "--input-capability",
+            "sampling",
+        ];
+        if let Some(arguments) = arguments {
+            base.extend(["--arguments", arguments]);
+        }
+        let initial = run_cli(&base);
+        assert!(!initial.status.success(), "input_required exits nonzero");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&initial.stdout).unwrap(),
+            serde_json::from_str::<serde_json::Value>(OPERATION_INPUT_REQUIRED).unwrap()
+        );
+        let (_first_file, first_path) = operation_json_file(&initial.stdout);
+        let (_partial_file, partial_path) = operation_json_file(br#"{"roots":{"roots":[]}}"#);
+        let mut partial_args = base.clone();
+        partial_args.extend([
+            "--resume-result-file",
+            &first_path,
+            "--input-responses-file",
+            &partial_path,
+        ]);
+        let partial = run_cli(&partial_args);
+        assert!(
+            !partial.status.success(),
+            "remaining input_required exits nonzero"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&partial.stdout).unwrap(),
+            serde_json::from_str::<serde_json::Value>(OPERATION_INPUT_REMAINING).unwrap()
+        );
+        let (_remaining_file, remaining_path) = operation_json_file(&partial.stdout);
+        let (_answers_file, answers_path) =
+            operation_json_file(br#"{"approval":{"action":"accept","content":{"approved":true}}}"#);
+        let mut complete_args = base;
+        complete_args.extend([
+            "--resume-result-file",
+            &remaining_path,
+            "--input-responses-file",
+            &answers_path,
+        ]);
+        let completed = run_cli(&complete_args);
+        finished.send(()).unwrap();
+        wait_for_loopback_fixture(fixture, "explicit operation resume");
+        assert!(completed.status.success(), "{}", stderr_str(&completed));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&completed.stdout).unwrap(),
+            serde_json::from_str::<serde_json::Value>(complete).unwrap()
+        );
+        if command == "call" {
+            assert!(stdout_str(&completed).contains(r#""negativeZero":-0"#));
+            assert!(stdout_str(&completed).contains(r#""decimal":1.2300"#));
+        }
+        assert_eq!(
+            received.recv().unwrap().len(),
+            6,
+            "each explicit invocation discovers and dispatches once"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_http_resume_preserves_absent_state_and_state_only_results() {
+    for (challenge, answers, expect_responses) in [
+        (
+            r#"{"resultType":"input_required","requestState":""}"#,
+            "{}",
+            false,
+        ),
+        (
+            r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}}}"#,
+            r#"{"roots":{"roots":[]}}"#,
+            true,
+        ),
+        (
+            OPERATION_INPUT_REQUIRED,
+            r#"{"roots":{"roots":[]},"approval":{"action":"decline"}}"#,
+            true,
+        ),
+    ] {
+        let (_result_file, result_path) = operation_json_file(challenge.as_bytes());
+        let (_responses_file, responses_path) = operation_json_file(answers.as_bytes());
+        let (output, wire) = run_http_operation_fixture_with_resume(
+            "call",
+            "echo",
+            None,
+            "result",
+            OPERATION_CALL_RESULT,
+            true,
+            Some((&result_path, &responses_path)),
+        );
+        assert!(output.status.success(), "{}", stderr_str(&output));
+        assert_eq!(wire.len(), 2);
+        let prior: serde_json::Value = serde_json::from_str(challenge).unwrap();
+        assert_eq!(
+            wire[1]["params"].get("requestState"),
+            prior.get("requestState")
+        );
+        if expect_responses {
+            assert_eq!(
+                wire[1]["params"]["inputResponses"],
+                serde_json::from_str::<serde_json::Value>(answers).unwrap()
+            );
+        } else {
+            assert!(wire[1]["params"].get("inputResponses").is_none());
+        }
+    }
+    let (_result_file, result_path) = operation_json_file(OPERATION_INPUT_REQUIRED.as_bytes());
+    let (_responses_file, responses_path) = operation_json_file(br#"{"roots":{"roots":[]}}"#);
+    let (failed, wire) = run_http_operation_fixture_with_resume(
+        "call",
+        "echo",
+        None,
+        "error",
+        r#"{"code":-32602,"message":"resume-reflected-private","data":{"requestState":"resume-reflected-private"}}"#,
+        true,
+        Some((&result_path, &responses_path)),
+    );
+    assert!(!failed.status.success());
+    assert_eq!(
+        wire.len(),
+        2,
+        "a failed explicit continuation is never replayed"
+    );
+    assert!(!stdout_str(&failed).contains("resume-reflected-private"));
+    assert!(!stderr_str(&failed).contains("resume-reflected-private"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_resume_rejects_invalid_inputs_before_contact() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let observer =
+        spawn_forbidden_http_contact_observer(listener, Arc::clone(&contacts), "resume preflight");
+    for (command, target) in [
+        ("call", "echo"),
+        ("read", "demo://status"),
+        ("prompt", "greeting"),
+    ] {
+        for (result, responses) in [
+            (r#"{"resultType":"complete","content":[]}"#, "{}"),
+            (
+                r#"{"resultType":"input_required","requestState":"first","requestState":"resume-private"}"#,
+                "{}",
+            ),
+            (
+                r#"{"resultType":"input_required","inputRequests":{"roots":{"method":"unsupported/private"}},"requestState":"resume-private"}"#,
+                r#"{"roots":{"roots":[]}}"#,
+            ),
+            ("null", "{}"),
+            ("[]", "{}"),
+            (OPERATION_INPUT_REQUIRED, "null"),
+            (OPERATION_INPUT_REQUIRED, "[]"),
+            (
+                OPERATION_INPUT_REQUIRED,
+                r#"{"unrequested-private":{"roots":[]}}"#,
+            ),
+            (
+                OPERATION_INPUT_REQUIRED,
+                r#"{"roots":{"action":"decline"}}"#,
+            ),
+            (OPERATION_INPUT_REQUIRED, r#"{"approval":{"roots":[]}}"#),
+            (
+                OPERATION_INPUT_REQUIRED,
+                r#"{"roots":{"roots":[]},"roots":{"roots":[]}}"#,
+            ),
+            (
+                OPERATION_INPUT_REQUIRED,
+                r#"{"approval":{"action":"accept","content":{"approved":true,"approved":"resume-private"}}}"#,
+            ),
+            (
+                r#"{"resultType":"input_required","requestState":"resume-private"}"#,
+                r#"{"roots":{"roots":[]}}"#,
+            ),
+        ] {
+            let (_result_file, result_path) = operation_json_file(result.as_bytes());
+            let (_responses_file, responses_path) = operation_json_file(responses.as_bytes());
+            let output = run_cli(&[
+                command,
+                target,
+                "--http-url",
+                &url,
+                "--protocol-policy",
+                "modern-only",
+                "--json",
+                "--resume-result-file",
+                &result_path,
+                "--input-responses-file",
+                &responses_path,
+            ]);
+            assert!(!output.status.success(), "invalid resume input must fail");
+            let error: serde_json::Value =
+                serde_json::from_slice(&output.stdout).expect("one redacted resume failure");
+            assert_eq!(error["command"], command);
+            assert_eq!(error["success"], false);
+            for secret in [
+                "resume-private",
+                "unrequested-private",
+                "unsupported/private",
+            ] {
+                assert!(!stdout_str(&output).contains(secret));
+                assert!(!stderr_str(&output).contains(secret));
+            }
+        }
+    }
+    let (_valid_result, result_path) = operation_json_file(OPERATION_INPUT_REQUIRED.as_bytes());
+    let (_valid_responses, responses_path) = operation_json_file(br#"{"roots":{"roots":[]}}"#);
+    let (oversized_result, oversized_result_path) = operation_json_file(b"{}");
+    oversized_result.set_len(6 * 1024 * 1024 + 1).unwrap();
+    let (oversized_responses, oversized_responses_path) = operation_json_file(b"{}");
+    oversized_responses.set_len(1024 * 1024 + 1).unwrap();
+    let (pipe_read, _pipe_write) = std::io::pipe().unwrap();
+    use std::os::fd::AsRawFd as _;
+    let pipe_path = format!("/proc/{}/fd/{}", std::process::id(), pipe_read.as_raw_fd());
+    for (result, responses) in [
+        (oversized_result_path.as_str(), responses_path.as_str()),
+        (result_path.as_str(), oversized_responses_path.as_str()),
+        ("/dev/null", responses_path.as_str()),
+        (result_path.as_str(), "/dev/null"),
+        ("/", responses_path.as_str()),
+        (pipe_path.as_str(), responses_path.as_str()),
+        (result_path.as_str(), pipe_path.as_str()),
+    ] {
+        let output = run_cli(&[
+            "call",
+            "echo",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--json",
+            "--timeout",
+            "1",
+            "--resume-result-file",
+            result,
+            "--input-responses-file",
+            responses,
+        ]);
+        assert!(
+            !output.status.success(),
+            "unbounded or non-regular resume file must fail"
+        );
+    }
+    stop_forbidden_http_contact_observer(observer, "resume preflight");
+    assert_eq!(
+        contacts.load(Ordering::SeqCst),
+        0,
+        "resume admission finishes before discovery"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_resume_requires_modern_http_before_contact() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let contacts = Arc::new(AtomicUsize::new(0));
+    let observer =
+        spawn_forbidden_http_contact_observer(listener, Arc::clone(&contacts), "resume policy");
+    let (_result_file, result_path) = operation_json_file(OPERATION_INPUT_REQUIRED.as_bytes());
+    let (_responses_file, responses_path) = operation_json_file(br#"{"roots":{"roots":[]}}"#);
+    for policy in ["auto", "legacy-only"] {
+        for input in [
+            vec![
+                "--resume-result-file",
+                result_path.as_str(),
+                "--input-responses-file",
+                responses_path.as_str(),
+            ],
+            vec!["--input-capability", "roots"],
+        ] {
+            let mut args = vec![
+                "call",
+                "echo",
+                "--http-url",
+                &url,
+                "--protocol-policy",
+                policy,
+                "--json",
+            ];
+            args.extend(input);
+            let output = run_cli(&args);
+            assert!(
+                !output.status.success(),
+                "manual input cannot enter Auto or a legacy era"
+            );
+        }
+    }
+    for input in [
+        vec!["--resume-result-file", result_path.as_str()],
+        vec!["--input-responses-file", responses_path.as_str()],
+        vec![
+            "--resume-result-file",
+            result_path.as_str(),
+            "--input-responses-file",
+            responses_path.as_str(),
+            "--legacy-sse-url",
+            url.as_str(),
+        ],
+    ] {
+        let mut args = vec![
+            "call",
+            "echo",
+            "--http-url",
+            &url,
+            "--protocol-policy",
+            "modern-only",
+            "--json",
+        ];
+        args.extend(input);
+        assert!(!run_cli(&args).status.success());
+    }
+    stop_forbidden_http_contact_observer(observer, "resume policy");
+    assert_eq!(contacts.load(Ordering::SeqCst), 0);
+    for input in [
+        vec![
+            "--resume-result-file",
+            result_path.as_str(),
+            "--input-responses-file",
+            responses_path.as_str(),
+        ],
+        vec!["--input-capability", "elicitation-form"],
+    ] {
+        let mut args = vec![
+            "call",
+            "echo",
+            "--server",
+            "/bin/sh",
+            "--server-arg=-c",
+            "--server-arg",
+            "printf 'FORBIDDEN_RESUME_SPAWN\\n' >&2",
+            "--protocol-policy",
+            "modern-only",
+            "--json",
+        ];
+        args.extend(input);
+        let output = run_cli(&args);
+        assert!(!output.status.success());
+        assert!(!stderr_str(&output).contains("FORBIDDEN_RESUME_SPAWN"));
+    }
+}
 
 #[test]
 fn e2e_cli_operations_stdio_invoke_read_and_prompt_once() {
@@ -2447,6 +2979,20 @@ done
 
 #[test]
 fn e2e_cli_operations_http_timeout_closes_the_dispatched_request_without_replay() {
+    assert_http_operation_timeout(None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn e2e_cli_operations_http_resume_timeout_never_replays() {
+    let (_result_file, result_path) = operation_json_file(
+        br#"{"resultType":"input_required","inputRequests":{"roots":{"method":"roots/list"}},"requestState":"timeout-resume"}"#,
+    );
+    let (_responses_file, responses_path) = operation_json_file(br#"{"roots":{"roots":[]}}"#);
+    assert_http_operation_timeout(Some((&result_path, &responses_path)));
+}
+
+fn assert_http_operation_timeout(resume: Option<(&str, &str)>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let (finished, finish) = mpsc::channel();
@@ -2454,6 +3000,7 @@ fn e2e_cli_operations_http_timeout_closes_the_dispatched_request_without_replay(
     let observed = Arc::clone(&dispatched);
     let closed = Arc::new(AtomicBool::new(false));
     let observed_closed = Arc::clone(&closed);
+    let resuming = resume.is_some();
     let fixture = spawn_loopback_fixture_with_deadline(
         "silent HTTP operation",
         Duration::from_secs(8),
@@ -2475,6 +3022,10 @@ fn e2e_cli_operations_http_timeout_closes_the_dispatched_request_without_replay(
                 accept_h1_fixture_connection(&listener, deadline, "silent HTTP action");
             let (_, request) = read_h1_json_request(&mut stream, deadline);
             assert_eq!(request["method"], "tools/call");
+            if resuming {
+                assert_eq!(request["params"]["requestState"], "timeout-resume");
+                assert_eq!(request["params"]["inputResponses"], serde_json::json!({"roots": {"roots": []}}));
+            }
             observed.fetch_add(1, Ordering::SeqCst);
             expect_h1_fixture_reset(&mut stream, deadline, "timed out HTTP stream must close");
             observed_closed.store(true, Ordering::SeqCst);
@@ -2504,6 +3055,9 @@ fn e2e_cli_operations_http_timeout_closes_the_dispatched_request_without_replay(
         "--timeout",
         "1",
     ]);
+    if let Some((result_path, responses_path)) = resume {
+        command.args(["--resume-result-file", result_path, "--input-responses-file", responses_path]);
+    }
     let output = run_with_deadline(command, Duration::from_secs(6)).unwrap_or_else(|expired| {
         panic!(
             "HTTP operation exceeded its timeout: {:?}",

@@ -789,6 +789,61 @@ rustup toolchain install nightly-2026-08-25
 cargo +nightly-2026-08-25 install fastmcp-cli --version 0.13.0 --locked
 ```
 
+### Manual CLI input continuations (current source tree)
+
+`fastmcp call`, `fastmcp read`, and `fastmcp prompt` can complete MCP 2026-07-28
+HTTP operations that return `input_required`. Each invocation sends one
+application request. Select the kinds of input you can answer with repeatable
+`--input-capability` options: `elicitation-form`, `elicitation-url`, `roots`,
+or `sampling`. These options advertise manual support; the CLI emits the
+request for review and waits for a separate, explicit invocation with answers.
+The default capability set remains empty.
+
+For example, begin a tool call and save its result:
+
+```bash
+fastmcp call publish-report \
+  --http-url https://example.com/mcp --protocol-policy modern-only \
+  --input-capability elicitation-form --arguments-file arguments.json \
+  --json > round-1.json
+```
+
+An `input_required` result intentionally exits nonzero, while preserving the
+result JSON on stdout. Check the saved document's `resultType` before resuming;
+a connection or protocol failure also exits nonzero. If `inputRequests`
+contains an elicitation keyed by `approval`, an answers file might contain:
+
+```json
+{"approval":{"action":"accept","content":{"approved":true}}}
+```
+
+Use the exact keys and response shapes requested by your server. Repeat the
+original endpoint, command, target, arguments, and capabilities when submitting
+the saved challenge and answers together:
+
+```bash
+fastmcp call publish-report \
+  --http-url https://example.com/mcp --protocol-policy modern-only \
+  --input-capability elicitation-form --arguments-file arguments.json \
+  --resume-result-file round-1.json --input-responses-file answers.json \
+  --json > round-2.json
+```
+
+The CLI validates the saved result and correlates every supplied answer before
+contacting the server. Valid partial answers are accepted. If the server returns
+another `input_required`, use that new result for the next explicit invocation;
+its opaque `requestState` is forwarded unchanged. A result containing only
+`requestState` requires an explicit empty `{}` answers file and sends no
+`inputResponses` member. The server validates whether its state belongs to the
+repeated operation and caller.
+
+Both files must be readable regular files without duplicate JSON members.
+The saved result is limited to 6 MiB and answers to 1 MiB. `--json` preserves
+unredacted result content, including continuation state. Resume files and manual
+input capabilities require an explicit HTTP endpoint with `modern-only` policy;
+they cannot be used with Auto negotiation, legacy routes, or a newly spawned
+stdio server. Timeouts and peer errors exit nonzero without replaying the action.
+
 ### Client request deadlines (current source tree)
 
 Ordinary client requests use separate idle and absolute response-wait

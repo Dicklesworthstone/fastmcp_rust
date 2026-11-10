@@ -690,7 +690,7 @@ enum Commands {
     /// Read one MCP resource.
     ///
     /// Sends the absolute URI unchanged to resources/read. The CLI does not
-    /// fetch the URI independently or follow an input_required continuation.
+    /// fetch the URI independently. Continuations require explicit resume files.
     Read {
         /// Absolute resource URI, including custom schemes.
         uri: String,
@@ -937,6 +937,18 @@ struct OperationConnection {
     /// Protocol-policy selection for this connection.
     #[arg(long, value_enum, default_value_t = CliProtocolPolicy::default())]
     protocol_policy: CliProtocolPolicy,
+    /// Manual embedded input capability (repeatable); requires modern-only HTTP.
+    /// Requests are emitted for review, never resolved automatically.
+    #[arg(long, value_enum)]
+    input_capability: Vec<OperationInputCapability>,
+    /// Resume from a saved input_required result JSON file (at most 6 MiB).
+    /// Repeat the original endpoint, operation, target, arguments, and capabilities.
+    #[arg(long, value_name = "PATH", requires = "input_responses_file")]
+    resume_result_file: Option<PathBuf>,
+    /// JSON object of answers keyed by input request ID (at most 1 MiB).
+    /// Valid partial answers are allowed; state-only continuations require {}.
+    #[arg(long, value_name = "PATH", requires = "resume_result_file")]
+    input_responses_file: Option<PathBuf>,
     /// Emit the admitted MCP result JSON, including its unredacted content.
     #[arg(long)]
     json: bool,
@@ -946,6 +958,43 @@ struct OperationConnection {
     #[arg(long, default_value_t = 30,
         value_parser = clap::value_parser!(u64).range(1..=900))]
     timeout: u64,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy)]
+enum OperationInputCapability {
+    Sampling,
+    Roots,
+    ElicitationForm,
+    ElicitationUrl,
+}
+
+fn operation_input_capabilities(
+    selected: &[OperationInputCapability],
+) -> fastmcp_protocol::ClientCapabilities {
+    let mut capabilities = fastmcp_protocol::ClientCapabilities::default();
+    for capability in selected {
+        match capability {
+            OperationInputCapability::Sampling => {
+                capabilities.sampling = Some(fastmcp_protocol::SamplingCapability::default());
+            }
+            OperationInputCapability::Roots => {
+                capabilities.roots = Some(fastmcp_protocol::RootsCapability::default());
+            }
+            OperationInputCapability::ElicitationForm => {
+                capabilities
+                    .elicitation
+                    .get_or_insert_with(Default::default)
+                    .form = Some(fastmcp_protocol::FormElicitationCapability::default());
+            }
+            OperationInputCapability::ElicitationUrl => {
+                capabilities
+                    .elicitation
+                    .get_or_insert_with(Default::default)
+                    .url = Some(fastmcp_protocol::UrlElicitationCapability::default());
+            }
+        }
+    }
+    capabilities
 }
 
 #[derive(clap::Args, Default)]
@@ -6289,6 +6338,155 @@ fn read_operation_arguments(
     }
 }
 
+/// Manual embedded-input handling belongs to the modern HTTP request model.
+/// A fresh stdio process cannot own another process's continuation state, and
+/// an Auto connection must never carry that state into a different wire era.
+fn validate_operation_input_policy(connection: &OperationConnection) -> McpResult<()> {
+    let has_manual_input = !connection.input_capability.is_empty()
+        || connection.resume_result_file.is_some()
+        || connection.input_responses_file.is_some();
+    if has_manual_input
+        && (connection.protocol_policy != CliProtocolPolicy::ModernOnly
+            || connection.http_url.is_none()
+            || connection.server.is_some()
+            || connection.legacy_sse_url.is_some()
+            || connection.legacy_message_url.is_some())
+    {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "manual input capabilities and resume files require --protocol-policy modern-only and only an explicit --http-url",
+        ));
+    }
+    if connection.resume_result_file.is_some() != connection.input_responses_file.is_some() {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "--resume-result-file and --input-responses-file must be supplied together",
+        ));
+    }
+    Ok(())
+}
+
+/// Open nonblocking on Unix so a FIFO cannot consume the operation's deadline
+/// before its file type is checked. Error messages never include the path or
+/// any untrusted JSON, which may contain credentials or elicited user input.
+fn read_operation_resume_file(
+    path: &Path,
+    max_bytes: usize,
+    message: &'static str,
+) -> McpResult<Vec<u8>> {
+    let invalid = || fastmcp_core::McpError::invalid_params(message);
+    #[cfg(unix)]
+    let file = {
+        use rustix::fs::{Mode, OFlags};
+        File::from(
+            rustix::fs::open(
+                path,
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .map_err(|_| invalid())?,
+        )
+    };
+    #[cfg(not(unix))]
+    let file = {
+        if !std::fs::metadata(path).map_err(|_| invalid())?.is_file() {
+            return Err(invalid());
+        }
+        File::open(path).map_err(|_| invalid())?
+    };
+    let metadata = file.metadata().map_err(|_| invalid())?;
+    if !metadata.is_file() || metadata.len() > max_bytes as u64 {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| invalid())?;
+    fastmcp_protocol::admit_raw_jsonrpc_document(&bytes, max_bytes).map_err(|_| invalid())?;
+    Ok(bytes)
+}
+
+/// Admit both original documents before adding any continuation members. The
+/// caller explicitly repeats the original operation and connection; the server
+/// remains responsible for binding its opaque state to that identity.
+fn apply_operation_resume(
+    cx: &Cx,
+    connection: &OperationConnection,
+    method: &'static str,
+    parameters: &mut serde_json::Value,
+    budget: OperationBudget,
+) -> McpResult<()> {
+    use fastmcp_protocol::{CoreRequest, CoreResult, FinalCoreResult};
+    use fastmcp_protocol::{FinalInputResponseCorrelationError, FinalInputResponses};
+
+    budget.remaining(cx)?;
+    let (Some(result_path), Some(responses_path)) = (
+        connection.resume_result_file.as_deref(),
+        connection.input_responses_file.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    const INVALID_RESULT: &str = "--resume-result-file must be a readable regular file containing one valid input_required result JSON object of at most 6 MiB with no duplicate members";
+    const INVALID_RESPONSES: &str = "--input-responses-file must be a readable regular file containing one valid input response JSON object of at most 1 MiB with no duplicate members";
+    let invalid_result = || fastmcp_core::McpError::invalid_params(INVALID_RESULT);
+    let invalid_responses = || fastmcp_core::McpError::invalid_params(INVALID_RESPONSES);
+    let result_bytes = read_operation_resume_file(
+        result_path,
+        fastmcp_protocol::MAX_RESULT_ENCODED_BYTES,
+        INVALID_RESULT,
+    )?;
+    budget.remaining(cx)?;
+    let result_source = std::str::from_utf8(&result_bytes).map_err(|_| invalid_result())?;
+    let mut decoder_parameters = parameters.clone();
+    decoder_parameters["_meta"] = serde_json::to_value(fastmcp_protocol::FinalRequestMeta::new(
+        operation_input_capabilities(&connection.input_capability),
+    ))
+    .map_err(|_| invalid_result())?;
+    let request = CoreRequest::decode(ProtocolEra::Modern2026, method, Some(&decoder_parameters))
+        .map_err(|_| invalid_result())?;
+    let input_required = match request
+        .decode_result(result_source)
+        .map_err(|_| invalid_result())?
+    {
+        CoreResult::Final(
+            FinalCoreResult::ToolsCallInputRequired { result, .. }
+            | FinalCoreResult::ResourcesReadInputRequired { result, .. }
+            | FinalCoreResult::PromptsGetInputRequired { result, .. },
+        ) => result,
+        _ => return Err(invalid_result()),
+    };
+    budget.remaining(cx)?;
+    let response_bytes =
+        read_operation_resume_file(responses_path, 1024 * 1024, INVALID_RESPONSES)?;
+    let responses: FinalInputResponses =
+        serde_json::from_slice(&response_bytes).map_err(|_| invalid_responses())?;
+    let response_value: serde_json::Value =
+        serde_json::from_slice(&response_bytes).map_err(|_| invalid_responses())?;
+    if let Some(input_requests) = input_required.input_requests() {
+        // The full validator checks every descriptor, key, and response kind
+        // before MissingResponse. Only that final cardinality check may fail
+        // for an explicit partial answer; unrelated or mismatched input cannot.
+        match responses.validate_against(input_requests) {
+            Ok(()) | Err(FinalInputResponseCorrelationError::MissingResponse) => {}
+            Err(_) => {
+                return Err(fastmcp_core::McpError::invalid_params(
+                    "input responses do not match the saved input_required request keys and response kinds",
+                ));
+            }
+        }
+    } else if !responses.is_empty() {
+        return Err(fastmcp_core::McpError::invalid_params(
+            "a state-only input_required result requires an empty input responses object",
+        ));
+    }
+    budget.remaining(cx)?;
+    if input_required.input_requests().is_some() {
+        parameters["inputResponses"] = response_value;
+    }
+    if let Some(state) = input_required.request_state() {
+        parameters["requestState"] = state.into();
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct OperationBudget {
     deadline: std::time::Instant,
@@ -6364,7 +6562,8 @@ async fn cmd_operation(
     let budget = OperationBudget::new(connection.timeout)?;
     budget.remaining(cx)?;
     validate_cli_protocol_policy(connection.protocol_policy)?;
-    let parameters = operation.parameters(arguments)?;
+    validate_operation_input_policy(connection)?;
+    let mut parameters = operation.parameters(arguments)?;
     let has_http = connection.http_url.is_some()
         || connection.legacy_sse_url.is_some()
         || connection.legacy_message_url.is_some();
@@ -6373,6 +6572,7 @@ async fn cmd_operation(
             "operation requires either --server or explicit HTTP endpoints",
         ));
     }
+    apply_operation_resume(cx, connection, operation.method(), &mut parameters, budget)?;
     let result = if let Some(server) = connection.server.as_deref() {
         if connection.bearer_token_file.is_some() {
             return Err(fastmcp_core::McpError::invalid_params(
@@ -6416,7 +6616,7 @@ async fn cmd_operation(
             "tool returned isError=true; its result was emitted and no action was retried",
         )),
         OperationOutcome::InputRequired => Err(fastmcp_core::McpError::invalid_request(
-            "operation returned input_required; its result was emitted without submitting responses or retrying",
+            "operation returned input_required; its result was emitted; no further continuation was submitted",
         )),
         OperationOutcome::Complete => Ok(()),
         #[cfg(feature = "tasks")]
@@ -6501,7 +6701,8 @@ async fn http_operation(
         connection.legacy_message_url.as_deref(),
         connection.protocol_policy,
     )?;
-    let builder = http_client_builder(plan, connection.bearer_token_file.as_deref())?;
+    let builder = http_client_builder(plan, connection.bearer_token_file.as_deref())?
+        .capabilities(operation_input_capabilities(&connection.input_capability));
     let remaining = budget.remaining(cx)?;
     asupersync::time::timeout(
         cx.now(),
@@ -13960,6 +14161,60 @@ mod tests {
                 ])
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn operation_resume_cancellation_and_expired_budget_precede_file_access() {
+        for cancelled in [false, true] {
+            let cli = Cli::try_parse_from([
+                "fastmcp",
+                "call",
+                "echo",
+                "--http-url",
+                "http://127.0.0.1:1/mcp",
+                "--protocol-policy",
+                "modern-only",
+                "--input-capability",
+                "roots",
+                "--resume-result-file",
+                "/missing-resume-private/result.json",
+                "--input-responses-file",
+                "/missing-resume-private/answers.json",
+            ])
+            .unwrap();
+            let Commands::Call { connection, .. } = cli.command else {
+                panic!("parsed call command");
+            };
+            let runtime = build_cli_runtime().expect("CLI runtime");
+            runtime.block_on(async {
+                let cx = Cx::current().expect("ambient Cx");
+                let budget = if cancelled {
+                    cx.set_cancel_requested(true);
+                    OperationBudget::new(30).unwrap()
+                } else {
+                    OperationBudget {
+                        deadline: std::time::Instant::now(),
+                    }
+                };
+                let original = serde_json::json!({"name": "echo"});
+                let mut parameters = original.clone();
+                let error =
+                    apply_operation_resume(&cx, &connection, "tools/call", &mut parameters, budget)
+                        .expect_err(
+                            "cancelled or expired commands must stop before reading either file",
+                        );
+                assert_eq!(
+                    parameters, original,
+                    "failed preflight cannot attach continuation state"
+                );
+                if cancelled {
+                    assert_eq!(error.code, fastmcp_core::McpErrorCode::RequestCancelled);
+                } else {
+                    assert!(error.message.contains("--timeout"));
+                }
+                assert!(!error.message.contains("resume-private"));
+            });
         }
     }
 
