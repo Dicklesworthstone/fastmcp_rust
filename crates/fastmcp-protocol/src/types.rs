@@ -5887,8 +5887,8 @@ mod tests {
         use McpAppsSandboxPermission as P;
         for permission in P::ALL {
             for bits in 0_u8..32 {
-                let included = |bit| {
-                    if bits & (1 << bit) != 0 {
+                let included = |bit: u32| {
+                    if bits & (1_u8 << bit) != 0 {
                         vec![permission]
                     } else {
                         vec![]
