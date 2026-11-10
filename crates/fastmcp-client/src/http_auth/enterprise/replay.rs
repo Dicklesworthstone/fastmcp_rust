@@ -554,7 +554,7 @@ struct ReservationPermit<'a>(&'a AtomicUsize);
 impl<'a> ReservationPermit<'a> {
     fn new(pending: &'a AtomicUsize) -> Result<Self, IdentityAssertionReplayError> {
         pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 (value < MAX_PENDING_ASSERTION_RESERVATIONS).then(|| value + 1)
             })
             .map_err(|_| IdentityAssertionReplayError::Saturated)?;

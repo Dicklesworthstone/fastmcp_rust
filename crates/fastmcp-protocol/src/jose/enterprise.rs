@@ -45,9 +45,9 @@ pub const MAX_ENTERPRISE_SCOPE_COUNT: usize = 64;
 pub const MAX_ENTERPRISE_SCOPE_BYTES: usize = 256;
 pub const MAX_ENTERPRISE_SCOPE_SET_BYTES: usize = 4096;
 /// The local OIDC verifier admits lifetimes no longer than one day.
-pub const MAX_ENTERPRISE_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400);
+pub const MAX_ENTERPRISE_TOKEN_LIFETIME: Duration = Duration::from_hours(24);
 /// The ID-JAG profile further tightens that bound to fifteen minutes.
-pub const MAX_ID_JAG_LIFETIME: Duration = Duration::from_secs(900);
+pub const MAX_ID_JAG_LIFETIME: Duration = Duration::from_mins(15);
 pub const MAX_ENTERPRISE_CLOCK_SKEW: Duration = Duration::from_secs(300);
 
 const MAX_ACCESS_TOKEN_BYTES: usize = 4096;

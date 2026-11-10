@@ -572,10 +572,9 @@ impl RecoveryRate {
         if self.window.is_some_and(|start| now < start) {
             return Err(RestoreError::DeadlineExceeded);
         }
-        if self.window.is_none()
-            || self
-                .window
-                .is_some_and(|start| now.as_nanos() - start.as_nanos() >= 60_000_000_000)
+        if self
+            .window
+            .is_none_or(|start| now.as_nanos() - start.as_nanos() >= 60_000_000_000)
         {
             self.window = Some(now);
             self.count = 0;

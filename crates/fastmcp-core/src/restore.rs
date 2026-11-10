@@ -1171,7 +1171,7 @@ struct CounterLease<'a> {
 impl<'a> CounterLease<'a> {
     fn acquire(counter: &'a AtomicUsize, maximum: usize) -> Result<Self, RestoreError> {
         counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < maximum).then_some(n + 1)
             })
             .map_err(|_| RestoreError::CapacityExceeded)?;
@@ -1191,7 +1191,7 @@ impl OwnedIntentLease {
         let maximum = shared.configuration.limits.active_intents;
         shared
             .intents
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < maximum).then_some(n + 1)
             })
             .map_err(|_| RestoreError::CapacityExceeded)?;

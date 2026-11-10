@@ -80,7 +80,7 @@ const MAX_RETAINED_PEER_ACTIVITY: usize = 1_024;
 static NEXT_EXECUTOR_OPERATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn reserve_operator_generation(next: &AtomicU64) -> Option<u64> {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
         generation.checked_add(1)
     })
     .ok()

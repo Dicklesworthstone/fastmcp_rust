@@ -8074,7 +8074,7 @@ impl HttpConnectionLimiter {
 
     fn for_http(limit: usize, policy: ProtocolPolicy) -> McpResult<Self> {
         let generation = NEXT_HTTP_OPERATOR_GENERATION
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             })
             .map_err(|_| McpError::internal_error("HTTP listener generation exhausted"))?;

@@ -516,7 +516,7 @@ impl OutputQueue {
             state: Mutex::new(OutputState::default()),
             changed: Notify::new(),
             generation: NEXT_STDIO_OPERATOR_GENERATION
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                     value.checked_add(1)
                 })
                 .ok(),

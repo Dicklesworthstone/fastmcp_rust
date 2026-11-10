@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 use super::{EnterpriseVerificationError, ID_JAG_CLAIMS, numeric_date, validate_issuer};
 
 /// A finite review window; expiry never inherits a JWT clock-skew allowance.
-pub const MAX_DISCLOSURE_REVIEW_LIFETIME: Duration = Duration::from_secs(365 * 86_400);
+pub const MAX_DISCLOSURE_REVIEW_LIFETIME: Duration = Duration::from_hours(365 * 24);
 const MAX_POLICY_ID_BYTES: usize = 128;
 const MAX_PURPOSE_BYTES: usize = 256;
 const MAX_POLICY_BYTES: usize = 4096;
