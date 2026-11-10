@@ -515,3 +515,527 @@ fn memory_task_watch_pending_events_obey_original_retention_and_caller_deadline(
         }
     });
 }
+
+#[test]
+fn memory_task_watch_keeps_its_opening_clock_during_foreign_waiter_reconciliation() {
+    use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use std::sync::Arc;
+
+    run(|cx| async move {
+        let foreign_clock = Arc::new(VirtualClock::new());
+        foreign_clock.advance(3_600_000_000_000);
+        let foreign_timer = TimerDriverHandle::with_virtual_clock(foreign_clock);
+        let foreign_runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(foreign_timer.clone())
+            .build()
+            .unwrap();
+        let foreign = foreign_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
+        let live = McpRequestCancellation::new();
+        let mut sibling = client
+            .execute_core(&cx, &live, "tools/list", json!({}))
+            .await
+            .unwrap();
+        receive(&cx, &mut peer, "tools/list", Some(3)).await;
+        let mut watch = handle
+            .watch_with_memory(&cx, &mut client, &live)
+            .await
+            .unwrap();
+        listen(&cx, &mut peer, 4).await;
+        peer.send_async(&cx, &acknowledgement(4, json!([TASK_ID])))
+            .await
+            .unwrap();
+        assert!(matches!(
+            watch.next_event(&foreign, &live).await.unwrap(),
+            Some(FinalTaskWatchEvent::Acknowledged { .. })
+        ));
+        assert_eq!(
+            watch.stop_reason(),
+            None,
+            "a foreign clock cannot expire the opening budget"
+        );
+        let mut ambiguous = task("working", None, 1);
+        ambiguous["statusMessage"] = json!("requires an owner-bound read");
+        peer.send_async(&cx, &task_notification(4, ambiguous))
+            .await
+            .unwrap();
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                receive(&peer_cx, &mut peer, "tasks/get", Some(5)).await;
+                peer.send_async(&peer_cx, &task_response(5, task("completed", None, 2)))
+                    .await
+                    .unwrap();
+                receive_cancel(&peer_cx, &mut peer, 4).await;
+                peer.send_async(&peer_cx, &tools_response(3)).await.unwrap();
+                peer
+            })
+            .unwrap();
+        assert!(matches!(
+            watch.next_event(&foreign, &live).await.unwrap(),
+            Some(FinalTaskWatchEvent::TaskReconciled {
+                authoritative: FinalTask::Completed { .. },
+                ..
+            })
+        ));
+        assert_eq!(watch.stop_reason(), Some(FinalTaskWaitOutcome::Completed));
+        drop(watch);
+        assert!(matches!(
+            client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+            Some(crate::MemoryRequestEvent::Result(_))
+        ));
+        let peer = server.join(&cx).await.unwrap();
+        finish(&cx, &mut client, peer, vec![], 6).await;
+        assert_eq!(foreign_timer.pending_count(), 0);
+        drop(foreign);
+        assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
+    });
+}
+
+#[test]
+fn memory_task_watch_retains_opening_cancellation_with_a_fresh_waiter_token() {
+    run(|cx| async move {
+        let (mut client, mut handle, mut peer) = attached(&cx, task("working", None, 1)).await;
+        let live = McpRequestCancellation::new();
+        let origin = McpRequestCancellation::new();
+        let mut sibling = client
+            .execute_core(&cx, &live, "tools/list", json!({}))
+            .await
+            .unwrap();
+        receive(&cx, &mut peer, "tools/list", Some(3)).await;
+        let mut watch = handle
+            .watch_with_memory(&cx, &mut client, &origin)
+            .await
+            .unwrap();
+        listen(&cx, &mut peer, 4).await;
+        peer.send_async(&cx, &acknowledgement(4, json!([TASK_ID])))
+            .await
+            .unwrap();
+        watch.next_event(&cx, &live).await.unwrap();
+        origin.cancel();
+        assert!(watch.next_event(&cx, &live).await.unwrap().is_none());
+        assert_eq!(
+            watch.stop_reason(),
+            Some(FinalTaskWaitOutcome::ObservationCancelled)
+        );
+        assert!(!live.is_cancel_requested());
+        assert!(cx.checkpoint().is_ok());
+        drop(watch);
+        let mut server = cx
+            .spawn(move |peer_cx| async move {
+                receive_cancel(&peer_cx, &mut peer, 4).await;
+                peer.send_async(&peer_cx, &tools_response(3)).await.unwrap();
+                peer
+            })
+            .unwrap();
+        assert!(matches!(
+            client.next_event(&cx, &live, &mut sibling).await.unwrap(),
+            Some(crate::MemoryRequestEvent::Result(_))
+        ));
+        let peer = server.join(&cx).await.unwrap();
+        finish(&cx, &mut client, peer, vec![], 5).await;
+    });
+}
+
+mod watch_caller_lifetime {
+    use super::*;
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+    use asupersync::time::{TimerDriverHandle, VirtualClock};
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Waker};
+
+    const NO_IO: CapMask = CapSet::<true, true, true, false, true>::MASK;
+
+    fn clock_runtime(
+        offset: u64,
+    ) -> (
+        asupersync::runtime::Runtime,
+        Arc<VirtualClock>,
+        TimerDriverHandle,
+    ) {
+        let clock = Arc::new(VirtualClock::new());
+        clock.advance(offset);
+        let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        (runtime, clock, timer)
+    }
+
+    fn poll_as<F: Future>(future: Pin<&mut F>, caller: &Cx) -> Poll<F::Output> {
+        let _caller = Cx::set_current(Some(caller.clone()));
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    fn ready_as<F: Future>(future: F, caller: &Cx) -> F::Output {
+        match poll_as(pin!(future), caller) {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("this watch operation must be immediately decidable"),
+        }
+    }
+
+    #[derive(Default)]
+    struct Observed {
+        calls: Vec<(&'static str, Cx)>,
+        cancelled: usize,
+    }
+
+    struct Probe {
+        observed: Arc<Mutex<Observed>>,
+        events: VecDeque<StdioTaskSubscriptionEvent>,
+        cancel_on_read: Option<McpRequestCancellation>,
+    }
+
+    impl Probe {
+        fn record(&self, method: &'static str, cx: &Cx) {
+            let active = Cx::current().unwrap();
+            assert_eq!(active.task_id(), cx.task_id());
+            assert_eq!(active.now(), cx.now());
+            assert_eq!(active.capabilities().io, cx.capabilities().io);
+            self.observed.lock().unwrap().calls.push((method, active));
+        }
+    }
+
+    impl TaskWaitTransport for Probe {
+        type Error = McpError;
+
+        async fn read_task(
+            &mut self,
+            cx: &Cx,
+            _: &McpRequestCancellation,
+            _: FinalTaskId,
+        ) -> McpResult<FinalTask> {
+            self.record("read", cx);
+            if let Some(cancellation) = &self.cancel_on_read {
+                cancellation.cancel();
+            }
+            Ok(serde_json::from_value(task("completed", None, 2)).unwrap())
+        }
+    }
+
+    impl TaskWatchTransport for Probe {
+        type Owner = RequestId;
+
+        fn watch_timeout(&self) -> Duration {
+            Duration::from_secs(30)
+        }
+        fn live_watch_id(&self) -> Option<RequestId> {
+            None
+        }
+
+        async fn open_watch(
+            &mut self,
+            cx: &Cx,
+            _: &McpRequestCancellation,
+            _: SubscriptionFilter,
+            owner: &mut Option<RequestId>,
+        ) -> McpResult<()> {
+            self.record("open", cx);
+            *owner = Some(RequestId::Number(17));
+            Ok(())
+        }
+
+        async fn next_watch_event(
+            &mut self,
+            cx: &Cx,
+            _: &McpRequestCancellation,
+            _: &mut RequestId,
+        ) -> McpResult<StdioTaskSubscriptionEvent> {
+            self.record("event", cx);
+            match self.events.pop_front() {
+                Some(event) => Ok(event),
+                None => std::future::pending().await,
+            }
+        }
+
+        async fn cancel_watch(&mut self, _: &Cx, _: &mut RequestId) -> McpResult<()> {
+            self.observed.lock().unwrap().cancelled += 1;
+            Ok(())
+        }
+
+        fn abandon_watch(&mut self, _: RequestId) {
+            self.observed.lock().unwrap().cancelled += 1;
+        }
+    }
+
+    fn probe() -> (Probe, Arc<Mutex<Observed>>, FinalTaskHandle) {
+        let observed = Arc::new(Mutex::new(Observed::default()));
+        let mut accepted = SubscriptionFilter::default();
+        fastmcp_protocol::set_task_subscription_ids(
+            &mut accepted,
+            vec![FinalTaskId::parse(TASK_ID).unwrap()],
+        )
+        .unwrap();
+        let mut ambiguous = task("working", None, 1);
+        ambiguous["statusMessage"] = json!("conflicting timestamp");
+        let notification =
+            serde_json::from_value(serde_json::to_value(task_notification(17, ambiguous)).unwrap())
+                .unwrap();
+        (
+            Probe {
+                observed: Arc::clone(&observed),
+                cancel_on_read: None,
+                events: VecDeque::from([
+                    StdioTaskSubscriptionEvent::Acknowledged(accepted),
+                    StdioTaskSubscriptionEvent::Notification(notification),
+                ]),
+            },
+            observed,
+            FinalTaskHandle::new(serde_json::from_value(task("working", None, 1)).unwrap()),
+        )
+    }
+
+    #[test]
+    fn watch_origin_deadline_is_not_replaced_by_an_ahead_or_behind_waiter_clock() {
+        for (owner_offset, waiter_offset) in [(0, 3_600_000_000_000), (3_600_000_000_000, 0)] {
+            let (runtime, clock, timer) = clock_runtime(owner_offset);
+            let owner = runtime.request_cx_with_budget(
+                asupersync::Budget::INFINITE
+                    .with_deadline(Time::from_nanos(owner_offset + 1_000_000_000)),
+            );
+            let (waiter_runtime, _, waiter_timer) = clock_runtime(waiter_offset);
+            let waiter = waiter_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (mut probe, observed, mut handle) = probe();
+            let live = McpRequestCancellation::new();
+            let mut watch = ready_as(
+                open_task_stream_watch(&mut handle, &owner, &mut probe, &live),
+                &owner,
+            )
+            .unwrap();
+            assert!(matches!(
+                ready_as(next_task_stream_event(&mut watch, &waiter, &live), &waiter).unwrap(),
+                Some(FinalTaskWatchEvent::Acknowledged { .. })
+            ));
+            clock.advance(1_000_000_000);
+            assert!(
+                ready_as(next_task_stream_event(&mut watch, &waiter, &live), &waiter)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                watch.stop_reason(),
+                Some(FinalTaskWaitOutcome::DeadlineElapsed)
+            );
+            drop(watch);
+            let observed = observed.lock().unwrap();
+            assert_eq!(
+                observed
+                    .calls
+                    .iter()
+                    .map(|(method, _)| *method)
+                    .collect::<Vec<_>>(),
+                ["open", "event"]
+            );
+            assert_eq!(observed.cancelled, 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(waiter_timer.pending_count(), 0);
+            drop(observed);
+            drop(owner);
+            drop(waiter);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(waiter_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn watch_reconciliation_retains_opening_authority_and_meets_waiter_effects() {
+        for restricted_origin in [true, false] {
+            let (runtime, _, timer) = clock_runtime(0);
+            let owner = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (waiter_runtime, _, waiter_timer) = clock_runtime(3_600_000_000_000);
+            let waiter = waiter_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+            let (mut probe, observed, mut handle) = probe();
+            let live = McpRequestCancellation::new();
+            let mut watch = {
+                let _owner = Cx::set_current(Some(owner.clone()));
+                let _restriction = Cx::push_restriction(if restricted_origin {
+                    NO_IO
+                } else {
+                    CapMask::all()
+                });
+                ready_as(
+                    open_task_stream_watch(&mut handle, &owner, &mut probe, &live),
+                    &Cx::current().unwrap(),
+                )
+                .unwrap()
+            };
+            let waiter = if restricted_origin {
+                waiter
+            } else {
+                let _waiter = Cx::set_current(Some(waiter));
+                let _restriction = Cx::push_restriction(NO_IO);
+                Cx::current().unwrap()
+            };
+            ready_as(next_task_stream_event(&mut watch, &waiter, &live), &waiter).unwrap();
+            assert!(matches!(
+                ready_as(next_task_stream_event(&mut watch, &waiter, &live), &waiter).unwrap(),
+                Some(FinalTaskWatchEvent::TaskReconciled { .. })
+            ));
+            drop(watch);
+            let observed = observed.lock().unwrap();
+            let read = observed
+                .calls
+                .iter()
+                .find(|(method, _)| *method == "read")
+                .unwrap();
+            assert_eq!(read.1.task_id(), owner.task_id());
+            assert_eq!(read.1.now(), owner.now());
+            assert!(
+                !read.1.capabilities().io,
+                "neither a later waiter nor reconciliation may restore denied effects"
+            );
+            assert_eq!(observed.cancelled, 1);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(waiter_timer.pending_count(), 0);
+            drop(observed);
+            drop(owner);
+            drop(waiter);
+            assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+            assert!(waiter_runtime.shutdown_timeout(Duration::from_secs(1)));
+        }
+    }
+
+    #[test]
+    fn waiter_cancellation_during_reconciliation_preserves_the_admitted_snapshot() {
+        let (runtime, _, timer) = clock_runtime(0);
+        let owner = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (waiter_runtime, _, waiter_timer) = clock_runtime(3_600_000_000_000);
+        let waiter = waiter_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (mut probe, observed, mut handle) = probe();
+        let before = serde_json::to_vec(handle.task()).unwrap();
+        let origin_token = McpRequestCancellation::new();
+        let waiter_token = McpRequestCancellation::new();
+        probe.cancel_on_read = Some(waiter_token.clone());
+        let mut watch = ready_as(
+            open_task_stream_watch(&mut handle, &owner, &mut probe, &origin_token),
+            &owner,
+        )
+        .unwrap();
+        ready_as(
+            next_task_stream_event(&mut watch, &waiter, &waiter_token),
+            &waiter,
+        )
+        .unwrap();
+        assert!(
+            ready_as(
+                next_task_stream_event(&mut watch, &waiter, &waiter_token),
+                &waiter
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            watch.stop_reason(),
+            Some(FinalTaskWaitOutcome::ObservationCancelled)
+        );
+        assert_eq!(serde_json::to_vec(watch.task()).unwrap(), before);
+        assert!(!origin_token.is_cancel_requested());
+        assert!(owner.checkpoint().is_ok());
+        drop(watch);
+        assert_eq!(observed.lock().unwrap().cancelled, 1);
+        assert_eq!(timer.pending_count(), 0);
+        assert_eq!(waiter_timer.pending_count(), 0);
+        drop(owner);
+        drop(waiter);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(waiter_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn pending_watch_waiter_deadline_uses_its_own_clock_and_releases_both_timers() {
+        let (runtime, _, owner_timer) = clock_runtime(3_600_000_000_000);
+        let owner = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (waiter_runtime, waiter_clock, waiter_timer) = clock_runtime(0);
+        let waiter = waiter_runtime.request_cx_with_budget(
+            asupersync::Budget::INFINITE.with_deadline(Time::from_nanos(1_000_000_000)),
+        );
+        let (mut probe, observed, mut handle) = probe();
+        probe.events.clear();
+        let live = McpRequestCancellation::new();
+        let mut watch = ready_as(
+            open_task_stream_watch(&mut handle, &owner, &mut probe, &live),
+            &owner,
+        )
+        .unwrap();
+        {
+            let mut waiting = Box::pin(next_task_stream_event(&mut watch, &waiter, &live));
+            assert!(poll_as(waiting.as_mut(), &waiter).is_pending());
+            assert!(owner_timer.pending_count() > 0);
+            assert!(waiter_timer.pending_count() > 0);
+            waiter_clock.advance(1_000_000_000);
+            let _ = waiter_timer.process_timers();
+            assert!(matches!(
+                poll_as(waiting.as_mut(), &waiter),
+                Poll::Ready(Ok(None))
+            ));
+        }
+        assert_eq!(
+            watch.stop_reason(),
+            Some(FinalTaskWaitOutcome::DeadlineElapsed)
+        );
+        assert_eq!(owner.now().as_nanos(), 3_600_000_000_000);
+        assert!(!live.is_cancel_requested());
+        assert!(owner.checkpoint().is_ok());
+        drop(watch);
+        assert_eq!(observed.lock().unwrap().cancelled, 1);
+        assert_eq!(owner_timer.pending_count(), 0);
+        assert_eq!(waiter_timer.pending_count(), 0);
+        drop(owner);
+        drop(waiter);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+        assert!(waiter_runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn waiter_cancellation_cannot_hide_an_already_committed_event() {
+        let (runtime, _, timer) = clock_runtime(0);
+        let waiter = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let cancellation = McpRequestCancellation::new();
+        let committed = std::cell::Cell::new(false);
+        let operation = poll_fn(|_| {
+            committed.set(true);
+            cancellation.cancel();
+            Poll::Ready("committed event")
+        });
+        assert_eq!(
+            ready_as(
+                guard_task_watch_waiter(&waiter, &cancellation, operation),
+                &waiter,
+            ),
+            Ok("committed event")
+        );
+        assert!(committed.get());
+        assert!(cancellation.is_cancel_requested());
+        assert_eq!(timer.pending_count(), 0);
+        drop(waiter);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn waiter_cancellation_during_an_uncommitted_poll_stops_observation() {
+        let (runtime, _, timer) = clock_runtime(0);
+        let waiter = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let cancellation = McpRequestCancellation::new();
+        let polls = std::cell::Cell::new(0);
+        let operation = poll_fn(|_| {
+            polls.set(polls.get() + 1);
+            cancellation.cancel();
+            Poll::<()>::Pending
+        });
+        assert_eq!(
+            ready_as(
+                guard_task_watch_waiter(&waiter, &cancellation, operation),
+                &waiter,
+            ),
+            Err(FinalTaskWaitOutcome::ObservationCancelled)
+        );
+        assert_eq!(polls.get(), 1);
+        assert_eq!(timer.pending_count(), 0);
+        drop(waiter);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+}
