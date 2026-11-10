@@ -4134,12 +4134,10 @@ fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Option<String> 
         return normalize_absolute_uri_reference(reference);
     }
     let base = base?;
-    let base_uri =
-        AbsoluteUri::parse_with_max_bytes(base, MAX_SCHEMA_ASSERTION_STRING_BYTES).ok()?;
+    let base_uri = AbsoluteUri::parse_with_max_bytes(base, MAX_SCHEMA_ASSERTION_STRING_BYTES)
+        .ok()
+        .filter(|uri| uri.fragment().is_none())?;
     let scheme = base_uri.scheme().as_str();
-    let (base_without_query, base_query) = base
-        .split_once('?')
-        .map_or((base, None), |(value, query)| (value, Some(query)));
     let (reference_path, reference_query) = reference
         .split_once('?')
         .map_or((reference, None), |(path, query)| (path, Some(query)));
@@ -4147,21 +4145,43 @@ fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Option<String> 
         let resolved = format!("{scheme}:{reference}");
         return normalize_absolute_uri_reference(&resolved);
     }
-    let hierarchy = base_without_query
-        .strip_prefix(&format!("{scheme}:"))
-        .filter(|value| value.starts_with("//"))?;
-    let authority_end = hierarchy[2..]
-        .find('/')
-        .map_or(hierarchy.len(), |index| index + 2);
-    let origin = format!("{scheme}:{}", &hierarchy[..authority_end]);
-    let base_path = &hierarchy[authority_end..];
+    // A path-noscheme first segment cannot contain ':'. Valid absolute
+    // schemes were handled above; merging an invalid one such as `1:child`
+    // into the base path must not silently turn it into an admitted URI.
+    if !reference_path.starts_with('/')
+        && reference_path
+            .split('/')
+            .next()
+            .is_some_and(|segment| segment.contains(':'))
+    {
+        return None;
+    }
+    // RFC 3986 resolution inherits an optional authority, not a mandatory
+    // network origin. Bundled file:/ and custom-scheme resources use the same
+    // path/query rules without acquiring filesystem or network authority.
+    let hierarchy = base_uri.hier_part();
+    let (prefix, base_path, has_authority) =
+        if let Some(authority_and_path) = hierarchy.strip_prefix("//") {
+            let authority_end = authority_and_path
+                .find('/')
+                .map_or(hierarchy.len(), |index| index + 2);
+            (
+                format!("{scheme}:{}", &hierarchy[..authority_end]),
+                &hierarchy[authority_end..],
+                true,
+            )
+        } else {
+            (format!("{scheme}:"), hierarchy, false)
+        };
     let path = if reference_path.is_empty() {
         base_path.to_owned()
     } else if reference_path.starts_with('/') {
         remove_uri_dot_segments(reference_path)
     } else {
         let directory_end = base_path.rfind('/').map_or(0, |index| index + 1);
-        let directory = if base_path.is_empty() {
+        // Section 5.2.3 adds a leading slash for an empty path only when
+        // the base actually has an authority, including an empty authority.
+        let directory = if has_authority && base_path.is_empty() {
             "/"
         } else {
             &base_path[..directory_end]
@@ -4171,14 +4191,15 @@ fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Option<String> 
     // RFC 3986 section 5.2.2 inherits the base query only when the reference
     // has neither a path nor a query. A query-only reference replaces it, and
     // every non-empty path starts with no query unless it declares one.
-    let query = match (reference_path.is_empty(), reference_query, base_query) {
+    let query = match (reference_path.is_empty(), reference_query, base_uri.query()) {
         (_, Some(query), _) => format!("?{query}"),
         (true, None, Some(query)) => format!("?{query}"),
         (true, None, None) | (false, None, _) => String::new(),
     };
-    let resolved = format!("{origin}{path}{query}");
+    let resolved = format!("{prefix}{path}{query}");
     AbsoluteUri::parse_with_max_bytes(&resolved, MAX_SCHEMA_ASSERTION_STRING_BYTES)
         .ok()
+        .filter(|uri| uri.fragment().is_none())
         .map(|uri| uri.as_str().to_owned())
 }
 
@@ -9238,6 +9259,201 @@ mod tests {
             schema
                 .validate(&json!("ready"))
                 .expect("the authority-relative child reference reaches its local resource");
+        }
+    }
+
+    #[test]
+    fn authorityless_schema_resources_preserve_nested_reference_scopes() {
+        for base in [
+            "file:/schemas/root.json?edition=1",
+            "schema:/schemas/root.json?edition=1",
+            "schema:schemas/root.json?edition=1",
+        ] {
+            let source = json!({
+                "$schema": FINAL_JSON_SCHEMA_DIALECT,
+                "$id": base,
+                "$anchor": "rootOnly",
+                "$defs": {
+                    "outer": {
+                        "$id": "objects/outer.json",
+                        "$anchor": "outer",
+                        "type": "object",
+                        "properties": {
+                            "local": {"$ref": "#value"},
+                            "relative": {"$ref": "inner.json#inner"},
+                            "root": {"$ref": "/shared.json#shared"},
+                            "query": {"$ref": "?revision=2#revision"}
+                        },
+                        "required": ["local", "relative", "root", "query"],
+                        "$defs": {
+                            "value": {"$anchor": "value", "type": "integer"},
+                            "inner": {
+                                "$id": "inner.json",
+                                "$anchor": "inner",
+                                "type": "string"
+                            },
+                            "query": {
+                                "$id": "?revision=2",
+                                "$anchor": "revision",
+                                "type": "boolean"
+                            }
+                        }
+                    },
+                    "shared": {
+                        "$id": "/shared.json",
+                        "$anchor": "shared",
+                        "const": "shared"
+                    }
+                },
+                "$ref": "objects/outer.json#outer"
+            });
+            let admitted = admit_final_schema(source.clone())
+                .expect("bundled authorityless resources admit without external I/O");
+            let instance = json!({
+                "local": 7, "relative": "ready", "root": "shared", "query": true
+            });
+            admitted
+                .validate(&instance)
+                .expect("nested, rooted, query-only and fragment references retain their scopes");
+            let mut wrong_instance = instance;
+            wrong_instance["query"] = json!("not a boolean");
+            assert!(
+                admitted.validate(&wrong_instance).is_err(),
+                "the query-selected resource must actually enforce its schema"
+            );
+            assert_eq!(admitted.schema(), &source);
+
+            let mut wrong_scope = source.clone();
+            wrong_scope["$defs"]["outer"]["properties"]["local"]["$ref"] =
+                json!("#rootOnly");
+            let error = admit_final_schema(wrong_scope)
+                .expect_err("an inner fragment cannot escape to an outer resource's anchor");
+            assert_eq!(error.path(), "$.$defs.outer.properties.local.$ref");
+            assert_eq!(error.reason(), "unresolved local schema reference");
+
+            let mut missing = source.clone();
+            missing["$ref"] = json!("objects/missing.json#outer");
+            let error = admit_final_schema(missing)
+                .expect_err("an unbundled file or custom resource is never loaded externally");
+            assert_eq!(error.path(), "$.$ref");
+            assert_eq!(error.reason(), "external schema reference is not allowed");
+
+            let mut wrong_query = source.clone();
+            wrong_query["$defs"]["outer"]["properties"]["query"]["$ref"] =
+                json!("?revision=3#revision");
+            let error = admit_final_schema(wrong_query)
+                .expect_err("changing only the query cannot select a bundled sibling resource");
+            assert_eq!(error.path(), "$.$defs.outer.properties.query.$ref");
+            assert_eq!(error.reason(), "external schema reference is not allowed");
+
+            let mut invalid = source;
+            invalid["$ref"] = json!("objects/%ZZ.json#outer");
+            let error = admit_final_schema(invalid)
+                .expect_err("invalid percent encoding remains an admission error");
+            assert_eq!(error.path(), "$.$ref");
+            assert_eq!(error.reason(), "invalid local schema reference");
+        }
+    }
+
+    #[test]
+    fn authorityless_reference_resolution_preserves_component_presence_and_bounds() {
+        let vectors = [
+            ("file:/a/b?base=1", "child", "file:/a/child"),
+            ("file:/a/b?base=1", "../child", "file:/child"),
+            ("file:/a/b?base=1", "/child", "file:/child"),
+            ("file:/a/b?base=1", "?next=1", "file:/a/b?next=1"),
+            ("file:/a/b?base=1", "?", "file:/a/b?"),
+            ("file:/a/b?base=1", "", "file:/a/b?base=1"),
+            ("file:/a/b?", "", "file:/a/b?"),
+            ("file:/a/b", "", "file:/a/b"),
+            ("schema:a/b?base=1", "child", "schema:a/child"),
+            ("schema:a/b?base=1", "?", "schema:a/b?"),
+            ("schema:a/b?base=1", "/child", "schema:/child"),
+            ("schema:a/b", "//host/child", "schema://host/child"),
+            ("schema:a/b", "other:/child", "other:/child"),
+            ("schema:", "child", "schema:child"),
+            ("schema:/", "child", "schema:/child"),
+            ("schema://", "child", "schema:///child"),
+            ("file:/a//b", "child", "file:/a//child"),
+            ("file:/a/b", "child/.", "file:/a/child/"),
+            ("file:/a/b", "child/..", "file:/a/"),
+            ("file:/a/b", "?path=/../x", "file:/a/b?path=/../x"),
+            ("file:/a/b", "%2E%2E/child", "file:/a/%2E%2E/child"),
+            ("file:/a/b", "./1:child", "file:/a/1:child"),
+            ("file:/a/b", "child/1:leaf", "file:/a/child/1:leaf"),
+        ];
+        for (base, reference, expected) in vectors {
+            assert_eq!(
+                resolve_uri_reference(Some(base), reference).as_deref(),
+                Some(expected),
+                "reference {reference:?} against {base:?}"
+            );
+        }
+        for reference in [
+            "bad%", "bad%2", "bad%ZZ", "bad path", "é", "child#fragment", "1:child", ":child",
+        ] {
+            assert!(
+                resolve_uri_reference(Some("file:/schemas/root"), reference).is_none(),
+                "document identifiers do not relax syntax or retain fragments: {reference:?}"
+            );
+        }
+        let overlong = "x".repeat(MAX_SCHEMA_ASSERTION_STRING_BYTES + 1);
+        assert!(resolve_uri_reference(Some("file:/schemas/root"), &overlong).is_none());
+        let bounded_input = "x".repeat(MAX_SCHEMA_ASSERTION_STRING_BYTES);
+        assert!(
+            resolve_uri_reference(Some("file:/schemas/root"), &bounded_input).is_none(),
+            "the fully resolved identifier must also fit the existing byte limit"
+        );
+    }
+
+    #[test]
+    fn rfc3986_normal_and_abnormal_path_resolution_examples() {
+        // RFC 3986 sections 5.4.1 and 5.4.2. Fragment selection is handled by
+        // resolve_local_reference, after this document-identifier operation.
+        let vectors = [
+            ("g:h", "g:h"),
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            ("//g", "http://g"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            (";x", "http://a/b/c/;x"),
+            ("g;x", "http://a/b/c/g;x"),
+            ("", "http://a/b/c/d;p?q"),
+            (".", "http://a/b/c/"),
+            ("./", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../..", "http://a/"),
+            ("../../", "http://a/"),
+            ("../../g", "http://a/g"),
+            ("../../../g", "http://a/g"),
+            ("../../../../g", "http://a/g"),
+            ("/./g", "http://a/g"),
+            ("/../g", "http://a/g"),
+            ("g.", "http://a/b/c/g."),
+            (".g", "http://a/b/c/.g"),
+            ("g..", "http://a/b/c/g.."),
+            ("..g", "http://a/b/c/..g"),
+            ("./../g", "http://a/b/g"),
+            ("./g/.", "http://a/b/c/g/"),
+            ("g/./h", "http://a/b/c/g/h"),
+            ("g/../h", "http://a/b/c/h"),
+            ("g;x=1/./y", "http://a/b/c/g;x=1/y"),
+            ("g;x=1/../y", "http://a/b/c/y"),
+            ("g?y/./x", "http://a/b/c/g?y/./x"),
+            ("g?y/../x", "http://a/b/c/g?y/../x"),
+            ("http:g", "http:g"),
+        ];
+        for (reference, expected) in vectors {
+            assert_eq!(
+                resolve_uri_reference(Some("http://a/b/c/d;p?q"), reference).as_deref(),
+                Some(expected),
+                "RFC 3986 reference {reference:?}"
+            );
         }
     }
 
