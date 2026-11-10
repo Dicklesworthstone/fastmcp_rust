@@ -11467,42 +11467,56 @@ impl LegacySsePersistentReceiver {
             armed: true,
         };
         let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
-        if let Err(error) = self
+        let sent = self
             .outbound
             .send(cx, &JsonRpcMessage::Request(request))
-            .await
+            .await;
+        pending_post.armed = false;
+        drop(pending_post);
+        if let Err(LegacySseOutboundSendError {
+            error,
+            request_may_have_reached_peer,
+        }) = sent
         {
-            let LegacySseOutboundSendError {
-                error,
-                request_may_have_reached_peer,
-            } = error;
-            pending_post.armed = false;
-            drop(pending_post);
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.stopped {
-                return Err(if matches!(error, LegacySseHttpClientError::StreamGenerationEnded) {
-                    state.stopped_error()
+            // The SSE response can outrun the POST acknowledgement: a peer may
+            // answer and end the generation before its 202 is read, and the
+            // ended generation then aborts the POST. The reader removes a
+            // waiter only to route its terminal outcome, which it sends after
+            // releasing this lock; a stopped reader has finished every routing
+            // it began and dropped the remaining waiters. Once the reader owns
+            // the outcome of a request that may have reached the peer, the
+            // POST's own failure must not discard it: the returned waiter
+            // delivers that outcome, or the stop if the reader dropped it.
+            let reader_owns_outcome = request_may_have_reached_peer
+                && (receiver.is_ready() || (!state.stopped && !state.pending.contains_key(&key)));
+            if !reader_owns_outcome {
+                if state.stopped {
+                    return Err(
+                        if matches!(error, LegacySseHttpClientError::StreamGenerationEnded) {
+                            state.stopped_error()
+                        } else {
+                            ClientHttpConnectionError::Legacy(error)
+                        },
+                    );
+                }
+                if request_may_have_reached_peer {
+                    let retired =
+                        retire_abandoned_persistent_waiter(&mut state, &key, request_id);
+                    let gate = Arc::clone(&state.post_gate);
+                    drop(state);
+                    gate.wake_stopped_posts();
+                    retired?;
                 } else {
-                    ClientHttpConnectionError::Legacy(error)
-                });
+                    state.pending.remove(&key);
+                    state.pending_changed();
+                }
+                return Err(ClientHttpConnectionError::Legacy(error));
             }
-            if request_may_have_reached_peer {
-                let retired = retire_abandoned_persistent_waiter(&mut state, &key, request_id);
-                let gate = Arc::clone(&state.post_gate);
-                drop(state);
-                gate.wake_stopped_posts();
-                retired?;
-            } else {
-                state.pending.remove(&key);
-                state.pending_changed();
-            }
-            return Err(ClientHttpConnectionError::Legacy(error));
         }
-        pending_post.armed = false;
-        drop(pending_post);
         deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -22919,9 +22933,12 @@ mod tests {
     fn public_legacy_receiver_eof_cancels_pending_message_posts() {
         // Exercise a quiet response-head wait and a quiet response-body wait.
         // Each negative differs from its positive only in whether the peer ends
-        // the generation before completing its POST acknowledgement.
+        // the generation before completing its POST acknowledgement. A peer
+        // that answers on SSE before ending the generation has completed the
+        // request even though the POST acknowledgement never arrives.
         for waiting_for_body in [false, true] {
-            for end_generation in [false, true] {
+            for (end_generation, answer_before_end) in [(false, false), (true, false), (true, true)]
+            {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
@@ -22979,6 +22996,15 @@ mod tests {
                         post.flush().unwrap();
                     }
                     if end_generation {
+                        if answer_before_end {
+                            let response = serde_json::json!({
+                                "jsonrpc":"2.0", "id":request["id"], "result":{"tools":[]}
+                            });
+                            write_chunked_sse_event(
+                                &mut sse,
+                                &format!("event: message\ndata: {response}\n\n"),
+                            );
+                        }
                         finish_chunked_sse(&mut sse);
                         // Keep the POST socket quiet until the client reports
                         // completion. Socket closure is not what wakes its wait.
@@ -23035,7 +23061,7 @@ mod tests {
                         client.request(&cx, "tools/list", serde_json::json!({})),
                     ))
                     .expect("SSE invalidation wakes a quiet native POST");
-                if end_generation {
+                if end_generation && !answer_before_end {
                     assert!(matches!(result,
                         Err(crate::HttpClientError::Connection(ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref error)))
                         if matches!(error.as_ref(), LegacySseHttpClientError::StreamGenerationEnded)));
