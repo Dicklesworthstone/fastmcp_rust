@@ -3363,6 +3363,7 @@ impl ServerBuilder {
             #[cfg(feature = "proxy")]
             catalog_relay,
             final_subscriptions,
+            subscription_publisher_owner: Arc::new(()),
         }
     }
 }

@@ -70,6 +70,22 @@ impl ManagedOAuthResourceTemplate {
         &self.definition
     }
 
+    /// Selects updates for one exact, reversibly matched resource URI.
+    ///
+    /// Construct before registering the handler. Namespace prefixes and
+    /// captured URI parameters never rewrite the selected wire identity.
+    /// Invalid or client-direct targets fail before credential acquisition.
+    pub fn update_subscription(
+        &self,
+        uri: &str,
+    ) -> McpResult<super::subscriptions::ManagedOAuthResourceSelector> {
+        let target = self.admit_uri(uri)?;
+        Ok(super::subscriptions::ManagedOAuthResourceSelector::new(
+            Arc::clone(&self.forwarder.next_id),
+            target,
+        ))
+    }
+
     async fn invoke(
         &self,
         ctx: &McpContext,
@@ -78,6 +94,21 @@ impl ManagedOAuthResourceTemplate {
     ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
         ctx.checkpoint()?;
         super::check_cx(cx)?;
+        self.admit_uri(uri)?;
+        // Do not reconstruct from caller-supplied UriParams, percent-decode
+        // twice, or prepend the provider namespace. The matched wire identity
+        // is the only resource selector authorized by this handler.
+        match self
+            .forwarder
+            .execute(ctx, cx, "resources/read", json!({"uri": uri}))
+            .await?
+        {
+            FinalCoreResult::ResourcesRead { result, .. } => Ok(result),
+            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
+        }
+    }
+
+    fn admit_uri(&self, uri: &str) -> McpResult<AbsoluteUri> {
         // A variable in the scheme position can expand to HTTPS even though
         // the catalog template does not literally begin with it. Apply the
         // server's URI-use policy to the actual target before authenticated I/O.
@@ -95,17 +126,7 @@ impl ManagedOAuthResourceTemplate {
         {
             return Err(route_error());
         }
-        // Do not reconstruct from caller-supplied UriParams, percent-decode
-        // twice, or prepend the provider namespace. The matched wire identity
-        // is the only resource selector authorized by this handler.
-        match self
-            .forwarder
-            .execute(ctx, cx, "resources/read", json!({"uri": uri}))
-            .await?
-        {
-            FinalCoreResult::ResourcesRead { result, .. } => Ok(result),
-            _ => Err(McpError::invalid_request(UNEXPECTED_RESULT)),
-        }
+        Ok(target)
     }
 }
 
@@ -363,6 +384,31 @@ mod tests {
             template.final_resource_read_cache_hint_provenance(),
             FinalResourceReadCacheHintProvenance::Explicit
         );
+    }
+
+    #[test]
+    fn update_subscription_retains_the_reversible_template_identity() {
+        let (template, backend) = fixture(vec![], false);
+        let selected = template
+            .update_subscription("report://monthly/a%2Fb")
+            .unwrap();
+        assert_eq!(selected.uri().as_str(), "report://monthly/a%2Fb");
+        assert!(
+            template
+                .update_subscription("report://monthly/a/b")
+                .is_err()
+        );
+        assert!(
+            template
+                .update_subscription("report://other/a%2Fb")
+                .is_err()
+        );
+        assert!(
+            template
+                .update_subscription("https://monthly/a%2Fb")
+                .is_err()
+        );
+        assert!(backend.calls.lock().unwrap().is_empty());
     }
 
     #[test]

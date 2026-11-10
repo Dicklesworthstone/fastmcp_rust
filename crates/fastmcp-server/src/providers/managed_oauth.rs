@@ -46,6 +46,8 @@ pub mod dynamic;
 pub mod headers;
 /// Opt-in, request-owned host resolution of upstream input-required workflows.
 pub mod interaction;
+/// Caller-owned relay of authenticated updates for explicitly selected resources.
+pub mod subscriptions;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -11,6 +11,8 @@
 mod managed_provider;
 #[path = "http_continuation_recovery/provider_headers.rs"]
 mod provider_headers;
+#[path = "http_continuation_recovery/provider_updates.rs"]
+mod provider_updates;
 #[path = "http_continuation_recovery/schema_bound.rs"]
 mod schema_bound;
 #[path = "http_continuation_recovery/schema_driver.rs"]
@@ -616,6 +618,7 @@ enum Case {
     Abandon,
     Endpoint,
     Provider(managed_provider::Case),
+    ProviderUpdates(provider_updates::Case),
     SchemaBound(schema_bound::Case),
     SchemaDriver(schema_driver::Case),
     ProviderHeaders(provider_headers::Case),
@@ -695,6 +698,10 @@ fn run(case: Case) {
         });
 }
 async fn scenario(cx: Cx, case: Case) {
+    if let Case::ProviderUpdates(selected) = case {
+        Box::pin(provider_updates::scenario(cx, selected)).await;
+        return;
+    }
     if let Case::ProviderHeaders(selected) = case {
         Box::pin(provider_headers::scenario(cx, selected)).await;
         return;

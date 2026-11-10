@@ -464,7 +464,7 @@ pub mod server {
         ExtensionHandlerLookupError, ExtensionHandlerRegistrationError, ExtensionHandlerRegistry,
         FinalElicitation, FinalElicitationContextExt, FinalMethodOutcome,
         FinalResourceReadCacheHintProvenance, FinalRoots, FinalRootsContextExt, FinalSampling,
-        FinalSamplingContextExt, FinalToolOutcome, FinalToolSchemaAuthority,
+        FinalSamplingContextExt, FinalSubscriptionPublisher, FinalToolOutcome, FinalToolSchemaAuthority,
         HttpConnectionAdmissionError, HttpConnectionAdmissionPermit, HttpConnectionAdmissionProbe,
         HttpNonquiescentShutdown, HttpOperatorHandle, HttpServerConfig, HttpServerShutdown,
         HttpShutdownSettlement, InboundRequestContext, InboundRequestTransport, LifespanHooks,
@@ -2741,6 +2741,13 @@ pub mod auto {
             notification: crate::ServerNotification,
         ) -> McpResult<usize> {
             self.inner.publish_subscription_notification(notification)
+        }
+
+        /// Retains weak publication access after moving this server into its
+        /// caller-owned HTTP/stdio lifecycle. No producer task is started.
+        #[must_use]
+        pub fn subscription_publisher(&self) -> crate::server::FinalSubscriptionPublisher {
+            self.inner.subscription_publisher()
         }
 
         pub fn open_subscription_listen(
@@ -8449,6 +8456,13 @@ pub mod modern {
             notification: ServerNotification,
         ) -> McpResult<usize> {
             self.inner.publish_subscription_notification(notification)
+        }
+
+        /// Retains weak publication access after moving this server into its
+        /// caller-owned HTTP/stdio lifecycle. No producer task is started.
+        #[must_use]
+        pub fn subscription_publisher(&self) -> crate::server::FinalSubscriptionPublisher {
+            self.inner.subscription_publisher()
         }
 
         /// Opens one in-process `subscriptions/listen` stream.

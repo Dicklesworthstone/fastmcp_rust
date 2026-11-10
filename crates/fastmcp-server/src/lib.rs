@@ -5290,6 +5290,54 @@ static NEXT_MODERN_HTTP_STREAM_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// wire, so listener teardown can own every active SSE dispatch.
 static NEXT_LIVE_MODERN_HTTP_RESPONSE_BODY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// A weak, cloneable publisher for application-owned subscription producers.
+///
+/// Obtain it before moving a server into a consuming serve/bind method. It
+/// does not retain the server or its subscription registry and creates no
+/// worker. Publication uses the same resource authorization, filter narrowing,
+/// exact downstream ID tagging and bounded queues as
+/// [`Server::publish_subscription_notification`]. This is trusted embedding
+/// authority, not a request adapter that accepts arbitrary peer notifications.
+#[derive(Clone)]
+pub struct FinalSubscriptionPublisher {
+    registry: std::sync::Weak<FinalSubscriptionRegistry>,
+    owner: std::sync::Weak<()>,
+}
+
+impl FinalSubscriptionPublisher {
+    /// True after the server is dropped or begins terminating subscriptions.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.owner.strong_count() == 0
+            || self
+                .registry
+                .upgrade()
+                .is_none_or(|registry| registry.is_terminating())
+    }
+
+    /// Publishes a catalog/resource event with the server's existing gates.
+    ///
+    /// A closed owner returns cancellation rather than silently discarding
+    /// producer work as a successful zero-recipient publication. As with the
+    /// server method, callbacks are synchronous and must bound their own work.
+    pub fn publish(&self, notification: ServerNotification) -> McpResult<usize> {
+        // Do not retain the lifetime token across callbacks: a callback may
+        // drop the server, and another producer must not inherit this call's
+        // temporary ownership as permission to keep publishing.
+        if self.owner.strong_count() == 0 {
+            return Err(McpError::request_cancelled());
+        }
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(McpError::request_cancelled)?;
+        if registry.is_terminating() {
+            return Err(McpError::request_cancelled());
+        }
+        registry.publish(notification)
+    }
+}
+
 /// Bridges handler catalog mutations onto live `subscriptions/listen` streams.
 struct FinalCatalogPublisher {
     registry: std::sync::Weak<FinalSubscriptionRegistry>,
@@ -15598,6 +15646,9 @@ pub struct Server {
     catalog_relay: Option<Arc<ProxyCatalogRelay>>,
     /// Request-owned final subscription streams shared by stdio and HTTP.
     final_subscriptions: Arc<FinalSubscriptionRegistry>,
+    /// Only the server owns this producer lifetime; retained listener leases
+    /// cannot keep an external publisher usable after the server is dropped.
+    subscription_publisher_owner: Arc<()>,
 }
 
 impl Server {
@@ -15741,6 +15792,17 @@ impl Server {
         notification: ServerNotification,
     ) -> McpResult<usize> {
         self.final_subscriptions.publish(notification)
+    }
+
+    /// Returns a weak publisher usable while this server is owned by a live
+    /// transport. Clone it before moving the server into `bind_http` or serve.
+    /// The application owns and cancels any producer future using this handle.
+    #[must_use]
+    pub fn subscription_publisher(&self) -> FinalSubscriptionPublisher {
+        FinalSubscriptionPublisher {
+            registry: Arc::downgrade(&self.final_subscriptions),
+            owner: Arc::downgrade(&self.subscription_publisher_owner),
+        }
     }
 
     /// Opens one in-process `subscriptions/listen` stream.
