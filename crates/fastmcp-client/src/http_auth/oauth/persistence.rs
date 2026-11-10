@@ -30,7 +30,8 @@ use fastmcp_core::partition::{CredentialStoreKey, PartitionAuthorization};
 
 use super::{
     OAuthClient, OAuthClientConfiguration, OAuthCredentials, OAuthError, TOKEN_TIMEOUT,
-    admit_refresh_response, encode_form, operation_deadline, valid_opaque, validate_scopes,
+    admit_refresh_response, encode_form, ensure_live, operation_deadline, valid_opaque,
+    validate_scopes,
 };
 use crate::http_auth::secure_file::SecureAtomicFile;
 use crate::http_auth::secure_file::slot::coordinator::{
@@ -237,12 +238,7 @@ impl OAuthClient {
         let body = encode_form(&fields)?;
         let started = Instant::now();
         let response = self.exchange(cx, deadline, body).await?;
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.now() >= deadline {
-            return Err(OAuthError::TimedOut);
-        }
+        ensure_live(cx, deadline)?;
         let credentials = admit_refresh_response(
             &self.configuration,
             &grant.scopes,
@@ -250,12 +246,7 @@ impl OAuthClient {
             &response,
             started,
         )?;
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.now() >= deadline {
-            return Err(OAuthError::TimedOut);
-        }
+        ensure_live(cx, deadline)?;
         Ok(credentials)
     }
 

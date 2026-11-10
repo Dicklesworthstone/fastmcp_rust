@@ -467,12 +467,15 @@ impl OAuthDiscoveryPlan {
         for ((tag, location), candidate_deadline) in candidates.into_iter().zip(deadlines) {
             // Check the outer budget before opening each candidate. A candidate
             // timeout alone is NOT an outer-budget failure and permits the root.
-            if cx.checkpoint().is_err() {
-                failure.interrupted = Some(ResourceMetadataFailureClass::Cancelled);
-                break;
-            }
+            // The deadline goes first, as in check_context: a checkpoint also
+            // fails once the caller's budget deadline passes, and that is the
+            // overall deadline, not a cancellation.
             if cx.now() >= deadline {
                 failure.interrupted = Some(ResourceMetadataFailureClass::OverallDeadline);
+                break;
+            }
+            if cx.checkpoint().is_err() {
+                failure.interrupted = Some(ResourceMetadataFailureClass::Cancelled);
                 break;
             }
             let result = fetch_metadata(
@@ -488,10 +491,10 @@ impl OAuthDiscoveryPlan {
             // Admission is part of the candidate's allowance, not unbounded
             // work after its network timeout. A noncooperative synchronous
             // decoder cannot be preempted, but no later effect follows an overrun.
-            let result = if cx.checkpoint().is_err() {
-                Err(OAuthDiscoveryError::Cancelled)
-            } else if cx.now() >= candidate_deadline {
+            let result = if cx.now() >= candidate_deadline {
                 Err(OAuthDiscoveryError::TimedOut)
+            } else if cx.checkpoint().is_err() {
+                Err(OAuthDiscoveryError::Cancelled)
             } else {
                 result
             };
@@ -503,10 +506,10 @@ impl OAuthDiscoveryPlan {
                 }),
             }
         }
-        if cx.checkpoint().is_err() {
-            failure.interrupted = Some(ResourceMetadataFailureClass::Cancelled);
-        } else if cx.now() >= deadline {
+        if cx.now() >= deadline {
             failure.interrupted = Some(ResourceMetadataFailureClass::OverallDeadline);
+        } else if cx.checkpoint().is_err() {
+            failure.interrupted = Some(ResourceMetadataFailureClass::Cancelled);
         }
         Err(OAuthDiscoveryError::ResourceMetadataExhausted(failure))
     }
@@ -1000,6 +1003,11 @@ fn check_context(cx: &Cx, deadline: Time) -> Result<(), OAuthDiscoveryError> {
 }
 
 fn discovery_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthDiscoveryError> {
+    // A caller whose budget deadline has already passed timed out; its
+    // checkpoint would fail too, but that is not a cancellation.
+    if let Some(parent) = cx.budget().deadline {
+        check_context(cx, parent)?;
+    }
     if cx.checkpoint().is_err() {
         return Err(OAuthDiscoveryError::Cancelled);
     }

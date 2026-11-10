@@ -682,6 +682,34 @@ fn renewal_deadline_does_not_restart_when_observation_resumes() {
 }
 
 #[test]
+fn renewal_handoff_reports_an_elapsed_observer_deadline_as_timeout() {
+    run(|cx| async move {
+        let fixture = Fixture::new();
+        let client = OAuthClient::new(native::config());
+        let store = fixture.seed(&cx, &client).await;
+        let mut renewal = fixture.begin(&cx, &client, store);
+        // An exhausted budget is a stop; a budget whose deadline alone has
+        // passed is a timeout, although both fail the observer's checkpoint.
+        let stopped = Cx::for_testing_with_budget(asupersync::Budget::ZERO);
+        let elapsed =
+            Cx::for_testing_with_budget(asupersync::Budget::new().with_deadline(Time::ZERO));
+        assert!(matches!(
+            renewal.take_managed_session(&stopped, OAuthSessionPolicy::default()),
+            Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled))
+        ));
+        assert!(matches!(
+            renewal.take_managed_session(&elapsed, OAuthSessionPolicy::default()),
+            Err(OAuthRefreshRenewalError::Context(OAuthError::TimedOut))
+        ));
+        assert_eq!(renewal.stage(), OAuthRefreshRenewalStage::ReadyToTake);
+        let OAuthRefreshRenewalCustody::ReadyToTake(store) = renewal.into_custody() else {
+            panic!("unstarted custody");
+        };
+        close(&cx, store).await;
+    });
+}
+
+#[test]
 fn renewal_wait_errors_distinguish_terminal_mailbox_failures_from_interruption() {
     for error in [
         CredentialIoError::WorkerStopped,

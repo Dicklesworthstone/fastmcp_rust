@@ -24,7 +24,7 @@ use super::{
     PartitionAuthorization, SlotRevision,
 };
 use crate::http_auth::managed::{ManagedOAuthSession, OAuthSessionError, OAuthSessionPolicy};
-use crate::http_auth::oauth::{OAuthError, operation_deadline, within};
+use crate::http_auth::oauth::{OAuthError, interrupted, operation_deadline, within};
 
 /// Non-secret progress. ReadyToPersist never means the replacement is durable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,13 +221,19 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
         ),
         OAuthRefreshRenewalError,
     > {
+        // A caller whose budget deadline has passed also fails its checkpoint;
+        // that is a timeout, so a cancellation outranks it here as below.
+        let origin = interrupted(&self.origin);
+        let observed = interrupted(observer);
         if self.cancellation.is_cancel_requested()
-            || self.origin.checkpoint().is_err()
-            || observer.checkpoint().is_err()
+            || origin == Some(OAuthError::Cancelled)
+            || observed == Some(OAuthError::Cancelled)
         {
             return Err(OAuthRefreshRenewalError::Context(OAuthError::Cancelled));
         }
-        if self.origin.now() >= self.deadline
+        if origin.is_some()
+            || observed.is_some()
+            || self.origin.now() >= self.deadline
             || observer
                 .budget()
                 .deadline

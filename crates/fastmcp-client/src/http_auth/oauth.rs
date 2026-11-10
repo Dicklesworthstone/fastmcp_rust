@@ -525,12 +525,7 @@ impl OAuthClient {
             &response,
             started,
         )?;
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.now() >= deadline {
-            return Err(OAuthError::TimedOut);
-        }
+        ensure_live(cx, deadline)?;
         Ok(credentials)
     }
 
@@ -564,20 +559,10 @@ impl OAuthClient {
         let response =
             while_refresh_live(&quarantine.revoked, self.exchange(cx, deadline, body)).await?;
         // Do not publish a new token pair after the caller has cancelled.
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.now() >= deadline {
-            return Err(OAuthError::TimedOut);
-        }
+        ensure_live(cx, deadline)?;
         let mut replacement =
             self.admit_refresh(credentials, previous_refresh, &response, started)?;
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.now() >= deadline {
-            return Err(OAuthError::TimedOut);
-        }
+        ensure_live(cx, deadline)?;
         if quarantine.revoked.is_cancel_requested() {
             return Err(OAuthError::RefreshUnavailable);
         }
@@ -767,7 +752,7 @@ async fn bind_loopback() -> Result<TcpListener, OAuthError> {
 fn operation_deadline(cx: &Cx, timeout: Duration) -> Result<Time, OAuthError> {
     with_caller(cx, || {
         if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
+            return Err(interruption(cx));
         }
         require_native_effects(cx)?;
         let nanos =
@@ -803,6 +788,40 @@ fn require_native_effects(cx: &Cx) -> Result<(), OAuthError> {
     Ok(())
 }
 
+/// Refuses an OAuth step once the caller is interrupted or `deadline` has
+/// passed.
+fn ensure_live(cx: &Cx, deadline: Time) -> Result<(), OAuthError> {
+    if cx.checkpoint().is_err() {
+        return Err(interruption(cx));
+    }
+    if cx.now() >= deadline {
+        return Err(OAuthError::TimedOut);
+    }
+    Ok(())
+}
+
+/// Classifies a failed checkpoint by the runtime's recorded reason, as
+/// `check_modern_http_context` does. A caller whose budget deadline passes
+/// fails its checkpoint with a deadline reason, and that is a timeout. An
+/// explicit cancellation, or an exhausted poll or cost budget (which the
+/// runtime ranks above a deadline), is a cancellation.
+fn interruption(cx: &Cx) -> OAuthError {
+    if cx
+        .cancel_reason()
+        .is_some_and(|reason| reason.kind == asupersync::CancelKind::Deadline)
+    {
+        OAuthError::TimedOut
+    } else {
+        OAuthError::Cancelled
+    }
+}
+
+/// How a checkpoint of `cx` interrupts an OAuth step, if it does.
+#[cfg(target_os = "linux")]
+fn interrupted(cx: &Cx) -> Option<OAuthError> {
+    cx.checkpoint().is_err().then(|| interruption(cx))
+}
+
 async fn within<T>(
     cx: &Cx,
     deadline: Time,
@@ -814,12 +833,7 @@ async fn within<T>(
         .map_or(deadline, |parent| parent.min(deadline));
     let mut future = std::pin::pin!(future);
     let sleep = with_caller(cx, || {
-        if cx.checkpoint().is_err() {
-            return Err(OAuthError::Cancelled);
-        }
-        if cx.now() >= deadline {
-            return Err(OAuthError::TimedOut);
-        }
+        ensure_live(cx, deadline)?;
         require_native_effects(cx)?;
         Ok::<_, OAuthError>(Sleep::new(deadline))
     })?;
@@ -830,11 +844,8 @@ async fn within<T>(
     let mut cancelled = std::pin::pin!(receiver.recv(cx));
     poll_fn(|task| {
         with_caller(cx, || {
-            if cx.checkpoint().is_err() {
-                return Poll::Ready(Err(OAuthError::Cancelled));
-            }
-            if cx.now() >= deadline {
-                return Poll::Ready(Err(OAuthError::TimedOut));
+            if let Err(error) = ensure_live(cx, deadline) {
+                return Poll::Ready(Err(error));
             }
             // Recheck every poll: a suspended flow may resume under a stricter host
             // scope. Refuse before polling a socket, timer, or browser future there.
@@ -848,11 +859,8 @@ async fn within<T>(
                 return Poll::Ready(Err(OAuthError::TimedOut));
             }
             let result = future.as_mut().poll(task);
-            if cx.checkpoint().is_err() {
-                return Poll::Ready(Err(OAuthError::Cancelled));
-            }
-            if cx.now() >= deadline {
-                return Poll::Ready(Err(OAuthError::TimedOut));
+            if let Err(error) = ensure_live(cx, deadline) {
+                return Poll::Ready(Err(error));
             }
             result
         })

@@ -8,7 +8,7 @@ use asupersync::Cx;
 
 use super::{
     AsyncOAuthRefreshStore, ManagedOAuthSession, OAuthError, OAuthRefreshRenewal,
-    OAuthRefreshRenewalCustody, SlotRevision, within,
+    OAuthRefreshRenewalCustody, SlotRevision, interrupted, within,
 };
 
 pub use crate::http_auth::managed::logout::rotation::OAuthAccessRotationError;
@@ -130,13 +130,19 @@ impl<A, P> OAuthRefreshRenewal<A, P> {
     }
 
     fn check_installation_context(&self, observer: &Cx) -> Result<(), OAuthAccessRotationError> {
+        // A caller whose budget deadline has passed also fails its checkpoint;
+        // that is a timeout, so a cancellation outranks it here as below.
+        let origin = interrupted(&self.origin);
+        let observed = interrupted(observer);
         if self.cancellation.is_cancel_requested()
-            || self.origin.checkpoint().is_err()
-            || observer.checkpoint().is_err()
+            || origin == Some(OAuthError::Cancelled)
+            || observed == Some(OAuthError::Cancelled)
         {
             return Err(OAuthAccessRotationError::Context(OAuthError::Cancelled));
         }
-        if self.origin.now() >= self.deadline
+        if origin.is_some()
+            || observed.is_some()
+            || self.origin.now() >= self.deadline
             || self
                 .origin
                 .budget()
