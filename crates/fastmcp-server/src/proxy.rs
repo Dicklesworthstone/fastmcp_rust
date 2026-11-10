@@ -6798,13 +6798,112 @@ struct StdioBindingKey {
 ///
 /// Unlike [`StdioBindingKey`], this key has no caller-supplied adapter-era
 /// receipt. The selected era is derived only after a live client completes its
-/// immutable protocol-plan handshake.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// immutable protocol-plan handshake. The actual executable and ordered argv
+/// participate independently of the caller's route/transport labels.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct LiveStdioBindingKey {
     route_identity: String,
     transport_identity: String,
+    spawn_identity: fastmcp_core::Sha256Digest,
     policy: ProtocolPolicy,
     configuration_generation: u64,
+}
+
+// Bound both the work needed to derive an identity and the retained route
+// labels before allocation. argv may carry credentials, so only a digest is
+// retained and neither it nor the input labels are exposed by Debug.
+const MAX_PROXY_STDIO_IDENTITY_BYTES: usize = 1024 * 1024;
+const MAX_PROXY_STDIO_ARGUMENTS: usize = 4096;
+const PROXY_STDIO_IDENTITY_DOMAIN: &[u8] = b"fastmcp-proxy-stdio-spawn-v1\0";
+
+impl std::fmt::Debug for LiveStdioBindingKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LiveStdioBindingKey")
+            .field("policy", &self.policy)
+            .field("configuration_generation", &self.configuration_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LiveStdioBindingKey {
+    fn new(
+        route_identity: &str,
+        transport_identity: &str,
+        configuration_generation: u64,
+        policy: ProtocolPolicy,
+        command: &str,
+        args: &[&str],
+    ) -> McpResult<Self> {
+        if route_identity.is_empty() || transport_identity.is_empty() {
+            return Err(McpError::invalid_params(
+                "Upstream route and transport identities must be non-empty",
+            ));
+        }
+        if command.is_empty() {
+            return Err(McpError::invalid_params(
+                "Proxy stdio command must be non-empty",
+            ));
+        }
+        if args.len() > MAX_PROXY_STDIO_ARGUMENTS {
+            return Err(McpError::invalid_params(
+                "Proxy stdio argument count exceeds its identity limit",
+            ));
+        }
+        let fields = std::iter::once(command).chain(args.iter().copied());
+        let encoded_len =
+            fields
+                .clone()
+                .try_fold(PROXY_STDIO_IDENTITY_DOMAIN.len(), |total, field| {
+                    let length = total
+                        .checked_add(field.len())
+                        .and_then(|length| length.checked_add(1))
+                        .filter(|length| *length <= MAX_PROXY_STDIO_IDENTITY_BYTES)
+                        .ok_or_else(|| {
+                            McpError::invalid_params(
+                                "Proxy stdio configuration exceeds its identity byte limit",
+                            )
+                        })?;
+                    if field.as_bytes().contains(&0) {
+                        return Err(McpError::invalid_params(
+                            "Proxy stdio command and arguments must contain no NUL bytes",
+                        ));
+                    }
+                    Ok(length)
+                })?;
+        if encoded_len
+            .checked_add(route_identity.len())
+            .and_then(|length| length.checked_add(transport_identity.len()))
+            .is_none_or(|length| length > MAX_PROXY_STDIO_IDENTITY_BYTES)
+        {
+            return Err(McpError::invalid_params(
+                "Proxy stdio configuration exceeds its identity byte limit",
+            ));
+        }
+
+        // NUL cannot occur inside a process argument. Keeping every field's
+        // terminator preserves empty arguments, argument order and boundaries
+        // without ambiguous concatenation or command/path normalization.
+        let mut encoded = zeroize::Zeroizing::new(Vec::with_capacity(encoded_len));
+        encoded.extend_from_slice(PROXY_STDIO_IDENTITY_DOMAIN);
+        for field in fields {
+            encoded.extend_from_slice(field.as_bytes());
+            encoded.push(0);
+        }
+        let spawn_identity = fastmcp_core::sha256_bounded(&encoded, MAX_PROXY_STDIO_IDENTITY_BYTES)
+            .map_err(|_| {
+                McpError::invalid_params(
+                    "Proxy stdio configuration exceeds its identity byte limit",
+                )
+            })?;
+        Ok(Self {
+            route_identity: route_identity.to_owned(),
+            transport_identity: transport_identity.to_owned(),
+            spawn_identity,
+            policy,
+            configuration_generation,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -9929,7 +10028,9 @@ impl ProxyUpstreamBindingRegistry {
     /// Live client keys deliberately omit the adapter receipt, but include the
     /// immutable route, transport, policy, and configuration generation. The
     /// retained client binding is checked as well, so another era or policy is
-    /// never evicted by this generation-scoped operation.
+    /// never evicted by this generation-scoped operation. All stdio command/
+    /// argument variants under the selected configuration generation are
+    /// invalidated together; this does not select an individual child process.
     pub fn invalidate_live_cached_binding(
         &mut self,
         route_identity: &str,
@@ -9977,6 +10078,13 @@ impl ProxyUpstreamBindingRegistry {
     /// establishments for the same immutable upstream reuse that live client,
     /// rather than allowing a caller-provided classification or a fresh
     /// negotiation to alter the pinned era.
+    /// The exact executable and ordered arguments are part of that identity;
+    /// reusing route labels cannot silently reuse a different child command.
+    /// This entry point inherits the process environment and working directory.
+    /// The trusted transport identity and configuration generation must change
+    /// when that inherited environment or working-directory policy changes.
+    /// Identity admission permits at most 4096 arguments and 1 MiB of combined
+    /// encoded command/arguments and route/transport labels before spawning.
     /// On Unix, initialization yields between bounded receive turns on the
     /// caller's runtime. Process creation, writes, and cleanup remain synchronous.
     #[allow(clippy::too_many_arguments)]
@@ -10003,12 +10111,14 @@ impl ProxyUpstreamBindingRegistry {
             ));
         }
 
-        let key = LiveStdioBindingKey {
-            route_identity: route_identity.to_owned(),
-            transport_identity: transport_identity.to_owned(),
-            policy: protocol_plan.policy(),
+        let key = LiveStdioBindingKey::new(
+            route_identity,
+            transport_identity,
             configuration_generation,
-        };
+            protocol_plan.policy(),
+            command,
+            args,
+        )?;
         if let Some(existing) = self.live_stdio.get(&key) {
             return Ok(existing.clone());
         }
@@ -28765,6 +28875,137 @@ IFS= read -r end
     }
 
     #[test]
+    fn proxy_stdio_spawn_identity_preserves_exact_argument_boundaries() {
+        let key = |command: &str, args: &[&str]| {
+            super::LiveStdioBindingKey::new(
+                "route",
+                "transport",
+                7,
+                ProtocolPolicy::ModernOnly,
+                command,
+                args,
+            )
+            .expect("bounded process identity")
+        };
+        let original = key("peer", &["a", "bc"]);
+        assert_eq!(original, key("peer", &["a", "bc"]));
+        for changed in [
+            key("other-peer", &["a", "bc"]),
+            key("peer", &["ab", "c"]),
+            key("peer", &["bc", "a"]),
+            key("peer", &["abc"]),
+            key("peer", &["a", "bc", ""]),
+        ] {
+            assert_ne!(original, changed);
+        }
+        assert_ne!(key("peer", &[]), key("peer", &[""]));
+        for (route, transport, generation, policy) in [
+            ("other-route", "transport", 7, ProtocolPolicy::ModernOnly),
+            ("route", "other-transport", 7, ProtocolPolicy::ModernOnly),
+            ("route", "transport", 8, ProtocolPolicy::ModernOnly),
+            ("route", "transport", 7, ProtocolPolicy::Auto),
+        ] {
+            assert_ne!(
+                original,
+                super::LiveStdioBindingKey::new(
+                    route,
+                    transport,
+                    generation,
+                    policy,
+                    "peer",
+                    &["a", "bc"],
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_stdio_spawn_identity_enforces_bounds_and_redacts_arguments() {
+        let key = |command: &str, args: &[&str]| {
+            super::LiveStdioBindingKey::new("r", "t", 1, ProtocolPolicy::ModernOnly, command, args)
+        };
+        let secret = key("secret-command", &["--token=private-argument"]).unwrap();
+        let debug = format!("{secret:?}");
+        assert!(!debug.contains("secret-command"));
+        assert!(!debug.contains("private-argument"));
+        assert!(!debug.contains(&format!("{:?}", secret.spawn_identity)));
+
+        let mut arguments = vec![""; super::MAX_PROXY_STDIO_ARGUMENTS];
+        assert!(key("c", &arguments).is_ok());
+        arguments.push("");
+        assert_eq!(
+            key("c", &arguments).unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+
+        // Domain + command/terminator + argument terminator + two labels.
+        let exact = "x".repeat(
+            super::MAX_PROXY_STDIO_IDENTITY_BYTES - super::PROXY_STDIO_IDENTITY_DOMAIN.len() - 5,
+        );
+        assert!(key("c", &[&exact]).is_ok());
+        let over = format!("{exact}x");
+        assert_eq!(
+            key("c", &[&over]).unwrap_err().code,
+            McpErrorCode::InvalidParams
+        );
+        for (command, args) in [
+            ("", vec![]),
+            ("c\0", vec![]),
+            ("c", vec!["private\0argument"]),
+        ] {
+            let error = key(command, &args).unwrap_err();
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert!(!error.message.contains("private"));
+        }
+    }
+
+    #[test]
+    fn proxy_stdio_registry_rejects_invalid_spawn_without_reusing_cached_route() {
+        let selected = proxy_binding(ProtocolEra::Modern2026);
+        let client = ProxyClient::from_backend_with_upstream_binding(
+            TestBackend::default(),
+            selected,
+            ProtocolEra::Modern2026.version().as_str(),
+        )
+        .unwrap();
+        let key = super::LiveStdioBindingKey::new(
+            "route",
+            "transport",
+            selected.configuration_generation,
+            selected.policy,
+            "peer",
+            &["accepted"],
+        )
+        .unwrap();
+        let mut registry = ProxyUpstreamBindingRegistry::default();
+        registry.live_stdio.insert(key.clone(), client.clone());
+        let oversized = "x".repeat(super::MAX_PROXY_STDIO_IDENTITY_BYTES);
+        let too_many = vec![""; super::MAX_PROXY_STDIO_ARGUMENTS + 1];
+        for (command, args) in [
+            ("", vec!["accepted"]),
+            ("peer\0", vec!["accepted"]),
+            ("peer", vec!["private\0argument"]),
+            ("peer", vec![oversized.as_str()]),
+            ("peer", too_many),
+        ] {
+            let error = block_on(registry.connect_stdio_with_protocol_plan(
+                &Cx::for_testing(),
+                "route",
+                "transport",
+                selected.configuration_generation,
+                command,
+                &args,
+                ClientProtocolPlan::stdio(selected.policy),
+            ))
+            .expect_err("invalid process inputs are refused before a cache hit or spawn");
+            assert_eq!(error.code, McpErrorCode::InvalidParams);
+            assert_eq!(registry.live_stdio.len(), 1);
+            assert!(registry.live_stdio[&key].same_upstream_route(&client));
+        }
+    }
+
+    #[test]
     fn live_cached_binding_invalidation_removes_only_the_exact_generation() {
         let selected = proxy_binding(ProtocolEra::Modern2026);
         let retained = ProxyUpstreamBinding {
@@ -28785,21 +29026,39 @@ IFS= read -r end
         .expect("the other generation modern live client is admitted");
         let mut registry = ProxyUpstreamBindingRegistry::default();
         registry.live_stdio.insert(
-            super::LiveStdioBindingKey {
-                route_identity: "weather-route".to_owned(),
-                transport_identity: "stdio:weather".to_owned(),
-                policy: selected.policy,
-                configuration_generation: selected.configuration_generation,
-            },
+            super::LiveStdioBindingKey::new(
+                "weather-route",
+                "stdio:weather",
+                selected.configuration_generation,
+                selected.policy,
+                "weather-server",
+                &[],
+            )
+            .expect("bounded stdio identity"),
+            selected_client.clone(),
+        );
+        registry.live_stdio.insert(
+            super::LiveStdioBindingKey::new(
+                "weather-route",
+                "stdio:weather",
+                selected.configuration_generation,
+                selected.policy,
+                "weather-server",
+                &["--alternate"],
+            )
+            .expect("a changed spawn has its own identity in the selected generation"),
             selected_client,
         );
         registry.live_stdio.insert(
-            super::LiveStdioBindingKey {
-                route_identity: "weather-route".to_owned(),
-                transport_identity: "stdio:weather".to_owned(),
-                policy: retained.policy,
-                configuration_generation: retained.configuration_generation,
-            },
+            super::LiveStdioBindingKey::new(
+                "weather-route",
+                "stdio:weather",
+                retained.configuration_generation,
+                retained.policy,
+                "weather-server",
+                &[],
+            )
+            .expect("bounded stdio identity"),
             retained_client,
         );
 
@@ -28807,7 +29066,7 @@ IFS= read -r end
             .invalidate_live_cached_binding("weather-route", "stdio:weather", selected)
             .expect("the exact live binding generation can be invalidated");
 
-        assert_eq!(removed, 1);
+        assert_eq!(removed, 2);
         assert_eq!(registry.live_stdio.len(), 1);
         assert!(
             registry
@@ -28832,12 +29091,15 @@ IFS= read -r end
         .expect("the other generation modern live client is admitted");
         let mut registry = ProxyUpstreamBindingRegistry::default();
         registry.live_stdio.insert(
-            super::LiveStdioBindingKey {
-                route_identity: "weather-route".to_owned(),
-                transport_identity: "stdio:weather".to_owned(),
-                policy: retained.policy,
-                configuration_generation: retained.configuration_generation,
-            },
+            super::LiveStdioBindingKey::new(
+                "weather-route",
+                "stdio:weather",
+                retained.configuration_generation,
+                retained.policy,
+                "weather-server",
+                &[],
+            )
+            .expect("bounded stdio identity"),
             retained_client,
         );
 
@@ -32281,6 +32543,117 @@ exec sleep 2
             [ContentBlock::Text { text, .. }] if text == "second"
         ));
         assert_eq!(bindings.live_stdio.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proxy_stdio_registry_isolates_changed_command_and_arguments_on_live_children() {
+        let discovery = modern_discovery_response_line("same-reported-peer", &["2026-07-28"]);
+        let script = format!(
+            r#"
+IFS= read -r discovery || exit 90
+case "$discovery" in *"\"method\":\"server/discover\""*) ;; *) exit 91 ;; esac
+printf '%s\n' '{discovery}'
+IFS= read -r tool || exit 92
+case "$tool" in *"\"method\":\"tools/call\""*) ;; *) exit 93 ;; esac
+printf '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","content":[{{"type":"text","text":"%s"}}]}}}}\n' "$1"
+IFS= read -r shutdown
+"#,
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = Cx::current().unwrap();
+            let mut work = root
+                .spawn(move |cx| async move {
+                    let mut registry = ProxyUpstreamBindingRegistry::default();
+                    let plan = ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly);
+                    let args = ["-c", script.as_str(), "proxy-identity-peer", "first"];
+                    let first = registry
+                        .connect_stdio_with_protocol_plan(
+                            &cx,
+                            "route",
+                            "transport",
+                            1,
+                            "sh",
+                            &args,
+                            plan.clone(),
+                        )
+                        .await
+                        .unwrap();
+                    let cached = registry
+                        .connect_stdio_with_protocol_plan(
+                            &cx,
+                            "route",
+                            "transport",
+                            1,
+                            "sh",
+                            &args,
+                            plan.clone(),
+                        )
+                        .await
+                        .unwrap();
+                    assert!(first.same_upstream_route(&cached));
+                    assert_eq!(registry.live_stdio.len(), 1);
+
+                    let changed_args = ["-c", script.as_str(), "proxy-identity-peer", "second"];
+                    let second = registry
+                        .connect_stdio_with_protocol_plan(
+                            &cx,
+                            "route",
+                            "transport",
+                            1,
+                            "sh",
+                            &changed_args,
+                            plan.clone(),
+                        )
+                        .await
+                        .unwrap();
+                    let changed_command = registry
+                        .connect_stdio_with_protocol_plan(
+                            &cx,
+                            "route",
+                            "transport",
+                            1,
+                            "/bin/sh",
+                            &args,
+                            plan,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!first.same_upstream_route(&second));
+                    assert!(!first.same_upstream_route(&changed_command));
+                    assert_eq!(registry.live_stdio.len(), 3);
+
+                    for (proxy, expected) in [
+                        (cached, "first"),
+                        (second, "second"),
+                        (changed_command, "first"),
+                    ] {
+                        let result = proxy
+                            .call_tool_typed_async(
+                                &McpContext::new(cx.clone(), 1),
+                                "echo",
+                                serde_json::json!({}),
+                            )
+                            .await
+                            .expect("each selected child answers its own first tool request");
+                        let CoreResult::Final(FinalCoreResult::ToolsCall { result, .. }) = result
+                        else {
+                            panic!("the selected child returns a final tool result");
+                        };
+                        assert!(matches!(
+                            result.payload.content.as_slice(),
+                            [ContentBlock::Text { text, .. }] if text == expected
+                        ));
+                    }
+                })
+                .unwrap();
+            work.join(&root).await.unwrap();
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
     }
 
     #[cfg(unix)]
