@@ -21868,6 +21868,106 @@ mod router_tests {
     }
 
     #[test]
+    fn legacy_tuple_tool_validates_tail_before_direct_and_nested_dispatch() {
+        struct TupleTool {
+            tail_schema: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for TupleTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "legacy-tuple".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "values": {
+                                "type": "array",
+                                "items": [{"type": "string"}],
+                                "additionalItems": self.tail_schema
+                            }
+                        },
+                        "required": ["values"]
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Content::text("validated")])
+            }
+        }
+
+        for strict in [false, true] {
+            for (tail_schema, accepted, rejected) in [
+                (
+                    serde_json::json!(false),
+                    serde_json::json!({"values": ["header"]}),
+                    serde_json::json!({"values": ["header", 1]}),
+                ),
+                (
+                    serde_json::json!({"type": "integer"}),
+                    serde_json::json!({"values": ["header", 1, 2]}),
+                    serde_json::json!({"values": ["header", 1, "tail-secret-canary"]}),
+                ),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut router = Router::new();
+                router.set_strict_input_validation(strict);
+                router
+                    .add_legacy_tool(TupleTool {
+                        tail_schema,
+                        calls: Arc::clone(&calls),
+                    })
+                    .expect("legacy tuple registration remains available");
+                let router = Arc::new(router);
+                let cx = Cx::for_testing();
+                let state = SessionState::new();
+                let ctx = request_context(&cx, 146, Budget::INFINITE, &state);
+                let caller = RouterToolCaller::new(Arc::clone(&router), state.clone());
+
+                for (arguments, valid) in [(&accepted, true), (&rejected, false), (&accepted, true)] {
+                    let before = calls.load(Ordering::SeqCst);
+                    let direct = block_on(router.handle_tools_call(
+                        &ctx,
+                        CallToolParams {
+                            name: "legacy-tuple".to_owned(),
+                            arguments: Some(arguments.clone()),
+                            meta: None,
+                        },
+                        state.clone(),
+                        None,
+                        None,
+                    ));
+                    let nested =
+                        block_on(caller.call_tool(&ctx, "legacy-tuple", arguments.clone(), 1));
+                    for result in [
+                        direct.map(|value| value.is_error),
+                        nested.map(|value| value.is_error),
+                    ] {
+                        if valid {
+                            assert!(!result.expect("valid tuple reaches the application"));
+                        } else {
+                            let error =
+                                result.expect_err("invalid tuple is refused before application code");
+                            assert_eq!(error.code, McpErrorCode::InvalidParams);
+                            assert!(error.message.contains("root.values["));
+                            assert!(!error.message.contains("tail-secret-canary"));
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), before + usize::from(valid) * 2);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn legacy_tool_validation_errors_redact_schema_and_instance_literals() {
         const SCHEMA_CANARY: &str = "rpc-schema-secret-canary";
         const INSTANCE_CANARY: &str = "rpc-instance-secret-canary";
