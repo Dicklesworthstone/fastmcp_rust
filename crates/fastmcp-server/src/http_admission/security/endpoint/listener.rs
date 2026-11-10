@@ -25,7 +25,7 @@ use std::time::Duration;
 use asupersync::Cx;
 use asupersync::io::AsyncWriteExt;
 use asupersync::tls::TlsAcceptor;
-use fastmcp_core::{CanonicalHttpUrl, McpError, McpResult};
+use fastmcp_core::{CanonicalHttpUrl, McpError, McpResult, OperatorLifecycle};
 use fastmcp_protocol::protocol_policy::ProtocolPolicy;
 
 use super::super::HttpSecurityPolicy;
@@ -351,6 +351,10 @@ impl BoundSecuredHttpServer {
                     ));
                 }
             };
+            // The bound limiter refuses every connection until serving starts,
+            // as on the plain HTTP listener; it captures this caller's
+            // cancellation and deadline for its connection-slot probes.
+            bound.connection_limiter.start_serving(cx);
             let result = loop {
                 children.reap_finished();
                 if cx.checkpoint().is_err() {
@@ -455,6 +459,9 @@ impl BoundSecuredHttpServer {
                     }
                 }
             };
+            bound
+                .connection_limiter
+                .set_lifecycle(OperatorLifecycle::Stopping);
             shutdown.request();
             let _ = server.router.close_stateless_mrtr_exchanges();
             let terminal = server.final_subscriptions.terminate_with_receipt();
