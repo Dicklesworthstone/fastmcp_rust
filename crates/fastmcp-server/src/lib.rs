@@ -2280,21 +2280,26 @@ fn poll_on_cx<F: Future>(cx: &Cx, future: F) -> F::Output {
         }
     }
 
-    let _guard = Cx::set_current(Some(cx.clone()));
-    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
-    let mut task_cx = TaskContext::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
-            return output;
+    // Retain request identity and drivers without restoring effects denied by
+    // the embedding. The restriction also covers future destruction and panic
+    // cleanup. This bridge stays separate from the core runtime-entry guard:
+    // a blocking-pool handler may itself call a synchronous core bridge.
+    fastmcp_core::runtime::with_caller_context(cx, || {
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut task_cx = TaskContext::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
+                return output;
+            }
+            if cx.is_cancel_requested()
+                && let Poll::Ready(output) = future.as_mut().poll(&mut task_cx)
+            {
+                return output;
+            }
+            std::thread::park_timeout(Duration::from_millis(1));
         }
-        if cx.is_cancel_requested()
-            && let Poll::Ready(output) = future.as_mut().poll(&mut task_cx)
-        {
-            return output;
-        }
-        std::thread::park_timeout(Duration::from_millis(1));
-    }
+    })
 }
 
 /// Establishes or verifies the connection owner at an ordinary request's
@@ -16180,6 +16185,14 @@ impl Server {
                     .with_request_cancellation(cancellation.clone()),
             ),
         );
+        // Runtime children inherit the held Cx's mask, not this poll's
+        // ambient ceiling. Retain the admitted intersection before opening
+        // their region so a broader inbound caller cannot restore a denied
+        // effect when the scheduler later polls the notification elsewhere.
+        let admitted_cx = fastmcp_core::runtime::with_caller_context(context.cx(), || {
+            Cx::current().expect("notification caller context is installed")
+        });
+        let context = context.with_request_cx(admitted_cx);
         // Even a deployment with ordinary request timeouts disabled must not
         // retain unacknowledged notification work indefinitely.
         let maximum = context.cx().now().saturating_add_nanos(60_000_000_000);
@@ -16191,28 +16204,37 @@ impl Server {
             .begin_request_scope()
             .ok_or_else(|| McpError::internal_error("request scope could not be established"))?;
         Self::enforce_request_context(&context)?;
-        self.authenticate_modern_request(
-            &context,
-            inbound,
-            &mut notification,
-            auth_receipt.as_ref(),
-            websocket_connection_generation,
-        )?;
+        fastmcp_core::runtime::with_caller_context(context.cx(), || {
+            self.authenticate_modern_request(
+                &context,
+                inbound,
+                &mut notification,
+                auth_receipt.as_ref(),
+                websocket_connection_generation,
+            )
+        })?;
         let deadline = context.budget().deadline.unwrap_or(maximum).min(maximum);
         let result = if let Some(region) = router::open_modern_request_region(&context).await? {
             let server = Arc::clone(&self);
             let dispatch_context = context.clone();
             let dispatch_cancellation = cancellation.clone();
-            let task = region.cx().spawn(move |child_cx| async move {
+            // Region admission may have yielded into a narrower host scope.
+            // Carry that scope into the dispatched child's own retained Cx.
+            let dispatch_cx = fastmcp_core::runtime::with_caller_context(region.cx(), || {
+                Cx::current().expect("notification region context is installed")
+            });
+            let task = dispatch_cx.spawn(move |child_cx| async move {
                 let context = dispatch_context.with_request_cx(child_cx);
-                server
-                    .dispatch_extension_notification_in_region(
+                fastmcp_core::runtime::CallerContextFuture::new(
+                    context.cx(),
+                    server.dispatch_extension_notification_in_region(
                         &context,
                         notification,
                         dispatch_cancellation,
                         deadline,
-                    )
-                    .await
+                    ),
+                )
+                .await
             });
             let mut task = match task {
                 Ok(task) => task,
@@ -16225,7 +16247,10 @@ impl Server {
                     ));
                 }
             };
-            let joined = {
+            // The join, timer and receive registrations may own foreign
+            // wakers. Their destruction must retain the same ceiling as
+            // polling, including when the public request is abandoned.
+            let joined = fastmcp_core::runtime::CallerContextFuture::new(context.cx(), async {
                 let mut join = std::pin::pin!(task.join(context.cx()));
                 let mut cancelled = std::pin::pin!(context.request_cancelled());
                 let mut timer = std::pin::pin!(asupersync::time::Sleep::new(deadline));
@@ -16233,24 +16258,27 @@ impl Server {
                 let mut runtime_cancelled = std::pin::pin!(receiver.recv(context.cx()));
                 let mut cancel_forwarded = false;
                 std::future::poll_fn(|task_cx| {
-                    let _current = Cx::set_current(Some(context.cx().clone()));
-                    if !cancel_forwarded
-                        && (context.cx().now() >= deadline
-                            || Self::enforce_request_context(&context).is_err()
-                            || cancelled.as_mut().poll(task_cx).is_ready()
-                            || runtime_cancelled.as_mut().poll(task_cx).is_ready()
-                            || (context.cx().timer_driver().is_some()
-                                && timer.as_mut().poll(task_cx).is_ready()))
-                    {
-                        let _ = region.cancel(asupersync::CancelReason::user(
-                            "Extension notification cancelled",
-                        ));
-                        cancel_forwarded = true;
-                    }
-                    join.as_mut().poll(task_cx)
+                    fastmcp_core::runtime::with_caller_context(context.cx(), || {
+                        let has_timer = Cx::current()
+                            .is_some_and(|caller| caller.timer_driver().is_some());
+                        if !cancel_forwarded
+                            && (context.cx().now() >= deadline
+                                || Self::enforce_request_context(&context).is_err()
+                                || cancelled.as_mut().poll(task_cx).is_ready()
+                                || runtime_cancelled.as_mut().poll(task_cx).is_ready()
+                                || (has_timer && timer.as_mut().poll(task_cx).is_ready()))
+                        {
+                            let _ = region.cancel(asupersync::CancelReason::user(
+                                "Extension notification cancelled",
+                            ));
+                            cancel_forwarded = true;
+                        }
+                        join.as_mut().poll(task_cx)
+                    })
                 })
                 .await
-            };
+            })
+            .await;
             // Callback completion alone does not settle work spawned through
             // its Cx. Close cancels and drains all remaining descendants on
             // success, error, panic and expiry before transport completion.
@@ -16270,11 +16298,14 @@ impl Server {
             // A detached testing context has no runtime gateway and therefore
             // cannot spawn descendants. Immediate callbacks still work there;
             // the inner watchdog rejects pending work without a timer driver.
-            self.dispatch_extension_notification_in_region(
-                &context,
-                notification,
-                cancellation.clone(),
-                deadline,
+            fastmcp_core::runtime::CallerContextFuture::new(
+                context.cx(),
+                self.dispatch_extension_notification_in_region(
+                    &context,
+                    notification,
+                    cancellation.clone(),
+                    deadline,
+                ),
             )
             .await
         };
@@ -16384,30 +16415,39 @@ impl Server {
             let (_sender, mut receiver) = asupersync::channel::oneshot::channel::<()>();
             let mut runtime_cancelled = std::pin::pin!(receiver.recv(context.cx()));
             std::future::poll_fn(|task| {
-                let _current = Cx::set_current(Some(context.cx().clone()));
-                // Refuse expired work before polling a callback that may commit
-                // an effect immediately when its own I/O/timer becomes ready.
-                if context.cx().now() >= deadline
-                    || Self::enforce_request_context(context).is_err()
-                    || cancelled.as_mut().poll(task).is_ready()
-                    || runtime_cancelled.as_mut().poll(task).is_ready()
-                {
-                    return std::task::Poll::Ready(Err(McpError::request_cancelled()));
-                }
-                if context.cx().timer_driver().is_some() && timer.as_mut().poll(task).is_ready() {
-                    return std::task::Poll::Ready(Err(McpError::request_cancelled()));
-                }
-                match catch_extension_unwind(|| dispatch.as_mut().poll(task)) {
-                    Ok(std::task::Poll::Pending) if context.cx().timer_driver().is_none() => {
-                        std::task::Poll::Ready(Err(McpError::internal_error(
-                            "notification execution requires a timer driver",
-                        )))
+                // A caller may resume this future under a stricter effect
+                // ceiling than the one retained by the request. Neither the
+                // callback nor its timer may regain that denied authority.
+                fastmcp_core::runtime::with_caller_context(context.cx(), || {
+                    // Sleep discovers its driver through the effective ambient
+                    // context. A retained Cx can still carry a timer after this
+                    // poll's host denied TIME; never start Sleep's fallback.
+                    let has_timer =
+                        Cx::current().is_some_and(|caller| caller.timer_driver().is_some());
+                    // Refuse expired work before polling a callback that may
+                    // commit an effect as soon as its I/O/timer becomes ready.
+                    if context.cx().now() >= deadline
+                        || Self::enforce_request_context(context).is_err()
+                        || cancelled.as_mut().poll(task).is_ready()
+                        || runtime_cancelled.as_mut().poll(task).is_ready()
+                    {
+                        return std::task::Poll::Ready(Err(McpError::request_cancelled()));
                     }
-                    Ok(result) => result,
-                    Err(_) => {
-                        std::task::Poll::Ready(Err(extension_panic_error("notification_handler")))
+                    if has_timer && timer.as_mut().poll(task).is_ready() {
+                        return std::task::Poll::Ready(Err(McpError::request_cancelled()));
                     }
-                }
+                    match catch_extension_unwind(|| dispatch.as_mut().poll(task)) {
+                        Ok(std::task::Poll::Pending) if !has_timer => {
+                            std::task::Poll::Ready(Err(McpError::internal_error(
+                                "notification execution requires a timer driver",
+                            )))
+                        }
+                        Ok(result) => result,
+                        Err(_) => {
+                            std::task::Poll::Ready(Err(extension_panic_error("notification_handler")))
+                        }
+                    }
+                })
             })
             .await
         };
@@ -28929,6 +28969,103 @@ mod lib_unit_tests {
         .expect("test request should produce a JSON-RPC response")
     }
 
+    fn caller_context_effects(cx: &Cx) -> [bool; 5] {
+        let capabilities = cx.capabilities();
+        [
+            capabilities.spawn,
+            capabilities.time,
+            capabilities.entropy,
+            capabilities.io,
+            capabilities.remote,
+        ]
+    }
+
+    #[test]
+    fn server_poll_on_cx_preserves_caller_identity_and_intersects_effect_ceilings() {
+        use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
+        use std::task::Poll;
+
+        let masks = [
+            CapMask::all(),
+            CapSet::<false, true, true, true, true>::MASK,
+            CapSet::<true, false, true, true, true>::MASK,
+            CapSet::<true, true, false, true, true>::MASK,
+            CapSet::<true, true, true, false, true>::MASK,
+            CapSet::<true, true, true, true, false>::MASK,
+            CapMask::none(),
+        ];
+        for caller_mask in masks {
+            for host_mask in masks {
+                let caller = Cx::for_request_with_budget(Budget::new());
+                let retained = {
+                    let _current = Cx::set_current(Some(caller.clone()));
+                    let _restriction = Cx::push_restriction(caller_mask);
+                    Cx::current().unwrap()
+                };
+                let host = Cx::for_request_with_budget(Budget::new());
+                let _host = Cx::set_current(Some(host.clone()));
+                let _host_restriction = Cx::push_restriction(host_mask);
+                let caller_effects = caller_context_effects(&retained);
+                let host_effects = caller_context_effects(&Cx::current().unwrap());
+                let expected: [bool; 5] =
+                    std::array::from_fn(|i| caller_effects[i] && host_effects[i]);
+                let mut polls = 0;
+                let output = super::poll_on_cx(
+                    &retained,
+                    std::future::poll_fn(|task| {
+                        let current = Cx::current().unwrap();
+                        assert_eq!(current.task_id(), caller.task_id());
+                        assert_eq!(current.region_id(), caller.region_id());
+                        assert_eq!(caller_context_effects(&current), expected);
+                        polls += 1;
+                        if polls == 1 {
+                            task.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(41)
+                        }
+                    }),
+                );
+                assert_eq!(output, 41);
+                assert_eq!(polls, 2);
+                let restored = Cx::current().unwrap();
+                assert_eq!(restored.task_id(), host.task_id());
+                assert_eq!(caller_context_effects(&restored), host_effects);
+            }
+        }
+    }
+
+    #[test]
+    fn server_poll_on_cx_preserves_effect_ceiling_during_unwind_cleanup() {
+        use asupersync::cx::cap::CapMask;
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        struct CleanupProbe(Rc<Cell<Option<[bool; 5]>>>);
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                self.0
+                    .set(Cx::current().as_ref().map(caller_context_effects));
+            }
+        }
+
+        let caller = Cx::for_testing();
+        let host = Cx::for_testing();
+        let _host = Cx::set_current(Some(host));
+        let _restriction = Cx::push_restriction(CapMask::none());
+        let observed = Rc::new(Cell::new(None));
+        let cleanup = CleanupProbe(Rc::clone(&observed));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::poll_on_cx(&caller, async move {
+                let _cleanup = cleanup;
+                panic!("bounded handler panic fixture");
+            });
+        }));
+        assert!(result.is_err());
+        assert_eq!(observed.get(), Some([false; 5]));
+        assert_eq!(caller_context_effects(&Cx::current().unwrap()), [false; 5]);
+    }
+
     #[derive(Default)]
     struct HttpExtensionNotificationProbe {
         authorized: AtomicUsize,
@@ -28939,6 +29076,10 @@ mod lib_unit_tests {
         authenticated: AtomicBool,
         child_started: AtomicUsize,
         child_settled: AtomicUsize,
+        io_effects: AtomicUsize,
+        authorization_io: AtomicBool,
+        resolver_io: AtomicBool,
+        cleanup_io: Mutex<Vec<bool>>,
         children: Mutex<Vec<asupersync::runtime::TaskHandle<()>>>,
     }
 
@@ -28951,6 +29092,8 @@ mod lib_unit_tests {
         hold: bool,
         #[serde(default)]
         spawn_child: bool,
+        #[serde(default)]
+        require_io: bool,
     }
 
     struct HttpExtensionNotificationWorkGuard {
@@ -28960,6 +29103,11 @@ mod lib_unit_tests {
 
     impl Drop for HttpExtensionNotificationWorkGuard {
         fn drop(&mut self) {
+            self.probe
+                .cleanup_io
+                .lock()
+                .unwrap()
+                .push(Cx::current().is_some_and(|cx| cx.capabilities().io));
             if !self.completed {
                 self.probe.abandoned.fetch_add(1, Ordering::AcqRel);
             }
@@ -29027,6 +29175,10 @@ mod lib_unit_tests {
                 "com.example/notify",
                 move |context: &McpContext, parameters: &serde_json::Value| {
                     authorization.authorized.fetch_add(1, Ordering::AcqRel);
+                    authorization.authorization_io.store(
+                        Cx::current().is_some_and(|cx| cx.capabilities().io),
+                        Ordering::Release,
+                    );
                     authorization
                         .authenticated
                         .store(context.auth().is_some(), Ordering::Release);
@@ -29048,6 +29200,15 @@ mod lib_unit_tests {
                             completed: false,
                         };
                         guard.probe.started.fetch_add(1, Ordering::AcqRel);
+                        if parameters.require_io {
+                            if !Cx::current().is_some_and(|cx| cx.capabilities().io) {
+                                return Err(McpError::new(
+                                    McpErrorCode::ResourceForbidden,
+                                    "notification requires I/O authority",
+                                ));
+                            }
+                            guard.probe.io_effects.fetch_add(1, Ordering::AcqRel);
+                        }
                         if parameters.spawn_child {
                             let probe = Arc::clone(&guard.probe);
                             let (ready, mut readiness) = asupersync::channel::oneshot::channel();
@@ -29115,6 +29276,10 @@ mod lib_unit_tests {
                       client: &ExtensionSettings,
                       server: &ExtensionSettings| {
                     resolution.resolved.fetch_add(1, Ordering::AcqRel);
+                    resolution.resolver_io.store(
+                        Cx::current().is_some_and(|cx| cx.capabilities().io),
+                        Ordering::Release,
+                    );
                     if client.as_object().get("level") != Some(&serde_json::json!(1))
                         || server.as_object().get("level") != Some(&serde_json::json!(1))
                     {
@@ -29143,6 +29308,386 @@ mod lib_unit_tests {
                 ))
                 .unwrap(),
             )
+    }
+
+    #[test]
+    fn http_extension_notification_cannot_restore_host_denied_io_authority() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::task::{Context, Poll};
+
+        // A driverless caller uses the supported inline notification path.
+        // Poll the public HTTP session directly so no test runtime or helper
+        // can accidentally preserve the ceiling on the server's behalf.
+        for (caller_denied, host_denied) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let source = Cx::for_request_with_budget(Budget::INFINITE);
+            let caller = {
+                let _source = Cx::set_current(Some(source));
+                let _restriction = caller_denied.then(|| {
+                    Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                });
+                Cx::current().unwrap()
+            };
+            let denied = caller_denied || host_denied;
+            let host = Cx::for_request_with_budget(Budget::INFINITE);
+            let probe = Arc::new(HttpExtensionNotificationProbe::default());
+            let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                .test_http_endpoint("http://notification.test")
+                .unwrap();
+            let mut session = endpoint.open_session(&caller).unwrap();
+            let mut request = http_extension_notification_request(41, 0, false);
+            let mut body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["params"]["require_io"] = serde_json::json!(true);
+            request.body = serde_json::to_vec(&body).unwrap();
+            {
+                let _host = Cx::set_current(Some(host.clone()));
+                let _restriction = host_denied.then(|| {
+                    Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                });
+                let mut task = Context::from_waker(std::task::Waker::noop());
+                let mut request = Box::pin(session.handle_async(&caller, request));
+                let Poll::Ready(Ok(ServerHttpEndpointResponse::Immediate(response))) =
+                    request.as_mut().poll(&mut task)
+                else {
+                    panic!("an immediate driverless notification must complete in one poll")
+                };
+                assert_eq!(
+                    response.status,
+                    if denied {
+                        HttpStatus::FORBIDDEN
+                    } else {
+                        HttpStatus::ACCEPTED
+                    }
+                );
+                assert_eq!(probe.authorized.load(Ordering::Acquire), 1);
+                assert_eq!(probe.resolved.load(Ordering::Acquire), 1);
+                assert_eq!(probe.authorization_io.load(Ordering::Acquire), !denied);
+                assert_eq!(probe.resolver_io.load(Ordering::Acquire), !denied);
+                assert_eq!(probe.started.load(Ordering::Acquire), 1);
+                assert_eq!(probe.io_effects.load(Ordering::Acquire), usize::from(!denied));
+                assert_eq!(probe.completed.load(Ordering::Acquire), usize::from(!denied));
+                assert_eq!(probe.abandoned.load(Ordering::Acquire), usize::from(denied));
+                let restored = Cx::current().unwrap();
+                assert_eq!(restored.task_id(), host.task_id());
+                assert_eq!(restored.capabilities().io, !host_denied);
+            }
+            super::poll_on_cx(&caller, session.close(&caller));
+        }
+    }
+
+    #[test]
+    fn http_extension_notification_runtime_children_preserve_effect_ceilings() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+
+        let mut lab = asupersync::lab::LabRuntime::new(
+            asupersync::lab::LabConfig::new(1256)
+                .with_auto_advance()
+                .max_steps(512),
+        );
+        let budget = Budget::INFINITE;
+        let region = lab.state.create_root_region(budget);
+        let (task, mut outcome) = lab
+            .state
+            .create_task(region, budget, async {
+                let source = Cx::current().unwrap();
+                assert!(source.timer_driver().is_some());
+                for (caller_denied, initial_host_denied, resumed_host_denied) in [
+                    (false, false, false),
+                    (false, true, true),
+                    (true, false, false),
+                    (true, true, true),
+                    (false, true, false),
+                    (false, false, true),
+                ] {
+                    let caller = {
+                        let _restriction = caller_denied.then(|| {
+                            Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                        });
+                        Cx::current().unwrap()
+                    };
+                    let denied = caller_denied || initial_host_denied || resumed_host_denied;
+                    let probe = Arc::new(HttpExtensionNotificationProbe::default());
+                    let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                        .test_http_endpoint("http://notification.test")
+                        .unwrap();
+                    let mut session = endpoint.open_session(&caller).unwrap();
+                    let mut request = http_extension_notification_request(41, 0, false);
+                    let mut body: serde_json::Value =
+                        serde_json::from_slice(&request.body).unwrap();
+                    body["params"]["require_io"] = serde_json::json!(true);
+                    request.body = serde_json::to_vec(&body).unwrap();
+                    let mut polls = 0;
+                    let response = {
+                        let mut request = std::pin::pin!(session.handle_async(&caller, request));
+                        std::future::poll_fn(|task| {
+                            polls += 1;
+                            let host_denied = if polls == 1 {
+                                initial_host_denied
+                            } else {
+                                resumed_host_denied
+                            };
+                            let _restriction = host_denied.then(|| {
+                                Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK)
+                            });
+                            request.as_mut().poll(task)
+                        })
+                        .await
+                        .unwrap()
+                    };
+                    assert!(polls >= 2, "runtime region admission must yield");
+                    let ServerHttpEndpointResponse::Immediate(response) = response else {
+                        panic!("finite notification status")
+                    };
+                    assert_eq!(
+                        response.status,
+                        if denied {
+                            HttpStatus::FORBIDDEN
+                        } else {
+                            HttpStatus::ACCEPTED
+                        }
+                    );
+                    assert_eq!(probe.authorized.load(Ordering::Acquire), 1);
+                    assert_eq!(probe.resolved.load(Ordering::Acquire), 1);
+                    assert_eq!(probe.authorization_io.load(Ordering::Acquire), !denied);
+                    assert_eq!(probe.resolver_io.load(Ordering::Acquire), !denied);
+                    assert_eq!(probe.io_effects.load(Ordering::Acquire), usize::from(!denied));
+                    assert_eq!(probe.completed.load(Ordering::Acquire), usize::from(!denied));
+                    assert_eq!(probe.abandoned.load(Ordering::Acquire), usize::from(denied));
+                    assert_eq!(*probe.cleanup_io.lock().unwrap(), vec![!denied]);
+                    assert!(source.capabilities().io, "the original caller is unchanged");
+                    assert!(Cx::current().unwrap().capabilities().io);
+                    session.close(&source).await;
+                }
+            })
+            .unwrap();
+        lab.scheduler.lock().schedule(task, budget.priority);
+        assert_eq!(
+            lab.run_with_auto_advance().termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent
+        );
+        outcome
+            .try_join()
+            .unwrap()
+            .expect("notification authority matrix completes");
+    }
+
+    #[test]
+    fn http_extension_notification_pending_work_requires_effective_timer_authority() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use asupersync::runtime::RuntimeBuilder;
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
+        use std::task::{Context, Poll, Waker};
+
+        let clock = Arc::new(VirtualClock::new());
+        let timer = TimerDriverHandle::with_virtual_clock(clock);
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .with_timer_driver(timer.clone())
+            .build()
+            .unwrap();
+        let caller = runtime.request_cx_with_budget(Budget::INFINITE);
+        let host = Cx::for_testing();
+        let installed = Cx::set_current(Some(host));
+        for (hold, initially_pending) in [(false, false), (true, false), (true, true)] {
+            let probe = Arc::new(HttpExtensionNotificationProbe::default());
+            let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                .test_http_endpoint("http://notification.test")
+                .unwrap();
+            let (context, _lease) = McpContext::new(caller.clone(), 0)
+                .begin_request_scope()
+                .unwrap();
+            let request = http_extension_notification_request(41, 0, hold);
+            let notification = serde_json::from_slice(&request.body).unwrap();
+            let mut dispatch = Box::pin(fastmcp_core::runtime::CallerContextFuture::new(
+                &caller,
+                endpoint.server.dispatch_extension_notification_in_region(
+                    &context,
+                    notification,
+                    McpRequestCancellation::new(),
+                    caller.now().saturating_add_nanos(1_000_000_000),
+                ),
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            if initially_pending {
+                assert!(dispatch.as_mut().poll(&mut task).is_pending());
+                assert_eq!(timer.pending_count(), 1);
+            }
+            let no_time = Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK);
+            assert!(context.cx().timer_driver().is_some(), "the retained caller has a timer");
+            let result = dispatch.as_mut().poll(&mut task);
+            if hold {
+                assert!(matches!(
+                    result,
+                    Poll::Ready(Err(error))
+                        if error.code == McpErrorCode::InternalError
+                            && error.message == "notification execution requires a timer driver"
+                ));
+            } else {
+                assert!(matches!(result, Poll::Ready(Ok(()))));
+            }
+            drop(no_time);
+            drop(dispatch);
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(probe.started.load(Ordering::Acquire), 1);
+            assert_eq!(probe.completed.load(Ordering::Acquire), usize::from(!hold));
+            assert_eq!(probe.abandoned.load(Ordering::Acquire), usize::from(hold));
+            assert!(Cx::current().unwrap().capabilities().time);
+            assert!(caller.checkpoint().is_ok());
+        }
+        drop(installed);
+        drop(caller);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn http_extension_notification_join_waker_cleanup_keeps_caller_ceiling() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct ObserveWakerDrop {
+            delegate: Waker,
+            observed: Arc<Mutex<Vec<bool>>>,
+        }
+
+        impl Wake for ObserveWakerDrop {
+            fn wake(self: Arc<Self>) {
+                self.delegate.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.delegate.wake_by_ref();
+            }
+        }
+
+        impl Drop for ObserveWakerDrop {
+            fn drop(&mut self) {
+                self.observed
+                    .lock()
+                    .unwrap()
+                    .push(Cx::current().is_some_and(|cx| cx.capabilities().io));
+            }
+        }
+
+        let mut lab = asupersync::lab::LabRuntime::new(
+            asupersync::lab::LabConfig::new(1257)
+                .with_auto_advance()
+                .max_steps(256),
+        );
+        let budget = Budget::INFINITE;
+        let region = lab.state.create_root_region(budget);
+        let (task, mut outcome) = lab
+            .state
+            .create_task(region, budget, async {
+                let source = Cx::current().unwrap();
+                let caller = {
+                    let _restriction =
+                        Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+                    Cx::current().unwrap()
+                };
+                let probe = Arc::new(HttpExtensionNotificationProbe::default());
+                let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+                    .test_http_endpoint("http://notification.test")
+                    .unwrap();
+                let mut session = endpoint.open_session(&caller).unwrap();
+                let mut pending = Box::pin(session.handle_async(
+                    &caller,
+                    http_extension_notification_request(41, 0, true),
+                ));
+                std::future::poll_fn(|task| {
+                    assert!(pending.as_mut().poll(task).is_pending());
+                    if probe.started.load(Ordering::Acquire) == 1 {
+                        Poll::Ready(())
+                    } else {
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                std::future::poll_fn(|task| {
+                    let waker = Waker::from(Arc::new(ObserveWakerDrop {
+                        delegate: task.waker().clone(),
+                        observed: Arc::clone(&observed),
+                    }));
+                    let mut task = Context::from_waker(&waker);
+                    assert!(pending.as_mut().poll(&mut task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(observed.lock().unwrap().is_empty(), "the wait owns the waker");
+                assert!(Cx::current().unwrap().capabilities().io);
+                drop(pending);
+                assert_eq!(
+                    *observed.lock().unwrap(),
+                    vec![false],
+                    "abandoning a request releases foreign wait wakers under its caller"
+                );
+                assert!(Cx::current().unwrap().capabilities().io);
+                for _ in 0..128 {
+                    if probe.abandoned.load(Ordering::Acquire) == 1 {
+                        break;
+                    }
+                    asupersync::runtime::yield_now().await;
+                }
+                assert_eq!(probe.abandoned.load(Ordering::Acquire), 1);
+                assert_eq!(*probe.cleanup_io.lock().unwrap(), vec![false]);
+                assert!(!source.is_cancel_requested());
+                session.close(&source).await;
+            })
+            .unwrap();
+        lab.scheduler.lock().schedule(task, budget.priority);
+        assert_eq!(
+            lab.run_with_auto_advance().termination,
+            asupersync::lab::AutoAdvanceTermination::Quiescent
+        );
+        outcome
+            .try_join()
+            .unwrap()
+            .expect("notification foreign-waker cleanup completes");
+    }
+
+    #[test]
+    fn http_extension_notification_cleanup_keeps_retained_effect_ceiling() {
+        use asupersync::cx::cap::{CapSet, CapSetRuntimeMask};
+        use std::task::{Context, Poll};
+
+        let source = Cx::for_request_with_budget(Budget::INFINITE);
+        let caller = {
+            let _source = Cx::set_current(Some(source));
+            let _no_io = Cx::push_restriction(CapSet::<true, true, true, false, true>::MASK);
+            Cx::current().unwrap()
+        };
+        let host = Cx::for_request_with_budget(Budget::INFINITE);
+        let _host = Cx::set_current(Some(host));
+        let probe = Arc::new(HttpExtensionNotificationProbe::default());
+        let endpoint = http_extension_notification_builder(Arc::clone(&probe))
+            .test_http_endpoint("http://notification.test")
+            .unwrap();
+        let mut session = endpoint.open_session(&caller).unwrap();
+        {
+            // The inline path refuses a pending callback without a timer
+            // driver. Its destruction still belongs to the narrower caller,
+            // even after polling has returned to the unrestricted host.
+            let mut request = Box::pin(session.handle_async(
+                &caller,
+                http_extension_notification_request(41, 0, true),
+            ));
+            let mut task = Context::from_waker(std::task::Waker::noop());
+            let Poll::Ready(Ok(ServerHttpEndpointResponse::Immediate(response))) =
+                request.as_mut().poll(&mut task)
+            else {
+                panic!("driverless pending notification must fail without detaching work")
+            };
+            assert_eq!(response.status, HttpStatus::INTERNAL_SERVER_ERROR);
+        }
+        assert_eq!(probe.started.load(Ordering::Acquire), 1);
+        assert_eq!(probe.completed.load(Ordering::Acquire), 0);
+        assert_eq!(probe.abandoned.load(Ordering::Acquire), 1);
+        assert_eq!(*probe.cleanup_io.lock().unwrap(), vec![false]);
+        assert!(Cx::current().unwrap().capabilities().io);
+        super::poll_on_cx(&caller, session.close(&caller));
     }
 
     #[test]

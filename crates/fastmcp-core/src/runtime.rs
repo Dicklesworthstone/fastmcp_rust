@@ -1166,7 +1166,11 @@ mod tests {
             drop(future);
             assert_eq!(dropped.get(), Some([false; 5]));
             assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
-            assert_eq!(effects(&caller), [true; 5], "the caller itself is not mutated");
+            assert_eq!(
+                effects(&caller),
+                [true; 5],
+                "the caller itself is not mutated"
+            );
         }
     }
 
