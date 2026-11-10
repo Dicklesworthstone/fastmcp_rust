@@ -1588,7 +1588,14 @@ mod tests {
             let cx = runtime.request_cx_with_budget(
                 Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
             );
-            test(&cx, &clock, &timer);
+            // An unloaned current-thread runtime drives its worker, timers
+            // included, on a background thread. Run the hand-driven clock as
+            // the root poll so only the test fires the virtual timers it
+            // inspects, without the root ambient context `block_on` installs.
+            runtime.block_on(async {
+                let _ambient = Cx::set_current(None);
+                test(&cx, &clock, &timer);
+            });
             assert_eq!(timer.pending_count(), 0);
             drop(cx);
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));

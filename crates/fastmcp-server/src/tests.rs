@@ -7408,7 +7408,10 @@ mod handler_direct_tests {
         }
 
         // Force every real Sleep, including each replacement, to become ready
-        // immediately. This needs no wall-clock delay or scheduler lottery.
+        // without a wall-clock delay or scheduler lottery. Since asupersync 0.6
+        // a Sleep first polled after its task was cancelled returns Pending and
+        // wakes once before completing (one scheduler trip), so a rate tick can
+        // take two handler polls; the loop below allows exactly that many.
         let ambient = Cx::for_testing();
         ambient.set_cancel_requested(true);
         let _ambient = Cx::set_current(Some(ambient));
@@ -7419,13 +7422,14 @@ mod handler_direct_tests {
             fastmcp_protocol::ProgressMarker::from("rearm"),
             |request| sent.lock().unwrap().push(request),
         );
-        let mut polls = 0;
+        // The handler finishes only when released, however many polls the rate
+        // ticks needed.
+        let released = std::cell::Cell::new(false);
         let handler = std::future::poll_fn(|_| {
-            polls += 1;
-            if polls <= 3 {
-                Poll::Pending
-            } else {
+            if released.get() {
                 Poll::Ready(73)
+            } else {
+                Poll::Pending
             }
         });
         let mut wait = Box::pin(crate::await_final_progress_rate_tick(
@@ -7442,7 +7446,12 @@ mod handler_direct_tests {
                 assert!(cancellation.cancel());
             }
             runtime.send_progress_exact(serde_json::Number::from(step), None, None);
-            assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+            for _ in 0..2 {
+                assert!(wait.as_mut().poll(&mut task_cx).is_pending());
+                if sent.lock().unwrap().len() == step {
+                    break;
+                }
+            }
         }
         let expected_frames = if cancel { 2 } else { 3 };
         assert!(
@@ -7458,6 +7467,7 @@ mod handler_direct_tests {
             assert_eq!(params["progress"], index + 1);
         }
         drop(notifications);
+        released.set(true);
         assert_eq!(wait.as_mut().poll(&mut task_cx), Poll::Ready(73));
         assert_eq!(sent.lock().unwrap().len(), expected_frames);
         assert!(!cx.is_cancel_requested());

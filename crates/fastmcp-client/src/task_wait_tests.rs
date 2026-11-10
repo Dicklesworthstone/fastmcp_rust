@@ -569,26 +569,53 @@ mod memory {
                     } else {
                         None
                     };
-                    let limited = runtime.request_cx_with_budget(
+                    // The earlier caller is a child task whose budget carries
+                    // the deadline. A runtime request Cx cannot be that
+                    // caller: it is not a registered task, so the memory
+                    // transport's checked send obligation refuses it.
+                    let limited = cx.scope_with_budget(
                         asupersync::Budget::INFINITE
                             .with_deadline(cx.now() + Duration::from_millis(80)),
                     );
+                    // Its deadline also classifies the child as cancelled, so
+                    // the join reports that and the child hands its client,
+                    // handle and outcome back through this slot.
                     let cancellation = McpRequestCancellation::new();
-                    let started = Instant::now();
-                    assert_eq!(
-                        handle
-                            .wait_with_memory(
-                                &limited,
-                                &mut client,
-                                &cancellation,
-                                policy(2000, 8, 1)
-                            )
-                            .await
-                            .unwrap(),
-                        FinalTaskWaitOutcome::DeadlineElapsed,
-                    );
+                    let limited_cancellation = cancellation.clone();
+                    let returned = std::sync::Arc::new(std::sync::Mutex::new(None));
+                    let slot = std::sync::Arc::clone(&returned);
+                    let mut waiting = cx
+                        .spawn_in(&limited, move |limited| async move {
+                            let started = Instant::now();
+                            let outcome = handle
+                                .wait_with_memory(
+                                    &limited,
+                                    &mut client,
+                                    &limited_cancellation,
+                                    policy(2000, 8, 1),
+                                )
+                                .await;
+                            *slot.lock().unwrap() =
+                                Some((client, handle, outcome, started.elapsed()));
+                        })
+                        .unwrap();
+                    match waiting.join(&cx).await {
+                        Ok(()) => {}
+                        Err(asupersync::runtime::JoinError::Cancelled(reason)) => {
+                            assert_eq!(reason.kind, asupersync::types::CancelKind::Deadline);
+                        }
+                        Err(error) => panic!("the limited caller failed: {error:?}"),
+                    }
+                    let (returned_client, returned_handle, outcome, elapsed) = returned
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .expect("the limited caller returns its client after the wait");
+                    client = returned_client;
+                    handle = returned_handle;
+                    assert_eq!(outcome.unwrap(), FinalTaskWaitOutcome::DeadlineElapsed);
                     assert!(
-                        started.elapsed() < Duration::from_secs(1),
+                        elapsed < Duration::from_secs(1),
                         "the earlier caller budget must wake the operation, not a later watchdog"
                     );
                     assert!(!cancellation.is_cancel_requested());

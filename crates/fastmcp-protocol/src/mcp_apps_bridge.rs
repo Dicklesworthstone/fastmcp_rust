@@ -639,6 +639,21 @@ pub struct McpAppsSandboxCapabilities {
     pub csp: Option<McpAppsResourceCsp>,
 }
 
+impl McpAppsSandboxCapabilities {
+    /// Advertises exactly the effective grants and approved external domains
+    /// compiled for this View. Requested resource permissions are never used
+    /// directly as Host grants. The renderer must install the policy's full
+    /// CSP value separately; this domain-only wire shape cannot express local
+    /// keyword restrictions.
+    #[must_use]
+    pub fn from_policy(policy: &crate::types::McpAppsSandboxPolicy) -> Self {
+        Self {
+            permissions: Some(policy.granted_permissions()),
+            csp: Some(policy.approved_domains()),
+        }
+    }
+}
+
 /// Pinned source-parity Host capabilities retained at the JSON-RPC boundary.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

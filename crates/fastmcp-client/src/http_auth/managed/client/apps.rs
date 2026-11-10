@@ -15,7 +15,7 @@ use fastmcp_core::McpRequestCancellation;
 use fastmcp_protocol::{
     McpAppsBridgeLifecycle, McpAppsCancelledControlParams, McpAppsDisplayMode,
     McpAppsDisplayModeParams, McpAppsJsonRpcRequestId, McpAppsProgressControlParams,
-    McpAppsRoutedMethod, McpAppsSamplingParams, McpAppsSamplingResult,
+    McpAppsRoutedMethod, McpAppsSamplingParams, McpAppsSamplingResult, McpAppsSandboxPolicy,
     McpAppsUpdateModelContextParams,
 };
 use serde_json::Value;
@@ -145,6 +145,99 @@ impl ManagedHttpClient {
         T: McpAppsWireBridgeTransport,
         E: McpAppsWireHostEffects,
     {
+        self.serve_mcp_apps_wire_host_inner(
+            cx,
+            cancellation,
+            transport,
+            configuration,
+            None,
+            effects,
+            limits,
+        )
+        .await
+    }
+
+    /// Serves one credential-bound View with an exact compiled sandbox policy.
+    ///
+    /// Compile the selected document's policy against the embedder's Host
+    /// ceiling and install that same policy in its renderer. This runner binds
+    /// the advertised sandbox grants to the supplied policy before the View
+    /// can initialize, replacing any raw sandbox claim in `configuration`.
+    /// The policy is immutable for this View and remains inside the original
+    /// credential lifetime, including during callbacks and continuations.
+    ///
+    /// This method does not install browser CSP, validate HTML conformance, or
+    /// satisfy the embedder's external-domain warning and consent duties.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_mcp_apps_wire_host_with_sandbox_policy<T, E>(
+        &mut self,
+        cx: &Cx,
+        transport: T,
+        configuration: McpAppsWireHostConfiguration,
+        sandbox_policy: McpAppsSandboxPolicy,
+        effects: E,
+        limits: ManagedMcpAppsLimits,
+    ) -> Result<ManagedMcpAppsOutcome, ManagedMcpAppsError>
+    where
+        T: McpAppsWireBridgeTransport,
+        E: McpAppsWireHostEffects,
+    {
+        self.serve_mcp_apps_wire_host_with_sandbox_policy_and_cancellation(
+            cx,
+            &McpRequestCancellation::new(),
+            transport,
+            configuration,
+            sandbox_policy,
+            effects,
+            limits,
+        )
+        .await
+    }
+
+    /// Cancellation-aware counterpart of
+    /// [`Self::serve_mcp_apps_wire_host_with_sandbox_policy`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn serve_mcp_apps_wire_host_with_sandbox_policy_and_cancellation<T, E>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        transport: T,
+        configuration: McpAppsWireHostConfiguration,
+        sandbox_policy: McpAppsSandboxPolicy,
+        effects: E,
+        limits: ManagedMcpAppsLimits,
+    ) -> Result<ManagedMcpAppsOutcome, ManagedMcpAppsError>
+    where
+        T: McpAppsWireBridgeTransport,
+        E: McpAppsWireHostEffects,
+    {
+        self.serve_mcp_apps_wire_host_inner(
+            cx,
+            cancellation,
+            transport,
+            configuration,
+            Some(sandbox_policy),
+            effects,
+            limits,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn serve_mcp_apps_wire_host_inner<T, E>(
+        &mut self,
+        cx: &Cx,
+        cancellation: &McpRequestCancellation,
+        transport: T,
+        configuration: McpAppsWireHostConfiguration,
+        sandbox_policy: Option<McpAppsSandboxPolicy>,
+        effects: E,
+        limits: ManagedMcpAppsLimits,
+    ) -> Result<ManagedMcpAppsOutcome, ManagedMcpAppsError>
+    where
+        T: McpAppsWireBridgeTransport,
+        E: McpAppsWireHostEffects,
+    {
         if self.closed {
             return Err(ManagedMcpAppsError::Managed(ManagedHttpClientError::Closed));
         }
@@ -212,6 +305,13 @@ impl ManagedHttpClient {
                             let host = match client.mcp_apps_wire_host(transport, configuration) {
                                 Ok(host) => host,
                                 Err(_) => return Ok(Err(ManagedMcpAppsError::Bridge)),
+                            };
+                            let host = match sandbox_policy {
+                                Some(policy) => match host.with_sandbox_policy(policy) {
+                                    Ok(host) => host,
+                                    Err(_) => return Ok(Err(ManagedMcpAppsError::Bridge)),
+                                },
+                                None => host,
                             };
                             let mut host = host.with_effects(effects);
                             for processed_turns in 1..=limits.maximum_turns {

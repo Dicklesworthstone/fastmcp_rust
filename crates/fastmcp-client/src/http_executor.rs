@@ -780,6 +780,33 @@ struct ModernHttpIo {
     cx: Cx,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
+    response_head_admitted: Arc<AtomicBool>,
+}
+
+impl Drop for ModernHttpIo {
+    fn drop(&mut self) {
+        if self.request_bytes_sent.load(Ordering::Acquire)
+            && !self.response_head_admitted.load(Ordering::Acquire)
+        {
+            // A clean FIN after the POST is indistinguishable from a legal
+            // request write-half close. A server whose handler has not elected
+            // response headers must retain that half-closed request, so merely
+            // dropping it can leave the handler running indefinitely. Reset
+            // this abandoned exchange instead. The native TCP destructor
+            // preserves zero-linger close without first sending a FIN.
+            //
+            // Once a response head is admitted, retain the existing response
+            // body lifecycle, including successful SSE terminals that release
+            // their body before its HTTP trailer is consumed.
+            let stream = match &self.inner {
+                ClientIo::Plain(stream) => stream,
+                ClientIo::Tls(stream) => stream.get_ref(),
+                // Modern native execution never constructs proxy tunnels.
+                ClientIo::TlsTunnel(_) => return,
+            };
+            let _ = stream.set_zero_linger();
+        }
+    }
 }
 
 impl AsyncRead for ModernHttpIo {
@@ -1922,6 +1949,16 @@ pub enum ModernHttpExtensionEvent {
     Progress(FinalProgressNotificationParams),
     /// Another final server notification admitted by its declared direction.
     Notification(ServerNotification),
+    /// A server notification owned by this request's negotiated extension.
+    ExtensionNotification {
+        /// The admitted envelope and materialized parameters.
+        notification: JsonRpcRequest,
+        /// Exact parameter source, preserving member order and number lexemes.
+        ///
+        /// Absent only when the peer omitted `params`. The response stream
+        /// owns correlation; no stdio correlation metadata is required.
+        raw_params: Option<String>,
+    },
     /// The one result admitted by this request's frozen extension authority.
     Terminal(serde_json::Value),
 }
@@ -1929,6 +1966,10 @@ pub enum ModernHttpExtensionEvent {
 enum ModernHttpOwnedEvent {
     Progress(FinalProgressNotificationParams),
     Notification(ServerNotification),
+    ExtensionNotification {
+        notification: JsonRpcRequest,
+        raw_params: Option<String>,
+    },
     CoreTerminal(FinalCoreResult),
     ExtensionTerminal {
         result: serde_json::Value,
@@ -2229,7 +2270,8 @@ impl ModernHttpRequestExecution {
                 ModernHttpOwnedEvent::CoreTerminal(terminal) => {
                     Ok(ModernHttpFinalCoreEvent::Terminal(terminal))
                 }
-                ModernHttpOwnedEvent::ExtensionTerminal { .. } => {
+                ModernHttpOwnedEvent::ExtensionTerminal { .. }
+                | ModernHttpOwnedEvent::ExtensionNotification { .. } => {
                     Err(ModernHttpFinalCoreListenError::UnexpectedTerminalResult)
                 }
             })
@@ -2469,6 +2511,13 @@ impl ModernHttpExtensionExecution {
             ModernHttpOwnedEvent::Notification(notification) => {
                 ModernHttpExtensionEvent::Notification(notification)
             }
+            ModernHttpOwnedEvent::ExtensionNotification {
+                notification,
+                raw_params,
+            } => ModernHttpExtensionEvent::ExtensionNotification {
+                notification,
+                raw_params,
+            },
             ModernHttpOwnedEvent::ExtensionTerminal {
                 result,
                 raw_result_source,
@@ -3019,7 +3068,9 @@ impl ModernHttpExtensionListener {
         if !matches!(
             result,
             Ok(Some(
-                ModernHttpOwnedEvent::Progress(_) | ModernHttpOwnedEvent::Notification(_)
+                ModernHttpOwnedEvent::Progress(_)
+                    | ModernHttpOwnedEvent::Notification(_)
+                    | ModernHttpOwnedEvent::ExtensionNotification { .. }
             ))
         ) {
             self.stream.close();
@@ -3050,6 +3101,27 @@ impl ModernHttpExtensionListener {
             )
             .map(Some),
             JsonRpcMessage::Request(request) => {
+                if final_2026_07_28_method(&request.method).is_none() {
+                    // Strict envelope admission above already bounded and
+                    // duplicate-checked this frame. Retain its exact params,
+                    // including explicit null, before checking the frozen owner.
+                    let mut envelope: BTreeMap<String, Box<serde_json::value::RawValue>> =
+                        serde_json::from_slice(event.as_bytes()).map_err(|_| {
+                            ModernHttpFinalCoreListenError::ExtensionAdmission(
+                                McpError::invalid_request(
+                                    "Peer HTTP extension notification is not admitted",
+                                ),
+                            )
+                        })?;
+                    let raw_params = envelope.remove("params").map(|raw| raw.get().to_owned());
+                    self.admission
+                        .admit_http_stream_notification(&request, raw_params.as_deref())
+                        .map_err(ModernHttpFinalCoreListenError::ExtensionAdmission)?;
+                    return Ok(Some(ModernHttpOwnedEvent::ExtensionNotification {
+                        notification: request,
+                        raw_params,
+                    }));
+                }
                 let notification =
                     decode_final_http_server_notification(&request, event.as_bytes())?;
                 Ok(Some(match notification {
@@ -4830,6 +4902,7 @@ impl ModernHttpExecutor {
         HttpResponseDeadline::add_timeout(cx.now(), policy.absolute_timeout())?;
         let committed_at = Arc::new(OnceLock::new());
         let request_bytes_sent = Arc::new(AtomicBool::new(false));
+        let response_head_admitted = Arc::new(AtomicBool::new(false));
         let progress_marker = serde_json::from_slice::<serde_json::Value>(request.body())
             .ok()
             .and_then(|body| body.pointer("/params/_meta/progressToken").cloned())
@@ -4851,6 +4924,7 @@ impl ModernHttpExecutor {
             self.resource_tls.as_ref(),
             committed_at,
             Arc::clone(&request_bytes_sent),
+            Arc::clone(&response_head_admitted),
         ));
         // A native response-head wait may remain pending even after the
         // caller's Cx has been cancelled. Keep the request-owned exchange
@@ -4907,6 +4981,7 @@ impl ModernHttpExecutor {
         }
         check_modern_http_effects(cx)?;
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
+        response_head_admitted.store(true, Ordering::Release);
         let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
             let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
             let target = fastmcp_core::CanonicalHttpUrl::parse(request.target()).ok()?;
@@ -4936,6 +5011,7 @@ async fn execute_native_modern_request(
     resource_tls: Option<&ResourceTlsTrust>,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
+    response_head_admitted: Arc<AtomicBool>,
 ) -> Result<ClientStreamingResponse<ModernHttpIo>, ModernHttpExecutorError> {
     let map_error = |error| map_modern_exchange_error(error, &request_bytes_sent);
     let unavailable = |credential: &crate::http_auth::BoundBearerCredential| {
@@ -5025,6 +5101,7 @@ async fn execute_native_modern_request(
             cx: cx.clone(),
             committed_at,
             request_bytes_sent: Arc::clone(&request_bytes_sent),
+            response_head_admitted,
         },
         native_request,
     )
@@ -9102,6 +9179,36 @@ impl ModernHttpClient {
         Ok((decoder, response))
     }
 
+    /// Reads a fresh catalog for one Apps View's tool visibility admission.
+    ///
+    /// Tasks is omitted before the Host makes any creation decision. Other
+    /// negotiated extensions and final request metadata keep their normal
+    /// authority. The enclosing Apps operation owns the response deadline,
+    /// cancellation, and exact selected-era result admission.
+    #[cfg(feature = "apps")]
+    pub(crate) async fn request_apps_tool_catalog_page(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        parameters: serde_json::Value,
+    ) -> Result<(CoreRequest, ModernHttpResponseStream), ModernHttpClientError> {
+        let request = self.build_post_discovery_request(
+            cx,
+            "tools/list",
+            parameters,
+            Some(request_id),
+            None,
+            true,
+        )?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body)
+            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+        let decoder =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", wire.params.as_ref())
+                .map_err(ModernHttpClientError::TypedResult)?;
+        let response = self.execute_post_discovery_request(cx, &request).await?;
+        Ok((decoder, response))
+    }
+
     /// Starts a tool call, resource read, prompt request, or argument completion.
     /// The first three support caller-managed MRTR retries; completion retains
     /// its complete-only decoder.
@@ -11360,42 +11467,56 @@ impl LegacySsePersistentReceiver {
             armed: true,
         };
         let request = JsonRpcRequest::new(method, Some(parameters), request_id.clone());
-        if let Err(error) = self
+        let sent = self
             .outbound
             .send(cx, &JsonRpcMessage::Request(request))
-            .await
+            .await;
+        pending_post.armed = false;
+        drop(pending_post);
+        if let Err(LegacySseOutboundSendError {
+            error,
+            request_may_have_reached_peer,
+        }) = sent
         {
-            let LegacySseOutboundSendError {
-                error,
-                request_may_have_reached_peer,
-            } = error;
-            pending_post.armed = false;
-            drop(pending_post);
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.stopped {
-                return Err(if matches!(error, LegacySseHttpClientError::StreamGenerationEnded) {
-                    state.stopped_error()
+            // The SSE response can outrun the POST acknowledgement: a peer may
+            // answer and end the generation before its 202 is read, and the
+            // ended generation then aborts the POST. The reader removes a
+            // waiter only to route its terminal outcome, which it sends after
+            // releasing this lock; a stopped reader has finished every routing
+            // it began and dropped the remaining waiters. Once the reader owns
+            // the outcome of a request that may have reached the peer, the
+            // POST's own failure must not discard it: the returned waiter
+            // delivers that outcome, or the stop if the reader dropped it.
+            let reader_owns_outcome = request_may_have_reached_peer
+                && (receiver.is_ready() || (!state.stopped && !state.pending.contains_key(&key)));
+            if !reader_owns_outcome {
+                if state.stopped {
+                    return Err(
+                        if matches!(error, LegacySseHttpClientError::StreamGenerationEnded) {
+                            state.stopped_error()
+                        } else {
+                            ClientHttpConnectionError::Legacy(error)
+                        },
+                    );
+                }
+                if request_may_have_reached_peer {
+                    let retired =
+                        retire_abandoned_persistent_waiter(&mut state, &key, request_id);
+                    let gate = Arc::clone(&state.post_gate);
+                    drop(state);
+                    gate.wake_stopped_posts();
+                    retired?;
                 } else {
-                    ClientHttpConnectionError::Legacy(error)
-                });
+                    state.pending.remove(&key);
+                    state.pending_changed();
+                }
+                return Err(ClientHttpConnectionError::Legacy(error));
             }
-            if request_may_have_reached_peer {
-                let retired = retire_abandoned_persistent_waiter(&mut state, &key, request_id);
-                let gate = Arc::clone(&state.post_gate);
-                drop(state);
-                gate.wake_stopped_posts();
-                retired?;
-            } else {
-                state.pending.remove(&key);
-                state.pending_changed();
-            }
-            return Err(ClientHttpConnectionError::Legacy(error));
         }
-        pending_post.armed = false;
-        drop(pending_post);
         deadline
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -13850,6 +13971,7 @@ mod tests {
                 cx: owner.clone(),
                 committed_at: Arc::new(OnceLock::new()),
                 request_bytes_sent: Arc::new(AtomicBool::new(false)),
+                response_head_admitted: Arc::new(AtomicBool::new(false)),
             };
             let mut task = Context::from_waker(Waker::noop());
             for mask in [NO_IO, NO_TIME] {
@@ -14412,12 +14534,19 @@ mod tests {
             assert_eq!(request["method"], "example/events");
             assert!(request.get("id").is_none());
             started_tx.send(()).unwrap();
+            // No response head was sent, so the dropped exchange is reset, not
+            // half-closed (a FIN would read as a legal request write-half close).
             let mut byte = [0_u8; 1];
-            assert_eq!(
-                stream.read(&mut byte).unwrap(),
-                0,
-                "dropping the owned notification closes its response wait"
-            );
+            match stream.read(&mut byte) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => {
+                    panic!("dropping the owned notification resets its response wait: {result:?}")
+                }
+            }
             respond_notification_followup(&listener);
         });
         let cx = Cx::for_request();
@@ -15686,6 +15815,382 @@ mod tests {
         br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#
     }
 
+    mod extension_response_notifications {
+        use super::*;
+        use std::future::Future;
+
+        use fastmcp_protocol::extensions::{
+            ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
+            ExtensionDirection, ExtensionFallbackPolicy, ExtensionHttpEraDisposition, ExtensionId,
+            ExtensionMethodDescriptor, ExtensionNegotiationError, ExtensionNegotiationResolver,
+            ExtensionNotificationDescriptor, ExtensionSettings, ExtensionSettingsSchema,
+        };
+
+        use super::super::{ModernHttpExtensionEvent, ModernHttpExtensionExecution};
+
+        const OWNER: &str = "com.example/stream-events";
+        const FOREIGN: &str = "com.example/foreign-events";
+        const METHOD: &str = "example/watch";
+        const EVENT: &str = "example/changed";
+        const FOREIGN_EVENT: &str = "example/foreign-changed";
+        const EXACT_PARAMS: &str = r#"{ "fraction":7.30e-2, "integer":123456789012345678901234567890, "extra":{"z":1.20e+4,"a":2}, "_meta":{"com.example/note":"kept"} }"#;
+        const EXACT_RESULT: &str =
+            r#"{ "resultType":"complete", "value":7.30e-2, "extra":{"z":2,"a":1} }"#;
+
+        fn builder(target: &str, direction: ExtensionDirection) -> ClientBuilder {
+            let mut registry = ExtensionDescriptorRegistry::new();
+            let mut extensions = BTreeMap::new();
+            for (owner, method, notification) in [
+                (OWNER, METHOD, EVENT),
+                (FOREIGN, "example/foreign-watch", FOREIGN_EVENT),
+            ] {
+                let id = ExtensionId::parse(owner).unwrap();
+                registry
+                    .register(ExtensionDescriptor {
+                        id: id.clone(),
+                        client_settings: ExtensionSettingsSchema {
+                            schema_id: "stream-client-v1".to_owned(),
+                            codec_id: "stream-client-v1".to_owned(),
+                        },
+                        server_settings: ExtensionSettingsSchema {
+                            schema_id: "stream-server-v1".to_owned(),
+                            codec_id: "stream-server-v1".to_owned(),
+                        },
+                        resolver: ExtensionNegotiationResolver {
+                            id: "stream-settings-v1".to_owned(),
+                            version: 1,
+                            fallback: ExtensionFallbackPolicy::RejectOneSided,
+                        },
+                        method: Some(ExtensionMethodDescriptor {
+                            name: method.to_owned(),
+                            direction: ExtensionDirection::ClientToServer,
+                            http_era_disposition: Some(
+                                ExtensionHttpEraDisposition::ModernExclusive,
+                            ),
+                            legacy_fallback: false,
+                        }),
+                        notification: Some(ExtensionNotificationDescriptor {
+                            name: notification.to_owned(),
+                            direction,
+                            activation_proof: None,
+                        }),
+                        result_discriminator: None,
+                        routing_headers: Vec::new(),
+                        stdio_correlation: None,
+                    })
+                    .unwrap();
+                extensions.insert(id, ExtensionSettings::new(serde_json::json!({})).unwrap());
+            }
+            ClientBuilder::new()
+                .protocol_plan(plan(
+                    target,
+                    "http://127.0.0.1:9/unused-sse",
+                    "http://127.0.0.1:9/unused-messages",
+                    ProtocolPolicy::ModernOnly,
+                ))
+                .request_timeout_policy(
+                    crate::RequestTimeoutPolicy::new(
+                        Duration::from_secs(2),
+                        Duration::from_secs(3),
+                    )
+                    .unwrap(),
+                )
+                .extension_registry(registry, ClientExtensionDiscovery { extensions }, || {
+                    |descriptor: &ExtensionDescriptor,
+                     client: &ExtensionSettings,
+                     server: &ExtensionSettings| {
+                        if client.clone().into_value() == server.clone().into_value() {
+                            Ok(client.clone())
+                        } else {
+                            Err(ExtensionNegotiationError::SettingsCompatibilityRejected(
+                                descriptor.id.to_string(),
+                            ))
+                        }
+                    }
+                })
+                .unwrap()
+        }
+
+        fn discovery(listener: &TcpListener) {
+            let mut stream = accept_notification_test_peer(listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["method"], SERVER_DISCOVER);
+            assert_eq!(request["id"], 1);
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"extensions":{"com.example/stream-events":{},"com.example/foreign-events":{}}},"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+        }
+
+        fn prepare(client: &crate::HttpClient, cx: &Cx) -> ModernHttpExtensionExecution {
+            client
+                .execute_final_extension(
+                    cx,
+                    &ExtensionId::parse(OWNER).unwrap(),
+                    METHOD,
+                    serde_json::json!({}),
+                    SseLimits::new(4_096, 4_096, 32).unwrap(),
+                )
+                .unwrap()
+        }
+
+        fn accept_request(listener: &TcpListener) -> TcpStream {
+            let mut stream = accept_notification_test_peer(listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["method"], METHOD);
+            assert_eq!(request["id"], 2);
+            begin_chunked_sse(&mut stream);
+            stream
+        }
+
+        fn send_record(stream: &mut TcpStream, message: &str) {
+            write_chunked_sse_event(stream, &format!("data: {message}\n\n"));
+        }
+
+        fn serve_sibling(listener: &TcpListener) {
+            let mut stream = accept_notification_test_peer(listener);
+            let request: serde_json::Value =
+                serde_json::from_slice(&read_request(&mut stream).body).unwrap();
+            assert_eq!(request["method"], "tools/list");
+            assert_eq!(request["id"], 3);
+            write_response(
+                &mut stream,
+                200,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}"#,
+            );
+            assert_sse_peer_closed(&mut stream);
+        }
+
+        async fn assert_sibling(client: &crate::HttpClient, cx: &Cx) {
+            let mut sibling = client
+                .execute_core(
+                    cx,
+                    "tools/list",
+                    serde_json::json!({}),
+                    SseLimits::new(4_096, 4_096, 32).unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(
+                sibling.next_event(cx).await.unwrap(),
+                Some(ModernHttpFinalCoreEvent::Terminal(
+                    FinalCoreResult::ToolsList { .. }
+                ))
+            ));
+            assert!(sibling.next_event(cx).await.unwrap().is_none());
+            assert!(cx.checkpoint().is_ok());
+        }
+
+        #[test]
+        fn owned_http_extension_notifications_preserve_exact_parameters_and_terminal() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = thread::spawn(move || {
+                discovery(&listener);
+                let mut stream = accept_request(&listener);
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","method":"{EVENT}","params":{EXACT_PARAMS}}}"#),
+                );
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","method":"{EVENT}"}}"#),
+                );
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","id":2,"result":{EXACT_RESULT}}}"#),
+                );
+                assert_sse_peer_closed(&mut stream);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().expect("extension stream uses its caller runtime");
+                let client = builder(&target, ExtensionDirection::ServerToClient)
+                    .connect_http_client_with_cx(&cx)
+                    .await
+                    .unwrap();
+                let mut execution = prepare(&client, &cx);
+                let control = execution.control();
+                let Some(ModernHttpExtensionEvent::ExtensionNotification {
+                    notification,
+                    raw_params,
+                }) = execution.next_event(&cx).await.unwrap()
+                else {
+                    panic!("the registered owner must receive its live notification");
+                };
+                assert_eq!(notification.method, EVENT);
+                assert!(notification.is_notification());
+                assert_eq!(raw_params.as_deref(), Some(EXACT_PARAMS));
+                assert_eq!(
+                    notification.params.as_ref().unwrap()["fraction"]
+                        .as_number()
+                        .unwrap()
+                        .as_str(),
+                    "7.30e-2"
+                );
+                assert_eq!(control.terminal_reason(), None);
+                let Some(ModernHttpExtensionEvent::ExtensionNotification {
+                    notification,
+                    raw_params,
+                }) = execution.next_event(&cx).await.unwrap()
+                else {
+                    panic!("an admitted parameterless notification must remain nonterminal");
+                };
+                assert!(notification.params.is_none());
+                assert!(raw_params.is_none());
+                let Some(ModernHttpExtensionEvent::Terminal(result)) =
+                    execution.next_event(&cx).await.unwrap()
+                else {
+                    panic!("extension notifications must leave the terminal response live");
+                };
+                assert_eq!(result["value"].as_number().unwrap().as_str(), "7.30e-2");
+                assert_eq!(execution.raw_result_source(), Some(EXACT_RESULT));
+                assert_eq!(
+                    control.terminal_reason(),
+                    Some(crate::ExecutionTerminalReason::FinalResponse)
+                );
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert!(!control.cancel());
+                assert!(control.take_cancellation_event().is_none());
+                assert!(cx.checkpoint().is_ok());
+            });
+            peer.join().unwrap();
+        }
+
+        #[test]
+        fn owned_http_extension_notifications_reject_foreign_authority_and_preserve_siblings() {
+            let cases = [
+                (
+                    ExtensionDirection::ServerToClient,
+                    FOREIGN_EVENT,
+                    r#","params":{}"#,
+                ),
+                (
+                    ExtensionDirection::ServerToClient,
+                    "example/unknown",
+                    r#","params":{}"#,
+                ),
+                (ExtensionDirection::ClientToServer, EVENT, r#","params":{}"#),
+                (
+                    ExtensionDirection::ServerToClient,
+                    EVENT,
+                    r#","id":9,"params":{}"#,
+                ),
+                (
+                    ExtensionDirection::ServerToClient,
+                    EVENT,
+                    r#","params":{"_meta":[]}"#,
+                ),
+                (
+                    ExtensionDirection::ServerToClient,
+                    EVENT,
+                    r#","params":null"#,
+                ),
+                (ExtensionDirection::ServerToClient, EVENT, r#","params":[]"#),
+            ];
+            for (direction, method, members) in cases {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let peer = thread::spawn(move || {
+                    discovery(&listener);
+                    let mut stream = accept_request(&listener);
+                    send_record(
+                        &mut stream,
+                        &format!(r#"{{"jsonrpc":"2.0","method":"{method}"{members}}}"#),
+                    );
+                    assert_sse_peer_closed(&mut stream);
+                    serve_sibling(&listener);
+                });
+                runtime_block_on(async {
+                    let cx = Cx::current().expect("extension refusal uses its caller runtime");
+                    let client = builder(&target, direction)
+                        .connect_http_client_with_cx(&cx)
+                        .await
+                        .unwrap();
+                    let mut execution = prepare(&client, &cx);
+                    let control = execution.control();
+                    assert!(
+                        matches!(
+                            execution.next_event(&cx).await,
+                            Err(ModernHttpFinalCoreListenError::ExtensionAdmission(_))
+                        ),
+                        "notification must stay within its frozen owner: {method}{members}"
+                    );
+                    assert_eq!(
+                        control.terminal_reason(),
+                        Some(crate::ExecutionTerminalReason::PeerProtocol)
+                    );
+                    assert!(execution.raw_result_source().is_none());
+                    assert!(execution.next_event(&cx).await.unwrap().is_none());
+                    assert!(control.take_cancellation_event().is_none());
+                    assert!(!control.cancel());
+                    assert_sibling(&client, &cx).await;
+                });
+                peer.join().unwrap();
+            }
+        }
+
+        #[test]
+        fn owned_http_extension_notification_cancellation_releases_only_its_stream() {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let target = format!("http://{}/mcp", listener.local_addr().unwrap());
+            let peer = thread::spawn(move || {
+                discovery(&listener);
+                let mut stream = accept_request(&listener);
+                send_record(
+                    &mut stream,
+                    &format!(r#"{{"jsonrpc":"2.0","method":"{EVENT}","params":{{}}}}"#),
+                );
+                assert_sse_peer_closed(&mut stream);
+                serve_sibling(&listener);
+            });
+            runtime_block_on(async {
+                let cx = Cx::current().expect("extension cancellation uses its caller runtime");
+                let client = builder(&target, ExtensionDirection::ServerToClient)
+                    .connect_http_client_with_cx(&cx)
+                    .await
+                    .unwrap();
+                let mut execution = prepare(&client, &cx);
+                let control = execution.control();
+                assert!(matches!(
+                    execution.next_event(&cx).await.unwrap(),
+                    Some(ModernHttpExtensionEvent::ExtensionNotification { .. })
+                ));
+                {
+                    let mut pending = std::pin::pin!(execution.next_event(&cx));
+                    std::future::poll_fn(|task_cx| {
+                        assert!(pending.as_mut().poll(task_cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                }
+                assert!(control.cancel());
+                assert!(!control.cancel());
+                assert!(matches!(
+                    execution.next_event(&cx).await,
+                    Err(ModernHttpFinalCoreListenError::CallerCancelled {
+                        request_id: RequestId::Number(2),
+                    })
+                ));
+                assert_eq!(
+                    control.take_cancellation_event().unwrap().reason,
+                    crate::ExecutionTerminalReason::CallerCancelled
+                );
+                assert!(control.take_cancellation_event().is_none());
+                assert!(execution.raw_result_source().is_none());
+                assert!(execution.next_event(&cx).await.unwrap().is_none());
+                assert_sibling(&client, &cx).await;
+            });
+            peer.join().unwrap();
+        }
+    }
+
     fn owned_http_error_test_builder(target: &str) -> ClientBuilder {
         use fastmcp_protocol::extensions::{
             ClientExtensionDiscovery, ExtensionDescriptor, ExtensionDescriptorRegistry,
@@ -16043,19 +16548,39 @@ mod tests {
     #[test]
     fn owned_http_errors_reject_foreign_response_ids() {
         for extension in [false, true] {
+            // An explicit null id is an invalid envelope, not a foreign id:
+            // uncorrelated MCP errors omit the id, and strict admission
+            // refuses null, so the HTTP outcome is preserved.
+            let null_id = owned_http_failure_case(
+                extension,
+                404,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#,
+                4_096,
+            );
+            assert!(
+                matches!(
+                    null_id,
+                    ModernHttpFinalCoreListenError::UnexpectedHttpStatus { status: 404 }
+                ),
+                "extension {extension}: {null_id:?}"
+            );
             for body in [
                 &br#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}"#[..],
                 &br#"{"jsonrpc":"2.0","id":"2","error":{"code":-32601,"message":"Method not found"}}"#[..],
-                &br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#[..],
             ] {
                 let error = owned_http_failure_case(extension, 404, "application/json", body, 4_096);
-                assert!(matches!(
-                    error,
-                    ModernHttpFinalCoreListenError::ResponseIdMismatch {
-                        expected: RequestId::Number(2),
-                        ..
-                    }
-                ));
+                assert!(
+                    matches!(
+                        error,
+                        ModernHttpFinalCoreListenError::ResponseIdMismatch {
+                            expected: RequestId::Number(2),
+                            ..
+                        }
+                    ),
+                    "extension {extension}, body {}: {error:?}",
+                    String::from_utf8_lossy(body)
+                );
             }
         }
     }
@@ -16460,23 +16985,27 @@ mod tests {
 
     #[test]
     fn collected_http_errors_reject_foreign_ids_and_non_error_bodies() {
-        for id in [
-            serde_json::json!(3),
-            serde_json::json!("2"),
-            serde_json::Value::Null,
-        ] {
+        // An explicit null id is not a foreign id but an invalid envelope:
+        // uncorrelated MCP errors omit the id, and strict response admission
+        // refuses null. It keeps the HTTP failure, with the malformed bodies.
+        for id in [serde_json::json!(3), serde_json::json!("2")] {
             let body = serde_json::json!({
                 "jsonrpc": "2.0", "id": id,
                 "error": {"code": -32601, "message": "Method not found"}
             })
             .to_string();
-            assert!(matches!(
-                collected_http_error_response(404, "application/json", body.as_bytes(), 4_096),
-                Err(ClientHttpConnectionError::ResponseIdMismatch {
-                    expected: RequestId::Number(2),
-                    ..
-                })
-            ));
+            let collected =
+                collected_http_error_response(404, "application/json", body.as_bytes(), 4_096);
+            assert!(
+                matches!(
+                    collected,
+                    Err(ClientHttpConnectionError::ResponseIdMismatch {
+                        expected: RequestId::Number(2),
+                        ..
+                    })
+                ),
+                "response id {id}: {collected:?}"
+            );
         }
         const ERROR: &[u8] =
             br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
@@ -16484,6 +17013,11 @@ mod tests {
             (400, "text/plain", ERROR),
             (404, "application/json; charset=iso-8859-1", ERROR),
             (400, "application/json", &b"{malformed"[..]),
+            (
+                404,
+                "application/json",
+                &br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#[..],
+            ),
             (401, "application/json", ERROR),
             (403, "application/json", ERROR),
             (429, "application/json", ERROR),
@@ -20102,14 +20636,13 @@ mod tests {
                 .expect("bound cancelled request socket closure");
             let mut byte = [0_u8; 1];
             match stream.read(&mut byte) {
-                Ok(0) => {}
                 Err(error)
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                     ) => {}
                 result => panic!(
-                    "cancelling a pending response must close its request-owned socket: {result:?}"
+                    "cancelling before response headers must reset the socket, not half-close: {result:?}"
                 ),
             }
         });
@@ -22436,9 +22969,12 @@ mod tests {
     fn public_legacy_receiver_eof_cancels_pending_message_posts() {
         // Exercise a quiet response-head wait and a quiet response-body wait.
         // Each negative differs from its positive only in whether the peer ends
-        // the generation before completing its POST acknowledgement.
+        // the generation before completing its POST acknowledgement. A peer
+        // that answers on SSE before ending the generation has completed the
+        // request even though the POST acknowledgement never arrives.
         for waiting_for_body in [false, true] {
-            for end_generation in [false, true] {
+            for (end_generation, answer_before_end) in [(false, false), (true, false), (true, true)]
+            {
                 let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 listener.set_nonblocking(true).unwrap();
                 let address = listener.local_addr().unwrap();
@@ -22496,6 +23032,15 @@ mod tests {
                         post.flush().unwrap();
                     }
                     if end_generation {
+                        if answer_before_end {
+                            let response = serde_json::json!({
+                                "jsonrpc":"2.0", "id":request["id"], "result":{"tools":[]}
+                            });
+                            write_chunked_sse_event(
+                                &mut sse,
+                                &format!("event: message\ndata: {response}\n\n"),
+                            );
+                        }
                         finish_chunked_sse(&mut sse);
                         // Keep the POST socket quiet until the client reports
                         // completion. Socket closure is not what wakes its wait.
@@ -22552,7 +23097,7 @@ mod tests {
                         client.request(&cx, "tools/list", serde_json::json!({})),
                     ))
                     .expect("SSE invalidation wakes a quiet native POST");
-                if end_generation {
+                if end_generation && !answer_before_end {
                     assert!(matches!(result,
                         Err(crate::HttpClientError::Connection(ClientHttpConnectionError::LegacyPersistentReceiverFailed(ref error)))
                         if matches!(error.as_ref(), LegacySseHttpClientError::StreamGenerationEnded)));
@@ -23096,11 +23641,14 @@ mod tests {
             served,
             "the wrong-version wire peer must receive its two requests"
         );
-        assert!(matches!(
-            error,
-            crate::HttpClientError::LegacyInitializationUnsupportedProtocolVersion { actual }
-                if actual == "2026-07-28"
-        ));
+        assert!(
+            matches!(
+                &error,
+                crate::HttpClientError::LegacyInitializationUnsupportedProtocolVersion { actual }
+                    if actual == "2026-07-28"
+            ),
+            "{error:?}"
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

@@ -711,7 +711,7 @@ fastmcp-rust = "0.13.0"
 ```toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-asupersync = "=0.5.0"
+asupersync = "=0.6.2"
 ```
 
 ### Headless server embeddings (current source tree)
@@ -1417,7 +1417,7 @@ cd my-mcp-server
 # Cargo.toml
 [dependencies]
 fastmcp-rust = { git = "https://github.com/Dicklesworthstone/fastmcp_rust" }
-asupersync = "=0.5.0"
+asupersync = "=0.6.2"
 ```
 
 ### 3. Write Your Server

@@ -265,14 +265,12 @@ impl ReplayDigestLimits {
         let framed = context_bytes
             .checked_add(MAC_FRAMING + MAX_KEY_ID_BYTES)
             .ok_or(ReplayDigestError::InvalidLimits)?;
-        if context_bytes < CONTEXT_FRAMING + 33
-            || context_bytes > MAX_CONTEXT_BYTES
+        if !(CONTEXT_FRAMING + 33..=MAX_CONTEXT_BYTES).contains(&context_bytes)
             || input_bytes < framed
             || input_bytes > MAX_INPUT_BYTES
             || !(1..=MAX_GENERATIONS).contains(&generations)
             || !(1..=MAX_ACTIVE_OPERATIONS).contains(&active_operations)
-            || reserved_bytes < OPERATION_OVERHEAD
-            || reserved_bytes > MAX_RESERVED_BYTES
+            || !(OPERATION_OVERHEAD..=MAX_RESERVED_BYTES).contains(&reserved_bytes)
             || call_timeout.is_zero()
             || call_timeout > MAX_CALL_TIMEOUT
         {

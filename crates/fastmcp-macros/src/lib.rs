@@ -142,6 +142,14 @@ fn found_crate_path(found: FoundCrate, package: &str) -> TokenStream2 {
 }
 
 fn direct_crate_path(package: &str) -> syn::Result<TokenStream2> {
+    // This crate's own unit tests expand handlers to inspect their tokens,
+    // never to compile them, and its manifest deliberately depends on no
+    // runtime crate. There, an unresolved package names its canonical crate.
+    #[cfg(test)]
+    if crate_name(package).is_err() {
+        let ident = Ident::new(&package.replace('-', "_"), Span::call_site());
+        return Ok(quote!(::#ident));
+    }
     crate_name(package)
         .map(|found| found_crate_path(found, package))
         .map_err(|error| {
@@ -7452,7 +7460,7 @@ fn schema_flatten_type(ty: &Type) -> syn::Result<SchemaFlattenType<'_>> {
         }
         "Option" => Err(syn::Error::new_spanned(
             ty,
-            "optional serde(flatten) fields require an explicit schema; optional fields inside a flattened object are supported",
+            "optional serde(flatten) fields require an explicit schema; implement json_schema() explicitly (optional fields inside a flattened object are supported)",
         )),
         "HashMap" | "BTreeMap" => {
             if let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments {

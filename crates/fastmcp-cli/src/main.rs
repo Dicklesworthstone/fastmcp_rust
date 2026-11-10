@@ -2255,8 +2255,9 @@ fn validate_regular_metadata(
 fn inspect_replacement_metadata(file: &File) -> ReplacementMetadataStatus {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let mut empty = [0_u8; 0];
-        match rustix::fs::flistxattr(file, &mut empty) {
+        // rustix's flistxattr reports 0 for an empty buffer; only
+        // flistxattr_query returns the size of the attribute name list.
+        match rustix::fs::flistxattr_query(file) {
             Ok(0) => {}
             Ok(_) => return ReplacementMetadataStatus::ExtendedAttributesPresent,
             Err(error) => {
@@ -2322,8 +2323,7 @@ fn linux_platform_attributes_present(file: &File) -> io::Result<bool> {
 fn list_extended_attribute_names(file: &File) -> io::Result<Vec<u8>> {
     const MAX_ATTRIBUTE_NAME_BYTES: usize = 64 * 1024;
 
-    let mut empty = [0_u8; 0];
-    let required = rustix::fs::flistxattr(file, &mut empty).map_err(io::Error::from)?;
+    let required = rustix::fs::flistxattr_query(file).map_err(io::Error::from)?;
     if required > MAX_ATTRIBUTE_NAME_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -13387,9 +13387,8 @@ mod portable_install {
             let metadata = fs::metadata(path).map_err(|error| io_error("inspect", &error))?;
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if let Ok(file) = File::open(path) {
-                let mut empty = [0_u8; 0];
                 publication.dropped_extended_attributes =
-                    rustix::fs::flistxattr(&file, &mut empty).is_ok_and(|length| length > 0);
+                    rustix::fs::flistxattr_query(&file).is_ok_and(|length| length > 0);
             }
             let backup = sibling(".fastmcp-backup.");
             fs::hard_link(path, &backup).map_err(|error| io_error("link a backup", &error))?;

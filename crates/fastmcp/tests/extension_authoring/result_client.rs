@@ -202,6 +202,35 @@ impl fastmcp_rust::extensions::authoring::ExtensionHandler<ScaleRequest, ScaleRe
 
 #[test]
 fn typed_extension_http_cancellation_settles_handler_and_preserves_client() {
+    typed_extension_http_interruption_settles_handler_and_preserves_client(
+        HttpRequestInterruption::Cancel,
+    );
+}
+
+#[test]
+fn typed_extension_http_dropped_request_settles_handler_and_preserves_client() {
+    typed_extension_http_interruption_settles_handler_and_preserves_client(
+        HttpRequestInterruption::Drop,
+    );
+}
+
+#[test]
+fn typed_extension_http_response_timeout_settles_handler_and_preserves_client() {
+    typed_extension_http_interruption_settles_handler_and_preserves_client(
+        HttpRequestInterruption::IdleTimeout,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum HttpRequestInterruption {
+    Cancel,
+    Drop,
+    IdleTimeout,
+}
+
+fn typed_extension_http_interruption_settles_handler_and_preserves_client(
+    interruption: HttpRequestInterruption,
+) {
     use fastmcp_rust::{McpErrorCode, McpRequestCancellation};
     use std::future::Future;
     use std::task::Poll;
@@ -243,9 +272,20 @@ fn typed_extension_http_cancellation_settles_handler_and_preserves_client() {
                 .unwrap();
             let server_cx = receiver.recv(&cx).await.unwrap();
             let (id, descriptors, discovery) = client_configuration();
-            let mut client = modern::ClientBuilder::new()
+            let client_builder = modern::ClientBuilder::new()
                 .extension_registry(descriptors, discovery, || accept_settings)
-                .unwrap()
+                .unwrap();
+            let client_builder = match interruption {
+                HttpRequestInterruption::IdleTimeout => client_builder.request_timeout_policy(
+                    fastmcp_rust::RequestTimeoutPolicy::new(
+                        Duration::from_secs(2),
+                        Duration::from_secs(4),
+                    )
+                    .unwrap(),
+                ),
+                HttpRequestInterruption::Cancel | HttpRequestInterruption::Drop => client_builder,
+            };
+            let mut client = client_builder
                 .connect_http_with_cx(&cx, endpoint)
                 .await
                 .unwrap();
@@ -262,8 +302,10 @@ fn typed_extension_http_cancellation_settles_handler_and_preserves_client() {
                 )
                 .await
                 .unwrap_err();
-            assert!(matches!(error, fastmcp_rust::HttpClientError::CoreResult(error)
-                if error.code == McpErrorCode::RequestCancelled));
+            assert!(
+                matches!(error, fastmcp_rust::HttpClientError::CoreResult(error)
+                if error.code == McpErrorCode::RequestCancelled)
+            );
             assert_eq!(observations.started.load(Ordering::SeqCst), 0);
 
             let cancellation = McpRequestCancellation::new();
@@ -279,25 +321,60 @@ fn typed_extension_http_cancellation_settles_handler_and_preserves_client() {
                     std::future::poll_fn(|task| Poll::Ready(request.as_mut().poll(task)))
                         .await
                         .is_pending(),
-                    "the typed handler must start before cancellation"
+                    "the typed handler must start before request interruption"
                 );
                 asupersync::runtime::yield_now().await;
             }
-            cancellation.cancel();
-            let error = asupersync::time::timeout(cx.now(), Duration::from_secs(2), request)
-                .await
-                .expect("cancellation does not wait for the handler's result")
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                fastmcp_rust::HttpClientError::Connection(
-                    fastmcp_rust::ClientHttpConnectionError::Modern(
-                        fastmcp_rust::ModernHttpClientError::Executor(
-                            fastmcp_rust::ModernHttpExecutorError::Cancelled
+            assert_eq!(observations.completed.load(Ordering::SeqCst), 0);
+            assert_eq!(observations.abandoned.load(Ordering::SeqCst), 0);
+            match interruption {
+                HttpRequestInterruption::Cancel => {
+                    cancellation.cancel();
+                    let error =
+                        asupersync::time::timeout(cx.now(), Duration::from_secs(2), request)
+                            .await
+                            .expect("cancellation does not wait for the handler's result")
+                            .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        fastmcp_rust::HttpClientError::Connection(
+                            fastmcp_rust::ClientHttpConnectionError::Modern(
+                                fastmcp_rust::ModernHttpClientError::Executor(
+                                    fastmcp_rust::ModernHttpExecutorError::Cancelled
+                                )
+                            )
                         )
-                    )
-                )
-            ));
+                    ));
+                }
+                HttpRequestInterruption::Drop => {
+                    // This future is the sole owner of the admitted POST. Its
+                    // handler is still pending and has emitted no response head.
+                    // Dropping that custody must settle the remote handler even
+                    // though neither cancellation domain has been signalled.
+                    drop(request);
+                    assert!(!cancellation.is_cancel_requested());
+                }
+                HttpRequestInterruption::IdleTimeout => {
+                    let error =
+                        asupersync::time::timeout(cx.now(), Duration::from_secs(5), request)
+                            .await
+                            .expect("the response deadline releases the pending typed request")
+                            .unwrap_err();
+                    assert!(matches!(
+                        error,
+                        fastmcp_rust::HttpClientError::Connection(
+                            fastmcp_rust::ClientHttpConnectionError::Modern(
+                                fastmcp_rust::ModernHttpClientError::Executor(
+                                    fastmcp_rust::ModernHttpExecutorError::Timeout(
+                                        fastmcp_rust::RequestTimeoutSource::Idle
+                                    )
+                                )
+                            )
+                        )
+                    ));
+                    assert!(!cancellation.is_cancel_requested());
+                }
+            }
             assert!(cx.checkpoint().is_ok());
             let live = McpRequestCancellation::new();
             let result = client

@@ -2,6 +2,31 @@
 
 **Date:** 2026-10-12 | **Project:** fastmcp_rust | **Language:** Rust
 
+## 2026-11-09 asupersync =0.5.0 -> =0.6.2
+
+Dependabot's f0264c96 moved asupersync to 0.6.2, asupersync-macros to 0.6.0
+and franken-decision, franken-evidence and franken-kernel to 0.6.0. frankenterm
+moved to asupersync 0.6.2 as well and hands its `Cx` to fastmcp (its MCP server
+and client). A `Cx` of one asupersync version is not a `Cx` of another, so the
+two have to agree. asupersync 0.6.0 removed or renamed no public item; its
+changelog lists six breaks (new fields and enum variants, generic child
+regions, lost auto traits), and none of them reaches fastmcp: every workspace
+target compiles unchanged. The README consumer pins now say `=0.6.2`.
+
+The bump makes asupersync's futures larger, so pedantic Clippy reports more
+`clippy::large_futures` sites; the typical HTTP-auth RPC future grows from
+22,504 to 31,464 bytes. Strict Clippy (`-D warnings`) on the pinned nightly
+also denied four deprecated `fetch_update` calls (now `try_update`), two
+hand-written range checks, one `is_none_or` in fastmcp-core and three
+`Duration` constants spelled in seconds in fastmcp-protocol; those are fixed.
+Strict Clippy is still not green: the workspace keeps the bump's extra
+`large_futures` sites and lints that predate it, such as the wildcard parent
+import in `restore/recovery.rs`, which its tests reach through.
+
+FND-01 binds `dependency.asupersync` in its policy (at `=0.3.9`), and that key
+is already a baselined drift in `KNOWN_DRIFTS`, so the declaration ratchet
+accepts the new value without a policy change.
+
 ## Current upgrade run (v0.13.0 release)
 
 A currency sweep of the 30 exact direct registry pins in the root manifest and

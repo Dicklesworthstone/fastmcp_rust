@@ -440,14 +440,23 @@ impl FinalTaskHandle {
 /// watch because its ambiguous notification cannot be silently forgotten.
 /// Dropping the watcher retires its exact subscription without cancelling the
 /// remote Task, a catalog listener, or an unrelated request.
+/// The opening caller retains ownership of the watch's clock, cancellation,
+/// deadline and effect ceiling. A later event waiter may further restrict
+/// effects or stop observation, but cannot replace that original authority.
 pub struct FinalTaskStreamWatch<'client, 'handle, T, O = RequestId> {
     handle: &'handle mut FinalTaskHandle,
     client: &'client mut T,
     owner: Option<O>,
+    caller: Option<TaskWatchCaller>,
     budget: Option<WaitBudget>,
     observing: bool,
     stop_reason: Option<FinalTaskWaitOutcome>,
     abandon: fn(&mut T, O),
+}
+
+struct TaskWatchCaller {
+    cx: Cx,
+    cancellation: McpRequestCancellation,
 }
 
 impl<T, O> FinalTaskStreamWatch<'_, '_, T, O> {
@@ -743,6 +752,7 @@ async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
         handle,
         client,
         owner: None,
+        caller: None,
         budget: None,
         observing: false,
         abandon: T::abandon_watch,
@@ -795,6 +805,10 @@ async fn open_task_stream_watch<'client, 'handle, T: TaskWatchTransport>(
         ));
     }
     watch.budget = Some(budget);
+    watch.caller = Some(TaskWatchCaller {
+        cx: caller,
+        cancellation: cancellation.clone(),
+    });
     watch.observing = true;
     Ok(watch)
 }
@@ -815,22 +829,132 @@ async fn next_task_stream_event<T: TaskWatchTransport>(
     cx: &Cx,
     cancellation: &McpRequestCancellation,
 ) -> McpResult<Option<FinalTaskWatchEvent>> {
-    let caller = with_caller(cx, || Cx::current().expect("Task watch caller is installed"));
-    let cx = &caller;
-    let result = next_task_stream_event_inner(watch, cx, cancellation).await;
+    if !watch.observing {
+        if watch.owner.is_some() {
+            let caller = watch
+                .caller
+                .as_ref()
+                .map_or_else(|| cx.clone(), |origin| origin.cx.clone());
+            stop_task_stream_watch(watch, &caller).await?;
+        }
+        return Ok(None);
+    }
+    let waiter = with_caller(cx, || {
+        Cx::current().expect("Task watch waiter is installed")
+    });
+    let origin = watch.caller.as_ref().expect("a live watch has a caller");
+    // The deadline in WaitBudget belongs to this clock domain. Capture only
+    // the waiter's effect ceiling; neither its identity nor its timer may
+    // replace the opening caller during ingress or reconciliation.
+    let caller = with_caller(&waiter, || {
+        with_caller(&origin.cx, || {
+            Cx::current().expect("Task watch caller is installed")
+        })
+    });
+    let origin_cancellation = origin.cancellation.clone();
+    let result = guard_task_watch_waiter(
+        &waiter,
+        cancellation,
+        next_task_stream_event_inner(watch, &caller, &origin_cancellation, &waiter, cancellation),
+    )
+    .await;
+    let result = match result {
+        Ok(result) => result,
+        Err(reason) => {
+            watch.stop_reason = Some(reason);
+            watch.observing = false;
+            Ok(None)
+        }
+    };
     if result.is_err() {
         watch.observing = false;
     }
     if !watch.observing {
-        stop_task_stream_watch(watch, cx).await?;
+        stop_task_stream_watch(watch, &caller).await?;
     }
     result
+}
+
+/// A waiter has its own cancellation and clock domain. Its checkpoints may
+/// shorten observation, while the inner watch keeps the opening caller's
+/// absolute lifetime and timer driver. A waiter timer is polled only under
+/// that waiter's context; no absolute timestamp crosses between runtimes.
+async fn guard_task_watch_waiter<T>(
+    waiter: &Cx,
+    cancellation: &McpRequestCancellation,
+    operation: impl Future<Output = T>,
+) -> Result<T, FinalTaskWaitOutcome> {
+    let delay = || {
+        let checkpoint_slice = Duration::from_millis(20);
+        waiter
+            .budget()
+            .deadline
+            .map_or(checkpoint_slice, |deadline| {
+                checkpoint_slice.min(Duration::from_nanos(deadline.duration_since(waiter.now())))
+            })
+    };
+    let mut operation = std::pin::pin!(operation);
+    let mut cancelled = std::pin::pin!(cancellation.cancelled());
+    let mut wake = Box::pin(asupersync::time::sleep(waiter.now(), delay()));
+    std::future::poll_fn(|task_cx| {
+        with_caller(waiter, || {
+            if let Some(reason) = task_watch_waiter_stop(waiter, cancellation) {
+                return Poll::Ready(Err(reason));
+            }
+            if cancelled.as_mut().poll(task_cx).is_ready() {
+                return Poll::Ready(Err(FinalTaskWaitOutcome::ObservationCancelled));
+            }
+            if Cx::current()
+                .expect("Task watch waiter is installed")
+                .timer_driver()
+                .is_none()
+            {
+                return Poll::Ready(Err(FinalTaskWaitOutcome::TimerUnavailable));
+            }
+            if let Poll::Ready(result) = operation.as_mut().poll(task_cx) {
+                // The inner operation checks the waiter before committing a
+                // snapshot. Once committed, its event must remain observable
+                // even if the waiter is cancelled during that same poll.
+                return Poll::Ready(Ok(result));
+            }
+            if let Some(reason) = task_watch_waiter_stop(waiter, cancellation) {
+                return Poll::Ready(Err(reason));
+            }
+            if wake.as_mut().poll(task_cx).is_ready() {
+                wake.set(asupersync::time::sleep(waiter.now(), delay()));
+                task_cx.waker().wake_by_ref();
+            }
+            Poll::Pending
+        })
+    })
+    .await
+}
+
+fn task_watch_waiter_stop(
+    waiter: &Cx,
+    cancellation: &McpRequestCancellation,
+) -> Option<FinalTaskWaitOutcome> {
+    if cancellation.is_cancel_requested() {
+        Some(FinalTaskWaitOutcome::ObservationCancelled)
+    } else if waiter
+        .budget()
+        .deadline
+        .is_some_and(|deadline| waiter.now() >= deadline)
+    {
+        Some(FinalTaskWaitOutcome::DeadlineElapsed)
+    } else if waiter.checkpoint().is_err() {
+        Some(FinalTaskWaitOutcome::ObservationCancelled)
+    } else {
+        None
+    }
 }
 
 async fn next_task_stream_event_inner<T: TaskWatchTransport>(
     watch: &mut FinalTaskStreamWatch<'_, '_, T, T::Owner>,
     cx: &Cx,
     cancellation: &McpRequestCancellation,
+    waiter: &Cx,
+    waiter_cancellation: &McpRequestCancellation,
 ) -> McpResult<Option<FinalTaskWatchEvent>> {
     if !watch.observing {
         return Ok(None);
@@ -856,6 +980,11 @@ async fn next_task_stream_event_inner<T: TaskWatchTransport>(
                 return Ok(None);
             }
         };
+        if let Some(reason) = task_watch_waiter_stop(waiter, waiter_cancellation) {
+            watch.stop_reason = Some(reason);
+            watch.observing = false;
+            return Ok(None);
+        }
         match event {
             StdioTaskSubscriptionEvent::Acknowledged(accepted_filter) => {
                 let accepted = task_subscription_ids(&accepted_filter)
@@ -917,6 +1046,11 @@ async fn next_task_stream_event_inner<T: TaskWatchTransport>(
                 let budget = watch.budget.as_mut().expect("a live watch has a budget");
                 budget.refresh_retention(cx, &task)?;
                 if let Some(reason) = budget.stop(cx, cancellation) {
+                    watch.stop_reason = Some(reason);
+                    watch.observing = false;
+                    return Ok(None);
+                }
+                if let Some(reason) = task_watch_waiter_stop(waiter, waiter_cancellation) {
                     watch.stop_reason = Some(reason);
                     watch.observing = false;
                     return Ok(None);

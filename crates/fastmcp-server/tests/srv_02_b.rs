@@ -1114,8 +1114,9 @@ fn srv_02_b_http_session_caller_runtime_and_cancelled_negative() {
                 assert_eq!(children_completed.load(Ordering::SeqCst), 1);
 
                 // Keep the endpoint, session, request, and runtime unchanged. Native
-                // HTTP currently maps failed cancellation/budget admission to its
-                // fixed authentication rejection before it invokes the handler.
+                // HTTP maps failed cancellation/budget admission to its sanitized,
+                // retryable authentication-unavailable response before it invokes
+                // the handler: the credential was never judged, so it is not a 401.
                 cx.cancel_with(
                     asupersync::CancelKind::User,
                     Some("caller cancelled HTTP admission"),
@@ -1127,10 +1128,14 @@ fn srv_02_b_http_session_caller_runtime_and_cancelled_negative() {
                 let ServerHttpEndpointResponse::Immediate(negative) = negative else {
                     panic!("cancelled admission must not allocate a response stream");
                 };
-                assert_eq!(negative.status, HttpStatus::UNAUTHORIZED);
+                assert_eq!(negative.status, HttpStatus::SERVICE_UNAVAILABLE);
                 assert_eq!(
-                    negative.headers.get("www-authenticate").map(String::as_str),
-                    Some("Bearer")
+                    negative.headers.get("retry-after").map(String::as_str),
+                    Some("1")
+                );
+                assert_eq!(
+                    negative.headers.get("cache-control").map(String::as_str),
+                    Some("no-store")
                 );
                 assert!(negative.body.is_empty());
                 assert_eq!(

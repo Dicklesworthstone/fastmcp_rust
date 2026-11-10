@@ -434,7 +434,9 @@ mod tests {
         if pool {
             builder.blocking_threads(0, 2).build().unwrap()
         } else {
-            builder.build().unwrap()
+            // Since asupersync 0.6 a bare builder starts an on-demand pool;
+            // (0, 0) keeps the pool-less runtime these refusals are about.
+            builder.blocking_threads(0, 0).build().unwrap()
         }
     }
     fn fixture(lane: BlockingHandlerLane) -> (BlockingResource<Document>, Calls) {

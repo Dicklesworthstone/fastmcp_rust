@@ -68,6 +68,18 @@ pub enum OperatorReason {
     ExecutorFailed,
     /// The executor has intentionally stopped admitting work; cleanup may still settle.
     ExecutorStopped,
+    /// At least one configured output retention limit is zero.
+    OutputCapacityDisabled,
+    /// Every configured output frame slot is currently charged.
+    OutputFrameCapacitySaturated,
+    /// The output byte budget is fully retained.
+    OutputByteCapacitySaturated,
+    /// The connection has stopped ingress while accepted output drains.
+    OutputStopping,
+    /// The output contributor has stopped; it cannot admit another frame.
+    OutputStopped,
+    /// A serving or output failure has made this output contributor unavailable.
+    OutputFailed,
 }
 
 /// Fixed-size connection gauges from the same admission critical section.
@@ -123,6 +135,63 @@ pub struct OperatorHttpConnections {
     pub connections: OperatorConnectionCapacity,
     /// Fixed counters for this listener generation.
     pub counters: OperatorConnectionCounters,
+}
+
+/// Retained NDJSON output, including the frame currently owned by the writer.
+///
+/// Byte charges include each frame's newline. These observations describe
+/// retention, not kernel socket buffers or a promise that another frame fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorOutputCapacity {
+    /// Maximum number of retained frames.
+    pub frame_limit: usize,
+    /// Maximum retained encoded bytes.
+    pub byte_limit: usize,
+    /// Queued frames plus the frame being written.
+    pub retained_frames: usize,
+    /// Encoded bytes charged to those frames.
+    pub retained_bytes: usize,
+}
+
+impl OperatorOutputCapacity {
+    /// Whether all frame slots are currently charged.
+    #[must_use]
+    pub const fn frames_saturated(self) -> bool {
+        self.retained_frames >= self.frame_limit
+    }
+
+    /// Whether the encoded byte budget is fully charged.
+    #[must_use]
+    pub const fn bytes_saturated(self) -> bool {
+        self.retained_bytes >= self.byte_limit
+    }
+}
+
+/// Fixed, saturating counters for one stdio output generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OperatorOutputCounters {
+    /// Frames admitted to the actual output queue.
+    pub enqueued: u64,
+    /// Frames refused by the encoded frame, frame-count, or byte bound.
+    pub rejected_capacity: u64,
+    /// Frame charges released after writing, suppression, or teardown.
+    /// This is not a peer-delivery acknowledgement.
+    pub released: u64,
+    /// Failed frame writes or writer closes.
+    pub writer_failures: u64,
+    /// At least one increment exceeded the representable counter range.
+    pub overflowed: bool,
+}
+
+/// Privacy-safe observations of the caller-owned stdio writer and outbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorStdioOutput {
+    /// Capacity copied from the live output admission cell.
+    pub capacity: OperatorOutputCapacity,
+    /// Counters from that same cell and generation.
+    pub counters: OperatorOutputCounters,
+    /// Serving has encountered a terminal error; no peer error text is retained.
+    pub failed: bool,
 }
 
 /// Request slots charged by the client executor's own admission primitive.
@@ -255,10 +324,11 @@ pub trait OperatorSnapshotSource<Contributor = OperatorHttpConnections> {
 
 /// Immutable, privacy-safe observation of one typed contributor generation.
 ///
-/// Schema 2 distinguishes HTTP connection admission from client request and
-/// correlation admission. The default contributor preserves the HTTP listener
-/// API; [`OperatorExecutorSnapshot`] names the client observation explicitly.
-/// Neither contributor asserts process-wide progress, credential availability,
+/// Schema 3 distinguishes HTTP connection admission, client request/correlation
+/// admission, and retained stdio output. The default contributor preserves the
+/// HTTP listener API; [`OperatorExecutorSnapshot`] and [`OperatorStdioSnapshot`]
+/// name the client and stdio observations explicitly.
+/// No contributor asserts process-wide progress, credential availability,
 /// durable task readiness, or per-request byte budgets.
 /// In particular, `Ready` may coincide with saturation: only an acquired live
 /// admission permit reserves capacity. No address, peer identity, error text,
@@ -277,6 +347,9 @@ pub struct OperatorSnapshot<Contributor = OperatorHttpConnections> {
 
 /// Explicit client snapshot type for storage, trait objects, and exporter APIs.
 pub type OperatorExecutorSnapshot = OperatorSnapshot<OperatorExecutorCapacity>;
+
+/// Explicit stdio writer snapshot type for storage and exporter APIs.
+pub type OperatorStdioSnapshot = OperatorSnapshot<OperatorStdioOutput>;
 
 impl<Contributor> OperatorSnapshot<Contributor> {
     /// Captures through a shipped contributor without acquiring an admission slot.
@@ -332,7 +405,7 @@ impl<Contributor> OperatorSnapshot<Contributor> {
 
 impl OperatorSnapshot<OperatorHttpConnections> {
     /// Version of the bounded, typed contributor observation schema.
-    pub const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     /// Constructs a bounded HTTP-listener observation from one coherent cell.
     ///
@@ -492,6 +565,72 @@ impl OperatorSnapshot<OperatorExecutorCapacity> {
     #[must_use]
     pub const fn correlations(&self) -> OperatorCorrelationCapacity {
         self.contributor.correlations
+    }
+}
+
+impl OperatorSnapshot<OperatorStdioOutput> {
+    /// Constructs a bounded observation copied from one stdio output cell.
+    #[must_use]
+    pub fn stdio_output(
+        captured_at: Instant,
+        configuration_generation: u64,
+        profile: OperatorProfile,
+        lifecycle: OperatorLifecycle,
+        output: OperatorStdioOutput,
+    ) -> Self {
+        let (readiness, reason) = if output.failed {
+            (OperatorReadiness::NotReady, Some(OperatorReason::OutputFailed))
+        } else {
+            match lifecycle {
+                OperatorLifecycle::Starting => (
+                    OperatorReadiness::Starting,
+                    Some(OperatorReason::StartupPending),
+                ),
+                OperatorLifecycle::Running
+                    if output.capacity.frame_limit == 0 || output.capacity.byte_limit == 0 =>
+                {
+                    (
+                        OperatorReadiness::NotReady,
+                        Some(OperatorReason::OutputCapacityDisabled),
+                    )
+                }
+                OperatorLifecycle::Running => (OperatorReadiness::Ready, None),
+                OperatorLifecycle::Stopping => (
+                    OperatorReadiness::Stopping,
+                    Some(OperatorReason::OutputStopping),
+                ),
+                OperatorLifecycle::Stopped => (
+                    OperatorReadiness::NotReady,
+                    Some(OperatorReason::OutputStopped),
+                ),
+            }
+        };
+        Self {
+            schema_version: OperatorSnapshot::SCHEMA_VERSION,
+            captured_at,
+            configuration_generation,
+            profile,
+            lifecycle,
+            readiness,
+            reasons: [
+                reason,
+                output
+                    .capacity
+                    .frames_saturated()
+                    .then_some(OperatorReason::OutputFrameCapacitySaturated),
+                output
+                    .capacity
+                    .bytes_saturated()
+                    .then_some(OperatorReason::OutputByteCapacitySaturated),
+            ],
+            contributor: output,
+        }
+    }
+
+    /// Fixed slots for structural state, frame saturation, and byte saturation.
+    #[must_use]
+    pub const fn reasons(&self) -> &[Option<OperatorReason>; 3] {
+        &self.reasons
     }
 }
 

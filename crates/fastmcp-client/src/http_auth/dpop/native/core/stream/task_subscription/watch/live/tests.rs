@@ -129,7 +129,15 @@ fn fixture(test: impl FnOnce(&ReadOwner<'_>, &TimerDriverHandle, &Arc<VirtualClo
     let cancellation = McpRequestCancellation::new();
     let bounds = WaitBounds::new(&cx, Duration::from_secs(60), &credential).unwrap();
     let owner = ReadOwner::new(&cx, &cancellation, &session, &credential, bounds);
-    with_caller(&cx, || test(&owner, &timer, &clock));
+    // An unloaned current-thread runtime drives its worker, timers included,
+    // on a background thread. Run the hand-driven clock as the root poll so
+    // only the test fires the virtual timers it inspects. `block_on` installs
+    // its root context as ambient; clear it so the test still observes only
+    // the contexts the code under test installs.
+    runtime.block_on(async {
+        let _ambient = Cx::set_current(None);
+        with_caller(&cx, || test(&owner, &timer, &clock));
+    });
     assert_eq!(timer.pending_count(), 0);
     drop(owner);
     drop(cx);

@@ -15210,15 +15210,18 @@ mod tests {
         let now = Arc::new(Mutex::new(Instant::now()));
         let clock_now = Arc::clone(&now);
         let clock_armed = Arc::new(AtomicBool::new(false));
-        let clock_sampled_boundary = Arc::new(AtomicBool::new(false));
+        let armed_samples = Arc::new(AtomicUsize::new(0));
+        let precommit_samples = Arc::new(AtomicUsize::new(usize::MAX));
         let armed_for_clock = Arc::clone(&clock_armed);
-        let sampled_for_clock = Arc::clone(&clock_sampled_boundary);
+        let samples_for_clock = Arc::clone(&armed_samples);
+        let precommit_for_clock = Arc::clone(&precommit_samples);
         let clock: Arc<dyn Fn() -> Instant + Send + Sync> = Arc::new(move || {
             let sampled_now = *clock_now
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if armed_for_clock.load(AtomicOrdering::SeqCst)
-                && sampled_for_clock.swap(true, AtomicOrdering::SeqCst)
+                && samples_for_clock.fetch_add(1, AtomicOrdering::SeqCst)
+                    >= precommit_for_clock.load(AtomicOrdering::SeqCst)
             {
                 sampled_now
                     .checked_add(boundary)
@@ -15245,7 +15248,22 @@ mod tests {
         runtime
             .require_input(&task_id, final_roots_request(), None)
             .expect("update fixture enters input_required");
+        // The request-time load reads the store more than once (access
+        // metadata during admission, then the snapshot itself). Count those
+        // reads with a dry run so the boundary falls after the whole load and
+        // before the commit, however many reads admission performs.
         clock_armed.store(true, AtomicOrdering::SeqCst);
+        runtime
+            .task_for_request(
+                &McpContext::new(Cx::for_testing(), 1),
+                &task_id,
+                TaskAccessAction::Update,
+            )
+            .expect("the dry-run precommit load admits the fixture task");
+        precommit_samples.store(
+            armed_samples.swap(0, AtomicOrdering::SeqCst),
+            AtomicOrdering::SeqCst,
+        );
         (store, runtime, task_id)
     }
 
@@ -27279,7 +27297,7 @@ mod tests {
         let runtime_for_task = runtime.clone();
         let task_id_for_task = task_id.clone();
 
-        let ((), report) = asupersync::lab::run_async_under_lab(0x71_05, move |cx| async move {
+        let ((), report) = run_timed_lab(0x71_05, move |cx| async move {
             let mut supervisor = cx
                 .spawn(move |supervisor_cx| async move {
                     runner
@@ -27369,7 +27387,7 @@ mod tests {
         let runtime_for_task = runtime.clone();
         let task_id_for_task = task_id.clone();
 
-        let ((), report) = asupersync::lab::run_async_under_lab(0x71_08, move |cx| async move {
+        let ((), report) = run_timed_lab(0x71_08, move |cx| async move {
             let mut supervisor = cx
                 .spawn(move |supervisor_cx| async move {
                     runner
@@ -27397,6 +27415,21 @@ mod tests {
         assert!(!runtime.is_cancellation_requested(&task_id).unwrap());
         assert!(runtime.recover_accepted_input().unwrap().is_none());
         assert_eq!(store.active_task_count(), 0);
+    }
+
+    /// Runs a timer-driven lab body. The lab never advances virtual time on
+    /// its own: without auto-advance every sleep, heartbeat and grace timer
+    /// here stays pending, and the run ends unfinished at virtual time zero.
+    fn run_timed_lab<F, Fut, T>(seed: u64, body: F) -> (T, asupersync::lab::LabRunReport)
+    where
+        F: FnOnce(Cx) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        asupersync::lab::run_async_under_lab_with_config(
+            asupersync::lab::LabConfig::new(seed).with_auto_advance(),
+            body,
+        )
     }
 
     fn check_delayed_supervisor_completion_after_cancellation(cancel: bool) {
@@ -27452,45 +27485,44 @@ mod tests {
         let effects_for_task = Arc::clone(&completion_effects);
         let dropped_for_task = Arc::clone(&dropped);
 
-        let (settled_nanos, _) =
-            asupersync::lab::run_async_under_lab(0x71_09, move |cx| async move {
-                let started_at = cx.now();
-                let mut supervisor = cx
-                    .spawn(move |supervisor_cx| async move {
-                        runner
-                            .resume_handoff(
-                                &supervisor_cx,
-                                FinalTaskSupervisorHandoff::Initial(initial),
-                            )
-                            .await
-                    })
-                    .unwrap();
-                started_receiver.recv(&cx).await.unwrap();
-                if cancel {
-                    runtime_for_task.cancel_task(&task_id_for_task).unwrap();
-                }
-                let joined = asupersync::time::timeout(
-                    cx.now(),
-                    StdDuration::from_millis(50),
-                    supervisor.join(&cx),
-                )
-                .await
-                .expect("cancellation grace cannot be renewed by lease heartbeats");
-                assert!(matches!(joined, Ok(Ok(()))));
-                let settled_nanos = cx.now().duration_since(started_at);
-                assert!(dropped_for_task.load(AtomicOrdering::SeqCst));
-                assert_eq!(
-                    effects_for_task.load(AtomicOrdering::SeqCst),
-                    usize::from(!cancel)
-                );
-                asupersync::time::sleep(cx.now(), FINAL_TASK_CANCELLATION_GRACE_PERIOD).await;
-                assert_eq!(
-                    effects_for_task.load(AtomicOrdering::SeqCst),
-                    usize::from(!cancel),
-                    "retirement cannot leave application work running after the terminal result"
-                );
-                settled_nanos
-            });
+        let (settled_nanos, _) = run_timed_lab(0x71_09, move |cx| async move {
+            let started_at = cx.now();
+            let mut supervisor = cx
+                .spawn(move |supervisor_cx| async move {
+                    runner
+                        .resume_handoff(
+                            &supervisor_cx,
+                            FinalTaskSupervisorHandoff::Initial(initial),
+                        )
+                        .await
+                })
+                .unwrap();
+            started_receiver.recv(&cx).await.unwrap();
+            if cancel {
+                runtime_for_task.cancel_task(&task_id_for_task).unwrap();
+            }
+            let joined = asupersync::time::timeout(
+                cx.now(),
+                StdDuration::from_millis(50),
+                supervisor.join(&cx),
+            )
+            .await
+            .expect("cancellation grace cannot be renewed by lease heartbeats");
+            assert!(matches!(joined, Ok(Ok(()))));
+            let settled_nanos = cx.now().duration_since(started_at);
+            assert!(dropped_for_task.load(AtomicOrdering::SeqCst));
+            assert_eq!(
+                effects_for_task.load(AtomicOrdering::SeqCst),
+                usize::from(!cancel)
+            );
+            asupersync::time::sleep(cx.now(), FINAL_TASK_CANCELLATION_GRACE_PERIOD).await;
+            assert_eq!(
+                effects_for_task.load(AtomicOrdering::SeqCst),
+                usize::from(!cancel),
+                "retirement cannot leave application work running after the terminal result"
+            );
+            settled_nanos
+        });
 
         assert_eq!(
             settled_nanos,

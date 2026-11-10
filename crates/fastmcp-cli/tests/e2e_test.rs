@@ -1116,6 +1116,38 @@ fn read_h1_fixture_chunk(
     }
 }
 
+/// Waits for the client to reset an exchange it abandoned before response
+/// headers. A clean FIN would read as a legal request write-half close and
+/// leave the server's handler running, so the client resets instead.
+fn expect_h1_fixture_reset(stream: &mut TcpStream, deadline: Instant, context: &str) {
+    let mut byte = [0_u8; 1];
+    loop {
+        match stream.set_read_timeout(Some(fixture_wait(deadline, context))) {
+            Ok(()) => {}
+            // macOS refuses SO_RCVTIMEO on a socket the peer has already
+            // reset; the read below then reports that reset.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {}
+            Err(error) => panic!("{context}: set loopback fixture read timeout: {error}"),
+        }
+        match stream.read(&mut byte) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            result => panic!("{context}: expected a reset, got {result:?}"),
+        }
+    }
+}
+
 fn configure_h1_fixture_write(stream: &TcpStream, deadline: Instant, context: &str) {
     stream
         .set_write_timeout(Some(fixture_wait(deadline, context)))
@@ -2444,16 +2476,7 @@ fn e2e_cli_operations_http_timeout_closes_the_dispatched_request_without_replay(
             let (_, request) = read_h1_json_request(&mut stream, deadline);
             assert_eq!(request["method"], "tools/call");
             observed.fetch_add(1, Ordering::SeqCst);
-            let mut byte = [0_u8; 1];
-            assert_eq!(
-                read_h1_fixture_chunk(
-                    &mut stream,
-                    &mut byte,
-                    deadline,
-                    "timed out HTTP stream must close"
-                ),
-                0
-            );
+            expect_h1_fixture_reset(&mut stream, deadline, "timed out HTTP stream must close");
             observed_closed.store(true, Ordering::SeqCst);
             loop {
                 let done = finish.try_recv().is_ok();

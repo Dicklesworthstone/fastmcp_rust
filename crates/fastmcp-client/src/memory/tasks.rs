@@ -27,7 +27,7 @@ use super::{
 use crate::session::{ClientExtensionResultAdmission, ClientExtensionRuntime};
 use crate::{
     FinalCancelTaskResult, FinalGetTaskResult, FinalTask, FinalTaskId, FinalTaskInputResponses,
-    FinalToolCallOutcome, FinalUpdateTaskResult, RequestTimeoutPolicy,
+    FinalToolCallOutcome, FinalUpdateTaskResult, RequestTimeoutPolicy, ReverseRequestHandlers,
 };
 
 #[derive(Debug)]
@@ -106,6 +106,18 @@ impl MemoryClientBuilder {
 }
 
 impl MemoryClient {
+    pub(crate) const fn task_input_timeout_policy(&self) -> RequestTimeoutPolicy {
+        self.timeout_policy
+    }
+
+    pub(crate) fn task_input_context(&self) -> McpResult<(ReverseRequestHandlers, Value)> {
+        self.ensure_open()?;
+        self.require_tasks()?;
+        let capabilities = serde_json::to_value(self.session.client_capabilities())
+            .map_err(|_| McpError::invalid_params("Invalid Memory client capabilities"))?;
+        Ok((self.reverse_request_handlers.clone(), capabilities))
+    }
+
     /// Whether this open connection admitted the explicitly selected Tasks profile.
     #[must_use]
     pub fn tasks_active(&self) -> bool {

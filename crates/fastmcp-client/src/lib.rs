@@ -1948,6 +1948,11 @@ const MAX_CLIENT_SUBSCRIPTION_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 const MAX_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT: Duration = Duration::from_hours(24);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long an explicit close lets a stdio server exit on its own once its
+/// stdin is closed. MCP stdio shutdown closes the server's input first and
+/// signals only a server that does not exit; signalling at once cuts off a
+/// server that is still flushing its final state.
+const STDIO_EOF_EXIT_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_CLEANUP_CALLER_DEADLINE_ERROR: &str =
     "Subprocess cleanup exceeded the caller deadline";
 const OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -27846,9 +27851,10 @@ impl Client {
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
         let cx = self.cx.clone();
+        let orderly = self.initialized.load(Ordering::SeqCst);
         let deferred_retirement_result = self.begin_close(&cx);
         self.join_reverse_callback_pool()?;
-        self.finish_close(deferred_retirement_result)
+        self.finish_close(deferred_retirement_result, orderly)
     }
 
     /// Cancels and joins callbacks while yielding to the caller's runtime.
@@ -27869,11 +27875,68 @@ impl Client {
     /// snapshots remain synchronous. Platform limits from [`Self::close`]
     /// still apply; this does not make arbitrary custom transports nonblocking.
     pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        let orderly = self.initialized.load(Ordering::SeqCst);
         let deferred_retirement_result = self.begin_close(cx);
         self.reverse_callback_pool.join_bounded_with_cx(cx).await?;
         self.close_transport_retaining_error();
+        if orderly {
+            self.await_eof_exit_with_cx(cx).await;
+        }
         let process_result = self.stop_retained_child_with_cx(cx).await;
         self.finish_close_result(deferred_retirement_result, process_result)
+    }
+
+    /// Gives the retained server one bounded chance to exit on stdin EOF
+    /// before cleanup signals it, waiting only on the caller's timer. A failed
+    /// probe, the caller's deadline, or a caller without a timer ends the
+    /// grace early. Signalling and reaping then run exactly as before, so the
+    /// grace never weakens cleanup.
+    ///
+    /// Only the close of an initialized session waits: a server whose
+    /// connection failed, timed out or was rejected during initialization has
+    /// no session to shut down, and a close retried after an interrupted one
+    /// does not wait again.
+    async fn await_eof_exit_with_cx(&mut self, cx: &Cx) {
+        if self.child_cleanup_phase != ClientChildCleanupPhase::Active {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let deadline = Instant::now() + STDIO_EOF_EXIT_GRACE;
+        while matches!(child.try_wait(), Ok(None)) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || wait_for_process_cleanup(cx, remaining.min(DIRECT_CHILD_REAP_POLL_INTERVAL))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The blocking counterpart of [`Self::await_eof_exit_with_cx`] for
+    /// [`Self::close`], which already waits synchronously to reap.
+    fn await_eof_exit(&mut self) {
+        if self.child_cleanup_phase != ClientChildCleanupPhase::Active {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let deadline = Instant::now() + STDIO_EOF_EXIT_GRACE;
+        while matches!(child.try_wait(), Ok(None)) {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            std::thread::park_timeout(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(DIRECT_CHILD_REAP_POLL_INTERVAL),
+            );
+        }
     }
 
     fn begin_close(&self, cx: &Cx) -> McpResult<()> {
@@ -27894,8 +27957,15 @@ impl Client {
         deferred_retirement_result
     }
 
-    fn finish_close(&mut self, deferred_retirement_result: McpResult<()>) -> McpResult<()> {
+    fn finish_close(
+        &mut self,
+        deferred_retirement_result: McpResult<()>,
+        orderly: bool,
+    ) -> McpResult<()> {
         self.close_transport_retaining_error();
+        if orderly {
+            self.await_eof_exit();
+        }
         let process_result = self.stop_retained_child();
         self.finish_close_result(deferred_retirement_result, process_result)
     }
@@ -28793,8 +28863,13 @@ mod tests {
         ambient_clock.advance(20_000_000);
         assert_eq!(ambient_timer.process_timers(), 0);
         assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
-        caller_clock.advance(10_000_000);
-        assert_eq!(caller_timer.process_timers(), 1);
+        // Fire with the caller's worker on loan so this test, not that
+        // runtime's background worker, observes the timer.
+        let fired = caller_runtime.block_on(async {
+            caller_clock.advance(10_000_000);
+            caller_timer.process_timers()
+        });
+        assert_eq!(fired, 1);
         assert!(wakes.0.load(Ordering::SeqCst) > 0);
         drop(waiting);
         assert_eq!(caller_timer.pending_count(), 0);
@@ -42005,6 +42080,28 @@ exec sleep 2
     }
 
     #[cfg(unix)]
+    thread_local! {
+        /// Supplies test callers with their own timer. Child cleanup (a
+        /// bounded reap after close or kill) and MRTR operation waits use only
+        /// the caller's timer, never an ambient runtime's, and
+        /// Cx::for_request() has none, so those operations were refused. The
+        /// runtime lives for the test thread, past every client that retains
+        /// its caller context; it is never loaned to block_on, so its own
+        /// worker fires timers.
+        static TIMER_TEST_RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("timer test caller runtime must build");
+    }
+
+    /// A caller context that owns a live timer.
+    #[cfg(unix)]
+    fn timer_test_caller() -> Cx {
+        TIMER_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE))
+    }
+
+    #[cfg(unix)]
     fn http_test_runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
             .build()
@@ -42048,6 +42145,30 @@ exec sleep 2
         }
         serde_json::from_slice(&wire[head_end..head_end + content_length])
             .expect("HTTP cache request is JSON-RPC")
+    }
+
+    /// Reads the peer side of an exchange the client abandoned and requires
+    /// that no further request byte arrives. Before response headers the client
+    /// resets the socket, because a clean FIN would read as a legal request
+    /// write-half close and leave the handler running (6ecb1d6d). After them it
+    /// may close cleanly, or the kernel may reset a socket closed with unread
+    /// response bytes.
+    #[cfg(unix)]
+    fn assert_abandoned_http_exchange_closed(
+        stream: &mut TcpStream,
+        after_response_head: bool,
+        context: &str,
+    ) {
+        let mut probe = [0_u8; 1];
+        match stream.read(&mut probe) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            Ok(0) if after_response_head => {}
+            result => panic!("{context}: {result:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -42604,6 +42725,10 @@ exec sleep 2
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD-derived kernels (macOS) hand the accepted socket
+                    // the listener's O_NONBLOCK, and a read timeout does not
+                    // clear it. Block so the request read waits for its bytes.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -42821,11 +42946,12 @@ exec sleep 2
                     request.flush().unwrap();
                 }
                 request_ready.send(()).unwrap();
-                let mut byte = [0_u8; 1];
-                assert_eq!(
-                    request.read(&mut byte).unwrap(),
-                    0,
-                    "cancellation must close the {phase} exchange without another peer byte"
+                assert_abandoned_http_exchange_closed(
+                    &mut request,
+                    phase != "headers",
+                    &format!(
+                        "cancellation must close the {phase} exchange without another peer byte"
+                    ),
                 );
                 write_http_cache_test_response(
                     &mut sibling,
@@ -43045,6 +43171,10 @@ exec sleep 2
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD-derived kernels (macOS) hand the accepted socket
+                    // the listener's O_NONBLOCK, and a read timeout does not
+                    // clear it. Block so the request read waits for its bytes.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -44554,7 +44684,7 @@ exec sleep 2
             );
         });
 
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(http_cache_test_plan(&modern_target))
@@ -45108,7 +45238,7 @@ exec sleep 2
                 &serde_json::to_vec(&response).unwrap(),
             );
         });
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let callbacks = Arc::new(AtomicUsize::new(0));
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
@@ -46889,7 +47019,7 @@ exec sleep 2
             }
         });
 
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let handlers =
             ReverseRequestHandlers::new().with_modern_roots_list(|_cx, _cancellation, _params| {
                 Box::pin(async move { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
@@ -49119,11 +49249,10 @@ exec sleep 2
             assert_eq!(retried["params"]["arguments"], first["params"]["arguments"]);
             assert_ne!(retried["id"], first["id"]);
             let waiting = Instant::now();
-            let mut probe = [0_u8; 1];
-            assert_eq!(
-                pending.read(&mut probe).unwrap(),
-                0,
-                "timeout releases the retried POST"
+            assert_abandoned_http_exchange_closed(
+                &mut pending,
+                false,
+                "timeout releases the retried POST",
             );
             assert!(
                 waiting.elapsed() < Duration::from_millis(1_200),
@@ -49705,11 +49834,10 @@ exec sleep 2
                 let mut pending = accept_http_catalog_test_request(&listener);
                 let request = read_http_cache_test_request(&mut pending);
                 assert_eq!(request["params"]["cursor"], "pending");
-                let mut probe = [0_u8; 1];
-                assert_eq!(
-                    pending.read(&mut probe).unwrap(),
-                    0,
-                    "deadline drops this request's socket"
+                assert_abandoned_http_exchange_closed(
+                    &mut pending,
+                    false,
+                    "deadline drops this request's socket",
                 );
                 let mut healthy = accept_http_catalog_test_request(&listener);
                 let request = read_http_cache_test_request(&mut healthy);
@@ -50688,23 +50816,68 @@ exec sleep 2
     }
 
     #[cfg(all(unix, feature = "apps"))]
-    #[test]
-    fn public_mcp_apps_stdio_policy_cancellation_reaches_its_real_upstream_request() {
-        let script = "IFS= read -r request; \\
-            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
-            IFS= read -r cancellation; \\
-            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \\
-            IFS= read -r ping; \\
-            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \\
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"cancellation\":%s,\"ping\":%s}}\\n' \\
-              \"$request_ok\" \"$cancellation_ok\" \"$ping_ok\"; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client_for_version(
-            script,
-            Duration::from_secs(2),
-            MODERN_PROTOCOL_VERSION,
+    fn make_scripted_apps_cancellation_client(script: &str, cx: Cx) -> (Client, UnixStream) {
+        let (control, peer_control) =
+            UnixStream::pair().expect("create the real stdio Apps acceptance barrier");
+        control
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the real stdio Apps acceptance observation");
+        control
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the real stdio Apps response release");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(OwnedFd::from(peer_control)));
+        let mut child = command.spawn().expect("spawn the real stdio Apps peer");
+        let stdin = child.stdin.take().expect("scripted Apps peer stdin");
+        let stdout = child.stdout.take().expect("scripted Apps peer stdout");
+        let session = ClientSession::try_new(
+            ClientInfo {
+                name: "test-client".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            Some(ServerInfo {
+                name: "scripted-apps-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            }),
+            ServerCapabilities::default(),
+            MODERN_PROTOCOL_VERSION.to_owned(),
+        )
+        .expect("the real stdio Apps peer uses the final protocol");
+        let mut client = Client::from_parts(
+            child,
+            StdioTransport::new(stdout, stdin),
+            cx,
+            session,
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
         );
         install_test_mcp_apps_activation(&mut client);
-        let cx = Cx::for_testing();
+        (client, control)
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_stdio_policy_cancellation_reaches_its_real_upstream_request() {
+        let script = "IFS= read -r catalog; \\
+            case \"$catalog\" in *'\"method\":\"tools/list\"'*'\"id\":2'*) catalog_ok=true;; *) catalog_ok=false;; esac; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\"}}],\"ttlMs\":0,\"cacheScope\":\"private\"}}'; \\
+            IFS= read -r request; \\
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":3'*) request_ok=true;; *) request_ok=false;; esac; \\
+            printf 'T' >&2; \\
+            IFS= read -r cancellation; \\
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":3'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \\
+            IFS= read -r ping; \\
+            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":4'*) ping_ok=true;; *) ping_ok=false;; esac; \\
+            printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"catalog\":%s,\"request\":%s,\"cancellation\":%s,\"ping\":%s}}\\n' \\
+              \"$catalog_ok\" \"$request_ok\" \"$cancellation_ok\" \"$ping_ok\"; exec sleep 2";
+        let cx = block_on(async {
+            Cx::current().expect("the real stdio Apps policy retains its caller runtime")
+        });
+        let (mut client, mut control) = make_scripted_apps_cancellation_client(script, cx.clone());
         let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
         let configuration = mcp_apps::McpAppsWireHostConfiguration {
             host_info: fastmcp_protocol::McpAppsBridgeImplementation {
@@ -50762,16 +50935,31 @@ exec sleep 2
             )
             .await
             .expect("the View commits the real forwarded request");
-            view.send_to_host(
-                &cx,
-                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
-            )
-            .await
-            .expect("the View commits the matching real cancellation");
+        });
+        let cancellation_controller = std::thread::spawn(move || {
+            let mut accepted = [0_u8; 1];
+            control
+                .read_exact(&mut accepted)
+                .expect("the peer receives the real stdio tool request before cancellation");
+            assert_eq!(accepted, [b'T']);
+            block_on(async {
+                let cancellation_cx = Cx::current().expect("the View owns its control runtime");
+                view.send_to_host(
+                    &cancellation_cx,
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
+                )
+                .await
+                .expect("the View commits the matching real cancellation");
+            });
+        });
+        block_on(async {
             host.process_next(&cx)
                 .await
                 .expect("the real stdio policy settles its cancelled request");
         });
+        cancellation_controller
+            .join()
+            .expect("the matching stdio Apps cancellation controller joins");
         drop(host);
 
         let evidence: serde_json::Value = client
@@ -50779,8 +50967,8 @@ exec sleep 2
             .expect("the stdio client remains usable after the Apps-owned cancellation");
         assert_eq!(
             evidence,
-            serde_json::json!({"request": true, "cancellation": true, "ping": true}),
-            "the real subprocess saw the Apps request, its exact cancellation, and one later request"
+            serde_json::json!({"catalog": true, "request": true, "cancellation": true, "ping": true}),
+            "the real subprocess saw the catalog, Apps request, its exact cancellation, and one later request"
         );
         client.close().expect("real stdio Apps policy cleanup");
     }
@@ -50788,20 +50976,21 @@ exec sleep 2
     #[cfg(all(unix, feature = "apps"))]
     #[test]
     fn public_mcp_apps_stdio_policy_wrong_id_cancellation_emits_no_cancel_frame() {
-        let script = "IFS= read -r request; \\
-            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
-            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}'; \\
+        let script = "IFS= read -r catalog; \\
+            case \"$catalog\" in *'\"method\":\"tools/list\"'*'\"id\":2'*) catalog_ok=true;; *) catalog_ok=false;; esac; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\"}}],\"ttlMs\":0,\"cacheScope\":\"private\"}}'; \\
+            IFS= read -r request; \\
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":3'*) request_ok=true;; *) request_ok=false;; esac; \\
+            printf 'T' >&2; IFS= read -r release <&2; [ \"$release\" = R ] || exit 1; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}'; \\
             IFS= read -r follow_up; \\
-            case \"$follow_up\" in *'\"method\":\"notifications/cancelled\"'*) no_cancellation=false; ping_ok=false;; *'\"method\":\"ping\"'*'\"id\":3'*) no_cancellation=true; ping_ok=true;; *) no_cancellation=true; ping_ok=false;; esac; \\
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"noCancellation\":%s,\"ping\":%s}}\\n' \\
-              \"$request_ok\" \"$no_cancellation\" \"$ping_ok\"; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client_for_version(
-            script,
-            Duration::from_secs(2),
-            MODERN_PROTOCOL_VERSION,
-        );
-        install_test_mcp_apps_activation(&mut client);
-        let cx = Cx::for_testing();
+            case \"$follow_up\" in *'\"method\":\"notifications/cancelled\"'*) no_cancellation=false; ping_ok=false;; *'\"method\":\"ping\"'*'\"id\":4'*) no_cancellation=true; ping_ok=true;; *) no_cancellation=true; ping_ok=false;; esac; \\
+            printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"catalog\":%s,\"request\":%s,\"noCancellation\":%s,\"ping\":%s}}\\n' \\
+              \"$catalog_ok\" \"$request_ok\" \"$no_cancellation\" \"$ping_ok\"; exec sleep 2";
+        let cx = block_on(async {
+            Cx::current().expect("the real stdio Apps policy retains its caller runtime")
+        });
+        let (mut client, mut control) = make_scripted_apps_cancellation_client(script, cx.clone());
         let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
         let configuration = mcp_apps::McpAppsWireHostConfiguration {
             host_info: fastmcp_protocol::McpAppsBridgeImplementation {
@@ -50859,13 +51048,32 @@ exec sleep 2
             )
             .await
             .expect("the View commits the real forwarded request");
-            view.send_to_host(
-                &cx,
-                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
-            )
-            .await
-            .expect("the View commits the one-field wrong cancellation");
-            let first_result = host.process_next(&cx).await;
+        });
+        let wrong_id_controller = std::thread::spawn(move || {
+            let mut accepted = [0_u8; 1];
+            control.read_exact(&mut accepted).expect(
+                "the peer receives the real stdio tool request before the wrong-ID control",
+            );
+            assert_eq!(accepted, [b'T']);
+            block_on(async {
+                let controller_cx = Cx::current().expect("the View owns its control runtime");
+                view.send_to_host(
+                    &controller_cx,
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
+                )
+                .await
+                .expect("the View commits the one-field wrong cancellation");
+            });
+            control.write_all(b"R\n").expect(
+                "release the normal stdio response after the wrong-ID control is committed",
+            );
+            view
+        });
+        let first_result = block_on(async { host.process_next(&cx).await });
+        let mut view = wrong_id_controller
+            .join()
+            .expect("the wrong-ID stdio Apps cancellation controller joins");
+        block_on(async {
             match first_result {
                 Err(mcp_apps::McpAppsHostError::Bridge(
                     fastmcp_protocol::McpAppsBridgeError::UnknownCorrelation,
@@ -50899,7 +51107,7 @@ exec sleep 2
             .expect("the stdio client remains usable after the inert Apps cancellation");
         assert_eq!(
             evidence,
-            serde_json::json!({"request": true, "noCancellation": true, "ping": true}),
+            serde_json::json!({"catalog": true, "request": true, "noCancellation": true, "ping": true}),
             "a wrong View ID must not emit an upstream stdio cancellation frame"
         );
         client.close().expect("real stdio Apps wrong-ID cleanup");
@@ -50954,11 +51162,35 @@ exec sleep 2
                     .as_bytes(),
             );
 
+            let (mut catalog, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP tool catalog request");
+            let catalog_request = read_http_cache_test_request(&mut catalog);
+            assert_eq!(catalog_request["id"], 2);
+            assert_eq!(catalog_request["method"], "tools/list");
+            let catalog_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                },
+            });
+            write_http_cache_test_response(
+                &mut catalog,
+                "application/json",
+                serde_json::to_string(&catalog_response)
+                    .expect("the real Apps HTTP tool catalog response serializes")
+                    .as_bytes(),
+            );
+
             let (mut tool_call, _) = listener
                 .accept()
                 .expect("accept the real Apps HTTP tool request");
             let tool_request = read_http_cache_test_request(&mut tool_call);
-            assert_eq!(tool_request["id"], 2);
+            assert_eq!(tool_request["id"], 3);
             assert_eq!(tool_request["method"], "tools/call");
             post_accepted_sender
                 .send(())
@@ -50970,6 +51202,14 @@ exec sleep 2
             let dropped = match tool_call.read(&mut probe) {
                 Ok(0) => true,
                 Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    true
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -50985,12 +51225,14 @@ exec sleep 2
                 .expect("report the real Apps request close before headers");
         });
 
-        let cx = Cx::for_testing();
+        let cx = block_on(async {
+            Cx::current().expect("the real HTTP Apps policy retains its caller runtime")
+        });
         let target = format!("http://{address}/mcp");
         let settings =
             McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned()])
                 .expect("the real Apps HTTP policy uses admitted client settings");
-        let mut client = http_test_runtime_block_on(HttpClient::connect_with_mcp_apps(
+        let mut client = block_on(HttpClient::connect_with_mcp_apps(
             &cx,
             http_cache_test_plan(&target),
             ClientInfo {
@@ -51019,7 +51261,7 @@ exec sleep 2
             .mcp_apps_wire_host(transport, configuration)
             .expect("the public HTTP Apps policy admits its negotiated Host");
 
-        http_test_runtime_block_on(async {
+        block_on(async {
             view.send_to_host(
                 &cx,
                 serde_json::json!({
@@ -51065,8 +51307,8 @@ exec sleep 2
             post_accepted_receiver
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the peer accepts the real Apps POST before cancellation");
-            let cancellation_cx = Cx::for_testing();
-            http_test_runtime_block_on(async {
+            block_on(async {
+                let cancellation_cx = Cx::current().expect("the View owns its control runtime");
                 view.send_to_host(
                     &cancellation_cx,
                     r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
@@ -51075,7 +51317,7 @@ exec sleep 2
                 .expect("the View commits the matching real HTTP cancellation");
             });
         });
-        http_test_runtime_block_on(async {
+        block_on(async {
             host.process_next(&cx)
                 .await
                 .expect("the real HTTP policy settles its cancelled request");
@@ -51145,11 +51387,35 @@ exec sleep 2
                     .as_bytes(),
             );
 
+            let (mut catalog, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP tool catalog request");
+            let catalog_request = read_http_cache_test_request(&mut catalog);
+            assert_eq!(catalog_request["id"], 2);
+            assert_eq!(catalog_request["method"], "tools/list");
+            let catalog_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                },
+            });
+            write_http_cache_test_response(
+                &mut catalog,
+                "application/json",
+                serde_json::to_string(&catalog_response)
+                    .expect("the real Apps HTTP tool catalog response serializes")
+                    .as_bytes(),
+            );
+
             let (mut tool_call, _) = listener
                 .accept()
                 .expect("accept the real Apps HTTP tool request");
             let tool_request = read_http_cache_test_request(&mut tool_call);
-            assert_eq!(tool_request["id"], 2);
+            assert_eq!(tool_request["id"], 3);
             assert_eq!(tool_request["method"], "tools/call");
             post_accepted_sender
                 .send(())
@@ -51175,7 +51441,7 @@ exec sleep 2
             }
             let tool_response = serde_json::json!({
                 "jsonrpc": JSONRPC_VERSION,
-                "id": 2,
+                "id": 3,
                 "result": {"resultType": "complete", "content": [], "isError": false},
             });
             write_http_cache_test_response(
@@ -51187,12 +51453,14 @@ exec sleep 2
             );
         });
 
-        let cx = Cx::for_testing();
+        let cx = block_on(async {
+            Cx::current().expect("the real HTTP Apps policy retains its caller runtime")
+        });
         let target = format!("http://{address}/mcp");
         let settings =
             McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned()])
                 .expect("the real Apps HTTP policy uses admitted client settings");
-        let mut client = http_test_runtime_block_on(HttpClient::connect_with_mcp_apps(
+        let mut client = block_on(HttpClient::connect_with_mcp_apps(
             &cx,
             http_cache_test_plan(&target),
             ClientInfo {
@@ -51221,7 +51489,7 @@ exec sleep 2
             .mcp_apps_wire_host(transport, configuration)
             .expect("the public HTTP Apps policy admits its negotiated Host");
 
-        http_test_runtime_block_on(async {
+        block_on(async {
             view.send_to_host(
                 &cx,
                 serde_json::json!({
@@ -51267,8 +51535,8 @@ exec sleep 2
             post_accepted_receiver
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the peer accepts the real Apps POST before the wrong-ID control");
-            let controller_cx = Cx::for_testing();
-            let response = http_test_runtime_block_on(async {
+            let response = block_on(async {
+                let controller_cx = Cx::current().expect("the View owns its control runtime");
                 view.send_to_host(
                     &controller_cx,
                     r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
@@ -51287,7 +51555,7 @@ exec sleep 2
             assert_eq!(response["id"], "view-call");
             assert_eq!(response["result"]["content"], serde_json::json!([]));
         });
-        let result = http_test_runtime_block_on(async { host.process_next(&cx).await });
+        let result = block_on(async { host.process_next(&cx).await });
         assert!(matches!(
             result,
             Err(mcp_apps::McpAppsHostError::Bridge(
@@ -53122,8 +53390,13 @@ exec sleep 2
                 assert!(waiting.as_mut().poll(&mut context).is_pending());
                 assert_eq!(caller.checkpoint().is_err(), cancelled);
 
-                caller_clock.advance(5_000_000);
-                assert_eq!(caller_timer.process_timers(), 1);
+                // Fire with the caller's worker on loan so this test, not
+                // that runtime's background worker, observes the timer.
+                let fired = caller_runtime.block_on(async {
+                    caller_clock.advance(5_000_000);
+                    caller_timer.process_timers()
+                });
+                assert_eq!(fired, 1);
                 assert!(wakes.0.load(Ordering::SeqCst) > 0);
                 assert!(matches!(
                     waiting.as_mut().poll(&mut context),
@@ -53164,8 +53437,13 @@ exec sleep 2
             assert!(waiting.as_mut().poll(&mut context).is_pending());
             assert_eq!(caller_timer.pending_count(), 1);
             assert_eq!(ambient_timer.pending_count(), 0);
-            caller_clock.advance(3_000_000);
-            assert_eq!(caller_timer.process_timers(), 1);
+            // Fire with the caller's worker on loan so this test, not that
+            // runtime's background worker, observes the timer.
+            let fired = caller_runtime.block_on(async {
+                caller_clock.advance(3_000_000);
+                caller_timer.process_timers()
+            });
+            assert_eq!(fired, 1);
             assert!(matches!(
                 waiting.as_mut().poll(&mut context),
                 Poll::Ready(Err(error))
@@ -53501,7 +53779,7 @@ exec sleep 30
                         let first = std::future::poll_fn(|task_cx| {
                             Poll::Ready(closing.as_mut().poll(task_cx))
                         }).await;
-                        assert!(first.is_pending(), "process shutdown must yield after signalling");
+                        assert!(first.is_pending(), "process shutdown must yield during the EOF grace");
                         let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
                             assert_eq!(std::thread::current().id(), worker);
                             sibling_cx.checkpoint().unwrap();
@@ -53509,6 +53787,17 @@ exec sleep 30
                         }).unwrap();
                         assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
                         if matches!(mode, ClientCloseInterruption::Drop) {
+                            // The peer ignores EOF, so once its grace has
+                            // passed the next poll signals and yields again.
+                            asupersync::time::sleep(
+                                cx.now(),
+                                STDIO_EOF_EXIT_GRACE + Duration::from_millis(50),
+                            )
+                            .await;
+                            let signalled = std::future::poll_fn(|task_cx| {
+                                Poll::Ready(closing.as_mut().poll(task_cx))
+                            }).await;
+                            assert!(signalled.is_pending(), "process shutdown must yield after signalling");
                             drop(closing);
                             assert_eq!(client.child.as_ref().unwrap().id(), peer_id);
                             assert!(client.transport_is_closed());
@@ -55570,7 +55859,9 @@ exec sleep 30
 
     #[cfg(unix)]
     fn assert_automatic_catalog_rebuild_deadline(late_rebuild: bool) {
-        let delay = if late_rebuild { "0.35" } else { "0.005" };
+        // Each 600ms page fits the 1000ms deadline with 400ms to spare on a
+        // loaded host; a late rebuild's two pages together cannot.
+        let delay = if late_rebuild { "0.6" } else { "0.005" };
         let cancellation_read = if late_rebuild {
             r#"IFS= read -r control || exit 1
                case "$control" in *'"method":"notifications/cancelled"'*) ;; *) exit 1 ;; esac
@@ -55582,7 +55873,7 @@ exec sleep 30
             r#"
             IFS= read -r request || exit 1
             case "$request" in *'"cursor":"initial"'*) ;; *) exit 1 ;; esac
-            sleep 0.35
+            sleep 0.6
             printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","tools":[{{"name":"stale","inputSchema":{{"type":"object"}}}}],"nextCursor":"next","ttlMs":0,"cacheScope":"private"}}}}'
             IFS= read -r request || exit 1
             case "$request" in *'"cursor":"next"'*) ;; *) exit 1 ;; esac
@@ -55604,7 +55895,7 @@ exec sleep 30
         );
         let mut client = make_shell_scripted_initialized_client_for_version(
             &script,
-            Duration::from_millis(550),
+            Duration::from_millis(1000),
             MODERN_PROTOCOL_VERSION,
         );
         let result = client.list_tools_with_params(ListToolsParams {
@@ -57416,7 +57707,7 @@ IFS= read -r second || exit 91
                     RequestTimeoutPolicy::new(Duration::from_secs(10), Duration::from_secs(30))
                         .unwrap(),
                 )
-                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+                .connect_stdio_with_cx(&timer_test_caller(), "sh", &["-c", script]),
         )
         .expect("the public stdio builder discovers the typed catalog peer")
     }
@@ -57972,7 +58263,7 @@ while IFS= read -r unexpected; do exit 34; done
 "#,
         );
         let mut client = connect_stdio_catalog_test_client(&script);
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let executor = client.multiplexed_stdio_executor().unwrap();
         let next_id = Arc::clone(&client.next_id);
         let response_sender = Arc::clone(&client.response_sender);
@@ -58210,7 +58501,7 @@ while IFS= read -r unexpected; do exit 34; done
             format!(
                 "IFS= read -r discovery || exit 1\n\
                  case \"$discovery\" in *server/discover*) ;; *) exit 2 ;; esac\n\
-                 sleep 0.12\n\
+                 sleep 0.5\n\
                  printf '%s\\n' '{discovery}'\n"
             )
         } else {
@@ -58221,7 +58512,7 @@ while IFS= read -r unexpected; do exit 34; done
                 r#"IFS= read -r first || exit 20
 case "$first" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
 case "$first" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 22 ;; esac
-sleep 0.12
+sleep 0.5
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"nextCursor":"next","ttlMs":0,"cacheScope":"private"}}'
 "#,
             );
@@ -58232,7 +58523,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools"
             r#"IFS= read -r pending || exit 23
 case "$pending" in *'"method":"tools/list"'*) ;; *) exit 24 ;; esac
 case "$pending" in *'"id":{pending_id},'*|*'"id":{pending_id}}}'*) ;; *) exit 25 ;; esac
-sleep 0.12
+sleep 0.5
 printf '%s\n' '{{"jsonrpc":"2.0","id":{pending_id},"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}'
 IFS= read -r cancellation || exit 26
 case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":{pending_id}'*) ;; *) exit 27 ;; esac
@@ -58251,7 +58542,7 @@ while IFS= read -r unexpected; do exit 31; done
         };
         let cancellation = McpRequestCancellation::new();
         let budget = PaginationBudget::for_request(
-            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(200))
+            RequestTimeoutPolicy::new(Duration::from_millis(900), Duration::from_millis(900))
                 .unwrap(),
         );
         let error = http_test_runtime_block_on(client.collect_stdio_catalog_with_cx_and_budget(
@@ -58263,8 +58554,10 @@ while IFS= read -r unexpected; do exit 31; done
             budget,
         ))
         .unwrap_err();
-        // Both 120ms stages fit a restarted 200ms budget, so success would
+        // Both 500ms stages fit a restarted 900ms budget, so success would
         // reveal a reset at discovery completion or the continuation page.
+        // Together they cannot fit (a sleep never ends early), and each keeps
+        // 400ms of margin for a loaded host.
         assert_eq!(
             error.data,
             Some(serde_json::json!({"timeoutSource":"absolute"}))
@@ -62909,6 +63202,10 @@ IFS= read -r end
                 } else {
                     method
                 };
+                // In the planted negative the sibling cancels this request and
+                // then sends its ping. The cancellation control can reach the
+                // wire before that ping or after the responses; the peer
+                // accepts it exactly once in either position.
                 let script = format!(
                     r#"
 {handshake}
@@ -62916,13 +63213,16 @@ IFS= read -r first || exit 92
 case "$first" in *'"method":"{wire_method}"'*'"id":2'*) ;; *) exit 93 ;; esac
 {no_tasks}
 IFS= read -r sibling || exit 94
+control=false
+case "$sibling" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r sibling || exit 94 ;; esac
 case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 95 ;; esac
 {progress}
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{result}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{ping_result}}}'
 IFS= read -r recovery || exit 96
-control=false
-case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+if [ "$control" = false ]; then
+  case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+fi
 case "$recovery" in *'"method":"tools/list"'*'"id":4'*) ;; *) exit 97 ;; esac
 printf '{{"jsonrpc":"2.0","id":4,"result":{{{recovery_prefix}"tools":[{{"name":"%s","inputSchema":{{"type":"object"}}}}]}}}}\n' "$control"
 IFS= read -r end
@@ -63335,6 +63635,10 @@ while IFS= read -r unexpected; do exit 22; done
             } else {
                 r#"{"resultType":"complete"}"#
             };
+            // In the planted negative the sibling cancels this request and
+            // then sends its ping. The cancellation control can reach the wire
+            // before that ping or after the responses; the peer accepts it
+            // exactly once in either position.
             let script = format!(
                 r#"
 IFS= read -r discovery || exit 90
@@ -63342,12 +63646,15 @@ printf '%s\n' '{discovery}'
 IFS= read -r first || exit 91
 case "$first" in *'"method":"{method}"'*'{subject}'*'"id":2'*) ;; *) exit 92 ;; esac
 IFS= read -r sibling || exit 93
+control=false
+case "$sibling" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r sibling || exit 93 ;; esac
 case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 94 ;; esac
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{initial}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete"}}}}'
 IFS= read -r recovery || exit 96
-control=false
-case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+if [ "$control" = false ]; then
+  case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+fi
 case "$recovery" in *'"method":"tasks/get"'*'{subject}'*'"id":4'*) ;; *) exit 97 ;; esac
 printf '{{"jsonrpc":"2.0","id":4,"result":{{"statusMessage":"%s",' "$control"
 printf '%s\n' '"resultType":"complete","taskId":"{subject}","status":"completed","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"result":{nested}}}}}'
@@ -64945,7 +65252,7 @@ exec sleep 5
                 })
             });
         let script = modern_mrtr_two_input_client_script(!cancel);
-        let connection_cx = Cx::for_request();
+        let connection_cx = timer_test_caller();
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
@@ -64958,7 +65265,7 @@ exec sleep 5
         let next_id = client.next_id.load(Ordering::SeqCst);
         // Cleanup has a separate live caller even when the request's Cx was
         // cancelled. The negative peer accepts EOF only, never a partial retry.
-        let cleanup_cx = Cx::for_request();
+        let cleanup_cx = timer_test_caller();
         http_test_runtime_block_on(client.close_with_cx(&cleanup_cx)).unwrap();
         assert!(client.child.is_none());
         assert_eq!(roots_calls.load(Ordering::SeqCst), 1);

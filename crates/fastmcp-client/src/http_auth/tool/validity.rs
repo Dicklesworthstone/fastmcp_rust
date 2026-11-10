@@ -432,47 +432,54 @@ mod context_cancellation_tests {
         use std::time::Duration;
 
         let (runtime, timer, clock) = clocked_runtime();
-        let cx = runtime
-            .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
         let (foreign_runtime, foreign_timer, foreign_clock) = clocked_runtime();
-        foreign_clock.advance(1_000_000_000);
-        let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
-        let ambient = Cx::set_current(Some(foreign_cx.clone()));
-        let contract = contract();
-        let cancellation = McpRequestCancellation::new();
-        let state = Arc::new(State::default());
-        let wakes = Arc::new(Wakes::default());
-        let waker = Waker::from(wakes.clone());
-        let mut task = Context::from_waker(&waker);
-        let mut future = Box::pin(await_validity(
-            &cx,
-            &cancellation,
-            &contract,
-            Waiting(state.clone()),
-        ));
-        assert!(future.as_mut().poll(&mut task).is_pending());
-        assert!(timer.pending_count() > 0);
-        assert_eq!(foreign_timer.pending_count(), 0);
-        assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
-        clock.advance(10_000_000);
-        assert!(timer.process_timers() > 0);
-        assert!(wakes.0.load(Ordering::SeqCst) > 0);
-        assert!(matches!(
-            future.as_mut().poll(&mut task),
-            Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::TimedOut)))
-        ));
-        assert_eq!(state.polls.load(Ordering::SeqCst), 1);
-        assert!(state.dropped.load(Ordering::SeqCst));
-        assert_eq!(timer.pending_count(), 0);
-        assert_eq!(foreign_timer.pending_count(), 0);
-        assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
-        assert!(!cancellation.is_cancel_requested());
-        assert!(!foreign_cx.is_cancel_requested());
-        contract.check().unwrap();
-        drop(future);
-        drop(ambient);
-        drop(foreign_cx);
-        drop(cx);
+        // An unloaned current-thread runtime drives its worker, timers
+        // included, on a background thread. Run the hand-driven clock as the
+        // root poll so only this test fires the virtual timers it inspects;
+        // the foreign ambient context below replaces the root one.
+        runtime.block_on(async {
+            let cx = runtime.request_cx_with_budget(
+                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+            );
+            foreign_clock.advance(1_000_000_000);
+            let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
+            let ambient = Cx::set_current(Some(foreign_cx.clone()));
+            let contract = contract();
+            let cancellation = McpRequestCancellation::new();
+            let state = Arc::new(State::default());
+            let wakes = Arc::new(Wakes::default());
+            let waker = Waker::from(wakes.clone());
+            let mut task = Context::from_waker(&waker);
+            let mut future = Box::pin(await_validity(
+                &cx,
+                &cancellation,
+                &contract,
+                Waiting(state.clone()),
+            ));
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert!(timer.pending_count() > 0);
+            assert_eq!(foreign_timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+            clock.advance(10_000_000);
+            assert!(timer.process_timers() > 0);
+            assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            assert!(matches!(
+                future.as_mut().poll(&mut task),
+                Poll::Ready(Err(ManagedToolError::Core(ManagedCoreError::TimedOut)))
+            ));
+            assert_eq!(state.polls.load(Ordering::SeqCst), 1);
+            assert!(state.dropped.load(Ordering::SeqCst));
+            assert_eq!(timer.pending_count(), 0);
+            assert_eq!(foreign_timer.pending_count(), 0);
+            assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+            assert!(!cancellation.is_cancel_requested());
+            assert!(!foreign_cx.is_cancel_requested());
+            contract.check().unwrap();
+            drop(future);
+            drop(ambient);
+            drop(foreign_cx);
+            drop(cx);
+        });
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
     }

@@ -2066,21 +2066,34 @@ async fn run_handler_in_request<'a, T>(
         }
     }
 
+    enum HandlerInterrupted {
+        Panicked,
+        Cancelled,
+    }
+
     let future = crate::catch_extension_unwind(|| make_future(request_cx))
         .map_err(|_payload| sanitized_handler_panic(ctx.cx(), handler_class))?;
     let mut future = future;
     let poll_handler = std::future::poll_fn(|task_cx| {
         match crate::catch_extension_unwind(|| future.as_mut().poll(task_cx)) {
             Ok(Poll::Ready(outcome)) => Poll::Ready(Ok(outcome)),
+            // Cancellation publication wakes this task, and the handler gets
+            // that poll to settle. One still parked in a wait that ignores
+            // cancellation is dropped here: neither the request deadline's
+            // timer nor any other wait completes for a cancelled task (since
+            // asupersync 0.6 a timeout does not), and the region holding this
+            // task could otherwise never close. Masked cleanup stays exempt.
+            Ok(Poll::Pending) if request_cx_cancellation_is_visible(request_cx) => {
+                Poll::Ready(Err(HandlerInterrupted::Cancelled))
+            }
             Ok(Poll::Pending) => Poll::Pending,
-            Err(_payload) => Poll::Ready(Err(())),
+            Err(_payload) => Poll::Ready(Err(HandlerInterrupted::Panicked)),
         }
     });
 
-    let outcome = match budget.deadline {
+    let polled = match budget.deadline {
         Some(deadline) => match asupersync::time::timeout_at(deadline, poll_handler).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(())) => return Err(sanitized_handler_panic(ctx.cx(), handler_class)),
+            Ok(polled) => polled,
             Err(_elapsed) => {
                 return Err(McpError::new(
                     McpErrorCode::RequestCancelled,
@@ -2088,10 +2101,14 @@ async fn run_handler_in_request<'a, T>(
                 ));
             }
         },
-        None => match poll_handler.await {
-            Ok(outcome) => outcome,
-            Err(()) => return Err(sanitized_handler_panic(ctx.cx(), handler_class)),
-        },
+        None => poll_handler.await,
+    };
+    let outcome = match polled {
+        Ok(outcome) => outcome,
+        Err(HandlerInterrupted::Panicked) => {
+            return Err(sanitized_handler_panic(ctx.cx(), handler_class));
+        }
+        Err(HandlerInterrupted::Cancelled) => return Err(cancellation_error(ctx)),
     };
 
     if request_cx_cancellation_is_visible(request_cx) {
@@ -21864,6 +21881,106 @@ mod router_tests {
                     .expect("modern validation returns a tool error");
             assert!(refused.is_error);
             assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn legacy_tuple_tool_validates_tail_before_direct_and_nested_dispatch() {
+        struct TupleTool {
+            tail_schema: serde_json::Value,
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ToolHandler for TupleTool {
+            fn definition(&self) -> Tool {
+                Tool {
+                    name: "legacy-tuple".to_owned(),
+                    description: None,
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "values": {
+                                "type": "array",
+                                "items": [{"type": "string"}],
+                                "additionalItems": self.tail_schema
+                            }
+                        },
+                        "required": ["values"]
+                    }),
+                    output_schema: None,
+                    icon: None,
+                    version: None,
+                    tags: Vec::new(),
+                    annotations: None,
+                }
+            }
+
+            fn call(&self, _ctx: &McpContext, _args: serde_json::Value) -> McpResult<Vec<Content>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![Content::text("validated")])
+            }
+        }
+
+        for strict in [false, true] {
+            for (tail_schema, accepted, rejected) in [
+                (
+                    serde_json::json!(false),
+                    serde_json::json!({"values": ["header"]}),
+                    serde_json::json!({"values": ["header", 1]}),
+                ),
+                (
+                    serde_json::json!({"type": "integer"}),
+                    serde_json::json!({"values": ["header", 1, 2]}),
+                    serde_json::json!({"values": ["header", 1, "tail-secret-canary"]}),
+                ),
+            ] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let mut router = Router::new();
+                router.set_strict_input_validation(strict);
+                router
+                    .add_legacy_tool(TupleTool {
+                        tail_schema,
+                        calls: Arc::clone(&calls),
+                    })
+                    .expect("legacy tuple registration remains available");
+                let router = Arc::new(router);
+                let cx = Cx::for_testing();
+                let state = SessionState::new();
+                let ctx = request_context(&cx, 146, Budget::INFINITE, &state);
+                let caller = RouterToolCaller::new(Arc::clone(&router), state.clone());
+
+                for (arguments, valid) in [(&accepted, true), (&rejected, false), (&accepted, true)] {
+                    let before = calls.load(Ordering::SeqCst);
+                    let direct = block_on(router.handle_tools_call(
+                        &ctx,
+                        CallToolParams {
+                            name: "legacy-tuple".to_owned(),
+                            arguments: Some(arguments.clone()),
+                            meta: None,
+                        },
+                        state.clone(),
+                        None,
+                        None,
+                    ));
+                    let nested =
+                        block_on(caller.call_tool(&ctx, "legacy-tuple", arguments.clone(), 1));
+                    for result in [
+                        direct.map(|value| value.is_error),
+                        nested.map(|value| value.is_error),
+                    ] {
+                        if valid {
+                            assert!(!result.expect("valid tuple reaches the application"));
+                        } else {
+                            let error =
+                                result.expect_err("invalid tuple is refused before application code");
+                            assert_eq!(error.code, McpErrorCode::InvalidParams);
+                            assert!(error.message.contains("root.values["));
+                            assert!(!error.message.contains("tail-secret-canary"));
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), before + usize::from(valid) * 2);
+                }
+            }
         }
     }
 

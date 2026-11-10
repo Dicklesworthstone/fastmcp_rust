@@ -78,6 +78,8 @@ pub(super) enum RevocationTarget {
     #[default]
     EndpointUnavailable,
     AuthenticationUnavailable,
+    // Only private_key_jwt authentication needs a revocation registration.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
     RegistrationUnavailable,
     Endpoint(CanonicalHttpUrl),
 }
@@ -222,6 +224,7 @@ impl ClientCredentialsClient {
                 RevocationTarget::AuthenticationUnavailable => {
                     return Ok(ClientCredentialsRemoteRevocation::AuthenticationUnavailable);
                 }
+                #[cfg(all(not(target_arch = "wasm32"), feature = "builtin-auth-server"))]
                 RevocationTarget::RegistrationUnavailable => {
                     return Ok(ClientCredentialsRemoteRevocation::RegistrationUnavailable);
                 }

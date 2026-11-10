@@ -5,11 +5,11 @@
 //! its request lifetime. Neither the registration nor the handler context grants
 //! access to the registry, raw protocol data, credentials, or an executor.
 //!
-//! Requests use bilateral settings. A notification supplies its own bounded
-//! settings proof in an explicitly registered metadata field on every message.
-//! HTTP and modern stream transports run that message inside the owning
-//! transport's scope. Neither path installs legacy fallbacks or grants
-//! transport authority.
+//! Requests and their server notifications use bilateral settings. A standalone
+//! client notification supplies its own bounded settings proof in a registered
+//! metadata field on every message. HTTP and modern stream transports run these
+//! messages inside the owning transport's scope. Neither path installs legacy
+//! fallbacks or grants transport authority.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -157,7 +157,8 @@ impl ExtensionNotification {
 
 /// One typed server-to-client notification owned by an admitted request.
 ///
-/// The framework stamps the exact request ID into the registered metadata key.
+/// Stdio and memory stamp the exact request ID into the registered metadata key.
+/// Owned HTTP response bodies supply correlation without adding that metadata.
 /// This declaration neither creates a subscription nor grants a broadcast sink.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExtensionRequestNotification {
@@ -179,7 +180,9 @@ impl ExtensionRequestNotification {
         &self.parameter_schema_id
     }
 
-    /// Framework-owned metadata member carrying the exact originating ID.
+    /// Framework-owned stdio/memory metadata member carrying the originating ID.
+    ///
+    /// Owned HTTP response notifications omit this member.
     #[must_use]
     pub fn correlation_metadata_key(&self) -> &str {
         &self.correlation_metadata_key
@@ -314,9 +317,11 @@ impl<Settings> ExtensionContext<'_, Settings> {
 
     /// Emits this extension's registered typed notification for this request.
     ///
-    /// Available on modern stdio and memory transports only. Parameters must
-    /// satisfy the installed schema and cannot contain `_meta`; the framework
-    /// supplies the immutable method, metadata key and exact originating ID.
+    /// Available on modern stdio, memory and owned HTTP response streams.
+    /// Parameters must satisfy the installed schema and cannot contain `_meta`.
+    /// The framework supplies the immutable method; stdio and memory also add
+    /// the declared correlation key and exact request ID. HTTP uses its owned
+    /// response body and emits no synthetic correlation metadata.
     /// Cancellation, request completion or missing bilateral negotiation closes
     /// this capability. Emission uses the transport's bounded output queue;
     /// success acknowledges submission, never peer delivery or a replay promise.
@@ -327,8 +332,23 @@ impl<Settings> ExtensionContext<'_, Settings> {
                 "This extension has no request notification declaration",
             ));
         }
-        let value = encode_value(parameters, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)
-            .map_err(|_| McpError::invalid_params("Extension notification exceeds its byte budget"))?;
+        let source = encode_bytes(parameters, MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES)
+            .map_err(|_| {
+                McpError::invalid_params("Extension notification exceeds its byte budget")
+            })?;
+        // HTTP correlation does not pass through the stdio capsule decoder.
+        // Apply the same raw-document depth, string and numeric bounds before
+        // either transport can accept this application-produced payload.
+        fastmcp_protocol::admit_raw_jsonrpc_document(
+            &source,
+            MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
+        )
+        .map_err(|_| {
+            McpError::invalid_params("Extension notification parameters fail protocol admission")
+        })?;
+        let value = serde_json::from_slice(&source).map_err(|_| {
+            McpError::invalid_params("Extension notification parameters are not valid JSON")
+        })?;
         self.context.emit_request_extension_notification(value)
     }
 
@@ -1023,14 +1043,16 @@ where
     /// Declares one typed server notification emitted during this extension's requests.
     ///
     /// Install at least one request handler and call [`ExtensionContext::notify`]
-    /// from that handler. Modern stdio and memory dispatch retain the admitted
-    /// bilateral settings and exact request ID; callers cannot supply a method,
-    /// correlation key or destination. Parameters must be an object satisfying
-    /// `Notification`'s schema and must not contain `_meta`.
+    /// from that handler. Modern stdio, memory and owned HTTP dispatch retain
+    /// the admitted bilateral settings and request owner; callers cannot supply
+    /// a method or destination. Stdio and memory stamp the declared correlation
+    /// key; HTTP uses its response body without adding metadata. Parameters must
+    /// be an object satisfying `Notification`'s schema and must not contain `_meta`.
     ///
     /// The registry currently supports one notification per extension, so this
     /// declaration is mutually exclusive with a client-to-server notification.
-    /// HTTP, WebSocket and subscription publication are not enabled by it.
+    /// HTTP requires an owned SSE response; a JSON-only Accept header is refused.
+    /// WebSocket and subscription publication are not enabled by it.
     pub fn typed_request_notification<Notification>(
         mut self,
         method: impl Into<String>,
@@ -1442,6 +1464,30 @@ where
             self.binding.encode(context, &response)
         })
     }
+
+    fn invoke_response_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: fastmcp_protocol::RequestId,
+        handler_admission: Option<crate::FinalHandlerAdmission>,
+    ) -> BoxFuture<'a, McpResult<fastmcp_protocol::JsonRpcResponse>> {
+        Box::pin(async move {
+            let (request, settings) = self.binding.decode(context, negotiated, parameters)?;
+            if let Some(admit) = handler_admission {
+                admit();
+                ensure_live(context)?;
+            }
+            let response = self
+                .handler
+                .handle(self.binding.context(context, &settings), request)
+                .await?;
+            self.binding
+                .encode(context, &response)
+                .map(|value| fastmcp_protocol::JsonRpcResponse::success(id, value))
+        })
+    }
 }
 
 struct TypedSyncHandler<Request, Response, Settings, Handler> {
@@ -1481,6 +1527,27 @@ where
         parameters: Value,
     ) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move { self.invoke_admitted(context, negotiated, parameters) })
+    }
+
+    fn invoke_response_async<'a>(
+        &'a self,
+        context: &'a McpContext,
+        negotiated: &'a NegotiatedExtension,
+        parameters: Value,
+        id: fastmcp_protocol::RequestId,
+        handler_admission: Option<crate::FinalHandlerAdmission>,
+    ) -> BoxFuture<'a, McpResult<fastmcp_protocol::JsonRpcResponse>> {
+        Box::pin(async move {
+            let (request, settings) = self.binding.decode(context, negotiated, parameters)?;
+            if let Some(admit) = handler_admission {
+                admit();
+                ensure_live(context)?;
+            }
+            let response = (self.handler)(self.binding.context(context, &settings), request)?;
+            self.binding
+                .encode(context, &response)
+                .map(|value| fastmcp_protocol::JsonRpcResponse::success(id, value))
+        })
     }
 }
 

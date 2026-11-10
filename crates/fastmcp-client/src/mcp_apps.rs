@@ -1422,6 +1422,7 @@ pub struct McpAppsWireHost<T, P> {
     admission: McpAppsBridgeAdmission,
     next_host_id: McpAppsHostIdAllocator,
     configuration: McpAppsWireHostConfiguration,
+    sandbox_policy: Option<fastmcp_protocol::McpAppsSandboxPolicy>,
     policy: P,
     state: McpAppsWireHostState,
     /// Frames received while an admitted View request is still executing.
@@ -2342,6 +2343,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             admission,
             next_host_id: McpAppsHostIdAllocator::default(),
             configuration,
+            sandbox_policy: None,
             policy,
             state: McpAppsWireHostState::default(),
             deferred_view_frames: VecDeque::new(),
@@ -2381,6 +2383,7 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             admission: self.admission,
             next_host_id: self.next_host_id,
             configuration: self.configuration,
+            sandbox_policy: self.sandbox_policy,
             policy: McpAppsWireHostWithEffects {
                 forwarding: self.policy,
                 effects,
@@ -2395,6 +2398,37 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
             server_catalogs: self.server_catalogs,
             disconnected: self.disconnected,
         }
+    }
+
+    /// Installs the exact compiled sandbox before View initialization. Its
+    /// grant set must match the initialization callback's sandbox response;
+    /// inconsistent callbacks fail before any initialization result is sent.
+    /// Resource declarations cannot grant permissions outside the policy
+    /// supplied to the external renderer. Once initialization begins, policy
+    /// changes require a fresh View.
+    ///
+    /// This does not render HTML, install browser CSP, validate document
+    /// conformance, or replace the Host's external-domain warning requirement.
+    pub fn with_sandbox_policy(
+        mut self,
+        policy: fastmcp_protocol::McpAppsSandboxPolicy,
+    ) -> Result<Self, McpAppsHostError> {
+        if self.disconnected || self.lifecycle() != McpAppsBridgeLifecycle::New {
+            return Err(McpAppsHostError::Bridge(
+                McpAppsBridgeError::InvalidLifecycle,
+            ));
+        }
+        self.configuration.host_capabilities.sandbox = Some(
+            fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(&policy),
+        );
+        self.sandbox_policy = Some(policy);
+        Ok(self)
+    }
+
+    /// Returns the immutable renderer-facing policy retained for this View.
+    #[must_use]
+    pub fn sandbox_policy(&self) -> Option<&fastmcp_protocol::McpAppsSandboxPolicy> {
+        self.sandbox_policy.as_ref()
     }
 
     /// Authorizes catalog forwarding for this exact admitted View and MCP
@@ -3209,6 +3243,20 @@ impl<T: McpAppsWireBridgeTransport, P: McpAppsWireHostPolicy> McpAppsWireHost<T,
     ) -> Result<(), McpAppsHostError> {
         let mut prepared_catalog = None;
         let result = result.and_then(|result| {
+            if method == McpAppsRoutedMethod::Initialize {
+                if let Some(policy) = &self.sandbox_policy {
+                    McpAppsJsonRpcEnvelope::validate_response_for(method, &result)
+                        .map_err(McpAppsHostError::Bridge)?;
+                    let initialized: McpAppsPinnedInitializeResult =
+                        decode_params(Some(&result))?;
+                    let expected = Some(
+                        fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(policy),
+                    );
+                    if initialized.host_capabilities.sandbox != expected {
+                        return Err(wire_policy_denied());
+                    }
+                }
+            }
             let result = if let Some(request) = &catalog {
                 let prepared = self.server_catalogs.prepare_page(
                     cx,
@@ -4324,7 +4372,7 @@ impl McpAppsServerInputClient for crate::HttpClient {
         // The enclosing operation watchdog bounds every POST and callback.
         // Dropping the existing HTTP execution owns its cancellation cleanup.
         crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
-        if method != "tools/call" {
+        if !matches!(method, "tools/list" | "tools/call") {
             return self
                 .request_final_core_with_cancellation(cx, cancellation, method, params)
                 .await
@@ -4344,12 +4392,20 @@ impl McpAppsServerInputClient for crate::HttpClient {
                 ));
             }
         };
-        // Unlike the general convenience API, this stamps Tasks only when the
-        // originating View's Host has explicitly approved Task creation.
-        let (request, response) = client
-            .request_mrtr(cx, method, request_id.clone(), params, allow_tasks)
-            .await
-            .map_err(|error| McpError::invalid_request(error.to_string()))?;
+        // Unlike the general convenience API, these requests stamp Tasks only
+        // on a tool call whose originating Host approved Task creation. The
+        // catalog always comes from the server: positive cached TTLs cannot
+        // retain a later-revoked visibility grant for another View operation.
+        let (request, response) = if method == "tools/list" {
+            client
+                .request_apps_tool_catalog_page(cx, request_id.clone(), params)
+                .await
+        } else {
+            client
+                .request_mrtr(cx, method, request_id.clone(), params, allow_tasks)
+                .await
+        }
+        .map_err(|error| McpError::invalid_request(error.to_string()))?;
         let (mut response, result_source, _) = match response.metadata().kind() {
             ModernHttpResponseKind::Json => {
                 let body = response
@@ -4694,6 +4750,86 @@ fn apps_task_input_required(
     .map_err(|_| invalid())
 }
 
+// A View's tool name selects only the current authorized catalog of the
+// originating connection. No catalog or visibility decision survives this
+// logical call: a later View call must observe a fresh catalog again. This
+// check grants routing eligibility only; the ordinary tools/call request
+// still traverses the server's current operation authorization and limits.
+async fn admit_apps_server_tool<C: McpAppsServerInputClient>(
+    client: &mut C,
+    cx: &Cx,
+    cancellation: &McpRequestCancellation,
+    deadline: std::time::Instant,
+    name: &str,
+    prepared_parameters: &Value,
+) -> Result<(), McpAppsHostError> {
+    let mut names = BTreeSet::new();
+    let mut cursors = BTreeSet::new();
+    let mut next_cursor = None;
+    let mut remaining_bytes = MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES;
+    let mut eligible = false;
+    for _ in 0..MAX_APPS_CATALOG_PAGES {
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        let mut parameters = json!({});
+        if let Some(meta) = prepared_parameters.get("_meta") {
+            parameters["_meta"] = meta.clone();
+        }
+        if let Some(cursor) = next_cursor.take() {
+            parameters["cursor"] = Value::String(cursor);
+        }
+        let result = client
+            .request_apps_server_input(cx, cancellation, deadline, "tools/list", parameters, false)
+            .await?;
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        // Charge the complete selected-era result, including open metadata
+        // and siblings. Its codec already bounds each admitted page before
+        // this cumulative catalog budget is applied.
+        let bytes = result.encode().map_err(|_| wire_policy_denied())?.len();
+        remaining_bytes = remaining_bytes
+            .checked_sub(bytes)
+            .ok_or_else(wire_policy_denied)?;
+        let CoreResult::Final(FinalCoreResult::ToolsList { result, .. }) = result else {
+            return Err(wire_policy_denied());
+        };
+        let page = result.payload;
+        if page.tools.len() > MAX_MCP_APPS_VIEW_TOOLS.saturating_sub(names.len()) {
+            return Err(wire_policy_denied());
+        }
+        for tool in page.tools {
+            crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+            if tool.name.is_empty()
+                || tool.name.len() > fastmcp_protocol::MAX_MCP_APPS_BRIDGE_TEXT_BYTES
+                || !names.insert(tool.name.clone())
+            {
+                return Err(wire_policy_denied());
+            }
+            let metadata = tool.mcp_apps_metadata().map_err(|_| wire_policy_denied())?;
+            if tool.name == name {
+                // The pinned default applies even to ordinary tools without
+                // any ui metadata. Explicit [] is different from omission.
+                eligible = metadata.is_none_or(|metadata| {
+                    metadata
+                        .effective_visibility()
+                        .contains(&fastmcp_protocol::McpAppsToolVisibility::App)
+                });
+            }
+        }
+        crate::check_mrtr_operation(cx, Some(cancellation), deadline)?;
+        let Some(cursor) = page.next_cursor else {
+            return if eligible {
+                Ok(())
+            } else {
+                Err(wire_policy_denied())
+            };
+        };
+        if cursor.len() > MAX_APPS_CATALOG_CURSOR_BYTES || !cursors.insert(cursor.clone()) {
+            return Err(wire_policy_denied());
+        }
+        next_cursor = Some(cursor);
+    }
+    Err(wire_policy_denied())
+}
+
 pub(crate) async fn dispatch_apps_server_input<
     C: McpAppsServerInputClient,
     E: McpAppsWireHostEffects,
@@ -4733,6 +4869,19 @@ pub(crate) async fn dispatch_apps_server_input<
         )?,
     )?;
     crate::wait_for_mrtr_operation(cx, Some(cancellation), deadline, async {
+        if method == McpAppsRoutedMethod::ToolsCall {
+            let request: fastmcp_protocol::McpAppsToolCallParams =
+                serde_json::from_value(params.clone()).map_err(|_| invalid())?;
+            admit_apps_server_tool(
+                client,
+                cx,
+                cancellation,
+                deadline,
+                &request.name,
+                &original_parameters,
+            )
+            .await?;
+        }
         let mut operation = AppsServerInputOperation {
             cx,
             cancellation,
@@ -4801,6 +4950,14 @@ pub(crate) async fn dispatch_apps_server_input<
 
 /// Concrete policy that forwards only standard-reused View methods through a
 /// fresh selected-era core request on one live [`crate::Client`].
+///
+/// Each new View tool call first checks its exact name and Apps visibility in
+/// that connection's current authorized catalog, bounded to 64 pages, 1,024
+/// tools and one MiB. Missing, ambiguous or non-app-visible tools never reach
+/// tool execution or consent callbacks. The same deadline and cancellation
+/// owner cover discovery, consent and any operation continuations.
+/// Native stdio tool forwarding requires the Unix cancellation-aware adapter;
+/// other platforms refuse these calls before contacting the server.
 pub struct McpAppsClientWirePolicy<'client> {
     client: &'client mut crate::Client,
 }
@@ -4848,6 +5005,12 @@ impl McpAppsWireHostPolicy for McpAppsClientWirePolicy<'_> {
                 &mut (),
             )
             .await;
+        }
+        #[cfg(not(unix))]
+        if method == McpAppsRoutedMethod::ToolsCall {
+            // The portable fallback has no bounded asynchronous catalog
+            // admission. It must not bypass the visibility gate above.
+            return Err(wire_policy_denied());
         }
         self.client
             .forward_mcp_apps_reused_core(cx, cancellation, method, params)
@@ -5761,6 +5924,16 @@ exec sleep 10
         json!({"resultType": "complete", "content": [{"type": "text", "text": "completed core operation"}]})
     }
 
+    fn apps_server_tool_page(names: &[&str]) -> Value {
+        json!({
+            "resultType": "complete",
+            "tools": names.iter().map(|name| json!({
+                "name": name, "inputSchema": {"type": "object"}
+            })).collect::<Vec<_>>(),
+            "ttlMs": 0, "cacheScope": "private"
+        })
+    }
+
     fn server_input_http_peer(
         results: Vec<Value>,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Value>>) {
@@ -5771,6 +5944,19 @@ exec sleep 10
         results: Vec<Value>,
         tasks: bool,
         sse: bool,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Value>>) {
+        server_input_http_peer_with_catalog(results, tasks, sse, true)
+    }
+
+    // Existing composition tests inspect operation continuations separately
+    // from catalog discovery. Their fixture supplies ordinary listed tools
+    // and verifies each discovery request before returning that operation
+    // trace. Visibility tests disable this and inspect every real request.
+    fn server_input_http_peer_with_catalog(
+        results: Vec<Value>,
+        tasks: bool,
+        sse: bool,
+        automatic_catalog: bool,
     ) -> (std::net::SocketAddr, std::thread::JoinHandle<Vec<Value>>) {
         use std::io::{Read, Write};
 
@@ -5789,76 +5975,104 @@ exec sleep 10
                     json!({});
             }
             let mut requests = Vec::new();
-            for result in std::iter::once(discovery).chain(results) {
-                let accept_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let (mut stream, _) = loop {
-                    match listener.accept() {
-                        Ok(connection) => break connection,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < accept_deadline,
-                                "expected Apps core request was never sent"
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut next_id = 1;
+            for scripted_result in std::iter::once(discovery).chain(results) {
+                loop {
+                    let accept_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    let (mut stream, _) = loop {
+                        match listener.accept() {
+                            Ok(connection) => break connection,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < accept_deadline,
+                                    "expected Apps core request was never sent"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("Apps test peer could not accept: {error}"),
                         }
-                        Err(error) => panic!("Apps test peer could not accept: {error}"),
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0_u8; 4096];
+                    let header_end = loop {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0, "peer must receive a complete request");
+                        bytes.extend_from_slice(&buffer[..count]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            break end + 4;
+                        }
+                        assert!(bytes.len() < 64 * 1024);
+                    };
+                    let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap();
+                    assert!(length < 2 * fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES);
+                    while bytes.len() < header_end + length {
+                        let count = stream.read(&mut buffer).unwrap();
+                        assert!(count > 0);
+                        bytes.extend_from_slice(&buffer[..count]);
                     }
-                };
-                stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                let mut buffer = [0_u8; 4096];
-                let header_end = loop {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0, "peer must receive a complete request");
-                    bytes.extend_from_slice(&buffer[..count]);
-                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                        break end + 4;
+                    let request: Value =
+                        serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    assert_eq!(
+                        request["id"], next_id,
+                        "every continuation needs a fresh core ID"
+                    );
+                    next_id += 1;
+                    if requests.is_empty() {
+                        assert_eq!(request["method"], "server/discover");
                     }
-                    assert!(bytes.len() < 64 * 1024);
-                };
-                let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
-                let length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap();
-                assert!(length < 2 * fastmcp_protocol::MAX_MCP_APPS_BRIDGE_MESSAGE_BYTES);
-                while bytes.len() < header_end + length {
-                    let count = stream.read(&mut buffer).unwrap();
-                    assert!(count > 0);
-                    bytes.extend_from_slice(&buffer[..count]);
+                    let catalog = automatic_catalog && request["method"] == "tools/list";
+                    let result = if catalog {
+                        let parameters = request["params"].as_object().unwrap();
+                        assert!(parameters.keys().all(|key| key == "_meta"));
+                        assert!(request["params"]["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]
+                        ["extensions"].get(fastmcp_protocol::extensions::OFFICIAL_TASKS_EXTENSION_ID).is_none());
+                        apps_server_tool_page(&[
+                            "server_task",
+                            "ordinary",
+                            "healthy",
+                            "needs-task-input",
+                            "sibling-task",
+                            "server_echo",
+                            "needs-input",
+                            "sibling-input",
+                            "sibling-healthy",
+                        ])
+                    } else {
+                        scripted_result.clone()
+                    };
+                    let body =
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
+                    let (body, content_type) = if sse && !requests.is_empty() {
+                        (
+                            format!("event: message\ndata: {body}\n\n"),
+                            "text/event-stream",
+                        )
+                    } else {
+                        (body, "application/json")
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                    stream.flush().unwrap();
+                    if !catalog {
+                        requests.push(request);
+                        break;
+                    }
                 }
-                let request: Value =
-                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
-                assert_eq!(
-                    request["id"],
-                    requests.len() + 1,
-                    "every continuation needs a fresh core ID"
-                );
-                if requests.is_empty() {
-                    assert_eq!(request["method"], "server/discover");
-                }
-                let body = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
-                let (body, content_type) = if sse && !requests.is_empty() {
-                    (
-                        format!("event: message\ndata: {body}\n\n"),
-                        "text/event-stream",
-                    )
-                } else {
-                    (body, "application/json")
-                };
-                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-                stream.flush().unwrap();
-                requests.push(request);
             }
             requests
         });
@@ -5909,6 +6123,270 @@ exec sleep 10
             .connect_http_client_with_cx(cx)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn public_http_apps_tool_visibility_controls_real_dispatch() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (metadata, allowed) in [
+                (None, true),
+                (Some(json!({})), true),
+                (Some(json!({"visibility": ["app"]})), true),
+                (Some(json!({"visibility": ["model", "app", "app"]})), true),
+                (Some(json!({"visibility": ["model"]})), false),
+                (Some(json!({"visibility": []})), false),
+                (Some(json!({"visibility": null})), false),
+                (Some(json!({"visibility": ["App"]})), false),
+                (
+                    Some(json!({"visibility": ["app"], "permissions": {}})),
+                    false,
+                ),
+            ] {
+                let mut page = apps_server_tool_page(&["selected"]);
+                if let Some(metadata) = metadata {
+                    page["tools"][0]["_meta"] = json!({"ui": metadata});
+                }
+                let mut results = vec![page];
+                if allowed {
+                    results.push(server_input_complete());
+                }
+                let (address, peer) =
+                    server_input_http_peer_with_catalog(results, false, false, false);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap();
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "view-private-id",
+                    "tools/call",
+                    json!({"name": "selected", "arguments": {"value": 7}}),
+                )
+                .await;
+                assert_eq!(response.get("result").is_some(), allowed);
+                assert_eq!(response.get("error").is_some(), !allowed);
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), if allowed { 3 } else { 2 });
+                assert_eq!(requests[1]["method"], "tools/list");
+                assert!(requests[1]["params"].get("name").is_none());
+                assert!(requests[1]["params"].get("arguments").is_none());
+                assert!(requests[1]["params"].get("inputResponses").is_none());
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| !request.to_string().contains("view-private-id"))
+                );
+                if allowed {
+                    assert_eq!(requests[2]["method"], "tools/call");
+                    assert_eq!(requests[2]["params"]["name"], "selected");
+                    assert_eq!(requests[2]["params"]["arguments"], json!({"value": 7}));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn public_http_apps_tool_visibility_reads_all_pages_and_never_reuses_a_grant() {
+        let mut first = apps_server_tool_page(&["unrelated"]);
+        first["nextCursor"] = json!("private-catalog-cursor");
+        first["ttlMs"] = json!(60_000);
+        let mut visible = apps_server_tool_page(&["selected"]);
+        visible["tools"][0]["_meta"] = json!({"ui": {"visibility": ["app"]}});
+        visible["ttlMs"] = json!(60_000);
+        let mut revoked = visible.clone();
+        revoked["tools"][0]["_meta"]["ui"]["visibility"] = json!(["model"]);
+        let (address, peer) = server_input_http_peer_with_catalog(
+            vec![first, visible, server_input_complete(), revoked],
+            false,
+            false,
+            false,
+        );
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            let mut client = server_input_http_client(&cx, address).await;
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client
+                .mcp_apps_wire_host(transport, wire_configuration())
+                .unwrap();
+            activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+            for allowed in [true, false] {
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "same-view-id",
+                    "tools/call",
+                    json!({"name": "selected"}),
+                )
+                .await;
+                assert_eq!(response.get("result").is_some(), allowed);
+                assert!(!response.to_string().contains("private-catalog-cursor"));
+            }
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+        });
+        let requests = peer.join().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "server/discover",
+                "tools/list",
+                "tools/list",
+                "tools/call",
+                "tools/list"
+            ]
+        );
+        assert_eq!(requests[2]["params"]["cursor"], "private-catalog-cursor");
+        assert!(
+            requests[4]["params"].get("cursor").is_none(),
+            "new calls restart catalog admission"
+        );
+    }
+
+    #[test]
+    fn public_http_apps_tool_visibility_rejects_missing_ambiguous_and_unbounded_catalogs() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for (case, allowed) in [
+                ("missing", false),
+                ("duplicate", false),
+                ("later-duplicate", false),
+                ("unrelated-invalid", false),
+                ("cursor-cycle", false),
+                ("page-floor", true),
+                ("pages", false),
+                ("tool-floor", true),
+                ("tools", false),
+                ("byte-floor", true),
+                ("bytes", false),
+            ] {
+                let mut page = apps_server_tool_page(&["selected"]);
+                let mut results = match case {
+                    "missing" => vec![apps_server_tool_page(&[])],
+                    "duplicate" => vec![apps_server_tool_page(&["selected", "selected"])],
+                    "later-duplicate" => {
+                        page["nextCursor"] = json!("second");
+                        vec![page, apps_server_tool_page(&["selected"])]
+                    }
+                    "unrelated-invalid" => {
+                        let mut page = apps_server_tool_page(&["selected", "other"]);
+                        page["tools"][1]["_meta"] = json!({"ui": {"visibility": ["unknown"]}});
+                        vec![page]
+                    }
+                    "cursor-cycle" => {
+                        page["nextCursor"] = json!("same");
+                        let mut next = apps_server_tool_page(&[]);
+                        next["nextCursor"] = json!("same");
+                        vec![page, next]
+                    }
+                    "page-floor" | "pages" => (0..MAX_APPS_CATALOG_PAGES)
+                        .map(|index| {
+                            let mut page = if index == 0 {
+                                apps_server_tool_page(&["selected"])
+                            } else {
+                                apps_server_tool_page(&[])
+                            };
+                            if index + 1 < MAX_APPS_CATALOG_PAGES || !allowed {
+                                page["nextCursor"] = json!(format!("page-{index}"));
+                            }
+                            page
+                        })
+                        .collect(),
+                    "tool-floor" | "tools" => {
+                        page["tools"] = json!(
+                            (0..MAX_MCP_APPS_VIEW_TOOLS)
+                                .map(|index| {
+                                    let name = if index == 0 {
+                                        "selected".to_owned()
+                                    } else {
+                                        format!("tool-{index}")
+                                    };
+                                    json!({"name": name, "inputSchema": {"type": "object"}})
+                                })
+                                .collect::<Vec<_>>()
+                        );
+                        // Cross-page overflow must be refused even though
+                        // both pages satisfy the protocol's per-array bound.
+                        if allowed {
+                            vec![page]
+                        } else {
+                            page["nextCursor"] = json!("one-too-many");
+                            vec![page, apps_server_tool_page(&["extra"])]
+                        }
+                    }
+                    "byte-floor" | "bytes" => {
+                        // Both fixtures contain a callable selected tool and
+                        // two individually bounded pages. The single-byte
+                        // difference crosses the cumulative result budget,
+                        // including its inert open siblings.
+                        page["nextCursor"] = json!("last");
+                        page["catalogPadding"] = json!("");
+                        let mut last = apps_server_tool_page(&[]);
+                        last["catalogPadding"] = json!("");
+                        let base = page.to_string().len() + last.to_string().len();
+                        let padding =
+                            MAX_MCP_APPS_VIEW_TOOL_STATE_BYTES - base + usize::from(!allowed);
+                        page["catalogPadding"] = json!("x".repeat(padding / 2));
+                        last["catalogPadding"] = json!("x".repeat(padding - padding / 2));
+                        vec![page, last]
+                    }
+                    _ => unreachable!(),
+                };
+                if allowed {
+                    results.push(server_input_complete());
+                }
+                let expected = results.len() + 1;
+                let (address, peer) =
+                    server_input_http_peer_with_catalog(results, false, false, false);
+                let cx = Cx::current().unwrap();
+                let mut client = server_input_http_client(&cx, address).await;
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(transport, wire_configuration())
+                    .unwrap();
+                activate_stateful_wire_host(&mut host, &mut view, &cx, None).await;
+                let response = stateful_wire_request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "catalog-denied",
+                    "tools/call",
+                    json!({"name": "selected"}),
+                )
+                .await;
+                assert_eq!(response.get("error").is_some(), !allowed, "{case}");
+                assert_eq!(response.get("result").is_some(), allowed, "{case}");
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                let requests = peer.join().unwrap();
+                assert_eq!(requests.len(), expected, "{case}");
+                let catalog_end = requests.len() - usize::from(allowed);
+                assert!(
+                    requests[1..catalog_end]
+                        .iter()
+                        .all(|request| request["method"] == "tools/list"),
+                    "{case}"
+                );
+                if allowed {
+                    assert_eq!(requests.last().unwrap()["method"], "tools/call", "{case}");
+                }
+            }
+        });
     }
 
     #[derive(Clone, Copy)]
@@ -6788,39 +7266,46 @@ exec sleep 10
 IFS= read -r discovery || exit 91
 case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/ui":{},"io.modelcontextprotocol/tasks":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-task-stdio","version":"1"}}}}'
+IFS= read -r catalog || exit 120
+case "$catalog" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 121 ;; esac
+case "$catalog" in *io.modelcontextprotocol/tasks*|*view-task-id*) exit 122 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"server_task","inputSchema":{"type":"object"}},{"name":"ordinary","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}'
 IFS= read -r first || exit 93
-case "$first" in *'"id":2'*) ;; *) exit 94 ;; esac
+case "$first" in *'"id":3'*) ;; *) exit 94 ;; esac
 case "$first" in *'"method":"tools/call"'*) ;; *) exit 95 ;; esac
 case "$first" in *'"io.modelcontextprotocol/tasks":{}'*) ;; *) exit 96 ;; esac
 case "$first" in *view-task-id*|*taskId*) exit 97 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"task","taskId":"private-server-task","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"pollIntervalMs":1}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"task","taskId":"private-server-task","status":"working","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:00.000Z","ttlMs":null,"pollIntervalMs":1}}'
 IFS= read -r get || exit 98
-case "$get" in *'"id":3'*) ;; *) exit 99 ;; esac
+case "$get" in *'"id":4'*) ;; *) exit 99 ;; esac
 case "$get" in *'"method":"tasks/get"'*) ;; *) exit 100 ;; esac
 case "$get" in *'"taskId":"private-server-task"'*) ;; *) exit 101 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","taskId":"private-server-task","status":"input_required","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null,"pollIntervalMs":1,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","taskId":"private-server-task","status":"input_required","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:01.000Z","ttlMs":null,"pollIntervalMs":1,"inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
 IFS= read -r update || exit 102
-case "$update" in *'"id":4'*) ;; *) exit 103 ;; esac
+case "$update" in *'"id":5'*) ;; *) exit 103 ;; esac
 case "$update" in *'"method":"tasks/update"'*) ;; *) exit 104 ;; esac
 case "$update" in *'"taskId":"private-server-task"'*) ;; *) exit 105 ;; esac
 case "$update" in *'"inputResponses":{"sample":'*) ;; *) exit 106 ;; esac
 case "$update" in *host-approved*) ;; *) exit 107 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete"}}'
 IFS= read -r final || exit 108
-case "$final" in *'"id":5'*) ;; *) exit 109 ;; esac
+case "$final" in *'"id":6'*) ;; *) exit 109 ;; esac
 case "$final" in *'"method":"tasks/get"'*) ;; *) exit 110 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","taskId":"private-server-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:02.000Z","ttlMs":null,"result":{"content":[{"type":"text","text":"stdio Task completed"}]}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","taskId":"private-server-task","status":"completed","createdAt":"2026-07-28T12:00:00.000Z","lastUpdatedAt":"2026-07-28T12:00:02.000Z","ttlMs":null,"result":{"content":[{"type":"text","text":"stdio Task completed"}]}}}'
+IFS= read -r ordinary_catalog || exit 123
+case "$ordinary_catalog" in *'"method":"tools/list"'*'"id":7'*) ;; *) exit 124 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","tools":[{"name":"ordinary","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}'
 IFS= read -r ordinary || exit 111
-case "$ordinary" in *'"id":6'*) ;; *) exit 112 ;; esac
+case "$ordinary" in *'"id":8'*) ;; *) exit 112 ;; esac
 case "$ordinary" in *'"method":"tools/call"'*) ;; *) exit 113 ;; esac
 case "$ordinary" in *io.modelcontextprotocol/tasks*|*private-server-task*|*inputResponses*) exit 114 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","content":[{"type":"text","text":"ordinary call completed"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":8,"result":{"resultType":"complete","content":[{"type":"text","text":"ordinary call completed"}]}}'
 IFS= read -r fallback || exit 115
-case "$fallback" in *'"id":7'*) ;; *) exit 116 ;; esac
+case "$fallback" in *'"id":9'*) ;; *) exit 116 ;; esac
 case "$fallback" in *'"method":"tools/call"'*) ;; *) exit 117 ;; esac
 case "$fallback" in *'"name":"fallback"'*) ;; *) exit 118 ;; esac
 case "$fallback" in *io.modelcontextprotocol/tasks*|*private-server-task*|*inputResponses*) exit 119 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{"resultType":"complete","content":[{"type":"text","text":"fallback call completed"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":9,"result":{"resultType":"complete","content":[{"type":"text","text":"fallback call completed"}]}}'
 exec sleep 10
 "#;
             let mut client = crate::ClientBuilder::new()
@@ -6875,38 +7360,41 @@ exec sleep 10
 IFS= read -r discovery || exit 91
 case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"resources":{},"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"apps-mrtr-stdio","version":"1"}}}}'
+IFS= read -r catalog || exit 106
+case "$catalog" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 107 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"server_echo","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}'
 IFS= read -r first || exit 93
-case "$first" in *'"id":2'*) ;; *) exit 94 ;; esac
+case "$first" in *'"id":3'*) ;; *) exit 94 ;; esac
 case "$first" in *'"method":"tools/call"'*) ;; *) exit 94 ;; esac
 case "$first" in *'"arguments":{"value":7}'*) ;; *) exit 94 ;; esac
 case "$first" in *'"name":"server_echo"'*) ;; *) exit 94 ;; esac
 case "$first" in *requestState*|*inputResponses*|*view-tool*) exit 95 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"input_required","requestState":"stdio-sampling-state","inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"input_required","requestState":"stdio-sampling-state","inputRequests":{"sample":{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"Review this View"}}],"maxTokens":32}}}}}'
 IFS= read -r retry || exit 96
-case "$retry" in *'"id":3'*) ;; *) exit 97 ;; esac
+case "$retry" in *'"id":4'*) ;; *) exit 97 ;; esac
 case "$retry" in *'"method":"tools/call"'*) ;; *) exit 97 ;; esac
 case "$retry" in *'"arguments":{"value":7}'*) ;; *) exit 97 ;; esac
 case "$retry" in *'"inputResponses":{"sample":'*) ;; *) exit 98 ;; esac
 case "$retry" in *'host-approved answer'*) ;; *) exit 98 ;; esac
 case "$retry" in *'"name":"server_echo"'*) ;; *) exit 98 ;; esac
 case "$retry" in *'"requestState":"stdio-sampling-state"'*) ;; *) exit 98 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"stdio completed"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"complete","content":[{"type":"text","text":"stdio completed"}]}}'
 IFS= read -r read || exit 99
-case "$read" in *'"id":4'*) ;; *) exit 100 ;; esac
+case "$read" in *'"id":5'*) ;; *) exit 100 ;; esac
 case "$read" in *'"method":"resources/read"'*) ;; *) exit 100 ;; esac
 case "$read" in *'"uri":"test://private"'*) ;; *) exit 100 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{"resultType":"input_required","requestState":"stdio-state-only"}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"input_required","requestState":"stdio-state-only"}}'
 IFS= read -r resumed || exit 101
-case "$resumed" in *'"id":5'*) ;; *) exit 102 ;; esac
+case "$resumed" in *'"id":6'*) ;; *) exit 102 ;; esac
 case "$resumed" in *'"method":"resources/read"'*) ;; *) exit 102 ;; esac
 case "$resumed" in *'"requestState":"stdio-state-only"'*) ;; *) exit 102 ;; esac
 case "$resumed" in *'"uri":"test://private"'*) ;; *) exit 102 ;; esac
 case "$resumed" in *inputResponses*|*stdio-sampling-state*|*view-read*) exit 103 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":5,"result":{"resultType":"complete","contents":[{"uri":"test://private","text":"stdio read completed"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{"resultType":"complete","contents":[{"uri":"test://private","text":"stdio read completed"}]}}'
 IFS= read -r ping || exit 104
-case "$ping" in *'"id":6'*) ;; *) exit 105 ;; esac
+case "$ping" in *'"id":7'*) ;; *) exit 105 ;; esac
 case "$ping" in *'"method":"server/discover"'*) ;; *) exit 105 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":6,"result":{}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":7,"result":{}}'
 exec sleep 10
 "#;
             let mut client = crate::ClientBuilder::new()
@@ -7045,9 +7533,12 @@ exec sleep 10
 IFS= read -r discovery || exit 91
 case "$discovery" in *server/discover*io.modelcontextprotocol/ui*) ;; *) exit 92 ;; esac
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"extensions":{"io.modelcontextprotocol/ui":{}}},"ttlMs":0,"cacheScope":"private","_meta":{"io.modelcontextprotocol/serverInfo":{"name":"composed-effects-peer","version":"1"}}}}'
+IFS= read -r catalog || exit 107
+case "$catalog" in *'"method":"tools/list"'*'"id":2'*) ;; *) exit 108 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"server_echo","inputSchema":{"type":"object"}}],"ttlMs":0,"cacheScope":"private"}}'
 IFS= read -r tool || exit 93
 case "$tool" in *'"method":"tools/call"'*) ;; *) exit 94 ;; esac
-case "$tool" in *'"id":2'*) ;; *) exit 95 ;; esac
+case "$tool" in *'"id":3'*) ;; *) exit 95 ;; esac
 case "$tool" in *'"name":"server_echo"'*) ;; *) exit 96 ;; esac
 case "$tool" in *'"arguments":{"value":7}'*) ;; *) exit 97 ;; esac
 case "$tool" in *view-call*|*ui/update-model-context*) exit 98 ;; esac
@@ -7056,18 +7547,18 @@ case "$tool" in *view-call*|*ui/update-model-context*) exit 98 ;; esac
             r#"
 IFS= read -r cancelled || exit 101
 case "$cancelled" in *'"method":"notifications/cancelled"'*) ;; *) exit 102 ;; esac
-case "$cancelled" in *'"requestId":2'*) ;; *) exit 103 ;; esac
+case "$cancelled" in *'"requestId":3'*) ;; *) exit 103 ;; esac
 "#
         } else {
             r#"
-printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"real core result"}]}}'
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","content":[{"type":"text","text":"real core result"}]}}'
 "#
         };
         let ending = r#"
 IFS= read -r ping || exit 104
 case "$ping" in *'"method":"server/discover"'*) ;; *) exit 105 ;; esac
-case "$ping" in *'"id":3'*) ;; *) exit 106 ;; esac
-printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+case "$ping" in *'"id":4'*) ;; *) exit 106 ;; esac
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"result":{}}'
 exec sleep 10
 "#;
         let script = format!("{opening}\n{execution}\n{ending}");
@@ -7222,6 +7713,7 @@ exec sleep 10
         runtime.block_on(async {
             let cx = Cx::current().unwrap();
             let mut client = composed_effects_stdio_client(&cx, true).await;
+            let next_id = Arc::clone(&client.next_id);
             let events = Arc::new(Mutex::new(Vec::new()));
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
             let mut host = client
@@ -7243,6 +7735,18 @@ exec sleep 10
             )
             .await
             .unwrap();
+            // Advance past admission to the real tool RPC before cancelling
+            // this View call. Cancelling the catalog is covered separately.
+            let mut pending = Box::pin(host.process_next(&cx));
+            poll_fn(|task| {
+                assert!(pending.as_mut().poll(task).is_pending());
+                if next_id.load(std::sync::atomic::Ordering::SeqCst) >= 4 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
             view.send_to_host(
                 &cx,
                 json!({
@@ -7253,7 +7757,7 @@ exec sleep 10
             )
             .await
             .unwrap();
-            host.process_next(&cx).await.unwrap();
+            pending.await.unwrap();
             assert_eq!(
                 *events.lock().unwrap(),
                 vec![
@@ -9414,6 +9918,101 @@ exec sleep 10
     }
 
     const VIEW_OPERATION_IDLE_NANOS: u64 = 60 * 1_000_000_000;
+
+    #[test]
+    fn closed_wire_sandbox_policy_controls_initialization_grants_and_is_frozen() {
+        use fastmcp_protocol::{
+            McpAppsCspDirective, McpAppsResourceMetadata, McpAppsSandboxHostPolicy,
+            McpAppsSandboxPermission, McpAppsSandboxPolicy,
+        };
+        block_on(async {
+            let cx = Cx::for_testing();
+            for (consented, override_policy) in [(true, false), (false, false), (true, true)] {
+                let metadata: McpAppsResourceMetadata = serde_json::from_value(json!({
+                    "csp": {"connectDomains": ["https://api.example.test"]},
+                    "permissions": {"camera": {}, "microphone": {}}
+                }))
+                .unwrap();
+                let host_policy = McpAppsSandboxHostPolicy::default()
+                    .allow_pinned_local_sources()
+                    .allow_source(McpAppsCspDirective::ConnectSrc, "https://api.example.test")
+                    .unwrap()
+                    .with_permissions(
+                        [McpAppsSandboxPermission::Camera],
+                        [McpAppsSandboxPermission::Camera],
+                        [McpAppsSandboxPermission::Camera],
+                        consented.then_some(McpAppsSandboxPermission::Camera),
+                    );
+                let compiled =
+                    McpAppsSandboxPolicy::compile(Some(&metadata), &host_policy).unwrap();
+                let expected = compiled.clone();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(4);
+                let mut callback = state_recording_policy();
+                if override_policy {
+                    callback.advertised = Some(
+                        serde_json::from_value(json!({
+                            "sandbox": {
+                                "permissions": {"camera": {}, "microphone": {}, "clipboardWrite": {}},
+                                "csp": {"connectDomains": ["https://unapproved.example.test"]}
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+                let mut host = McpAppsWireHost::new_negotiated(
+                    transport,
+                    wire_configuration(),
+                    callback,
+                    activation_proof(),
+                )
+                .with_sandbox_policy(compiled)
+                .unwrap()
+                .with_effects(());
+                assert_eq!(host.sandbox_policy(), Some(&expected));
+                let response = stateful_wire_request(
+                    &mut host, &mut view, &cx, "sandbox-init", "ui/initialize",
+                    json!({
+                        "appInfo": {"name": "sandbox-view", "version": "1"},
+                        "appCapabilities": {}, "protocolVersion": MCP_APPS_HOST_VIEW_PROTOCOL_VERSION
+                    }),
+                ).await;
+                if override_policy {
+                    assert!(response.get("error").is_some());
+                    assert!(response.get("result").is_none());
+                    assert!(host.state.capabilities.is_none());
+                    assert!(!response.to_string().contains("unapproved"));
+                    assert_eq!(host.sandbox_policy(), Some(&expected));
+                    continue;
+                }
+                let sandbox = &response["result"]["hostCapabilities"]["sandbox"];
+                assert_eq!(sandbox["permissions"].get("camera").is_some(), consented);
+                assert!(sandbox["permissions"].get("microphone").is_none());
+                assert!(sandbox["permissions"].get("clipboardWrite").is_none());
+                assert_eq!(
+                    sandbox["csp"]["connectDomains"],
+                    json!(["https://api.example.test"])
+                );
+                assert!(!response.to_string().contains("unapproved"));
+                assert_eq!(
+                    host.state
+                        .capabilities
+                        .as_ref()
+                        .unwrap()
+                        .sandbox
+                        .as_ref()
+                        .unwrap()
+                        .permissions,
+                    Some(expected.granted_permissions())
+                );
+                assert!(matches!(
+                    host.with_sandbox_policy(expected),
+                    Err(McpAppsHostError::Bridge(
+                        McpAppsBridgeError::InvalidLifecycle
+                    ))
+                ));
+            }
+        });
+    }
 
     struct ViewOperationDrop(Arc<std::sync::atomic::AtomicUsize>);
 

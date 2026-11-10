@@ -1021,7 +1021,7 @@ impl<F> Drop for CallerFuture<'_, F> {
 struct ActiveLease<'a> { counter: &'a AtomicUsize }
 impl<'a> ActiveLease<'a> {
     fn acquire(counter: &'a AtomicUsize, maximum: usize) -> Result<Self, PersistentEnvelopeError> {
-        counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < maximum).then_some(n + 1))
+        counter.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < maximum).then_some(n + 1))
             .map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
         Ok(Self { counter })
     }
@@ -1032,7 +1032,7 @@ impl Drop for ActiveLease<'_> {
 struct ByteLease { counter: Arc<AtomicUsize>, bytes: usize }
 impl ByteLease {
     fn acquire(counter: Arc<AtomicUsize>, bytes: usize, maximum: usize) -> Result<Self, PersistentEnvelopeError> {
-        counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(bytes).filter(|n| *n <= maximum))
+        counter.try_update(Ordering::AcqRel, Ordering::Acquire, |old| old.checked_add(bytes).filter(|n| *n <= maximum))
             .map_err(|_| PersistentEnvelopeError::CapacityExceeded)?;
         Ok(Self { counter, bytes })
     }

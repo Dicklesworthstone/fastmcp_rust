@@ -80,7 +80,7 @@ const MAX_RETAINED_PEER_ACTIVITY: usize = 1_024;
 static NEXT_EXECUTOR_OPERATOR_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn reserve_operator_generation(next: &AtomicU64) -> Option<u64> {
-    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+    next.try_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
         generation.checked_add(1)
     })
     .ok()
@@ -5150,6 +5150,30 @@ mod tests {
                 let large = "x".repeat(60 * 1024);
                 deliver(&executor, &mut peer, &cx, &event(json!(24), &large));
                 assert_eq!(owners[23].take_stream_notifications().unwrap()[0].params.as_ref().unwrap()["value"], large);
+                if !source {
+                    // Typed ingress retains no admitted source frame, and an
+                    // extension result is admitted only from that source, so
+                    // its final response fails the connection closed instead
+                    // of completing an owner from re-encoded JSON.
+                    // The routing drive publishes it as every owner's
+                    // terminal error; later drives report that terminal.
+                    deliver(
+                        &executor,
+                        &mut peer,
+                        &cx,
+                        &response(24, json!({"resultType":"complete", "owner":24})),
+                    );
+                    let terminal = executor
+                        .terminal_error()
+                        .expect("lost source fails the connection");
+                    assert_eq!(
+                        terminal.message,
+                        "Peer final extension response lost its admitted result source"
+                    );
+                    assert!(executor.try_take_response(&mut owners[23]).is_err());
+                    assert!(executor.drive(&cx).is_err());
+                    continue;
+                }
                 for id in (1..=24).rev() {
                     deliver(&executor, &mut peer, &cx, &response(id, json!({"resultType":"complete", "owner":id})));
                 }
@@ -5237,6 +5261,34 @@ mod tests {
                 assert_eq!(sibling.take_stream_notifications().unwrap().len(), 1);
                 assert_eq!(fresh.take_stream_notifications().unwrap().len(), 1);
                 assert_eq!(executor.take_notifications().len(), 1, "retired notification has no request authority");
+                if !source {
+                    // The retired request's late response is absorbed by its
+                    // tombstone. A live extension result on typed ingress has
+                    // no admitted source frame and fails the connection closed.
+                    deliver(
+                        &executor,
+                        &mut peer,
+                        &cx,
+                        &response(1, json!({"resultType":"complete", "owner":1})),
+                    );
+                    assert!(executor.terminal_error().is_none());
+                    deliver(
+                        &executor,
+                        &mut peer,
+                        &cx,
+                        &response(3, json!({"resultType":"complete", "owner":3})),
+                    );
+                    let terminal = executor
+                        .terminal_error()
+                        .expect("lost source fails the connection");
+                    assert_eq!(
+                        terminal.message,
+                        "Peer final extension response lost its admitted result source"
+                    );
+                    assert!(executor.try_take_response(&mut fresh).is_err());
+                    assert!(executor.drive(&cx).is_err());
+                    continue;
+                }
                 for id in [1, 3, 2] { deliver(&executor, &mut peer, &cx, &response(id, json!({"resultType":"complete", "owner":id}))); }
                 deliver(&executor, &mut peer, &cx, &event(json!(2), "after final"));
                 assert!(sibling.take_stream_notifications().unwrap().is_empty());

@@ -484,7 +484,10 @@ fn native_async_auth_silent_provider_obeys_deadline_cancellation_and_abandonment
 fn native_async_auth_receipt_expiry_prevents_commit_without_mutating_context() {
     run(|cx| async move {
         let mut provider = Provider::new(Behavior::YieldSuccess);
-        let deadline = Instant::now() + Duration::from_millis(250);
+        // The window must outlast preauthentication and the first commit on a
+        // loaded shared host (250 ms once expired before the receipt was
+        // minted); the test waits it out, so only its length is at stake.
+        let deadline = Instant::now() + Duration::from_secs(2);
         provider.valid_until = Some(deadline);
         let calls = Arc::new(AtomicUsize::new(0));
         let server = server(provider.clone(), &calls);

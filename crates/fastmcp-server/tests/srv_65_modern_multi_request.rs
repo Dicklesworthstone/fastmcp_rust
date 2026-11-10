@@ -659,8 +659,12 @@ impl TransportRecvHalf for WireRecv {
     }
 
     fn close(&mut self, _cx: &Cx) -> Result<(), TransportError> {
-        self.0.get_ref().shutdown(Shutdown::Read)?;
-        Ok(())
+        match self.0.get_ref().shutdown(Shutdown::Read) {
+            // After the peer's EOF, BSD-derived kernels (macOS) can report the
+            // socket as no longer connected: its read side is closed already.
+            Err(error) if error.kind() == std::io::ErrorKind::NotConnected => Ok(()),
+            result => result.map_err(TransportError::from),
+        }
     }
 }
 
@@ -866,8 +870,16 @@ impl WireScenario {
     }
 
     fn response(&mut self, id: i64) -> JsonRpcResponse {
-        let message = read_wire(&mut self.reader)
-            .expect("request must receive a response within the wire deadline");
+        let message = match read_wire(&mut self.reader) {
+            Ok(message) => message,
+            Err(error) => {
+                // A closed wire usually means the pump returned; report why.
+                let pump = self.outcome.recv_timeout(Duration::from_secs(1));
+                panic!(
+                    "request {id} must receive a response within the wire deadline: {error:?}; pump: {pump:?}"
+                );
+            }
+        };
         let JsonRpcMessage::Response(response) = message else {
             panic!("expected response, got {message:?}");
         };
@@ -1119,17 +1131,16 @@ fn srv_65_modern_subscription_drains_before_shutdown() {
     wire.send(modern_request("tools/list", 41, None));
     assert_ok_response(&wire.response(41), "catalog while subscription pending");
     wire.close_input();
+    // Server-owned teardown terminates the listen with exactly one correlated
+    // cancellation and no result: a response would be a second terminal.
     let cancellation = read_wire(&mut wire.reader).unwrap();
     assert!(
         matches!(cancellation, JsonRpcMessage::Request(request) if request.method == "notifications/cancelled" && request.params.as_ref().unwrap()["requestId"] == 40)
     );
-    let completion = wire.response(40);
-    assert_ok_response(&completion, "graceful subscription completion");
-    let result = completion.result.unwrap();
-    assert_eq!(result["resultType"], "complete");
-    assert_eq!(
-        result["_meta"]["io.modelcontextprotocol/subscriptionId"],
-        40
+    let after = read_wire(&mut wire.reader);
+    assert!(
+        matches!(after, Err(TransportError::Closed)),
+        "the drained subscription must not receive a second terminal: {after:?}"
     );
     wire.finish();
 }

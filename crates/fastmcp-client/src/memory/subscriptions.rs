@@ -669,7 +669,10 @@ impl MemoryClient {
             let maintenance = self.executor.poll_timeouts_at(cx, Instant::now());
             let event = {
                 let mut state = lock(&execution.state);
-                if checkpoint(cx, cancellation).is_err() {
+                // A finished subscription has consumed its outcome and has
+                // nothing left to cancel; later reads return None, as for
+                // ordinary executions.
+                if !state.finished && checkpoint(cx, cancellation).is_err() {
                     let cancelled = self.executor.cancel(cx, &mut state.inner);
                     if state.inner.terminal_error().is_none() {
                         cancelled?;

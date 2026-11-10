@@ -93,9 +93,9 @@ pub mod uri;
 pub use stats::{
     OperatorConnectionCapacity, OperatorConnectionCounters, OperatorCorrelationCapacity,
     OperatorExecutorCapacity, OperatorExecutorSnapshot, OperatorExecutorState,
-    OperatorHttpConnections, OperatorLifecycle, OperatorProfile, OperatorReadiness,
-    OperatorReason, OperatorRequestCapacity, OperatorSnapshot, OperatorSnapshotError,
-    OperatorSnapshotSource,
+    OperatorHttpConnections, OperatorLifecycle, OperatorOutputCapacity, OperatorOutputCounters,
+    OperatorProfile, OperatorReadiness, OperatorReason, OperatorRequestCapacity, OperatorSnapshot,
+    OperatorSnapshotError, OperatorSnapshotSource, OperatorStdioOutput, OperatorStdioSnapshot,
 };
 
 /// Immutable protocol-limit snapshots and cumulative logical-exchange admission.

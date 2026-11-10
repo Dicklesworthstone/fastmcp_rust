@@ -54,34 +54,53 @@ impl Facade {
         stopped: Arc<AtomicBool>,
     ) -> McpResult<()> {
         let shutdown = move || stopped.store(true, Ordering::Release);
-        match self {
-            Self::Modern => {
-                modern::ServerBuilder::new("facade-native-stdio", "1.2.3")
-                    .tool(FacadeEcho)
-                    .on_shutdown(shutdown)
-                    .build()
-                    .serve_stdio_io(cx, reader, writer)
-                    .await
-            }
+        let bound = match self {
+            Self::Modern => modern::ServerBuilder::new("facade-native-stdio", "1.2.3")
+                .tool(FacadeEcho)
+                .on_shutdown(shutdown)
+                .build()
+                .bind_stdio_io(reader, writer),
             #[cfg(feature = "legacy-2024-11-05")]
-            Self::Auto => {
-                fastmcp_rust::auto::ServerBuilder::new("facade-native-stdio", "1.2.3")
-                    .tool(FacadeEcho)
-                    .on_shutdown(shutdown)
-                    .build()
-                    .serve_stdio_io(cx, reader, writer)
-                    .await
-            }
+            Self::Auto => fastmcp_rust::auto::ServerBuilder::new("facade-native-stdio", "1.2.3")
+                .tool(FacadeEcho)
+                .on_shutdown(shutdown)
+                .build()
+                .bind_stdio_io(reader, writer),
             #[cfg(feature = "legacy-2024-11-05")]
             Self::Legacy => {
                 fastmcp_rust::legacy_2024::ServerBuilder::new("facade-native-stdio", "1.2.3")
                     .tool(FacadeEcho)
                     .on_shutdown(shutdown)
                     .build()
-                    .serve_stdio_io(cx, reader, writer)
-                    .await
+                    .bind_stdio_io(reader, writer)
             }
-        }
+        };
+        let operator: fastmcp_rust::StdioOperatorHandle = bound.operator_handle();
+        let starting: fastmcp_rust::OperatorStdioSnapshot =
+            fastmcp_rust::OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(starting.readiness(), fastmcp_rust::OperatorReadiness::Starting);
+        let profile = match self {
+            Self::Modern => fastmcp_rust::OperatorProfile::Modern,
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::Auto => fastmcp_rust::OperatorProfile::Auto,
+            #[cfg(feature = "legacy-2024-11-05")]
+            Self::Legacy => fastmcp_rust::OperatorProfile::Legacy2024,
+        };
+        assert_eq!(starting.profile(), profile);
+        let result = bound.serve(cx).await;
+        let stopped = fastmcp_rust::OperatorSnapshot::capture(&operator).unwrap();
+        assert_eq!(stopped.lifecycle(), fastmcp_rust::OperatorLifecycle::Stopped);
+        assert_eq!(stopped.contributor().capacity.retained_frames, 0);
+        assert_eq!(stopped.contributor().capacity.retained_bytes, 0);
+        assert_eq!(
+            stopped.contributor().counters.enqueued,
+            stopped.contributor().counters.released,
+        );
+        assert_eq!(
+            stopped.configuration_generation(),
+            starting.configuration_generation(),
+        );
+        result
     }
 }
 

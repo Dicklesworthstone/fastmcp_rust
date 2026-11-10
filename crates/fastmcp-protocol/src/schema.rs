@@ -3012,7 +3012,21 @@ fn validate_format_keyword(
 /// assert!(validate(&schema, &invalid).is_err());
 /// ```
 pub fn validate(schema: &Value, value: &Value) -> ValidationResult {
+    bound_raw_validation_schema(schema)?;
     validate_with_schema_features(schema, value, false)
+}
+
+// Legacy tool registration and the raw validation API do not pass through
+// final-dialect admission. Bound their complete schema documents as well,
+// before either semantic traversal or strict-mode cloning. This does not
+// reinterpret a legacy schema as the final dialect.
+fn bound_raw_validation_schema(schema: &Value) -> ValidationResult {
+    bound_schema_document(schema).map_err(|error| {
+        vec![ValidationError {
+            path: "root".to_owned(),
+            message: error.reason().to_owned(),
+        }]
+    })
 }
 
 /// Validates an instance with the final-schema vocabulary accepted by
@@ -3118,6 +3132,7 @@ fn validate_with_schema_features(
 /// assert!(validate_strict(&schema, &valid).is_ok());
 /// ```
 pub fn validate_strict(schema: &Value, value: &Value) -> ValidationResult {
+    bound_raw_validation_schema(schema)?;
     // Clone and modify the schema to enforce additionalProperties: false
     let strict_schema = make_strict_schema(schema);
     validate(&strict_schema, value)
@@ -3161,6 +3176,7 @@ fn make_strict_schema(schema: &Value) -> Value {
 
             for keyword in [
                 "additionalProperties",
+                "additionalItems",
                 "unevaluatedProperties",
                 "unevaluatedItems",
                 "items",
@@ -5078,7 +5094,17 @@ fn validate_array<'a>(
                         validate_internal(item_schema, item, &item_path, errors, context);
                     }
                 }
-                // In older drafts, 'additionalItems' controls the rest. We skip that for simplicity unless needed.
+                // Legacy tuple schemas constrain every element after the
+                // positional prefix through additionalItems. The keyword has
+                // no effect for a single items schema or for a sibling tuple
+                // hidden behind an applicator. Final-dialect admission never
+                // admits the array-valued items form.
+                if let Some(additional) = schema.get("additionalItems") {
+                    for (index, item) in arr.iter().enumerate().skip(items_arr.len()) {
+                        let item_path = format!("{path}[{index}]");
+                        validate_internal(additional, item, &item_path, errors, context);
+                    }
+                }
             }
         } else if items_schema.is_object() || items_schema.is_boolean() {
             // Validate items starting from where prefixItems left off
@@ -10468,7 +10494,11 @@ mod tests {
         fixtures[0].0 = json!({"allOf": vec![json!({"minLength": 1}); 63 + excess]});
         fixtures[1].0 = json!({"allOf": vec![json!({"uniqueItems": true}); 37 + excess]});
         for keyword in ["const", "enum"] {
-            let instance = json!("x".repeat(4 * 1024 * 1024));
+            // The literal lives in the schema, and raw documents are bounded by
+            // MAX_SCHEMA_DOCUMENT_BYTES (a36a8c79), so it is smaller than the
+            // instances above. One allOf holds at most 64 branches, so the
+            // extra comparisons come from two groups of 64 references.
+            let instance = json!("x".repeat(1536 * 1024));
             let assertion = if keyword == "enum" {
                 json!([instance.clone()])
             } else {
@@ -10477,9 +10507,14 @@ mod tests {
             // Raw schemas retain their existing local-reference and literal
             // representation semantics. Refer to one large assertion rather
             // than constructing dozens of separately retained copies.
+            let mut all_of = vec![json!({"$ref": "#/$defs/group"}); 2];
+            all_of.extend(vec![json!({"$ref": "#/$defs/large"}); 34 + excess]);
             let source = json!({
-                "$defs": {"large": {keyword: assertion}},
-                "allOf": vec![json!({"$ref": "#/$defs/large"}); 62 + excess]
+                "$defs": {
+                    "large": {keyword: assertion},
+                    "group": {"allOf": vec![json!({"$ref": "#/$defs/large"}); 64]}
+                },
+                "allOf": all_of
             });
             fixtures.push((source, instance));
         }
@@ -12515,6 +12550,122 @@ mod tests {
 
         assert!(validate(&schema, &json!(["hello", 42])).is_ok());
         assert!(validate(&schema, &json!([123, "wrong"])).is_err());
+    }
+
+    #[test]
+    fn legacy_tuple_additional_items_rejects_only_the_tail() {
+        let schema = json!({
+            "type": "array",
+            "items": [{"type": "string"}, {"type": "integer"}],
+            "additionalItems": false
+        });
+        for value in [json!([]), json!(["hello"]), json!(["hello", 42])] {
+            assert!(validate(&schema, &value).is_ok());
+        }
+        let errors = validate(&schema, &json!(["hello", 42, true])).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "root[2]");
+        assert!(validate(&schema, &json!(["hello", "wrong"])).is_err());
+
+        let empty = json!({"items": [], "additionalItems": false});
+        assert!(validate(&empty, &json!([])).is_ok());
+        assert!(validate(&empty, &json!([null])).is_err());
+    }
+
+    #[test]
+    fn legacy_tuple_additional_items_applies_references_and_strict_objects() {
+        let schema = json!({
+            "type": "array",
+            "items": [{"type": "string"}],
+            "additionalItems": {"$ref": "#/definitions/entry"},
+            "definitions": {
+                "entry": {
+                    "type": "object",
+                    "properties": {"id": {"type": "integer"}},
+                    "required": ["id"]
+                }
+            }
+        });
+        let valid = json!(["header", {"id": 1}, {"id": 2}]);
+        assert!(validate(&schema, &valid).is_ok());
+        assert!(validate_strict(&schema, &valid).is_ok());
+        let wrong_type = json!(["header", {"id": 1}, {"id": "secret-canary"}]);
+        for errors in [
+            validate(&schema, &wrong_type).unwrap_err(),
+            validate_strict(&schema, &wrong_type).unwrap_err(),
+        ] {
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].path, "root[2].id");
+            assert!(!format!("{errors:?}").contains("secret-canary"));
+        }
+
+        // The direct tail schema also participates in strict object traversal.
+        let direct = json!({
+            "items": [{"type": "string"}],
+            "additionalItems": {
+                "type": "object",
+                "properties": {"id": {"type": "integer"}}
+            }
+        });
+        let extra = json!(["header", {"id": 1, "extra": true}]);
+        assert!(validate(&direct, &extra).is_ok());
+        assert!(validate_strict(&direct, &json!(["header", {"id": 1}])).is_ok());
+        assert!(validate_strict(&direct, &extra).is_err());
+    }
+
+    #[test]
+    fn legacy_tuple_additional_items_is_scoped_to_its_own_tuple() {
+        for schema in [
+            json!({"additionalItems": false}),
+            json!({"items": true, "additionalItems": false}),
+            json!({"items": {"type": "integer"}, "additionalItems": false}),
+            json!({"allOf": [{"items": [{"type": "integer"}]}], "additionalItems": false}),
+            json!({"items": [{"type": "integer"}], "additionalItems": true}),
+            json!({"items": [{"type": "integer"}]}),
+        ] {
+            assert!(validate(&schema, &json!([1, 2, 3])).is_ok(), "{schema}");
+        }
+
+        // The final dialect retains this removed keyword as an annotation;
+        // it must not acquire legacy validation behavior.
+        let modern = admit_final_schema(json!({
+            "prefixItems": [{"type": "integer"}],
+            "additionalItems": false
+        }))
+        .unwrap();
+        assert!(modern.validate(&json!([1, "still allowed"])).is_ok());
+        assert!(modern.validate_strict(&json!([1, "still allowed"])).is_ok());
+    }
+
+    #[test]
+    fn raw_schema_validation_bounds_documents_before_strict_cloning() {
+        let valid = json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        let mut deep = Value::Null;
+        for _ in 0..MAX_SCHEMA_VALIDATION_DEPTH {
+            deep = json!([deep]);
+        }
+        for (schema, reason) in [
+            (
+                json!({"type": "object", "x-annotation": deep}),
+                "schema document nesting limit exceeded",
+            ),
+            (
+                json!({"type": "object", "x-annotation": vec![Value::Null; MAX_SCHEMA_DOCUMENT_NODES]}),
+                "schema document node limit exceeded",
+            ),
+            (
+                json!({"type": "object", "description": "x".repeat(MAX_SCHEMA_DOCUMENT_BYTES)}),
+                "schema document byte limit exceeded",
+            ),
+        ] {
+            for validate in [super::validate, validate_strict] {
+                let errors = validate(&schema, &json!({"id": 1})).unwrap_err();
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].path, "root");
+                assert_eq!(errors[0].message, reason);
+                assert!(validate(&valid, &json!({"id": 1})).is_ok());
+            }
+        }
     }
 
     #[test]

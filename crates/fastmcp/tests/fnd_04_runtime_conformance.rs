@@ -82,11 +82,11 @@ const TARGET_MATRIX: [&str; 3] = [
 /// archive*. A different version number does not move any of them: it
 /// invalidates them, and they must be re-derived against the new checksum
 /// before any claim is restated (FND-04-B-12).
-const PINNED_RUNTIME_VERSION: &str = "0.5.0";
+const PINNED_RUNTIME_VERSION: &str = "0.6.2";
 
 /// Exact registry checksum of the pinned runtime archive.
 const PINNED_RUNTIME_CHECKSUM: &str =
-    "f34b1a19ffd6b74570339a156912436335bb09c594c675c62ea164b19a1f2511";
+    "e5b2e20bf4312b9fedbc06d6c7244e994119b987946f44f82a447e3bc3c9bb03";
 
 /// The feature that must never appear in a product dependency graph.
 const FORBIDDEN_RUNTIME_FEATURE: &str = "test-internals";

@@ -323,6 +323,7 @@ fn managed_apps_authenticated_json_sse_mrtr_resource_and_teardown() {
                 async {
                     peer.mcp("server/discover", "access-one", apps_discovery(false))
                         .await;
+                    peer.catalog("access-one", "lookup").await;
                     let first = rpc_reply(&peer, "tools/call", input_request(), sse).await;
                     let second = rpc_reply(&peer, "tools/call", complete(), sse).await;
                     assert_ne!(first["id"], second["id"]);
@@ -413,6 +414,7 @@ fn managed_apps_callback_construction_poll_and_drop_revocation_prevent_continuat
                 async {
                     peer.mcp("server/discover", "access-one", apps_discovery(false))
                         .await;
+                    peer.catalog("access-one", "lookup").await;
                     rpc_reply(&peer, "tools/call", input_request(), false).await;
                     if close_at == CloseAt::Never {
                         rpc_reply(&peer, "tools/call", complete(), false).await;
@@ -469,6 +471,7 @@ fn managed_apps_tasks_require_local_selection_before_host_creation_consent() {
                 },
             ), async {
                 peer.mcp("server/discover", "access-one", apps_discovery(true)).await;
+                peer.catalog("access-one", "lookup").await;
                 let task = |created: bool, completed: bool| {
                     let mut value = json!({
                         "resultType": if created { "task" } else { "complete" },
@@ -657,4 +660,205 @@ fn managed_apps_idle_timeout_keeps_the_original_deadline_and_allows_later_renewa
         assert_eq!(client.cached_credential_generation(), Some(2));
         peer.no_more(&cx).await;
     });
+}
+
+fn compiled_sandbox(consented: bool) -> fastmcp_protocol::McpAppsSandboxPolicy {
+    use fastmcp_protocol::{
+        McpAppsCspDirective, McpAppsResourceMetadata, McpAppsSandboxHostPolicy,
+        McpAppsSandboxPermission, McpAppsSandboxPolicy,
+    };
+    let metadata: McpAppsResourceMetadata = serde_json::from_value(json!({
+        "csp": {"connectDomains": ["https://api.example.test"]},
+        "permissions": {"camera": {}, "microphone": {}}
+    }))
+    .unwrap();
+    let ceiling = McpAppsSandboxHostPolicy::default()
+        .allow_pinned_local_sources()
+        .allow_source(McpAppsCspDirective::ConnectSrc, "https://api.example.test")
+        .unwrap()
+        .with_permissions(
+            [McpAppsSandboxPermission::Camera],
+            [McpAppsSandboxPermission::Camera],
+            [McpAppsSandboxPermission::Camera],
+            consented.then_some(McpAppsSandboxPermission::Camera),
+        );
+    McpAppsSandboxPolicy::compile(Some(&metadata), &ceiling).unwrap()
+}
+
+async fn initialize_sandbox_view(
+    cx: &Cx,
+    view: &mut McpAppsInMemoryWireViewTransport,
+    expected: &fastmcp_protocol::McpAppsSandboxCapabilities,
+) {
+    view.send_to_host(
+        cx,
+        json!({
+            "jsonrpc":"2.0", "id":"sandbox-init", "method":"ui/initialize",
+            "params":{
+                "appInfo":{"name":"sandbox-view","version":"1"},
+                "appCapabilities":{},
+                "protocolVersion":MCP_APPS_HOST_VIEW_PROTOCOL_VERSION
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    let raw = view.receive_from_host(cx).await.unwrap();
+    let response: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(response["id"], "sandbox-init");
+    assert!(response.get("error").is_none());
+    assert_eq!(
+        response["result"]["hostCapabilities"]["sandbox"],
+        serde_json::to_value(expected).unwrap()
+    );
+    assert_eq!(response["result"]["hostCapabilities"]["serverTools"], json!({}));
+    for forbidden in ["unapproved.example.test", "access-one", "refresh-one"] {
+        assert!(!raw.contains(forbidden));
+    }
+    view.send_to_host(
+        cx,
+        json!({"jsonrpc":"2.0","method":"ui/notifications/initialized"}).to_string(),
+    )
+    .await
+    .unwrap();
+}
+
+#[test]
+fn managed_apps_compiled_sandbox_overrides_raw_claims_before_initialization() {
+    for consented in [false, true] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let mut client = ManagedHttpClient::new(
+                session.clone(),
+                apps_builder(&peer),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+            let policy = compiled_sandbox(consented);
+            let expected = fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(&policy);
+            let permissions = expected.permissions.as_ref().unwrap();
+            assert_eq!(permissions.camera.is_some(), consented);
+            assert!(permissions.microphone.is_none());
+            let mut configuration = configuration();
+            configuration.host_capabilities.sandbox = Some(
+                serde_json::from_value(json!({
+                    "permissions":{"camera":{},"microphone":{},"clipboardWrite":{}},
+                    "csp":{"connectDomains":["https://unapproved.example.test"]}
+                }))
+                .unwrap(),
+            );
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let ((result, ()), ()) = Box::pin(pair(
+                pair(
+                    client.serve_mcp_apps_wire_host_with_sandbox_policy(
+                        &cx,
+                        transport,
+                        configuration,
+                        policy,
+                        (),
+                        ManagedMcpAppsLimits::new(2).unwrap(),
+                    ),
+                    async {
+                        initialize_sandbox_view(&cx, &mut view, &expected).await;
+                        assert!(view.receive_from_host(&cx).await.is_err());
+                    },
+                ),
+                peer.mcp("server/discover", "access-one", apps_discovery(false)),
+            ))
+            .await;
+            assert_eq!(
+                result.unwrap(),
+                ManagedMcpAppsOutcome::TurnLimit { processed_turns: 2 }
+            );
+            assert_eq!(client.cached_credential_generation(), None);
+            let (listed, ()) = pair(client.list_tools(&cx, None), async {
+                peer.mcp("server/discover", "access-one", apps_discovery(false))
+                    .await;
+                peer.catalog("access-one", "after-sandbox").await;
+            })
+            .await;
+            assert_catalog(listed.unwrap(), "after-sandbox");
+            peer.no_more(&cx).await;
+        });
+    }
+}
+
+#[test]
+fn managed_apps_compiled_sandbox_keeps_cancellation_and_credential_retirement() {
+    for revoke in [false, true] {
+        run(async {
+            let cx = Cx::current().unwrap();
+            let peer = Peer::new().await;
+            let session = peer.login(&cx).await;
+            let credential = session.credential(&cx).await.unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let mut client = ManagedHttpClient::new(
+                session.clone(),
+                apps_builder(&peer),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+            let policy = compiled_sandbox(true);
+            let expected = fastmcp_protocol::McpAppsSandboxCapabilities::from_policy(&policy);
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let ((result, ()), ()) = Box::pin(pair(
+                pair(
+                    client.serve_mcp_apps_wire_host_with_sandbox_policy_and_cancellation(
+                        &cx,
+                        &cancellation,
+                        transport,
+                        configuration(),
+                        policy,
+                        (),
+                        ManagedMcpAppsLimits::default(),
+                    ),
+                    async {
+                        initialize_sandbox_view(&cx, &mut view, &expected).await;
+                        if revoke {
+                            credential.credential().revoke();
+                        } else {
+                            cancellation.cancel();
+                        }
+                        assert!(view.receive_from_host(&cx).await.is_err());
+                    },
+                ),
+                peer.mcp("server/discover", "access-one", apps_discovery(false)),
+            ))
+            .await;
+            if revoke {
+                assert!(matches!(
+                    result,
+                    Err(ManagedMcpAppsError::Managed(
+                        ManagedHttpClientError::Session(OAuthSessionError::LoginRequired)
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(ManagedMcpAppsError::Managed(
+                        ManagedHttpClientError::Session(OAuthSessionError::Cancelled)
+                    ))
+                ));
+            }
+            assert_eq!(client.cached_credential_generation(), None);
+            if !revoke {
+                let mut sibling = ManagedHttpClient::new(
+                    session.clone(),
+                    peer.client_builder(),
+                    Duration::from_secs(30),
+                )
+                .unwrap();
+                let (listed, ()) = pair(sibling.list_tools(&cx, None), async {
+                    peer.discovery("access-one").await;
+                    peer.catalog("access-one", "sandbox-sibling").await;
+                })
+                .await;
+                assert_catalog(listed.unwrap(), "sandbox-sibling");
+            }
+            peer.no_more(&cx).await;
+        });
+    }
 }

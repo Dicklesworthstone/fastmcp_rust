@@ -1064,13 +1064,14 @@ mod typed_tasks {
     use std::sync::atomic::AtomicUsize;
 
     use fastmcp_rust::{
-        ApplicationTaskSupervisor, BoxFuture, ClientCapabilities, ClientInfo, Content, ContentBlock,
-        CoreResult, FinalCoreResult, FinalTask, FinalTaskCallToolResult, FinalTaskId,
-        FinalTaskInputRequests, FinalTaskInputResponses, FinalTaskRuntime, FinalTaskRuntimeConfig,
-        FinalTaskSupervisorFuture, FinalTaskSupervisorHandoff, FinalTaskWaitOutcome,
-        FinalTaskWaitPolicy, FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome,
-        McpError, McpErrorCode, McpOutcome, McpRequestCancellation, MemorySubscriptionEvent,
-        SubscriptionFilter, Tool, ToolExecutionMode, ToolHandler, serde_json,
+        ApplicationTaskSupervisor, BoxFuture, ClientCapabilities, ClientInfo, Content,
+        ContentBlock, CoreResult, FinalCoreResult, FinalEmbeddedRootsListResult, FinalTask,
+        FinalTaskCallToolResult, FinalTaskId, FinalTaskInputRequests, FinalTaskInputResponses,
+        FinalTaskRuntime, FinalTaskRuntimeConfig, FinalTaskSupervisorFuture,
+        FinalTaskSupervisorHandoff, FinalTaskWaitOutcome, FinalTaskWaitPolicy,
+        FinalTaskWorkDescriptor, FinalToolCallOutcome, FinalToolOutcome, McpError, McpErrorCode,
+        McpOutcome, McpRequestCancellation, MemorySubscriptionEvent, SubscriptionFilter, Tool,
+        ToolExecutionMode, ToolHandler, serde_json,
     };
 
     const TASK_TOOL: &str = "memory-task";
@@ -1092,7 +1093,7 @@ mod typed_tasks {
                 description: Some("A task driven by the caller's in-process runtime".to_owned()),
                 input_schema: json!({
                     "type": "object",
-                    "properties": {"mode": {"enum": ["input", "hold"]}},
+                    "properties": {"mode": {"enum": ["input", "input-batch", "hold"]}},
                     "required": ["mode"],
                 }),
                 output_schema: None,
@@ -1155,11 +1156,19 @@ mod typed_tasks {
                 assert!(cx.blocking_pool_handle().is_none());
                 match handoff {
                     FinalTaskSupervisorHandoff::Initial(initial) => {
-                        if initial.work_descriptor().as_value()["mode"] == "input" {
-                            let requests: FinalTaskInputRequests = serde_json::from_value(json!({
-                                "roots": {"method": "roots/list"},
-                            }))
-                            .unwrap();
+                        let mode = initial.work_descriptor().as_value()["mode"].as_str();
+                        if matches!(mode, Some("input" | "input-batch")) {
+                            let requests = if mode == Some("input-batch") {
+                                json!({
+                                    "a-prior": {"method": "roots/list"},
+                                    "b-first": {"method": "roots/list"},
+                                    "c-second": {"method": "roots/list"},
+                                })
+                            } else {
+                                json!({"roots": {"method": "roots/list"}})
+                            };
+                            let requests: FinalTaskInputRequests =
+                                serde_json::from_value(requests).unwrap();
                             initial.require_input(requests, None)?;
                         } else {
                             self.0.holding.fetch_add(1, Ordering::AcqRel);
@@ -1176,9 +1185,18 @@ mod typed_tasks {
                         }
                     }
                     FinalTaskSupervisorHandoff::Resumed(accepted) => {
+                        let expected = if accepted.work_descriptor().as_value()["mode"] == "input-batch" {
+                            json!({
+                                "a-prior": {"roots": []},
+                                "b-first": {"roots": []},
+                                "c-second": {"roots": []},
+                            })
+                        } else {
+                            json!({"roots": {"roots": []}})
+                        };
                         assert_eq!(
                             serde_json::to_value(accepted.input_responses()).unwrap(),
-                            json!({"roots": {"roots": []}}),
+                            expected,
                         );
                         self.0.resumed.fetch_add(1, Ordering::AcqRel);
                         let result: FinalTaskCallToolResult = serde_json::from_value(json!({
@@ -1439,6 +1457,115 @@ mod typed_tasks {
             .await;
             assert_eq!(effects.created.load(Ordering::Acquire), 2);
             assert_eq!(effects.cancelled.load(Ordering::Acquire), 1);
+            assert_echo(&cx, &mut client).await;
+            client.close(&cx).unwrap();
+            serving.join(&cx).await.unwrap().unwrap();
+            assert!(!tasks.is_task_service_ready());
+            assert!(cx.checkpoint().is_ok());
+        });
+    }
+
+    #[test]
+    fn memory_tasks_resolve_only_remaining_inputs_concurrently_and_resume_the_real_supervisor() {
+        run(|cx| async move {
+            let effects = Arc::new(Effects::default());
+            let tasks = task_runtime();
+            let server = modern::ServerBuilder::new("memory-task-input-server", "1")
+                .tool(TaskTool(Arc::clone(&effects)))
+                .tool(MemoryEcho)
+                .final_tasks(tasks.clone())
+                .unwrap()
+                .task_supervisor(Arc::new(Supervisor(Arc::clone(&effects))))
+                .build();
+            let (transport, server_transport) = create_memory_transport_pair_with_capacity(1);
+            let mut serving = cx
+                .spawn(move |serve_cx| async move {
+                    server.serve_memory(&serve_cx, server_transport).await
+                })
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let handlers =
+                modern::ReverseRequestHandlers::new().with_modern_roots_list(move |cx, _, _| {
+                    assert!(cx.blocking_pool_handle().is_none());
+                    let calls = Arc::clone(&counted);
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Box::pin(async move {
+                        // Both outstanding callbacks must start before the first
+                        // can finish. Serial callback execution cannot resume this Task.
+                        while calls.load(Ordering::Acquire) < 2 {
+                            asupersync::runtime::yield_now().await;
+                        }
+                        Ok(FinalEmbeddedRootsListResult { roots: Vec::new() })
+                    })
+                });
+            let mut client = modern::MemoryClient::builder(info())
+                .reverse_request_handlers(handlers)
+                .with_tasks()
+                .connect(&cx, transport)
+                .await
+                .unwrap();
+            let cancellation = McpRequestCancellation::new();
+            let FinalToolCallOutcome::Task(created) = client
+                .call_tool_final_outcome(
+                    &cx,
+                    &cancellation,
+                    TASK_TOOL,
+                    json!({"mode": "input-batch"}),
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("the public tool must create the real supervised Task");
+            };
+            let id = created.task.base().task_id.clone();
+            let initial = wait_for_task(&cx, &mut client, &id, |task| {
+                matches!(task, FinalTask::InputRequired { .. })
+            })
+            .await;
+            client
+                .update_task_final(
+                    &cx,
+                    &cancellation,
+                    &initial,
+                    serde_json::from_value(json!({"a-prior": {"roots": []}})).unwrap(),
+                )
+                .await
+                .unwrap();
+            let remaining = client
+                .get_task_final(&cx, &cancellation, id.clone())
+                .await
+                .unwrap();
+            let FinalTask::InputRequired { input_requests, .. } = remaining.task else {
+                panic!("a partial update must retain the outstanding inputs");
+            };
+            assert_eq!(
+                input_requests
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["b-first", "c-second"]
+            );
+            assert_eq!(effects.resumed.load(Ordering::Acquire), 0);
+            client
+                .resolve_task_inputs_final(&cx, id.clone(), 2, 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                calls.load(Ordering::Acquire),
+                2,
+                "the already acknowledged input must not invoke a handler again"
+            );
+            let completed = wait_for_task(&cx, &mut client, &id, |task| {
+                matches!(task, FinalTask::Completed { .. })
+            })
+            .await;
+            assert_eq!(
+                serde_json::to_value(completed).unwrap()["result"]["receipt"],
+                json!({"source": "caller runtime", "items": 0})
+            );
+            assert_eq!(effects.created.load(Ordering::Acquire), 1);
+            assert_eq!(effects.resumed.load(Ordering::Acquire), 1);
             assert_echo(&cx, &mut client).await;
             client.close(&cx).unwrap();
             serving.join(&cx).await.unwrap().unwrap();

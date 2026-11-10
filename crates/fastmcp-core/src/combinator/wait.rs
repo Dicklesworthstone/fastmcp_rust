@@ -394,36 +394,42 @@ mod tests {
                 .with_timer_driver(timer.clone())
                 .build()
                 .unwrap();
-            let cx = runtime.request_cx_with_budget(
-                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-            );
-            // No ambient driver may stand in for the explicit caller's driver.
-            let _ambient = Cx::set_current(Some(Cx::for_testing()));
-            let polls = Arc::new(AtomicUsize::new(0));
-            let drops = Arc::new(AtomicUsize::new(0));
-            let counter = Arc::new(WakeCounter::default());
-            let waker = Waker::from(Arc::clone(&counter));
-            let mut task = Context::from_waker(&waker);
-            let mut future = run(kind, &cx, probes(2, false, &polls, &drops));
-            assert!(future.as_mut().poll(&mut task).is_pending(), "{kind:?}");
-            assert!(timer.pending_count() > 0);
-            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+            // An unloaned current-thread runtime drives its worker, timers
+            // included, on a background thread. Run the hand-driven clock as
+            // the root poll so only this test fires the virtual timers it
+            // inspects.
+            runtime.block_on(async {
+                let cx = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+                );
+                // No ambient driver may stand in for the explicit caller's driver.
+                let _ambient = Cx::set_current(Some(Cx::for_testing()));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::new(WakeCounter::default());
+                let waker = Waker::from(Arc::clone(&counter));
+                let mut task = Context::from_waker(&waker);
+                let mut future = run(kind, &cx, probes(2, false, &polls, &drops));
+                assert!(future.as_mut().poll(&mut task).is_pending(), "{kind:?}");
+                assert!(timer.pending_count() > 0);
+                assert_eq!(counter.0.load(Ordering::Relaxed), 0);
 
-            clock.advance(10_000_000);
-            assert!(timer.process_timers() > 0);
-            assert!(
-                counter.0.load(Ordering::Relaxed) > 0,
-                "{kind:?} missed deadline wake"
-            );
-            let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
-                panic!("{kind:?} remained pending after its caller deadline");
-            };
-            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
-            assert_eq!(polls.load(Ordering::Relaxed), 2);
-            assert_eq!(drops.load(Ordering::Relaxed), 2);
-            assert_eq!(timer.pending_count(), 0);
-            drop(future);
-            drop(cx);
+                clock.advance(10_000_000);
+                assert!(timer.process_timers() > 0);
+                assert!(
+                    counter.0.load(Ordering::Relaxed) > 0,
+                    "{kind:?} missed deadline wake"
+                );
+                let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                    panic!("{kind:?} remained pending after its caller deadline");
+                };
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(polls.load(Ordering::Relaxed), 2);
+                assert_eq!(drops.load(Ordering::Relaxed), 2);
+                assert_eq!(timer.pending_count(), 0);
+                drop(future);
+                drop(cx);
+            });
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         }
     }
@@ -529,56 +535,60 @@ mod tests {
                 .with_timer_driver(timer.clone())
                 .build()
                 .unwrap();
-            let cx = runtime.request_cx_with_budget(
-                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-            );
+            // Keep the caller runtime's worker on loan so only this test fires
+            // the virtual timers it inspects.
+            runtime.block_on(async {
+                let cx = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+                );
 
-            // A real but unrelated ambient driver is already past the caller's
-            // deadline. Merely checking for the existence of a timer is not
-            // enough: using this clock would finish early or register elsewhere.
-            let foreign_clock = Arc::new(VirtualClock::new());
-            foreign_clock.advance(1_000_000_000);
-            let foreign_timer = TimerDriverHandle::with_virtual_clock(foreign_clock);
-            let foreign_runtime = RuntimeBuilder::current_thread()
-                .blocking_threads(0, 0)
-                .with_timer_driver(foreign_timer.clone())
-                .build()
-                .unwrap();
-            let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
-            let ambient = Cx::set_current(Some(foreign_cx.clone()));
-            let polls = Arc::new(AtomicUsize::new(0));
-            let drops = Arc::new(AtomicUsize::new(0));
-            let counter = Arc::new(WakeCounter::default());
-            let waker = Waker::from(Arc::clone(&counter));
-            let mut task = Context::from_waker(&waker);
-            let mut future = run(kind, &cx, probes(2, false, &polls, &drops));
+                // A real but unrelated ambient driver is already past the caller's
+                // deadline. Merely checking for the existence of a timer is not
+                // enough: using this clock would finish early or register elsewhere.
+                let foreign_clock = Arc::new(VirtualClock::new());
+                foreign_clock.advance(1_000_000_000);
+                let foreign_timer = TimerDriverHandle::with_virtual_clock(foreign_clock);
+                let foreign_runtime = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 0)
+                    .with_timer_driver(foreign_timer.clone())
+                    .build()
+                    .unwrap();
+                let foreign_cx = foreign_runtime.request_cx_with_budget(Budget::INFINITE);
+                let ambient = Cx::set_current(Some(foreign_cx.clone()));
+                let polls = Arc::new(AtomicUsize::new(0));
+                let drops = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::new(WakeCounter::default());
+                let waker = Waker::from(Arc::clone(&counter));
+                let mut task = Context::from_waker(&waker);
+                let mut future = run(kind, &cx, probes(2, false, &polls, &drops));
 
-            assert!(future.as_mut().poll(&mut task).is_pending(), "{kind:?}");
-            assert!(timer.pending_count() > 0);
-            assert_eq!(foreign_timer.pending_count(), 0, "{kind:?}");
-            assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
-            assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+                assert!(future.as_mut().poll(&mut task).is_pending(), "{kind:?}");
+                assert!(timer.pending_count() > 0);
+                assert_eq!(foreign_timer.pending_count(), 0, "{kind:?}");
+                assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+                assert_eq!(counter.0.load(Ordering::Relaxed), 0);
 
-            clock.advance(10_000_000);
-            assert!(timer.process_timers() > 0);
-            assert!(counter.0.load(Ordering::Relaxed) > 0);
-            let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
-                panic!("{kind:?} ignored its own runtime's deadline");
-            };
-            assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
-            assert_eq!(polls.load(Ordering::Relaxed), 2);
-            assert_eq!(drops.load(Ordering::Relaxed), 2);
-            assert_eq!(timer.pending_count(), 0);
-            assert_eq!(foreign_timer.pending_count(), 0);
-            assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
-            assert!(!foreign_cx.is_cancel_requested());
+                clock.advance(10_000_000);
+                assert!(timer.process_timers() > 0);
+                assert!(counter.0.load(Ordering::Relaxed) > 0);
+                let Poll::Ready(result) = future.as_mut().poll(&mut task) else {
+                    panic!("{kind:?} ignored its own runtime's deadline");
+                };
+                assert_eq!(result.unwrap_err().code, McpErrorCode::RequestCancelled);
+                assert_eq!(polls.load(Ordering::Relaxed), 2);
+                assert_eq!(drops.load(Ordering::Relaxed), 2);
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(foreign_timer.pending_count(), 0);
+                assert_eq!(Cx::current().unwrap().now(), foreign_cx.now());
+                assert!(!foreign_cx.is_cancel_requested());
 
-            drop(future);
-            drop(ambient);
-            drop(foreign_cx);
-            drop(cx);
+                drop(future);
+                drop(ambient);
+                drop(foreign_cx);
+                drop(cx);
+                assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
+            });
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
-            assert!(foreign_runtime.shutdown_timeout(Duration::from_secs(1)));
         }
     }
 
