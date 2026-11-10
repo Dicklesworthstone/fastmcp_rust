@@ -1948,6 +1948,11 @@ const MAX_CLIENT_SUBSCRIPTION_IDLE_TIMEOUT: Duration = Duration::from_hours(1);
 const MAX_CLIENT_SUBSCRIPTION_ABSOLUTE_TIMEOUT: Duration = Duration::from_hours(24);
 const DIRECT_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const DIRECT_CHILD_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// How long an explicit close lets a stdio server exit on its own once its
+/// stdin is closed. MCP stdio shutdown closes the server's input first and
+/// signals only a server that does not exit; signalling at once cuts off a
+/// server that is still flushing its final state.
+const STDIO_EOF_EXIT_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_CLEANUP_CALLER_DEADLINE_ERROR: &str =
     "Subprocess cleanup exceeded the caller deadline";
 const OWNED_PROCESS_GROUP_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -27846,9 +27851,10 @@ impl Client {
     /// reaped within the cleanup deadline.
     pub fn close(&mut self) -> McpResult<()> {
         let cx = self.cx.clone();
+        let orderly = self.initialized.load(Ordering::SeqCst);
         let deferred_retirement_result = self.begin_close(&cx);
         self.join_reverse_callback_pool()?;
-        self.finish_close(deferred_retirement_result)
+        self.finish_close(deferred_retirement_result, orderly)
     }
 
     /// Cancels and joins callbacks while yielding to the caller's runtime.
@@ -27869,11 +27875,68 @@ impl Client {
     /// snapshots remain synchronous. Platform limits from [`Self::close`]
     /// still apply; this does not make arbitrary custom transports nonblocking.
     pub async fn close_with_cx(&mut self, cx: &Cx) -> McpResult<()> {
+        let orderly = self.initialized.load(Ordering::SeqCst);
         let deferred_retirement_result = self.begin_close(cx);
         self.reverse_callback_pool.join_bounded_with_cx(cx).await?;
         self.close_transport_retaining_error();
+        if orderly {
+            self.await_eof_exit_with_cx(cx).await;
+        }
         let process_result = self.stop_retained_child_with_cx(cx).await;
         self.finish_close_result(deferred_retirement_result, process_result)
+    }
+
+    /// Gives the retained server one bounded chance to exit on stdin EOF
+    /// before cleanup signals it, waiting only on the caller's timer. A failed
+    /// probe, the caller's deadline, or a caller without a timer ends the
+    /// grace early. Signalling and reaping then run exactly as before, so the
+    /// grace never weakens cleanup.
+    ///
+    /// Only the close of an initialized session waits: a server whose
+    /// connection failed, timed out or was rejected during initialization has
+    /// no session to shut down, and a close retried after an interrupted one
+    /// does not wait again.
+    async fn await_eof_exit_with_cx(&mut self, cx: &Cx) {
+        if self.child_cleanup_phase != ClientChildCleanupPhase::Active {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let deadline = Instant::now() + STDIO_EOF_EXIT_GRACE;
+        while matches!(child.try_wait(), Ok(None)) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero()
+                || wait_for_process_cleanup(cx, remaining.min(DIRECT_CHILD_REAP_POLL_INTERVAL))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    /// The blocking counterpart of [`Self::await_eof_exit_with_cx`] for
+    /// [`Self::close`], which already waits synchronously to reap.
+    fn await_eof_exit(&mut self) {
+        if self.child_cleanup_phase != ClientChildCleanupPhase::Active {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let deadline = Instant::now() + STDIO_EOF_EXIT_GRACE;
+        while matches!(child.try_wait(), Ok(None)) {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            std::thread::park_timeout(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(DIRECT_CHILD_REAP_POLL_INTERVAL),
+            );
+        }
     }
 
     fn begin_close(&self, cx: &Cx) -> McpResult<()> {
@@ -27894,8 +27957,15 @@ impl Client {
         deferred_retirement_result
     }
 
-    fn finish_close(&mut self, deferred_retirement_result: McpResult<()>) -> McpResult<()> {
+    fn finish_close(
+        &mut self,
+        deferred_retirement_result: McpResult<()>,
+        orderly: bool,
+    ) -> McpResult<()> {
         self.close_transport_retaining_error();
+        if orderly {
+            self.await_eof_exit();
+        }
         let process_result = self.stop_retained_child();
         self.finish_close_result(deferred_retirement_result, process_result)
     }
@@ -53641,7 +53711,7 @@ exec sleep 30
                         let first = std::future::poll_fn(|task_cx| {
                             Poll::Ready(closing.as_mut().poll(task_cx))
                         }).await;
-                        assert!(first.is_pending(), "process shutdown must yield after signalling");
+                        assert!(first.is_pending(), "process shutdown must yield during the EOF grace");
                         let mut sibling = sibling_root.spawn(move |sibling_cx| async move {
                             assert_eq!(std::thread::current().id(), worker);
                             sibling_cx.checkpoint().unwrap();
@@ -53649,6 +53719,17 @@ exec sleep 30
                         }).unwrap();
                         assert_eq!(sibling.join(&sibling_root).await.unwrap(), 1);
                         if matches!(mode, ClientCloseInterruption::Drop) {
+                            // The peer ignores EOF, so once its grace has
+                            // passed the next poll signals and yields again.
+                            asupersync::time::sleep(
+                                cx.now(),
+                                STDIO_EOF_EXIT_GRACE + Duration::from_millis(50),
+                            )
+                            .await;
+                            let signalled = std::future::poll_fn(|task_cx| {
+                                Poll::Ready(closing.as_mut().poll(task_cx))
+                            }).await;
+                            assert!(signalled.is_pending(), "process shutdown must yield after signalling");
                             drop(closing);
                             assert_eq!(client.child.as_ref().unwrap().id(), peer_id);
                             assert!(client.transport_is_closed());
