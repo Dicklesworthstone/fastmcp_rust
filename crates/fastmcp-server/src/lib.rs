@@ -16530,7 +16530,7 @@ impl Server {
             let source = codec.encode_request(&notification).map_err(|_| {
                 McpError::invalid_params("Extension notification exceeds its wire budget")
             })?;
-            fastmcp_protocol::jsonrpc::admit_raw_jsonrpc_document(
+            fastmcp_protocol::admit_raw_jsonrpc_document(
                 &source,
                 codec.max_message_size(),
             ).map_err(|_| {

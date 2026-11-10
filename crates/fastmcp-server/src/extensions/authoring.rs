@@ -339,7 +339,7 @@ impl<Settings> ExtensionContext<'_, Settings> {
         // HTTP correlation does not pass through the stdio capsule decoder.
         // Apply the same raw-document depth, string and numeric bounds before
         // either transport can accept this application-produced payload.
-        fastmcp_protocol::jsonrpc::admit_raw_jsonrpc_document(
+        fastmcp_protocol::admit_raw_jsonrpc_document(
             &source,
             MAX_STDIO_EXTENSION_NOTIFICATION_PARAMS_BYTES,
         )
