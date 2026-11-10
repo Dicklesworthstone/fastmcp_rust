@@ -780,6 +780,33 @@ struct ModernHttpIo {
     cx: Cx,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
+    response_head_admitted: Arc<AtomicBool>,
+}
+
+impl Drop for ModernHttpIo {
+    fn drop(&mut self) {
+        if self.request_bytes_sent.load(Ordering::Acquire)
+            && !self.response_head_admitted.load(Ordering::Acquire)
+        {
+            // A clean FIN after the POST is indistinguishable from a legal
+            // request write-half close. A server whose handler has not elected
+            // response headers must retain that half-closed request, so merely
+            // dropping it can leave the handler running indefinitely. Reset
+            // this abandoned exchange instead. The native TCP destructor
+            // preserves zero-linger close without first sending a FIN.
+            //
+            // Once a response head is admitted, retain the existing response
+            // body lifecycle, including successful SSE terminals that release
+            // their body before its HTTP trailer is consumed.
+            let stream = match &self.inner {
+                ClientIo::Plain(stream) => stream,
+                ClientIo::Tls(stream) => stream.get_ref(),
+                // Modern native execution never constructs proxy tunnels.
+                ClientIo::TlsTunnel(_) => return,
+            };
+            let _ = stream.set_zero_linger();
+        }
+    }
 }
 
 impl AsyncRead for ModernHttpIo {
@@ -4830,6 +4857,7 @@ impl ModernHttpExecutor {
         HttpResponseDeadline::add_timeout(cx.now(), policy.absolute_timeout())?;
         let committed_at = Arc::new(OnceLock::new());
         let request_bytes_sent = Arc::new(AtomicBool::new(false));
+        let response_head_admitted = Arc::new(AtomicBool::new(false));
         let progress_marker = serde_json::from_slice::<serde_json::Value>(request.body())
             .ok()
             .and_then(|body| body.pointer("/params/_meta/progressToken").cloned())
@@ -4851,6 +4879,7 @@ impl ModernHttpExecutor {
             self.resource_tls.as_ref(),
             committed_at,
             Arc::clone(&request_bytes_sent),
+            Arc::clone(&response_head_admitted),
         ));
         // A native response-head wait may remain pending even after the
         // caller's Cx has been cancelled. Keep the request-owned exchange
@@ -4907,6 +4936,7 @@ impl ModernHttpExecutor {
         }
         check_modern_http_effects(cx)?;
         let metadata = validate_response_head(response.head.status, &response.head.headers)?;
+        response_head_admitted.store(true, Ordering::Release);
         let diagnostic_credential = self.bearer_credential.clone().or_else(|| {
             let token = request.authorization.as_deref()?.strip_prefix("Bearer ")?;
             let target = fastmcp_core::CanonicalHttpUrl::parse(request.target()).ok()?;
@@ -4936,6 +4966,7 @@ async fn execute_native_modern_request(
     resource_tls: Option<&ResourceTlsTrust>,
     committed_at: Arc<OnceLock<Time>>,
     request_bytes_sent: Arc<AtomicBool>,
+    response_head_admitted: Arc<AtomicBool>,
 ) -> Result<ClientStreamingResponse<ModernHttpIo>, ModernHttpExecutorError> {
     let map_error = |error| map_modern_exchange_error(error, &request_bytes_sent);
     let unavailable = |credential: &crate::http_auth::BoundBearerCredential| {
@@ -5025,6 +5056,7 @@ async fn execute_native_modern_request(
             cx: cx.clone(),
             committed_at,
             request_bytes_sent: Arc::clone(&request_bytes_sent),
+            response_head_admitted,
         },
         native_request,
     )
@@ -13850,6 +13882,7 @@ mod tests {
                 cx: owner.clone(),
                 committed_at: Arc::new(OnceLock::new()),
                 request_bytes_sent: Arc::new(AtomicBool::new(false)),
+                response_head_admitted: Arc::new(AtomicBool::new(false)),
             };
             let mut task = Context::from_waker(Waker::noop());
             for mask in [NO_IO, NO_TIME] {
@@ -20102,14 +20135,13 @@ mod tests {
                 .expect("bound cancelled request socket closure");
             let mut byte = [0_u8; 1];
             match stream.read(&mut byte) {
-                Ok(0) => {}
                 Err(error)
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
                     ) => {}
                 result => panic!(
-                    "cancelling a pending response must close its request-owned socket: {result:?}"
+                    "cancelling before response headers must reset the socket, not half-close: {result:?}"
                 ),
             }
         });
