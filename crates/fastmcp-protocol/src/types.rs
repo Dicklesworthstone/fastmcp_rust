@@ -6,11 +6,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::common_types::{
-    AbsoluteUri, Annotations, ContentBlock, Implementation, JsonInteger, OpenMetadata, RawIcon,
-    SamplingContentBlock,
+    AbsoluteUri, Annotations, ContentBlock, EmbeddedResourceContents, Implementation, JsonInteger,
+    OpenMetadata, RawIcon, SamplingContentBlock,
 };
 use crate::extensions::MCP_APPS_HTML_MIME_TYPE;
-use crate::messages::{FinalCallToolResult, FinalCoreResult};
+use crate::messages::{FinalCallToolResult, FinalCoreResult, FinalReadResourceResult};
 use crate::result::{MAX_RESULT_CONTAINER_MEMBERS, MAX_RESULT_ENCODED_BYTES};
 use base64::Engine as _;
 use serde::de::Error as _;
@@ -795,10 +795,58 @@ impl McpAppsToolMetadata {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct McpAppsToolMetadataWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_mcp_apps_field"
+    )]
     resource_uri: Option<AbsoluteUri>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_mcp_apps_field"
+    )]
     visibility: Option<Vec<McpAppsToolVisibility>>,
+}
+
+// Apps fields may be omitted, but their schemas never admit explicit null.
+// `default` handles absence; deserializing T itself handles a present member
+// without Option's otherwise silent conversion of null into absence.
+fn deserialize_present_mcp_apps_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+// A derived struct visitor also accepts positional sequences. Apps metadata
+// requires objects, especially for empty permission markers: `[]` must never
+// become `{}`. Keep decoding on the map stream so each closed wire struct's
+// unknown-field and duplicate-field checks bound its member traversal.
+fn deserialize_mcp_apps_object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct ObjectVisitor<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for ObjectVisitor<T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an MCP Apps metadata object")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    deserializer.deserialize_map(ObjectVisitor::<T>(std::marker::PhantomData))
 }
 
 impl Serialize for McpAppsToolMetadata {
@@ -821,7 +869,7 @@ impl<'de> Deserialize<'de> for McpAppsToolMetadata {
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = McpAppsToolMetadataWire::deserialize(deserializer)?;
+        let wire: McpAppsToolMetadataWire = deserialize_mcp_apps_object(deserializer)?;
         Self::try_new(wire.resource_uri, wire.visibility).map_err(serde::de::Error::custom)
     }
 }
@@ -873,24 +921,28 @@ struct McpAppsResourceCspWire {
     #[serde(
         rename = "connectDomains",
         default,
+        deserialize_with = "deserialize_present_mcp_apps_field",
         skip_serializing_if = "Option::is_none"
     )]
     connect: Option<Vec<String>>,
     #[serde(
         rename = "resourceDomains",
         default,
+        deserialize_with = "deserialize_present_mcp_apps_field",
         skip_serializing_if = "Option::is_none"
     )]
     resources: Option<Vec<String>>,
     #[serde(
         rename = "frameDomains",
         default,
+        deserialize_with = "deserialize_present_mcp_apps_field",
         skip_serializing_if = "Option::is_none"
     )]
     frames: Option<Vec<String>>,
     #[serde(
         rename = "baseUriDomains",
         default,
+        deserialize_with = "deserialize_present_mcp_apps_field",
         skip_serializing_if = "Option::is_none"
     )]
     base_uris: Option<Vec<String>>,
@@ -923,36 +975,77 @@ impl<'de> Deserialize<'de> for McpAppsResourceCsp {
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = McpAppsResourceCspWire::deserialize(deserializer)?;
+        let wire: McpAppsResourceCspWire = deserialize_mcp_apps_object(deserializer)?;
         Self::try_new(wire.connect, wire.resources, wire.frames, wire.base_uris)
             .map_err(serde::de::Error::custom)
     }
 }
 
 /// An empty-object Apps sandbox permission marker.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct McpAppsResourcePermission {}
+
+impl<'de> Deserialize<'de> for McpAppsResourcePermission {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PermissionMarker {}
+
+        let _: PermissionMarker = deserialize_mcp_apps_object(deserializer)?;
+        Ok(Self {})
+    }
+}
 
 /// Optional sandbox permissions requested by an Apps resource.
 ///
 /// Presence requests a host permission; absence does not. A host may further
 /// restrict or reject every requested permission.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpAppsResourcePermissions {
     /// Camera permission marker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub camera: Option<McpAppsResourcePermission>,
     /// Microphone permission marker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub microphone: Option<McpAppsResourcePermission>,
     /// Geolocation permission marker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub geolocation: Option<McpAppsResourcePermission>,
     /// Clipboard-write permission marker.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub clipboard_write: Option<McpAppsResourcePermission>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpAppsResourcePermissionsWire {
+    #[serde(default, deserialize_with = "deserialize_present_mcp_apps_field")]
+    camera: Option<McpAppsResourcePermission>,
+    #[serde(default, deserialize_with = "deserialize_present_mcp_apps_field")]
+    microphone: Option<McpAppsResourcePermission>,
+    #[serde(default, deserialize_with = "deserialize_present_mcp_apps_field")]
+    geolocation: Option<McpAppsResourcePermission>,
+    #[serde(default, deserialize_with = "deserialize_present_mcp_apps_field")]
+    clipboard_write: Option<McpAppsResourcePermission>,
+}
+
+impl<'de> Deserialize<'de> for McpAppsResourcePermissions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: McpAppsResourcePermissionsWire = deserialize_mcp_apps_object(deserializer)?;
+        Ok(Self {
+            camera: wire.camera,
+            microphone: wire.microphone,
+            geolocation: wire.geolocation,
+            clipboard_write: wire.clipboard_write,
+        })
+    }
 }
 
 /// Closed Apps rendering metadata attached to a `Resource` under `_meta.ui`.
@@ -1034,13 +1127,29 @@ impl McpAppsResourceMetadata {
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct McpAppsResourceMetadataWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_mcp_apps_field"
+    )]
     csp: Option<McpAppsResourceCsp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_mcp_apps_field"
+    )]
     permissions: Option<McpAppsResourcePermissions>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_mcp_apps_field"
+    )]
     domain: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_mcp_apps_field"
+    )]
     prefers_border: Option<bool>,
 }
 
@@ -1064,7 +1173,7 @@ impl<'de> Deserialize<'de> for McpAppsResourceMetadata {
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = McpAppsResourceMetadataWire::deserialize(deserializer)?;
+        let wire: McpAppsResourceMetadataWire = deserialize_mcp_apps_object(deserializer)?;
         Self::try_new(wire.csp, wire.permissions, wire.domain, wire.prefers_border)
             .map_err(serde::de::Error::custom)
     }
@@ -1078,6 +1187,43 @@ pub struct McpAppsResourceBinding {
     pub resource_uri: AbsoluteUri,
     /// The tool's effective Apps visibility.
     pub visibility: Vec<McpAppsToolVisibility>,
+}
+
+/// The exact document and effective metadata selected for one Apps View.
+///
+/// Construction through [`McpAppsResourceBinding::resolve_read_result`] binds
+/// the document to its own metadata without copying its HTML or blob. The
+/// original core result, including unrelated contents and open metadata,
+/// remains untouched. These are resource requests for Host policy, not grants
+/// of browser permissions or evidence of authorization.
+pub struct McpAppsResourceRead<'a> {
+    contents: &'a EmbeddedResourceContents,
+    metadata: Option<McpAppsResourceMetadata>,
+}
+
+impl McpAppsResourceRead<'_> {
+    /// The unique exact-URI HTML item, with its original wire metadata intact.
+    #[must_use]
+    pub const fn contents(&self) -> &EmbeddedResourceContents {
+        self.contents
+    }
+
+    /// Effective typed metadata: a present read-item `ui` object replaces the
+    /// entire listing object, including when it is empty. Listing fallback is
+    /// possible only when the read-item `ui` member is absent.
+    #[must_use]
+    pub const fn metadata(&self) -> Option<&McpAppsResourceMetadata> {
+        self.metadata.as_ref()
+    }
+}
+
+impl fmt::Debug for McpAppsResourceRead<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpAppsResourceRead")
+            .field("has_metadata", &self.metadata.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl McpAppsResourceBinding {
@@ -1112,6 +1258,80 @@ impl McpAppsResourceBinding {
             return Err(McpAppsResourceBindingError::HtmlMimeTypeRequired);
         }
         Ok(())
+    }
+
+    /// Selects an Apps document from an ordinarily admitted, complete resource
+    /// read made through the originating authenticated MCP server.
+    ///
+    /// Exactly one content item must match the linked URI byte for byte, and
+    /// that item must use the exact Apps HTML MIME type. Other items cannot
+    /// supply its content, MIME type or metadata. A present read-item `ui`
+    /// object wins wholesale; invalid, null or oversized metadata never falls
+    /// back to a catalog entry. If `ui` is absent, only an exact-URI Apps catalog
+    /// entry may supply metadata. No field-wise merging is performed.
+    ///
+    /// This method performs no network access, Apps activation, authorization,
+    /// blob decoding or HTML rendering. Ordinary core admission owns complete
+    /// message/byte bounds; selection additionally bounds its item traversal.
+    pub fn resolve_read_result<'a>(
+        &self,
+        result: &'a FinalReadResourceResult,
+        listed: Option<&FinalResource>,
+    ) -> Result<McpAppsResourceRead<'a>, McpAppsResourceBindingError> {
+        if !self.resource_uri.as_str().starts_with("ui://") {
+            return Err(McpAppsResourceBindingError::Metadata(
+                McpAppsMetadataError::ResourceUriMustUseUiPrefix,
+            ));
+        }
+        if result.contents.len() > MAX_RESULT_CONTAINER_MEMBERS {
+            return Err(McpAppsResourceBindingError::ReadResultTooLarge);
+        }
+        let mut selected = None;
+        for contents in &result.contents {
+            let (uri, mime_type, metadata) = match contents {
+                EmbeddedResourceContents::Text {
+                    uri,
+                    mime_type,
+                    meta,
+                    ..
+                }
+                | EmbeddedResourceContents::Blob {
+                    uri,
+                    mime_type,
+                    meta,
+                    ..
+                } => (uri, mime_type, meta),
+            };
+            if uri != &self.resource_uri {
+                continue;
+            }
+            if selected.is_some() {
+                return Err(McpAppsResourceBindingError::DuplicateReadResource);
+            }
+            selected = Some((contents, mime_type, metadata));
+        }
+        let (contents, mime_type, metadata) =
+            selected.ok_or(McpAppsResourceBindingError::MissingReadResource)?;
+        if mime_type.as_deref() != Some(MCP_APPS_HTML_MIME_TYPE) {
+            return Err(McpAppsResourceBindingError::HtmlMimeTypeRequired);
+        }
+        let read_metadata = metadata
+            .as_ref()
+            .map(parse_mcp_apps_resource_metadata)
+            .transpose()
+            .map_err(McpAppsResourceBindingError::Metadata)?
+            .flatten();
+        let metadata = match (read_metadata, listed) {
+            (Some(metadata), _) => Some(metadata),
+            (None, Some(listed)) => {
+                self.validate_resource(listed)?;
+                listed
+                    .mcp_apps_metadata()
+                    .map_err(McpAppsResourceBindingError::Metadata)?
+            }
+            (None, None) => None,
+        };
+        Ok(McpAppsResourceRead { contents, metadata })
     }
 }
 
@@ -1399,13 +1619,19 @@ impl fmt::Display for McpAppsMetadataError {
 
 impl std::error::Error for McpAppsMetadataError {}
 
-/// A catalog resource did not satisfy one validated Apps binding.
+/// A catalog or read resource did not satisfy one validated Apps binding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpAppsResourceBindingError {
     /// The candidate resource URI differs from the tool's exact binding URI.
     UriMismatch,
     /// The candidate resource is not an Apps HTML resource.
     HtmlMimeTypeRequired,
+    /// No item in the complete read result matches the linked resource URI.
+    MissingReadResource,
+    /// Multiple read items match, even if their content is identical.
+    DuplicateReadResource,
+    /// The read result exceeds the bounded content-item traversal.
+    ReadResultTooLarge,
     /// Resource metadata was not a valid closed Apps metadata object.
     Metadata(McpAppsMetadataError),
 }
@@ -1418,6 +1644,15 @@ impl fmt::Display for McpAppsResourceBindingError {
             }
             Self::HtmlMimeTypeRequired => {
                 formatter.write_str("MCP Apps bound resource must use text/html;profile=mcp-app")
+            }
+            Self::MissingReadResource => {
+                formatter.write_str("MCP Apps read result has no exact bound resource")
+            }
+            Self::DuplicateReadResource => {
+                formatter.write_str("MCP Apps read result has multiple exact bound resources")
+            }
+            Self::ReadResultTooLarge => {
+                formatter.write_str("MCP Apps read result exceeds its content-item bound")
             }
             Self::Metadata(error) => write!(formatter, "MCP Apps resource metadata: {error}"),
         }
@@ -4363,6 +4598,376 @@ mod tests {
             serde_json::to_value(&baseline).expect("baseline resource re-encodes"),
             accepted,
             "the invalid resource cannot mutate the admitted binding target"
+        );
+    }
+
+    fn apps_read_binding() -> McpAppsResourceBinding {
+        let tool: FinalTool = serde_json::from_value(json!({
+            "name": "weather", "inputSchema": {"type": "object"},
+            "_meta": {"ui": {"resourceUri": "ui://weather/dashboard"}}
+        }))
+        .unwrap();
+        tool.mcp_apps_resource_binding().unwrap().unwrap()
+    }
+
+    fn apps_read_item() -> serde_json::Value {
+        json!({
+            "uri": "ui://weather/dashboard", "mimeType": MCP_APPS_HTML_MIME_TYPE,
+            "text": "<main>private document résumé 東京</main>"
+        })
+    }
+
+    fn apps_read_result(contents: Vec<serde_json::Value>) -> FinalReadResourceResult {
+        serde_json::from_value(json!({
+            "contents": contents, "ttlMs": 25, "cacheScope": "private"
+        }))
+        .unwrap()
+    }
+
+    fn apps_read_listing() -> FinalResource {
+        serde_json::from_value(json!({
+            "uri": "ui://weather/dashboard", "name": "dashboard",
+            "mimeType": MCP_APPS_HTML_MIME_TYPE,
+            "_meta": {"ui": {
+                "csp": {"connectDomains": ["https://api.example.test"]},
+                "permissions": {"camera": {}},
+                "domain": "private.host.example", "prefersBorder": true
+            }}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn apps_read_binding_selects_exact_text_and_blob_without_borrowing_other_items() {
+        let binding = apps_read_binding();
+        for blob in [false, true] {
+            let mut selected = apps_read_item();
+            if blob {
+                selected.as_object_mut().unwrap().remove("text");
+                selected["blob"] = json!("PG1haW4+SGk8L21haW4+");
+            }
+            selected["_meta"] = json!({"ui": {"prefersBorder": false}});
+            let result = apps_read_result(vec![
+                json!({
+                    "uri": "ui://unrelated/document", "mimeType": MCP_APPS_HTML_MIME_TYPE,
+                    "text": "other content", "_meta": {"ui": {"permissions": {"camera": null}}}
+                }),
+                selected.clone(),
+            ]);
+            let before = serde_json::to_value(&result).unwrap();
+            let read = binding.resolve_read_result(&result, None).unwrap();
+            assert!(std::ptr::eq(read.contents(), &result.contents[1]));
+            assert_eq!(serde_json::to_value(read.contents()).unwrap(), selected);
+            assert_eq!(
+                read.metadata(),
+                Some(&McpAppsResourceMetadata::new(Some(false)))
+            );
+            assert!(!format!("{read:?}").contains("private document"));
+            assert_eq!(serde_json::to_value(&result).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn apps_read_binding_resolves_presence_without_merging_catalog_policy() {
+        let binding = apps_read_binding();
+        let listing = apps_read_listing();
+        let listing_metadata = listing.mcp_apps_metadata().unwrap().unwrap();
+        for (read_meta, expected) in [
+            (None, Some(listing_metadata.clone())),
+            (
+                Some(json!({"com.example/note": "inert"})),
+                Some(listing_metadata),
+            ),
+            (
+                Some(json!({"ui": {}})),
+                Some(McpAppsResourceMetadata::default()),
+            ),
+            (
+                Some(json!({"ui": {"prefersBorder": false}})),
+                Some(McpAppsResourceMetadata::new(Some(false))),
+            ),
+        ] {
+            let mut item = apps_read_item();
+            if let Some(meta) = read_meta {
+                item["_meta"] = meta;
+            }
+            let result = apps_read_result(vec![item]);
+            let read = binding
+                .resolve_read_result(&result, Some(&listing))
+                .unwrap();
+            assert_eq!(read.metadata(), expected.as_ref());
+        }
+        let result = apps_read_result(vec![apps_read_item()]);
+        assert!(
+            binding
+                .resolve_read_result(&result, None)
+                .unwrap()
+                .metadata()
+                .is_none()
+        );
+
+        let mut foreign_listing = listing;
+        foreign_listing.uri = AbsoluteUri::parse("ui://other/dashboard").unwrap();
+        assert_eq!(
+            binding
+                .resolve_read_result(&result, Some(&foreign_listing))
+                .unwrap_err(),
+            McpAppsResourceBindingError::UriMismatch
+        );
+        let mut authoritative = apps_read_item();
+        authoritative["_meta"] = json!({"ui": {}});
+        let result = apps_read_result(vec![authoritative]);
+        assert_eq!(
+            binding
+                .resolve_read_result(&result, Some(&foreign_listing))
+                .unwrap()
+                .metadata(),
+            Some(&McpAppsResourceMetadata::default()),
+            "present read metadata must not inspect or inherit a stale catalog entry"
+        );
+    }
+
+    #[test]
+    fn apps_read_binding_rejects_invalid_policy_instead_of_catalog_fallback() {
+        let binding = apps_read_binding();
+        let listing = apps_read_listing();
+        let mut invalid = vec![
+            serde_json::Value::Null,
+            json!([]),
+            json!("policy"),
+            json!({"csp": null}),
+            json!({"permissions": null}),
+            json!({"domain": null}),
+            json!({"prefersBorder": null}),
+            json!({"domain": ""}),
+            json!({"unknown": true}),
+            json!({"permissions": {"camera": {"grant": true}}}),
+        ];
+        for key in [
+            "connectDomains",
+            "resourceDomains",
+            "frameDomains",
+            "baseUriDomains",
+        ] {
+            invalid.push(json!({"csp": {key: null}}));
+        }
+        for key in ["camera", "microphone", "geolocation", "clipboardWrite"] {
+            invalid.push(json!({"permissions": {key: null}}));
+        }
+        invalid.push(json!({"csp": {"connectDomains":
+            vec!["https://api.example.test"; MAX_MCP_APPS_CSP_DOMAINS_PER_DIRECTIVE + 1]
+        }}));
+        for ui in invalid {
+            let mut item = apps_read_item();
+            item["_meta"] = json!({"ui": ui});
+            let result = apps_read_result(vec![item]);
+            let before = serde_json::to_value(&result).unwrap();
+            assert!(
+                matches!(
+                    binding.resolve_read_result(&result, Some(&listing)),
+                    Err(McpAppsResourceBindingError::Metadata(_))
+                ),
+                "an invalid present policy cannot inherit the listing: {ui}"
+            );
+            assert_eq!(serde_json::to_value(&result).unwrap(), before);
+        }
+        let mut valid = apps_read_item();
+        valid["_meta"] = json!({"ui": {"csp": {}, "permissions": {"camera": {}}}});
+        let result = apps_read_result(vec![valid]);
+        assert!(binding.resolve_read_result(&result, Some(&listing)).is_ok());
+    }
+
+    #[test]
+    fn apps_read_binding_rejects_missing_duplicate_and_mismatched_documents() {
+        let binding = apps_read_binding();
+        let mut foreign = apps_read_item();
+        foreign["uri"] = json!("ui://other/dashboard");
+        let missing = apps_read_result(vec![foreign.clone()]);
+        assert_eq!(
+            binding.resolve_read_result(&missing, None).unwrap_err(),
+            McpAppsResourceBindingError::MissingReadResource
+        );
+        for mime in [MCP_APPS_HTML_MIME_TYPE, "text/plain"] {
+            let mut second = apps_read_item();
+            second["mimeType"] = json!(mime);
+            let duplicate = apps_read_result(vec![apps_read_item(), second]);
+            assert_eq!(
+                binding.resolve_read_result(&duplicate, None).unwrap_err(),
+                McpAppsResourceBindingError::DuplicateReadResource
+            );
+        }
+        let listing = apps_read_listing();
+        let mut wrong_mime = apps_read_item();
+        wrong_mime["mimeType"] = json!("text/html");
+        let mismatched = apps_read_result(vec![wrong_mime, foreign]);
+        assert_eq!(
+            binding
+                .resolve_read_result(&mismatched, Some(&listing))
+                .unwrap_err(),
+            McpAppsResourceBindingError::HtmlMimeTypeRequired
+        );
+        let mut too_large = apps_read_result(vec![apps_read_item()]);
+        too_large.contents.resize(
+            MAX_RESULT_CONTAINER_MEMBERS + 1,
+            too_large.contents[0].clone(),
+        );
+        assert_eq!(
+            binding.resolve_read_result(&too_large, None).unwrap_err(),
+            McpAppsResourceBindingError::ReadResultTooLarge
+        );
+        let mut forged = binding;
+        forged.resource_uri = AbsoluteUri::parse("https://example.test/dashboard").unwrap();
+        assert!(matches!(
+            forged.resolve_read_result(&missing, None),
+            Err(McpAppsResourceBindingError::Metadata(
+                McpAppsMetadataError::ResourceUriMustUseUiPrefix
+            ))
+        ));
+    }
+
+    #[test]
+    fn apps_metadata_optional_fields_reject_explicit_null_but_preserve_empty_values() {
+        for key in ["resourceUri", "visibility"] {
+            assert!(serde_json::from_value::<McpAppsToolMetadata>(json!({key: null})).is_err());
+        }
+        assert!(serde_json::from_value::<McpAppsToolMetadata>(json!({"visibility": []})).is_ok());
+        for ui in [
+            json!({}),
+            json!({"csp": {}, "permissions": {}}),
+            json!({"prefersBorder": false}),
+        ] {
+            let metadata: McpAppsResourceMetadata = serde_json::from_value(ui.clone()).unwrap();
+            assert_eq!(serde_json::to_value(metadata).unwrap(), ui);
+        }
+    }
+
+    #[test]
+    fn apps_metadata_structures_require_objects_in_json_values_and_wire_input() {
+        fn assert_object_only<T: serde::de::DeserializeOwned + Serialize>(
+            positional: serde_json::Value,
+        ) {
+            let accepted: T = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(serde_json::to_value(accepted).unwrap(), json!({}));
+            let accepted: T = serde_json::from_str("{}").unwrap();
+            assert_eq!(serde_json::to_value(accepted).unwrap(), json!({}));
+
+            for invalid in [
+                serde_json::Value::Null,
+                json!(false),
+                json!(42),
+                json!("metadata"),
+                json!([]),
+                positional,
+                json!({"unknown": {}}),
+            ] {
+                let wire = serde_json::to_string(&invalid).unwrap();
+                assert!(
+                    serde_json::from_value::<T>(invalid).is_err(),
+                    "Apps metadata must be a closed object: {wire}"
+                );
+                assert!(
+                    serde_json::from_str::<T>(&wire).is_err(),
+                    "wire decoding must not accept positional or scalar metadata: {wire}"
+                );
+            }
+        }
+
+        assert_object_only::<McpAppsToolMetadata>(json!(["ui://weather/dashboard", []]));
+        assert_object_only::<McpAppsResourceCsp>(json!([
+            ["https://api.weather.example"],
+            [],
+            [],
+            []
+        ]));
+        assert_object_only::<McpAppsResourcePermission>(json!([{}]));
+        assert_object_only::<McpAppsResourcePermissions>(json!([{}, {}, {}, {}]));
+        assert_object_only::<McpAppsResourceMetadata>(json!([{}, {}, "view.host.example", false]));
+    }
+
+    #[test]
+    fn apps_read_binding_rejects_non_object_policy_components_without_fallback() {
+        let binding = apps_read_binding();
+        let listing = apps_read_listing();
+
+        for field in ["csp", "permissions"] {
+            for invalid in [
+                json!([]),
+                json!([{}]),
+                json!(false),
+                json!(42),
+                json!("policy"),
+            ] {
+                let mut item = apps_read_item();
+                item["_meta"] = json!({"ui": {field: invalid}});
+                let result = apps_read_result(vec![item]);
+                assert!(matches!(
+                    binding.resolve_read_result(&result, Some(&listing)),
+                    Err(McpAppsResourceBindingError::Metadata(_))
+                ));
+            }
+            let mut item = apps_read_item();
+            item["_meta"] = json!({"ui": {field: {}}});
+            let result = apps_read_result(vec![item]);
+            let read = binding
+                .resolve_read_result(&result, Some(&listing))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(read.metadata().unwrap()).unwrap(),
+                json!({field: {}})
+            );
+        }
+
+        for permission in ["camera", "microphone", "geolocation", "clipboardWrite"] {
+            for invalid in [
+                json!([]),
+                json!([{}]),
+                json!(false),
+                json!(42),
+                json!("marker"),
+            ] {
+                let mut item = apps_read_item();
+                item["_meta"] = json!({"ui": {"permissions": {permission: invalid}}});
+                let result = apps_read_result(vec![item]);
+                assert!(matches!(
+                    binding.resolve_read_result(&result, Some(&listing)),
+                    Err(McpAppsResourceBindingError::Metadata(_))
+                ));
+            }
+            let mut item = apps_read_item();
+            item["_meta"] = json!({"ui": {"permissions": {permission: {}}}});
+            let result = apps_read_result(vec![item]);
+            let read = binding
+                .resolve_read_result(&result, Some(&listing))
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(read.metadata().unwrap()).unwrap(),
+                json!({"permissions": {permission: {}}}),
+                "only the valid empty object is a permission request marker"
+            );
+        }
+    }
+
+    #[test]
+    fn apps_metadata_object_decoders_preserve_duplicate_field_rejections() {
+        assert!(
+            serde_json::from_str::<McpAppsToolMetadata>(r#"{"visibility":[],"visibility":[]}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<McpAppsResourceCsp>(
+                r#"{"connectDomains":[],"connectDomains":[]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<McpAppsResourcePermissions>(r#"{"camera":{},"camera":{}}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<McpAppsResourceMetadata>(
+                r#"{"prefersBorder":false,"prefersBorder":false}"#
+            )
+            .is_err()
         );
     }
 

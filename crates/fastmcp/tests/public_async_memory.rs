@@ -908,6 +908,154 @@ mod interactions {
     }
 }
 
+#[cfg(feature = "apps")]
+mod apps_resources {
+    use super::*;
+    use fastmcp_rust::{
+        AbsoluteUri, ClientInfo, CoreResult, FinalCoreResult, MCP_APPS_HTML_MIME_TYPE,
+        McpAppsClientSettings, McpAppsResourceBinding, McpAppsResourceCsp, McpAppsResourceMetadata,
+        McpAppsResourcePermission, McpAppsResourcePermissions, McpRequestCancellation,
+    };
+
+    const URI: &str = "ui://memory-app/dashboard";
+    const HTML: &str = "<main>résumé 東京 &amp; weather</main>";
+
+    fn read_apps_resource(include_metadata: bool) {
+        let runtime = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cx = Cx::current().unwrap();
+            assert!(cx.blocking_pool_handle().is_none());
+            asupersync::time::timeout(cx.now(), Duration::from_secs(8), async {
+                let mut resource = modern::McpAppsUiResource::try_new(
+                    AbsoluteUri::parse(URI).unwrap(),
+                    "memory-app",
+                    HTML,
+                )
+                .unwrap();
+                let expected_metadata = include_metadata.then(|| {
+                    McpAppsResourceMetadata::try_new(
+                        Some(
+                            McpAppsResourceCsp::try_new(
+                                Some(vec!["https://api.example.test".to_owned()]),
+                                Some(vec!["https://static.example.test".to_owned()]),
+                                None,
+                                None,
+                            )
+                            .unwrap(),
+                        ),
+                        Some(McpAppsResourcePermissions {
+                            geolocation: Some(McpAppsResourcePermission::default()),
+                            ..McpAppsResourcePermissions::default()
+                        }),
+                        Some("memory-app.host.example".to_owned()),
+                        Some(true),
+                    )
+                    .unwrap()
+                });
+                if let Some(metadata) = &expected_metadata {
+                    resource = resource.with_apps_metadata(metadata.clone()).unwrap();
+                }
+                let stopped = Arc::new(AtomicBool::new(false));
+                let server_stopped = Arc::clone(&stopped);
+                let server = modern::ServerBuilder::new("memory-apps", "1")
+                    .mcp_apps()
+                    .unwrap()
+                    .mcp_apps_ui_resource(resource)
+                    .unwrap()
+                    .on_shutdown(move || server_stopped.store(true, Ordering::Release))
+                    .build();
+                let (transport, peer) = create_memory_transport_pair_with_capacity(1);
+                let mut serving = cx
+                    .spawn(
+                        move |serve_cx| async move { server.serve_memory(&serve_cx, peer).await },
+                    )
+                    .unwrap();
+                let mut client = modern::MemoryClient::builder(ClientInfo {
+                    name: "public-memory-apps".to_owned(),
+                    version: "1".to_owned(),
+                })
+                .mcp_apps(
+                    McpAppsClientSettings::new(vec![MCP_APPS_HTML_MIME_TYPE.to_owned()]).unwrap(),
+                )
+                .connect(&cx, transport)
+                .await
+                .unwrap();
+                assert!(client.mcp_apps_active());
+                let cancellation = McpRequestCancellation::new();
+
+                // A host may load a tool's resourceUri directly. No catalog
+                // fetch can stand in for the metadata on the actual content.
+                let CoreResult::Final(FinalCoreResult::ResourcesRead { result, .. }) =
+                    client.read_resource(&cx, &cancellation, URI).await.unwrap()
+                else {
+                    panic!("the public Apps read must return typed modern contents");
+                };
+                let binding = McpAppsResourceBinding {
+                    resource_uri: AbsoluteUri::parse(URI).unwrap(),
+                    visibility: Vec::new(),
+                };
+                let admitted: fastmcp_rust::modern::McpAppsResourceRead<'_> =
+                    binding.resolve_read_result(&result.payload, None).unwrap();
+                assert!(std::ptr::eq(
+                    admitted.contents(),
+                    &result.payload.contents[0]
+                ));
+                assert_eq!(admitted.metadata(), expected_metadata.as_ref());
+                let contents = serde_json::to_value(&result.payload).unwrap();
+                assert_eq!(contents["contents"].as_array().unwrap().len(), 1);
+                let content = &contents["contents"][0];
+                assert_eq!(content["uri"], URI);
+                assert_eq!(content["mimeType"], MCP_APPS_HTML_MIME_TYPE);
+                assert_eq!(content["text"], HTML);
+                if let Some(metadata) = &expected_metadata {
+                    assert_eq!(content["_meta"]["ui"], json!(metadata));
+                } else {
+                    assert!(content.get("_meta").is_none());
+                }
+
+                let CoreResult::Final(FinalCoreResult::ResourcesList { result, .. }) = client
+                    .list_resources(
+                        &cx,
+                        &cancellation,
+                        fastmcp_rust::ListResourcesParams::default(),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("the same Apps connection must retain a typed catalog");
+                };
+                assert_eq!(result.payload.resources.len(), 1);
+                assert_eq!(
+                    result.payload.resources[0].mcp_apps_metadata().unwrap(),
+                    expected_metadata,
+                    "catalog and read metadata must describe the same sandbox requests"
+                );
+
+                client.close(&cx).unwrap();
+                serving.join(&cx).await.unwrap().unwrap();
+                assert!(stopped.load(Ordering::Acquire));
+                assert!(cx.checkpoint().is_ok());
+            })
+            .await
+            .expect("Apps resource reads must settle on the caller's runtime");
+        });
+        assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn public_apps_resource_read_retains_sandbox_metadata_before_catalog_discovery() {
+        read_apps_resource(true);
+    }
+
+    #[test]
+    fn public_apps_resource_read_without_metadata_does_not_invent_sandbox_requests() {
+        read_apps_resource(false);
+    }
+}
+
 #[cfg(feature = "tasks")]
 mod typed_tasks {
     use super::*;

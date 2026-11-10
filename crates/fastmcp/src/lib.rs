@@ -739,9 +739,9 @@ pub use fastmcp_protocol::{
     MCP_APPS_DEPRECATED_RESOURCE_URI_METADATA_KEY, MCP_APPS_UI_METADATA_KEY, McpAppsDisplayMode,
     McpAppsLifecycleError, McpAppsMetadataError, McpAppsResourceBinding,
     McpAppsResourceBindingError, McpAppsResourceCsp, McpAppsResourceMetadata,
-    McpAppsResourcePermission, McpAppsResourcePermissions, McpAppsResultProjectionError,
-    McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
-    project_final_core_tools_call_result,
+    McpAppsResourcePermission, McpAppsResourcePermissions, McpAppsResourceRead,
+    McpAppsResultProjectionError, McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility,
+    McpAppsViewLifecycle, project_final_core_tools_call_result,
 };
 
 // Final extension vocabulary.
@@ -3302,9 +3302,9 @@ pub mod modern {
         McpAppsMetadataError, McpAppsPinnedHostCapabilities, McpAppsPinnedHostContext,
         McpAppsResourceBinding, McpAppsResourceBindingError, McpAppsResourceCsp,
         McpAppsResourceMetadata, McpAppsResourcePermission, McpAppsResourcePermissions,
-        McpAppsResultProjectionError, McpAppsSamplingCapability, McpAppsSamplingParams,
-        McpAppsSamplingResult, McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility,
-        McpAppsViewLifecycle, project_final_core_tools_call_result,
+        McpAppsResourceRead, McpAppsResultProjectionError, McpAppsSamplingCapability,
+        McpAppsSamplingParams, McpAppsSamplingResult, McpAppsToolMetadata, McpAppsToolResult,
+        McpAppsToolVisibility, McpAppsViewLifecycle, project_final_core_tools_call_result,
     };
     #[cfg(feature = "apps")]
     pub use fastmcp_server::providers::McpAppsUiResource;
@@ -12250,8 +12250,8 @@ pub mod prelude {
         McpAppsClientSettings, McpAppsDisplayMode, McpAppsLifecycleError, McpAppsMetadataError,
         McpAppsNegotiationResolver, McpAppsResourceBinding, McpAppsResourceBindingError,
         McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
-        McpAppsResourcePermissions, McpAppsResultProjectionError, McpAppsToolMetadata,
-        McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
+        McpAppsResourcePermissions, McpAppsResourceRead, McpAppsResultProjectionError,
+        McpAppsToolMetadata, McpAppsToolResult, McpAppsToolVisibility, McpAppsViewLifecycle,
         project_final_core_tools_call_result,
     };
     #[cfg(all(feature = "proxy", feature = "tasks"))]
