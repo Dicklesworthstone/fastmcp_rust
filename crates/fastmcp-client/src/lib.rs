@@ -50688,23 +50688,68 @@ exec sleep 2
     }
 
     #[cfg(all(unix, feature = "apps"))]
-    #[test]
-    fn public_mcp_apps_stdio_policy_cancellation_reaches_its_real_upstream_request() {
-        let script = "IFS= read -r request; \\
-            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
-            IFS= read -r cancellation; \\
-            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":2'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \\
-            IFS= read -r ping; \\
-            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":3'*) ping_ok=true;; *) ping_ok=false;; esac; \\
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"cancellation\":%s,\"ping\":%s}}\\n' \\
-              \"$request_ok\" \"$cancellation_ok\" \"$ping_ok\"; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client_for_version(
-            script,
-            Duration::from_secs(2),
-            MODERN_PROTOCOL_VERSION,
+    fn make_scripted_apps_cancellation_client(script: &str, cx: Cx) -> (Client, UnixStream) {
+        let (control, peer_control) =
+            UnixStream::pair().expect("create the real stdio Apps acceptance barrier");
+        control
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the real stdio Apps acceptance observation");
+        control
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("bound the real stdio Apps response release");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(OwnedFd::from(peer_control)));
+        let mut child = command.spawn().expect("spawn the real stdio Apps peer");
+        let stdin = child.stdin.take().expect("scripted Apps peer stdin");
+        let stdout = child.stdout.take().expect("scripted Apps peer stdout");
+        let session = ClientSession::try_new(
+            ClientInfo {
+                name: "test-client".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            ClientCapabilities::default(),
+            Some(ServerInfo {
+                name: "scripted-apps-server".to_owned(),
+                version: "1.0.0".to_owned(),
+            }),
+            ServerCapabilities::default(),
+            MODERN_PROTOCOL_VERSION.to_owned(),
+        )
+        .expect("the real stdio Apps peer uses the final protocol");
+        let mut client = Client::from_parts(
+            child,
+            StdioTransport::new(stdout, stdin),
+            cx,
+            session,
+            RequestTimeoutPolicy::new(Duration::from_secs(2), Duration::from_secs(2)).unwrap(),
         );
         install_test_mcp_apps_activation(&mut client);
-        let cx = Cx::for_testing();
+        (client, control)
+    }
+
+    #[cfg(all(unix, feature = "apps"))]
+    #[test]
+    fn public_mcp_apps_stdio_policy_cancellation_reaches_its_real_upstream_request() {
+        let script = "IFS= read -r catalog; \\
+            case \"$catalog\" in *'\"method\":\"tools/list\"'*'\"id\":2'*) catalog_ok=true;; *) catalog_ok=false;; esac; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\"}}],\"ttlMs\":0,\"cacheScope\":\"private\"}}'; \\
+            IFS= read -r request; \\
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":3'*) request_ok=true;; *) request_ok=false;; esac; \\
+            printf 'T' >&2; \\
+            IFS= read -r cancellation; \\
+            case \"$cancellation\" in *'\"method\":\"notifications/cancelled\"'*'\"requestId\":3'*) cancellation_ok=true;; *) cancellation_ok=false;; esac; \\
+            IFS= read -r ping; \\
+            case \"$ping\" in *'\"method\":\"ping\"'*'\"id\":4'*) ping_ok=true;; *) ping_ok=false;; esac; \\
+            printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"catalog\":%s,\"request\":%s,\"cancellation\":%s,\"ping\":%s}}\\n' \\
+              \"$catalog_ok\" \"$request_ok\" \"$cancellation_ok\" \"$ping_ok\"; exec sleep 2";
+        let cx = block_on(async {
+            Cx::current().expect("the real stdio Apps policy retains its caller runtime")
+        });
+        let (mut client, mut control) = make_scripted_apps_cancellation_client(script, cx.clone());
         let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
         let configuration = mcp_apps::McpAppsWireHostConfiguration {
             host_info: fastmcp_protocol::McpAppsBridgeImplementation {
@@ -50762,16 +50807,31 @@ exec sleep 2
             )
             .await
             .expect("the View commits the real forwarded request");
-            view.send_to_host(
-                &cx,
-                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
-            )
-            .await
-            .expect("the View commits the matching real cancellation");
+        });
+        let cancellation_controller = std::thread::spawn(move || {
+            let mut accepted = [0_u8; 1];
+            control
+                .read_exact(&mut accepted)
+                .expect("the peer receives the real stdio tool request before cancellation");
+            assert_eq!(accepted, [b'T']);
+            block_on(async {
+                let cancellation_cx = Cx::current().expect("the View owns its control runtime");
+                view.send_to_host(
+                    &cancellation_cx,
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
+                )
+                .await
+                .expect("the View commits the matching real cancellation");
+            });
+        });
+        block_on(async {
             host.process_next(&cx)
                 .await
                 .expect("the real stdio policy settles its cancelled request");
         });
+        cancellation_controller
+            .join()
+            .expect("the matching stdio Apps cancellation controller joins");
         drop(host);
 
         let evidence: serde_json::Value = client
@@ -50779,8 +50839,8 @@ exec sleep 2
             .expect("the stdio client remains usable after the Apps-owned cancellation");
         assert_eq!(
             evidence,
-            serde_json::json!({"request": true, "cancellation": true, "ping": true}),
-            "the real subprocess saw the Apps request, its exact cancellation, and one later request"
+            serde_json::json!({"catalog": true, "request": true, "cancellation": true, "ping": true}),
+            "the real subprocess saw the catalog, Apps request, its exact cancellation, and one later request"
         );
         client.close().expect("real stdio Apps policy cleanup");
     }
@@ -50788,20 +50848,21 @@ exec sleep 2
     #[cfg(all(unix, feature = "apps"))]
     #[test]
     fn public_mcp_apps_stdio_policy_wrong_id_cancellation_emits_no_cancel_frame() {
-        let script = "IFS= read -r request; \\
-            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":2'*) request_ok=true;; *) request_ok=false;; esac; \\
-            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}'; \\
+        let script = "IFS= read -r catalog; \\
+            case \"$catalog\" in *'\"method\":\"tools/list\"'*'\"id\":2'*) catalog_ok=true;; *) catalog_ok=false;; esac; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"weather\",\"inputSchema\":{\"type\":\"object\"}}],\"ttlMs\":0,\"cacheScope\":\"private\"}}'; \\
+            IFS= read -r request; \\
+            case \"$request\" in *'\"method\":\"tools/call\"'*'\"id\":3'*) request_ok=true;; *) request_ok=false;; esac; \\
+            printf 'T' >&2; IFS= read -r release <&2; [ \"$release\" = R ] || exit 1; \\
+            printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"resultType\":\"complete\",\"content\":[],\"isError\":false}}'; \\
             IFS= read -r follow_up; \\
-            case \"$follow_up\" in *'\"method\":\"notifications/cancelled\"'*) no_cancellation=false; ping_ok=false;; *'\"method\":\"ping\"'*'\"id\":3'*) no_cancellation=true; ping_ok=true;; *) no_cancellation=true; ping_ok=false;; esac; \\
-            printf '{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"request\":%s,\"noCancellation\":%s,\"ping\":%s}}\\n' \\
-              \"$request_ok\" \"$no_cancellation\" \"$ping_ok\"; exec sleep 2";
-        let mut client = make_shell_scripted_initialized_client_for_version(
-            script,
-            Duration::from_secs(2),
-            MODERN_PROTOCOL_VERSION,
-        );
-        install_test_mcp_apps_activation(&mut client);
-        let cx = Cx::for_testing();
+            case \"$follow_up\" in *'\"method\":\"notifications/cancelled\"'*) no_cancellation=false; ping_ok=false;; *'\"method\":\"ping\"'*'\"id\":4'*) no_cancellation=true; ping_ok=true;; *) no_cancellation=true; ping_ok=false;; esac; \\
+            printf '{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"catalog\":%s,\"request\":%s,\"noCancellation\":%s,\"ping\":%s}}\\n' \\
+              \"$catalog_ok\" \"$request_ok\" \"$no_cancellation\" \"$ping_ok\"; exec sleep 2";
+        let cx = block_on(async {
+            Cx::current().expect("the real stdio Apps policy retains its caller runtime")
+        });
+        let (mut client, mut control) = make_scripted_apps_cancellation_client(script, cx.clone());
         let (transport, mut view) = mcp_apps::mcp_apps_in_memory_wire_pair(8);
         let configuration = mcp_apps::McpAppsWireHostConfiguration {
             host_info: fastmcp_protocol::McpAppsBridgeImplementation {
@@ -50859,13 +50920,32 @@ exec sleep 2
             )
             .await
             .expect("the View commits the real forwarded request");
-            view.send_to_host(
-                &cx,
-                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
-            )
-            .await
-            .expect("the View commits the one-field wrong cancellation");
-            let first_result = host.process_next(&cx).await;
+        });
+        let wrong_id_controller = std::thread::spawn(move || {
+            let mut accepted = [0_u8; 1];
+            control.read_exact(&mut accepted).expect(
+                "the peer receives the real stdio tool request before the wrong-ID control",
+            );
+            assert_eq!(accepted, [b'T']);
+            block_on(async {
+                let controller_cx = Cx::current().expect("the View owns its control runtime");
+                view.send_to_host(
+                    &controller_cx,
+                    r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
+                )
+                .await
+                .expect("the View commits the one-field wrong cancellation");
+            });
+            control.write_all(b"R\n").expect(
+                "release the normal stdio response after the wrong-ID control is committed",
+            );
+            view
+        });
+        let first_result = block_on(async { host.process_next(&cx).await });
+        let mut view = wrong_id_controller
+            .join()
+            .expect("the wrong-ID stdio Apps cancellation controller joins");
+        block_on(async {
             match first_result {
                 Err(mcp_apps::McpAppsHostError::Bridge(
                     fastmcp_protocol::McpAppsBridgeError::UnknownCorrelation,
@@ -50899,7 +50979,7 @@ exec sleep 2
             .expect("the stdio client remains usable after the inert Apps cancellation");
         assert_eq!(
             evidence,
-            serde_json::json!({"request": true, "noCancellation": true, "ping": true}),
+            serde_json::json!({"catalog": true, "request": true, "noCancellation": true, "ping": true}),
             "a wrong View ID must not emit an upstream stdio cancellation frame"
         );
         client.close().expect("real stdio Apps wrong-ID cleanup");
@@ -50954,11 +51034,35 @@ exec sleep 2
                     .as_bytes(),
             );
 
+            let (mut catalog, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP tool catalog request");
+            let catalog_request = read_http_cache_test_request(&mut catalog);
+            assert_eq!(catalog_request["id"], 2);
+            assert_eq!(catalog_request["method"], "tools/list");
+            let catalog_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                },
+            });
+            write_http_cache_test_response(
+                &mut catalog,
+                "application/json",
+                serde_json::to_string(&catalog_response)
+                    .expect("the real Apps HTTP tool catalog response serializes")
+                    .as_bytes(),
+            );
+
             let (mut tool_call, _) = listener
                 .accept()
                 .expect("accept the real Apps HTTP tool request");
             let tool_request = read_http_cache_test_request(&mut tool_call);
-            assert_eq!(tool_request["id"], 2);
+            assert_eq!(tool_request["id"], 3);
             assert_eq!(tool_request["method"], "tools/call");
             post_accepted_sender
                 .send(())
@@ -50970,6 +51074,14 @@ exec sleep 2
             let dropped = match tool_call.read(&mut probe) {
                 Ok(0) => true,
                 Ok(_) => false,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    true
+                }
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -50985,12 +51097,14 @@ exec sleep 2
                 .expect("report the real Apps request close before headers");
         });
 
-        let cx = Cx::for_testing();
+        let cx = block_on(async {
+            Cx::current().expect("the real HTTP Apps policy retains its caller runtime")
+        });
         let target = format!("http://{address}/mcp");
         let settings =
             McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned()])
                 .expect("the real Apps HTTP policy uses admitted client settings");
-        let mut client = http_test_runtime_block_on(HttpClient::connect_with_mcp_apps(
+        let mut client = block_on(HttpClient::connect_with_mcp_apps(
             &cx,
             http_cache_test_plan(&target),
             ClientInfo {
@@ -51019,7 +51133,7 @@ exec sleep 2
             .mcp_apps_wire_host(transport, configuration)
             .expect("the public HTTP Apps policy admits its negotiated Host");
 
-        http_test_runtime_block_on(async {
+        block_on(async {
             view.send_to_host(
                 &cx,
                 serde_json::json!({
@@ -51065,8 +51179,8 @@ exec sleep 2
             post_accepted_receiver
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the peer accepts the real Apps POST before cancellation");
-            let cancellation_cx = Cx::for_testing();
-            http_test_runtime_block_on(async {
+            block_on(async {
+                let cancellation_cx = Cx::current().expect("the View owns its control runtime");
                 view.send_to_host(
                     &cancellation_cx,
                     r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"view-call"}}"#.to_owned(),
@@ -51075,7 +51189,7 @@ exec sleep 2
                 .expect("the View commits the matching real HTTP cancellation");
             });
         });
-        http_test_runtime_block_on(async {
+        block_on(async {
             host.process_next(&cx)
                 .await
                 .expect("the real HTTP policy settles its cancelled request");
@@ -51145,11 +51259,35 @@ exec sleep 2
                     .as_bytes(),
             );
 
+            let (mut catalog, _) = listener
+                .accept()
+                .expect("accept the real Apps HTTP tool catalog request");
+            let catalog_request = read_http_cache_test_request(&mut catalog);
+            assert_eq!(catalog_request["id"], 2);
+            assert_eq!(catalog_request["method"], "tools/list");
+            let catalog_response = serde_json::json!({
+                "jsonrpc": JSONRPC_VERSION,
+                "id": 2,
+                "result": {
+                    "resultType": "complete",
+                    "tools": [{"name": "weather", "inputSchema": {"type": "object"}}],
+                    "ttlMs": 0,
+                    "cacheScope": "private",
+                },
+            });
+            write_http_cache_test_response(
+                &mut catalog,
+                "application/json",
+                serde_json::to_string(&catalog_response)
+                    .expect("the real Apps HTTP tool catalog response serializes")
+                    .as_bytes(),
+            );
+
             let (mut tool_call, _) = listener
                 .accept()
                 .expect("accept the real Apps HTTP tool request");
             let tool_request = read_http_cache_test_request(&mut tool_call);
-            assert_eq!(tool_request["id"], 2);
+            assert_eq!(tool_request["id"], 3);
             assert_eq!(tool_request["method"], "tools/call");
             post_accepted_sender
                 .send(())
@@ -51175,7 +51313,7 @@ exec sleep 2
             }
             let tool_response = serde_json::json!({
                 "jsonrpc": JSONRPC_VERSION,
-                "id": 2,
+                "id": 3,
                 "result": {"resultType": "complete", "content": [], "isError": false},
             });
             write_http_cache_test_response(
@@ -51187,12 +51325,14 @@ exec sleep 2
             );
         });
 
-        let cx = Cx::for_testing();
+        let cx = block_on(async {
+            Cx::current().expect("the real HTTP Apps policy retains its caller runtime")
+        });
         let target = format!("http://{address}/mcp");
         let settings =
             McpAppsClientSettings::new(vec![fastmcp_protocol::MCP_APPS_HTML_MIME_TYPE.to_owned()])
                 .expect("the real Apps HTTP policy uses admitted client settings");
-        let mut client = http_test_runtime_block_on(HttpClient::connect_with_mcp_apps(
+        let mut client = block_on(HttpClient::connect_with_mcp_apps(
             &cx,
             http_cache_test_plan(&target),
             ClientInfo {
@@ -51221,7 +51361,7 @@ exec sleep 2
             .mcp_apps_wire_host(transport, configuration)
             .expect("the public HTTP Apps policy admits its negotiated Host");
 
-        http_test_runtime_block_on(async {
+        block_on(async {
             view.send_to_host(
                 &cx,
                 serde_json::json!({
@@ -51267,8 +51407,8 @@ exec sleep 2
             post_accepted_receiver
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .expect("the peer accepts the real Apps POST before the wrong-ID control");
-            let controller_cx = Cx::for_testing();
-            let response = http_test_runtime_block_on(async {
+            let response = block_on(async {
+                let controller_cx = Cx::current().expect("the View owns its control runtime");
                 view.send_to_host(
                     &controller_cx,
                     r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"other-call"}}"#.to_owned(),
@@ -51287,7 +51427,7 @@ exec sleep 2
             assert_eq!(response["id"], "view-call");
             assert_eq!(response["result"]["content"], serde_json::json!([]));
         });
-        let result = http_test_runtime_block_on(async { host.process_next(&cx).await });
+        let result = block_on(async { host.process_next(&cx).await });
         assert!(matches!(
             result,
             Err(mcp_apps::McpAppsHostError::Bridge(

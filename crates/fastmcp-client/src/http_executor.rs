@@ -9179,6 +9179,36 @@ impl ModernHttpClient {
         Ok((decoder, response))
     }
 
+    /// Reads a fresh catalog for one Apps View's tool visibility admission.
+    ///
+    /// Tasks is omitted before the Host makes any creation decision. Other
+    /// negotiated extensions and final request metadata keep their normal
+    /// authority. The enclosing Apps operation owns the response deadline,
+    /// cancellation, and exact selected-era result admission.
+    #[cfg(feature = "apps")]
+    pub(crate) async fn request_apps_tool_catalog_page(
+        &self,
+        cx: &Cx,
+        request_id: RequestId,
+        parameters: serde_json::Value,
+    ) -> Result<(CoreRequest, ModernHttpResponseStream), ModernHttpClientError> {
+        let request = self.build_post_discovery_request(
+            cx,
+            "tools/list",
+            parameters,
+            Some(request_id),
+            None,
+            true,
+        )?;
+        let wire: JsonRpcRequest = serde_json::from_slice(&request.body)
+            .map_err(|_| ModernHttpClientError::RequestEncodingFailed)?;
+        let decoder =
+            CoreRequest::decode(ProtocolEra::Modern2026, "tools/list", wire.params.as_ref())
+                .map_err(ModernHttpClientError::TypedResult)?;
+        let response = self.execute_post_discovery_request(cx, &request).await?;
+        Ok((decoder, response))
+    }
+
     /// Starts a tool call, resource read, prompt request, or argument completion.
     /// The first three support caller-managed MRTR retries; completion retains
     /// its complete-only decoder.

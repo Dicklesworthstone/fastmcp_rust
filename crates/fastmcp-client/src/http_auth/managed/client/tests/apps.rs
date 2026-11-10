@@ -323,6 +323,7 @@ fn managed_apps_authenticated_json_sse_mrtr_resource_and_teardown() {
                 async {
                     peer.mcp("server/discover", "access-one", apps_discovery(false))
                         .await;
+                    peer.catalog("access-one", "lookup").await;
                     let first = rpc_reply(&peer, "tools/call", input_request(), sse).await;
                     let second = rpc_reply(&peer, "tools/call", complete(), sse).await;
                     assert_ne!(first["id"], second["id"]);
@@ -413,6 +414,7 @@ fn managed_apps_callback_construction_poll_and_drop_revocation_prevent_continuat
                 async {
                     peer.mcp("server/discover", "access-one", apps_discovery(false))
                         .await;
+                    peer.catalog("access-one", "lookup").await;
                     rpc_reply(&peer, "tools/call", input_request(), false).await;
                     if close_at == CloseAt::Never {
                         rpc_reply(&peer, "tools/call", complete(), false).await;
@@ -469,6 +471,7 @@ fn managed_apps_tasks_require_local_selection_before_host_creation_consent() {
                 },
             ), async {
                 peer.mcp("server/discover", "access-one", apps_discovery(true)).await;
+                peer.catalog("access-one", "lookup").await;
                 let task = |created: bool, completed: bool| {
                     let mut value = json!({
                         "resultType": if created { "task" } else { "complete" },

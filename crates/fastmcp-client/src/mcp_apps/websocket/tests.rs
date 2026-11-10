@@ -237,6 +237,12 @@ fn complete(text: &str) -> Value {
     json!({"resultType": "complete", "content": [{"type": "text", "text": text}]})
 }
 
+fn callable_tools(names: &[&str]) -> Value {
+    json!({"resultType": "complete", "tools": names.iter().map(|name| json!({
+        "name": name, "inputSchema": {"type": "object"}
+    })).collect::<Vec<_>>(), "ttlMs": 0, "cacheScope": "private"})
+}
+
 fn input_required(state: &str) -> Value {
     json!({
         "resultType": "input_required", "requestState": state,
@@ -314,7 +320,10 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
             ("resources/templates/list", json!({}), json!({"resourceTemplates": [], "ttlMs": 0, "cacheScope": "private"})),
             ("prompts/list", json!({}), json!({"prompts": [], "ttlMs": 0, "cacheScope": "private"})),
         ].into_iter().enumerate() {
-            let id = i64::try_from(index).unwrap() + 2;
+            let id = i64::try_from(index).unwrap() + 3;
+            if method == "tools/call" {
+                respond(&mut peer, &cx, 2, callable_tools(&["ordinary"])).await;
+            }
             let mut result = payload.clone();
             result["resultType"] = json!("complete");
             respond(&mut peer, &cx, id, result).await;
@@ -324,6 +333,11 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
                 assert!(response["result"].get("resultType").is_none());
             } else {
                 assert_eq!(response["result"], payload);
+            }
+            if method == "tools/call" {
+                let catalog = next_request(&mut peer, &cx).await;
+                assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                assert_eq!(catalog.method, "tools/list");
             }
             let forwarded = next_request(&mut peer, &cx).await;
             assert_eq!(forwarded.id, Some(RequestId::Number(id)));
@@ -338,6 +352,68 @@ fn public_websocket_apps_forwards_reused_methods_with_fresh_core_ids() {
         drop(host);
         client.close(&cx).await.unwrap();
         assert!(peer.recv(&cx).await.is_err(), "no Apps frame or extra core RPC");
+    });
+}
+
+#[test]
+fn public_websocket_apps_tool_visibility_rechecks_before_every_call() {
+    run_test(|| async {
+        let cx = Cx::current().unwrap();
+        let (stream, server) = streams();
+        let mut peer = Peer::from_upgraded(server);
+        let mut client = connect(&cx, stream, &mut peer, Options::default()).await;
+        let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+        let mut host = client
+            .mcp_apps_wire_host(transport, configuration())
+            .unwrap();
+        activate(&mut host, &mut view, &cx).await;
+        let mut page = callable_tools(&["selected"]);
+        page["ttlMs"] = json!(60_000);
+        page["tools"][0]["_meta"] = json!({"ui": {"visibility": ["app"]}});
+        respond(&mut peer, &cx, 2, page.clone()).await;
+        respond(&mut peer, &cx, 3, complete("visible")).await;
+        assert_eq!(
+            request(
+                &mut host,
+                &mut view,
+                &cx,
+                "same-view",
+                "tools/call",
+                json!({"name":"selected"})
+            )
+            .await["result"]["content"][0]["text"],
+            "visible"
+        );
+        let catalog = next_request(&mut peer, &cx).await;
+        assert_eq!(catalog.method, "tools/list");
+        assert_eq!(catalog.id, Some(RequestId::Number(2)));
+        let invoked = next_request(&mut peer, &cx).await;
+        assert_eq!(invoked.method, "tools/call");
+        assert_eq!(invoked.id, Some(RequestId::Number(3)));
+
+        page["tools"][0]["_meta"]["ui"]["visibility"] = json!(["model"]);
+        respond(&mut peer, &cx, 4, page).await;
+        let denied = request(
+            &mut host,
+            &mut view,
+            &cx,
+            "same-view",
+            "tools/call",
+            json!({"name":"selected"}),
+        )
+        .await;
+        assert!(denied.get("error").is_some());
+        assert!(denied.get("result").is_none());
+        assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+        let fresh = next_request(&mut peer, &cx).await;
+        assert_eq!(fresh.method, "tools/list");
+        assert_eq!(fresh.id, Some(RequestId::Number(4)));
+        drop(host);
+        client.close(&cx).await.unwrap();
+        assert!(
+            peer.recv(&cx).await.is_err(),
+            "revoked visibility sends no tools/call"
+        );
     });
 }
 
@@ -418,30 +494,34 @@ fn public_websocket_apps_mrtr_requires_this_views_capability_and_exact_input_rou
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
             let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
             activate(&mut host, &mut view, &cx).await;
-            respond(&mut peer, &cx, 2, input_required("private-round")).await;
+            respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+            respond(&mut peer, &cx, 3, input_required("private-round")).await;
             if case == "approved" {
-                respond(&mut peer, &cx, 3, complete("continued")).await;
+                respond(&mut peer, &cx, 4, complete("continued")).await;
             }
             let response = request(&mut host, &mut view, &cx, "view-round", "tools/call", json!({
                 "name": "job", "arguments": {"value": 7}
             })).await;
             assert_eq!(response.get("result").is_some(), case == "approved");
             assert_eq!(calls.lock().unwrap().len(), usize::from(case != "missing-capability"));
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let first = next_request(&mut peer, &cx).await;
-            assert_eq!(first.id, Some(RequestId::Number(2)));
+            assert_eq!(first.id, Some(RequestId::Number(3)));
             if case == "approved" {
                 let continued = next_request(&mut peer, &cx).await;
-                assert_eq!(continued.id, Some(RequestId::Number(3)));
+                assert_eq!(continued.id, Some(RequestId::Number(4)));
                 assert_eq!(continued.method, "tools/call");
                 let params = continued.params.unwrap();
                 assert_eq!(params["requestState"], "private-round");
                 assert_eq!(params["inputResponses"], input_response());
                 assert_eq!(params["arguments"], json!({"value": 7}));
             }
-            let healthy_id = if case == "approved" { 4 } else { 3 };
+            let healthy_id = if case == "approved" { 6 } else { 5 };
+            respond(&mut peer, &cx, healthy_id - 1, callable_tools(&["healthy"])).await;
             respond(&mut peer, &cx, healthy_id, complete("healthy")).await;
             let healthy = request(&mut host, &mut view, &cx, "view-round", "tools/call", json!({"name": "healthy"})).await;
             assert_eq!(healthy["result"]["content"][0]["text"], "healthy");
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let healthy = next_request(&mut peer, &cx).await;
             assert_eq!(healthy.id, Some(RequestId::Number(healthy_id)));
             let params = healthy.params.unwrap();
@@ -482,8 +562,12 @@ async fn cancellation_probe(abandon_drive: bool) {
 
     enqueue(&mut view, &cx, "owned-view-id", "tools/call", json!({"name": "slow"})).await;
     let mut drive = Box::pin(host.process_next(&cx));
+    let catalog = request_while_pending(&mut drive, &mut peer, &cx).await;
+    assert_eq!(catalog.id, Some(RequestId::Number(2)));
+    assert_eq!(catalog.method, "tools/list");
+    respond(&mut peer, &cx, 2, callable_tools(&["slow"])).await;
     let original = request_while_pending(&mut drive, &mut peer, &cx).await;
-    assert_eq!(original.id, Some(RequestId::Number(2)));
+    assert_eq!(original.id, Some(RequestId::Number(3)));
     assert_eq!(original.method, "tools/call");
 
     if abandon_drive {
@@ -517,18 +601,20 @@ async fn cancellation_probe(abandon_drive: bool) {
     let control = next_request(&mut peer, &cx).await;
     assert_eq!(control.method, "notifications/cancelled");
     assert!(control.id.is_none());
-    assert_eq!(control.params.unwrap()["requestId"], 2);
+    assert_eq!(control.params.unwrap()["requestId"], 3);
 
-    // Retired core ID 2 is discarded even though the View reuses its own ID.
-    respond(&mut peer, &cx, 2, complete("late cancelled result")).await;
-    respond(&mut peer, &cx, 3, complete("healthy successor")).await;
+    // Retired core ID 3 is discarded even though the View reuses its own ID.
+    respond(&mut peer, &cx, 3, complete("late cancelled result")).await;
+    respond(&mut peer, &cx, 4, callable_tools(&["healthy"])).await;
+    respond(&mut peer, &cx, 5, complete("healthy successor")).await;
     let healthy = request(
         &mut host, &mut view, &cx, "owned-view-id", "tools/call", json!({"name": "healthy"}),
     ).await;
     assert_eq!(healthy["result"]["content"][0]["text"], "healthy successor");
+    assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
     let successor = next_request(&mut peer, &cx).await;
     assert_eq!(successor.method, "tools/call");
-    assert_eq!(successor.id, Some(RequestId::Number(3)));
+    assert_eq!(successor.id, Some(RequestId::Number(5)));
     assert_eq!(successor.params.unwrap()["name"], "healthy");
     assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
     drop(host);
@@ -628,8 +714,13 @@ fn public_websocket_apps_cleanup_commits_view_cancel_before_stalled_native_retir
                 activate(&mut host, &mut view, &cx).await;
                 enqueue(&mut view, &cx, "cancel-before-await", "tools/call", json!({"name": "slow"})).await;
                 let mut drive = Box::pin(host.process_next(&cx));
+                let catalog = request_while_pending(&mut drive, &mut peer, &cx).await;
+                assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                assert_eq!(catalog.method, "tools/list");
+                respond(&mut peer, &cx, 2, callable_tools(&["slow"])).await;
                 let sent = request_while_pending(&mut drive, &mut peer, &cx).await;
-                assert_eq!(sent.id, Some(RequestId::Number(2)));
+                assert_eq!(sent.id, Some(RequestId::Number(3)));
+                assert_eq!(sent.method, "tools/call");
                 gate.remaining.store(prefix, Ordering::Release);
                 gate.blocked.store(true, Ordering::Release);
                 cancel_view(&mut view, &cx, "cancel-before-await").await;
@@ -670,7 +761,7 @@ fn public_websocket_apps_cleanup_commits_view_cancel_before_stalled_native_retir
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
                 assert!(gate.dropped.load(Ordering::Acquire), "both native halves are retired");
                 assert!(!host.policy.client.mcp_apps_active());
-                assert_eq!(host.policy.client.next_id, 3);
+                assert_eq!(host.policy.client.next_id, 4);
                 assert_eq!(host.policy.client.retired_requests.len(), 1);
                 let polls = gate.polls.load(Ordering::Acquire);
                 assert!(host.process_next(&cx).await.is_err());
@@ -791,11 +882,12 @@ mod tasks {
             let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
             activate(&mut host, &mut view, &cx).await;
             for (id, result) in [
-                (2, input_required("before-task-private-state")),
-                (3, task_snapshot("working", true)),
-                (4, task_snapshot("input_required", false)),
-                (5, json!({"resultType": "complete"})),
-                (6, task_snapshot("completed", false)),
+                (2, callable_tools(&["job"])),
+                (3, input_required("before-task-private-state")),
+                (4, task_snapshot("working", true)),
+                (5, task_snapshot("input_required", false)),
+                (6, json!({"resultType": "complete"})),
+                (7, task_snapshot("completed", false)),
             ] {
                 respond(&mut peer, &cx, id, result).await;
             }
@@ -811,9 +903,14 @@ mod tasks {
             assert!(calls.iter().all(|call| call["params"] == original));
             drop(calls);
             assert!(snapshots.lock().unwrap().iter().any(|entry| entry["status"] == "completed"));
+            let catalog = next_request(&mut peer, &cx).await;
+            assert_eq!(catalog.id, Some(RequestId::Number(2)));
+            assert_eq!(catalog.method, "tools/list");
+            assert!(catalog.params.unwrap()["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
+                .get(fastmcp_protocol::TASKS_EXTENSION).is_none());
             for (id, method) in [
-                (2, "tools/call"), (3, "tools/call"), (4, "tasks/get"),
-                (5, "tasks/update"), (6, "tasks/get"),
+                (3, "tools/call"), (4, "tools/call"), (5, "tasks/get"),
+                (6, "tasks/update"), (7, "tasks/get"),
             ] {
                 let request = next_request(&mut peer, &cx).await;
                 assert_eq!(request.id, Some(RequestId::Number(id)));
@@ -822,7 +919,7 @@ mod tasks {
                 assert!(params["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
                     .get(fastmcp_protocol::TASKS_EXTENSION).is_some());
                 assert!(!params.to_string().contains("view-task"));
-                if id == 3 {
+                if id == 4 {
                     assert_eq!(params["requestState"], "before-task-private-state");
                     assert_eq!(params["inputResponses"], input_response());
                     assert_eq!(params["arguments"], json!({"value": 7}));
@@ -830,24 +927,28 @@ mod tasks {
                 if method.starts_with("tasks/") {
                     assert_eq!(params["taskId"], "private-server-task");
                 }
-                if id == 5 {
+                if id == 6 {
                     assert_eq!(params["inputResponses"], input_response());
                 }
             }
-            respond(&mut peer, &cx, 7, complete("ordinary")).await;
+            respond(&mut peer, &cx, 8, callable_tools(&["ordinary"])).await;
+            respond(&mut peer, &cx, 9, complete("ordinary")).await;
             let ordinary = request(&mut host, &mut view, &cx, "view-task", "tools/call", json!({"name": "ordinary"})).await;
             assert_eq!(ordinary["result"]["content"][0]["text"], "ordinary");
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let ordinary = next_request(&mut peer, &cx).await;
-            assert_eq!(ordinary.id, Some(RequestId::Number(7)));
+            assert_eq!(ordinary.id, Some(RequestId::Number(9)));
             assert!(ordinary.params.unwrap()["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
                 .get(fastmcp_protocol::TASKS_EXTENSION).is_none());
 
             // The outermost effects owner replaces an earlier Task consent.
             let mut host = host.with_effects(());
-            respond(&mut peer, &cx, 8, complete("new consent owner")).await;
+            respond(&mut peer, &cx, 10, callable_tools(&["job"])).await;
+            respond(&mut peer, &cx, 11, complete("new consent owner")).await;
             assert!(request(&mut host, &mut view, &cx, "view-task", "tools/call", original).await.get("result").is_some());
+            assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
             let replaced = next_request(&mut peer, &cx).await;
-            assert_eq!(replaced.id, Some(RequestId::Number(8)));
+            assert_eq!(replaced.id, Some(RequestId::Number(11)));
             assert!(replaced.params.unwrap()["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
                 .get(fastmcp_protocol::TASKS_EXTENSION).is_none());
             drop(host);
@@ -902,8 +1003,9 @@ mod tasks {
                     }
                     _ => (vec![task_snapshot("input_required", true)], vec!["tools/call"]),
                 };
+                respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
                 for (offset, result) in results.into_iter().enumerate() {
-                    respond(&mut peer, &cx, i64::try_from(offset).unwrap() + 2, result).await;
+                    respond(&mut peer, &cx, i64::try_from(offset).unwrap() + 3, result).await;
                 }
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                 let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
@@ -917,9 +1019,12 @@ mod tasks {
                     usize::from(matches!(case, "input-round" | "input-reuse")),
                     "{case}",
                 );
+                let catalog = next_request(&mut peer, &cx).await;
+                assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                assert_eq!(catalog.method, "tools/list");
                 for (offset, method) in methods.iter().enumerate() {
                     let request = next_request(&mut peer, &cx).await;
-                    assert_eq!(request.id, Some(RequestId::Number(i64::try_from(offset).unwrap() + 2)));
+                    assert_eq!(request.id, Some(RequestId::Number(i64::try_from(offset).unwrap() + 3)));
                     assert_eq!(request.method.as_str(), *method);
                     if case == "not-approved" {
                         assert!(request.params.unwrap()["_meta"][crate::FINAL_CLIENT_CAPABILITIES_META_KEY]["extensions"]
@@ -933,9 +1038,11 @@ mod tasks {
                     assert!(peer.recv(&cx).await.is_err(), "foreign identity fences the connection");
                     continue;
                 }
-                let next_id = i64::try_from(methods.len()).unwrap() + 2;
+                let next_id = i64::try_from(methods.len()).unwrap() + 4;
+                respond(&mut peer, &cx, next_id - 1, callable_tools(&["healthy"])).await;
                 respond(&mut peer, &cx, next_id, complete("healthy")).await;
                 assert!(request(&mut host, &mut view, &cx, "refused", "tools/call", json!({"name": "healthy"})).await.get("result").is_some());
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let healthy = next_request(&mut peer, &cx).await;
                 assert_eq!(healthy.id, Some(RequestId::Number(next_id)));
                 assert_eq!(healthy.method, "tools/call", "no unauthorized Task update, read, cancel or replay");
@@ -964,19 +1071,21 @@ mod tasks {
                 }).await;
                 let mut effects = TaskEffects::new();
                 // Spend part of the one Apps operation budget before its
-                // first RPC. A new per-RPC budget must not replace it.
+                // tool RPC. A new per-RPC budget must not replace it.
                 effects.delay = Duration::from_millis(700);
                 let initial = if method == "tasks/get" { "working" } else { "input_required" };
-                respond(&mut peer, &cx, 2, task_snapshot(initial, true)).await;
+                respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
+                respond(&mut peer, &cx, 3, task_snapshot(initial, true)).await;
                 let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
                 let mut host = client.mcp_apps_wire_host(transport, configuration()).unwrap().with_effects(effects);
                 activate(&mut host, &mut view, &cx).await;
                 enqueue(&mut view, &cx, "bounded-task", "tools/call", json!({"name": "job"})).await;
                 let mut drive = Box::pin(host.process_next(&cx));
+                assert_eq!(request_while_pending(&mut drive, &mut peer, &cx).await.method, "tools/list");
                 assert_eq!(request_while_pending(&mut drive, &mut peer, &cx).await.method, "tools/call");
                 let held = request_while_pending(&mut drive, &mut peer, &cx).await;
                 assert_eq!(held.method, method);
-                assert_eq!(held.id, Some(RequestId::Number(3)));
+                assert_eq!(held.id, Some(RequestId::Number(4)));
 
                 // No response or View cancellation wakes this held request.
                 // Its own RPC timeout is 1 s; the original operation has only
@@ -987,20 +1096,22 @@ mod tasks {
                 assert!(view_response(&mut view, &cx).await.get("error").is_some());
                 let control = next_request(&mut peer, &cx).await;
                 assert_eq!(control.method, "notifications/cancelled");
-                assert_eq!(control.params.unwrap()["requestId"], 3);
+                assert_eq!(control.params.unwrap()["requestId"], 4);
                 assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
 
-                respond(&mut peer, &cx, 3, if method == "tasks/get" {
+                respond(&mut peer, &cx, 4, if method == "tasks/get" {
                     task_snapshot("completed", false)
                 } else {
                     json!({"resultType": "complete"})
                 }).await;
-                respond(&mut peer, &cx, 4, complete("after deadline")).await;
+                respond(&mut peer, &cx, 5, callable_tools(&["healthy"])).await;
+                respond(&mut peer, &cx, 6, complete("after deadline")).await;
                 let response = request(&mut host, &mut view, &cx, "bounded-task", "tools/call", json!({"name": "healthy"})).await;
                 assert_eq!(response["result"]["content"][0]["text"], "after deadline");
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let healthy = next_request(&mut peer, &cx).await;
                 assert_eq!(healthy.method, "tools/call", "observation cancellation never cancels the remote Task");
-                assert_eq!(healthy.id, Some(RequestId::Number(4)));
+                assert_eq!(healthy.id, Some(RequestId::Number(6)));
                 drop(host);
                 client.close(&cx).await.unwrap();
                 assert!(peer.recv(&cx).await.is_err());

@@ -567,6 +567,12 @@ mod tests {
         json!({"resultType": "complete", "tools": [], "ttlMs": 0, "cacheScope": "private"})
     }
 
+    fn callable_tools(names: &[&str]) -> Value {
+        json!({"resultType": "complete", "tools": names.iter().map(|name| json!({
+            "name": name, "inputSchema": {"type": "object"}
+        })).collect::<Vec<_>>(), "ttlMs": 0, "cacheScope": "private"})
+    }
+
     fn input_required(state: &str) -> Value {
         json!({
             "resultType": "input_required", "requestState": state,
@@ -689,7 +695,7 @@ mod tests {
     #[test]
     fn memory_apps_public_host_forwards_reused_methods_with_fresh_core_ids() {
         run(|cx| async move {
-            let (mut client, mut peer, _) = connect(&cx, builder(), json!({(APPS): {}}), 1).await;
+            let (mut client, mut peer, _) = connect(&cx, builder(), json!({(APPS): {}}), 2).await;
             let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
             let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap();
             host.bind_server_catalogs(McpAppsCatalogBinding {
@@ -705,7 +711,10 @@ mod tests {
                 ("resources/templates/list", json!({}), json!({"resourceTemplates": [], "ttlMs": 0, "cacheScope": "private"})),
                 ("prompts/list", json!({}), json!({"prompts": [], "ttlMs": 0, "cacheScope": "private"})),
             ].into_iter().enumerate() {
-                let id = i64::try_from(offset).unwrap() + 2;
+                let id = i64::try_from(offset).unwrap() + 3;
+                if method == "tools/call" {
+                    respond(&mut peer, &cx, 2, callable_tools(&["ordinary"])).await;
+                }
                 let mut result = payload.clone();
                 result["resultType"] = json!("complete");
                 respond(&mut peer, &cx, id, result).await;
@@ -716,6 +725,11 @@ mod tests {
                     assert_eq!(response["result"], payload);
                 }
                 assert!(response["result"].get("resultType").is_none());
+                if method == "tools/call" {
+                    let catalog = next_request(&mut peer, &cx).await;
+                    assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                    assert_eq!(catalog.method, "tools/list");
+                }
                 let forwarded = next_request(&mut peer, &cx).await;
                 assert_eq!(forwarded.id, Some(RequestId::Number(id)));
                 assert_eq!(forwarded.method, method);
@@ -729,6 +743,65 @@ mod tests {
             drop(host);
             client.close(&cx).unwrap();
             assert!(peer.recv_async(&cx).await.is_err(), "no Apps envelope or extra core request");
+        });
+    }
+
+    #[test]
+    fn memory_apps_tool_visibility_rechecks_before_every_call() {
+        run(|cx| async move {
+            let (mut client, mut peer, _) = connect(&cx, builder(), json!({(APPS): {}}), 4).await;
+            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+            let mut host = client
+                .mcp_apps_wire_host(&cx, transport, configuration())
+                .unwrap();
+            activate(&mut host, &mut view, &cx).await;
+            let mut page = callable_tools(&["selected"]);
+            page["ttlMs"] = json!(60_000);
+            page["tools"][0]["_meta"] = json!({"ui": {"visibility": ["app"]}});
+            respond(&mut peer, &cx, 2, page.clone()).await;
+            respond(&mut peer, &cx, 3, complete("visible")).await;
+            assert_eq!(
+                request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "same-view",
+                    "tools/call",
+                    json!({"name":"selected"})
+                )
+                .await["result"]["content"][0]["text"],
+                "visible"
+            );
+            let catalog = next_request(&mut peer, &cx).await;
+            assert_eq!(catalog.method, "tools/list");
+            assert_eq!(catalog.id, Some(RequestId::Number(2)));
+            let invoked = next_request(&mut peer, &cx).await;
+            assert_eq!(invoked.method, "tools/call");
+            assert_eq!(invoked.id, Some(RequestId::Number(3)));
+
+            page["tools"][0]["_meta"]["ui"]["visibility"] = json!(["model"]);
+            respond(&mut peer, &cx, 4, page).await;
+            let denied = request(
+                &mut host,
+                &mut view,
+                &cx,
+                "same-view",
+                "tools/call",
+                json!({"name":"selected"}),
+            )
+            .await;
+            assert!(denied.get("error").is_some());
+            assert!(denied.get("result").is_none());
+            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+            let fresh = next_request(&mut peer, &cx).await;
+            assert_eq!(fresh.method, "tools/list");
+            assert_eq!(fresh.id, Some(RequestId::Number(4)));
+            drop(host);
+            client.close(&cx).unwrap();
+            assert!(
+                peer.recv_async(&cx).await.is_err(),
+                "revoked visibility sends no tools/call"
+            );
         });
     }
 
@@ -752,9 +825,10 @@ mod tests {
                 let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap()
                     .with_effects(InputEffects { allowed, calls: Arc::clone(&calls) });
                 activate(&mut host, &mut view, &cx).await;
-                respond(&mut peer, &cx, 2, input_required("private-server-state")).await;
+                respond(&mut peer, &cx, 2, callable_tools(&["interactive"])).await;
+                respond(&mut peer, &cx, 3, input_required("private-server-state")).await;
                 if allowed {
-                    respond(&mut peer, &cx, 3, complete("Host approved")).await;
+                    respond(&mut peer, &cx, 4, complete("Host approved")).await;
                 }
                 let original = json!({"name": "interactive", "arguments": {"value": "résumé 東京"}});
                 let response = request(&mut host, &mut view, &cx, "view-input", "tools/call", original.clone()).await;
@@ -764,10 +838,11 @@ mod tests {
                 assert_eq!(calls.lock().unwrap().as_slice(), &[json!({
                     "params": original, "state": "private-server-state",
                 })]);
-                assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(2)));
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
+                assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(3)));
                 if allowed {
                     let continuation = next_request(&mut peer, &cx).await;
-                    assert_eq!(continuation.id, Some(RequestId::Number(3)));
+                    assert_eq!(continuation.id, Some(RequestId::Number(4)));
                     let params = continuation.params.unwrap();
                     assert_eq!(params["name"], original["name"]);
                     assert_eq!(params["arguments"], original["arguments"]);
@@ -776,15 +851,19 @@ mod tests {
                 }
                 // Replacing effects removes the earlier Host approval too.
                 let mut host = host.with_effects(());
-                let refused_id = if allowed { 4 } else { 3 };
+                let refused_id = if allowed { 6 } else { 5 };
+                respond(&mut peer, &cx, refused_id - 1, callable_tools(&["interactive"])).await;
                 respond(&mut peer, &cx, refused_id, input_required("default-refuses")).await;
                 assert!(request(&mut host, &mut view, &cx, "view-input", "tools/call", original)
                     .await.get("error").is_some());
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(refused_id)));
-                let healthy_id = refused_id + 1;
+                let healthy_id = refused_id + 2;
+                respond(&mut peer, &cx, healthy_id - 1, callable_tools(&["healthy"])).await;
                 respond(&mut peer, &cx, healthy_id, complete("healthy")).await;
                 assert_eq!(request(&mut host, &mut view, &cx, "healthy", "tools/call", json!({"name": "healthy"}))
                     .await["result"]["content"][0]["text"], "healthy");
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let healthy = next_request(&mut peer, &cx).await;
                 assert_eq!(healthy.id, Some(RequestId::Number(healthy_id)));
                 assert!(healthy.params.unwrap().get("inputResponses").is_none());
@@ -799,84 +878,236 @@ mod tests {
     #[test]
     fn memory_apps_dropped_backpressured_cleanup_resumes_without_losing_sibling_result() {
         run(|cx| async move {
-            let (mut client, mut peer, _) = connect(&cx, builder(), json!({(APPS): {}}), 1).await;
-            let token = McpRequestCancellation::new();
-            let mut sibling = client.execute_core(&cx, &token, "tools/list", json!({})).await.unwrap();
-            assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(2)));
-            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-            let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap();
-            activate(&mut host, &mut view, &cx).await;
-            enqueue(&mut view, &cx, "cancelled-view", "tools/call", json!({"name": "slow"})).await;
-            let mut drive = Box::pin(host.process_next(&cx));
-            poll_pending(&mut drive).await;
-            // The published call still occupies the only outbound slot.
-            cancel_view(&mut view, &cx, "cancelled-view").await;
-            poll_pending(&mut drive).await;
-            drop(drive);
-            let slow = next_request(&mut peer, &cx).await;
-            assert_eq!(slow.id, Some(RequestId::Number(3)));
-            assert_eq!(slow.params.unwrap()["name"], "slow");
-            respond(&mut peer, &cx, 2, tools()).await;
-            let mut serving = cx.spawn(move |peer_cx| async move {
-                let cancellation = next_request(&mut peer, &peer_cx).await;
-                assert_eq!(cancellation.method, "notifications/cancelled");
-                assert!(cancellation.id.is_none());
-                assert_eq!(cancellation.params.unwrap(), json!({"requestId": 3}));
-                let healthy = next_request(&mut peer, &peer_cx).await;
-                assert_eq!(healthy.id, Some(RequestId::Number(4)));
-                assert_eq!(healthy.method, "tools/call");
-                respond(&mut peer, &peer_cx, 3, complete("late cancelled response")).await;
-                respond(&mut peer, &peer_cx, 4, complete("healthy")).await;
-                peer
-            }).unwrap();
-            let response = request(&mut host, &mut view, &cx, "healthy-view", "tools/call", json!({"name": "healthy"})).await;
-            assert_eq!(response["result"]["content"][0]["text"], "healthy");
-            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
-            drop(host);
-            assert!(matches!(client.next_event(&cx, &token, &mut sibling).await.unwrap(),
-                Some(MemoryRequestEvent::Result(result)) if matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. }))));
-            assert!(!token.is_cancel_requested());
-            assert!(cx.checkpoint().is_ok());
-            let mut peer = serving.join(&cx).await.unwrap();
-            client.close(&cx).unwrap();
-            assert!(peer.recv_async(&cx).await.is_err(), "exactly one cancellation and no replay");
+            for cancel_tool_call in [false, true] {
+                let (mut client, mut peer, _) =
+                    connect(&cx, builder(), json!({(APPS): {}}), 1).await;
+                let token = McpRequestCancellation::new();
+                let mut sibling = client
+                    .execute_core(&cx, &token, "tools/list", json!({}))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    next_request(&mut peer, &cx).await.id,
+                    Some(RequestId::Number(2))
+                );
+                let executor = client.executor.clone();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(&cx, transport, configuration())
+                    .unwrap();
+                activate(&mut host, &mut view, &cx).await;
+                enqueue(
+                    &mut view,
+                    &cx,
+                    "cancelled-view",
+                    "tools/call",
+                    json!({"name": "slow"}),
+                )
+                .await;
+                let cancelled_id = if cancel_tool_call { 4 } else { 3 };
+                let mut drive = Box::pin(host.process_next(&cx));
+                for pending_id in 3..=cancelled_id {
+                    asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(2),
+                        poll_fn(|task| {
+                            assert!(drive.as_mut().poll(task).is_pending());
+                            if executor.pending_records().iter().any(|record| {
+                                record.request_id == RequestId::Number(pending_id)
+                                    && record.send_committed
+                            }) {
+                                Poll::Ready(())
+                            } else {
+                                task.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        }),
+                    )
+                    .await
+                    .expect("the exact Apps request is published before cancellation");
+                    if pending_id != cancelled_id {
+                        let catalog = next_request(&mut peer, &cx).await;
+                        assert_eq!(catalog.id, Some(RequestId::Number(3)));
+                        assert_eq!(catalog.method, "tools/list");
+                        respond(&mut peer, &cx, 3, callable_tools(&["slow"])).await;
+                    }
+                }
+                // Leave either the catalog or the real tool call in the only
+                // outbound slot so its exact cancellation cannot commit yet.
+                cancel_view(&mut view, &cx, "cancelled-view").await;
+                poll_pending(&mut drive).await;
+                drop(drive);
+                let slow = next_request(&mut peer, &cx).await;
+                assert_eq!(slow.id, Some(RequestId::Number(cancelled_id)));
+                if cancel_tool_call {
+                    assert_eq!(slow.method, "tools/call");
+                    assert_eq!(slow.params.unwrap()["name"], "slow");
+                } else {
+                    assert_eq!(slow.method, "tools/list");
+                    assert!(slow.params.unwrap().get("name").is_none());
+                }
+                respond(&mut peer, &cx, 2, tools()).await;
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        let cancellation = next_request(&mut peer, &peer_cx).await;
+                        assert_eq!(cancellation.method, "notifications/cancelled");
+                        assert!(cancellation.id.is_none());
+                        assert_eq!(
+                            cancellation.params.unwrap(),
+                            json!({"requestId": cancelled_id})
+                        );
+                        let catalog = next_request(&mut peer, &peer_cx).await;
+                        assert_eq!(catalog.id, Some(RequestId::Number(cancelled_id + 1)));
+                        assert_eq!(catalog.method, "tools/list");
+                        let late = if cancel_tool_call {
+                            complete("late cancelled response")
+                        } else {
+                            tools()
+                        };
+                        respond(&mut peer, &peer_cx, cancelled_id, late).await;
+                        respond(
+                            &mut peer,
+                            &peer_cx,
+                            cancelled_id + 1,
+                            callable_tools(&["healthy"]),
+                        )
+                        .await;
+                        let healthy = next_request(&mut peer, &peer_cx).await;
+                        assert_eq!(healthy.id, Some(RequestId::Number(cancelled_id + 2)));
+                        assert_eq!(healthy.method, "tools/call");
+                        assert_eq!(healthy.params.unwrap()["name"], "healthy");
+                        respond(&mut peer, &peer_cx, cancelled_id + 2, complete("healthy")).await;
+                        peer
+                    })
+                    .unwrap();
+                let response = request(
+                    &mut host,
+                    &mut view,
+                    &cx,
+                    "healthy-view",
+                    "tools/call",
+                    json!({"name": "healthy"}),
+                )
+                .await;
+                assert_eq!(response["result"]["content"][0]["text"], "healthy");
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Active);
+                drop(host);
+                assert!(
+                    matches!(client.next_event(&cx, &token, &mut sibling).await.unwrap(),
+                Some(MemoryRequestEvent::Result(result)) if matches!(*result, CoreResult::Final(FinalCoreResult::ToolsList { .. })))
+                );
+                assert!(!token.is_cancel_requested());
+                assert!(cx.checkpoint().is_ok());
+                let mut peer = serving.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+                assert!(
+                    peer.recv_async(&cx).await.is_err(),
+                    "exactly one cancellation and no replay"
+                );
+            }
         });
     }
 
     #[test]
     fn memory_apps_stopped_cleanup_context_retains_control_for_later_healthy_client_drive() {
         run(|cx| async move {
-            let (mut client, mut peer, _) = connect(&cx, builder(), json!({(APPS): {}}), 1).await;
-            let cleanup_cx = Cx::for_request();
-            let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
-            let mut host = client.mcp_apps_wire_host(&cleanup_cx, transport, configuration()).unwrap();
-            activate(&mut host, &mut view, &cx).await;
-            enqueue(&mut view, &cx, "stopped-cleanup", "tools/call", json!({"name": "slow"})).await;
-            let mut drive = Box::pin(host.process_next(&cx));
-            poll_pending(&mut drive).await;
-            cleanup_cx.set_cancel_requested(true);
-            cancel_view(&mut view, &cx, "stopped-cleanup").await;
-            assert!(matches!(drive.await, Err(McpAppsHostError::Core(_))));
-            assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
-            drop(host);
-            assert_eq!(next_request(&mut peer, &cx).await.id, Some(RequestId::Number(2)));
-            assert!(client.mcp_apps_active(), "a stopped cleanup owner does not retire the shared client");
-            let mut serving = cx.spawn(move |peer_cx| async move {
-                let control = next_request(&mut peer, &peer_cx).await;
-                assert_eq!(control.method, "notifications/cancelled");
-                assert_eq!(control.params.unwrap(), json!({"requestId": 2}));
-                let ordinary = next_request(&mut peer, &peer_cx).await;
-                assert_eq!(ordinary.id, Some(RequestId::Number(3)));
-                assert_eq!(ordinary.method, "tools/list");
-                respond(&mut peer, &peer_cx, 2, complete("late")).await;
-                respond(&mut peer, &peer_cx, 3, tools()).await;
-                peer
-            }).unwrap();
-            assert!(matches!(client.list_tools(&cx, &McpRequestCancellation::new(), None).await.unwrap(),
-                CoreResult::Final(FinalCoreResult::ToolsList { .. })));
-            let mut peer = serving.join(&cx).await.unwrap();
-            client.close(&cx).unwrap();
-            assert!(peer.recv_async(&cx).await.is_err());
+            for cancel_tool_call in [false, true] {
+                let (mut client, mut peer, _) =
+                    connect(&cx, builder(), json!({(APPS): {}}), 1).await;
+                let executor = client.executor.clone();
+                let cleanup_cx = Cx::for_request();
+                let (transport, mut view) = mcp_apps_in_memory_wire_pair(8);
+                let mut host = client
+                    .mcp_apps_wire_host(&cleanup_cx, transport, configuration())
+                    .unwrap();
+                activate(&mut host, &mut view, &cx).await;
+                enqueue(
+                    &mut view,
+                    &cx,
+                    "stopped-cleanup",
+                    "tools/call",
+                    json!({"name": "slow"}),
+                )
+                .await;
+                let cancelled_id = if cancel_tool_call { 3 } else { 2 };
+                let mut drive = Box::pin(host.process_next(&cx));
+                for pending_id in 2..=cancelled_id {
+                    asupersync::time::timeout(
+                        cx.now(),
+                        Duration::from_secs(2),
+                        poll_fn(|task| {
+                            assert!(drive.as_mut().poll(task).is_pending());
+                            if executor.pending_records().iter().any(|record| {
+                                record.request_id == RequestId::Number(pending_id)
+                                    && record.send_committed
+                            }) {
+                                Poll::Ready(())
+                            } else {
+                                task.waker().wake_by_ref();
+                                Poll::Pending
+                            }
+                        }),
+                    )
+                    .await
+                    .expect("the exact Apps request is published before its cleanup owner stops");
+                    if pending_id != cancelled_id {
+                        let catalog = next_request(&mut peer, &cx).await;
+                        assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                        assert_eq!(catalog.method, "tools/list");
+                        respond(&mut peer, &cx, 2, callable_tools(&["slow"])).await;
+                    }
+                }
+                cleanup_cx.set_cancel_requested(true);
+                cancel_view(&mut view, &cx, "stopped-cleanup").await;
+                assert!(matches!(drive.await, Err(McpAppsHostError::Core(_))));
+                assert_eq!(host.lifecycle(), McpAppsBridgeLifecycle::Closed);
+                drop(host);
+                let abandoned = next_request(&mut peer, &cx).await;
+                assert_eq!(abandoned.id, Some(RequestId::Number(cancelled_id)));
+                if cancel_tool_call {
+                    assert_eq!(abandoned.method, "tools/call");
+                    assert_eq!(abandoned.params.unwrap()["name"], "slow");
+                } else {
+                    assert_eq!(abandoned.method, "tools/list");
+                    assert!(abandoned.params.unwrap().get("name").is_none());
+                }
+                assert!(
+                    client.mcp_apps_active(),
+                    "a stopped cleanup owner does not retire the shared client"
+                );
+                let mut serving = cx
+                    .spawn(move |peer_cx| async move {
+                        let control = next_request(&mut peer, &peer_cx).await;
+                        assert_eq!(control.method, "notifications/cancelled");
+                        assert!(control.id.is_none());
+                        assert_eq!(control.params.unwrap(), json!({"requestId": cancelled_id}));
+                        let ordinary = next_request(&mut peer, &peer_cx).await;
+                        assert_eq!(ordinary.id, Some(RequestId::Number(cancelled_id + 1)));
+                        assert_eq!(ordinary.method, "tools/list");
+                        let late = if cancel_tool_call {
+                            complete("late cancelled response")
+                        } else {
+                            tools()
+                        };
+                        respond(&mut peer, &peer_cx, cancelled_id, late).await;
+                        respond(&mut peer, &peer_cx, cancelled_id + 1, tools()).await;
+                        peer
+                    })
+                    .unwrap();
+                assert!(matches!(
+                    client
+                        .list_tools(&cx, &McpRequestCancellation::new(), None)
+                        .await
+                        .unwrap(),
+                    CoreResult::Final(FinalCoreResult::ToolsList { .. })
+                ));
+                let mut peer = serving.join(&cx).await.unwrap();
+                client.close(&cx).unwrap();
+                assert!(
+                    peer.recv_async(&cx).await.is_err(),
+                    "deferred cancellation is sent exactly once without replay"
+                );
+            }
         });
     }
 
@@ -974,11 +1205,12 @@ mod tests {
                     .with_effects(effects);
                 activate(&mut host, &mut view, &cx).await;
                 for (id, result) in [
-                    (2, input_required("before-task-private-state")),
-                    (3, snapshot("working", true)),
-                    (4, snapshot("input_required", false)),
-                    (5, json!({"resultType": "complete"})),
-                    (6, snapshot("completed", false)),
+                    (2, callable_tools(&["job"])),
+                    (3, input_required("before-task-private-state")),
+                    (4, snapshot("working", true)),
+                    (5, snapshot("input_required", false)),
+                    (6, json!({"resultType": "complete"})),
+                    (7, snapshot("completed", false)),
                 ] {
                     respond(&mut peer, &cx, id, result).await;
                 }
@@ -994,9 +1226,13 @@ mod tests {
                 assert_eq!(calls.lock().unwrap().len(), 2, "one ordinary MRTR round and one Task input round");
                 assert!(calls.lock().unwrap().iter().all(|call| call["params"] == original));
                 assert!(snapshots.load(Ordering::Acquire) > 0);
+                let catalog = next_request(&mut peer, &cx).await;
+                assert_eq!(catalog.id, Some(RequestId::Number(2)));
+                assert_eq!(catalog.method, "tools/list");
+                assert!(catalog.params.unwrap()["_meta"][CAPS]["extensions"].get(TASKS).is_none());
                 for (id, method) in [
-                    (2, "tools/call"), (3, "tools/call"), (4, "tasks/get"),
-                    (5, "tasks/update"), (6, "tasks/get"),
+                    (3, "tools/call"), (4, "tools/call"), (5, "tasks/get"),
+                    (6, "tasks/update"), (7, "tasks/get"),
                 ] {
                     let forwarded = next_request(&mut peer, &cx).await;
                     assert_eq!(forwarded.id, Some(RequestId::Number(id)));
@@ -1004,7 +1240,7 @@ mod tests {
                     let params = forwarded.params.unwrap();
                     assert_eq!(params["_meta"][CAPS]["extensions"][TASKS], json!({}));
                     assert!(!params.to_string().contains("view-task"));
-                    if id == 3 {
+                    if id == 4 {
                         assert_eq!(params["requestState"], "before-task-private-state");
                         assert_eq!(params["inputResponses"], input_response());
                         assert_eq!(params["arguments"], original["arguments"]);
@@ -1012,16 +1248,18 @@ mod tests {
                     if method.starts_with("tasks/") {
                         assert_eq!(params["taskId"], "private-server-task");
                     }
-                    if id == 5 {
+                    if id == 6 {
                         assert_eq!(params["inputResponses"], input_response());
                     }
                 }
                 let mut host = host.with_effects(());
-                respond(&mut peer, &cx, 7, complete("ordinary")).await;
+                respond(&mut peer, &cx, 8, callable_tools(&["job"])).await;
+                respond(&mut peer, &cx, 9, complete("ordinary")).await;
                 assert_eq!(request(&mut host, &mut view, &cx, "view-task", "tools/call", original)
                     .await["result"]["content"][0]["text"], "ordinary");
+                assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                 let ordinary = next_request(&mut peer, &cx).await;
-                assert_eq!(ordinary.id, Some(RequestId::Number(7)));
+                assert_eq!(ordinary.id, Some(RequestId::Number(9)));
                 assert!(ordinary.params.unwrap()["_meta"][CAPS]["extensions"].get(TASKS).is_none(),
                     "new effects ownership cannot retain prior Task creation consent");
                 drop(host);
@@ -1049,24 +1287,28 @@ mod tests {
                     let mut host = client.mcp_apps_wire_host(&cx, transport, configuration()).unwrap()
                         .with_effects(effects);
                     activate(&mut host, &mut view, &cx).await;
+                    respond(&mut peer, &cx, 2, callable_tools(&["job"])).await;
                     if configured {
-                        respond(&mut peer, &cx, 2, snapshot("working", true)).await;
+                        respond(&mut peer, &cx, 3, snapshot("working", true)).await;
                     }
                     assert!(request(&mut host, &mut view, &cx, "refused-task", "tools/call", json!({"name": "job"}))
                         .await.get("error").is_some());
                     assert_eq!(snapshots.load(Ordering::Acquire), 0);
                     assert!(calls.lock().unwrap().is_empty());
+                    assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                     let healthy_id = if configured {
                         let unapproved = next_request(&mut peer, &cx).await;
-                        assert_eq!(unapproved.id, Some(RequestId::Number(2)));
+                        assert_eq!(unapproved.id, Some(RequestId::Number(3)));
                         assert!(unapproved.params.unwrap()["_meta"][CAPS]["extensions"].get(TASKS).is_none());
-                        3
+                        5
                     } else {
-                        2
+                        4
                     };
+                    respond(&mut peer, &cx, healthy_id - 1, callable_tools(&["healthy"])).await;
                     respond(&mut peer, &cx, healthy_id, complete("healthy")).await;
                     assert_eq!(request(&mut host, &mut view, &cx, "healthy", "tools/call", json!({"name": "healthy"}))
                         .await["result"]["content"][0]["text"], "healthy");
+                    assert_eq!(next_request(&mut peer, &cx).await.method, "tools/list");
                     let healthy = next_request(&mut peer, &cx).await;
                     assert_eq!(healthy.id, Some(RequestId::Number(healthy_id)));
                     assert_eq!(healthy.method, "tools/call", "no unapproved Task lifecycle request");
