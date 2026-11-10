@@ -14075,69 +14075,28 @@ impl HttpSubscriptionListener<'_> {
     }
 
     /// Collects the remaining live records into the established terminal record.
+    ///
+    /// All notification categories share the limits in
+    /// [`http_executor::MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS`] and
+    /// [`http_executor::MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES`]. Exceeding either
+    /// limit closes this response and returns an error without a partial
+    /// collection. Use [`Self::next_event`] for longer-lived subscriptions.
     pub async fn collect(
-        mut self,
+        self,
         cx: &Cx,
     ) -> Result<ModernHttpSubscriptionListenCollector, HttpClientError> {
-        let mut notifications = Vec::new();
-        #[cfg(feature = "tasks")]
-        let mut task_notifications = Vec::new();
-
-        loop {
-            let event = self.next_event(cx).await?.ok_or_else(|| {
-                HttpClientError::CoreResult(McpError::invalid_request(
-                    "HTTP subscriptions listener ended after its terminal result",
-                ))
-            })?;
-            match event {
-                ModernHttpSubscriptionListenEvent::Acknowledged { .. } => {}
-                ModernHttpSubscriptionListenEvent::Notification(notification) => {
-                    notifications.push(notification);
-                }
-                #[cfg(feature = "tasks")]
-                ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
-                    task_notifications.push(notification);
-                }
-                ModernHttpSubscriptionListenEvent::Terminal {
-                    subscription_id,
-                    result: terminal,
-                } => {
-                    let accepted_filter =
-                        self.listener.accepted_filter().cloned().ok_or_else(|| {
-                            HttpClientError::CoreResult(McpError::invalid_request(
-                                "HTTP subscriptions listener terminated before acknowledgement",
-                            ))
-                        })?;
-                    return Ok(ModernHttpSubscriptionListenCollector {
-                        subscription_id,
-                        accepted_filter,
-                        notifications,
-                        #[cfg(feature = "tasks")]
-                        task_notifications,
-                        terminal: ModernHttpSubscriptionTermination::Complete(terminal),
-                    });
-                }
-                ModernHttpSubscriptionListenEvent::Cancelled {
-                    subscription_id,
-                    params,
-                } => {
-                    let accepted_filter =
-                        self.listener.accepted_filter().cloned().ok_or_else(|| {
-                            HttpClientError::CoreResult(McpError::invalid_request(
-                                "HTTP subscriptions listener cancelled before acknowledgement",
-                            ))
-                        })?;
-                    return Ok(ModernHttpSubscriptionListenCollector {
-                        subscription_id,
-                        accepted_filter,
-                        notifications,
-                        #[cfg(feature = "tasks")]
-                        task_notifications,
-                        terminal: ModernHttpSubscriptionTermination::Cancelled(params),
-                    });
-                }
-            }
-        }
+        let Self {
+            listener,
+            final_result_cache,
+        } = self;
+        listener
+            .collect_with_notification_observer(cx, |notification| {
+                final_result_cache.invalidate_notification(notification);
+            })
+            .await
+            .map_err(|error| {
+                HttpClientError::Connection(ClientHttpConnectionError::SubscriptionsListen(error))
+            })
     }
 }
 

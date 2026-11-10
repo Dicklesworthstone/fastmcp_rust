@@ -301,6 +301,22 @@ const MAX_MODERN_HTTP_INTERLEAVED_CONTROL_FRAMES: usize = 64;
 /// which admits the 8 MiB decoded message a single event may carry.
 pub const MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES: usize = 9 * 1024 * 1024;
 
+/// Maximum notifications retained by one HTTP subscription collector.
+///
+/// Catalog, resource, and Tasks notifications share this aggregate bound.
+/// Incremental reads through [`ModernHttpSubscriptionListener::next_event`]
+/// do not accumulate a collection and are not subject to this lifetime limit.
+pub const MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS: usize =
+    MAX_PENDING_MODERN_HTTP_SSE_EVENTS;
+
+/// Maximum admitted JSON payload bytes retained by one HTTP subscription collector.
+///
+/// This counts the original UTF-8 payload of every retained catalog, resource,
+/// and Tasks notification, including metadata. It is separate from the per-event
+/// [`SseLimits`] and uses LIMIT-01's guarded stream-queue byte bound.
+pub const MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES: usize =
+    MAX_PENDING_MODERN_HTTP_SSE_EVENT_BYTES;
+
 /// Maximum retained bytes in one legacy SSE event, including its field names
 /// (LIMIT-01 guarded default: 9 MiB).
 #[cfg(feature = "legacy-2024-11-05")]
@@ -1165,6 +1181,7 @@ impl ModernHttpResponseStream {
             accepted_filter: None,
             resource_relations,
             maximum_jsonrpc_bytes,
+            last_event_bytes: 0,
             terminal_received: false,
         })
     }
@@ -1402,7 +1419,36 @@ pub struct ModernHttpSubscriptionListener {
     accepted_filter: Option<SubscriptionFilter>,
     resource_relations: ResourceSubscriptionRelations,
     maximum_jsonrpc_bytes: usize,
+    last_event_bytes: usize,
     terminal_received: bool,
+}
+
+#[derive(Default)]
+struct HttpSubscriptionCollectionBudget {
+    notifications: usize,
+    bytes: usize,
+}
+
+impl HttpSubscriptionCollectionBudget {
+    fn charge(&mut self, bytes: usize) -> Result<(), ModernHttpSubscriptionListenError> {
+        let notifications = self
+            .notifications
+            .checked_add(1)
+            .filter(|count| *count <= MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS)
+            .ok_or(ModernHttpSubscriptionListenError::CollectionCountExceeded {
+                maximum_notifications: MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS,
+            })?;
+        let retained_bytes = self
+            .bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES)
+            .ok_or(ModernHttpSubscriptionListenError::CollectionBytesExceeded {
+                maximum_bytes: MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES,
+            })?;
+        self.notifications = notifications;
+        self.bytes = retained_bytes;
+        Ok(())
+    }
 }
 
 impl ModernHttpSubscriptionListener {
@@ -1540,6 +1586,7 @@ impl ModernHttpSubscriptionListener {
         &mut self,
         event: String,
     ) -> Result<ModernHttpSubscriptionListenEvent, ModernHttpSubscriptionListenError> {
+        let event_bytes = event.len();
         let admitted = self.admit_listen_payload(event)?;
         if !matches!(
             admitted,
@@ -1550,6 +1597,7 @@ impl ModernHttpSubscriptionListener {
                 .observe_subscription_activity()
                 .map_err(ModernHttpSubscriptionListenError::Executor)?;
         }
+        self.last_event_bytes = event_bytes;
         Ok(admitted)
     }
 
@@ -1747,10 +1795,28 @@ impl ModernHttpSubscriptionListener {
     }
 
     /// Collects this live listener into the terminal compatibility record.
+    ///
+    /// Retention is bounded by [`MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS`]
+    /// and [`MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES`] across all notification
+    /// categories. Exceeding either bound closes this response and returns an
+    /// error without a partial collection. Use [`Self::next_event`] to consume
+    /// longer-lived subscriptions incrementally.
     pub async fn collect(
-        mut self,
+        self,
         cx: &Cx,
     ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError> {
+        self.collect_with_notification_observer(cx, |_| {}).await
+    }
+
+    pub(crate) async fn collect_with_notification_observer<F>(
+        mut self,
+        cx: &Cx,
+        mut observe: F,
+    ) -> Result<ModernHttpSubscriptionListenCollector, ModernHttpSubscriptionListenError>
+    where
+        F: FnMut(&ServerNotification),
+    {
+        let mut budget = HttpSubscriptionCollectionBudget::default();
         let mut notifications = Vec::new();
         #[cfg(feature = "tasks")]
         let mut task_notifications = Vec::new();
@@ -1764,10 +1830,21 @@ impl ModernHttpSubscriptionListener {
             match event {
                 ModernHttpSubscriptionListenEvent::Acknowledged { .. } => {}
                 ModernHttpSubscriptionListenEvent::Notification(notification) => {
+                    // An admitted catalog change still invalidates cached data
+                    // when retaining that event would exceed this collection.
+                    observe(&notification);
+                    if let Err(error) = budget.charge(self.last_event_bytes) {
+                        self.stream.close();
+                        return Err(error);
+                    }
                     notifications.push(notification);
                 }
                 #[cfg(feature = "tasks")]
                 ModernHttpSubscriptionListenEvent::TaskNotification(notification) => {
+                    if let Err(error) = budget.charge(self.last_event_bytes) {
+                        self.stream.close();
+                        return Err(error);
+                    }
                     task_notifications.push(notification);
                 }
                 ModernHttpSubscriptionListenEvent::Terminal {
@@ -3958,6 +4035,16 @@ pub enum ModernHttpSubscriptionListenError {
         /// The request ID supplied in the cancellation parameters.
         actual: RequestId,
     },
+    /// Retaining another notification would exceed the collector's count bound.
+    CollectionCountExceeded {
+        /// The aggregate notification limit across all collected categories.
+        maximum_notifications: usize,
+    },
+    /// Retaining another notification would exceed the collector's payload bound.
+    CollectionBytesExceeded {
+        /// The aggregate admitted JSON payload limit in UTF-8 bytes.
+        maximum_bytes: usize,
+    },
     /// The SSE stream reached EOF without a complete or cancellation terminal.
     EndOfStream {
         /// The parser's exact report of discarded framing at EOF.
@@ -4057,6 +4144,14 @@ impl fmt::Display for ModernHttpSubscriptionListenError {
                 formatter,
                 "subscriptions/listen cancellation ID {actual:?} did not match request {expected:?}"
             ),
+            Self::CollectionCountExceeded { maximum_notifications } => write!(
+                formatter,
+                "subscriptions/listen collection exceeded {maximum_notifications} notifications"
+            ),
+            Self::CollectionBytesExceeded { maximum_bytes } => write!(
+                formatter,
+                "subscriptions/listen collection exceeded {maximum_bytes} JSON payload bytes"
+            ),
             Self::EndOfStream { .. } => formatter.write_str(
                 "subscriptions/listen SSE reached EOF before a terminal signal",
             ),
@@ -4097,6 +4192,8 @@ impl std::error::Error for ModernHttpSubscriptionListenError {
             | Self::TaskEventOutsideAcceptedFilter
             | Self::CallerCancelled { .. }
             | Self::CancellationRequestIdMismatch { .. }
+            | Self::CollectionCountExceeded { .. }
+            | Self::CollectionBytesExceeded { .. }
             | Self::EndOfStream { .. } => None,
         }
     }
@@ -16997,6 +17094,296 @@ mod tests {
             .join()
             .expect("subscriptions/listen termination server joins");
         result
+    }
+
+    fn http_subscription_collection_bound_probe(
+        high_level: bool,
+        incremental: bool,
+        notification_count: usize,
+        task_count: usize,
+    ) {
+        const CATALOG_PAYLOAD: &str = r#"{ "jsonrpc":"2.0", "method":"notifications/tools/list_changed","params":{"_meta":{"io.modelcontextprotocol/subscriptionId":2,"test/collection-note":"é"}}}"#;
+
+        fn retained_count(collector: ModernHttpSubscriptionListenCollector) -> usize {
+            assert!(matches!(
+                collector.terminal,
+                super::ModernHttpSubscriptionTermination::Complete(_)
+            ));
+            let count = collector.notifications.len();
+            #[cfg(feature = "tasks")]
+            let count = count + collector.task_notifications.len();
+            count
+        }
+
+        fn observe_incremental(
+            event: Option<ModernHttpSubscriptionListenEvent>,
+            count: &mut usize,
+        ) -> bool {
+            match event.expect("subscription must reach its terminal result") {
+                ModernHttpSubscriptionListenEvent::Acknowledged { .. } => false,
+                ModernHttpSubscriptionListenEvent::Notification(_) => {
+                    *count += 1;
+                    false
+                }
+                #[cfg(feature = "tasks")]
+                ModernHttpSubscriptionListenEvent::TaskNotification(_) => {
+                    *count += 1;
+                    false
+                }
+                ModernHttpSubscriptionListenEvent::Terminal { subscription_id, .. } => {
+                    assert!(subscription_id.correlates_with(&RequestId::Number(2)));
+                    true
+                }
+                ModernHttpSubscriptionListenEvent::Cancelled { .. } => {
+                    panic!("collection fixture must complete without cancellation")
+                }
+            }
+        }
+
+        assert!(task_count <= notification_count);
+        assert!(!high_level || task_count == 0);
+        #[cfg(not(feature = "tasks"))]
+        assert_eq!(task_count, 0);
+        let overflow = !incremental
+            && notification_count > super::MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS;
+        let filter = SubscriptionFilter {
+            tools_list_changed: Some(true),
+            ..SubscriptionFilter::default()
+        };
+        #[cfg(feature = "tasks")]
+        let filter = {
+            let mut filter = filter;
+            if task_count > 0 {
+                fastmcp_protocol::set_task_subscription_ids(
+                    &mut filter,
+                    vec![fastmcp_protocol::FinalTaskId::parse("task-73").unwrap()],
+                )
+                .unwrap();
+            }
+            filter
+        };
+        let discovery_body = modern_discovery_body().to_vec();
+        #[cfg(feature = "tasks")]
+        let discovery_body = if task_count > 0 {
+            modern_tasks_discovery_body()
+        } else {
+            discovery_body
+        };
+        let peer_filter = filter.clone();
+        let peer = TcpListener::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let modern_target = format!("http://{}/mcp", peer.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut discovery = accept_notification_test_peer(&peer);
+            let request = read_request(&mut discovery);
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["method"], "server/discover");
+            write_response(&mut discovery, 200, "application/json", &discovery_body);
+
+            let mut stream = accept_notification_test_peer(&peer);
+            let request = read_request(&mut stream);
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["method"], "subscriptions/listen");
+            assert_eq!(body["id"], 2);
+            begin_chunked_sse(&mut stream);
+            let acknowledgement = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/subscriptions/acknowledged",
+                "params": {
+                    "_meta": {"io.modelcontextprotocol/subscriptionId": 2},
+                    "notifications": peer_filter,
+                },
+            });
+            write_chunked_sse_event(&mut stream, &format!("data: {acknowledgement}\n\n"));
+            let catalog_event = format!("data: {CATALOG_PAYLOAD}\n\n");
+            let task_event = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tasks\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2},\"taskId\":\"task-73\",\"status\":\"working\",\"createdAt\":\"2026-07-28T12:00:00.000Z\",\"lastUpdatedAt\":\"2026-07-28T12:00:00.000Z\",\"ttlMs\":null}}\n\n";
+            for index in 0..notification_count {
+                let event = if index < task_count {
+                    task_event
+                } else {
+                    catalog_event.as_str()
+                };
+                // Separate small chunks exercise aggregate collection, not
+                // the pending-frame or per-event admission limits.
+                write_chunked_sse_event(&mut stream, event);
+            }
+            if !overflow {
+                write_chunked_sse_event(
+                    &mut stream,
+                    "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":2}}}\n\n",
+                );
+            }
+            // Leave the body live: the client must close its own stream on
+            // refusal or a terminal event. The socket has a bounded timeout.
+            let mut byte = [0_u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                other => panic!("subscription did not close its owned stream: {other:?}"),
+            }
+        });
+
+        let cx = HTTP_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE));
+        let builder = ClientBuilder::new().protocol_plan(plan(
+            &modern_target,
+            "http://127.0.0.1:9/legacy-sse",
+            "http://127.0.0.1:9/legacy-message",
+            ProtocolPolicy::ModernOnly,
+        ));
+        let limits = SseLimits::new(2_048, 16_384, 16).unwrap();
+        let result: Result<usize, ModernHttpSubscriptionListenError> = if high_level {
+            let mut client = runtime_block_on(builder.connect_http_client_with_cx(&cx)).unwrap();
+            let mut listener =
+                runtime_block_on(client.open_subscriptions_listener(&cx, filter, limits)).unwrap();
+            let result = if incremental {
+                let mut count = 0;
+                loop {
+                    let event = runtime_block_on(listener.next_event(&cx)).unwrap();
+                    if observe_incremental(event, &mut count) {
+                        break;
+                    }
+                }
+                drop(listener);
+                Ok(count)
+            } else {
+                runtime_block_on(listener.collect(&cx))
+                    .map(retained_count)
+                    .map_err(|error| match error {
+                        crate::HttpClientError::Connection(
+                            ClientHttpConnectionError::SubscriptionsListen(error),
+                        ) => error,
+                        other => panic!("unexpected high-level collection error: {other:?}"),
+                    })
+            };
+            // This includes the admitted event that exceeds the retention
+            // budget: refusing to retain it must not preserve stale catalogs.
+            assert_eq!(
+                client.final_result_cache_stats().invalidations,
+                u64::try_from(notification_count).unwrap()
+            );
+            result
+        } else {
+            let connection = runtime_block_on(builder.connect_http_with_cx(&cx)).unwrap();
+            let mut listener = runtime_block_on(connection.open_subscriptions_listener(
+                &cx,
+                RequestId::Number(2),
+                filter,
+                limits,
+            ))
+            .unwrap();
+            if incremental {
+                let mut count = 0;
+                loop {
+                    let event = runtime_block_on(listener.next_event(&cx)).unwrap();
+                    if matches!(
+                        &event,
+                        Some(ModernHttpSubscriptionListenEvent::Notification(_))
+                    ) {
+                        assert_eq!(listener.last_event_bytes, CATALOG_PAYLOAD.len());
+                    }
+                    if observe_incremental(event, &mut count) {
+                        break;
+                    }
+                }
+                drop(listener);
+                Ok(count)
+            } else {
+                runtime_block_on(listener.collect(&cx)).map(retained_count)
+            }
+        };
+        if overflow {
+            assert!(matches!(
+                result,
+                Err(ModernHttpSubscriptionListenError::CollectionCountExceeded {
+                    maximum_notifications,
+                }) if maximum_notifications == super::MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS
+            ));
+        } else {
+            assert_eq!(result.unwrap(), notification_count);
+        }
+        assert!(cx.checkpoint().is_ok(), "collection must not cancel its caller");
+        server.join().expect("subscription bound peer must join");
+    }
+
+    #[test]
+    fn http_subscription_collectors_enforce_aggregate_notification_bound() {
+        let maximum = super::MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS;
+        for high_level in [false, true] {
+            http_subscription_collection_bound_probe(high_level, false, maximum, 0);
+            http_subscription_collection_bound_probe(high_level, false, maximum + 1, 0);
+        }
+    }
+
+    #[test]
+    fn http_subscription_incremental_reads_outlive_collection_bound() {
+        for high_level in [false, true] {
+            http_subscription_collection_bound_probe(
+                high_level,
+                true,
+                super::MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS + 1,
+                0,
+            );
+        }
+    }
+
+    #[cfg(feature = "tasks")]
+    #[test]
+    fn http_subscription_collection_shares_task_and_catalog_bound() {
+        let maximum = super::MAX_COLLECTED_HTTP_SUBSCRIPTION_NOTIFICATIONS;
+        // Neither individual vector exceeds the limit. Their sum does.
+        http_subscription_collection_bound_probe(false, false, maximum + 1, maximum);
+    }
+
+    #[test]
+    fn http_subscription_collection_budget_accepts_exact_byte_limit() {
+        let maximum = super::MAX_COLLECTED_HTTP_SUBSCRIPTION_BYTES;
+        let mut budget = super::HttpSubscriptionCollectionBudget::default();
+        budget.charge(maximum - 1).unwrap();
+        budget.charge(1).unwrap();
+        assert_eq!((budget.notifications, budget.bytes), (2, maximum));
+        assert!(matches!(
+            budget.charge(1),
+            Err(ModernHttpSubscriptionListenError::CollectionBytesExceeded { maximum_bytes })
+                if maximum_bytes == maximum
+        ));
+        assert_eq!((budget.notifications, budget.bytes), (2, maximum));
+
+        let mut empty = super::HttpSubscriptionCollectionBudget::default();
+        assert!(matches!(
+            empty.charge(maximum + 1),
+            Err(ModernHttpSubscriptionListenError::CollectionBytesExceeded { maximum_bytes })
+                if maximum_bytes == maximum
+        ));
+        assert_eq!((empty.notifications, empty.bytes), (0, 0));
+    }
+
+    #[test]
+    fn http_subscription_collection_budget_refuses_counter_overflow_atomically() {
+        let mut bytes = super::HttpSubscriptionCollectionBudget {
+            notifications: 0,
+            bytes: usize::MAX,
+        };
+        assert!(matches!(
+            bytes.charge(1),
+            Err(ModernHttpSubscriptionListenError::CollectionBytesExceeded { .. })
+        ));
+        assert_eq!((bytes.notifications, bytes.bytes), (0, usize::MAX));
+
+        let mut count = super::HttpSubscriptionCollectionBudget {
+            notifications: usize::MAX,
+            bytes: 0,
+        };
+        assert!(matches!(
+            count.charge(0),
+            Err(ModernHttpSubscriptionListenError::CollectionCountExceeded { .. })
+        ));
+        assert_eq!((count.notifications, count.bytes), (usize::MAX, 0));
     }
 
     #[cfg(feature = "tasks")]
