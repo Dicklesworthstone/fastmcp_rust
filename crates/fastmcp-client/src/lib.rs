@@ -28863,8 +28863,13 @@ mod tests {
         ambient_clock.advance(20_000_000);
         assert_eq!(ambient_timer.process_timers(), 0);
         assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
-        caller_clock.advance(10_000_000);
-        assert_eq!(caller_timer.process_timers(), 1);
+        // Fire with the caller's worker on loan so this test, not that
+        // runtime's background worker, observes the timer.
+        let fired = caller_runtime.block_on(async {
+            caller_clock.advance(10_000_000);
+            caller_timer.process_timers()
+        });
+        assert_eq!(fired, 1);
         assert!(wakes.0.load(Ordering::SeqCst) > 0);
         drop(waiting);
         assert_eq!(caller_timer.pending_count(), 0);
@@ -42075,6 +42080,28 @@ exec sleep 2
     }
 
     #[cfg(unix)]
+    thread_local! {
+        /// Supplies test callers with their own timer. Child cleanup (a
+        /// bounded reap after close or kill) and MRTR operation waits use only
+        /// the caller's timer, never an ambient runtime's, and
+        /// Cx::for_request() has none, so those operations were refused. The
+        /// runtime lives for the test thread, past every client that retains
+        /// its caller context; it is never loaned to block_on, so its own
+        /// worker fires timers.
+        static TIMER_TEST_RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("timer test caller runtime must build");
+    }
+
+    /// A caller context that owns a live timer.
+    #[cfg(unix)]
+    fn timer_test_caller() -> Cx {
+        TIMER_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE))
+    }
+
+    #[cfg(unix)]
     fn http_test_runtime_block_on<F: std::future::Future>(future: F) -> F::Output {
         RuntimeBuilder::current_thread()
             .build()
@@ -44624,7 +44651,7 @@ exec sleep 2
             );
         });
 
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(http_cache_test_plan(&modern_target))
@@ -45178,7 +45205,7 @@ exec sleep 2
                 &serde_json::to_vec(&response).unwrap(),
             );
         });
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let callbacks = Arc::new(AtomicUsize::new(0));
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
@@ -46959,7 +46986,7 @@ exec sleep 2
             }
         });
 
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let handlers =
             ReverseRequestHandlers::new().with_modern_roots_list(|_cx, _cancellation, _params| {
                 Box::pin(async move { Ok(FinalEmbeddedRootsListResult { roots: Vec::new() }) })
@@ -53332,8 +53359,13 @@ exec sleep 2
                 assert!(waiting.as_mut().poll(&mut context).is_pending());
                 assert_eq!(caller.checkpoint().is_err(), cancelled);
 
-                caller_clock.advance(5_000_000);
-                assert_eq!(caller_timer.process_timers(), 1);
+                // Fire with the caller's worker on loan so this test, not
+                // that runtime's background worker, observes the timer.
+                let fired = caller_runtime.block_on(async {
+                    caller_clock.advance(5_000_000);
+                    caller_timer.process_timers()
+                });
+                assert_eq!(fired, 1);
                 assert!(wakes.0.load(Ordering::SeqCst) > 0);
                 assert!(matches!(
                     waiting.as_mut().poll(&mut context),
@@ -53374,8 +53406,13 @@ exec sleep 2
             assert!(waiting.as_mut().poll(&mut context).is_pending());
             assert_eq!(caller_timer.pending_count(), 1);
             assert_eq!(ambient_timer.pending_count(), 0);
-            caller_clock.advance(3_000_000);
-            assert_eq!(caller_timer.process_timers(), 1);
+            // Fire with the caller's worker on loan so this test, not that
+            // runtime's background worker, observes the timer.
+            let fired = caller_runtime.block_on(async {
+                caller_clock.advance(3_000_000);
+                caller_timer.process_timers()
+            });
+            assert_eq!(fired, 1);
             assert!(matches!(
                 waiting.as_mut().poll(&mut context),
                 Poll::Ready(Err(error))
@@ -57637,7 +57674,7 @@ IFS= read -r second || exit 91
                     RequestTimeoutPolicy::new(Duration::from_secs(10), Duration::from_secs(30))
                         .unwrap(),
                 )
-                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+                .connect_stdio_with_cx(&timer_test_caller(), "sh", &["-c", script]),
         )
         .expect("the public stdio builder discovers the typed catalog peer")
     }
@@ -58193,7 +58230,7 @@ while IFS= read -r unexpected; do exit 34; done
 "#,
         );
         let mut client = connect_stdio_catalog_test_client(&script);
-        let cx = Cx::for_request();
+        let cx = timer_test_caller();
         let executor = client.multiplexed_stdio_executor().unwrap();
         let next_id = Arc::clone(&client.next_id);
         let response_sender = Arc::clone(&client.response_sender);
@@ -65166,7 +65203,7 @@ exec sleep 5
                 })
             });
         let script = modern_mrtr_two_input_client_script(!cancel);
-        let connection_cx = Cx::for_request();
+        let connection_cx = timer_test_caller();
         let mut client = http_test_runtime_block_on(
             ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
@@ -65179,7 +65216,7 @@ exec sleep 5
         let next_id = client.next_id.load(Ordering::SeqCst);
         // Cleanup has a separate live caller even when the request's Cx was
         // cancelled. The negative peer accepts EOF only, never a partial retry.
-        let cleanup_cx = Cx::for_request();
+        let cleanup_cx = timer_test_caller();
         http_test_runtime_block_on(client.close_with_cx(&cleanup_cx)).unwrap();
         assert!(client.child.is_none());
         assert_eq!(roots_calls.load(Ordering::SeqCst), 1);

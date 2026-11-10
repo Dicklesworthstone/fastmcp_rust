@@ -254,29 +254,45 @@ fn silent_poll_interval_wakes_on_each_owner_stop_without_advancing_the_clock() {
 #[test]
 fn poll_interval_uses_original_deadline_and_not_the_foreign_ambient_clock() {
     let (runtime, cx, timer, clock, client, credential) = environment();
-    let foreign = Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(Time::ZERO));
-    foreign.set_cancel_requested(true);
-    let cancellation = McpRequestCancellation::new();
-    let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
-    let wakes = Arc::new(Wakes::default());
-    let waker = Waker::from(Arc::clone(&wakes));
-    let mut interval = Box::pin(pause(&cx, &cancellation, &client.session, &credential,
-        bounds, Time::from_nanos(u64::MAX)));
-    {
-        let _ambient = Cx::set_current(Some(foreign.clone()));
-        assert!(poll(interval.as_mut(), &waker).is_pending());
-    }
-    clock.advance(9_999_999_999);
-    assert_eq!(timer.process_timers(), 0);
-    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
-    clock.advance(1);
-    assert!(timer.process_timers() > 0);
-    assert!(wakes.0.load(Ordering::SeqCst) > 0);
-    assert!(matches!(poll(interval.as_mut(), &waker), Poll::Ready(Err(DpopHttpError::TimedOut))));
-    assert_eq!(timer.pending_count(), 0);
-    assert!(cx.checkpoint().is_ok());
-    drop(interval);
-    drop((client, credential, cx, foreign));
+    // An unloaned current-thread runtime drives its worker, timers included,
+    // on a background thread. Run the hand-driven clock as the root poll so
+    // only this test fires the virtual timers it inspects, without the root
+    // ambient context `block_on` installs.
+    runtime.block_on(async {
+        let _no_root_ambient = Cx::set_current(None);
+        let foreign = Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(Time::ZERO));
+        foreign.set_cancel_requested(true);
+        let cancellation = McpRequestCancellation::new();
+        let bounds = WaitBounds::new(&cx, Duration::from_secs(10), &credential).unwrap();
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut interval = Box::pin(pause(
+            &cx,
+            &cancellation,
+            &client.session,
+            &credential,
+            bounds,
+            Time::from_nanos(u64::MAX),
+        ));
+        {
+            let _ambient = Cx::set_current(Some(foreign.clone()));
+            assert!(poll(interval.as_mut(), &waker).is_pending());
+        }
+        clock.advance(9_999_999_999);
+        assert_eq!(timer.process_timers(), 0);
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        clock.advance(1);
+        assert!(timer.process_timers() > 0);
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            poll(interval.as_mut(), &waker),
+            Poll::Ready(Err(DpopHttpError::TimedOut))
+        ));
+        assert_eq!(timer.pending_count(), 0);
+        assert!(cx.checkpoint().is_ok());
+        drop(interval);
+        drop((client, credential, cx, foreign));
+    });
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
 }
 

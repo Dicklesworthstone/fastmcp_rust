@@ -1001,8 +1001,13 @@ mod tests {
                 PendingIo(Arc::clone(&drops)),
             ));
             assert!(operation.as_mut().poll(&mut task).is_pending());
-            clock.advance(bounds.deadline.as_nanos());
-            assert!(timer.process_timers() > 0);
+            // Fire with the worker on loan so this test, not the runtime's
+            // background worker, observes the timers.
+            let fired = runtime.block_on(async {
+                clock.advance(bounds.deadline.as_nanos());
+                timer.process_timers()
+            });
+            assert!(fired > 0);
             assert!(
                 counter.0.load(Ordering::SeqCst) > 0,
                 "deadline must wake before manual repoll"
@@ -1165,8 +1170,13 @@ mod tests {
         assert_eq!(timer.pending_count(), 1);
         assert_eq!(ambient_timer.pending_count(), 0);
         assert_eq!(counter.0.load(Ordering::SeqCst), 0);
-        clock.advance(bounds.deadline.as_nanos());
-        assert!(timer.process_timers() > 0);
+        // Fire with the caller's worker on loan so this test, not that
+        // runtime's background worker, observes the timers.
+        let fired = caller_runtime.block_on(async {
+            clock.advance(bounds.deadline.as_nanos());
+            timer.process_timers()
+        });
+        assert!(fired > 0);
         assert!(counter.0.load(Ordering::SeqCst) > 0);
         assert_eq!(
             operation.as_mut().poll(&mut task),

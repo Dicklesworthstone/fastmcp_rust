@@ -2272,6 +2272,27 @@ exec sleep 5
         )
     }
 
+    #[cfg(unix)]
+    thread_local! {
+        /// Supplies stdio test callers with their own timer. Killing a child
+        /// (a refused first era, a timed-out handshake) ends in a bounded
+        /// reap that waits only on the caller's timer, and Cx::for_request()
+        /// has none, so that cleanup was refused. The runtime lives for the
+        /// test thread, past every client that retains its caller context;
+        /// it is never loaned to block_on, so its own worker fires timers.
+        static STDIO_TEST_RUNTIME: asupersync::runtime::Runtime =
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("stdio test caller runtime must build");
+    }
+
+    /// A caller context that owns a live timer for stdio child cleanup.
+    #[cfg(unix)]
+    fn stdio_test_caller() -> Cx {
+        STDIO_TEST_RUNTIME
+            .with(|runtime| runtime.request_cx_with_budget(asupersync::Budget::INFINITE))
+    }
+
     /// Connects `builder` through its yielding initializer, which polls the
     /// handshake under this bounded absolute deadline.
     #[cfg(all(unix, feature = "legacy-2024-11-05"))]
@@ -2283,7 +2304,7 @@ exec sleep 5
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(1))
                         .expect("bounded handshake timeout is valid"),
                 )
-                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+                .connect_stdio_with_cx(&stdio_test_caller(), "sh", &["-c", script]),
         )
     }
 
@@ -2295,7 +2316,7 @@ exec sleep 5
         script: &str,
     ) -> [(&'static str, McpResult<Client>); 2] {
         let direct = Client::stdio_with_protocol_plan_with_cx(
-            Cx::for_request(),
+            stdio_test_caller(),
             "sh",
             &["-c", script],
             ClientProtocolPlan::stdio(policy),
@@ -2902,7 +2923,14 @@ exec sleep 5
             printf '%s\n' response >> "$1" || exit 94;
             printf '}\n' || exit 95;
             exit 73"#;
-        let cx = Cx::for_request();
+        // Failed-attempt cleanup may have to wait for the killed child, and
+        // that wait uses only the caller's own timer. A runtime-owned caller
+        // context supplies one; Cx::for_request() has none, so cleanup was
+        // refused whenever the first child had not exited yet.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("retry probe runtime must build");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let canceller = cancel_during_delay.then(|| {
             let cancellation_cx = cx.clone();
             let cancellation_log = attempt_log.path.clone();
@@ -2929,7 +2957,7 @@ exec sleep 5
         });
 
         let started = Instant::now();
-        let result = block_on(
+        let result = runtime.block_on(
             ClientBuilder::new()
                 .protocol_plan(ClientProtocolPlan::stdio(ProtocolPolicy::ModernOnly))
                 .auto_initialize(false)
@@ -2965,6 +2993,8 @@ exec sleep 5
         // future resolves. Wait one cancellation slice before freezing the
         // observable so the negative assertion detects that race as well.
         std::thread::sleep(CONNECTION_RETRY_CANCEL_SLICE);
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
         PublicStdioRetryProbe {
             error,
             attempt_events: attempt_log.lines(),
@@ -4086,7 +4116,12 @@ exit 0
     fn public_connect_stdio_with_cx_cancellation_during_retry_delay_creates_no_second_child() {
         let probe = run_public_stdio_retry_probe(true);
 
-        assert_eq!(probe.error.code, McpErrorCode::RequestCancelled);
+        assert_eq!(
+            probe.error.code,
+            McpErrorCode::RequestCancelled,
+            "{:?}",
+            probe.error
+        );
         assert_eq!(
             probe.attempt_events,
             ["spawn", "response"],
@@ -4680,7 +4715,7 @@ exit 73
                     RequestTimeoutPolicy::new(Duration::from_secs(1), Duration::from_secs(3))
                         .expect("bounded probe timeout is valid"),
                 )
-                .connect_stdio_with_cx(&Cx::for_request(), "sh", &["-c", script]),
+                .connect_stdio_with_cx(&stdio_test_caller(), "sh", &["-c", script]),
         )
         .expect("a clean first-probe timeout authorizes one fresh legacy child");
 
@@ -4790,15 +4825,24 @@ exit 73
     #[cfg(unix)]
     #[test]
     fn connect_stdio_times_out_during_silent_initialization() {
+        // The timed-out child is killed and then reaped, and that bounded
+        // reap waits only on the caller's own timer; Cx::for_testing() has
+        // none, so cleanup was refused instead of reporting the timeout.
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("silent initialization runtime must build");
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
         let started = std::time::Instant::now();
-        let result = block_on(
+        let result = runtime.block_on(
             ClientBuilder::new()
                 .request_timeout_policy(
                     RequestTimeoutPolicy::new(Duration::from_millis(20), Duration::from_millis(40))
                         .unwrap(),
                 )
-                .connect_stdio_with_cx(&Cx::for_testing(), "sh", &["-c", "exec sleep 5"]),
+                .connect_stdio_with_cx(&cx, "sh", &["-c", "exec sleep 5"]),
         );
+        drop(cx);
+        assert!(runtime.shutdown_timeout(Duration::from_secs(2)));
 
         let Err(error) = result else {
             panic!("silent initialization should time out");
@@ -4828,8 +4872,10 @@ exit 73
             .connection_retry_policy(1, Duration::ZERO, Duration::from_millis(25))
             .expect("bounded retry policy is valid");
 
+        // The elapsed cap kills the still-starting child, and its bounded
+        // reap waits on the caller's timer, which Cx::for_testing() lacks.
         let error = match block_on(builder.connect_stdio_with_cx(
-            &Cx::for_testing(),
+            &stdio_test_caller(),
             "sh",
             &["-c", "exec sleep 5"],
         )) {

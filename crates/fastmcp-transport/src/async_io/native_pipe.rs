@@ -747,41 +747,46 @@ mod tests {
                 .blocking_threads(0, 0)
                 .build()
                 .unwrap();
-            let cx = runtime.request_cx_with_budget(
-                Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
-            );
-            let driver = cx.io_driver_handle().unwrap();
-            let (mut reader, writer) = native_pipe(&cx).unwrap();
-            let wakes = Arc::new(Wakes::default());
-            let waker = Waker::from(Arc::clone(&wakes));
-            let mut bytes = [0; 1];
-            assert!(read(&mut reader, &waker, &mut bytes).is_pending());
-            assert_eq!(driver.waker_count(), 1);
-            assert!(timer.pending_count() > 0);
-            if abandon {
-                drop(reader);
-                assert_eq!(timer.pending_count(), 0);
-                assert_eq!(driver.waker_count(), 0);
-                clock.advance(10_000_000);
-                assert_eq!(timer.process_timers(), 0);
-                cx.set_cancel_requested(true);
-                assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
-            } else {
-                clock.advance(9_999_999);
-                assert_eq!(timer.process_timers(), 0);
-                assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
-                clock.advance(1);
-                assert!(timer.process_timers() > 0);
-                assert!(wakes.0.load(Ordering::SeqCst) > 0);
-                assert!(matches!(
-                    read(&mut reader, &waker, &mut bytes),
-                    Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::Interrupted
-                ));
-                assert_eq!(timer.pending_count(), 0);
-                assert_eq!(driver.waker_count(), 0);
-                drop(reader);
-            }
-            drop((writer, cx));
+            // An unloaned current-thread runtime drives its worker, timers
+            // included, on a background thread. Run the hand-driven clock as
+            // the root poll so only this test fires the timers it inspects.
+            runtime.block_on(async {
+                let cx = runtime.request_cx_with_budget(
+                    Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)),
+                );
+                let driver = cx.io_driver_handle().unwrap();
+                let (mut reader, writer) = native_pipe(&cx).unwrap();
+                let wakes = Arc::new(Wakes::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut bytes = [0; 1];
+                assert!(read(&mut reader, &waker, &mut bytes).is_pending());
+                assert_eq!(driver.waker_count(), 1);
+                assert!(timer.pending_count() > 0);
+                if abandon {
+                    drop(reader);
+                    assert_eq!(timer.pending_count(), 0);
+                    assert_eq!(driver.waker_count(), 0);
+                    clock.advance(10_000_000);
+                    assert_eq!(timer.process_timers(), 0);
+                    cx.set_cancel_requested(true);
+                    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+                } else {
+                    clock.advance(9_999_999);
+                    assert_eq!(timer.process_timers(), 0);
+                    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+                    clock.advance(1);
+                    assert!(timer.process_timers() > 0);
+                    assert!(wakes.0.load(Ordering::SeqCst) > 0);
+                    assert!(matches!(
+                        read(&mut reader, &waker, &mut bytes),
+                        Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::Interrupted
+                    ));
+                    assert_eq!(timer.pending_count(), 0);
+                    assert_eq!(driver.waker_count(), 0);
+                    drop(reader);
+                }
+                drop((writer, cx));
+            });
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         }
     }

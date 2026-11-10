@@ -208,7 +208,15 @@ fn with_budget(budget: Budget, test: impl FnOnce(Cx, Arc<VirtualClock>, TimerDri
         .with_timer_driver(timer.clone())
         .build()
         .unwrap();
-    test(runtime.request_cx_with_budget(budget), clock, timer);
+    // An unloaned current-thread runtime drives its worker, timers included,
+    // on a background thread. Run the hand-driven clock as the root poll so
+    // only the test fires the virtual timers it inspects. `block_on` installs
+    // its root context as ambient; clear it so the test still observes only
+    // the contexts the code under test installs.
+    runtime.block_on(async {
+        let _ambient = Cx::set_current(None);
+        test(runtime.request_cx_with_budget(budget), clock, timer);
+    });
     assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
 }
 fn complete<F: Future>(future: F) -> F::Output {

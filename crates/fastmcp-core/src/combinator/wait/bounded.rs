@@ -624,43 +624,51 @@ mod tests {
     #[test]
     fn bounded_batch_maintenance_does_not_spend_application_poll_budget() {
         let (runtime, clock, timer, ctx) = environment();
-        let mut ceiling = Budget::INFINITE;
-        ceiling.poll_quota = 2;
-        let ctx = ctx.with_budget_ceiling(ceiling);
-        let (observed, futures) = probes(1, false, None);
-        let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
-        assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
-        for _ in 0..4 {
-            clock.advance(LIVENESS_TICK_NANOS);
-            assert!(timer.process_timers() > 0);
+        // An unloaned current-thread runtime drives its worker, timers
+        // included, on a background thread. Run the hand-driven clock as the
+        // root poll so only this test fires the virtual timers it inspects.
+        // `block_on` installs its root context as ambient; clear it so the
+        // batch observes the same ambient context as an unwrapped caller.
+        runtime.block_on(async {
+            let _ambient = Cx::set_current(None);
+            let mut ceiling = Budget::INFINITE;
+            ceiling.poll_quota = 2;
+            let ctx = ctx.with_budget_ceiling(ceiling);
+            let (observed, futures) = probes(1, false, None);
+            let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
             assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
-            assert_eq!(ctx.budget().poll_quota, 1);
-            assert_eq!(counts(&observed), vec![1]);
-        }
-        observed[0].finish();
-        assert_eq!(
-            completed(poll(batch.as_mut(), Waker::noop())).unwrap(),
-            vec![0]
-        );
-        assert_eq!(
-            ctx.budget().poll_quota,
-            0,
-            "the final admitted unit can complete"
-        );
-        assert!(ctx.ensure_live().is_ok());
-        drop(batch);
-        let (later, futures) = probes(1, true, None);
-        let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
-        assert_eq!(
-            completed(poll(batch.as_mut(), Waker::noop()))
-                .unwrap_err()
-                .code,
-            McpErrorCode::RequestCancelled
-        );
-        assert_eq!(counts(&later), vec![0]);
-        assert!(!ctx.cx().is_cancel_requested());
-        drop(batch);
-        drop(ctx);
+            for _ in 0..4 {
+                clock.advance(LIVENESS_TICK_NANOS);
+                assert!(timer.process_timers() > 0);
+                assert!(poll(batch.as_mut(), Waker::noop()).is_pending());
+                assert_eq!(ctx.budget().poll_quota, 1);
+                assert_eq!(counts(&observed), vec![1]);
+            }
+            observed[0].finish();
+            assert_eq!(
+                completed(poll(batch.as_mut(), Waker::noop())).unwrap(),
+                vec![0]
+            );
+            assert_eq!(
+                ctx.budget().poll_quota,
+                0,
+                "the final admitted unit can complete"
+            );
+            assert!(ctx.ensure_live().is_ok());
+            drop(batch);
+            let (later, futures) = probes(1, true, None);
+            let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
+            assert_eq!(
+                completed(poll(batch.as_mut(), Waker::noop()))
+                    .unwrap_err()
+                    .code,
+                McpErrorCode::RequestCancelled
+            );
+            assert_eq!(counts(&later), vec![0]);
+            assert!(!ctx.cx().is_cancel_requested());
+            drop(batch);
+            drop(ctx);
+        });
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
@@ -668,45 +676,50 @@ mod tests {
     fn bounded_batch_silent_liveness_changes_retire_work_on_the_callers_clock() {
         for cause in 0..4 {
             let (runtime, clock, timer, ctx) = environment();
-            let (ctx, lease) = ctx.begin_request_scope().unwrap();
-            let ctx = if cause == 0 {
-                ctx.with_operation_deadline(Some(Time::from_nanos(3_000_000)))
-            } else {
-                ctx
-            };
-            let mut lease = Some(lease);
-            let (observed, futures) = probes(2, false, None);
-            let wakes = Arc::new(Wakes::default());
-            let waker = Waker::from(Arc::clone(&wakes));
-            let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
-            assert!(poll(batch.as_mut(), &waker).is_pending());
-            match cause {
-                0 => {}
-                1 => {
-                    let _tightened = ctx.clone().with_budget_ceiling(
-                        Budget::INFINITE.with_deadline(Time::from_nanos(3_000_000)),
-                    );
+            // Keep the runtime's worker on loan so only this test fires the
+            // virtual timers it inspects, without its root ambient context.
+            runtime.block_on(async {
+                let _ambient = Cx::set_current(None);
+                let (ctx, lease) = ctx.begin_request_scope().unwrap();
+                let ctx = if cause == 0 {
+                    ctx.with_operation_deadline(Some(Time::from_nanos(3_000_000)))
+                } else {
+                    ctx
+                };
+                let mut lease = Some(lease);
+                let (observed, futures) = probes(2, false, None);
+                let wakes = Arc::new(Wakes::default());
+                let waker = Waker::from(Arc::clone(&wakes));
+                let mut batch = Box::pin(ctx.try_join_all_bounded(1, futures));
+                assert!(poll(batch.as_mut(), &waker).is_pending());
+                match cause {
+                    0 => {}
+                    1 => {
+                        let _tightened = ctx.clone().with_budget_ceiling(
+                            Budget::INFINITE.with_deadline(Time::from_nanos(3_000_000)),
+                        );
+                    }
+                    2 => {
+                        drop(lease.take());
+                    }
+                    _ => ctx.cx().set_cancel_requested(true),
                 }
-                2 => {
-                    drop(lease.take());
-                }
-                _ => ctx.cx().set_cancel_requested(true),
-            }
-            let before = wakes.0.load(Ordering::SeqCst);
-            clock.advance(LIVENESS_TICK_NANOS);
-            assert!(timer.process_timers() > 0);
-            assert!(wakes.0.load(Ordering::SeqCst) > before);
-            assert_eq!(
-                completed(poll(batch.as_mut(), &waker)).unwrap_err().code,
-                McpErrorCode::RequestCancelled
-            );
-            assert_eq!(counts(&observed), vec![1, 0]);
-            all_dropped(&observed);
-            assert_eq!(timer.pending_count(), 0);
-            assert_eq!(ctx.cx().is_cancel_requested(), cause == 3);
-            drop(batch);
-            drop(lease);
-            drop(ctx);
+                let before = wakes.0.load(Ordering::SeqCst);
+                clock.advance(LIVENESS_TICK_NANOS);
+                assert!(timer.process_timers() > 0);
+                assert!(wakes.0.load(Ordering::SeqCst) > before);
+                assert_eq!(
+                    completed(poll(batch.as_mut(), &waker)).unwrap_err().code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(counts(&observed), vec![1, 0]);
+                all_dropped(&observed);
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(ctx.cx().is_cancel_requested(), cause == 3);
+                drop(batch);
+                drop(lease);
+                drop(ctx);
+            });
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         }
     }

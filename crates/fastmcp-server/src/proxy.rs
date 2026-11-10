@@ -16557,8 +16557,13 @@ IFS= read -r end
                     };
                     upstream_waker.wake();
                 } else {
-                    clock.advance_to(deadline);
-                    assert_eq!(timer.process_timers(), 1);
+                    // Fire with the worker on loan so this test, not the
+                    // runtime's background worker, observes the timer.
+                    let fired = runtime.block_on(async {
+                        clock.advance_to(deadline);
+                        timer.process_timers()
+                    });
+                    assert_eq!(fired, 1);
                 }
                 assert!(
                     wakes.count() > before,
@@ -16649,8 +16654,13 @@ IFS= read -r end
         clock.advance_to(asupersync::Time::from_nanos(499_999));
         assert_eq!(timer.process_timers(), 0);
         assert_eq!(wakes.count(), before);
-        clock.advance_to(deadline);
-        assert_eq!(timer.process_timers(), 1);
+        // Fire with the worker on loan so this test, not the runtime's
+        // background worker, observes the timer.
+        let fired = runtime.block_on(async {
+            clock.advance_to(deadline);
+            timer.process_timers()
+        });
+        assert_eq!(fired, 1);
         assert!(wakes.count() > before);
         let std::task::Poll::Ready(Err(error)) = request.as_mut().poll(&mut task_cx) else {
             panic!("a shared framework deadline must retire the silent owned request");
@@ -19512,8 +19522,13 @@ IFS= read -r end
             .then(|| Cx::push_restriction(CapSet::<true, false, true, true, true>::MASK));
         if interrupt == 0 {
             state.lock().unwrap().incremental_listener_ready = true;
-            clock.advance_to(asupersync::Time::from_nanos(20_000_000));
-            assert_eq!(timer.process_timers(), 1);
+            // Fire with the worker on loan so this test, not the runtime's
+            // background worker, observes the timer.
+            let fired = runtime.block_on(async {
+                clock.advance_to(asupersync::Time::from_nanos(20_000_000));
+                timer.process_timers()
+            });
+            assert_eq!(fired, 1);
             assert!(wakes.count() > before);
         } else if interrupt == 1 {
             assert!(cancellation.cancel());
@@ -21445,8 +21460,13 @@ IFS= read -r end
             assert!(wait.as_mut().poll(&mut task_cx).is_pending());
             assert_eq!(timer.pending_count(), 1);
             let before = wakes.0.load(Ordering::SeqCst);
-            clock.advance_to(asupersync::Time::from_nanos(turn * 20_000_000));
-            assert_eq!(timer.process_timers(), 1);
+            // Fire with the worker on loan so this test, not the runtime's
+            // background worker, observes the timer.
+            let fired = runtime.block_on(async {
+                clock.advance_to(asupersync::Time::from_nanos(turn * 20_000_000));
+                timer.process_timers()
+            });
+            assert_eq!(fired, 1);
             assert!(wakes.0.load(Ordering::SeqCst) > before);
             let expired_wakes = wakes.0.load(Ordering::SeqCst);
             assert!(wait.as_mut().poll(&mut task_cx).is_pending());

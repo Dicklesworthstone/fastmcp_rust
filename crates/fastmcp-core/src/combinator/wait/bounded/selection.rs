@@ -557,41 +557,49 @@ mod tests {
     #[test]
     fn selection_maintenance_preserves_poll_budget_and_returns_borrowed_values() {
         let (runtime, clock, timer, ctx) = environment();
-        let mut budget = Budget::INFINITE;
-        budget.poll_quota = 2;
-        let ctx = ctx.with_budget_ceiling(budget);
-        let value = String::from("borrowed winner");
-        let seen = Arc::new(Seen::default());
-        let observed = Arc::clone(&seen);
-        let borrowed = value.as_str();
-        let future: BoxFuture<'_, McpResult<&str>> = Box::pin(poll_fn(move |task| {
-            observed.polls.fetch_add(1, Ordering::SeqCst);
-            *observed.waker.lock().unwrap() = Some(task.waker().clone());
-            if observed.ready.load(Ordering::Acquire) {
-                Poll::Ready(Ok(borrowed))
-            } else {
-                Poll::Pending
-            }
-        }));
-        let mut selection = Box::pin(ctx.first_ok_bounded(1, vec![future]));
-        assert!(poll(selection.as_mut(), Waker::noop()).is_pending());
-        for _ in 0..4 {
-            clock.advance(super::super::LIVENESS_TICK_NANOS);
-            assert!(timer.process_timers() > 0);
+        // An unloaned current-thread runtime drives its worker, timers
+        // included, on a background thread. Run the hand-driven clock as the
+        // root poll so only this test fires the virtual timers it inspects.
+        // `block_on` installs its root context as ambient; clear it so the
+        // selection observes the same ambient context as an unwrapped caller.
+        runtime.block_on(async {
+            let _ambient = Cx::set_current(None);
+            let mut budget = Budget::INFINITE;
+            budget.poll_quota = 2;
+            let ctx = ctx.with_budget_ceiling(budget);
+            let value = String::from("borrowed winner");
+            let seen = Arc::new(Seen::default());
+            let observed = Arc::clone(&seen);
+            let borrowed = value.as_str();
+            let future: BoxFuture<'_, McpResult<&str>> = Box::pin(poll_fn(move |task| {
+                observed.polls.fetch_add(1, Ordering::SeqCst);
+                *observed.waker.lock().unwrap() = Some(task.waker().clone());
+                if observed.ready.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(borrowed))
+                } else {
+                    Poll::Pending
+                }
+            }));
+            let mut selection = Box::pin(ctx.first_ok_bounded(1, vec![future]));
             assert!(poll(selection.as_mut(), Waker::noop()).is_pending());
-            assert_eq!(ctx.budget().poll_quota, 1);
-            assert_eq!(seen.polls.load(Ordering::SeqCst), 1);
-        }
-        seen.finish();
-        assert_eq!(
-            done(poll(selection.as_mut(), Waker::noop())).unwrap(),
-            "borrowed winner"
-        );
-        assert_eq!(ctx.budget().poll_quota, 0);
-        assert!(ctx.ensure_live().is_ok());
-        assert_eq!(timer.pending_count(), 0);
-        drop(selection);
-        drop(ctx);
+            for _ in 0..4 {
+                clock.advance(super::super::LIVENESS_TICK_NANOS);
+                assert!(timer.process_timers() > 0);
+                assert!(poll(selection.as_mut(), Waker::noop()).is_pending());
+                assert_eq!(ctx.budget().poll_quota, 1);
+                assert_eq!(seen.polls.load(Ordering::SeqCst), 1);
+            }
+            seen.finish();
+            assert_eq!(
+                done(poll(selection.as_mut(), Waker::noop())).unwrap(),
+                "borrowed winner"
+            );
+            assert_eq!(ctx.budget().poll_quota, 0);
+            assert!(ctx.ensure_live().is_ok());
+            assert_eq!(timer.pending_count(), 0);
+            drop(selection);
+            drop(ctx);
+        });
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
     }
 
@@ -599,40 +607,47 @@ mod tests {
     fn selection_observes_deadlines_lease_closure_and_runtime_cancellation_without_child_wakes() {
         for cause in 0..4 {
             let (runtime, clock, timer, ctx) = environment();
-            let (ctx, lease) = ctx.begin_request_scope().unwrap();
-            let ctx = if cause == 0 {
-                ctx.with_operation_deadline(Some(Time::from_nanos(3_000_000)))
-            } else {
-                ctx
-            };
-            let mut lease = Some(lease);
-            let (seen, futures) = branches(&[(false, false), (true, false)]);
-            let mut selection = Box::pin(ctx.quorum_bounded(1, 1, futures));
-            assert!(poll(selection.as_mut(), Waker::noop()).is_pending());
-            match cause {
-                0 => {}
-                1 => {
-                    let _ = ctx.clone().with_budget_ceiling(
-                        Budget::INFINITE.with_deadline(Time::from_nanos(3_000_000)),
-                    );
+            // Keep the runtime's worker on loan so only this test fires the
+            // virtual timers it inspects, without its root ambient context.
+            runtime.block_on(async {
+                let _ambient = Cx::set_current(None);
+                let (ctx, lease) = ctx.begin_request_scope().unwrap();
+                let ctx = if cause == 0 {
+                    ctx.with_operation_deadline(Some(Time::from_nanos(3_000_000)))
+                } else {
+                    ctx
+                };
+                let mut lease = Some(lease);
+                let (seen, futures) = branches(&[(false, false), (true, false)]);
+                let mut selection = Box::pin(ctx.quorum_bounded(1, 1, futures));
+                assert!(poll(selection.as_mut(), Waker::noop()).is_pending());
+                match cause {
+                    0 => {}
+                    1 => {
+                        let _ = ctx.clone().with_budget_ceiling(
+                            Budget::INFINITE.with_deadline(Time::from_nanos(3_000_000)),
+                        );
+                    }
+                    2 => {
+                        drop(lease.take());
+                    }
+                    _ => ctx.cx().set_cancel_requested(true),
                 }
-                2 => {
-                    drop(lease.take());
-                }
-                _ => ctx.cx().set_cancel_requested(true),
-            }
-            clock.advance(super::super::LIVENESS_TICK_NANOS);
-            assert!(timer.process_timers() > 0);
-            assert_eq!(
-                done(poll(selection.as_mut(), Waker::noop())).unwrap_err().code,
-                McpErrorCode::RequestCancelled
-            );
-            assert_eq!(counts(&seen), vec![1, 0]);
-            dropped(&seen);
-            assert_eq!(timer.pending_count(), 0);
-            assert_eq!(ctx.cx().is_cancel_requested(), cause == 3);
-            drop(selection);
-            drop((lease, ctx));
+                clock.advance(super::super::LIVENESS_TICK_NANOS);
+                assert!(timer.process_timers() > 0);
+                assert_eq!(
+                    done(poll(selection.as_mut(), Waker::noop()))
+                        .unwrap_err()
+                        .code,
+                    McpErrorCode::RequestCancelled
+                );
+                assert_eq!(counts(&seen), vec![1, 0]);
+                dropped(&seen);
+                assert_eq!(timer.pending_count(), 0);
+                assert_eq!(ctx.cx().is_cancel_requested(), cause == 3);
+                drop(selection);
+                drop((lease, ctx));
+            });
             assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
         }
     }

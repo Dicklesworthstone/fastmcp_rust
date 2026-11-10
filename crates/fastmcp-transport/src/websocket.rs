@@ -4654,7 +4654,13 @@ mod tests {
         future: std::sync::Mutex<Pin<Box<F>>>,
         result: std::sync::Mutex<Option<F::Output>>,
         completed: AtomicBool,
+        /// Wakes from outside the receive's own poll, such as permit release.
         wakes: AtomicUsize,
+        /// Wakes the receive raised during its own poll. Since asupersync 0.6
+        /// a split write that observes a close after its snapshot wakes itself
+        /// once to arm the close deadline; an executor polls it again.
+        self_wakes: AtomicUsize,
+        repoll: AtomicBool,
     }
 
     impl<F> ClientControlInlineWake<F>
@@ -4668,6 +4674,8 @@ mod tests {
                 result: std::sync::Mutex::new(None),
                 completed: AtomicBool::new(false),
                 wakes: AtomicUsize::new(0),
+                self_wakes: AtomicUsize::new(0),
+                repoll: AtomicBool::new(false),
             }
         }
 
@@ -4680,10 +4688,21 @@ mod tests {
                 .try_lock()
                 .expect("control polling is not recursive");
             let waker = std::task::Waker::from(Arc::clone(self));
-            if let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
-                self.completed.store(true, Ordering::Release);
-                *self.result.lock().expect("completed native receive") = Some(result);
+            // Serve self-wakes as an executor would, after the poll returns.
+            // A receive that keeps waking itself is a spin, not progress.
+            for _ in 0..4 {
+                self.repoll.store(false, Ordering::Release);
+                if let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(&waker))
+                {
+                    self.completed.store(true, Ordering::Release);
+                    *self.result.lock().expect("completed native receive") = Some(result);
+                    return;
+                }
+                if !self.repoll.load(Ordering::Acquire) {
+                    return;
+                }
             }
+            panic!("the native receive keeps waking itself without progress");
         }
     }
 
@@ -4697,6 +4716,13 @@ mod tests {
         }
 
         fn wake_by_ref(self: &Arc<Self>) {
+            // The test drives one current-thread runtime, so a held poll lock
+            // means this wake was raised inside the receive's own poll.
+            if self.future.try_lock().is_err() {
+                self.self_wakes.fetch_add(1, Ordering::AcqRel);
+                self.repoll.store(true, Ordering::Release);
+                return;
+            }
             self.wakes.fetch_add(1, Ordering::AcqRel);
             self.poll_once();
         }
@@ -7048,12 +7074,30 @@ mod tests {
                     .is_pending()
             );
             assert_eq!(read_bytes.load(Ordering::Acquire), control_bytes.len());
+            // Since asupersync 0.6 a split write that observes a close after
+            // its snapshot wakes itself once to arm the close deadline. Serve
+            // that wake as an executor would; only a peer Close may raise it,
+            // and the re-poll must park without waking again.
+            let self_wakes = control_wake.0.load(Ordering::Acquire);
+            assert!(
+                self_wakes <= usize::from(peer_close),
+                "only a peer Close arms a split close deadline"
+            );
+            if self_wakes > 0 {
+                assert!(
+                    receive
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
             assert_eq!(
                 writer.waiters(),
                 0,
                 "native controls bypass the outer writer lock"
             );
-            assert_eq!(control_wake.0.load(Ordering::Acquire), 0);
+            let early_wakes = control_wake.0.load(Ordering::Acquire);
+            assert_eq!(early_wakes, self_wakes);
             assert_eq!(
                 *output.lock().expect("control is not yet writable"),
                 before_control
@@ -7094,7 +7138,7 @@ mod tests {
                 }
             }
             assert!(
-                control_wake.0.load(Ordering::Acquire) > 0,
+                control_wake.0.load(Ordering::Acquire) > early_wakes,
                 "releasing the native write permit wakes the already-queued control reply",
             );
             assert!(
@@ -7369,6 +7413,10 @@ mod tests {
         assert!(!receive.completed.load(Ordering::Acquire));
         assert_eq!(read_bytes.load(Ordering::Acquire), control.len());
         assert_eq!(receive.wakes.load(Ordering::Acquire), 0);
+        assert!(
+            receive.self_wakes.load(Ordering::Acquire) <= usize::from(peer_close),
+            "only a peer Close arms a split close deadline"
+        );
         if !peer_close {
             let mut response = BytesMut::new();
             FrameCodec::server()

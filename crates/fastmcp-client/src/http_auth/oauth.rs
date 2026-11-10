@@ -1887,13 +1887,25 @@ mod tests {
             if mode == 0 {
                 caller.set_cancel_requested(true);
             } else if mode == 1 {
-                clock.advance(1_000_000_000);
-                assert!(timer.process_timers() > 0);
+                // Fire with the worker on loan so this test, not the runtime's
+                // background worker, observes the timers.
+                let fired = runtime.block_on(async {
+                    clock.advance(1_000_000_000);
+                    timer.process_timers()
+                });
+                assert!(fired > 0);
             }
             if mode != 2 {
                 assert!(wakes.0.load(Ordering::SeqCst) > before);
                 let expected = if mode == 0 { OAuthError::Cancelled } else { OAuthError::TimedOut };
-                assert!(matches!(flow.as_mut().poll(&mut task), Poll::Ready(Err(error)) if error == expected));
+                let outcome = flow
+                    .as_mut()
+                    .poll(&mut task)
+                    .map(|result| result.map(|_| ()));
+                assert!(
+                    matches!(&outcome, Poll::Ready(Err(error)) if *error == expected),
+                    "mode {mode}: {outcome:?}"
+                );
             }
             drop(flow);
             assert_eq!(drops.load(Ordering::SeqCst), 1);

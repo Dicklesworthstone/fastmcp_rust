@@ -67849,8 +67849,13 @@ mod lib_unit_tests {
             assert_eq!(timer.process_timers(), 0);
             assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
             assert!(!cancellation.is_cancel_requested());
-            clock.advance_to(deadline);
-            assert!(timer.process_timers() > 0);
+            // Fire with the worker on loan so this test, not the runtime's
+            // background worker, observes the timers.
+            let fired = runtime.block_on(async {
+                clock.advance_to(deadline);
+                timer.process_timers()
+            });
+            assert!(fired > 0);
             assert!(matches!(
                 dispatch.as_mut().poll(&mut task_cx),
                 std::task::Poll::Ready(None)
@@ -67974,8 +67979,13 @@ mod lib_unit_tests {
         assert_eq!(timer.process_timers(), 0);
         assert_eq!(wakes.0.load(Ordering::SeqCst), before);
         assert!(dispatch.as_mut().poll(&mut task_cx).is_pending());
-        clock.advance_to(deadline);
-        assert!(timer.process_timers() > 0);
+        // Fire with the worker on loan so this test, not the runtime's
+        // background worker, observes the timers.
+        let fired = runtime.block_on(async {
+            clock.advance_to(deadline);
+            timer.process_timers()
+        });
+        assert!(fired > 0);
         assert!(wakes.0.load(Ordering::SeqCst) > before);
         assert!(matches!(
             dispatch.as_mut().poll(&mut task_cx),
@@ -68087,8 +68097,13 @@ mod lib_unit_tests {
             assert_eq!(restored.is_cancel_requested(), foreign_cancelled);
 
             let before = wakes.0.load(Ordering::SeqCst);
-            clock.advance_to(asupersync::Time::from_secs(1));
-            assert!(timer.process_timers() > 0);
+            // Fire with the worker on loan so this test, not the runtime's
+            // background worker, observes the timers.
+            let fired = runtime.block_on(async {
+                clock.advance_to(asupersync::Time::from_secs(1));
+                timer.process_timers()
+            });
+            assert!(fired > 0);
             assert!(wakes.0.load(Ordering::SeqCst) > before);
             assert!(matches!(
                 dispatch.as_mut().poll(&mut task_cx),

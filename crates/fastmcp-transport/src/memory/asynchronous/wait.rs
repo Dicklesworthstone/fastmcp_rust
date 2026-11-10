@@ -182,7 +182,10 @@ mod tests {
             .unwrap();
         let cx = runtime
             .request_cx_with_budget(Budget::INFINITE.with_deadline(Time::from_nanos(10_000_000)));
-        test(&cx, &clock, &timer);
+        // An unloaned current-thread runtime drives its worker, timers
+        // included, on a background thread. Run the hand-driven clock as the
+        // root poll so only this test fires the virtual timers it inspects.
+        runtime.block_on(async { test(&cx, &clock, &timer) });
         assert_eq!(timer.pending_count(), 0);
         drop(cx);
         assert!(runtime.shutdown_timeout(Duration::from_secs(1)));
@@ -646,6 +649,10 @@ mod tests {
                     .spawn(move |cx| async move {
                         assert_eq!(cx.budget().deadline, Some(deadline));
                         assert!(cx.timer_driver().is_some());
+                        // Asupersync 0.6 arms one runtime timer for a task whose
+                        // budget has a deadline, so count only what the channel
+                        // operation itself registers.
+                        let armed = observed_timer.pending_count();
                         let cx = &cx;
                         let (mut client, mut server) =
                             create_memory_transport_pair_with_capacity(1);
@@ -664,7 +671,7 @@ mod tests {
                                 .unwrap(),
                             _ => unreachable!(),
                         });
-                        assert_eq!(observed_timer.pending_count(), 0);
+                        assert_eq!(observed_timer.pending_count(), armed);
                         if operation != 0 {
                             assert_eq!(json(&server.recv(cx).unwrap()), json(&request(71)));
                         }

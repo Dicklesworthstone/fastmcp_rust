@@ -639,8 +639,13 @@ mod tests {
         assert_eq!(timer.process_timers(), 0);
         assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
         assert_eq!(drops.load(Ordering::SeqCst), 0);
-        clock.advance(1);
-        assert!(timer.process_timers() > 0);
+        // Advance and fire with the worker on loan: an unloaned current-thread
+        // runtime would race this test to its own virtual timers.
+        let fired = runtime.block_on(async {
+            clock.advance(1);
+            timer.process_timers()
+        });
+        assert!(fired > 0);
         assert!(wakes.0.load(Ordering::SeqCst) > 0);
         assert_eq!(
             waiting.as_mut().poll(&mut task),
@@ -747,8 +752,13 @@ mod tests {
                 0 => credential.revoke(),
                 1 => session.revoke(),
                 _ => {
-                    clock.advance(bounds.deadline.as_nanos());
-                    assert!(timer.process_timers() > 0);
+                    // Fire with the worker on loan so this test, not the
+                    // runtime's background worker, observes the timers.
+                    let fired = runtime.block_on(async {
+                        clock.advance(bounds.deadline.as_nanos());
+                        timer.process_timers()
+                    });
+                    assert!(fired > 0);
                 }
             }
             assert!(wakes.0.load(Ordering::SeqCst) > before);

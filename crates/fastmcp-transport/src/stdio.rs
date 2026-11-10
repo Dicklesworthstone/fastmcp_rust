@@ -2378,10 +2378,11 @@ mod tests {
         let expected = format!("{}\n", serde_json::to_string(&message).unwrap());
         let cx = Cx::for_testing();
         let started = Instant::now();
-        assert!(matches!(
-            sender.send_until(&cx, &message, started + Duration::from_millis(500)),
-            Err(TransportError::Timeout)
-        ));
+        let sent = sender.send_until(&cx, &message, started + Duration::from_millis(500));
+        assert!(
+            matches!(sent, Err(TransportError::Timeout)),
+            "a send the peer never drains must time out, got {sent:?}"
+        );
         // REMOVED: assert!(started.elapsed() < Duration::from_secs(1).
         // This could not do the job it appeared to do. It sits AFTER the call it
         // bounds, so a hang in that call never reaches it — the test binary hangs

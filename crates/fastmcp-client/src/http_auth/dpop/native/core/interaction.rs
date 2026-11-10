@@ -957,8 +957,13 @@ mod tests {
                 2 => session.revoke(),
                 3 => credential.revoke(),
                 _ => {
-                    clock.advance(bounds.deadline.as_nanos());
-                    assert!(timer.process_timers() > 0);
+                    // Fire with the worker on loan so this test, not the
+                    // runtime's background worker, observes the timers.
+                    let fired = runtime.block_on(async {
+                        clock.advance(bounds.deadline.as_nanos());
+                        timer.process_timers()
+                    });
+                    assert!(fired > 0);
                 }
             }
             assert!(counter.0.load(Ordering::SeqCst) > 0);
