@@ -42147,6 +42147,30 @@ exec sleep 2
             .expect("HTTP cache request is JSON-RPC")
     }
 
+    /// Reads the peer side of an exchange the client abandoned and requires
+    /// that no further request byte arrives. Before response headers the client
+    /// resets the socket, because a clean FIN would read as a legal request
+    /// write-half close and leave the handler running (6ecb1d6d). After them it
+    /// may close cleanly, or the kernel may reset a socket closed with unread
+    /// response bytes.
+    #[cfg(unix)]
+    fn assert_abandoned_http_exchange_closed(
+        stream: &mut TcpStream,
+        after_response_head: bool,
+        context: &str,
+    ) {
+        let mut probe = [0_u8; 1];
+        match stream.read(&mut probe) {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            Ok(0) if after_response_head => {}
+            result => panic!("{context}: {result:?}"),
+        }
+    }
+
     #[cfg(unix)]
     fn write_http_cache_test_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
         write!(
@@ -42701,6 +42725,10 @@ exec sleep 2
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD-derived kernels (macOS) hand the accepted socket
+                    // the listener's O_NONBLOCK, and a read timeout does not
+                    // clear it. Block so the request read waits for its bytes.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -42918,11 +42946,12 @@ exec sleep 2
                     request.flush().unwrap();
                 }
                 request_ready.send(()).unwrap();
-                let mut byte = [0_u8; 1];
-                assert_eq!(
-                    request.read(&mut byte).unwrap(),
-                    0,
-                    "cancellation must close the {phase} exchange without another peer byte"
+                assert_abandoned_http_exchange_closed(
+                    &mut request,
+                    phase != "headers",
+                    &format!(
+                        "cancellation must close the {phase} exchange without another peer byte"
+                    ),
                 );
                 write_http_cache_test_response(
                     &mut sibling,
@@ -43142,6 +43171,10 @@ exec sleep 2
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD-derived kernels (macOS) hand the accepted socket
+                    // the listener's O_NONBLOCK, and a read timeout does not
+                    // clear it. Block so the request read waits for its bytes.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -49216,11 +49249,10 @@ exec sleep 2
             assert_eq!(retried["params"]["arguments"], first["params"]["arguments"]);
             assert_ne!(retried["id"], first["id"]);
             let waiting = Instant::now();
-            let mut probe = [0_u8; 1];
-            assert_eq!(
-                pending.read(&mut probe).unwrap(),
-                0,
-                "timeout releases the retried POST"
+            assert_abandoned_http_exchange_closed(
+                &mut pending,
+                false,
+                "timeout releases the retried POST",
             );
             assert!(
                 waiting.elapsed() < Duration::from_millis(1_200),
@@ -49802,11 +49834,10 @@ exec sleep 2
                 let mut pending = accept_http_catalog_test_request(&listener);
                 let request = read_http_cache_test_request(&mut pending);
                 assert_eq!(request["params"]["cursor"], "pending");
-                let mut probe = [0_u8; 1];
-                assert_eq!(
-                    pending.read(&mut probe).unwrap(),
-                    0,
-                    "deadline drops this request's socket"
+                assert_abandoned_http_exchange_closed(
+                    &mut pending,
+                    false,
+                    "deadline drops this request's socket",
                 );
                 let mut healthy = accept_http_catalog_test_request(&listener);
                 let request = read_http_cache_test_request(&mut healthy);
@@ -55828,7 +55859,9 @@ exec sleep 30
 
     #[cfg(unix)]
     fn assert_automatic_catalog_rebuild_deadline(late_rebuild: bool) {
-        let delay = if late_rebuild { "0.35" } else { "0.005" };
+        // Each 600ms page fits the 1000ms deadline with 400ms to spare on a
+        // loaded host; a late rebuild's two pages together cannot.
+        let delay = if late_rebuild { "0.6" } else { "0.005" };
         let cancellation_read = if late_rebuild {
             r#"IFS= read -r control || exit 1
                case "$control" in *'"method":"notifications/cancelled"'*) ;; *) exit 1 ;; esac
@@ -55840,7 +55873,7 @@ exec sleep 30
             r#"
             IFS= read -r request || exit 1
             case "$request" in *'"cursor":"initial"'*) ;; *) exit 1 ;; esac
-            sleep 0.35
+            sleep 0.6
             printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"resultType":"complete","tools":[{{"name":"stale","inputSchema":{{"type":"object"}}}}],"nextCursor":"next","ttlMs":0,"cacheScope":"private"}}}}'
             IFS= read -r request || exit 1
             case "$request" in *'"cursor":"next"'*) ;; *) exit 1 ;; esac
@@ -55862,7 +55895,7 @@ exec sleep 30
         );
         let mut client = make_shell_scripted_initialized_client_for_version(
             &script,
-            Duration::from_millis(550),
+            Duration::from_millis(1000),
             MODERN_PROTOCOL_VERSION,
         );
         let result = client.list_tools_with_params(ListToolsParams {
@@ -58468,7 +58501,7 @@ while IFS= read -r unexpected; do exit 34; done
             format!(
                 "IFS= read -r discovery || exit 1\n\
                  case \"$discovery\" in *server/discover*) ;; *) exit 2 ;; esac\n\
-                 sleep 0.12\n\
+                 sleep 0.5\n\
                  printf '%s\\n' '{discovery}'\n"
             )
         } else {
@@ -58479,7 +58512,7 @@ while IFS= read -r unexpected; do exit 34; done
                 r#"IFS= read -r first || exit 20
 case "$first" in *'"method":"tools/list"'*) ;; *) exit 21 ;; esac
 case "$first" in *'"id":2,'*|*'"id":2}'*) ;; *) exit 22 ;; esac
-sleep 0.12
+sleep 0.5
 printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[],"nextCursor":"next","ttlMs":0,"cacheScope":"private"}}'
 "#,
             );
@@ -58490,7 +58523,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools"
             r#"IFS= read -r pending || exit 23
 case "$pending" in *'"method":"tools/list"'*) ;; *) exit 24 ;; esac
 case "$pending" in *'"id":{pending_id},'*|*'"id":{pending_id}}}'*) ;; *) exit 25 ;; esac
-sleep 0.12
+sleep 0.5
 printf '%s\n' '{{"jsonrpc":"2.0","id":{pending_id},"result":{{"resultType":"complete","tools":[],"ttlMs":0,"cacheScope":"private"}}}}'
 IFS= read -r cancellation || exit 26
 case "$cancellation" in *'"method":"notifications/cancelled"'*'"requestId":{pending_id}'*) ;; *) exit 27 ;; esac
@@ -58509,7 +58542,7 @@ while IFS= read -r unexpected; do exit 31; done
         };
         let cancellation = McpRequestCancellation::new();
         let budget = PaginationBudget::for_request(
-            RequestTimeoutPolicy::new(Duration::from_millis(200), Duration::from_millis(200))
+            RequestTimeoutPolicy::new(Duration::from_millis(900), Duration::from_millis(900))
                 .unwrap(),
         );
         let error = http_test_runtime_block_on(client.collect_stdio_catalog_with_cx_and_budget(
@@ -58521,8 +58554,10 @@ while IFS= read -r unexpected; do exit 31; done
             budget,
         ))
         .unwrap_err();
-        // Both 120ms stages fit a restarted 200ms budget, so success would
+        // Both 500ms stages fit a restarted 900ms budget, so success would
         // reveal a reset at discovery completion or the continuation page.
+        // Together they cannot fit (a sleep never ends early), and each keeps
+        // 400ms of margin for a loaded host.
         assert_eq!(
             error.data,
             Some(serde_json::json!({"timeoutSource":"absolute"}))
@@ -63167,6 +63202,10 @@ IFS= read -r end
                 } else {
                     method
                 };
+                // In the planted negative the sibling cancels this request and
+                // then sends its ping. The cancellation control can reach the
+                // wire before that ping or after the responses; the peer
+                // accepts it exactly once in either position.
                 let script = format!(
                     r#"
 {handshake}
@@ -63174,13 +63213,16 @@ IFS= read -r first || exit 92
 case "$first" in *'"method":"{wire_method}"'*'"id":2'*) ;; *) exit 93 ;; esac
 {no_tasks}
 IFS= read -r sibling || exit 94
+control=false
+case "$sibling" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r sibling || exit 94 ;; esac
 case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 95 ;; esac
 {progress}
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{result}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{ping_result}}}'
 IFS= read -r recovery || exit 96
-control=false
-case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+if [ "$control" = false ]; then
+  case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+fi
 case "$recovery" in *'"method":"tools/list"'*'"id":4'*) ;; *) exit 97 ;; esac
 printf '{{"jsonrpc":"2.0","id":4,"result":{{{recovery_prefix}"tools":[{{"name":"%s","inputSchema":{{"type":"object"}}}}]}}}}\n' "$control"
 IFS= read -r end
@@ -63593,6 +63635,10 @@ while IFS= read -r unexpected; do exit 22; done
             } else {
                 r#"{"resultType":"complete"}"#
             };
+            // In the planted negative the sibling cancels this request and
+            // then sends its ping. The cancellation control can reach the wire
+            // before that ping or after the responses; the peer accepts it
+            // exactly once in either position.
             let script = format!(
                 r#"
 IFS= read -r discovery || exit 90
@@ -63600,12 +63646,15 @@ printf '%s\n' '{discovery}'
 IFS= read -r first || exit 91
 case "$first" in *'"method":"{method}"'*'{subject}'*'"id":2'*) ;; *) exit 92 ;; esac
 IFS= read -r sibling || exit 93
+control=false
+case "$sibling" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r sibling || exit 93 ;; esac
 case "$sibling" in *'"method":"ping"'*'"id":3'*) ;; *) exit 94 ;; esac
 printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{initial}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"resultType":"complete"}}}}'
 IFS= read -r recovery || exit 96
-control=false
-case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+if [ "$control" = false ]; then
+  case "$recovery" in *'"method":"notifications/cancelled"'*'"requestId":2'*) control=true; IFS= read -r recovery || exit 96 ;; esac
+fi
 case "$recovery" in *'"method":"tasks/get"'*'{subject}'*'"id":4'*) ;; *) exit 97 ;; esac
 printf '{{"jsonrpc":"2.0","id":4,"result":{{"statusMessage":"%s",' "$control"
 printf '%s\n' '"resultType":"complete","taskId":"{subject}","status":"completed","createdAt":"2026-07-28T12:00:00Z","lastUpdatedAt":"2026-07-28T12:00:00Z","ttlMs":null,"result":{nested}}}}}'

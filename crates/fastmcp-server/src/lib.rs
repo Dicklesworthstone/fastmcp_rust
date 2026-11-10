@@ -49884,6 +49884,9 @@ mod lib_unit_tests {
             assert_eq!(session.selected_era, None);
             assert_eq!(probe.effects(), (0, 0, 0));
         }
+        // A caller that cannot finish authentication gets the sanitized,
+        // retryable unavailability response: the credential was never judged,
+        // so a 401 would wrongly report it as rejected.
         cx.cancel_with(CancelKind::User, Some("cancel before HTTP authentication"));
         let response = block_on(
             session.handle_async(
@@ -49893,9 +49896,13 @@ mod lib_unit_tests {
             ),
         )
         .expect("cancelled authentication must return an HTTP refusal");
-        assert!(
-            matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
-        );
+        assert!(matches!(
+            response,
+            ServerHttpEndpointResponse::Immediate(response)
+                if response.status == HttpStatus::SERVICE_UNAVAILABLE
+                    && response.headers.get("retry-after").map(String::as_str) == Some("1")
+                    && response.body.is_empty()
+        ));
         assert_eq!(session.selected_era, None);
         assert_eq!(probe.effects(), (0, 0, 0));
         let expired =
@@ -49911,9 +49918,13 @@ mod lib_unit_tests {
             ),
         )
         .expect("expired authentication must return an HTTP refusal");
-        assert!(
-            matches!(response, ServerHttpEndpointResponse::Immediate(response) if response.status == HttpStatus::UNAUTHORIZED)
-        );
+        assert!(matches!(
+            response,
+            ServerHttpEndpointResponse::Immediate(response)
+                if response.status == HttpStatus::SERVICE_UNAVAILABLE
+                    && response.headers.get("retry-after").map(String::as_str) == Some("1")
+                    && response.body.is_empty()
+        ));
         assert_eq!(session.selected_era, None);
         assert_eq!(probe.effects(), (0, 0, 0));
 

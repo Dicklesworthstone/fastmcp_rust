@@ -1026,7 +1026,17 @@ fn e2e_read_and_semantic_noop_accept_xattrs_but_replacement_fails_closed() {
         &home,
         &["install", "other-server", "/bin/echo", "--target", "claude"],
     );
-    assert!(!mutation_output.status.success());
+    let xattr_names_after = {
+        let mut names = vec![0_u8; 4096];
+        rustix::fs::listxattr(&path, &mut names)
+            .map(|written| String::from_utf8_lossy(&names[..written]).into_owned())
+    };
+    assert!(
+        !mutation_output.status.success(),
+        "replacement of an xattr-bearing config must fail closed; stdout: {}; stderr: {}; xattrs now: {xattr_names_after:?}",
+        stdout_str(&mutation_output),
+        stderr_str(&mutation_output)
+    );
     assert!(stderr_str(&mutation_output).contains("extended attributes"));
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(!PathBuf::from(format!("{}.bak", path.display())).exists());

@@ -1204,12 +1204,13 @@ fn e2e_list_redacts_environment_values_in_structured_and_table_output() {
     assert_eq!(json["servers"][0]["args"][3], "<redacted>");
     assert_eq!(json["servers"][0]["args"][4], "--<option>=<redacted>");
     assert_eq!(json["servers"][0]["args"][5], "<redacted>");
-    assert_eq!(
-        json["servers"][0]["cwd"],
-        "token=<redacted>\\x0A/srv/server"
-    );
+    // Machine output preserves exact strings (db57de2b): the newline in the
+    // path survives and only the credential inside it is redacted. Terminal
+    // output below still escapes control characters.
+    assert_eq!(json["servers"][0]["cwd"], "token=<redacted>\n/srv/server");
     assert_eq!(json["redacted"], true);
-    assert_eq!(json["sanitized"], true);
+    // Nothing was escaped, so the document does not claim sanitization.
+    assert_eq!(json["sanitized"], false);
     assert_eq!(json["truncated"], false);
     assert!(!json_stdout.contains("safe"));
     assert!(!json_stdout.contains("api-token"));
@@ -1257,7 +1258,7 @@ fn e2e_list_redacts_environment_values_in_structured_and_table_output() {
     );
     assert_eq!(
         yaml.get("sanitized").and_then(serde_yaml::Value::as_bool),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         yaml.get("truncated").and_then(serde_yaml::Value::as_bool),

@@ -10494,7 +10494,11 @@ mod tests {
         fixtures[0].0 = json!({"allOf": vec![json!({"minLength": 1}); 63 + excess]});
         fixtures[1].0 = json!({"allOf": vec![json!({"uniqueItems": true}); 37 + excess]});
         for keyword in ["const", "enum"] {
-            let instance = json!("x".repeat(4 * 1024 * 1024));
+            // The literal lives in the schema, and raw documents are bounded by
+            // MAX_SCHEMA_DOCUMENT_BYTES (a36a8c79), so it is smaller than the
+            // instances above. One allOf holds at most 64 branches, so the
+            // extra comparisons come from two groups of 64 references.
+            let instance = json!("x".repeat(1536 * 1024));
             let assertion = if keyword == "enum" {
                 json!([instance.clone()])
             } else {
@@ -10503,9 +10507,14 @@ mod tests {
             // Raw schemas retain their existing local-reference and literal
             // representation semantics. Refer to one large assertion rather
             // than constructing dozens of separately retained copies.
+            let mut all_of = vec![json!({"$ref": "#/$defs/group"}); 2];
+            all_of.extend(vec![json!({"$ref": "#/$defs/large"}); 34 + excess]);
             let source = json!({
-                "$defs": {"large": {keyword: assertion}},
-                "allOf": vec![json!({"$ref": "#/$defs/large"}); 62 + excess]
+                "$defs": {
+                    "large": {keyword: assertion},
+                    "group": {"allOf": vec![json!({"$ref": "#/$defs/large"}); 64]}
+                },
+                "allOf": all_of
             });
             fixtures.push((source, instance));
         }

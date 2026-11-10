@@ -2135,14 +2135,17 @@ fn http_03_b_subscription_expired_listener_closes_socket_sibling_ping_succeeds_n
         thread::sleep(Duration::from_millis(260));
         assert_connection_closed_by_client(&mut subscription);
 
-        let mut ping = accept_bounded_stream(&listener);
-        let request = read_request(&mut ping);
-        assert_final_metadata(&request, "ping");
+        // The 2026-07-28 revision removed `ping`, and the modern client
+        // refuses it before network contact (bd-ep6pp). The sibling is
+        // therefore the canonical admitted request, `server/discover`.
+        let mut sibling = accept_bounded_stream(&listener);
+        let request = read_request(&mut sibling);
+        assert_final_metadata(&request, "server/discover");
         write_response(
-            &mut ping,
+            &mut sibling,
             200,
             "application/json",
-            br#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
+            br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{},"ttlMs":0,"cacheScope":"private"}}"#,
         );
     });
 
@@ -2187,18 +2190,23 @@ fn http_03_b_subscription_expired_listener_closes_socket_sibling_ping_succeeds_n
 
         let sibling = require_modern_response(
             connection
-                .request(&cx, "ping", serde_json::json!({}), RequestId::Number(3))
+                .request(
+                    &cx,
+                    "server/discover",
+                    serde_json::json!({}),
+                    RequestId::Number(3),
+                )
                 .await
-                .expect("sibling public ping must succeed after listener expiry"),
+                .expect("sibling public request must succeed after listener expiry"),
         );
         let body = sibling
             .read_to_end(&cx, 4_096)
             .await
-            .expect("read sibling ping body");
+            .expect("read sibling body");
         let body: serde_json::Value =
-            serde_json::from_slice(&body).expect("sibling ping body must be JSON");
+            serde_json::from_slice(&body).expect("sibling body must be JSON");
         assert_eq!(body["id"], 3);
-        assert_eq!(body["result"], serde_json::json!({}));
+        assert_eq!(body["result"]["resultType"], "complete");
     });
 
     server.join().expect("isolation server must join");

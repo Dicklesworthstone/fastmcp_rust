@@ -616,7 +616,17 @@ impl PeerLog {
     /// no modern routing header, no 2025 session or replay state, no DELETE,
     /// and nothing the script did not expect.
     fn assert_legacy_hygiene(&self, case: &str) {
-        assert_eq!(self.modern_probes(), 1, "{case}: exactly one modern probe");
+        self.assert_legacy_hygiene_for(case, ProtocolPolicy::Auto);
+    }
+
+    /// The same hygiene for a selected policy: `Auto` spends exactly one
+    /// disposable modern probe, and `LegacyOnly` is forbidden from probing.
+    fn assert_legacy_hygiene_for(&self, case: &str, policy: ProtocolPolicy) {
+        assert_eq!(
+            self.modern_probes(),
+            usize::from(policy == ProtocolPolicy::Auto),
+            "{case}: {policy:?} modern probe count"
+        );
         for header in [
             "Authorization",
             "Mcp-Session-Id",
@@ -966,12 +976,16 @@ async fn open_configured_ready_legacy(
         0,
     )
     .expect("the selected legacy endpoint plan is valid");
+    // connect_http_with_cx only opens the selected transport; the ready
+    // client connect runs initialize and notifications/initialized, which the
+    // peer script expects before it writes the ready marker.
     let mut connection = ClientBuilder::new()
         .protocol_plan(protocol_plan)
         .request_timeout_policy(timeout)
-        .connect_http_with_cx(cx)
+        .connect_http_client_with_cx(cx)
         .await
-        .expect("the public builder completes exact-2024 initialization");
+        .expect("the public builder completes exact-2024 initialization")
+        .into_connection();
     bounded_ready(poll_fn(|_| match connection.take_legacy_notification() {
         Some(notification) => {
             assert_eq!(notification.method, "notifications/resources/list_changed");
@@ -1407,7 +1421,7 @@ fn assert_legacy_request_idle_policy(expires: bool, policy: ProtocolPolicy) {
         assert_one_cancellation(&log, 71);
     }
     assert_eq!(log.held_closed_by_client, Some(true));
-    log.assert_legacy_hygiene("ordinary request idle policy");
+    log.assert_legacy_hygiene_for("ordinary request idle policy", policy);
 }
 
 #[test]
@@ -1526,7 +1540,7 @@ fn assert_legacy_request_progress_policy(
         assert_one_cancellation(&log, 81);
     }
     assert_eq!(log.held_closed_by_client, Some(true));
-    log.assert_legacy_hygiene("per-request progress policy");
+    log.assert_legacy_hygiene_for("per-request progress policy", ProtocolPolicy::LegacyOnly);
 }
 
 fn short_legacy_request_policy() -> RequestTimeoutPolicy {
@@ -1686,7 +1700,10 @@ fn ready_legacy_http_request_original_context_cancellation_retires_waiter() {
     assert_eq!(log.posts.len(), 5);
     assert_one_cancellation(&log, 91);
     assert_eq!(log.held_closed_by_client, Some(true));
-    log.assert_legacy_hygiene("original request context cancellation");
+    log.assert_legacy_hygiene_for(
+        "original request context cancellation",
+        ProtocolPolicy::LegacyOnly,
+    );
 }
 
 #[test]
@@ -1752,7 +1769,10 @@ fn ready_legacy_http_request_late_response_cannot_win_delayed_wait() {
         "a consumed terminal authorizes no cancellation control"
     );
     assert_eq!(log.held_closed_by_client, Some(true));
-    log.assert_legacy_hygiene("late response before first wait");
+    log.assert_legacy_hygiene_for(
+        "late response before first wait",
+        ProtocolPolicy::LegacyOnly,
+    );
 }
 
 /// A client request the peer can recognise in the POST body.

@@ -14534,12 +14534,19 @@ mod tests {
             assert_eq!(request["method"], "example/events");
             assert!(request.get("id").is_none());
             started_tx.send(()).unwrap();
+            // No response head was sent, so the dropped exchange is reset, not
+            // half-closed (a FIN would read as a legal request write-half close).
             let mut byte = [0_u8; 1];
-            assert_eq!(
-                stream.read(&mut byte).unwrap(),
-                0,
-                "dropping the owned notification closes its response wait"
-            );
+            match stream.read(&mut byte) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => {
+                    panic!("dropping the owned notification resets its response wait: {result:?}")
+                }
+            }
             respond_notification_followup(&listener);
         });
         let cx = Cx::for_request();
@@ -16541,19 +16548,39 @@ mod tests {
     #[test]
     fn owned_http_errors_reject_foreign_response_ids() {
         for extension in [false, true] {
+            // An explicit null id is an invalid envelope, not a foreign id:
+            // uncorrelated MCP errors omit the id, and strict admission
+            // refuses null, so the HTTP outcome is preserved.
+            let null_id = owned_http_failure_case(
+                extension,
+                404,
+                "application/json",
+                br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#,
+                4_096,
+            );
+            assert!(
+                matches!(
+                    null_id,
+                    ModernHttpFinalCoreListenError::UnexpectedHttpStatus { status: 404 }
+                ),
+                "extension {extension}: {null_id:?}"
+            );
             for body in [
                 &br#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}"#[..],
                 &br#"{"jsonrpc":"2.0","id":"2","error":{"code":-32601,"message":"Method not found"}}"#[..],
-                &br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#[..],
             ] {
                 let error = owned_http_failure_case(extension, 404, "application/json", body, 4_096);
-                assert!(matches!(
-                    error,
-                    ModernHttpFinalCoreListenError::ResponseIdMismatch {
-                        expected: RequestId::Number(2),
-                        ..
-                    }
-                ));
+                assert!(
+                    matches!(
+                        error,
+                        ModernHttpFinalCoreListenError::ResponseIdMismatch {
+                            expected: RequestId::Number(2),
+                            ..
+                        }
+                    ),
+                    "extension {extension}, body {}: {error:?}",
+                    String::from_utf8_lossy(body)
+                );
             }
         }
     }
@@ -16958,23 +16985,27 @@ mod tests {
 
     #[test]
     fn collected_http_errors_reject_foreign_ids_and_non_error_bodies() {
-        for id in [
-            serde_json::json!(3),
-            serde_json::json!("2"),
-            serde_json::Value::Null,
-        ] {
+        // An explicit null id is not a foreign id but an invalid envelope:
+        // uncorrelated MCP errors omit the id, and strict response admission
+        // refuses null. It keeps the HTTP failure, with the malformed bodies.
+        for id in [serde_json::json!(3), serde_json::json!("2")] {
             let body = serde_json::json!({
                 "jsonrpc": "2.0", "id": id,
                 "error": {"code": -32601, "message": "Method not found"}
             })
             .to_string();
-            assert!(matches!(
-                collected_http_error_response(404, "application/json", body.as_bytes(), 4_096),
-                Err(ClientHttpConnectionError::ResponseIdMismatch {
-                    expected: RequestId::Number(2),
-                    ..
-                })
-            ));
+            let collected =
+                collected_http_error_response(404, "application/json", body.as_bytes(), 4_096);
+            assert!(
+                matches!(
+                    collected,
+                    Err(ClientHttpConnectionError::ResponseIdMismatch {
+                        expected: RequestId::Number(2),
+                        ..
+                    })
+                ),
+                "response id {id}: {collected:?}"
+            );
         }
         const ERROR: &[u8] =
             br#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
@@ -16982,6 +17013,11 @@ mod tests {
             (400, "text/plain", ERROR),
             (404, "application/json; charset=iso-8859-1", ERROR),
             (400, "application/json", &b"{malformed"[..]),
+            (
+                404,
+                "application/json",
+                &br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32601,"message":"Method not found"}}"#[..],
+            ),
             (401, "application/json", ERROR),
             (403, "application/json", ERROR),
             (429, "application/json", ERROR),
@@ -23605,11 +23641,14 @@ mod tests {
             served,
             "the wrong-version wire peer must receive its two requests"
         );
-        assert!(matches!(
-            error,
-            crate::HttpClientError::LegacyInitializationUnsupportedProtocolVersion { actual }
-                if actual == "2026-07-28"
-        ));
+        assert!(
+            matches!(
+                &error,
+                crate::HttpClientError::LegacyInitializationUnsupportedProtocolVersion { actual }
+                    if actual == "2026-07-28"
+            ),
+            "{error:?}"
+        );
     }
 
     #[cfg(feature = "legacy-2024-11-05")]

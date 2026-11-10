@@ -1163,6 +1163,7 @@ fn direct_derive_tasks_consumer_compiles() {
     let core_path = toml_path(&workspace_root.join("crates/fastmcp-core"));
     let protocol_path = toml_path(&workspace_root.join("crates/fastmcp-protocol"));
     let server_path = toml_path(&workspace_root.join("crates/fastmcp-server"));
+    let serde_json = workspace_dependency_requirement(workspace_root, "serde_json");
     fs::write(
         fixture_root.join("Cargo.toml"),
         format!(
@@ -1179,7 +1180,7 @@ fastmcp-derive = {{ path = "{derive_path}", features = ["tasks"] }}
 fastmcp-core = {{ path = "{core_path}" }}
 fastmcp-protocol = {{ path = "{protocol_path}", features = ["tasks"] }}
 fastmcp-server = {{ path = "{server_path}" }}
-serde_json = "=1.0.151"
+serde_json = "{serde_json}"
 "#,
         ),
     )
@@ -1962,6 +1963,22 @@ fn toml_path(path: &Path) -> String {
         .to_string()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+}
+
+/// Reads a `[workspace.dependencies]` version requirement. A fixture that
+/// shares the workspace's path crates must resolve the same exact pins, and an
+/// offline lock cannot select a second version, so the pin is read rather
+/// than restated.
+fn workspace_dependency_requirement(workspace_root: &Path, name: &str) -> String {
+    let manifest =
+        fs::read_to_string(workspace_root.join("Cargo.toml")).expect("read workspace manifest");
+    let manifest = toml::from_str::<toml::Value>(&manifest).expect("workspace manifest is TOML");
+    let dependency = &manifest["workspace"]["dependencies"][name];
+    dependency
+        .as_str()
+        .or_else(|| dependency.get("version").and_then(toml::Value::as_str))
+        .unwrap_or_else(|| panic!("workspace dependency {name} declares a version requirement"))
+        .to_owned()
 }
 
 const FACADE_ONLY_CONSUMER: &str = r#"
