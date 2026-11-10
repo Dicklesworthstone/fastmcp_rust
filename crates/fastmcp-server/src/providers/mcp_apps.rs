@@ -4,16 +4,19 @@
 //! A `ui://` document is meaningful only to a negotiated modern Apps Host, so
 //! it must never leak into MCP 2024-11-05 resource discovery or dispatch.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
-use fastmcp_core::{McpContext, McpResult};
-use fastmcp_protocol::common_types::AbsoluteUri;
+use fastmcp_core::{McpContext, McpError, McpResult};
+use fastmcp_protocol::common_types::{AbsoluteUri, EmbeddedResourceContents};
 use fastmcp_protocol::{
-    FinalResource, MCP_APPS_HTML_MIME_TYPE, McpAppsMetadataError, McpAppsResourceMetadata,
-    Resource, ResourceContent,
+    CacheScope, CacheTtl, CompleteResult, FinalReadResourceResult, FinalResource,
+    MCP_APPS_HTML_MIME_TYPE, McpAppsMetadataError, McpAppsResourceMetadata, Resource,
+    ResourceContent, ResultMeta,
 };
 
-use crate::ResourceHandler;
+use crate::handler::DEFAULT_FINAL_RESOURCE_TTL_MS;
+use crate::{FinalResourceReadCacheHintProvenance, ResourceHandler, UriParams};
 
 /// An immutable HTML document advertised as one final-only `ui://` resource.
 #[derive(Clone, Debug)]
@@ -125,6 +128,54 @@ impl ResourceHandler for McpAppsUiResource {
             blob: None,
         }])
     }
+
+    fn read_final(
+        &self,
+        context: &McpContext,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        context.checkpoint()?;
+        let meta = self
+            .apps_metadata
+            .as_ref()
+            .map(McpAppsResourceMetadata::to_open_metadata)
+            .transpose()
+            .map_err(|_| {
+                McpError::internal_error("MCP Apps resource metadata could not be encoded")
+            })?;
+
+        // A Host may load this URI without listing resources first. Keep the
+        // validated presentation policy on the exact document it governs,
+        // including the distinction between absent metadata and `ui: {}`.
+        Ok(CompleteResult::new(
+            FinalReadResourceResult {
+                contents: vec![EmbeddedResourceContents::Text {
+                    uri: self.uri.clone(),
+                    text: self.html.clone(),
+                    mime_type: Some(MCP_APPS_HTML_MIME_TYPE.to_owned()),
+                    meta,
+                    additional: BTreeMap::new(),
+                }],
+                ttl_ms: CacheTtl::milliseconds(DEFAULT_FINAL_RESOURCE_TTL_MS),
+                cache_scope: CacheScope::Private,
+            },
+            ResultMeta::empty(),
+        ))
+    }
+
+    fn read_final_with_uri(
+        &self,
+        context: &McpContext,
+        _uri: &str,
+        _params: &UriParams,
+    ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+        self.read_final(context)
+    }
+
+    fn final_resource_read_cache_hint_provenance(&self) -> FinalResourceReadCacheHintProvenance {
+        // This provider adds document metadata, not an application cache
+        // policy. Preserve the router policy used by its former bridge.
+        FinalResourceReadCacheHintProvenance::RouterPolicy
+    }
 }
 
 /// Invalid final-only Apps resource configuration.
@@ -174,12 +225,50 @@ mod tests {
     use fastmcp_core::{Cx, McpContext, McpErrorCode, SessionState};
     use fastmcp_protocol::common_types::AbsoluteUri;
     use fastmcp_protocol::{
-        McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
+        JsonRpcRequest, McpAppsResourceCsp, McpAppsResourceMetadata, McpAppsResourcePermission,
         McpAppsResourcePermissions, ReadResourceParams,
     };
+    use serde_json::{Value, json};
 
     use super::*;
-    use crate::{DuplicateBehavior, Router};
+    use crate::{
+        DuplicateBehavior, InboundRequestContext, InboundRequestTransport, Router, Server,
+    };
+
+    fn apps_request_meta() -> Value {
+        json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {
+                    "io.modelcontextprotocol/ui": {
+                        "mimeTypes": [MCP_APPS_HTML_MIME_TYPE]
+                    }
+                }
+            }
+        })
+    }
+
+    async fn dispatch_apps_request(
+        server: &Server,
+        cx: &Cx,
+        method: &str,
+        params: Value,
+        id: u64,
+    ) -> Value {
+        let response = server
+            .dispatch_stateless(
+                &InboundRequestContext::new(cx.clone(), id, InboundRequestTransport::Memory),
+                &JsonRpcRequest::new(method, Some(params), i64::try_from(id).unwrap()),
+            )
+            .await
+            .expect("Apps request has a response");
+        assert!(
+            response.error.is_none(),
+            "Apps dispatch: {:?}",
+            response.error
+        );
+        response.result.expect("Apps request has a result")
+    }
 
     #[test]
     fn ui_resource_publishes_the_exact_html_catalog_shape_and_body() {
@@ -273,6 +362,208 @@ mod tests {
     }
 
     #[test]
+    fn public_apps_read_preserves_catalog_policy_without_a_prior_list() {
+        let ((), report) = asupersync::lab::run_async_under_lab(0xa9_01, |cx| async move {
+            let metadata = McpAppsResourceMetadata::try_new(
+                Some(
+                    McpAppsResourceCsp::try_new(
+                        Some(vec!["https://api.weather.example".to_owned()]),
+                        Some(vec!["https://cdn.weather.example".to_owned()]),
+                        Some(vec!["https://maps.weather.example".to_owned()]),
+                        Some(vec!["https://weather.example".to_owned()]),
+                    )
+                    .expect("bounded CSP is valid"),
+                ),
+                Some(McpAppsResourcePermissions {
+                    camera: Some(McpAppsResourcePermission::default()),
+                    microphone: Some(McpAppsResourcePermission::default()),
+                    geolocation: Some(McpAppsResourcePermission::default()),
+                    clipboard_write: Some(McpAppsResourcePermission::default()),
+                }),
+                Some("weather-view.host.example".to_owned()),
+                Some(false),
+            )
+            .expect("typed Apps metadata is valid");
+            let resource = McpAppsUiResource::try_new(
+                AbsoluteUri::parse("ui://weather/dashboard").unwrap(),
+                "weather-dashboard",
+                "<!doctype html>\n<main data-units=\"°C\">weather &amp; maps</main>\n",
+            )
+            .unwrap()
+            .with_apps_metadata(metadata)
+            .unwrap();
+            let server = Server::new("apps-resource-policy", "1.0")
+                .mcp_apps()
+                .unwrap()
+                .mcp_apps_ui_resource(resource)
+                .unwrap()
+                .build();
+
+            // A tool can link to this document before the Host lists resources.
+            let read = dispatch_apps_request(
+                &server,
+                &cx,
+                "resources/read",
+                json!({"uri": "ui://weather/dashboard", "_meta": apps_request_meta()}),
+                1,
+            )
+            .await;
+            let expected_meta = json!({
+                "ui": {
+                    "csp": {
+                        "connectDomains": ["https://api.weather.example"],
+                        "resourceDomains": ["https://cdn.weather.example"],
+                        "frameDomains": ["https://maps.weather.example"],
+                        "baseUriDomains": ["https://weather.example"]
+                    },
+                    "permissions": {
+                        "camera": {}, "microphone": {}, "geolocation": {}, "clipboardWrite": {}
+                    },
+                    "domain": "weather-view.host.example",
+                    "prefersBorder": false
+                }
+            });
+            assert_eq!(read["resultType"], "complete");
+            assert_eq!(
+                read["contents"],
+                json!([{
+                    "uri": "ui://weather/dashboard",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": "<!doctype html>\n<main data-units=\"°C\">weather &amp; maps</main>\n",
+                    "_meta": expected_meta
+                }]),
+                "one exact document must carry its own typed policy and unchanged HTML"
+            );
+            assert_eq!(read["ttlMs"], DEFAULT_FINAL_RESOURCE_TTL_MS);
+            assert_eq!(read["cacheScope"], "private");
+
+            let list = dispatch_apps_request(
+                &server,
+                &cx,
+                "resources/list",
+                json!({"_meta": apps_request_meta()}),
+                2,
+            )
+            .await;
+            assert_eq!(list["resources"].as_array().unwrap().len(), 1);
+            assert_eq!(list["resources"][0]["_meta"], expected_meta);
+            assert_eq!(read["contents"][0]["_meta"], list["resources"][0]["_meta"]);
+        });
+        assert!(report.lab_test_passed(), "Apps resource policy: {report:?}");
+    }
+
+    #[test]
+    fn public_apps_read_distinguishes_absent_and_present_empty_metadata() {
+        for present in [false, true] {
+            let ((), report) =
+                asupersync::lab::run_async_under_lab(0xa9_02, move |cx| async move {
+                    let resource = McpAppsUiResource::try_new(
+                        AbsoluteUri::parse("ui://weather/dashboard").unwrap(),
+                        "weather-dashboard",
+                        "<main>weather</main>",
+                    )
+                    .unwrap();
+                    let resource = if present {
+                        resource
+                            .with_apps_metadata(McpAppsResourceMetadata::default())
+                            .unwrap()
+                    } else {
+                        resource
+                    };
+                    let direct = resource
+                        .read_final_with_uri(
+                            &McpContext::new(cx.clone(), 1),
+                            "ui://weather/dashboard",
+                            &UriParams::new(),
+                        )
+                        .unwrap();
+                    let server = Server::new("apps-resource-presence", "1.0")
+                        .mcp_apps()
+                        .unwrap()
+                        .mcp_apps_ui_resource(resource)
+                        .unwrap()
+                        .build();
+                    let read = dispatch_apps_request(
+                        &server,
+                        &cx,
+                        "resources/read",
+                        json!({"uri": "ui://weather/dashboard", "_meta": apps_request_meta()}),
+                        2,
+                    )
+                    .await;
+                    assert_eq!(read["contents"].as_array().unwrap().len(), 1);
+                    assert_eq!(read["contents"][0]["text"], "<main>weather</main>");
+                    assert_eq!(
+                        read["contents"],
+                        serde_json::to_value(direct.payload.contents).unwrap(),
+                        "the URI-aware final hook preserves the same metadata presence"
+                    );
+                    if present {
+                        assert_eq!(read["contents"][0]["_meta"], json!({"ui": {}}));
+                    } else {
+                        assert!(
+                            read["contents"][0].get("_meta").is_none(),
+                            "absence must not synthesize a UI policy or permission markers"
+                        );
+                    }
+                });
+            assert!(
+                report.lab_test_passed(),
+                "Apps metadata presence: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apps_read_metadata_preserves_configured_router_cache_policy() {
+        let ((), report) = asupersync::lab::run_async_under_lab(0xa9_03, |cx| async move {
+            let resource = McpAppsUiResource::try_new(
+                AbsoluteUri::parse("ui://weather/dashboard").unwrap(),
+                "weather-dashboard",
+                "<main>weather</main>",
+            )
+            .unwrap()
+            .with_apps_metadata(McpAppsResourceMetadata::new(Some(true)))
+            .unwrap();
+            let mut router = Server::new("apps-resource-cache", "1.0")
+                .mcp_apps()
+                .unwrap()
+                .mcp_apps_ui_resource(resource)
+                .unwrap()
+                .build()
+                .into_router();
+            router.set_final_cache_hint_policy(
+                CacheTtl::milliseconds(17),
+                CacheTtl::milliseconds(23),
+                CacheScope::Public,
+            );
+            let read = router
+                .dispatch_stateless(
+                    &McpContext::new(cx, 1),
+                    &JsonRpcRequest::new(
+                        "resources/read",
+                        Some(json!({
+                            "uri": "ui://weather/dashboard", "_meta": apps_request_meta()
+                        })),
+                        1_i64,
+                    ),
+                )
+                .await
+                .expect("Apps resource reads through configured router");
+            assert_eq!(read["ttlMs"], 23);
+            assert_eq!(read["cacheScope"], "public");
+            assert_eq!(
+                read["contents"][0]["_meta"],
+                json!({"ui": {"prefersBorder": true}})
+            );
+        });
+        assert!(
+            report.lab_test_passed(),
+            "Apps resource cache policy: {report:?}"
+        );
+    }
+
+    #[test]
     fn changing_only_the_apps_domain_to_empty_rejects_metadata_without_catalog_mutation() {
         let accepted = McpAppsResourceMetadata::try_new(
             None,
@@ -305,6 +596,14 @@ mod tests {
             catalog_before.meta,
             "rejected metadata cannot alter the published final catalog entry"
         );
+        let read = resource
+            .read_final(&McpContext::new(Cx::for_testing(), 1))
+            .expect("original document remains readable");
+        let wire = serde_json::to_value(read.payload.contents).unwrap();
+        assert!(
+            wire[0].get("_meta").is_none(),
+            "rejected metadata cannot enter the matching resource content"
+        );
     }
 
     struct CountingUiResource {
@@ -324,6 +623,14 @@ mod tests {
         fn read(&self, context: &McpContext) -> McpResult<Vec<ResourceContent>> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             self.inner.read(context)
+        }
+
+        fn read_final(
+            &self,
+            context: &McpContext,
+        ) -> McpResult<CompleteResult<FinalReadResourceResult>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read_final(context)
         }
     }
 
