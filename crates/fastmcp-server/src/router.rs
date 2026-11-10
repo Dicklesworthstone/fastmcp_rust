@@ -2066,21 +2066,34 @@ async fn run_handler_in_request<'a, T>(
         }
     }
 
+    enum HandlerInterrupted {
+        Panicked,
+        Cancelled,
+    }
+
     let future = crate::catch_extension_unwind(|| make_future(request_cx))
         .map_err(|_payload| sanitized_handler_panic(ctx.cx(), handler_class))?;
     let mut future = future;
     let poll_handler = std::future::poll_fn(|task_cx| {
         match crate::catch_extension_unwind(|| future.as_mut().poll(task_cx)) {
             Ok(Poll::Ready(outcome)) => Poll::Ready(Ok(outcome)),
+            // Cancellation publication wakes this task, and the handler gets
+            // that poll to settle. One still parked in a wait that ignores
+            // cancellation is dropped here: neither the request deadline's
+            // timer nor any other wait completes for a cancelled task (since
+            // asupersync 0.6 a timeout does not), and the region holding this
+            // task could otherwise never close. Masked cleanup stays exempt.
+            Ok(Poll::Pending) if request_cx_cancellation_is_visible(request_cx) => {
+                Poll::Ready(Err(HandlerInterrupted::Cancelled))
+            }
             Ok(Poll::Pending) => Poll::Pending,
-            Err(_payload) => Poll::Ready(Err(())),
+            Err(_payload) => Poll::Ready(Err(HandlerInterrupted::Panicked)),
         }
     });
 
-    let outcome = match budget.deadline {
+    let polled = match budget.deadline {
         Some(deadline) => match asupersync::time::timeout_at(deadline, poll_handler).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(())) => return Err(sanitized_handler_panic(ctx.cx(), handler_class)),
+            Ok(polled) => polled,
             Err(_elapsed) => {
                 return Err(McpError::new(
                     McpErrorCode::RequestCancelled,
@@ -2088,10 +2101,14 @@ async fn run_handler_in_request<'a, T>(
                 ));
             }
         },
-        None => match poll_handler.await {
-            Ok(outcome) => outcome,
-            Err(()) => return Err(sanitized_handler_panic(ctx.cx(), handler_class)),
-        },
+        None => poll_handler.await,
+    };
+    let outcome = match polled {
+        Ok(outcome) => outcome,
+        Err(HandlerInterrupted::Panicked) => {
+            return Err(sanitized_handler_panic(ctx.cx(), handler_class));
+        }
+        Err(HandlerInterrupted::Cancelled) => return Err(cancellation_error(ctx)),
     };
 
     if request_cx_cancellation_is_visible(request_cx) {
