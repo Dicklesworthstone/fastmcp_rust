@@ -6,51 +6,9 @@
 //! synchronous scope or remain installed across an await.
 
 use asupersync::Cx;
-use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
 
 pub(crate) fn with_caller<T>(cx: &Cx, operation: impl FnOnce() -> T) -> T {
-    let ceiling = ambient_ceiling();
-    let _caller = Cx::set_current(Some(cx.clone()));
-    let _restriction = Cx::push_restriction(ceiling);
-    operation()
-}
-
-// Use the pinned runtime's public sealed masks, not raw bits or a fabricated
-// Cx. An unrelated ambient caller contributes ONLY effects, never identity,
-// budget, cancellation or a replacement I/O/timer driver.
-fn ambient_ceiling() -> CapMask {
-    let Some(active) = Cx::current() else {
-        return CapMask::all();
-    };
-    let capabilities = active.capabilities();
-    let mut ceiling = CapMask::all();
-    for (allowed, without) in [
-        (
-            capabilities.spawn,
-            CapSet::<false, true, true, true, true>::MASK,
-        ),
-        (
-            capabilities.time,
-            CapSet::<true, false, true, true, true>::MASK,
-        ),
-        (
-            capabilities.entropy,
-            CapSet::<true, true, false, true, true>::MASK,
-        ),
-        (
-            capabilities.io,
-            CapSet::<true, true, true, false, true>::MASK,
-        ),
-        (
-            capabilities.remote,
-            CapSet::<true, true, true, true, false>::MASK,
-        ),
-    ] {
-        if !allowed {
-            ceiling = ceiling.intersect(without);
-        }
-    }
-    ceiling
+    fastmcp_core::runtime::with_caller_context(cx, operation)
 }
 
 #[cfg(test)]
@@ -60,6 +18,7 @@ mod tests {
     use std::time::Duration;
 
     use asupersync::Budget;
+    use asupersync::cx::cap::{CapMask, CapSet, CapSetRuntimeMask};
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::time::{TimerDriverHandle, VirtualClock};
 

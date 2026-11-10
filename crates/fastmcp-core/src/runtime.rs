@@ -664,6 +664,101 @@ pub(crate) fn ambient_capability_ceiling() -> CapMask {
     ceiling
 }
 
+/// Runs one synchronous operation with the explicit caller's runtime context
+/// while preserving every restriction of the surrounding host.
+///
+/// The caller supplies identity, budget, cancellation and runtime drivers. The
+/// ambient context contributes only an intersecting capability ceiling; a
+/// retained, broader caller cannot restore an effect denied by its host.
+/// Both context frames are restored on return or unwinding.
+///
+/// Async drivers must call this for each individual poll. The returned value
+/// carries no context guard, so returning a future does not install a context
+/// for its later polls. Capture [`asupersync::Cx::current`] inside the operation
+/// when a continuation must retain the admitted ceiling across later polls.
+pub fn with_caller_context<T>(cx: &asupersync::Cx, operation: impl FnOnce() -> T) -> T {
+    let ceiling = ambient_capability_ceiling();
+    let _current = asupersync::Cx::set_current(Some(cx.clone()));
+    let _restriction = asupersync::Cx::push_restriction(ceiling);
+    operation()
+}
+
+/// A future whose polling and destruction retain its admitted caller context.
+///
+/// The initial host ceiling is captured at construction. Each poll retains any
+/// further restriction before entering user code, so later polling or cleanup
+/// from a wider host cannot restore a denied effect. Destruction also intersects
+/// the current host's permissions, while identity,
+/// cancellation, budget and drivers still belong to the original caller.
+/// No thread-local guard survives a poll, and abandoning the future runs its
+/// cleanup with the same authority as its work. No runtime or task is created.
+#[must_use = "futures do nothing unless polled or awaited"]
+pub struct CallerContextFuture<F: Future> {
+    caller: asupersync::Cx,
+    future: Option<std::pin::Pin<Box<F>>>,
+}
+
+impl<F: Future> CallerContextFuture<F> {
+    /// Captures the effective caller and takes exclusive ownership of `future`.
+    ///
+    /// Construct the future itself inside [`with_caller_context`] too if its
+    /// factory performs synchronous work that depends on ambient authority.
+    pub fn new(cx: &asupersync::Cx, future: F) -> Self {
+        let caller = with_caller_context(cx, || {
+            asupersync::Cx::current().expect("explicit caller context is installed")
+        });
+        Self {
+            caller,
+            future: Some(Box::pin(future)),
+        }
+    }
+}
+
+impl<F: Future> fmt::Debug for CallerContextFuture<F> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallerContextFuture")
+            .field("completed", &self.future.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Future> Future for CallerContextFuture<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        task_cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let caller = this.caller.clone();
+        with_caller_context(&caller, || {
+            // Latch before entering the user future, including when that poll
+            // panics or yields. Later abandonment cannot widen its cleanup.
+            this.caller = asupersync::Cx::current().expect("explicit caller context is installed");
+            let result = this
+                .future
+                .as_mut()
+                .expect("caller-context future polled after completion")
+                .as_mut()
+                .poll(task_cx);
+            if result.is_ready() {
+                // Release the actual user future before restoring the host,
+                // even when it completed in a more restricted resumed poll.
+                drop(this.future.take());
+            }
+            result
+        })
+    }
+}
+
+impl<F: Future> Drop for CallerContextFuture<F> {
+    fn drop(&mut self) {
+        let future = self.future.take();
+        with_caller_context(&self.caller, || drop(future));
+    }
+}
+
 /// Drives `future` to completion on the calling thread under the caller's own
 /// `cx`, without creating or entering a runtime.
 ///
@@ -704,18 +799,17 @@ pub fn poll_on_cx<F: Future>(cx: &asupersync::Cx, future: F) -> F::Output {
     // Record the position before installing `cx`, which would otherwise make
     // a bridge entered from a bare thread look like one entered from a task.
     let _entry = BridgeEntry::enter();
-    let ceiling = ambient_capability_ceiling();
-    let _current = asupersync::Cx::set_current(Some(cx.clone()));
-    let _restriction = asupersync::Cx::push_restriction(ceiling);
-    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
-    let mut task_cx = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
-            return output;
+    with_caller_context(cx, || {
+        let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
+        let mut task_cx = Context::from_waker(&waker);
+        let mut future = std::pin::pin!(future);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut task_cx) {
+                return output;
+            }
+            std::thread::park_timeout(std::time::Duration::from_millis(1));
         }
-        std::thread::park_timeout(std::time::Duration::from_millis(1));
-    }
+    })
 }
 
 #[cfg(test)]
@@ -915,6 +1009,165 @@ mod tests {
         assert_eq!(super::poll_on_cx(&caller, async { 41 }), 41);
         drop(restriction);
         assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+    }
+
+    #[test]
+    fn caller_context_future_retains_authority_and_scopes_completion_cleanup() {
+        use asupersync::Cx;
+        use std::cell::Cell;
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        struct ObserveDrop(Rc<Cell<Option<[bool; 5]>>>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.set(Cx::current().as_ref().map(effects));
+            }
+        }
+
+        for admitted_mask in effect_masks() {
+            for resumed_mask in effect_masks() {
+                let caller = Cx::for_request_with_budget(asupersync::Budget::new());
+                let host = Cx::for_request_with_budget(asupersync::Budget::new());
+                let _host = Cx::set_current(Some(host.clone()));
+                let admission = Cx::push_restriction(admitted_mask);
+                let admitted = effects(&Cx::current().unwrap());
+                let dropped = Rc::new(Cell::new(None));
+                let probe = ObserveDrop(Rc::clone(&dropped));
+                let mut polls = 0;
+                let mut future = Box::pin(super::CallerContextFuture::new(
+                    &caller,
+                    poll_fn(move |_| {
+                        let _keep_until_future_drop = &probe;
+                        let current = Cx::current().unwrap();
+                        polls += 1;
+                        if polls == 1 {
+                            assert_eq!(effects(&current), admitted);
+                            Poll::Pending
+                        } else {
+                            Poll::Ready((effects(&current), current.task_id()))
+                        }
+                    }),
+                ));
+                drop(admission);
+                let depth = Cx::restriction_depth();
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(future.as_mut().poll(&mut task).is_pending());
+                assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+                assert_eq!(Cx::restriction_depth(), depth);
+
+                let restriction = Cx::push_restriction(resumed_mask);
+                let resumed = effects(&Cx::current().unwrap());
+                let expected = std::array::from_fn(|i| admitted[i] && resumed[i]);
+                assert_eq!(
+                    future.as_mut().poll(&mut task),
+                    Poll::Ready((expected, caller.task_id()))
+                );
+                assert_eq!(dropped.get(), Some(expected));
+                assert_eq!(Cx::current().unwrap().task_id(), host.task_id());
+                drop(restriction);
+                drop(future);
+                assert_eq!(dropped.get(), Some(expected), "cleanup occurs exactly once");
+                assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+                assert_eq!(Cx::restriction_depth(), depth);
+            }
+        }
+    }
+
+    #[test]
+    fn caller_context_future_abandonment_and_panic_cannot_restore_denied_effects() {
+        use asupersync::Cx;
+        use std::cell::Cell;
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        struct ObserveDrop(Rc<Cell<Option<[bool; 5]>>>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.set(Cx::current().as_ref().map(effects));
+            }
+        }
+
+        for panic_on_poll in [false, true] {
+            let caller = Cx::for_testing();
+            let _host = Cx::set_current(Some(Cx::for_testing()));
+            let admission = Cx::push_restriction(super::CapMask::none());
+            let dropped = Rc::new(Cell::new(None));
+            let probe = ObserveDrop(Rc::clone(&dropped));
+            let mut future = Box::pin(super::CallerContextFuture::new(
+                &caller,
+                poll_fn(move |_| {
+                    let _keep_until_future_drop = &probe;
+                    assert_eq!(effects(&Cx::current().unwrap()), [false; 5]);
+                    assert!(!panic_on_poll, "poll panic probe");
+                    Poll::<()>::Pending
+                }),
+            ));
+            drop(admission);
+            let depth = Cx::restriction_depth();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(future.as_mut().poll(&mut task).is_pending());
+            }));
+            assert_eq!(result.is_err(), panic_on_poll);
+            assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+            assert_eq!(Cx::restriction_depth(), depth);
+            assert_eq!(dropped.get(), None);
+            drop(future);
+            assert_eq!(dropped.get(), Some([false; 5]));
+            assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+            assert_eq!(Cx::restriction_depth(), depth);
+        }
+    }
+
+    #[test]
+    fn caller_context_future_latches_restrictions_from_a_resumed_pending_poll() {
+        use asupersync::Cx;
+        use std::cell::Cell;
+        use std::future::{Future, poll_fn};
+        use std::rc::Rc;
+        use std::task::{Context, Poll, Waker};
+
+        struct ObserveDrop(Rc<Cell<Option<[bool; 5]>>>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.set(Cx::current().as_ref().map(effects));
+            }
+        }
+
+        for resume_again in [false, true] {
+            let caller = Cx::for_testing();
+            let _host = Cx::set_current(Some(Cx::for_testing()));
+            let observed = Rc::new(Cell::new(None));
+            let dropped = Rc::new(Cell::new(None));
+            let probe = ObserveDrop(Rc::clone(&dropped));
+            let polled = Rc::clone(&observed);
+            let mut future = Box::pin(super::CallerContextFuture::new(
+                &caller,
+                poll_fn(move |_| {
+                    let _keep_until_future_drop = &probe;
+                    polled.set(Cx::current().as_ref().map(effects));
+                    Poll::<()>::Pending
+                }),
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert_eq!(observed.get(), Some([true; 5]));
+            let restriction = Cx::push_restriction(super::CapMask::none());
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            assert_eq!(observed.get(), Some([false; 5]));
+            drop(restriction);
+            if resume_again {
+                assert!(future.as_mut().poll(&mut task).is_pending());
+                assert_eq!(observed.get(), Some([false; 5]));
+            }
+            drop(future);
+            assert_eq!(dropped.get(), Some([false; 5]));
+            assert_eq!(effects(&Cx::current().unwrap()), [true; 5]);
+            assert_eq!(effects(&caller), [true; 5], "the caller itself is not mutated");
+        }
     }
 
     #[test]
