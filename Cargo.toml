@@ -39,6 +39,8 @@ strip = true
 # 0.5.0 preserves runtime capability ceilings when caller-owned contexts are
 # installed by server polling. Test-only constructors remain opt-in above.
 # Bounded shutdown migration and product-profile verification: UPGRADE_LOG.md.
+# 0.6.2: consumers that pass a Cx into fastmcp (frankenterm) moved to 0.6.2,
+# and a Cx from one asupersync version is not a Cx of another.
 asupersync = { version = "=0.6.2" }
 rich_rust = { version = "=0.2.3" }
 # Safe readiness polling for interruptible Unix child-stdout reads and
